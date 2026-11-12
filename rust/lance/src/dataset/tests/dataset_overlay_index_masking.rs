@@ -190,6 +190,7 @@ fn scalar_params(index_type: IndexType) -> ScalarIndexParams {
         IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
         IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
         IndexType::NGram => ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+        IndexType::Fm => ScalarIndexParams::for_builtin(BuiltinIndexType::Fm),
         _ => ScalarIndexParams::default(),
     }
 }
@@ -2107,27 +2108,30 @@ async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
 }
 
-/// [`scalar_index_hits`] for `contains(text, pattern)` on the `text_ngram` index.
-async fn ngram_index_hits(dataset: &Dataset, pattern: &str) -> u64 {
+/// [`scalar_index_hits`] for `contains(text, pattern)` on the `text_idx` index.
+async fn substring_index_hits(dataset: &Dataset, pattern: &str) -> u64 {
     let query = TextQuery::StringContains(pattern.to_string());
-    scalar_index_hits(dataset, "text", "text_ngram", &query).await
+    scalar_index_hits(dataset, "text", "text_idx", &query).await
 }
 
-/// The NGram merge primitive gets the stale rows too: the merged file holds the post-overlay
+/// Substring merge primitives get the stale rows too: the merged file holds the post-overlay
 /// text only and covers both fragments.
 #[rstest]
+#[case::ngram(IndexType::NGram)]
+#[case::fmindex(IndexType::Fm)]
 #[tokio::test]
-async fn test_ngram_merge_rescans_overlay_stale_fragment(
+async fn test_substring_merge_rescans_overlay_stale_fragment(
+    #[case] index_type: IndexType,
     #[values(false, true)] stable_row_ids: bool,
 ) {
     let mut dataset = create_text_dataset(stable_row_ids).await;
     let source_version =
-        commit_single_fragment_segments(&mut dataset, "text", IndexType::NGram, "text_ngram").await;
+        commit_single_fragment_segments(&mut dataset, "text", index_type, "text_idx").await;
 
     // Fragment 0, row 1: "apple banana" -> "cherry mango", committed after the segments.
     let mut dataset = commit_overlay(
         dataset,
-        "ngram_text_overlay",
+        "substring_text_overlay",
         0,
         &[1],
         OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
@@ -2136,15 +2140,15 @@ async fn test_ngram_merge_rescans_overlay_stale_fragment(
     .await;
 
     let merge = OptimizeOptions::merge(2);
-    let merged = optimize_into_one_segment(&mut dataset, "text_ngram", &merge, &[0, 1]).await;
+    let merged = optimize_into_one_segment(&mut dataset, "text_idx", &merge, &[0, 1]).await;
     assert!(merged.dataset_version > source_version);
     // Row 1 was re-read with the overlay applied: its "apple" and "banana" are gone, its
     // "cherry" and "mango" join the base rows that hold them; fragment 1 was carried over.
-    assert_eq!(ngram_index_hits(&dataset, "apple").await, 1);
-    assert_eq!(ngram_index_hits(&dataset, "banana").await, 1);
-    assert_eq!(ngram_index_hits(&dataset, "cherry").await, 2);
-    assert_eq!(ngram_index_hits(&dataset, "mango").await, 2);
-    assert_eq!(ngram_index_hits(&dataset, "pear").await, 1);
+    assert_eq!(substring_index_hits(&dataset, "apple").await, 1);
+    assert_eq!(substring_index_hits(&dataset, "banana").await, 1);
+    assert_eq!(substring_index_hits(&dataset, "cherry").await, 2);
+    assert_eq!(substring_index_hits(&dataset, "mango").await, 2);
+    assert_eq!(substring_index_hits(&dataset, "pear").await, 1);
     assert_ids_match_oracle(&dataset, "contains(text, 'apple')", &[0]).await;
     assert_ids_match_oracle(&dataset, "contains(text, 'banana')", &[3]).await;
     assert_ids_match_oracle(&dataset, "contains(text, 'mango')", &[1, 6]).await;
@@ -2688,6 +2692,43 @@ async fn test_btree_physical_merge_preserves_overlay_staleness() {
 
     assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+}
+
+#[tokio::test]
+async fn test_fmindex_physical_merge_preserves_overlay_staleness() {
+    let mut dataset = create_text_dataset(true).await;
+    let source_version =
+        commit_single_fragment_segments(&mut dataset, "text", IndexType::Fm, "text_idx").await;
+    let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+    let mut dataset = commit_overlay(
+        dataset,
+        "fmindex_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+    dataset.delete("id = 3").await.unwrap();
+    let merged = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap();
+    assert_eq!(merged.dataset_version, source_version);
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged.clone()])
+        .await
+        .unwrap();
+    assert_ids_match_oracle(&dataset, "contains(text, 'apple')", &[0]).await;
+    assert_ids_match_oracle(&dataset, "contains(text, 'mango')", &[1, 6]).await;
+    let mut restored = dataset.checkout_version(source_version).await.unwrap();
+    restored.restore().await.unwrap();
+    restored
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert_ids_match_oracle(&restored, "contains(text, 'banana')", &[1, 3]).await;
+    assert_ids_match_oracle(&restored, "contains(text, 'mango')", &[6]).await;
 }
 
 #[tokio::test]

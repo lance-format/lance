@@ -813,13 +813,7 @@ impl DatasetIndexExt for Dataset {
             )
             .await?
         } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(
-                self,
-                source_segments,
-                has_remapped_source_coverage,
-                staged,
-            )
-            .await?
+            crate::index::scalar::fmindex::merge_segments(self, source_segments, staged).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments, staged).await?
         } else if all_bloomfilter {
@@ -843,7 +837,7 @@ impl DatasetIndexExt for Dataset {
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments, staged).await?
         };
-        if !all_ngram && !all_fmindex {
+        if !all_ngram {
             merged_segment.dataset_version = merged_dataset_version;
         }
         Ok(merged_segment)
