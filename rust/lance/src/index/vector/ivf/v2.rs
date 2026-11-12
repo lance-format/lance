@@ -1827,7 +1827,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
         .await?;
         let storage = match frag_reuse_index {
-            Some(ResolvedRemapping::V0(remapper)) => {
+            Some(ResolvedRemapping::V0 { remapper, .. }) => {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, Some(remapper))
                     .await?
             }
@@ -3387,7 +3387,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepare_index = self.clone();
         let prepare_metrics = metrics.clone();
         let prepare_raw_query_context = raw_query_context.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             let shared_query = Arc::new(query.clone());
             let prepare_stream = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
@@ -3441,7 +3441,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         // batch instead would delay the first search (and the early-stop feedback it
         // produces) behind up to a whole batch of prepare I/O, which is significant
         // when prepare parallelism is low.
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             loop {
                 // Stop pulling as soon as the search is done — or the receiver of our
                 // results is gone — so the producer stops preparing partitions we
@@ -4004,7 +4004,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         )
     };
     let storage = match frag_reuse_index {
-        Some(ResolvedRemapping::V0(remapper)) => make_storage(Some(remapper)),
+        Some(ResolvedRemapping::V0 { remapper, .. }) => make_storage(Some(remapper)),
         Some(ResolvedRemapping::V1Translate { remapper, .. }) => {
             make_storage(None).with_row_id_remapping(remapper)
         }

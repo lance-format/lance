@@ -309,6 +309,8 @@ impl CacheKey for IndexMetadataKey<'_> {
 
 /// Legacy cache key for the query-time index listing derived from a v1 (tagged) FRI:
 /// the coverage-rewritten, filtered listing produced by `frag_reuse_reader`.
+/// For a v0 FRI it holds the listing `load_all_indices` remapped through it; a
+/// snapshot carries one FRI entry, so the two never share a key.
 ///
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
 /// listing. Retained with its original value type for callers using this public

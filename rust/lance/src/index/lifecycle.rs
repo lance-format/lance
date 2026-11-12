@@ -1286,7 +1286,13 @@ impl DatasetIndexExt for Dataset {
         // The stages a distributed optimize runs across workers, run here in
         // turn: without row bounds every index is one task that does the
         // whole single-process optimize, and every merge passes it through.
-        let Some(plan) = optimize::plan_optimize_indices_or_skip(self, &indices, options).await?
+        let Some(plan) = optimize::plan_optimize_indices_or_skip(
+            self,
+            &indices,
+            options,
+            optimize::OptimizeExecution::Local,
+        )
+        .await?
         else {
             return Ok(());
         };

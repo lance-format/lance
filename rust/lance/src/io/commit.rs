@@ -1410,6 +1410,22 @@ pub(crate) async fn do_commit_detached_transaction(
             }
         };
 
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                dataset,
+                &transaction.operation,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            }
+            checked
+        })
+        .await?;
+
         manifest.version = random_version;
 
         // recompute_stats is always false so far because detached manifests are newer than
@@ -1879,7 +1895,7 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
                     .await?
-                    .with_read_version_fragments(read_version_dataset.fragments().clone());
+                    .with_read_version_dataset(&read_version_dataset);
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -2003,6 +2019,23 @@ pub(crate) async fn commit_transaction(
                 (manifest, indices)
             }
         };
+
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                &dataset,
+                &attempt_transaction.operation,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
+            }
+            checked
+        })
+        .await?;
 
         manifest.version = target_version;
 

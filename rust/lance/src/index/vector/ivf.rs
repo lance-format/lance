@@ -7,14 +7,19 @@ use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    utils::{filter_finite_training_data, maybe_sample_training_data, sample_unseen_training_data},
+    utils::{
+        filter_finite_training_data, infer_vector_dim, maybe_sample_training_data,
+        sample_unseen_training_data,
+    },
 };
 use super::{
     builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
+use crate::dataset::transaction::Operation;
 use crate::index::DatasetIndexExt;
+use crate::index::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
@@ -40,7 +45,7 @@ use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::TryFutureExt;
+use futures::{FutureExt, TryFutureExt};
 use futures::{
     Stream, TryStreamExt,
     stream::{self, StreamExt},
@@ -108,7 +113,7 @@ use lance_index::{
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::CachedFileSize;
+use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_io::{
     ReadBatchParams,
     local::to_local_path,
@@ -131,7 +136,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::Range,
     pin::Pin,
@@ -559,6 +564,255 @@ pub(crate) fn validate_vector_query_compatibility(
     }
 
     Ok(())
+}
+
+/// What a search ranks a vector segment by: its metric and its index type.
+/// Merging the distances of segments that differ in either ranks part of the
+/// data by the wrong one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VectorQueryContract {
+    metric: DistanceType,
+    /// `IndexType::Vector` for an index extension, which names no type this
+    /// build knows; it matches only another such segment.
+    index_type: IndexType,
+}
+
+impl VectorQueryContract {
+    /// The contract of an opened segment, from the two accessors every
+    /// vector index implements, legacy ones included.
+    pub(crate) fn of_index(index: &dyn VectorIndex) -> Self {
+        Self {
+            metric: index.metric_type(),
+            index_type: index.index_type(),
+        }
+    }
+
+    /// The contract an index file of the current format records in its
+    /// schema: the type the opener dispatches on, and the metric the opened
+    /// index ranks by.
+    fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
+        let index_type = IndexType::try_from(metadata.index_type.as_str())?;
+        // The opener opens these files only as one of the IVF types.
+        if !index_type.is_vector() || index_type == IndexType::Vector {
+            return Err(Error::index(format!(
+                "Unsupported index type: {}",
+                metadata.index_type
+            )));
+        }
+        Ok(Self {
+            metric: DistanceType::try_from(metadata.distance_type.as_str())?,
+            index_type,
+        })
+    }
+}
+
+impl std::fmt::Display for VectorQueryContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.index_type {
+            // Its `Display` says IVF_PQ.
+            IndexType::Vector => write!(f, "metric {:?}, an index extension's type", self.metric),
+            index_type => write!(f, "metric {:?}, type {index_type}", self.metric),
+        }
+    }
+}
+
+/// Refuses a `CreateIndex` that would leave the segments of one index name
+/// keyed on different columns, or its vector segments under different query
+/// contracts. The index APIs compare the contracts of opened segments with
+/// [`validate_vector_query_compatibility`]; a raw transaction reaches the
+/// commit without them, so each commit attempt compares every segment the new
+/// manifest keeps under each name the transaction adds to, retained ones
+/// included, whatever their details say: a search merges all of them once it
+/// picks the name, and one this build would leave out as too new, a newer
+/// build merges. The caller of a raw transaction sets every field of the
+/// segment metadata, so each contract is read from the segment's own index
+/// file, and a file that cannot be read refuses the commit.
+///
+/// A search opens every segment of the name it picks as a vector segment, so
+/// when some segments of a name have an index file, all of them need one: a
+/// scalar segment on the same column, or a vector segment whose file is gone,
+/// would fail every search. A name none of whose segments has one, such as a
+/// zone map on a vector-typed column, is not a vector index.
+pub(crate) async fn validate_committed_vector_segments(
+    dataset: &Dataset,
+    operation: &Operation,
+    proposed_indices: &[TableIndexMetadata],
+) -> Result<()> {
+    let Operation::CreateIndex { new_indices, .. } = operation else {
+        return Ok(());
+    };
+    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = new_indices
+        .iter()
+        .map(|index| (index.name.as_str(), Vec::new()))
+        .collect();
+    for segment in proposed_indices {
+        if let Some(segments) = segments_by_name.get_mut(segment.name.as_str()) {
+            segments.push(segment);
+        }
+    }
+
+    for (name, segments) in segments_by_name {
+        // A search picks a name by a segment keyed on the queried vector
+        // column, then merges the other segments of that name with it.
+        let keyed_on_a_vector_column = segments.iter().any(|segment| {
+            segment
+                .fields
+                .first()
+                .and_then(|&field_id| dataset.schema().field_by_id(field_id))
+                .is_some_and(|field| infer_vector_dim(&field.data_type()).is_ok())
+        });
+        if segments.len() < 2 || !keyed_on_a_vector_column {
+            continue;
+        }
+        let first = segments[0];
+        if let Some(other) = segments
+            .iter()
+            .find(|segment| segment.keyed_fields() != first.keyed_fields())
+        {
+            let columns = |segment: &TableIndexMetadata| {
+                segment
+                    .keyed_fields()
+                    .iter()
+                    .map(|&field_id| {
+                        dataset
+                            .schema()
+                            .field_path(field_id)
+                            .unwrap_or_else(|_| format!("field {field_id}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segments {} (on {}) and {} (on {}) would both remain in index \
+                 '{name}'; a search reads every segment of an index as keyed on the queried \
+                 column, so all of them must be keyed on the same columns",
+                first.uuid,
+                columns(first),
+                other.uuid,
+                columns(other),
+            )));
+        }
+        // Boxed and collected first: reading a segment is a large future, and
+        // mapping these references inside the stream makes rustc report the
+        // commit future's `Send` as "not general enough".
+        let contracts = segments
+            .into_iter()
+            .map(|segment| {
+                async move {
+                    let contract =
+                        vector_segment_contract(dataset, segment)
+                            .await
+                            .map_err(|error| {
+                                Error::io(format!(
+                                    "CreateIndex: cannot read vector segment {} to check that \
+                                     index '{}' keeps one metric and index type: {error}",
+                                    segment.uuid, segment.name
+                                ))
+                            })?;
+                    Ok::<_, Error>((segment, contract))
+                }
+                .boxed()
+            })
+            .collect::<Vec<_>>();
+        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
+        let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
+        let mut without_index_file = None;
+        while let Some((segment, contract)) = contracts.try_next().await? {
+            match contract {
+                None => {
+                    without_index_file.get_or_insert(segment);
+                }
+                Some(contract) => match &reference {
+                    None => reference = Some((segment, contract)),
+                    Some((first, expected)) if *expected != contract => {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: vector segments {} ({expected}) and {} ({contract}) \
+                             would both remain in index '{name}'; a search ranks every segment \
+                             of an index by one metric and index type, so replace all of its \
+                             segments in one commit",
+                            first.uuid, segment.uuid,
+                        )));
+                    }
+                    Some(_) => {}
+                },
+            }
+            if let (Some((first, expected)), Some(other)) = (&reference, without_index_file) {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: vector segment {} ({expected}) and segment {}, which has no \
+                     vector index file, would both remain in index '{name}'; a search opens \
+                     every segment of an index as a vector segment",
+                    first.uuid, other.uuid,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A vector segment's contract, read from its own index file. A file of the
+/// current format records it in its schema, read the way the opener reads it
+/// before loading any centroid; a file of an older format, or an index
+/// extension's, is opened on the identity plan, since a staged segment is in
+/// no listing a query plan covers, and a plan translates row addresses, never
+/// a metric or a type.
+///
+/// `None` when the segment has no index file: the files it records name
+/// none, or it records no files and the store has none.
+async fn vector_segment_contract(
+    dataset: &Dataset,
+    segment: &TableIndexMetadata,
+) -> Result<Option<VectorQueryContract>> {
+    // Not asked of the store: a missing key costs a request and its retries
+    // per segment, and a store may answer it with a denial instead.
+    if segment
+        .files
+        .as_ref()
+        .is_some_and(|files| !files.iter().any(|file| file.path == INDEX_FILE_NAME))
+    {
+        return Ok(None);
+    }
+    let object_store = dataset.object_store_for_index(segment).await?;
+    let index_file = dataset
+        .indice_files_dir(segment)?
+        .join(segment.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let file_sizes = segment.file_size_map();
+    let version = async {
+        let reader = open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+        read_version(&read_last_block(reader.as_ref()).await?)
+    };
+    let version = match version.await {
+        Ok(version) => version,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if matches!(version, (0, 3) | (2, _)) {
+        let metadata = dataset
+            .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
+            .await?;
+        return VectorQueryContract::from_file_metadata(&metadata).map(Some);
+    }
+    let field_id = segment
+        .fields
+        .first()
+        .ok_or_else(|| Error::invalid_input("the segment names no indexed column".to_string()))?;
+    let column = dataset.schema().field_path(*field_id)?;
+    let index = dataset
+        .open_vector_index_from_metadata_with_plan(
+            &column,
+            segment,
+            Some(&SegmentRemappingPlan::Identity),
+            OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
+    Ok(Some(VectorQueryContract::of_index(index.as_ref())))
 }
 
 fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
@@ -3537,7 +3791,7 @@ where
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -5483,7 +5737,7 @@ async fn finish_streaming_ivf_training<T>(
     training_result: Result<T>,
     progress_tx: mpsc::UnboundedSender<u64>,
     on_progress: KMeansProgressCallback,
-    progress_worker: tokio::task::JoinHandle<Result<()>>,
+    progress_worker: lance_core::utils::tokio::JoinHandle<Result<()>>,
     trainer_name: &str,
 ) -> Result<T> {
     drop(progress_tx);
@@ -5616,7 +5870,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -5841,7 +6095,7 @@ async fn train_streaming_ivf_model(
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }

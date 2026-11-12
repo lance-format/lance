@@ -65,5 +65,9 @@ harness = false
 name = "batch_distance"
 harness = false
 
+[[bench]]
+name = "hamming"
+harness = false
+
 [lints]
 workspace = true
