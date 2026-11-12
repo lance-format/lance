@@ -947,8 +947,9 @@ impl VariableWidthBlock {
         _proof: ValidVariableWidthLayout,
     ) -> ArrayData {
         let builder = self.into_arrow_builder(data_type);
-        // SAFETY: `_proof` witnesses that `validate_layout` proved this block
-        // satisfies the Arrow layout contract for `data_type`.
+        // SAFETY: `_proof` witnesses that `validate_layout` checked this block's offsets and
+        // values against `data_type`. It does not check buffer alignment; Arrow checks that
+        // when the offsets are read as typed values and panics on a misaligned buffer.
         unsafe { builder.build_unchecked() }
     }
 
@@ -2721,6 +2722,9 @@ mod tests {
         #[case] data_type: DataType,
         #[case] offsets: Buffer,
     ) {
+        // SAFETY: the offsets are deliberately invalid. `build_unchecked` leaves validity to the
+        // caller, and the array only reaches `validate_array_data`, which must reject it before
+        // anything reads the strings.
         let array_data = unsafe {
             ArrayData::builder(data_type)
                 .len(1)

@@ -703,6 +703,7 @@ mod tests {
                 }
                 assert_eq!(&actual[offset..end], expected);
                 // Decode independently generated scalar bytes with SIMD.
+                // SAFETY: the same buffer and layout as the encode call above.
                 unsafe {
                     x86_64::transform::<true>(
                         &mut actual[offset..end],
