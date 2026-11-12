@@ -13,6 +13,8 @@
 // The original code is licensed under the Apache Software License:
 // https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/LICENSE
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use arrayref::{array_mut_ref, array_ref};
 use core::mem::{MaybeUninit, size_of};
 
@@ -225,22 +227,32 @@ macro_rules! impl_bitpacking_compat {
     ($ty:ty) => {
         impl BitPacking for $ty {
             unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+                // SAFETY: `MaybeUninit<Self>` has the layout of `Self`, and the new slice takes
+                // over the exclusive borrow of `output`. The kernels only write initialized
+                // values, so `output` stays valid even if one of them panics.
                 let output = unsafe {
                     core::slice::from_raw_parts_mut(
                         output.as_mut_ptr().cast::<MaybeUninit<Self>>(),
                         output.len(),
                     )
                 };
+                // SAFETY: `unchecked_pack_uninit` has the same length contract as this function,
+                // and the caller upholds it.
                 unsafe { <Self as BitPackingUninit>::unchecked_pack_uninit(width, input, output) };
             }
 
             unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+                // SAFETY: `MaybeUninit<Self>` has the layout of `Self`, and the new slice takes
+                // over the exclusive borrow of `output`. The kernels only write initialized
+                // values, so `output` stays valid even if one of them panics.
                 let output = unsafe {
                     core::slice::from_raw_parts_mut(
                         output.as_mut_ptr().cast::<MaybeUninit<Self>>(),
                         output.len(),
                     )
                 };
+                // SAFETY: `unchecked_unpack_uninit` has the same length contract as this function,
+                // and the caller upholds it.
                 unsafe {
                     <Self as BitPackingUninit>::unchecked_unpack_uninit(width, input, output)
                 };
@@ -1941,7 +1953,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u8>` has the layout of `u8`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len()) };
 
@@ -1970,7 +1983,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u16>` has the layout of `u16`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u16>(), packed.len()) };
 
@@ -1999,7 +2013,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u32>` has the layout of `u32`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u32>(), packed.len()) };
 
@@ -2034,7 +2049,8 @@ mod test {
                 values[$pos]
             });
         }
-        // The pack kernel writes every element of the packed output.
+        // SAFETY: the pack kernel writes every element of the packed output, and
+        // `MaybeUninit<u64>` has the layout of `u64`.
         let packed =
             unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u64>(), packed.len()) };
 
@@ -2187,10 +2203,12 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u8;
         }
         let mut packed = vec![0; 1024 * bit_width / 8];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2202,10 +2220,12 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u16;
         }
         let mut packed = vec![0; 1024 * bit_width / u16::T];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2217,10 +2237,12 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u32;
         }
         let mut packed = vec![0; 1024 * bit_width / u32::T];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2238,10 +2260,12 @@ mod test {
             }
         }
         let mut packed = vec![0; 1024 * bit_width / u64::T];
+        // SAFETY: `values` holds 1024 values and `packed` holds `1024 * W / T`.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds `1024 * W / T` values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
         assert_eq!(values, output);
     }
@@ -2250,8 +2274,10 @@ mod test {
     fn test_unchecked_pack() {
         let input = array::from_fn(|i| i as u32);
         let mut packed = [0; 320];
+        // SAFETY: `input` holds 1024 values and `packed` holds 1024 * 10 / 32 = 320.
         unsafe { BitPacking::unchecked_pack(10, &input, &mut packed) };
         let mut output = [0; 1024];
+        // SAFETY: `packed` holds 320 values and `output` holds 1024.
         unsafe { BitPacking::unchecked_unpack(10, &packed, &mut output) };
         assert_eq!(input, output);
 

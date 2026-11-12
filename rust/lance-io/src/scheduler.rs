@@ -674,7 +674,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run());
+                lance_core::utils::tokio::spawn(task.run());
             }
             None => {
                 // The sender has been dropped, we are done
@@ -1054,7 +1054,7 @@ impl ScanScheduler {
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
             // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
             // to wait for it to finish but that doesn't seem helpful.
-            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+            lance_core::utils::tokio::spawn(async move { run_io_loop(io_queue_clone).await });
             IoQueueType::Standard(io_queue)
         };
         Arc::new(Self {
@@ -1103,6 +1103,7 @@ impl ScanScheduler {
             max_iop_size,
             bypass_backpressure: false,
             extra_stats: None,
+            metadata_read_size: None,
         })
     }
 
@@ -1136,6 +1137,7 @@ impl ScanScheduler {
             max_iop_size: self.object_store.max_iop_size(),
             bypass_backpressure: false,
             extra_stats: None,
+            metadata_read_size: None,
         }
     }
 
@@ -1372,6 +1374,7 @@ pub struct FileScheduler {
     /// through this handle is also recorded here, in addition to the
     /// scheduler's global totals.  Used to measure per-scope I/O.
     extra_stats: Option<Arc<dyn IoStatsRecorder>>,
+    metadata_read_size: Option<NonZero<usize>>,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -1537,7 +1540,36 @@ impl FileScheduler {
             base_priority: priority,
             bypass_backpressure: self.bypass_backpressure,
             extra_stats: self.extra_stats.clone(),
+            metadata_read_size: self.metadata_read_size,
         }
+    }
+
+    /// Set the initial metadata read size without changing data I/O coalescing.
+    ///
+    /// A structural projection can read just a file footer first, so speculative
+    /// tail reads do not pull in values adjacent to that footer.
+    ///
+    /// ```
+    /// # use lance_io::scheduler::FileScheduler;
+    /// # fn example(scheduler: &FileScheduler) -> lance_core::Result<()> {
+    /// let reader = scheduler.with_metadata_read_size(40)?;
+    /// assert_eq!(reader.metadata_read_size(), 40);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_metadata_read_size(&self, bytes: usize) -> Result<Self> {
+        let bytes = NonZero::new(bytes)
+            .ok_or_else(|| Error::invalid_input("metadata read size must be greater than zero"))?;
+        Ok(Self {
+            metadata_read_size: Some(bytes),
+            ..self.clone()
+        })
+    }
+
+    /// Initial metadata read size, or the underlying reader's preferred block size.
+    pub fn metadata_read_size(&self) -> usize {
+        self.metadata_read_size
+            .map_or_else(|| self.reader.block_size(), NonZero::get)
     }
 
     /// Returns a copy of this scheduler that additionally records the I/O it

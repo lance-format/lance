@@ -87,10 +87,6 @@ impl PrimitivePageDecoder for FsstPageDecoder {
 
         let mut decompressed_offsets = vec![0_i32; offsets.len()];
         let mut decompressed_bytes = vec![0_u8; bytes.len() * 8];
-        // Safety: Exposes uninitialized memory but we're about to clobber it
-        unsafe {
-            decompressed_bytes.set_len(decompressed_bytes.capacity());
-        }
         fsst::fsst::decompress(
             &self.symbol_table,
             &bytes,

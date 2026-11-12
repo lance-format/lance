@@ -14,7 +14,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use lance_core::Result;
-use lance_core::cache::{Context, DeepSizeOf};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::error::Error;
 
 use crate::EncodingsIo;
@@ -23,7 +23,7 @@ use crate::compression::{
     DecompressionStrategy, FixedPerValueDecompressor, VariablePerValueDecompressor,
 };
 use crate::data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, VariableWidthBlock};
-use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
+use crate::decoder::{DecodePageTask, DecodedPage, ListReadMode, StructuralPageDecoder};
 use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{
@@ -31,10 +31,13 @@ use crate::repdef::{
 };
 use crate::utils::bytepack::ByteUnpacker;
 
+use super::structure::{StructuralMetadataIo, StructuralProjection};
 use super::{
     CachedPageData, NoCachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     StructuralPageScheduler,
 };
+
+mod structure;
 
 #[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
@@ -147,6 +150,8 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     pub(super) enable_cache: bool,
+    pub(super) structural_projection: Option<StructuralProjection>,
+    structural_cache: Option<Arc<LanceCache>>,
 }
 
 impl FullZipScheduler {
@@ -282,6 +287,8 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
+            structural_cache: None,
         })
     }
 
@@ -574,6 +581,9 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        self.structural_cache = self.structural_projection.is_some().then_some(cache);
+    }
     fn needs_initialization(&self) -> bool {
         self.enable_cache && self.rep_index.is_some()
     }
@@ -624,6 +634,9 @@ impl StructuralPageScheduler for FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
+        if let Some(projection) = &self.structural_projection {
+            return self.schedule_list_structure(ranges, io, projection.clone());
+        }
         if let Some(rep_index) = self.rep_index {
             self.schedule_ranges_rep(ranges, io, rep_index)
         } else {
@@ -1857,6 +1870,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1983,6 +1998,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: true,
+            structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -2108,6 +2125,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();

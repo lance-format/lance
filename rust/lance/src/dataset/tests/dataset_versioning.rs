@@ -1669,8 +1669,11 @@ async fn test_concurrent_branch_creation_preserves_winner() {
                 assert!(successful_version.replace(version).is_none());
             }
             Err(error) => {
+                // A concurrent loser can observe either the reserved branch
+                // name or the winner's version directory first. Both paths are
+                // valid RefConflict outcomes; the winner invariants below are
+                // the contract exercised here.
                 assert!(matches!(error, Error::RefConflict { .. }), "{error}");
-                assert!(error.to_string().contains("branch race already exists"));
                 conflicts += 1;
             }
         }
