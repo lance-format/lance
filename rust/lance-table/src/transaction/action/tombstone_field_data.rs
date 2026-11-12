@@ -35,6 +35,9 @@ pub struct TombstoneFieldData {
 impl TombstoneFieldData {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
+        if self.data_change {
+            state.reject_data_change_to_rearranged(fragment_id, "TombstoneFieldData")?;
+        }
         let field_ids = self
             .field_ids
             .iter()

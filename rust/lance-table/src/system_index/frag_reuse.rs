@@ -5,6 +5,7 @@ pub mod gate;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata;
+pub mod retention;
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
@@ -25,6 +26,40 @@ use crate::format::{ExternalFile, Fragment, IndexMetadata, pb};
 
 pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
+
+/// The current fragment reuse history, read ahead of a manifest build that
+/// cannot read the external details file it lives in.
+#[derive(Debug, Clone)]
+pub struct PreloadedFragReuseHistory {
+    /// The entry the history was read from. A build refuses a history read
+    /// from any other entry, so a stale read is never merged onto.
+    pub entry: Uuid,
+    /// The serialized `InlineContent`, exactly as stored.
+    pub content: bytes::Bytes,
+}
+
+/// What an action-based transaction's commit attempt supplies for the
+/// fragment reuse history, which applying the actions cannot work out alone.
+#[derive(Debug, Clone)]
+pub struct FragReuseActionInputs {
+    /// The current history when it lives in an external details file; an
+    /// inline history is read from the entry itself.
+    pub history: Option<PreloadedFragReuseHistory>,
+    /// Whether this build can serve a segment. Trimming the history counts
+    /// only such segments' coverage as having caught up, since a segment no
+    /// query can use answers for nothing.
+    pub index_is_usable: fn(&IndexMetadata) -> bool,
+}
+
+impl Default for FragReuseActionInputs {
+    /// No history read ahead, and every segment counted as usable.
+    fn default() -> Self {
+        Self {
+            history: None,
+            index_is_usable: |_| true,
+        }
+    }
+}
 
 /// Whether `index` is the fragment reuse index itself, not a user index that
 /// borrows its name.
