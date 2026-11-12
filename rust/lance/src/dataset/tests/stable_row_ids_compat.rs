@@ -6,6 +6,7 @@ use std::fs::File;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
+use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::pb;
 use lance_table::format::{Fragment, RowDatasetVersionMeta, RowIdMeta};
 use prost::Message;
@@ -163,14 +164,26 @@ async fn stable_row_id_compat_fixtures() {
         let uri = dir.std_path().join(format!("{name}.lance"));
         let dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
 
-        assert!(
-            dataset.manifest.uses_stable_row_ids(),
-            "{name}: stable row IDs flag missing"
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS,
+            0,
+            "{name}: reader_feature_flags should have FLAG_STABLE_ROW_IDS"
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS,
+            0,
+            "{name}: writer_feature_flags should have FLAG_STABLE_ROW_IDS"
         );
         let expected_row_ids = u64_column(&fixture[ROW_ID]);
-        assert!(
-            dataset.manifest.next_row_id > *expected_row_ids.iter().max().unwrap(),
-            "{name}: next_row_id does not cover the fixture"
+        // Deletes, updates and compaction leave gaps, so the writer's high-water
+        // mark is only reachable from the generation steps, not from the live
+        // maximum row ID.
+        assert_eq!(
+            dataset.manifest.next_row_id,
+            fixture["next_row_id"]
+                .as_u64()
+                .expect("expected next_row_id"),
+            "{name}: next_row_id"
         );
 
         let batch = dataset

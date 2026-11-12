@@ -14,8 +14,9 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   32-bit offsets, an unsorted `Array` from a reverse-order merge, and inline
   row version sequences with multiple update versions. `expected.json` records
   the exact `_rowid`, `_row_created_at_version`, and
-  `_row_last_updated_at_version` values. `datagen.py` regenerates the datasets
-  and expected values with pylance 14.0.2.
+  `_row_last_updated_at_version` values plus the `next_row_id` high-water mark
+  of the writer. `datagen.py` regenerates the datasets and expected values with
+  pylance 14.0.2.
 
 * `v6.0.1/wrapped_bitpacked_levels.lance`: Synthetic nullable half-float lists
   with a dense prefix and a long null run. The legacy writer wraps a mini-block
