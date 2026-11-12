@@ -11,7 +11,9 @@
 //! unchanged. `LANCE_FTS_PIPELINE_MERGE_WORKERS` defaults to one; it is not
 //! inferred from CPU count. Optional `RUN_MIB`, `TARGET_MIB` and `QUEUE_RUNS`
 //! settings under the same `LANCE_FTS_PIPELINE_` prefix control the producer
-//! flush trigger, per-merger working-set reservation and bounded queue count.
+//! flush trigger, final partition target and bounded queue count. Merge workers
+//! are a maximum concurrency: memory admission can reduce the active count,
+//! rather than reducing partition size to accommodate more workers.
 //! The working set includes a conservative allocation-growth allowance and
 //! decoded positions scratch, so its reservation exceeds the output target.
 //! Input Arrow batches, tokenization temporaries, allocator retention and object
@@ -31,8 +33,8 @@ use tokio::task::JoinSet;
 
 use super::{
     IndexStore, IndexWorker, IndexWorkerConfig, InnerBuilder, InvertedIndexBuilder,
-    InvertedListFormatVersion, PartitionWriteTarget, SendableRecordBatchStream, WorkerOutput,
-    document_coordinate_rank, resolve_num_workers,
+    InvertedListFormatVersion, PartitionWriteTarget, SendableRecordBatchStream, TailPartition,
+    WorkerOutput, document_coordinate_rank, resolve_num_workers,
 };
 
 const QUEUE_UNIT_BYTES: u64 = 1024;
@@ -80,12 +82,14 @@ pub(super) async fn build(
     }
     let workers = resolve_num_workers(&builder.params);
     log::info!(
-        "FTS_PIPELINE_CONFIG workers={} merge_workers={} queue_runs={} run_trigger_bytes={} max_run_bytes={} merge_working_set_bytes={} queue_bytes={}",
+        "FTS_PIPELINE_CONFIG workers={} requested_merge_workers={} merge_workers={} queue_runs={} run_trigger_bytes={} max_run_bytes={} output_target_bytes={} merge_working_set_bytes={} queue_bytes={}",
         workers,
+        config.requested_merge_workers,
         config.merge_workers,
         config.queue_runs,
         config.run_memory_limit_bytes,
         config.max_run_bytes,
+        config.output_target_bytes,
         config.merge_memory_limit_bytes,
         config.queue_memory_bytes,
     );
@@ -180,7 +184,8 @@ pub(super) async fn build(
             Result::Ok(WorkerOutput::default())
         });
 
-        finish_workers(tasks, &stop).await
+        let (output, tails) = finish_workers(tasks, &stop).await?;
+        finish_tails(output, tails, store, target, config, &stop).await
     });
     let output = supervisor.await?;
     drop(cancel_on_drop);
@@ -190,8 +195,9 @@ pub(super) async fn build(
 async fn finish_workers(
     mut tasks: JoinSet<Result<WorkerOutput>>,
     stop: &Stop,
-) -> Result<WorkerOutput> {
+) -> Result<(WorkerOutput, Vec<InnerBuilder>)> {
     let mut result = WorkerOutput::default();
+    let mut tails = Vec::new();
     let mut first_error = None;
     let mut prerequisite_error = None;
     // Ordinary failures drain gracefully: aborting async workers would
@@ -201,6 +207,9 @@ async fn finish_workers(
             Ok(output) if first_error.is_none() => {
                 result.partitions.extend(output.partitions);
                 result.files.extend(output.files);
+                if let Some(tail) = output.tail_partition {
+                    tails.push(tail.builder);
+                }
             }
             Ok(_) => {}
             Err(error @ Error::PrerequisiteFailed { .. }) => {
@@ -219,17 +228,20 @@ async fn finish_workers(
         return Err(error);
     }
     result.partitions.sort_unstable();
-    Ok(result)
+    Ok((result, tails))
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Config {
+    pub requested_merge_workers: usize,
     pub merge_workers: usize,
     // Producer bursts can require more buffering than merge concurrency.
     pub queue_runs: usize,
     pub queue_memory_bytes: u64,
     pub run_memory_limit_bytes: u64,
     pub max_run_bytes: u64,
+    pub output_target_bytes: u64,
+    pub total_memory_bytes: u64,
     // Includes allocation growth and positions scratch, not just the output.
     pub merge_memory_limit_bytes: u64,
 }
@@ -291,60 +303,80 @@ impl Config {
         run: Option<u64>,
         queue_runs: Option<usize>,
     ) -> Result<Self> {
-        let queue_runs = queue_runs.unwrap_or(merge_workers);
-        if merge_workers == 0 {
-            return Err(Error::invalid_input(
-                "merge worker count must be positive".to_string(),
-            ));
+        if workers == 0 || merge_workers == 0 || queue_runs == Some(0) {
+            return Err(Error::invalid_input(format!(
+                "pipeline worker and queue counts must be positive: workers={workers}, merge_workers={merge_workers}, queue_runs={queue_runs:?}"
+            )));
         }
-        if queue_runs == 0 {
-            return Err(Error::invalid_input(
-                "pipeline queue capacity must be positive, got queue_runs=0".to_string(),
-            ));
+        // Match the ordinary per-worker trigger when feasible. Even a single
+        // merger needs room for its working set plus producers and the queue.
+        // This target never depends on requested merger concurrency.
+        let output_target_bytes =
+            target.unwrap_or((total_budget / workers as u64).min(total_budget / 8));
+        let merge_memory_limit_bytes = output_target_bytes
+            .checked_mul(6)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| Error::invalid_input("invalid FTS pipeline output target"))?;
+        let minimum_run_bytes = match run {
+            Some(0) => {
+                return Err(Error::invalid_input(
+                    "pipeline run trigger must be positive",
+                ));
+            }
+            Some(bytes) => bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(QUEUE_UNIT_BYTES - 1))
+                .map(|bytes| bytes / QUEUE_UNIT_BYTES * QUEUE_UNIT_BYTES)
+                .ok_or_else(|| Error::invalid_input("pipeline run reservation overflow"))?,
+            None => QUEUE_UNIT_BYTES,
+        };
+        let fixed_slots = (workers as u64)
+            .checked_add(queue_runs.unwrap_or(0) as u64)
+            .ok_or_else(|| Error::invalid_input("pipeline worker count overflow"))?;
+        // With no explicit queue count, each admitted merger gets one queue
+        // slot as well as its independent current-input reservation.
+        let per_merger = minimum_run_bytes
+            .checked_mul(if queue_runs.is_some() { 1 } else { 2 })
+            .and_then(|bytes| bytes.checked_add(merge_memory_limit_bytes))
+            .ok_or_else(|| Error::invalid_input("pipeline merge reservation overflow"))?;
+        let available = fixed_slots
+            .checked_mul(minimum_run_bytes)
+            .and_then(|bytes| total_budget.checked_sub(bytes))
+            .unwrap_or(0);
+        let effective_workers = (available / per_merger).min(merge_workers as u64) as usize;
+        if effective_workers == 0 || minimum_run_bytes > output_target_bytes / 4 {
+            return Err(Error::invalid_input(format!(
+                "FTS pipeline output target {output_target_bytes} and run reservation {minimum_run_bytes} exceed total budget {total_budget} with workers={workers}, requested_merge_workers={merge_workers}, queue_runs={queue_runs:?}"
+            )));
         }
-        let merger_slots = (merge_workers as u64)
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_input("merge worker count overflow".to_string()))?;
-        let merge_memory_limit_bytes = target.unwrap_or(total_budget / merger_slots);
-        let output_budget = merge_memory_limit_bytes
-            .checked_mul(merge_workers as u64)
-            .ok_or_else(|| Error::invalid_input("merge output reservation overflow".to_string()))?;
-        let slots = (workers as u64)
-            .checked_add(merge_workers as u64)
-            .and_then(|slots| slots.checked_add(queue_runs as u64))
-            .ok_or_else(|| Error::invalid_input("pipeline worker count overflow".to_string()))?;
-        let remaining = total_budget.checked_sub(output_budget).ok_or_else(|| {
-            Error::invalid_input(format!("pipeline merge output reservation {output_budget} exceeds total budget {total_budget}"))
-        })?;
-        // Reserve retained producer runs, the bounded queue, and one current
-        // input per consumer independently of the consumers' merge outputs.
-        let max_run_bytes = (remaining / slots).min(merge_memory_limit_bytes / 4)
-            / QUEUE_UNIT_BYTES
-            * QUEUE_UNIT_BYTES;
+        let queue_runs = queue_runs.unwrap_or(effective_workers);
+        // Only admitted consumers are spawned. A waiting extra consumer must
+        // not depend on a slot retained by a completed consumer's tail.
+        let remaining = total_budget - merge_memory_limit_bytes * effective_workers as u64;
+        let slots = workers as u64 + effective_workers as u64 + queue_runs as u64;
+        let max_run_bytes =
+            (remaining / slots).min(output_target_bytes / 4) / QUEUE_UNIT_BYTES * QUEUE_UNIT_BYTES;
         let queue_memory_bytes = max_run_bytes
             .checked_mul(queue_runs as u64)
-            .ok_or_else(|| Error::invalid_input("merge queue reservation overflow".to_string()))?;
+            .ok_or_else(|| Error::invalid_input("merge queue reservation overflow"))?;
         let run_memory_limit_bytes = run.unwrap_or(max_run_bytes / 2);
-        if workers == 0
-            || max_run_bytes < QUEUE_UNIT_BYTES
-            || merge_memory_limit_bytes < max_run_bytes
-            || run_memory_limit_bytes == 0
-            || run_memory_limit_bytes > max_run_bytes / 2
+        if max_run_bytes < minimum_run_bytes
             || queue_memory_bytes / QUEUE_UNIT_BYTES > u32::MAX as u64
             || queue_memory_bytes / QUEUE_UNIT_BYTES > Semaphore::MAX_PERMITS as u64
         {
             return Err(Error::invalid_input(format!(
-                "invalid FTS pipeline budgets: total={total_budget}, workers={workers}, merge_workers={merge_workers}, queue_runs={queue_runs}, \
-                 merge_target={merge_memory_limit_bytes}, max_run={max_run_bytes}, run_trigger={run_memory_limit_bytes}; \
-                 the run trigger must leave half its reservation for document and allocation growth"
+                "invalid FTS pipeline budgets: total={total_budget}, workers={workers}, merge_workers={effective_workers}, queue_runs={queue_runs}, output_target={output_target_bytes}, max_run={max_run_bytes}, run_trigger={run_memory_limit_bytes}"
             )));
         }
         Ok(Self {
-            merge_workers,
+            requested_merge_workers: merge_workers,
+            merge_workers: effective_workers,
             queue_runs,
             queue_memory_bytes,
             run_memory_limit_bytes,
             max_run_bytes,
+            output_target_bytes,
+            total_memory_bytes: total_budget,
             merge_memory_limit_bytes,
         })
     }
@@ -490,6 +522,7 @@ async fn consume_worker(
     let mut write_seconds = 0.0;
     let mut max_run_bytes = 0;
     let mut max_output_bytes = 0;
+    let mut undersized_partitions = 0;
     loop {
         let Run { builder, permit } = tokio::select! {
             biased;
@@ -521,6 +554,8 @@ async fn consume_worker(
                         mut previous,
                         incoming,
                     } => {
+                        undersized_partitions +=
+                            usize::from(previous.memory_size() < config.output_target_bytes);
                         let writing = Instant::now();
                         files.extend(previous.write_to(store.as_ref(), target).await?);
                         partitions.push(previous.id());
@@ -534,34 +569,116 @@ async fn consume_worker(
         if let Some(builder) = &accumulated {
             max_output_bytes = max_output_bytes.max(builder.memory_size());
         }
+        if let Some(mut builder) =
+            accumulated.take_if(|builder| builder.memory_size() >= config.output_target_bytes)
+        {
+            let writing = Instant::now();
+            files.extend(builder.write_to(store.as_ref(), target).await?);
+            partitions.push(builder.id());
+            write_seconds += writing.elapsed().as_secs_f64();
+        }
     }
     if stop.is_cancelled() {
         return Ok(WorkerOutput::default());
     }
-    let draining = Instant::now();
-    if let Some(mut builder) = accumulated {
-        files.extend(builder.write_to(store.as_ref(), target).await?);
-        partitions.push(builder.id());
-        write_seconds += draining.elapsed().as_secs_f64();
-    }
     log::info!(
         "FTS_PIPELINE_WORKER_COMPLETE worker={} runs={} partitions={} merge_task_seconds={:.3} write_seconds={:.3} \
-         final_write_seconds={:.3} max_run_bytes={} max_output_bytes={} elapsed_seconds={:.3}",
+         undersized_partitions={} max_run_bytes={} max_output_bytes={} tail_bytes={} elapsed_seconds={:.3}",
         worker,
         runs,
         partitions.len(),
         merge_seconds,
         write_seconds,
-        draining.elapsed().as_secs_f64(),
+        undersized_partitions,
         max_run_bytes,
         max_output_bytes,
+        accumulated.as_ref().map_or(0, InnerBuilder::memory_size),
         started.elapsed().as_secs_f64()
     );
     Ok(WorkerOutput {
         partitions,
         files,
-        tail_partition: None,
+        tail_partition: accumulated.map(|builder| TailPartition { builder }),
     })
+}
+
+async fn finish_tails(
+    mut output: WorkerOutput,
+    mut tails: Vec<InnerBuilder>,
+    store: Arc<dyn IndexStore>,
+    target: PartitionWriteTarget,
+    config: Config,
+    stop: &Stop,
+) -> Result<WorkerOutput> {
+    // Producers and consumers are joined. Their static reservations remain
+    // available to this sequential drain, except for the tails still retained.
+    // Merge smallest tails first so a large tail cannot strand smaller ones.
+    tails.sort_unstable_by_key(|builder| std::cmp::Reverse(builder.memory_size()));
+    let mut idle_bytes = tails.iter().try_fold(0u64, |bytes, tail| {
+        bytes
+            .checked_add(tail.memory_size())
+            .ok_or_else(|| Error::invalid_input("FTS pipeline tail memory overflow"))
+    })?;
+    let mut accumulated: Option<InnerBuilder> = None;
+    let tail_count = tails.len();
+    let previous_partitions = output.partitions.len();
+    while let Some(incoming) = tails.pop() {
+        if stop.is_cancelled() {
+            return Ok(WorkerOutput::default());
+        }
+        idle_bytes -= incoming.memory_size();
+        accumulated = Some(match accumulated.take() {
+            Some(previous) => {
+                let budget = config
+                    .total_memory_bytes
+                    .checked_sub(idle_bytes)
+                    .ok_or_else(|| {
+                        Error::invalid_input("FTS pipeline tails exceed total budget")
+                    })?;
+                let outcome = spawn_cpu(move || merge_runs(previous, incoming, budget)).await?;
+                if stop.is_cancelled() {
+                    return Ok(WorkerOutput::default());
+                }
+                match outcome {
+                    MergeOutcome::Merged(builder) => builder,
+                    MergeOutcome::Full {
+                        mut previous,
+                        incoming,
+                    } => {
+                        output
+                            .files
+                            .extend(previous.write_to(store.as_ref(), target).await?);
+                        output.partitions.push(previous.id());
+                        incoming
+                    }
+                }
+            }
+            None => incoming,
+        });
+        if let Some(mut builder) =
+            accumulated.take_if(|builder| builder.memory_size() >= config.output_target_bytes)
+        {
+            output
+                .files
+                .extend(builder.write_to(store.as_ref(), target).await?);
+            output.partitions.push(builder.id());
+        }
+    }
+    if !stop.is_cancelled()
+        && let Some(mut builder) = accumulated
+    {
+        output
+            .files
+            .extend(builder.write_to(store.as_ref(), target).await?);
+        output.partitions.push(builder.id());
+    }
+    log::info!(
+        "FTS_PIPELINE_TAILS_COMPLETE tails={} partitions={}",
+        tail_count,
+        output.partitions.len() - previous_partitions
+    );
+    output.partitions.sort_unstable();
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -574,6 +691,55 @@ mod tests {
     use object_store::path::Path;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn test_pipeline_output_target_is_not_the_working_set_limit() -> Result<()> {
+        let target_bytes = 64 << 10;
+        let config = Config::new(2 << 20, 1, 1, Some(target_bytes), None, None)?;
+        let builders = (0..8)
+            .map(|id| {
+                let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
+                builder.tokens.get_or_add(&format!("token{id}"));
+                let mut posting = super::super::PostingListBuilder::new(false);
+                for row in 0..128 {
+                    let doc = builder.docs.append(id * 128 + row, 1);
+                    posting.add(doc, super::super::PositionRecorder::Count(1));
+                }
+                builder.posting_lists.push(posting);
+                builder
+            })
+            .collect::<Vec<_>>();
+        let retained = builders.iter().map(InnerBuilder::memory_size).sum::<u64>();
+        assert!(retained < target_bytes && 4 * retained > target_bytes);
+        let (sender, receiver) = RunSender::new(config);
+        let producer = tokio::spawn(async move {
+            for builder in builders {
+                sender.send(builder).await?;
+            }
+            Result::Ok(())
+        });
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::from("index"),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let output = consume_worker(
+            receiver,
+            store,
+            PartitionWriteTarget::Final,
+            config,
+            0,
+            Stop::default(),
+        )
+        .await?;
+        producer.await??;
+        assert_eq!(
+            output.partitions.len() + usize::from(output.tail_partition.is_some()),
+            1,
+            "runs that fit one final partition must not be cut at target / 4"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_pipeline_closed_channel_does_not_hide_consumer_error() -> Result<()> {

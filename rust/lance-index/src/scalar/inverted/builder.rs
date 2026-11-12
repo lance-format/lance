@@ -5483,36 +5483,45 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::posting_open(INVERT_LIST_FILE, PipelineWriteFailure::Open)]
-    #[case::posting_batch(INVERT_LIST_FILE, PipelineWriteFailure::Batch)]
-    #[case::posting_finish(INVERT_LIST_FILE, PipelineWriteFailure::Finish)]
-    #[case::token_open(TOKENS_FILE, PipelineWriteFailure::Open)]
-    #[case::token_batch(TOKENS_FILE, PipelineWriteFailure::Batch)]
-    #[case::document_open(DOCS_FILE, PipelineWriteFailure::Open)]
-    #[case::document_finish(DOCS_FILE, PipelineWriteFailure::Finish)]
+    #[case::posting_open(INVERT_LIST_FILE, PipelineWriteFailure::Open, false)]
+    #[case::posting_batch(INVERT_LIST_FILE, PipelineWriteFailure::Batch, false)]
+    #[case::posting_finish(INVERT_LIST_FILE, PipelineWriteFailure::Finish, false)]
+    #[case::token_open(TOKENS_FILE, PipelineWriteFailure::Open, false)]
+    #[case::token_batch(TOKENS_FILE, PipelineWriteFailure::Batch, false)]
+    #[case::document_open(DOCS_FILE, PipelineWriteFailure::Open, false)]
+    #[case::document_finish(DOCS_FILE, PipelineWriteFailure::Finish, false)]
+    #[case::tail_posting_finish(INVERT_LIST_FILE, PipelineWriteFailure::Finish, true)]
+    #[case::tail_document_finish(DOCS_FILE, PipelineWriteFailure::Finish, true)]
     #[tokio::test]
     async fn test_pipeline_write_failure_drains_workers(
         #[case] suffix: &'static str,
         #[case] failure: PipelineWriteFailure,
+        #[case] tail_only: bool,
     ) -> Result<()> {
         let fault = Arc::new(PipelineWriteFault::new(suffix, failure));
         let store = CountingStore {
             fault: Some(fault.clone()),
             ..Default::default()
         };
-        let batch = make_doc_batch_from_docs(vec![Some("alpha beta alpha"); 128]);
-        // This source never finishes: a merger error must stop dispatch even
-        // when producers and both bounded queues have more work available.
-        let input = RecordBatchStreamAdapter::new(
-            batch.schema(),
-            stream::repeat_with(move || Ok(batch.clone())),
-        );
+        let batch = make_doc_batch_from_docs(vec![
+            Some("alpha beta alpha");
+            if tail_only { 4 } else { 128 }
+        ]);
+        let schema = batch.schema();
+        // Full outputs fail while input never finishes; tail failures occur
+        // only after every producer and merger has successfully joined.
+        let batches: BoxStream<'static, datafusion_common::Result<RecordBatch>> = if tail_only {
+            stream::iter([Ok(batch)]).boxed()
+        } else {
+            stream::repeat_with(move || Ok(batch.clone())).boxed()
+        };
+        let input = RecordBatchStreamAdapter::new(schema, batches);
         let params = consolidation_params().num_workers(2);
         let config = pipeline::Config::new(
-            128 << 10,
+            256 << 10,
             resolve_num_workers(&params),
             2,
-            None,
+            Some(16 << 10),
             Some(1 << 10),
             Some(1),
         )?;
@@ -5538,10 +5547,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::input_error(false)]
-    #[case::caller_cancellation(true)]
+    #[case::input_error(false, false)]
+    #[case::caller_cancellation(true, false)]
+    #[case::tail_cancellation(true, true)]
     #[tokio::test]
-    async fn test_pipeline_shutdown_retains_inflight_write(#[case] cancel: bool) -> Result<()> {
+    async fn test_pipeline_shutdown_retains_inflight_write(
+        #[case] cancel: bool,
+        #[case] tail_only: bool,
+    ) -> Result<()> {
         let fault = Arc::new(PipelineWriteFault::new(
             INVERT_LIST_FILE,
             PipelineWriteFailure::Pause,
@@ -5550,26 +5563,34 @@ mod tests {
             fault: Some(fault.clone()),
             ..Default::default()
         };
-        let batch = make_doc_batch_from_docs(vec![Some("alpha beta alpha"); 1025]);
+        let batch = make_doc_batch_from_docs(vec![
+            Some("alpha beta alpha");
+            if tail_only { 4 } else { 1025 }
+        ]);
+        let schema = batch.schema();
         let input_fault = fault.clone();
         let input_failed = Arc::new(Notify::new());
         let input_failed_signal = input_failed.clone();
-        let input = RecordBatchStreamAdapter::new(
-            batch.schema(),
-            stream::iter([Ok(batch)]).chain(stream::once(async move {
-                input_fault.started.notified().await;
-                if cancel {
-                    futures::future::pending().await
-                } else {
-                    input_failed_signal.notify_one();
-                    Err(datafusion_common::DataFusionError::Execution(
-                        "injected pipeline input failure".to_string(),
-                    ))
-                }
-            })),
-        );
+        let batches: BoxStream<'static, datafusion_common::Result<RecordBatch>> = if tail_only {
+            stream::iter([Ok(batch)]).boxed()
+        } else {
+            stream::iter([Ok(batch)])
+                .chain(stream::once(async move {
+                    input_fault.started.notified().await;
+                    if cancel {
+                        futures::future::pending().await
+                    } else {
+                        input_failed_signal.notify_one();
+                        Err(datafusion_common::DataFusionError::Execution(
+                            "injected pipeline input failure".to_string(),
+                        ))
+                    }
+                }))
+                .boxed()
+        };
+        let input = RecordBatchStreamAdapter::new(schema, batches);
         let params = consolidation_params().num_workers(1);
-        let config = pipeline::Config::new(32 << 10, 1, 1, None, Some(1 << 10), Some(1))?;
+        let config = pipeline::Config::new(128 << 10, 1, 1, None, Some(1 << 10), Some(1))?;
         let progress = Arc::new(RecordingProgress::default());
         let weak_progress = Arc::downgrade(&progress);
         let mut builder = InvertedIndexBuilder::new(params)
@@ -5647,7 +5668,7 @@ mod tests {
         let mut builder = InvertedIndexBuilder::new(consolidation_params().num_workers(1))
             .with_format_version(InvertedListFormatVersion::V3)
             .with_progress(progress.clone());
-        let config = pipeline::Config::new(32 << 10, 1, 1, None, Some(1 << 10), Some(1))?;
+        let config = pipeline::Config::new(128 << 10, 1, 1, None, Some(1 << 10), Some(1))?;
         let mut build = Box::pin(builder.update_index_with_pipeline(
             document_input(Box::pin(input), "doc")?,
             &store,
@@ -5731,56 +5752,61 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_pipeline_budget_reserves_producers_queue_and_merge() -> Result<()> {
-        let config = pipeline::Config::new(14 << 30, 12, 1, None, None, None)?;
+    #[rstest::rstest]
+    #[case::single(1)]
+    #[case::two(2)]
+    #[case::many(16)]
+    fn test_pipeline_target_survives_memory_admission(#[case] requested: usize) -> Result<()> {
+        let config = pipeline::Config::new(2 << 30, 8, requested, None, Some(16 << 20), None)?;
+        // The ordinary eight-worker build uses a 256 MiB trigger. Asking for
+        // more mergers must not reduce that output target to smaller pieces.
+        assert_eq!(config.output_target_bytes, 256 << 20);
+        assert_eq!(config.requested_merge_workers, requested);
+        assert_eq!(config.merge_workers, 1);
         assert_eq!(config.queue_runs, 1);
-        assert_eq!(config.run_memory_limit_bytes, 256 << 20);
-        assert_eq!(config.max_run_bytes, 512 << 20);
-        assert_eq!(config.merge_memory_limit_bytes, 7 << 30);
-        assert_eq!(
-            14 * config.max_run_bytes + config.merge_memory_limit_bytes,
-            14 << 30
+        assert!(
+            (8 + config.merge_workers) as u64 * config.max_run_bytes
+                + config.queue_memory_bytes
+                + config.merge_workers as u64 * config.merge_memory_limit_bytes
+                <= 2 << 30
         );
-        let error = pipeline::Config::new(14 << 30, 12, 1, Some(15 << 30), None, None).unwrap_err();
+        let error =
+            pipeline::Config::new(2 << 30, 8, requested, Some(1 << 30), None, None).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("exceeds total budget"));
+        assert!(error.to_string().contains("exceed total budget"));
         Ok(())
     }
 
     #[test]
     fn test_pipeline_parallel_budget_includes_both_outputs() -> Result<()> {
-        let config = pipeline::Config::new(14 << 30, 12, 2, Some(5 << 30), None, None)?;
+        let config = pipeline::Config::new(16 << 30, 16, 2, None, Some(64 << 20), None)?;
+        assert_eq!(config.output_target_bytes, 1 << 30);
+        assert_eq!(config.merge_workers, 2);
         assert_eq!(config.queue_runs, 2);
-        assert_eq!(config.run_memory_limit_bytes, 128 << 20);
-        assert_eq!(config.max_run_bytes, 256 << 20);
-        assert_eq!(config.queue_memory_bytes, 512 << 20);
-        assert_eq!(
-            12 * config.max_run_bytes
+        assert_eq!(config.merge_memory_limit_bytes, 6 << 30);
+        assert!(
+            18 * config.max_run_bytes
                 + config.queue_memory_bytes
-                + 2 * config.max_run_bytes
-                + 2 * config.merge_memory_limit_bytes,
-            14 << 30
+                + 2 * config.merge_memory_limit_bytes
+                <= 16 << 30
         );
-        let error = pipeline::Config::new(14 << 30, 12, 2, Some(8 << 30), None, None).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("exceeds total budget"));
         Ok(())
     }
 
     #[test]
     fn test_pipeline_queue_reservation_stays_in_total_budget() -> Result<()> {
-        let config = pipeline::Config::new(4 << 30, 4, 1, Some(3 << 30), Some(64 << 20), Some(3))?;
+        let config =
+            pipeline::Config::new(4 << 30, 4, 1, Some(256 << 20), Some(16 << 20), Some(3))?;
         assert_eq!(config.queue_runs, 3);
-        assert_eq!(config.max_run_bytes, 128 << 20);
-        assert_eq!(config.queue_memory_bytes, 384 << 20);
-        assert_eq!(
-            5 * config.max_run_bytes + config.queue_memory_bytes + config.merge_memory_limit_bytes,
-            4 << 30
+        assert_eq!(config.max_run_bytes, 64 << 20);
+        assert_eq!(config.queue_memory_bytes, 192 << 20);
+        assert!(
+            5 * config.max_run_bytes + config.queue_memory_bytes + config.merge_memory_limit_bytes
+                <= 4 << 30
         );
         let error = pipeline::Config::new(4 << 30, 4, 1, None, None, Some(0)).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("queue_runs=0"));
+        assert!(error.to_string().contains("queue counts must be positive"));
         Ok(())
     }
 
@@ -5789,7 +5815,10 @@ mod tests {
         let first = tail_with_docs(0, 4).builder;
         let maximum = 2 * first.memory_size().div_ceil(1024) * 1024;
         let config = pipeline::Config {
+            requested_merge_workers: 1,
             merge_workers: 1,
+            output_target_bytes: maximum,
+            total_memory_bytes: 16 * maximum,
             queue_runs: 3,
             queue_memory_bytes: 3 * maximum,
             run_memory_limit_bytes: maximum / 2,
@@ -5816,7 +5845,10 @@ mod tests {
         let first = tail_with_docs(0, 4).builder;
         let maximum = first.memory_size().div_ceil(1024) * 1024;
         let config = pipeline::Config {
+            requested_merge_workers: 1,
             merge_workers: 1,
+            output_target_bytes: maximum,
+            total_memory_bytes: 16 * maximum,
             queue_runs: 1,
             queue_memory_bytes: maximum,
             run_memory_limit_bytes: maximum / 2,
@@ -5918,10 +5950,11 @@ mod tests {
             2 << 20,
             resolve_num_workers(&params),
             mergers,
-            None,
+            Some((256 << 10) / mergers as u64),
             Some(8 << 10),
             queue_runs,
         )?;
+        assert_eq!(config.merge_workers, mergers);
         let input =
             RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
         let mut builder =
@@ -5939,7 +5972,11 @@ mod tests {
         if all_null || docs_per_fragment == 0 {
             assert_eq!(actual.partition_count(), 0);
         } else {
-            assert!((1..=mergers).contains(&actual.partition_count()));
+            assert_eq!(
+                actual.partition_count(),
+                1,
+                "all small merger tails fit together"
+            );
         }
         for phrase in [false, true] {
             let tokens = if phrase {
