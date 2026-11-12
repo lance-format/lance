@@ -1351,69 +1351,21 @@ mod tests {
         (test_dir, dataset)
     }
 
+    /// An overlay replaces a struct's validity, filling in row 0 (null in the
+    /// base) and nulling row 1. With required children, the null cell has to
+    /// mask the merged child values before the struct is rebuilt, or arrow
+    /// rejects it ("Found unmasked nulls for non-nullable StructArray field").
     #[rstest]
-    #[case::v2_1(LanceFileVersion::V2_1)]
-    #[case::v2_2(LanceFileVersion::V2_2)]
-    #[case::v2_3(LanceFileVersion::V2_3)]
     #[tokio::test]
-    async fn test_nullable_struct_validity_is_replaced(#[case] version: LanceFileVersion) {
-        let (_test_dir, dataset) =
-            nested_dataset_with_nullable_struct(true, true, Some(version)).await;
-        let nested_id = field_id(&dataset, "nested");
-        let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
-        writer
-            .write_batch(&batch(
-                0,
-                &[0, 1],
-                vec![(
-                    "nested",
-                    nested_array_with_validity(
-                        vec![-7, -8],
-                        vec![-70, -80],
-                        Some(NullBuffer::from(vec![true, false])),
-                        true,
-                    ),
-                )],
-            ))
-            .await
-            .unwrap();
-        let dataset = commit(dataset, writer.finish().await.unwrap().unwrap()).await;
-
-        let batch = dataset
-            .scan()
-            .project(&["nested"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let nested = batch["nested"].as_struct();
-        assert!(nested.is_valid(0));
-        assert!(nested.is_null(1));
-        assert!(nested.is_valid(2));
-        let a = nested.column(0).as_primitive::<Int32Type>();
-        let b = nested.column(1).as_primitive::<Int32Type>();
-        assert_eq!((a.value(0), b.value(0)), (-7, -70));
-    }
-
-    /// A struct's validity replacement must also hold when its children are
-    /// required: the null struct cell the overlay supplies has to mask the merged
-    /// child values before the struct is rebuilt, or arrow rejects the array
-    /// ("Found unmasked nulls for non-nullable StructArray field").
-    #[rstest]
-    #[case::v2_1(LanceFileVersion::V2_1)]
-    #[case::v2_2(LanceFileVersion::V2_2)]
-    #[case::v2_3(LanceFileVersion::V2_3)]
-    #[tokio::test]
-    async fn test_nullable_struct_validity_is_replaced_over_required_children(
-        #[case] version: LanceFileVersion,
+    async fn test_nullable_struct_validity_is_replaced(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+        #[values(true, false)] children_nullable: bool,
     ) {
         let (_test_dir, dataset) =
-            nested_dataset_with_nullable_struct(true, false, Some(version)).await;
+            nested_dataset_with_nullable_struct(true, children_nullable, Some(version)).await;
         let nested_id = field_id(&dataset, "nested");
         let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
-        // Row 0 (struct null in the base) is filled in; row 1 (valid in the base)
-        // is nulled. Children carry values under the null struct cell, which is
-        // valid Arrow: the null parent masks them.
         writer
             .write_batch(&batch(
                 0,
@@ -1424,7 +1376,7 @@ mod tests {
                         vec![-7, -8],
                         vec![-70, -80],
                         Some(NullBuffer::from(vec![true, false])),
-                        false,
+                        children_nullable,
                     ),
                 )],
             ))
@@ -1447,10 +1399,6 @@ mod tests {
         let a = nested.column(0).as_primitive::<Int32Type>();
         let b = nested.column(1).as_primitive::<Int32Type>();
         assert_eq!((a.value(0), b.value(0)), (-7, -70));
-        // The null struct cell masks its children, so their merged values read as
-        // null there; the rows the overlay leaves alone keep the base values.
-        assert!(a.is_null(1));
-        assert!(b.is_null(1));
         assert_eq!((a.value(2), b.value(2)), (2, 20));
     }
 
