@@ -61,6 +61,7 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::encodings::physical::bitpacking::{
     bitpack_out_of_line_vec, out_of_line_payload_byte_lengths, unpack_out_of_line,
 };
+use crate::encodings::physical::try_vec_with_capacity;
 use crate::encodings::physical::value::ValueEncoder;
 use crate::format::EncodingUtils;
 use crate::format::metadata;
@@ -1435,7 +1436,12 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
             )?;
         }
 
-        let mut out = vec![0u8; n * (self.bits_per_value as usize / 8)];
+        // A zero-width payload does not bound `n`, so the output size may come only from the file.
+        let output_bytes = num_values
+            .checked_mul(self.bits_per_value / 8)
+            .ok_or_else(|| Error::invalid_input("ALP output byte length overflows u64"))?;
+        let mut out: Vec<u8> = try_vec_with_capacity(output_bytes, "ALP output")?;
+        out.resize(output_bytes as usize, 0);
         #[cfg(feature = "bitpacking")]
         match self.bits_per_value {
             32 => self.decode_chunk32(&header, packed, n, &mut out)?,
@@ -1522,7 +1528,7 @@ impl AlpMiniBlockDecompressor {
                 block,
                 offset_count,
                 header.bit_width as usize,
-            ))
+            )?)
         };
         let offsets_buf = offsets_block
             .as_ref()
@@ -1574,7 +1580,7 @@ impl AlpMiniBlockDecompressor {
                 block,
                 offset_count,
                 header.bit_width as usize,
-            ))
+            )?)
         };
         let offsets_buf = offsets_block
             .as_ref()
@@ -1630,7 +1636,7 @@ impl AlpMiniBlockDecompressor {
                 num_values: count as u64,
                 block_info: BlockInfo::new(),
             };
-            Ok(unpack_out_of_line::<u64>(block, count, width)
+            Ok(unpack_out_of_line::<u64>(block, count, width)?
                 .data
                 .borrow_to_typed_slice::<u64>()
                 .as_ref()
@@ -1802,6 +1808,37 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("ALP offsets"), "{error}");
             assert!(error.to_string().contains("expected"), "{error}");
+        }
+    }
+
+    /// Zero-width offsets need no payload, so a chunk count too large to allocate must be an
+    /// error rather than a panic or an abort.
+    #[rstest]
+    fn test_zero_width_offsets_reject_unallocatable_count(#[values(32, 64)] bits: u64) {
+        let word_bytes = bits / 8;
+        let mut header = vec![MODE_DIV, 1, 0, 0];
+        header.extend_from_slice(&10i64.to_le_bytes()[..word_bytes as usize]);
+        let buffers = vec![
+            LanceBuffer::empty(),
+            LanceBuffer::from(header),
+            LanceBuffer::empty(),
+            LanceBuffer::empty(),
+        ];
+        let decompressor = AlpMiniBlockDecompressor {
+            bits_per_value: bits,
+        };
+        // Overflows u64 bytes, exceeds isize::MAX bytes, and fits isize but not any address
+        // space (1 EiB).
+        for num_values in [
+            u64::MAX - 2048,
+            isize::MAX as u64 / word_bytes + 1,
+            (1_u64 << 60) / word_bytes,
+        ] {
+            let error = decompressor
+                .decompress(buffers.clone(), num_values)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains("ALP output"), "{error}");
         }
     }
 
