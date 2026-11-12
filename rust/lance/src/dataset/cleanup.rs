@@ -14,6 +14,8 @@
 //!   fragment in a valid manifest file then it will be deleted.
 //! * Unreferenced delete files - If a delete file is not referenced by
 //!   any fragment in a valid manifest file then it will be deleted.
+//! * Unreferenced transaction files - If a transaction file is not referenced
+//!   by any valid manifest file then it will be deleted.
 //! * Unreferenced index files - If an index file is not referenced by
 //!   any valid manifest file then it will be deleted.
 //! * Orphaned staging manifests - If a staging manifest is not recorded by
@@ -2849,7 +2851,9 @@ pub struct CleanupPolicy {
     pub before_version: Option<u64>,
     /// If not none, cleanup only the specified versions.
     pub versions: Option<HashSet<u64>>,
-    /// If true, delete unverified data files even if they are recent
+    /// If true, delete files that no manifest references, such as the data,
+    /// transaction and deletion files of a failed commit, even if they are recent.
+    /// Only safe when no other operation is in progress on the dataset.
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
     pub error_if_tagged_old_versions: bool,
