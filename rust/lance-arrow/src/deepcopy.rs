@@ -3,8 +3,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, make_array};
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type};
+use arrow_array::{Array, GenericByteArray, RecordBatch, make_array};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, Buffer, MutableBuffer, NullBuffer,
+    OffsetBuffer, ScalarBuffer,
+};
 use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
 use arrow_schema::DataType;
 
@@ -103,20 +108,67 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
         DataType::Boolean => 0,
         _ => data.offset(),
     };
-    mutable.extend(0, start, start + data.len());
+    // The copy holds no more data than the valid source array, so offsets cannot overflow.
+    mutable
+        .try_extend(0, start, start + data.len())
+        .expect("copying a slice of a valid array cannot overflow its offsets");
 
     // Freeze into immutable ArrayData
     mutable.freeze()
 }
 
-/// Deep copy an array, extracting only the sliced portion using MutableArrayData
+/// Deep copy an array, extracting only the sliced portion.
 pub fn deep_copy_array_sliced(array: &dyn Array) -> Arc<dyn Array> {
+    match array.data_type() {
+        DataType::Utf8 => return deep_copy_bytes(array.as_bytes::<Utf8Type>()),
+        DataType::LargeUtf8 => return deep_copy_bytes(array.as_bytes::<LargeUtf8Type>()),
+        DataType::Binary => return deep_copy_bytes(array.as_bytes::<BinaryType>()),
+        DataType::LargeBinary => return deep_copy_bytes(array.as_bytes::<LargeBinaryType>()),
+        _ => {}
+    }
     let data = array.to_data();
     let data = deep_copy_array_data_sliced(&data);
     make_array(data)
 }
 
-/// Deep copy a RecordBatch, extracting only the sliced portion using MutableArrayData
+fn deep_copy_bytes<T: ByteArrayType>(array: &GenericByteArray<T>) -> Arc<dyn Array> {
+    let offsets = array.value_offsets();
+    let first = offsets[0];
+    let last = offsets[array.len()];
+    let copied_offsets = if first.as_usize() == 0 {
+        Buffer::from_slice_ref(offsets)
+    } else {
+        let mut buffer = MutableBuffer::new(std::mem::size_of_val(offsets));
+        buffer.extend(offsets.iter().map(|offset| *offset - first));
+        buffer.into()
+    };
+    let values = Buffer::from(&array.value_data()[first.as_usize()..last.as_usize()]);
+    let nulls = array
+        .nulls()
+        .filter(|nulls| nulls.null_count() > 0)
+        .map(|nulls| {
+            let mut buffer = BooleanBufferBuilder::new_from_buffer(
+                MutableBuffer::from_len_zeroed(nulls.len().div_ceil(8)),
+                0,
+            );
+            buffer.append_buffer(nulls.inner());
+            // SAFETY: append_buffer preserves the validity bits, length, and null count.
+            unsafe { NullBuffer::new_unchecked(buffer.finish(), nulls.null_count()) }
+        });
+    let copied_offsets = ScalarBuffer::new(copied_offsets, 0, offsets.len());
+    // SAFETY: Subtracting the first offset preserves nonnegative, monotonic offsets.
+    // The copied byte range retains the source's value boundaries and UTF-8 validity.
+    // Offsets and validity retain their original lengths.
+    unsafe {
+        Arc::new(GenericByteArray::<T>::new_unchecked(
+            OffsetBuffer::new_unchecked(copied_offsets),
+            values,
+            nulls,
+        ))
+    }
+}
+
+/// Deep copy a RecordBatch, extracting only the sliced portion.
 pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch> {
     let arrays = batch
         .columns()
@@ -270,6 +322,26 @@ mod tests {
         for i in 0..10 {
             assert_eq!(copied_array.value(i), 100 + i as i32);
         }
+    }
+
+    #[test]
+    fn test_deep_copy_string_slice_without_values() {
+        let array = StringArray::from(vec![Some("unused"), None, Some(""), Some("value")]);
+        let prefix = array.slice(0, 2);
+        assert_eq!(super::deep_copy_array_sliced(&prefix).as_ref(), &prefix);
+        let slice = array.slice(1, 2);
+        let copied = super::deep_copy_array_sliced(&slice);
+        assert_eq!(copied.as_ref(), &slice);
+        let copied = copied.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(copied.value_data().is_empty());
+        assert_eq!(copied.value_offsets(), &[0, 0, 0]);
+
+        let empty = array.slice(3, 0);
+        let copied = super::deep_copy_array_sliced(&empty);
+        assert_eq!(copied.as_ref(), &empty);
+        let copied = copied.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(copied.value_data().is_empty());
+        assert_eq!(copied.value_offsets(), &[0]);
     }
 
     #[test]

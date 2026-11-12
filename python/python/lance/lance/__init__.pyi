@@ -33,19 +33,16 @@ import pyarrow as pa
 from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
-from ..commit import CommitLock
-from ..dataset import (
+from .._dataset.index import Index
+from .._dataset.refs import Branch, Tag, Version, VersionRef
+from .._dataset.transaction import (
     AlterColumn,
-    Branch,
     ExecuteResult,
-    Index,
     LanceOperation,
-    Tag,
     Transaction,
     UpdateResult,
-    Version,
-    VersionRef,
 )
+from ..commit import CommitLock
 from ..fragment import (
     DataFile,
     FragmentMetadata,
@@ -84,6 +81,21 @@ from .optimize import (
     CompactionTask as CompactionTask,
 )
 from .optimize import (
+    IndexSegmentResult as IndexSegmentResult,
+)
+from .optimize import (
+    OptimizeIndexMerge as OptimizeIndexMerge,
+)
+from .optimize import (
+    OptimizeIndexTask as OptimizeIndexTask,
+)
+from .optimize import (
+    OptimizeIndices as OptimizeIndices,
+)
+from .optimize import (
+    OptimizeIndicesPlan as OptimizeIndicesPlan,
+)
+from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
@@ -116,6 +128,21 @@ class FtsToken:
     position: int
     def __repr__(self) -> str: ...
 
+class InsertedRowsFilter:
+    @property
+    def field_ids(self) -> List[int]: ...
+    @property
+    def kind(self) -> Literal["exact", "bloom"]: ...
+    @property
+    def payload(self) -> bytes: ...
+    @property
+    def number_of_items(self) -> Optional[int]: ...
+    @property
+    def probability(self) -> Optional[float]: ...
+    def might_contain(
+        self, values: Union[pa.Array, pa.RecordBatch, pa.Table]
+    ) -> List[bool]: ...
+
 def tokenize(
     query: str,
     *,
@@ -138,7 +165,9 @@ def tokenize(
 ) -> List[FtsToken]:
     """Tokenize an FTS query without an index.
 
-    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    ``max_token_length`` is an exclusive limit in UTF-8 bytes, not characters.
+    Tokens of this length or longer are removed. It defaults to 40; pass
+    ``None`` to disable the limit.
     """
     ...
 
@@ -150,6 +179,17 @@ class CleanupStats:
     index_files_removed: int
     deletion_files_removed: int
     failed_deletes: int
+
+class ExpireVersionsStats:
+    versions_removed: int
+    versions_retained: int
+    bytes_removed: int
+    failed_deletes: int
+
+class ExpireVersionsPlan:
+    versions: List[int]
+    stats: ExpireVersionsStats
+    tagged_but_kept: List[int]
 
 class CleanupCandidateFile:
     path: str
@@ -170,6 +210,9 @@ class CleanupExplanation:
     candidate_file_limit: int
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
+
+class FragmentAddColumnsCleanup:
+    def cleanup(self) -> None: ...
 
 class LanceFileWriteSummary:
     num_rows: int
@@ -219,6 +262,23 @@ class PackedBlobWriter:
     def finish(self) -> List[BlobDescriptor]: ...
     def finish_array(self, field_name: str) -> pa.StructArray: ...
 
+class ManagedBlobWriter:
+    @property
+    def path(self) -> str: ...
+    def write_blob(self, data: bytes) -> None: ...
+    def write_blobs(
+        self,
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
+    ) -> None: ...
+    def finish(self) -> List[BlobDescriptor]: ...
+    def finish_column(self, field_name: str) -> tuple[pa.Field, pa.StructArray]: ...
+
 class DedicatedBlobWriter:
     @property
     def blob_id(self) -> int: ...
@@ -264,6 +324,9 @@ class LanceFileSession:
         keep_original_array: Optional[bool] = None,
         max_page_bytes: Optional[int] = None,
     ) -> LanceFileWriter: ...
+    def open_managed_blob_writer(
+        self, *, base_id: Optional[int] = None
+    ) -> ManagedBlobWriter: ...
     def open_packed_blob_writer(self, path: str, blob_id: int) -> PackedBlobWriter: ...
     def open_dedicated_blob_writer(
         self, path: str, blob_id: int
@@ -349,6 +412,35 @@ class _Session:
         ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
+    def cache_diagnostics(
+        self, refresh: bool = False, by_type: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """Inspect lifetime activity and backend accounting for both caches.
+
+        The top-level keys are ``index`` and ``metadata``. Each value contains
+        ``activity``, ``backend``, and ``utilization``. Unsupported backend
+        measurements, unknown capacities, and utilization for zero capacity are
+        represented by ``None``. Setting ``refresh`` requests backend maintenance
+        before sampling. Setting ``by_type`` scans resident entries and adds a
+        ``by_type`` dictionary with bounded activity and approximate occupancy.
+        Either option may be more expensive.
+        """
+        ...
+
+def read_blob_files(
+    blob_files: List[Optional[LanceBlobFile]],
+    *,
+    io_parallelism: Optional[int] = None,
+    io_buffer_size: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]: ...
+def read_blob_file_ranges(
+    requests: List[Tuple[Optional[LanceBlobFile], int, int]],
+    *,
+    io_parallelism: Optional[int] = None,
+    io_buffer_size: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]: ...
 
 class LanceBlobFile:
     def close(self): ...
@@ -421,6 +513,7 @@ class _Dataset:
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[Any], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -488,18 +581,6 @@ class _Dataset:
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, int, Optional[bytes]]]: ...
-    def read_blob_files(
-        self,
-        blob_files: List[Optional[LanceBlobFile]],
-        io_buffer_size: Optional[int] = None,
-        preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, Optional[bytes]]]: ...
-    def read_blob_file_ranges(
-        self,
-        requests: List[Tuple[Optional[LanceBlobFile], int, int]],
-        io_buffer_size: Optional[int] = None,
-        preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, Optional[bytes]]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
@@ -518,6 +599,7 @@ class _Dataset:
         data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
+    def column_layout_stats(self) -> List[Dict[str, Any]]: ...
     def versions(self) -> List[Version]: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
@@ -543,6 +625,8 @@ class _Dataset:
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one_micros: Optional[Tuple[int, int]] = None,
+        policy_json: Optional[str] = None,
     ) -> CleanupStats: ...
     def explain_cleanup_old_versions(
         self,
@@ -554,9 +638,12 @@ class _Dataset:
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one_micros: Optional[Tuple[int, int]] = None,
+        policy_json: Optional[str] = None,
     ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
+    def get_tag(self, tag: str) -> Tag: ...
     def tags(self) -> Dict[str, Tag]: ...
     def tags_ordered(self, order: Optional[str]) -> List[Tuple[str, Tag]]: ...
     def create_tag(
@@ -735,8 +822,19 @@ class _MergeInsertBuilder:
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
     def execute_batches(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
+    def execute_dataset(self, source: _Dataset) -> ExecuteResult: ...
+    def analyze_plan_dataset(self, source: _Dataset) -> str: ...
+    def execute_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> ExecuteResult: ...
+    def analyze_plan_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> str: ...
     def execute_uncommitted(
         self, new_data: pa.RecordBatchReader
+    ) -> tuple[Transaction, ExecuteResult]: ...
+    def execute_uncommitted_dataset(
+        self, source: _Dataset
     ) -> tuple[Transaction, ExecuteResult]: ...
     def execute_uncommitted_batches(
         self, new_data: pa.RecordBatchReader
@@ -786,24 +884,44 @@ class _Fragment:
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
         substrait_filter: Optional[bytes] = None,
+        scan_stats_callback: Optional[Callable[[Any], None]] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
         reader: ReaderLike,
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
+    def add_columns_from_reader_with_cleanup(
+        self,
+        reader: ReaderLike,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
     def add_columns(
         self,
         transforms: Dict[str, str] | BatchUDF | ReaderLike,
         read_columns: Optional[List[str]],
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
+    def add_columns_with_cleanup(
+        self,
+        transforms: Dict[str, str] | BatchUDF | ReaderLike,
+        read_columns: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
+    def update_columns_from_stream(
+        self,
+        reader: pa.RecordBatchReader,
+        batch_size: Optional[int] = None,
+        with_offsets: bool = False,
+    ) -> Tuple[FragmentMetadata, List[int], Optional[bytes]]: ...
+    def write_overlay(self, columns: List[str]) -> _OverlayWriter: ...
     def delete(self, predicate: str) -> Optional[_Fragment]: ...
     def delete_rows(self, offsets: List[int]) -> Optional[_Fragment]: ...
     def schema(self) -> pa.Schema: ...
@@ -814,6 +932,11 @@ class _Fragment:
     @property
     def num_deletions(self) -> int: ...
     def validate(self) -> None: ...
+
+class _OverlayWriter:
+    def write_batch(self, batch: pa.RecordBatch) -> None: ...
+    def finish(self) -> Optional[LanceOperation.DataOverlayGroup]: ...
+    def abort(self) -> None: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...
@@ -893,7 +1016,7 @@ class _ShardWriter:
     def stats(self) -> Dict[str, Any]: ...
     def memtable_stats(self) -> Dict[str, Any]: ...
     def lsm_scanner(
-        self, shard_snapshots: Optional[List[_ShardSnapshot]] = None
+        self, shard_snapshots: List[_ShardSnapshot] = ...
     ) -> _LsmScanner: ...
 
 class _LsmScanner:
@@ -903,11 +1026,12 @@ class _LsmScanner:
     ) -> _LsmScanner: ...
     def project(self, columns: List[str]) -> Self: ...
     def filter(self, expr: str) -> Self: ...
-    def limit(self, n: int, offset: Optional[int] = None) -> Self: ...
+    def limit(self, n: Optional[int] = None, offset: Optional[int] = None) -> Self: ...
     def with_row_address(self) -> Self: ...
     def with_memtable_gen(self) -> Self: ...
     def to_batch(self) -> pa.RecordBatch: ...
     def to_batches(self) -> List[pa.RecordBatch]: ...
+    def to_reader(self) -> pa.RecordBatchReader: ...
     def count_rows(self) -> int: ...
 
 class _ExecutionPlan:
@@ -936,6 +1060,7 @@ class _LsmVectorSearchPlanner:
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
         distance_type: Optional[str] = None,
+        filter: Optional[str] = None,
     ) -> None: ...
     def plan_search(
         self,
@@ -943,6 +1068,8 @@ class _LsmVectorSearchPlanner:
         k: int = 10,
         nprobes: int = 20,
         columns: Optional[List[str]] = None,
+        refine_base_table: bool = False,
+        overfetch_factor: float = 1.0,
     ) -> _ExecutionPlan: ...
 
 class _Hnsw:

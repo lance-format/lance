@@ -12,6 +12,42 @@ use crate::RawJsonb;
 use crate::core::ArrayIterator;
 use crate::error::*;
 
+/// An owning iterator over the elements of a JSONB array.
+///
+/// Created by [`RawJsonb::array_elements`]. Iterates the elements in order in
+/// a single pass over the array's JEntries, and ends after the first decode
+/// error.
+pub struct ArrayElementIterator<'a> {
+    // `None` after a decode error: the inner iterator does not advance past a
+    // bad JEntry, so it would return the same error forever.
+    inner: Option<ArrayIterator<'a>>,
+}
+
+impl<'a> ArrayElementIterator<'a> {
+    fn new(inner: ArrayIterator<'a>) -> Self {
+        Self { inner: Some(inner) }
+    }
+}
+
+impl Iterator for ArrayElementIterator<'_> {
+    type Item = Result<OwnedJsonb>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.as_mut()?.next()?.and_then(OwnedJsonb::from_item) {
+            Ok(element) => Some(Ok(element)),
+            Err(e) => {
+                self.inner = None;
+                Some(Err(e))
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.inner.as_ref().map_or(0, |inner| inner.size_hint().0);
+        (0, Some(remaining))
+    }
+}
+
 impl RawJsonb<'_> {
     /// Gets the element at the specified index in a JSONB array.
     ///
@@ -65,6 +101,79 @@ impl RawJsonb<'_> {
             return Ok(Some(value));
         }
         Ok(None)
+    }
+
+    /// Gets the number of elements in a JSONB array.
+    ///
+    /// Reads the length from the array container header in O(1), unlike
+    /// iterating to count elements. If the JSONB value is not an array,
+    /// this function returns `Ok(None)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - The JSONB value.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(usize))` - The number of elements, if the input is an array.
+    /// * `Ok(None)` - If the input is not an array.
+    /// * `Err(Error)` - If an error occurred during decoding (e.g., invalid JSONB data).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use lance_jsonb::OwnedJsonb;
+    ///
+    /// let arr_jsonb = r#"[1, "hello", {"a": 1}]"#.parse::<OwnedJsonb>().unwrap();
+    /// assert_eq!(arr_jsonb.as_raw().array_len().unwrap(), Some(3));
+    ///
+    /// let empty_jsonb = "[]".parse::<OwnedJsonb>().unwrap();
+    /// assert_eq!(empty_jsonb.as_raw().array_len().unwrap(), Some(0));
+    ///
+    /// let obj_jsonb = r#"{"a": 1}"#.parse::<OwnedJsonb>().unwrap();
+    /// assert_eq!(obj_jsonb.as_raw().array_len().unwrap(), None); // Not an array
+    /// ```
+    pub fn array_len(&self) -> Result<Option<usize>> {
+        Ok(ArrayIterator::new(*self)?.map(|iter| iter.len()))
+    }
+
+    /// Iterates over the elements of a JSONB array.
+    ///
+    /// Each element is returned as an `OwnedJsonb`. Iteration walks the
+    /// array's JEntries once, so scanning all elements is O(n) — unlike
+    /// repeated [`RawJsonb::get_by_index`] calls, which walk the prefix of
+    /// the array on every call.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - The JSONB value.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(ArrayElementIterator))` - An iterator over the elements, if the input is an array.
+    /// * `Ok(None)` - If the input is not an array.
+    /// * `Err(Error)` - If an error occurred during decoding (e.g., invalid JSONB data).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use lance_jsonb::OwnedJsonb;
+    ///
+    /// let arr_jsonb = r#"[1, "hello", true]"#.parse::<OwnedJsonb>().unwrap();
+    /// let elements: Vec<String> = arr_jsonb
+    ///     .as_raw()
+    ///     .array_elements()
+    ///     .unwrap()
+    ///     .unwrap()
+    ///     .map(|elem| elem.unwrap().to_string())
+    ///     .collect();
+    /// assert_eq!(elements, vec!["1", r#""hello""#, "true"]);
+    ///
+    /// let obj_jsonb = r#"{"a": 1}"#.parse::<OwnedJsonb>().unwrap();
+    /// assert!(obj_jsonb.as_raw().array_elements().unwrap().is_none());
+    /// ```
+    pub fn array_elements(&self) -> Result<Option<ArrayElementIterator<'_>>> {
+        Ok(ArrayIterator::new(*self)?.map(ArrayElementIterator::new))
     }
 
     /// Gets the value associated with a given key in a JSONB object.

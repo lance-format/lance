@@ -13,8 +13,8 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use ivf::storage::IvfModel;
 use lance_core::deepsize::DeepSizeOf;
@@ -28,13 +28,16 @@ use v3::subindex::SubIndexType;
 
 pub mod bq;
 pub mod distributed;
+pub(crate) mod exact_buffers;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
 pub mod pairwise;
+pub mod pca;
 pub mod pq;
+pub mod pretransform;
 pub mod quantizer;
 pub mod residual;
 pub mod shared;
@@ -89,8 +92,9 @@ pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 /// Controls the speed / accuracy tradeoff for approximate vector search.
 ///
 /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
-/// prefiltered search on HNSW sub-indexes, where `Fast` enables the ACORN
-/// traversal. Other index types ignore this setting.
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where `Fast` enables the ACORN traversal. Other index types
+/// ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
     /// Prefer lower query latency, which can reduce recall.
@@ -173,12 +177,17 @@ pub struct Query {
     /// ALL partitions will be searched, if needed, to satisfy k results.
     pub maximum_nprobes: Option<usize>,
 
-    /// Continuous initial IVF search budget in [0, 1], default 0.5.
+    /// Initial IVF search effort in [0, 1], default 0.5.
     ///
     /// At 0.5, preserve Auto probing. At 0, start at the caller minimum (at
     /// least one available partition); at 1, start at all available partitions,
-    /// subject to the caller maximum. Intermediate values interpolate
-    /// geometrically around Auto. Later candidate-count expansion is unchanged.
+    /// subject to the caller maximum. For L2, cosine and dot with k <= 100000,
+    /// 0.1 and 0.25 select profiles targeting 80% and 90% mean partition-routing
+    /// recall; 0.5 retains Auto's nominal 95% target. These are empirical targets,
+    /// not per-query guarantees or end-to-end Recall@k guarantees. Intermediate
+    /// budgets interpolate geometrically between these anchors. Hamming and
+    /// larger k interpolate around their existing Auto budget without calibrated
+    /// targets. Later candidate-count expansion is unchanged.
     /// Caller options are resolved by [`ProbeParams`] before execution: an explicit
     /// effort ignores fixed `nprobes`, while explicit minimum/maximum bounds remain.
     /// This does not control quantization accuracy, HNSW ef, or refinement.
@@ -186,6 +195,8 @@ pub struct Query {
 
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
+    /// Unset defaults to `1.5 * k * refine_factor`, floored at
+    /// [`crate::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub ef: Option<usize>,
 
     /// If presented, apply a refine step.
@@ -216,8 +227,10 @@ pub struct Query {
 
     /// Controls the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-    /// Other index types ignore this setting.
+    /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+    /// HNSW sub-index searches that exclude rows (for example through a
+    /// prefilter or deletions), where `Fast` enables the ACORN traversal. Other
+    /// index types ignore this setting.
     pub approx_mode: ApproxMode,
 }
 
@@ -232,6 +245,25 @@ impl Query {
         }
         Ok(())
     }
+}
+
+/// Stable partition-local identity for one candidate emitted by an IVF search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub struct PartitionSearchCandidate {
+    /// IVF partition containing the candidate.
+    pub partition_id: u32,
+    /// Zero-based offset inside the partition's vector storage.
+    pub offset_in_partition: u32,
+}
+
+/// Result of a partition search that also exposes identities suitable for
+/// selected-candidate re-scoring.
+#[derive(Debug, Clone)]
+pub struct PartitionSearchResult {
+    /// Ordinary `(distance, row id)` result batch.
+    pub batch: RecordBatch,
+    /// Candidate identities in the same order as rows in `batch`.
+    pub candidates: Vec<PartitionSearchCandidate>,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -314,6 +346,37 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
+    /// Search one partition and preserve the local offsets of emitted rows.
+    ///
+    /// Implementations may reject this operation. Quantized refinement uses it
+    /// only for flat IVF_RQ sub-indices.
+    async fn search_in_partition_with_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+        _candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        Err(Error::not_supported("search_in_partition_with_candidates"))
+    }
+
+    /// Score partition-local candidate offsets with the index's most accurate
+    /// native storage representation.
+    ///
+    /// The returned rows preserve the order of `offsets_in_partition`. This
+    /// operation does not apply a pre-filter or distance bounds; callers must
+    /// validate candidate identity and apply query result shaping around it.
+    async fn score_partition_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _offsets_in_partition: &[u32],
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported("score_partition_candidates"))
+    }
+
     /// Asynchronously prepare a single-partition search so the CPU-heavy portion
     /// can be executed separately.
     async fn prepare_partition_search(
@@ -348,6 +411,25 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// not benefit from the sequential fast path.
     fn auto_query_parallelism(&self, _cpu_pool_size: usize) -> usize {
         1
+    }
+
+    /// Prepare a query and index pair for the partition-search stage.
+    ///
+    /// Decorators can transform the query once and return their wrapped index,
+    /// allowing both sequential and partition-parallel execution to reuse the
+    /// prepared query. The default returns `None` to keep the original pair.
+    ///
+    /// Decorators such as [`crate::vector::pretransform::PreTransformIndex`]
+    /// must override every method that receives a query. A new method that keeps
+    /// this default will skip the pre-transform and search the original vectors.
+    fn prepare_partition_query(
+        self: Arc<Self>,
+        _query: &Query,
+    ) -> Result<Option<(Arc<dyn VectorIndex>, Query)>>
+    where
+        Self: 'static,
+    {
+        Ok(None)
     }
 
     /// Search a range of partitions and return a stream of per-partition result batches.
@@ -506,6 +588,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
+    }
+
+    /// A partition's stored rows, read without caching the partition.
+    async fn partition_storage_batches(&self, _partition_id: usize) -> Result<Vec<RecordBatch>> {
+        Err(Error::not_supported(
+            "partition_storage_batches is only supported by IVF indices",
+        ))
     }
 
     /// Whether bounded native code-to-code scoring is available (current format).

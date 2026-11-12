@@ -3,7 +3,10 @@
 
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::frag_reuse_v0_cache::{
+    V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
+};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
@@ -24,7 +27,7 @@ use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -40,7 +43,11 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
-    V0(Arc<dyn RowIdRemapper>),
+    V0 {
+        remapper: Arc<dyn RowIdRemapper>,
+        /// See [`v0_segment_cache_id`].
+        cache_id: Option<Uuid>,
+    },
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
@@ -55,7 +62,10 @@ pub(crate) enum ResolvedRemapping {
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V0 { cache_id, .. } => f
+                .debug_struct("V0")
+                .field("cache_id", cache_id)
+                .finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
             Self::V1Translate { remapper, .. } => {
                 f.debug_tuple("V1Translate").field(remapper).finish()
@@ -64,18 +74,48 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
+/// Cache key for fragment reuse history with `index_version = 0` and the
+/// mappings decoded from it.
+///
+/// A writer can change the history without changing its UUID. Include the
+/// history contents and storage location in the key so we don't reuse an old
+/// mapping. Referenced files are immutable once published.
+pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
+    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lance.frag_reuse.v0_cache_identity");
+    hasher.update(entry.uuid.as_bytes());
+    if let Some(base_id) = entry.base_id {
+        hasher.update(&base_id.to_le_bytes());
+        if let Some(base) = dataset.manifest.base_paths.get(&base_id) {
+            hasher.update(&[u8::from(base.is_dataset_root)]);
+            update_sized(&mut hasher, base.path.as_bytes());
+        }
+    }
+    if let Some(details) = &entry.index_details {
+        update_sized(&mut hasher, details.type_url.as_bytes());
+        update_sized(&mut hasher, &details.value);
+    }
+    let mut identity = [0; 16];
+    identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(identity)
+}
+
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the FRI entry's UUID
-/// identify cached content. Under a tagged history the FRI UUID is
-/// deliberately left out: every rewrite and trim mints a new one, even for
-/// transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history, by
+/// [`v0_segment_cache_id`], identify cached content. Under a tagged history the
+/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
+/// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
     match resolved {
-        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        Some((_, ResolvedRemapping::V0 { cache_id, .. })) => cache_id.as_ref(),
         _ => None,
     }
 }
@@ -175,6 +215,10 @@ pub(crate) enum MissingCoverageReason {
     /// The stored metadata cannot be interpreted (no or undecodable index
     /// details). Maintenance fails.
     Corrupt,
+    /// The segment's format marker could not be read, so whether this build
+    /// can translate it is unknown. Not a verdict on the segment: maintenance
+    /// skips it and a later call reclassifies it once the read succeeds.
+    Unverifiable,
 }
 
 impl std::fmt::Display for MissingCoverageReason {
@@ -186,6 +230,7 @@ impl std::fmt::Display for MissingCoverageReason {
             }
             Self::Unsupported => "this build cannot translate it",
             Self::Corrupt => "its metadata cannot be interpreted",
+            Self::Unverifiable => "its format marker could not be read",
         })
     }
 }
@@ -253,104 +298,216 @@ impl CacheKey for FriQueryPlanKey<'_> {
 
 /// Build or fetch the snapshot's FRI query plan.
 ///
-/// Cached in the tagged (manifest-path scoped) namespace; concurrent opens
-/// coalesce on one build. Everything only needed to BUILD the plan (notably
-/// `load_indices` and its tagged coverage post-processing) runs inside the
-/// loader, so warm opens never recompute coverage.
+/// Cached in the tagged (manifest-path scoped) namespace, so warm opens never
+/// recompute coverage. A plan built from an unverifiable listing, or holding an
+/// `Unverifiable` segment, is returned uncached, so concurrent cold builds of
+/// such a snapshot each run the derivation -- the cost of re-probing instead of
+/// freezing a transient fault for the snapshot. A healthy snapshot's cold
+/// builds run the derivation concurrently too; the raw ledger, mapping and
+/// format-marker readers they go through stay cached.
 async fn fri_query_plan(
     dataset: &Dataset,
     fri: &IndexMetadata,
     stored: &[IndexMetadata],
     mapping: &Arc<super::frag_reuse_reader::FragmentReuseIndex>,
 ) -> lance_core::Result<Arc<FriQueryPlan>> {
-    dataset
+    let cache = dataset
         .index_cache
-        .with_key_prefix(dataset.manifest_location.path.as_ref())
-        .get_or_insert_with_key(
-            FriQueryPlanKey {
-                fri_uuid: &fri.uuid,
-            },
-            || async {
-                // The filtered listing carries the rewritten query coverage;
-                // `stored` keeps provenance from before that rewrite. Callers
-                // hold metadata returned by load_indices and cannot supply
-                // this distinction.
-                let indices = dataset.load_indices().await?;
-                let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    stored.iter().map(|entry| (entry.uuid, entry)).collect();
-                // Group the filtered listing by logical index name; the
-                // backtrack derives each member's sibling exclusions from the
-                // stored provenance of the whole group in one pass, so
-                // "direct coverage wins" is owned by one algorithm.
-                let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    HashMap::with_capacity(indices.len());
-                let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
-                for entry in indices.iter() {
-                    filtered_by_uuid.insert(entry.uuid, entry);
-                    if entry.name != FRAG_REUSE_INDEX_NAME {
-                        groups
-                            .entry(entry.name.as_str())
-                            .or_default()
-                            .push(entry.uuid);
+        .with_key_prefix(dataset.manifest_location.path.as_ref());
+    let key = FriQueryPlanKey {
+        fri_uuid: &fri.uuid,
+    };
+    if let Some(cached) = cache.get_with_key(&key).await {
+        return Ok(cached);
+    }
+    // The listing's own `unverifiable` set, not a guess from the plan's
+    // contents: a segment the reader dropped for an unreadable marker is
+    // simply absent here, and `missing_coverage_reason` below may then probe
+    // it successfully and return a DEFINITIVE reason. Caching a plan built
+    // from those two inconsistent views would freeze "no coverage" for the
+    // whole snapshot.
+    let mut unverifiable = BTreeSet::new();
+    let plan = {
+        let build = async {
+            // The filtered listing carries the rewritten query coverage;
+            // `stored` keeps provenance from before that rewrite. Callers
+            // hold metadata returned by load_indices and cannot supply
+            // this distinction.
+            let listing = dataset.derived_index_listing().await?;
+            unverifiable = listing.unverifiable;
+            let indices = listing.indices;
+            let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                stored.iter().map(|entry| (entry.uuid, entry)).collect();
+            // Group the filtered listing by logical index name; the
+            // backtrack derives each member's sibling exclusions from the
+            // stored provenance of the whole group in one pass, so
+            // "direct coverage wins" is owned by one algorithm.
+            let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                HashMap::with_capacity(indices.len());
+            let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
+            for entry in indices.iter() {
+                filtered_by_uuid.insert(entry.uuid, entry);
+                if entry.name != FRAG_REUSE_INDEX_NAME {
+                    groups
+                        .entry(entry.name.as_str())
+                        .or_default()
+                        .push(entry.uuid);
+                }
+            }
+            let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
+            for members in groups.into_values() {
+                let provenance: Vec<RoaringBitmap> = members
+                    .iter()
+                    .map(|uuid| {
+                        stored_by_uuid
+                            .get(uuid)
+                            .and_then(|source| source.fragment_bitmap.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
+                    parts_by_uuid.insert(*uuid, parts);
+                }
+            }
+            let mut segments = HashMap::with_capacity(stored.len());
+            for source in stored.iter() {
+                let plan = if source
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+                {
+                    // An empty bitmap needs no translation, but its pages
+                    // may still hold the withdrawn rows: never identity.
+                    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
+                } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
+                    SegmentRemappingPlan::Identity
+                } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
+                    && let Some(bitmap) = &entry.fragment_bitmap
+                {
+                    let coverage = bitmap & dataset.fragment_bitmap.as_ref();
+                    // Other selected segments own their direct coverage.
+                    // Drop paths entering those fragments before later
+                    // mappings can merge them with this segment's
+                    // contribution.
+                    let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
+                    let fingerprint =
+                        mapping.translation_fingerprint(&coverage, &parts.excluded, &parts.path);
+                    SegmentRemappingPlan::Translate {
+                        coverage,
+                        excluded_fragments: parts.excluded,
+                        fingerprint,
                     }
-                }
-                let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
-                for members in groups.into_values() {
-                    let provenance: Vec<RoaringBitmap> = members
-                        .iter()
-                        .map(|uuid| {
-                            stored_by_uuid
-                                .get(uuid)
-                                .and_then(|source| source.fragment_bitmap.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
-                        parts_by_uuid.insert(*uuid, parts);
-                    }
-                }
-                let mut segments = HashMap::with_capacity(stored.len());
-                for source in stored.iter() {
-                    let plan = if source
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|bitmap| bitmap.is_empty())
-                    {
-                        // An empty bitmap needs no translation, but its pages
-                        // may still hold the withdrawn rows: never identity.
-                        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
-                    } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
-                        SegmentRemappingPlan::Identity
-                    } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
-                        && let Some(bitmap) = &entry.fragment_bitmap
-                    {
-                        let coverage = bitmap & dataset.fragment_bitmap.as_ref();
-                        // Other selected segments own their direct coverage.
-                        // Drop paths entering those fragments before later
-                        // mappings can merge them with this segment's
-                        // contribution.
-                        let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
-                        let fingerprint = mapping.translation_fingerprint(
-                            &coverage,
-                            &parts.excluded,
-                            &parts.path,
-                        );
-                        SegmentRemappingPlan::Translate {
-                            coverage,
-                            excluded_fragments: parts.excluded,
-                            fingerprint,
-                        }
-                    } else {
-                        SegmentRemappingPlan::MissingCoverage(
-                            missing_coverage_reason(dataset, mapping, source).await?,
-                        )
-                    };
-                    segments.insert(source.uuid, plan);
-                }
-                Ok(FriQueryPlan { segments })
-            },
-        )
-        .await
+                } else if unverifiable.contains(&source.name) {
+                    // This segment's own logical group lost a segment to an
+                    // unreadable marker, so its absence here says nothing
+                    // about its coverage. Re-probing could answer a definitive
+                    // reason built on a group listing that is already known to
+                    // be incomplete; report the uncertainty instead (the plan
+                    // is uncached below). Another group's uncertainty leaves
+                    // this segment's reason to the probe.
+                    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
+                } else {
+                    SegmentRemappingPlan::MissingCoverage(
+                        missing_coverage_reason(dataset, mapping, source).await?,
+                    )
+                };
+                segments.insert(source.uuid, plan);
+            }
+            Ok::<_, Error>(FriQueryPlan { segments })
+        };
+        Arc::new(build.await?)
+    };
+    // A reason of `Unverifiable`, or a listing that lost a segment to an
+    // unreadable marker, holds for this call alone: caching the plan would
+    // keep the segment unverifiable for the whole snapshot. Return it
+    // uncached so the next call re-probes.
+    if unverifiable.is_empty()
+        && !plan.segments.values().any(|plan| {
+            matches!(
+                plan,
+                SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
+            )
+        })
+    {
+        cache.insert_with_key(&key, plan.clone()).await;
+    }
+    Ok(plan)
+}
+
+/// Resolve the current fragment coverage for committed query segments.
+///
+/// Tagged histories derive coverage from [`FriQueryPlan`]; all other histories use the segment
+/// metadata resolved for the query listing. Query callers must not substitute provenance for
+/// derived coverage, and an unknown or unavailable plan is refused instead of treated as empty
+/// coverage.
+pub(crate) async fn resolve_query_segment_coverages(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> lance_core::Result<Vec<RoaringBitmap>> {
+    let direct = |segment: &IndexMetadata| {
+        segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Index '{}' segment {} is missing fragment coverage",
+                    segment.name, segment.uuid
+                ))
+            })
+    };
+
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return segments.iter().map(|segment| direct(segment)).collect();
+    };
+    if fri.index_version == 0 {
+        return segments.iter().map(|segment| direct(segment)).collect();
+    }
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
+
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+    let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+        stored.iter().map(|entry| (entry.uuid, entry)).collect();
+    segments
+        .iter()
+        .map(|segment| match plan.segments.get(&segment.uuid) {
+            Some(SegmentRemappingPlan::Identity) => {
+                let stored = stored_by_uuid.get(&segment.uuid).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Index segment {} is not registered in the manifest",
+                        segment.uuid
+                    ))
+                })?;
+                direct(stored)
+            }
+            Some(SegmentRemappingPlan::Translate { coverage, .. }) => Ok(coverage.clone()),
+            Some(SegmentRemappingPlan::MissingCoverage(reason)) => {
+                Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} ({reason})",
+                    segment.uuid
+                )))
+            }
+            None if stored_by_uuid.contains_key(&segment.uuid) => {
+                Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} (the reader derives no \
+                     coverage for it)",
+                    segment.uuid
+                )))
+            }
+            None => Err(Error::invalid_input(format!(
+                "Index segment {} is not registered in the manifest",
+                segment.uuid
+            ))),
+        })
+        .collect()
 }
 
 /// Why the reader derives no coverage for the registered segment `index` on
@@ -361,7 +518,7 @@ pub(crate) async fn segment_coverage_reason(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> lance_core::Result<Option<MissingCoverageReason>> {
-    let stored = super::load_all_indices(dataset).await?;
+    let stored = super::loading::load_all_indices(dataset).await?;
     let Some(fri) = stored
         .iter()
         .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
@@ -398,11 +555,25 @@ async fn missing_coverage_reason(
     if source.index_details.is_none() {
         return Ok(MissingCoverageReason::Corrupt);
     }
+    // A probe that cannot reach the format marker says nothing about the
+    // segment's format, and the snapshot plan this reason goes into is built
+    // for every segment: failing here would fail every query on the table.
+    // Report it as unverifiable for THIS plan, so a later snapshot
+    // reclassifies once the store answers again.
     Ok(
-        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await? {
-            Some(true) => MissingCoverageReason::NoDerivedCoverage,
-            Some(false) => MissingCoverageReason::Unsupported,
-            None => MissingCoverageReason::Corrupt,
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await {
+            Ok(Some(true)) => MissingCoverageReason::NoDerivedCoverage,
+            Ok(Some(false)) => MissingCoverageReason::Unsupported,
+            Ok(None) => MissingCoverageReason::Corrupt,
+            Err(error) => {
+                log::warn!(
+                    "index {} (segment {}): could not read its format marker ({error}); \
+                     reporting its coverage as unverifiable for this snapshot",
+                    source.name,
+                    source.uuid,
+                );
+                MissingCoverageReason::Unverifiable
+            }
         },
     )
 }
@@ -427,7 +598,7 @@ pub(crate) async fn plan_staged_segments(
     dataset: &Dataset,
     segments: &[IndexMetadata],
 ) -> lance_core::Result<Option<StagedRemappingPlans>> {
-    let stored = super::load_all_indices(dataset).await?;
+    let stored = super::loading::load_all_indices(dataset).await?;
     let Some(fri) = stored
         .iter()
         .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
@@ -473,7 +644,9 @@ pub(crate) async fn plan_staged_segments(
     Ok(Some(plans))
 }
 
-/// Resolve the FRI remapper shared by scalar and vector index loading.
+/// Resolve the FRI remapper shared by scalar and vector index loading, with
+/// its cache identity: [`v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -495,7 +668,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
     // The cheap cached stored listing decides the generation; the filtered
     // listing (whose tagged post-processing recomputes coverage) is only
     // consulted inside the once-per-snapshot plan build.
-    let stored = super::load_all_indices(dataset).await?;
+    let stored = super::loading::load_all_indices(dataset).await?;
     let Some(fri) = stored
         .iter()
         .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
@@ -508,12 +681,24 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            (
-                legacy.uuid,
-                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
-            )
-        }));
+        let Some(legacy) = dataset.open_frag_reuse_index(metrics).await? else {
+            return Ok(None);
+        };
+        let history = v0_cache_identity(dataset, fri);
+        let digests = dataset
+            .index_cache
+            .get_or_insert_with_key(V0HistoryDigestsKey { history: &history }, || async {
+                Ok(V0HistoryDigests::new(&legacy.details))
+            })
+            .await?;
+        let cache_id = v0_segment_cache_id(history, &legacy.details, &digests, index);
+        return Ok(Some((
+            history,
+            ResolvedRemapping::V0 {
+                remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
+                cache_id,
+            },
+        )));
     }
     if fri.index_version != 1 {
         return Err(Error::not_supported(format!(
@@ -564,6 +749,13 @@ pub(super) async fn open_row_id_remapping_with_plan(
             Err(Error::not_supported(format!(
                 "segment {} cannot be translated by this build under the tagged fragment reuse \
                  history; leave it for a rebuild or a newer version of Lance",
+                index.uuid
+            )))
+        }
+        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable) => {
+            Err(Error::not_supported(format!(
+                "segment {}'s format marker could not be read, so whether this build can \
+                 translate it is unknown; retry once the store answers",
                 index.uuid
             )))
         }
@@ -810,6 +1002,8 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     // Spares the commit's history check from reading the file back.
     if let Some(Content::External(file)) = &proto.content {
@@ -1247,7 +1441,7 @@ pub async fn frag_reuse_entry_appending(
              stable-row-id datasets; this rewrite cannot carry transition intent here",
         ));
     }
-    let stored = super::load_all_indices(dataset).await?;
+    let stored = super::loading::load_all_indices(dataset).await?;
     let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
     let (mut content, mut fragment_bitmap) = match existing {
         None => (Vec::new(), RoaringBitmap::new()),
@@ -1312,6 +1506,8 @@ pub async fn frag_reuse_entry_appending(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -1541,7 +1737,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         ));
     }
 
-    let stored = super::load_all_indices(dataset).await?;
+    let stored = super::loading::load_all_indices(dataset).await?;
 
     // Bind the covered rewrite groups to the transitions, one to one and in
     // order. A group is covered when its old fragments appear among the
@@ -1904,6 +2100,135 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     Ok((entry, base_entry_version))
 }
 
+/// The committed segments whose coverage of `rewritten` a deferred rewrite
+/// must withdraw instead of leaving behind: those that cover one of the
+/// rewritten fragments, directly or through their retired provenance, and
+/// whose type cannot translate stored addresses through the history in
+/// batches.
+///
+/// The classification is the reader's own
+/// (`segment_supports_batch_remapping`), so a segment the reader would
+/// translate keeps its provenance:
+/// - `Some(true)`: deferrable, not listed;
+/// - `Some(false)`: listed, its coverage of the rewritten sources withdrawn;
+/// - `None`: not listed. Details that cannot be interpreted are refused
+///   elsewhere (the reader derives no coverage for such a segment and the
+///   write gates refuse the shapes that would rely on one), and guessing a
+///   withdrawal from unreadable metadata would delete coverage this build
+///   cannot prove is unsound.
+///
+/// Returned in the stored listing's order so the result does not depend on
+/// map iteration.
+pub(crate) async fn undeferrable_rewrite_segments(
+    dataset: &Dataset,
+    rewritten: &RoaringBitmap,
+) -> lance_core::Result<Vec<Uuid>> {
+    if rewritten.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stored = super::loading::load_all_indices(dataset).await?;
+    // A segment may cover `rewritten` only through a retired fragment an
+    // earlier rewrite already moved into it, so the selector needs the same
+    // history and liveness the withdrawal helper walks.
+    let lineage = match stored
+        .iter()
+        .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
+    {
+        Some(entry) => {
+            let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
+            Some(
+                lance_table::system_index::frag_reuse::lineage::TaggedLineage::new(
+                    entry,
+                    Some(Arc::new(ledger)),
+                ),
+            )
+        }
+        None => None,
+    };
+    let live: RoaringBitmap = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect();
+    undeferrable_segments_covering(dataset, stored.iter(), rewritten, lineage.as_ref(), &live).await
+}
+
+/// [`undeferrable_rewrite_segments`] over a supplied segment list: the
+/// segments of `segments` whose coverage of `fragments` cannot be translated
+/// through the history. Used for segments the manifest does not list yet, a
+/// `CreateIndex` rebased over a committed rewrite.
+///
+/// A segment is a candidate when it covers one of `fragments` directly, or
+/// when it covers a retired fragment (outside `live`) whose rows the history
+/// moved into one of `fragments`: that coverage addresses the rewritten
+/// fragment just as much, through one more hop. The reach of a retired
+/// source mirrors the withdrawal helper's conservative rule, so selection
+/// and withdrawal agree on the same fragments: an unwalkable history
+/// (`None` lineage, or `destinations_of` returning `None`) makes every
+/// retired source a candidate rather than silently keeping coverage the
+/// withdrawal would drop.
+///
+/// Only candidates pay the capability probe.
+pub(crate) async fn undeferrable_segments_covering<'a>(
+    dataset: &Dataset,
+    segments: impl Iterator<Item = &'a IndexMetadata>,
+    fragments: &RoaringBitmap,
+    lineage: Option<&lance_table::system_index::frag_reuse::lineage::TaggedLineage>,
+    live: &RoaringBitmap,
+) -> lance_core::Result<Vec<Uuid>> {
+    let mut undeferrable = Vec::new();
+    let mut reaches: HashMap<u32, bool> = HashMap::new();
+    for index in segments {
+        if lance_table::system_index::is_system_index(index) {
+            continue;
+        }
+        // Unknown coverage is not a candidate, as in every earlier revision
+        // of this selector: the established reader rules already refuse such
+        // a segment (no derived coverage, scan fallback), so there is nothing
+        // a withdrawal could protect, and the selector never guesses which
+        // fragments an absent bitmap would have named.
+        let Some(bitmap) = index.fragment_bitmap.as_ref() else {
+            continue;
+        };
+        let covers_directly = !bitmap.is_disjoint(fragments);
+        let covers_through_history = !covers_directly
+            && (bitmap - live).iter().any(|source| {
+                // Same-name segments routinely share retired sources, and the
+                // walk is transitive; memoize it for this call.
+                *reaches.entry(source).or_insert_with(|| {
+                    match lineage.and_then(|lineage| lineage.destinations_of(source)) {
+                        Some(destinations) => destinations
+                            .iter()
+                            .any(|destination| fragments.contains(*destination)),
+                        None => true,
+                    }
+                })
+            });
+        if !covers_directly && !covers_through_history {
+            continue;
+        }
+        // TODO: Support deferred remapping for all index types.
+        // Only a CONFIRMED undeferrable verdict withdraws coverage. A probe
+        // that cannot reach the segment's format marker is not a verdict: the
+        // commit proceeds without selecting the segment, so no withdrawal is
+        // persisted from a transient fault and nothing is cached. The reader
+        // refuses such a segment's coverage meanwhile, and a later commit
+        // withdraws once the probe answers.
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, index).await {
+            Ok(Some(false)) => undeferrable.push(index.uuid),
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "index {} (segment {}): could not read its format marker ({error}); \
+                 not withdrawing its coverage in this commit",
+                index.name,
+                index.uuid,
+            ),
+        }
+    }
+    Ok(undeferrable)
+}
+
 /// Package assembled tagged FRI content bytes into a fresh manifest entry,
 /// spilling to an external details file above the inline threshold. The
 /// content must already be validated (a decodable ledger); this only encodes.
@@ -1938,6 +2263,8 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         // The row-map files live in their own directories referenced from the
         // transitions, not under this entry's uuid.
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -2311,6 +2638,8 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
             // The relocated entry lives in the clone.
             base_id: None,
             files: entry.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         },
         spilled,
     ))
@@ -2333,6 +2662,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> lance_core::Result<Vec<(String, Path)>> {
+    use crate::dataset::FRAG_REUSE_DIR;
     use futures::TryStreamExt;
     use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_table::system_index::frag_reuse::ledger::Mapping;
@@ -2371,7 +2701,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
         };
         let map_dir = base_root
             .clone()
-            .join("_fri")
+            .join(FRAG_REUSE_DIR)
             .join(reference.map_id.as_str());
         let mut mapping_size = None;
         let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
@@ -2393,7 +2723,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
                         mapping_size = Some(meta.size);
                     }
                     paths.push((
-                        format!("_fri/{}/{relative}", reference.map_id),
+                        format!("{FRAG_REUSE_DIR}/{}/{relative}", reference.map_id),
                         base_root.clone(),
                     ));
                 }
@@ -2465,7 +2795,9 @@ mod tests {
     /// content plus `transitions`, as a caller assembling the entry by hand
     /// would produce it, so the commit path's own checks are what refuse it.
     async fn hand_built_entry(dataset: &Dataset, transitions: Vec<Transition>) -> IndexMetadata {
-        let stored = crate::index::load_all_indices(dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(dataset)
+            .await
+            .unwrap();
         let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
         let (mut content, mut bitmap) = match existing {
             None => (Vec::new(), RoaringBitmap::new()),
@@ -2502,6 +2834,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -2684,7 +3018,11 @@ mod tests {
         reserve_fragments(&mut dataset, 40).await;
         let untagged = dataset.clone();
         let dataset = tag_fragment_zero(dataset).await;
-        let entry = stored_fri(&crate::index::load_all_indices(&dataset).await.unwrap());
+        let entry = stored_fri(
+            &crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap(),
+        );
         assert_eq!(decode_entry(&dataset, &entry).await.transitions().len(), 1);
 
         // A second partition of F1, whose entry is built against the
@@ -2733,7 +3071,9 @@ mod tests {
             "{error}"
         );
         // Nothing landed: the history and the fragments are as they were.
-        let after = crate::index::load_all_indices(&dataset).await.unwrap();
+        let after = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         assert_eq!(stored_fri(&after).uuid, entry.uuid);
         assert_eq!(dataset.manifest.version, read_version);
     }
@@ -2746,7 +3086,11 @@ mod tests {
         let mut dataset = reader_tests::fixture().await;
         reserve_fragments(&mut dataset, 40).await;
         let dataset = tag_fragment_zero(dataset).await;
-        let entry = stored_fri(&crate::index::load_all_indices(&dataset).await.unwrap());
+        let entry = stored_fri(
+            &crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap(),
+        );
         let mut records = load_frag_reuse_records(&dataset, &entry).await.unwrap();
         let Some(transition::Mapping::StablePartition(mapping)) =
             records.transitions[0].mapping.as_mut()
@@ -2783,7 +3127,9 @@ mod tests {
                 .contains("changes the recorded transition"),
             "{error}"
         );
-        let after = crate::index::load_all_indices(&dataset).await.unwrap();
+        let after = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         assert_eq!(stored_fri(&after).uuid, entry.uuid);
     }
 
@@ -2825,7 +3171,9 @@ mod tests {
         assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
         let live_ids: Vec<u64> = dataset.fragments().iter().map(|frag| frag.id).collect();
         assert_eq!(live_ids, vec![10, 11]);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert!(is_tagged(&entry));
         assert_eq!(entry.index_version, 1);
@@ -2883,7 +3231,9 @@ mod tests {
             .unwrap();
         let live_ids: Vec<u64> = dataset.fragments().iter().map(|frag| frag.id).collect();
         assert_eq!(live_ids, vec![20, 21]);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         let second_content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
@@ -2969,7 +3319,9 @@ mod tests {
         assert_eq!(dataset.manifest.version, read_version + 1);
         let flag = FLAG_FRAGMENT_REUSE_INDEX;
         assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert!(is_tagged(&entry));
         assert_eq!(sorted_values(&dataset).await, before);
@@ -3041,7 +3393,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let v0_entry = stored_fri(&stored);
         let v0_content = load_raw_frag_reuse_content(&dataset, &v0_entry)
             .await
@@ -3268,7 +3622,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let sp_entry = stored_fri(&stored);
         let sp_content = load_raw_frag_reuse_content(&dataset, &sp_entry)
             .await
@@ -3288,7 +3644,9 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         assert!(is_tagged(&entry));
@@ -3363,6 +3721,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let error = dataset
             .apply_commit(
@@ -3443,7 +3803,7 @@ mod tests {
         unknown_raw.extend_from_slice(&reader_tests::field(9, b"future-mapping-payload"));
         let content = reader_tests::field(2, &unknown_raw);
         reader_tests::install(&mut dataset, content, destinations, false).await;
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -3549,7 +3909,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let source_entry = stored_fri(&stored);
         let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
             .await
@@ -3561,7 +3923,9 @@ mod tests {
             .shallow_clone(target_uri.as_str(), version, None)
             .await
             .unwrap();
-        let stored = crate::index::load_all_indices(&clone).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&clone)
+            .await
+            .unwrap();
         let cloned_entry = stored_fri(&stored);
         assert!(cloned_entry.base_id.is_some());
         // A v0 entry is carried exactly as before relocation existed: same
@@ -3597,7 +3961,9 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = crate::index::load_all_indices(&clone).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&clone)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         // The assembled entry carries the source's legacy content verbatim.
@@ -3668,12 +4034,11 @@ mod tests {
         assert_eq!(dataset.latest_version_id().await.unwrap(), version);
     }
 
-    /// Round 5 item 4: deferred compaction of fragments no index covers and
-    /// no lineage reaches commits a plain rewrite on a tagged table -- no
-    /// new transition, the entry untouched -- instead of growing the history
-    /// with records no reader ever has to translate.
+    /// Deferred compaction of fragments no index covers and no lineage reaches
+    /// still appends a transition on a tagged table (an index build in flight
+    /// may cover them), and trim releases it since no committed index needs it.
     #[tokio::test]
-    async fn uncovered_deferred_compaction_commits_plain_rewrite() {
+    async fn uncovered_deferred_compaction_appends_a_trimmable_transition() {
         let mut dataset = reader_tests::fixture().await;
         reserve_fragments(&mut dataset, 20).await;
         let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
@@ -3728,7 +4093,9 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry_before = stored_fri(&stored);
         let before = sorted_values(&dataset).await;
 
@@ -3746,18 +4113,34 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
 
-        // The entry is byte-for-byte the one from before the compaction.
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
-        assert_eq!(entry.uuid, entry_before.uuid);
+        assert_ne!(entry.uuid, entry_before.uuid);
         let ledger = decode_entry(&dataset, &entry).await;
-        assert_eq!(ledger.transitions().len(), 1);
+        assert_eq!(ledger.transitions().len(), 2);
         assert_eq!(sorted_values(&dataset).await, before);
         assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
         assert_eq!(
             filtered_values(&dataset, "i >= 100").await,
             (100..104).collect::<Vec<_>>()
         );
+
+        // Trim releases the uncovered transition and keeps the covered one.
+        let ledger_before = decode_entry(&dataset, &entry_before).await;
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
+        let trimmed = decode_entry(&dataset, &stored_fri(&stored)).await;
+        assert_eq!(
+            format!("{:?}", trimmed.transitions()),
+            format!("{:?}", ledger_before.transitions())
+        );
+        assert_eq!(sorted_values(&dataset).await, before);
     }
 
     /// Round 5 item 7: detached commits skip the rebase pipeline, so nothing
@@ -3799,6 +4182,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
             .with_detached(true)
@@ -3830,6 +4215,7 @@ mod tests {
             file_type: lance_table::format::DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         });
         let error = build_frag_reuse_rewrite_entry(
             &dataset,
@@ -3984,7 +4370,7 @@ mod tests {
         assert!(deletion.num_deleted_rows.is_some());
         deletion.num_deleted_rows = None;
         Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -4021,7 +4407,9 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 4);
         assert_eq!(metrics.fragments_added, 2);
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 3);
@@ -4056,7 +4444,9 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         let ledger = decode_entry(&dataset, &entry).await;
         assert!(ledger.consumer(2).is_some());
@@ -4224,7 +4614,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(dataset)
+                .await
+                .unwrap();
             load_raw_frag_reuse_content(dataset, &stored_fri(&stored))
                 .await
                 .unwrap()
@@ -4301,7 +4693,9 @@ mod tests {
             let before = sorted_values(&dataset).await;
             let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
             let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             let source_entry = stored_fri(&stored);
             assert_eq!(source_entry.index_version, 1);
             let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
@@ -4317,7 +4711,9 @@ mod tests {
 
             // The relocated entry lives in the clone under a fresh uuid; the
             // rest of its metadata is carried over.
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert!(is_tagged(&entry));
             assert_ne!(entry.uuid, source_entry.uuid);
@@ -4379,7 +4775,9 @@ mod tests {
                 .shallow_clone(clone_uri.as_str(), version, None)
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let relocated_content = load_raw_frag_reuse_content(&clone, &stored_fri(&stored))
                 .await
                 .unwrap();
@@ -4387,7 +4785,9 @@ mod tests {
             reserve_fragments(&mut clone, 40).await;
             let clone = commit_stable_partition(clone, &[10, 11], 20).await;
 
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert_eq!(entry.base_id, None);
             // Appended onto the relocated entry, its bytes verbatim.
@@ -4450,7 +4850,9 @@ mod tests {
             );
             assert!(clone2.manifest.base_paths[&1].path.ends_with("clone1"));
 
-            let stored = crate::index::load_all_indices(&clone2).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone2)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert_eq!(entry.base_id, None);
             let ledger = decode_entry(&clone2, &entry).await;
@@ -4532,7 +4934,9 @@ mod tests {
                 .shallow_clone(clone_uri.as_str(), version, None)
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let pre_trim_entry = stored_fri(&stored);
             let pre_trim_content = load_raw_frag_reuse_content(&clone, &pre_trim_entry)
                 .await
@@ -4541,7 +4945,9 @@ mod tests {
             crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut clone)
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert_ne!(entry.uuid, pre_trim_entry.uuid);
             let trimmed_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
@@ -4597,7 +5003,9 @@ mod tests {
             crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut clone)
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             assert!(!stored.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
 
             // Expire every old clone version and collect aggressively.
@@ -4648,7 +5056,7 @@ mod tests {
                 reader_tests::field(2, &raw)
             };
             reader_tests::install(&mut dataset, content, destinations, false).await;
-            let indices = crate::index::load_all_indices(&dataset)
+            let indices = crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .as_ref()
@@ -4733,7 +5141,9 @@ mod tests {
                 let child = parent.create_branch("child", version, None).await.unwrap();
                 // The branch's relocated entry reads the parent's row map in
                 // place, through the base stamped at branch creation.
-                let stored = crate::index::load_all_indices(&child).await.unwrap();
+                let stored = crate::index::loading::load_all_indices(&child)
+                    .await
+                    .unwrap();
                 let entry = stored_fri(&stored);
                 assert_eq!(entry.base_id, None);
                 let ledger = decode_entry(&child, &entry).await;
@@ -4758,7 +5168,9 @@ mod tests {
             crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut parent)
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(&parent).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&parent)
+                .await
+                .unwrap();
             assert!(!stored.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
 
             // Expire every old parent version.
@@ -4829,7 +5241,7 @@ mod tests {
             };
             let content = build_transition(&partition_bytes);
             reader_tests::install(&mut dataset, content, destinations, false).await;
-            let indices = crate::index::load_all_indices(&dataset)
+            let indices = crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .as_ref()
@@ -4848,7 +5260,9 @@ mod tests {
             let mut expected_partition = partition_bytes.clone();
             expected_partition.extend([0x18, 0x00]);
             let expected = build_transition(&expected_partition);
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             let clone_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
             assert_eq!(clone_content, expected);
@@ -5119,7 +5533,9 @@ mod tests {
             let before = sorted_values(&dataset).await;
             let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
             let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             let source_entry = stored_fri(&stored);
             assert_eq!(source_entry.index_version, 1);
             let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
@@ -5139,7 +5555,9 @@ mod tests {
             // stamp; the history's references were already unset (they
             // pointed at the source's own base), so its bytes carry over
             // unchanged.
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert!(is_tagged(&entry));
             assert_eq!(entry.index_version, 1);
@@ -5223,7 +5641,9 @@ mod tests {
             expected.sort();
             assert_eq!(list_fri_map_dirs(&deep).await, expected);
             assert!(deep.manifest.base_paths.is_empty());
-            let stored = crate::index::load_all_indices(&deep).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&deep)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert_eq!(entry.base_id, None);
             let ledger = decode_entry(&deep, &entry).await;
@@ -5268,7 +5688,7 @@ mod tests {
                 reader_tests::field(2, &raw)
             };
             reader_tests::install(&mut dataset, content, destinations, false).await;
-            let indices = crate::index::load_all_indices(&dataset)
+            let indices = crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .as_ref()
@@ -5319,7 +5739,9 @@ mod tests {
                 .deep_clone(clone_uri.as_str(), version, None)
                 .await
                 .unwrap();
-            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&clone)
+                .await
+                .unwrap();
             let entry = stored_fri(&stored);
             assert_eq!(entry, source_entry);
             assert_eq!(
@@ -5450,7 +5872,7 @@ mod tests {
                 committed_version: dataset.manifest.version,
             });
         Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -5548,7 +5970,7 @@ mod tests {
                 committed_version: dataset.manifest.version,
             });
         Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -5692,6 +6114,7 @@ mod tests {
             harness.read_version,
             &deletion_vector,
             &harness.dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -5784,7 +6207,9 @@ mod tests {
 
         // Digest semantics unchanged: scan-time counts, zero-deletion
         // destinations, same row map.
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 1);
@@ -5889,6 +6314,7 @@ mod tests {
             dataset.manifest.version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -5896,7 +6322,7 @@ mod tests {
         let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
         fragments[0].deletion_file = Some(file);
         Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -5939,6 +6365,7 @@ mod tests {
             dataset.manifest.version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -5946,7 +6373,7 @@ mod tests {
         let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
         fragments[0].deletion_file = Some(file);
         Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -5965,6 +6392,7 @@ mod tests {
             read_version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6076,6 +6504,7 @@ mod tests {
             read_version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6147,7 +6576,9 @@ mod tests {
         assert_eq!(filtered_values(&dataset, "i = 1").await, Vec::<i32>::new());
         assert_eq!(filtered_values(&dataset, "i = 6").await, Vec::<i32>::new());
         assert_eq!(filtered_values(&dataset, "i = 5").await, vec![5]);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 1);
@@ -6223,6 +6654,7 @@ mod tests {
                 base_version,
                 &deletion_vector,
                 &dataset.object_store,
+                0,
             )
             .await
             .unwrap()
@@ -6230,7 +6662,7 @@ mod tests {
             frag.deletion_file = Some(file);
         }
         Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -6361,7 +6793,9 @@ mod tests {
         assert_eq!(filtered_values(&dataset, "i = 1").await, Vec::<i32>::new());
         assert_eq!(filtered_values(&dataset, "i = 6").await, Vec::<i32>::new());
         assert_eq!(filtered_values(&dataset, "i = 7").await, vec![7]);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 2);
@@ -6392,6 +6826,7 @@ mod tests {
             harness.read_version,
             &forged,
             &harness.dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6441,7 +6876,7 @@ mod tests {
             .unwrap();
 
         // Simulated drained trim: the entry is gone, the sticky flag stays.
-        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+        let indices: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -6476,7 +6911,9 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         let ledger = decode_entry(&dataset, &entry).await;
@@ -6552,7 +6989,7 @@ mod tests {
         // Stamp the sticky flag next to the v0 entry: the concurrency
         // remnant under test, where an upgrade elsewhere tagged the table
         // while this legacy entry survived.
-        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+        let indices: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -6565,7 +7002,9 @@ mod tests {
         reader_tests::persist_fixture(&mut dataset, indices).await;
         let flag = FLAG_FRAGMENT_REUSE_INDEX;
         assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let v0_entry = stored_fri(&stored);
         assert_eq!(v0_entry.index_version, 0);
         let v0_content = load_raw_frag_reuse_content(&dataset, &v0_entry)
@@ -6585,7 +7024,9 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         assert!(is_tagged(&entry));
@@ -6712,7 +7153,7 @@ mod tests {
         // fixture writes no transaction file, so the stand-in for the
         // trim's transaction is supplied through the session cache for the
         // retry's transaction walk.
-        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+        let indices: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -6722,7 +7163,7 @@ mod tests {
         reader_tests::persist_fixture(&mut dataset, indices).await;
         assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
         assert!(
-            crate::index::load_all_indices(&dataset)
+            crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -6764,7 +7205,9 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         assert!(is_tagged(&entry));
@@ -6809,7 +7252,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 0);
         assert_eq!(

@@ -878,32 +878,42 @@ fn encode_offset<T: OffsetSizeTrait>(value: usize) -> io::Result<T> {
     })
 }
 
+/// The output buffer's allocation, written through a raw pointer so the decoder can fill
+/// spare capacity that was never initialized.
+#[derive(Clone, Copy)]
+struct OutBuf {
+    ptr: *mut u8,
+    capacity: usize,
+}
+
 #[inline(always)]
-fn write_symbol(out: &mut [u8], out_curr: usize, symbol: u64) {
+fn write_symbol(out: OutBuf, out_curr: usize, symbol: u64) {
     debug_assert!(
-        out_curr.checked_add(8).is_some_and(|end| end <= out.len()),
-        "FSST symbol write at {out_curr} overflows buffer of length {}",
-        out.len()
+        out_curr
+            .checked_add(8)
+            .is_some_and(|end| end <= out.capacity),
+        "FSST symbol write at {out_curr} overflows buffer of capacity {}",
+        out.capacity
     );
     // SAFETY: `FsstDecoder::init` rejected any declared `lens[i]` outside 1..=8 and left
     // undeclared slots at 0, so every code advances `out_curr` by at most 8. Combined with
-    // the 8x output-buffer check, `out_curr + 8 <= out.len()` holds for every write.
+    // the 8x output-capacity check, `out_curr + 8 <= out.capacity` holds for every write.
     unsafe {
-        ptr::write_unaligned(out.as_mut_ptr().add(out_curr) as *mut u64, symbol);
+        ptr::write_unaligned(out.ptr.add(out_curr) as *mut u64, symbol);
     }
 }
 
-fn store_out_byte(out: &mut [u8], out_curr: usize, byte: u8) {
+fn store_out_byte(out: OutBuf, out_curr: usize, byte: u8) {
     debug_assert!(
-        out_curr < out.len(),
-        "FSST literal write at {out_curr} overflows buffer of length {}",
-        out.len()
+        out_curr < out.capacity,
+        "FSST literal write at {out_curr} overflows buffer of capacity {}",
+        out.capacity
     );
     // SAFETY: same 8x + `lens[code] <= 8` proof as `write_symbol`. A literal
     // writes one byte at `out_curr` after a run that advanced by at most 8
     // bytes per consumed input byte.
     unsafe {
-        *out.get_unchecked_mut(out_curr) = byte;
+        out.ptr.add(out_curr).write(byte);
     }
 }
 
@@ -916,7 +926,7 @@ fn emit_escape(
     compressed_strs: &[u8],
     in_curr: &mut usize,
     in_end: usize,
-    out: &mut [u8],
+    out: OutBuf,
     out_curr: &mut usize,
 ) -> bool {
     let payload_index = *in_curr + 1;
@@ -950,15 +960,21 @@ fn decompress_bulk<T: OffsetSizeTrait>(
     let symbols = decoder.symbols;
     let lens = decoder.lens;
     // SAFETY invariant shared by every `unsafe` block in this closure:
-    // - `out` is sized to at least 8x `compressed_strs` (checked in `FsstDecoder::init`).
-    //   `init` also rejects any declared symbol length outside 1..=8, so each consumed
-    //   input byte yields at most 8 output bytes and `out_curr + 8 <= out.len()` at every
-    //   8-byte write, including the final one.
+    // - `out` has capacity for at least 8x `compressed_strs` (checked in
+    //   `FsstDecoder::init`). `init` also rejects any declared symbol length outside 1..=8,
+    //   so each consumed input byte yields at most 8 output bytes and
+    //   `out_curr + 8 <= out.capacity()` at every 8-byte write, including the final one.
     // - Offsets have been normalized with `to_usize` and checked to be non-decreasing
     //   and within `compressed_strs.len()`, so `in_curr + 4 <= in_end` implies the
     //   `read_unaligned::<u32>` is in bounds.
+    // The writes go through `out_buf` until `out`'s length is set below, so they may fill
+    // spare capacity the caller never initialized.
+    let out_buf = OutBuf {
+        ptr: out.as_mut_ptr(),
+        capacity: out.capacity(),
+    };
     let corrupt_escape = Cell::new(false);
-    let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
+    let decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
             let next_block;
@@ -977,28 +993,28 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                 // 0th byte
                 code = compressed_strs[in_curr] as usize;
                 len = lens[code] as usize;
-                write_symbol(out, *out_curr, symbols[code]);
+                write_symbol(out_buf, *out_curr, symbols[code]);
                 in_curr += 1;
                 *out_curr += len;
 
                 // 1st byte
                 code = compressed_strs[in_curr] as usize;
                 len = lens[code] as usize;
-                write_symbol(out, *out_curr, symbols[code]);
+                write_symbol(out_buf, *out_curr, symbols[code]);
                 in_curr += 1;
                 *out_curr += len;
 
                 // 2nd byte
                 code = compressed_strs[in_curr] as usize;
                 len = lens[code] as usize;
-                write_symbol(out, *out_curr, symbols[code]);
+                write_symbol(out_buf, *out_curr, symbols[code]);
                 in_curr += 1;
                 *out_curr += len;
 
                 // 3rd byte
                 code = compressed_strs[in_curr] as usize;
                 len = lens[code] as usize;
-                write_symbol(out, *out_curr, symbols[code]);
+                write_symbol(out_buf, *out_curr, symbols[code]);
                 in_curr += 1;
                 *out_curr += len;
             } else {
@@ -1007,27 +1023,27 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                     // 0th byte
                     code = compressed_strs[in_curr] as usize;
                     len = lens[code] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
+                    write_symbol(out_buf, *out_curr, symbols[code]);
                     in_curr += 1;
                     *out_curr += len;
 
                     // 1st byte
                     code = compressed_strs[in_curr] as usize;
                     len = lens[code] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
+                    write_symbol(out_buf, *out_curr, symbols[code]);
                     in_curr += 1;
                     *out_curr += len;
 
                     // 2nd byte
                     code = compressed_strs[in_curr] as usize;
                     len = lens[code] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
+                    write_symbol(out_buf, *out_curr, symbols[code]);
                     in_curr += 1;
                     *out_curr += len;
 
                     // ESC is the last byte of this 4-byte window; its payload is the next
                     // byte and may lie outside the current value.
-                    if !emit_escape(compressed_strs, &mut in_curr, in_end, out, out_curr) {
+                    if !emit_escape(compressed_strs, &mut in_curr, in_end, out_buf, out_curr) {
                         corrupt_escape.set(true);
                         return;
                     }
@@ -1035,35 +1051,35 @@ fn decompress_bulk<T: OffsetSizeTrait>(
                     // 0th byte
                     code = compressed_strs[in_curr] as usize;
                     len = lens[code] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
+                    write_symbol(out_buf, *out_curr, symbols[code]);
                     in_curr += 1;
                     *out_curr += len;
 
                     // 1st byte
                     code = compressed_strs[in_curr] as usize;
                     len = lens[code] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
+                    write_symbol(out_buf, *out_curr, symbols[code]);
                     in_curr += 1;
                     *out_curr += len;
 
                     // payload is inside the 4-byte window (`in_curr + 4 <= in_end`)
                     in_curr += 2;
-                    store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
+                    store_out_byte(out_buf, *out_curr, compressed_strs[in_curr - 1]);
                     *out_curr += 1;
                 } else if first_escape_pos == 1 {
                     // 0th byte
                     code = compressed_strs[in_curr] as usize;
                     len = lens[code] as usize;
-                    write_symbol(out, *out_curr, symbols[code]);
+                    write_symbol(out_buf, *out_curr, symbols[code]);
                     in_curr += 1;
                     *out_curr += len;
 
                     in_curr += 2;
-                    store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
+                    store_out_byte(out_buf, *out_curr, compressed_strs[in_curr - 1]);
                     *out_curr += 1;
                 } else {
                     in_curr += 2;
-                    store_out_byte(out, *out_curr, compressed_strs[in_curr - 1]);
+                    store_out_byte(out_buf, *out_curr, compressed_strs[in_curr - 1]);
                     *out_curr += 1;
                 }
             }
@@ -1071,13 +1087,13 @@ fn decompress_bulk<T: OffsetSizeTrait>(
 
         while in_curr < in_end {
             if compressed_strs[in_curr] == FSST_ESC {
-                if !emit_escape(compressed_strs, &mut in_curr, in_end, out, out_curr) {
+                if !emit_escape(compressed_strs, &mut in_curr, in_end, out_buf, out_curr) {
                     corrupt_escape.set(true);
                     return;
                 }
             } else {
                 let code = compressed_strs[in_curr] as usize;
-                write_symbol(out, *out_curr, symbols[code]);
+                write_symbol(out_buf, *out_curr, symbols[code]);
                 in_curr += 1;
                 *out_curr += lens[code] as usize;
             }
@@ -1103,7 +1119,16 @@ fn decompress_bulk<T: OffsetSizeTrait>(
         }
         out_offsets[i] = encode_offset(out_curr)?;
     }
-    out.resize(out_curr, 0);
+    // SAFETY: decoding started at `*out_pos` (0 from `decompress`) and every step wrote at
+    // least the bytes it advanced `out_curr` by, so `[0, out_curr)` is initialized, and
+    // `out_curr <= out.capacity()` by the 8x bound above.
+    debug_assert!(
+        *out_pos <= out.len(),
+        "bytes before out_pos must be initialized"
+    );
+    unsafe {
+        out.set_len(out_curr);
+    }
     out_offsets.resize(offsets.len(), encode_offset(0)?);
     *out_pos = out_curr;
     *out_offsets_len = offsets.len();
@@ -1271,7 +1296,7 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         symbol_table: &[u8],
         in_buf: &[u8],
         in_offsets_buf: &[T],
-        out_buf: &[u8],
+        out_capacity: usize,
         out_offsets_buf: &[T],
     ) -> io::Result<()> {
         if symbol_table.len() != FSST_SYMBOL_TABLE_SIZE {
@@ -1302,14 +1327,14 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         // decoded output can be up to 8x the input. `decompress_bulk` also relies on this bound: it
         // writes a full 8-byte word per code (advancing only by the symbol length), so the output
         // buffer must be large enough that even the final write stays in bounds. Require out_buf to
-        // be at least 8x in_buf. `checked_mul` guards against `in_buf.len() * 8` wrapping on 32-bit
-        // targets (an input >= 512 MiB would otherwise bypass the check); treat overflow as too
-        // small.
+        // have capacity for at least 8x in_buf. `checked_mul` guards against `in_buf.len() * 8`
+        // wrapping on 32-bit targets (an input >= 512 MiB would otherwise bypass the check); treat
+        // overflow as too small.
         if self.decoder_switch_on
             && in_buf
                 .len()
                 .checked_mul(8)
-                .is_none_or(|needed| needed > out_buf.len())
+                .is_none_or(|needed| needed > out_capacity)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1318,7 +1343,7 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         }
 
         // when decoder_switch_on is false, we make sure the out_buf is at least the same size of the in_buf,
-        if !self.decoder_switch_on && in_buf.len() > out_buf.len() {
+        if !self.decoder_switch_on && in_buf.len() > out_capacity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "output buffer too small for FSST decoder",
@@ -1366,8 +1391,8 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
     ) -> io::Result<()> {
         if !self.decoder_switch_on {
             validate_offsets(in_offsets_buf, in_buf.len())?;
-            out_buf.resize(in_buf.len(), 0);
-            out_buf.copy_from_slice(in_buf);
+            out_buf.clear();
+            out_buf.extend_from_slice(in_buf);
             out_offsets_buf.resize(in_offsets_buf.len(), T::from_usize(0).unwrap());
             out_offsets_buf.copy_from_slice(in_offsets_buf);
             return Ok(());
@@ -1417,10 +1442,11 @@ pub fn compress<T: OffsetSizeTrait>(
 // This is the public API for the FSST decompression, when the first 32 bits of in_buf is not the FSST_MAGIC, we know the input is not a
 // valid FSST compressed data and return an error
 // the following 32 bits after FSST_MAGIC contains information about FSST encoding, such as decoder_switch_on, suffix_lim, terminator, n_symbols
-// when the decoder_switch_on is off in the in_buf header, `decompress` first make sure the out_buf is at least the same size as the in_buf, then simply copy the
+// when the decoder_switch_on is off in the in_buf header, `decompress` first make sure the out_buf has capacity for at least the in_buf, then simply copy the
 // input data to the output
-// when the decoder_switch_on is on, `decompress` first make sure the out_buf is at least 8 times the size of the in_buf, then start decoding the
-// data using the symbol table. The 8x bound is required for correctness: a 1-byte code can expand to
+// when the decoder_switch_on is on, `decompress` first make sure the out_buf has capacity for at least 8 times the in_buf, then start decoding the
+// data using the symbol table. Only the capacity matters: the decoder fills it and sets out_buf's length to the decoded size,
+// so out_buf can be `Vec::with_capacity` with nothing initialized. The 8x bound is required for correctness: a 1-byte code can expand to
 // an 8-byte symbol, and the decode loop writes a full 8-byte word per code, so a smaller buffer can
 // be written out of bounds.
 // the out_offsets_buf should be at least the same size as the in_offsets_buf, otherwise an error is returned
@@ -1440,7 +1466,7 @@ pub fn decompress<T: OffsetSizeTrait>(
         symbol_table,
         in_buf,
         in_offsets_buf,
-        out_buf,
+        out_buf.capacity(),
         out_offsets_buf,
     )?;
     decoder.decompress(in_buf, in_offsets_buf, out_buf, out_offsets_buf)?;
@@ -1915,6 +1941,37 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
             &mut out_offsets,
         )
         .unwrap();
+    }
+
+    // Only the output's capacity has to cover the 8x bound, so callers need not zero it first
+    #[test_log::test(tokio::test)]
+    async fn test_decompress_into_uninitialized_capacity() {
+        let (symbol_table, compressed, compressed_offsets) = compress_paragraph();
+        let mut zeroed = vec![0u8; compressed.len() * 8];
+        let mut zeroed_offsets = vec![0i32; compressed_offsets.len()];
+        decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut zeroed,
+            &mut zeroed_offsets,
+        )
+        .unwrap();
+
+        // Garbage in the spare capacity must never show up in the output
+        let mut out = vec![0xAAu8; compressed.len() * 8];
+        out.clear();
+        let mut out_offsets = vec![0i32; compressed_offsets.len()];
+        decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut out,
+            &mut out_offsets,
+        )
+        .unwrap();
+        assert_eq!(out, zeroed);
+        assert_eq!(out_offsets, zeroed_offsets);
     }
 
     fn declared_lens_range(symbol_table: &[u8]) -> std::ops::Range<usize> {

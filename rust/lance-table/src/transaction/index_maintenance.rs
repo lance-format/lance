@@ -9,7 +9,8 @@
 //! drop the index. Getting this wrong does not fail the commit -- it silently
 //! returns stale rows from the index -- so each rule here is paired with a test.
 
-use crate::format::overlay::staleness::collect_overlay_stale_frags;
+use crate::format::clustering::ChangedReferences;
+use crate::format::overlay::staleness::{collect_overlay_stale_frags, field_affects_index};
 use crate::format::{Fragment, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::lineage::TaggedLineage;
@@ -22,7 +23,39 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// What invalidated the coverage a withdrawal is computed for, and which
+/// segments it applies to.
+#[derive(Clone, Copy)]
+enum Withdrawal<'a> {
+    /// Every retired fragment of every non-system segment, unknown coverage
+    /// included.
+    AllRetired,
+    /// An in-place rewrite of the listed fields per live fragment; applies to
+    /// the segments indexing one of those fields.
+    Columns(&'a [(u64, Vec<u32>)]),
+    /// A compaction whose source fragments the listed segments cannot
+    /// translate through the deferred history.
+    UndeferrableSegments {
+        segments: &'a [Uuid],
+        rewritten: &'a RoaringBitmap,
+    },
+}
+
+impl Withdrawal<'_> {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::AllRetired => "transaction cleanup left retired provenance unverified",
+            Self::Columns(_) => "an in-place rewrite of an indexed column",
+            Self::UndeferrableSegments { .. } => {
+                "its type cannot translate stored addresses through the deferred history \
+                 of this compaction"
+            }
+        }
+    }
+}
 
 impl Transaction {
     pub(super) fn register_pure_rewrite_rows_update_frags_in_indices(
@@ -37,19 +70,14 @@ impl Transaction {
             return Ok(());
         }
 
-        let value_updated_field_set = fields_for_preserving_frag_bitmap
-            .iter()
-            .collect::<HashSet<_>>();
-
         for index in indices.iter_mut() {
-            // Physical row addresses cannot follow moved rows into a new fragment.
-            // Leave that fragment uncovered so the scanner reads it directly.
-            if index.results_are_row_addrs() {
+            // Only known stable row IDs can follow moved rows into a new
+            // fragment. Unknown plugin domains must leave it for the scanner.
+            if !index.can_follow_stable_row_ids() {
                 continue;
             }
-            let index_covers_modified_field = index.fields.iter().any(|field_id| {
-                value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
-            });
+            let index_covers_modified_field =
+                Self::index_depends_on_any(index, fields_for_preserving_frag_bitmap, schema);
             if index_covers_modified_field {
                 continue;
             }
@@ -150,8 +178,10 @@ impl Transaction {
     /// physical column while an index on `s.x` records the child's id) and
     /// the coverage is withdrawn along the lineage
     /// ([`Self::withdraw_rewritten_coverage`]). Without a tagged history the
-    /// rewritten fragments are pruned from the covering indices by id, the
-    /// ordinary rule, exactly as before.
+    /// rewritten fragments are pruned from every index that depends on a
+    /// rewritten field: the field itself, a field nested under it, or a field
+    /// containing it ([`field_affects_index`]), so a rewrite reported against
+    /// a struct `s` withdraws coverage from an index on `s.x` here too.
     pub fn withdraw_in_place_rewrites(
         indices: &mut Vec<IndexMetadata>,
         rewrites: Vec<(u64, Vec<u32>)>,
@@ -169,14 +199,32 @@ impl Transaction {
             }
             None => {
                 for (fragment, fields) in rewrites {
-                    Self::prune_updated_fields_from_indices(
-                        indices,
-                        &[Fragment::new(fragment)],
-                        &fields,
-                    );
+                    let Ok(fragment) = u32::try_from(fragment) else {
+                        continue;
+                    };
+                    for index in indices.iter_mut() {
+                        if Self::index_depends_on_any(index, &fields, schema)
+                            && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+                        {
+                            fragment_bitmap.remove(fragment);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Whether `index` depends on any of `field_ids`: one of its fields, a
+    /// field nested under one of them, or a field containing one of them.
+    /// Index maintenance must decide dependency on whole subtrees, never by
+    /// exact id, or a change reported against a struct (or one of its
+    /// children) misses an index on a related nested field.
+    fn index_depends_on_any(index: &IndexMetadata, field_ids: &[u32], schema: &Schema) -> bool {
+        let dependency_fields = index.dependency_fields();
+        field_ids.iter().any(|field_id| {
+            i32::try_from(*field_id)
+                .is_ok_and(|field_id| field_affects_index(field_id, &dependency_fields, schema))
+        })
     }
 
     /// Expand every rewritten field id in `rewrites` to the field and all
@@ -231,8 +279,9 @@ impl Transaction {
     ///   segment derives no coverage of its destinations and those rows are
     ///   scanned until `optimize_indices` rebuilds them;
     /// - without a walkable history every retired fragment of `B` goes;
-    /// - a segment without a bitmap is untouched: its coverage is unknown,
-    ///   not empty, and the reader already excludes it.
+    /// - a segment without a bitmap is untouched here: commit preparation
+    ///   rejects rewrites of its indexed fields when it is a user index,
+    ///   because unknown coverage cannot be narrowed safely.
     ///
     /// What a withdrawal leaves is then settled per logical index name:
     /// - coverage partly left: the segment stays and serves what is left,
@@ -262,43 +311,154 @@ impl Transaction {
         live: &RoaringBitmap,
         rewrites: &[(u64, Vec<u32>)],
     ) {
+        Self::withdraw_coverage(indices, lineage, live, Withdrawal::Columns(rewrites));
+    }
+
+    /// Withdraw, from the listed segments only, their coverage of the
+    /// fragments a compaction rewrites, when the segment's type cannot
+    /// translate its stored addresses through the deferred (tagged) history.
+    ///
+    /// The selection is by segment, not by rewritten column: a compaction
+    /// rewrites no column, and which segments can defer is a per-segment
+    /// capability the commit layer establishes (it has to open the index
+    /// details). A deferring segment is not listed and keeps its retired
+    /// provenance, which the reader translates through the history.
+    ///
+    /// `rewritten` is the compaction's source fragments, still live in the
+    /// manifest the withdrawal is computed against; the subtraction rules,
+    /// the retired-ancestor closure and the segment retirement rules are
+    /// exactly [`Self::withdraw_rewritten_coverage`]'s. The index definition
+    /// always stays: an emptied last segment of its name is kept as the
+    /// record of what to rebuild.
+    pub fn withdraw_undeferrable_rewrite_coverage(
+        indices: &mut Vec<IndexMetadata>,
+        lineage: Option<&TaggedLineage>,
+        live: &RoaringBitmap,
+        segments: &[Uuid],
+        rewritten: &RoaringBitmap,
+    ) {
+        if segments.is_empty() || rewritten.is_empty() {
+            return;
+        }
+        Self::withdraw_coverage(
+            indices,
+            lineage,
+            live,
+            Withdrawal::UndeferrableSegments {
+                segments,
+                rewritten,
+            },
+        );
+    }
+
+    /// Withdraw retired index provenance whose values cannot be verified after
+    /// transaction cleanup. Live coverage survives when the reader can still
+    /// filter out withdrawn rows; see [`Self::withdraw_rewritten_coverage`].
+    /// Unknown coverage is withdrawn in full. Empty segments follow the same
+    /// retirement rules as rewritten coverage, retaining the last segment as
+    /// the definition to rebuild.
+    ///
+    /// ```
+    /// # use lance_table::{format::IndexMetadata, transaction::Transaction};
+    /// # use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
+    /// # use roaring::RoaringBitmap;
+    /// # fn withdraw(indices: &mut Vec<IndexMetadata>, lineage: &TaggedLineage, live: &RoaringBitmap) {
+    /// Transaction::withdraw_unverified_retired_coverage(indices, lineage, live);
+    /// # }
+    /// ```
+    pub fn withdraw_unverified_retired_coverage(
+        indices: &mut Vec<IndexMetadata>,
+        lineage: &TaggedLineage,
+        live: &RoaringBitmap,
+    ) {
+        Self::withdraw_coverage(indices, Some(lineage), live, Withdrawal::AllRetired);
+    }
+
+    /// The one withdrawal algorithm, driven by what invalidated the coverage
+    /// (see [`Withdrawal`]).
+    fn withdraw_coverage(
+        indices: &mut Vec<IndexMetadata>,
+        lineage: Option<&TaggedLineage>,
+        live: &RoaringBitmap,
+        withdrawal: Withdrawal<'_>,
+    ) {
+        let reason = withdrawal.reason();
         let mut emptied = Vec::new();
         for index in indices.iter_mut().filter(|index| !is_system_index(index)) {
-            let indexed: HashSet<u32> = index
-                .fields
-                .iter()
-                .filter_map(|field| u32::try_from(*field).ok())
-                .collect();
+            // Rewritten fragments this segment must give up, with the fields
+            // selection already applied; `None` leaves the segment alone.
+            let rewritten_for_segment: Option<Vec<u32>> = match withdrawal {
+                Withdrawal::AllRetired => None,
+                Withdrawal::Columns(rewrites) => {
+                    let indexed: HashSet<u32> = index
+                        .dependency_fields()
+                        .iter()
+                        .filter_map(|field| u32::try_from(*field).ok())
+                        .collect();
+                    let rewritten: Vec<u32> = rewrites
+                        .iter()
+                        .filter(|(_, fields)| fields.iter().any(|field| indexed.contains(field)))
+                        .filter_map(|(fragment, _)| u32::try_from(*fragment).ok())
+                        .collect();
+                    if rewritten.is_empty() {
+                        // The segment indexes none of the rewritten columns,
+                        // so no rewrite reached its rows.
+                        continue;
+                    }
+                    Some(rewritten)
+                }
+                Withdrawal::UndeferrableSegments {
+                    segments,
+                    rewritten,
+                } => {
+                    if !segments.contains(&index.uuid) {
+                        continue;
+                    }
+                    Some(rewritten.iter().collect())
+                }
+            };
             let Some(bitmap) = index.fragment_bitmap.as_mut() else {
+                if rewritten_for_segment.is_none() {
+                    index.fragment_bitmap = Some(RoaringBitmap::new());
+                    emptied.push(index.uuid);
+                    log::warn!(
+                        "index {} (segment {}): withdrew unknown coverage because {reason}; \
+                         its rows are scanned until the index is optimized",
+                        index.name,
+                        index.uuid,
+                    );
+                }
                 continue;
             };
             let retired = &*bitmap - live;
-            let mut withdrawn = RoaringBitmap::new();
-            for (fragment, fields) in rewrites {
-                if !fields.iter().any(|field| indexed.contains(field)) {
-                    continue;
-                }
-                let Ok(rewritten) = u32::try_from(*fragment) else {
-                    continue;
-                };
-                if bitmap.contains(rewritten) {
-                    withdrawn.insert(rewritten);
-                }
-                // Every retired source whose rows reach the rewritten
-                // fragment goes; the sources of one transition all reach the
-                // same destinations, so the transition is withdrawn whole.
+            let mut withdrawn = if let Some(rewritten_for_segment) = rewritten_for_segment {
+                let rewritten_for_segment: RoaringBitmap =
+                    rewritten_for_segment.into_iter().collect();
+                let mut withdrawn = &*bitmap & &rewritten_for_segment;
+                // Every retired source whose rows reach any rewritten fragment
+                // goes; the sources of one transition all reach the same
+                // destinations, so the transition is withdrawn whole. Each
+                // source is walked once and its destinations intersected with
+                // the rewritten set, rather than once per rewritten fragment.
                 for source in retired.iter() {
                     match lineage.and_then(|lineage| lineage.destinations_of(source)) {
-                        Some(destinations) if destinations.contains(&rewritten) => {
-                            withdrawn.insert(source);
+                        Some(destinations) => {
+                            if destinations
+                                .iter()
+                                .any(|destination| rewritten_for_segment.contains(*destination))
+                            {
+                                withdrawn.insert(source);
+                            }
                         }
-                        Some(_) => {}
                         None => {
                             withdrawn.insert(source);
                         }
                     }
                 }
-            }
+                withdrawn
+            } else {
+                retired.clone()
+            };
             if withdrawn.is_empty() {
                 continue;
             }
@@ -337,8 +497,8 @@ impl Transaction {
                 emptied.push(index.uuid);
             }
             log::warn!(
-                "index {} (segment {}): withdrew {} fragment(s) of coverage after an in-place \
-                 rewrite of an indexed column; the rows they covered are scanned until the index \
+                "index {} (segment {}): withdrew {} fragment(s) of coverage because {reason}; \
+                 the rows they covered are scanned until the index \
                  is optimized",
                 index.name,
                 index.uuid,
@@ -418,12 +578,17 @@ impl Transaction {
         }
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
-        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+        // System fields have negative IDs and cannot be modified by a user-column
+        // rewrite. A signed comparison also avoids aliasing a large u32 to one.
+        let fields_modified_set = fields_modified
+            .iter()
+            .map(|&field_id| i64::from(field_id))
+            .collect::<HashSet<_>>();
         for index in indices.iter_mut() {
             if index
-                .fields
+                .dependency_fields()
                 .iter()
-                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+                .any(|field_id| fields_modified_set.contains(&i64::from(*field_id)))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
                 *fragment_bitmap -= fragment_ids;
@@ -488,7 +653,8 @@ impl Transaction {
     /// stale pre-overlay values -- and unlike a live overlay, the compacted
     /// fragment no longer signals that staleness to the query path. Drop the
     /// group's fragments from the coverage of any index covering a field such
-    /// an overlay supplied, so those rows fall back to a flat scan.
+    /// an overlay supplied (or a field nested under or containing one, see
+    /// [`field_affects_index`]), so those rows fall back to a flat scan.
     ///
     /// Both the old and the new ids are dropped: an eager remap has already
     /// moved the bitmap to the new ids, while a deferred remap leaves the old
@@ -496,6 +662,7 @@ impl Transaction {
     pub(super) fn prune_overlay_stale_fields_from_indices(
         indices: &mut [IndexMetadata],
         groups: &[RewriteGroup],
+        schema: &Schema,
     ) {
         for group in groups {
             // field id -> newest overlay committed_version supplying that field
@@ -523,11 +690,14 @@ impl Transaction {
                 .map(|f| f.id as u32)
                 .collect::<Vec<_>>();
             for index in indices.iter_mut() {
-                let is_stale = index.fields.iter().any(|field_id| {
+                let dependency_fields = index.dependency_fields();
+                let is_stale =
                     overlaid_field_versions
-                        .get(field_id)
-                        .is_some_and(|&overlay_version| overlay_version > index.dataset_version)
-                });
+                        .iter()
+                        .any(|(&field_id, &overlay_version)| {
+                            overlay_version > index.dataset_version
+                                && field_affects_index(field_id, &dependency_fields, schema)
+                        });
                 if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                     for id in &fragment_ids {
                         fragment_bitmap.remove(*id);
@@ -547,12 +717,13 @@ impl Transaction {
             .map(|f| f.id)
             .collect::<HashSet<_>>();
 
-        // Remove indices for fields no longer in schema
+        // Reserved fields never belong to the user schema, so their absence
+        // does not mean a column was dropped.
         indices.retain(|existing_index| {
             existing_index
-                .fields
+                .dependency_fields()
                 .iter()
-                .all(|field_id| field_ids.contains(field_id))
+                .all(|field_id| *field_id < 0 || field_ids.contains(field_id))
                 || is_system_index(existing_index)
         });
 
@@ -724,12 +895,11 @@ impl Transaction {
     }
 
     pub(super) fn handle_rewrite_indices(
-        indices: &mut [IndexMetadata],
+        indices: &mut Vec<IndexMetadata>,
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
     ) -> Result<()> {
         let mut modified_indices = HashSet::new();
-
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
                 return Err(Error::invalid_input(format!(
@@ -737,29 +907,112 @@ impl Transaction {
                     rewritten_index.old_id
                 )));
             }
+        }
+
+        let mut handled_new_ids = HashSet::new();
+        for rewritten_index in rewritten_indices {
+            if !handled_new_ids.insert(rewritten_index.new_id) {
+                continue;
+            }
+
+            let replacements = rewritten_indices
+                .iter()
+                .filter(|candidate| candidate.new_id == rewritten_index.new_id)
+                .collect::<Vec<_>>();
+            if replacements.iter().any(|replacement| {
+                replacement.new_index_details != rewritten_index.new_index_details
+                    || replacement.new_index_version != rewritten_index.new_index_version
+                    || replacement.new_index_files != rewritten_index.new_index_files
+            }) {
+                return Err(Error::invalid_input(format!(
+                    "Compaction produced inconsistent metadata for replacement index {}",
+                    rewritten_index.new_id
+                )));
+            }
+
+            let old_ids = replacements
+                .iter()
+                .map(|replacement| replacement.old_id)
+                .collect::<HashSet<_>>();
+            let mut source_indices = indices
+                .iter()
+                .enumerate()
+                .filter(|(_, index)| old_ids.contains(&index.uuid))
+                .map(|(position, index)| (position, index.clone()))
+                .collect::<Vec<_>>();
 
             // Skip indices that no longer exist (may have been removed by concurrent operation)
-            let Some(index) = indices
-                .iter_mut()
-                .find(|idx| idx.uuid == rewritten_index.old_id)
-            else {
+            if source_indices.is_empty() {
                 continue;
-            };
+            }
+            if source_indices.len() != replacements.len() {
+                return Err(Error::invalid_input(format!(
+                    "Cannot partially apply merged index replacement {}: found {} of {} source segments",
+                    rewritten_index.new_id,
+                    source_indices.len(),
+                    replacements.len()
+                )));
+            }
 
-            index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
-                index.fragment_bitmap.as_ref().ok_or_else(|| {
+            let first_source = &source_indices[0].1;
+            if source_indices.iter().any(|(_, source)| {
+                source.name != first_source.name
+                    || source.fields != first_source.fields
+                    || source.covering_fields != first_source.covering_fields
+            }) {
+                return Err(Error::invalid_input(format!(
+                    "Cannot merge index segments with different names or fields into {}",
+                    rewritten_index.new_id
+                )));
+            }
+
+            let mut old_fragment_bitmap = RoaringBitmap::new();
+            for (_, source) in &source_indices {
+                old_fragment_bitmap |= source.fragment_bitmap.as_ref().ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Cannot rewrite index {} which did not store fragment bitmap",
-                        index.uuid
+                        source.uuid
                     ))
-                })?,
+                })?;
+            }
+
+            let mut replacement = first_source.clone();
+            replacement.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
+                &old_fragment_bitmap,
                 groups,
             )?);
-            index.uuid = rewritten_index.new_id;
+            replacement.uuid = rewritten_index.new_id;
+            if replacements
+                .iter()
+                .any(|replacement| replacement.old_id != replacement.new_id)
+            {
+                replacement.base_id = None;
+            }
+            // Independent remaps preserve the source's historical metadata. Only
+            // a physical merge publishes a new segment's details and version,
+            // and a merged segment is a new object: it carries neither the
+            // first source's clustering reference nor its metadata.
+            if replacements.len() > 1 {
+                replacement.index_details =
+                    Some(Arc::new(rewritten_index.new_index_details.clone()));
+                replacement.index_version = rewritten_index.new_index_version as i32;
+                replacement.clustering_id = None;
+                replacement.metadata = Default::default();
+            }
+            replacement.dataset_version = source_indices
+                .iter()
+                .map(|(_, source)| source.dataset_version)
+                .min()
+                .unwrap_or(replacement.dataset_version);
             // Update file sizes to match the new index files. When not available
             // (e.g., from older writers), clear the old file sizes to avoid
             // using stale sizes from the pre-remap index.
-            index.files = rewritten_index.new_index_files.clone();
+            replacement.files = rewritten_index.new_index_files.clone();
+
+            source_indices.sort_by_key(|(position, _)| *position);
+            let insert_at = source_indices[0].0;
+            indices.retain(|index| !old_ids.contains(&index.uuid));
+            indices.insert(insert_at.min(indices.len()), replacement);
         }
         Ok(())
     }
@@ -781,6 +1034,7 @@ impl Transaction {
         fragment_id: &mut u64,
         version: u64,
         _next_row_id: Option<&u64>,
+        changed_clustering_references: &mut ChangedReferences,
     ) -> Result<()> {
         // Index fragment positions up front so each rewrite group is located in
         // O(1). Scanning and splicing/retaining the fragment list per group is
@@ -820,6 +1074,10 @@ impl Transaction {
 
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
                 .collect::<Vec<_>>();
+            // These are this commit's outputs, whichever path places them.
+            for fragment in &new_fragments {
+                changed_clustering_references.fragment(fragment);
+            }
 
             // Version metadata for rewritten fragments is handled by the compaction code
             // (recalc_versions_for_rewritten_fragments) which preserves version information
@@ -873,8 +1131,15 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::test_support::overlay_with_field;
+    use crate::format::overlay::staleness::{
+        collect_overlay_stale_rows_for_segment, remove_overlay_stale_frags,
+    };
+    use crate::transaction::FragReuseUpdate;
+    use crate::transaction::test_support::{
+        default_build_config, overlay_with_field, sample_manifest, tagged_entry, update_txn,
+    };
     use chrono::{TimeZone, Utc};
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[test]
@@ -947,6 +1212,7 @@ mod tests {
             &mut fragment_id,
             version,
             None,
+            &mut ChangedReferences::default(),
         )
         .unwrap();
 
@@ -982,6 +1248,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1008,6 +1275,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1032,6 +1300,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         )
         .unwrap();
 
@@ -1063,6 +1332,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1070,8 +1340,16 @@ mod tests {
         assert!(error.to_string().contains("id=2"));
     }
 
-    #[test]
-    fn test_retain_indices_removes_missing_fields() {
+    #[rstest]
+    #[case::missing_user_field(vec![99], false)]
+    #[case::row_id(vec![crate::format::ROW_ID_FIELD_ID], true)]
+    #[case::unknown_reserved_field(vec![-100], true)]
+    #[case::reserved_and_present_user_field(vec![-3, 1], true)]
+    #[case::reserved_and_missing_user_field(vec![-3, 99], false)]
+    fn test_retain_indices_removes_missing_fields(
+        #[case] fields: Vec<i32>,
+        #[case] is_retained: bool,
+    ) {
         let schema = create_test_schema(&[1, 2]);
         let fragments = vec![Fragment::new(1), Fragment::new(2)];
 
@@ -1080,11 +1358,12 @@ mod tests {
             create_test_index("idx2", 2, 1, Some(RoaringBitmap::from_iter([1])), false),
             create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Field doesn't exist
         ];
+        indices[2].fields = fields;
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        assert_eq!(indices.len(), 2);
-        assert!(indices.iter().all(|idx| idx.fields[0] != 99));
+        assert_eq!(indices.len(), 2 + usize::from(is_retained));
+        assert_eq!(indices.iter().any(|idx| idx.name == "idx3"), is_retained);
     }
 
     #[test]
@@ -1535,6 +1814,214 @@ mod tests {
         assert!(indices.is_empty());
     }
 
+    #[rstest::rstest]
+    #[case::complete(None)]
+    #[case::inconsistent(Some("inconsistent metadata"))]
+    #[case::missing(Some("source segments"))]
+    #[case::incomplete_coverage(Some("split of indexed and non-indexed"))]
+    fn test_handle_rewrite_indices_merges_source_segments(#[case] expected_error: Option<&str>) {
+        let mut first = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        let mut second = create_test_index(
+            "vector_idx",
+            1,
+            4,
+            Some(RoaringBitmap::from_iter([2])),
+            true,
+        );
+        first.base_id = Some(0);
+        second.base_id = Some(0);
+        // Differently labelled sources: the merged segment inherits neither.
+        first.clustering_id = Some(1);
+        first.metadata = HashMap::from([("org.example.k".to_string(), "a".to_string())]);
+        second.clustering_id = Some(2);
+        second.metadata = HashMap::from([("org.example.k".to_string(), "b".to_string())]);
+        let first_id = first.uuid;
+        let second_id = second.uuid;
+        let merged_id = Uuid::new_v4();
+        let details = prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+            value: vec![1, 2, 3],
+        };
+        let mut rewritten_indices = vec![
+            RewrittenIndex {
+                old_id: first_id,
+                new_id: merged_id,
+                new_index_details: details.clone(),
+                new_index_version: 2,
+                new_index_files: None,
+            },
+            RewrittenIndex {
+                old_id: second_id,
+                new_id: merged_id,
+                new_index_details: details.clone(),
+                new_index_version: 2,
+                new_index_files: None,
+            },
+        ];
+        let groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+            new_fragments: vec![Fragment::new(5)],
+        }];
+        let mut indices = vec![first, second];
+
+        match expected_error {
+            Some("inconsistent metadata") => rewritten_indices[1].new_index_version += 1,
+            Some("source segments") => {
+                indices.pop();
+            }
+            Some("split of indexed and non-indexed") => {
+                rewritten_indices.pop();
+            }
+            _ => {}
+        }
+        if let Some(expected) = expected_error {
+            let error =
+                Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups)
+                    .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected), "{error}");
+            return;
+        }
+
+        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, merged_id);
+        assert_eq!(indices[0].dataset_version, 3);
+        assert_eq!(indices[0].index_version, 2);
+        assert_eq!(indices[0].base_id, None);
+        assert_eq!(indices[0].index_details.as_deref(), Some(&details));
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([5])
+        );
+        assert_eq!(
+            indices[0].clustering_id, None,
+            "a merged segment is a new object"
+        );
+        assert!(indices[0].metadata.is_empty());
+    }
+
+    /// A single-source remap is the same segment under a new UUID: it keeps
+    /// its clustering reference and metadata.
+    #[test]
+    fn test_handle_rewrite_indices_single_source_remap_keeps_labels() {
+        let mut source = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        source.clustering_id = Some(1);
+        source.metadata = HashMap::from([("org.example.k".to_string(), "a".to_string())]);
+        let old_id = source.uuid;
+        let new_id = Uuid::new_v4();
+        let rewritten_indices = vec![RewrittenIndex {
+            old_id,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            },
+            new_index_version: 1,
+            new_index_files: None,
+        }];
+        let groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1)],
+            new_fragments: vec![Fragment::new(5)],
+        }];
+        let mut indices = vec![source];
+        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, new_id);
+        assert_eq!(indices[0].clustering_id, Some(1));
+        assert_eq!(
+            indices[0].metadata,
+            HashMap::from([("org.example.k".to_string(), "a".to_string())])
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None)]
+    #[case::opaque(Some(prost_types::Any {
+        type_url: "future.index".into(),
+        value: vec![0x98, 0x06, 0x01],
+    }))]
+    // JsonIndexDetails { path: "x", target_details: {}, target_data_type: 999 }.
+    #[case::json_future_type(Some(prost_types::Any {
+        type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".into(),
+        value: vec![0x0a, 0x01, b'x', 0x12, 0x00, 0x18, 0xe7, 0x07],
+    }))]
+    fn test_handle_rewrite_indices_preserves_single_source_metadata(
+        #[case] details: Option<prost_types::Any>,
+    ) {
+        let mut index =
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::from_iter([1, 2])), true);
+        index.index_details = details.map(Arc::new);
+        index.index_version = 0;
+        index.base_id = Some(7);
+        let source_details = index.index_details.clone();
+        let new_id = Uuid::new_v4();
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: "different".into(),
+                value: vec![],
+            },
+            new_index_version: 2,
+            new_index_files: Some(vec![]),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(
+            &mut indices,
+            &[replacement],
+            &[RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(3)],
+            }],
+        )
+        .unwrap();
+        assert_eq!(indices[0].index_details, source_details);
+        assert_eq!(indices[0].index_version, 0);
+        assert_eq!(indices[0].uuid, new_id);
+        assert_eq!(indices[0].base_id, None);
+        assert_eq!(indices[0].files, Some(vec![]));
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([3]))
+        );
+    }
+
+    #[test]
+    fn test_handle_rewrite_indices_keeps_identity_routing() {
+        let mut index = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        index.base_id = Some(7);
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id: index.uuid,
+            new_index_details: index.index_details.as_ref().unwrap().as_ref().clone(),
+            new_index_version: index.index_version as u32,
+            new_index_files: index.files.clone(),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[]).unwrap();
+        assert_eq!(indices[0].base_id, Some(7));
+    }
+
     #[test]
     fn test_prune_overlay_stale_fields_from_indices() {
         // Fragment 0 carried an overlay on field 1 committed at v5, and was
@@ -1566,7 +2053,11 @@ mod tests {
             ),
         ];
 
-        Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups);
+        Transaction::prune_overlay_stale_fields_from_indices(
+            &mut indices,
+            &groups,
+            &create_test_schema(&[1, 2]),
+        );
 
         assert!(
             !indices[0].fragment_bitmap.as_ref().unwrap().contains(7),
@@ -1583,6 +2074,150 @@ mod tests {
         assert!(
             indices[3].fragment_bitmap.as_ref().unwrap().is_empty(),
             "stale index must drop the old fragment when the remap is deferred"
+        );
+    }
+
+    /// `s: struct<x: int32, y: int32>, b: int32`, ids assigned pre-order:
+    /// `s` = 0, `s.x` = 1, `s.y` = 2, `b` = 3.
+    fn create_nested_test_schema() -> Schema {
+        use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("b", DataType::Int32, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(schema.field_by_id(0).unwrap().name, "s");
+        assert_eq!(schema.field_by_id(1).unwrap().name, "x");
+        assert_eq!(schema.field_by_id(2).unwrap().name, "y");
+        assert_eq!(schema.field_by_id(3).unwrap().name, "b");
+        schema
+    }
+
+    #[test]
+    fn test_prune_overlay_stale_fields_matches_nested_fields() {
+        let schema = create_nested_test_schema();
+        // Fragment 0 carried an overlay on the struct `s` (id 0) and fragment
+        // 1 one on `s.y` (id 2), both committed at v5; both were compacted
+        // into new fragments.
+        let mut on_parent = Fragment::new(0);
+        on_parent.overlays = vec![overlay_with_field(0, 5)];
+        let mut on_child = Fragment::new(1);
+        on_child.overlays = vec![overlay_with_field(2, 5)];
+        let groups = vec![
+            RewriteGroup {
+                old_fragments: vec![on_parent],
+                new_fragments: vec![Fragment::new(7)],
+            },
+            RewriteGroup {
+                old_fragments: vec![on_child],
+                new_fragments: vec![Fragment::new(8)],
+            },
+        ];
+
+        let covering = || Some(RoaringBitmap::from_iter([7u32, 8]));
+        let mut indices = vec![
+            // On `s.x`: the overlay on its parent `s` supplied it.
+            create_test_index("child", 1, 2, covering(), false),
+            // On `s`: the overlay on its child `s.y` changed part of it.
+            create_test_index("parent", 0, 2, covering(), false),
+            // On `b`: unrelated to either overlay.
+            create_test_index("unrelated", 3, 2, covering(), false),
+        ];
+
+        Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups, &schema);
+
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([8u32]),
+            "an overlay on a struct makes an index on its child stale"
+        );
+        assert!(
+            indices[1].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "overlays on a struct or its child make an index on the struct stale"
+        );
+        assert_eq!(
+            indices[2].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([7u32, 8]),
+            "an index on an unrelated field is unaffected"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::parent(0, vec![1], false)]
+    #[case::child(1, vec![0], false)]
+    #[case::sibling(1, vec![2], true)]
+    #[case::unrelated(3, vec![1], true)]
+    #[case::carried(0, vec![3, 1], false)]
+    fn test_pure_row_rewrite_reuses_only_unchanged_dependencies(
+        #[case] changed: u32,
+        #[case] fields: Vec<i32>,
+        #[case] can_reuse: bool,
+    ) {
+        let schema = create_nested_test_schema();
+        let mut index =
+            create_test_index("idx", fields[0], 2, Some([0].into_iter().collect()), true);
+        if fields.len() > 1 {
+            index.covering_fields = fields[1..].to_vec();
+        }
+        index.fields = fields;
+        let mut indices = vec![index];
+        Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+            &mut indices,
+            &[1],
+            &[0],
+            &[changed],
+            &HashMap::new(),
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().contains(1),
+            can_reuse
+        );
+    }
+
+    #[test]
+    fn test_untagged_in_place_rewrite_withdraws_nested_fields() {
+        let schema = create_nested_test_schema();
+        let covering = || Some(RoaringBitmap::from_iter([4u32, 5]));
+        let mut indices = vec![
+            create_test_index("child", 1, 2, covering(), false),
+            create_test_index("parent", 0, 2, covering(), false),
+            create_test_index("unrelated", 3, 2, covering(), false),
+        ];
+        let live = RoaringBitmap::from_iter([4u32, 5]);
+
+        // Fragment 4 rewrote the packed struct `s` in place (reported by the
+        // parent id); fragment 5 rewrote only `s.y`.
+        Transaction::withdraw_in_place_rewrites(
+            &mut indices,
+            vec![(4, vec![0]), (5, vec![2])],
+            &schema,
+            &live,
+            None,
+        );
+
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([5u32]),
+            "a rewrite of a struct withdraws coverage from an index on its child"
+        );
+        assert!(
+            indices[1].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "a rewrite of a struct or its child withdraws coverage from an index on the struct"
+        );
+        assert_eq!(
+            indices[2].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([4u32, 5]),
+            "an index on an unrelated field is unaffected"
         );
     }
 
@@ -1621,6 +2256,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1685,6 +2322,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1707,6 +2346,250 @@ mod tests {
 
         lance_schema
     }
+
+    const KEYED: i32 = 1;
+    const CARRIED: i32 = 2;
+    const UNRELATED: i32 = 3;
+
+    /// Released writers repeat each carried column at the end of `fields`;
+    /// the keys-only shape lists it in `covering_fields` alone.
+    #[derive(Debug, Clone, Copy)]
+    enum CoveringShape {
+        Suffix,
+        KeysOnly,
+    }
+
+    impl CoveringShape {
+        fn index(self, keyed: i32, carried: i32) -> IndexMetadata {
+            let mut index =
+                create_test_index("covered", keyed, 2, Some(RoaringBitmap::from([0])), false);
+            if matches!(self, Self::Suffix) {
+                index.fields.push(carried);
+            }
+            index.covering_fields = vec![carried];
+            index
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum DependencySite {
+        PruneUpdatedFragmentIds,
+        RegisterPureRewrite,
+        WithdrawUntaggedRewrite,
+        WithdrawTaggedRewrite,
+        PruneOverlayStaleFields,
+        RetainRelevantIndices,
+        CollectOverlayStaleFrags,
+        CollectOverlayStaleRows,
+        RemoveOverlayStaleFrags,
+        RejectUnknownCoverageRewrite,
+    }
+
+    impl DependencySite {
+        fn marks_stale(self, index: IndexMetadata, schema: &Schema, changed: i32) -> bool {
+            let mut indices = vec![index];
+            let live = RoaringBitmap::from([0]);
+            let rewrites = vec![(0, vec![changed as u32])];
+            let mut overlaid = Fragment::new(0);
+            overlaid.overlays = vec![overlay_with_field(changed, 5)];
+            let covers = |indices: &[IndexMetadata], fragment: u64| {
+                indices[0]
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(fragment as u32)
+            };
+            match self {
+                Self::PruneUpdatedFragmentIds => {
+                    Transaction::prune_updated_fragment_ids_from_indices(
+                        &mut indices,
+                        &live,
+                        &[changed as u32],
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::RegisterPureRewrite => {
+                    indices[0].index_details = None;
+                    let pure_update_frag_id = 10;
+                    Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+                        &mut indices,
+                        &[pure_update_frag_id],
+                        &[0],
+                        &[changed as u32],
+                        &HashMap::new(),
+                        schema,
+                    )
+                    .unwrap();
+                    !covers(&indices, pure_update_frag_id)
+                }
+                Self::WithdrawUntaggedRewrite => {
+                    Transaction::withdraw_in_place_rewrites(
+                        &mut indices,
+                        rewrites,
+                        schema,
+                        &live,
+                        None,
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::WithdrawTaggedRewrite => {
+                    let history = tagged_entry(&[(&[5], &[6])]);
+                    let lineage = TaggedLineage::from_indices_with_ledger(
+                        std::slice::from_ref(&history),
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    Transaction::withdraw_in_place_rewrites(
+                        &mut indices,
+                        rewrites,
+                        schema,
+                        &live,
+                        Some(&lineage),
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::PruneOverlayStaleFields => {
+                    let groups = [RewriteGroup {
+                        old_fragments: vec![overlaid],
+                        new_fragments: vec![Fragment::new(7)],
+                    }];
+                    Transaction::prune_overlay_stale_fields_from_indices(
+                        &mut indices,
+                        &groups,
+                        schema,
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::RetainRelevantIndices => {
+                    let remaining = schema
+                        .fields_pre_order()
+                        .map(|field| field.id)
+                        .filter(|field| *field != changed)
+                        .collect::<Vec<_>>();
+                    Transaction::retain_relevant_indices(
+                        &mut indices,
+                        &create_test_schema(&remaining),
+                        &[Fragment::new(0)],
+                    );
+                    indices.is_empty()
+                }
+                Self::CollectOverlayStaleFrags => {
+                    let mut stale = RoaringBitmap::new();
+                    collect_overlay_stale_frags(
+                        &indices[0],
+                        &HashMap::from([(0, &overlaid)]),
+                        &mut stale,
+                        schema,
+                    )
+                    .unwrap();
+                    stale.contains(0)
+                }
+                Self::CollectOverlayStaleRows => {
+                    let mut stale = HashMap::new();
+                    collect_overlay_stale_rows_for_segment(
+                        &indices[0],
+                        &HashMap::from([(0, &overlaid)]),
+                        &mut stale,
+                        schema,
+                    )
+                    .unwrap();
+                    stale.contains_key(&0)
+                }
+                Self::RemoveOverlayStaleFrags => {
+                    let mut coverage = RoaringBitmap::from([0]);
+                    remove_overlay_stale_frags(&mut coverage, &[overlaid], &indices[0], schema);
+                    !coverage.contains(0)
+                }
+                Self::RejectUnknownCoverageRewrite => {
+                    indices[0].fragment_bitmap = None;
+                    let mut manifest = sample_manifest();
+                    manifest.schema = schema.clone();
+                    let mut update = update_txn(vec![]);
+                    let Operation::Update {
+                        updated_fragments,
+                        fields_modified,
+                        ..
+                    } = &mut update.operation
+                    else {
+                        unreachable!()
+                    };
+                    *updated_fragments = vec![Fragment::new(0)];
+                    *fields_modified = vec![changed as u32];
+                    match update.prepare_indices(
+                        Some(&manifest),
+                        indices,
+                        &default_build_config(),
+                        None,
+                        FragReuseUpdate::None,
+                    ) {
+                        Ok(_) => false,
+                        Err(error) => {
+                            assert!(
+                                error.to_string().contains("unknown fragment coverage"),
+                                "{error}"
+                            );
+                            true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An index goes stale on a change to its keyed or carried column, and not
+    /// on a change to another column, whether or not `fields` repeats the
+    /// carried column.
+    #[rstest]
+    #[case::prune_updated_fragment_ids(DependencySite::PruneUpdatedFragmentIds)]
+    #[case::register_pure_rewrite(DependencySite::RegisterPureRewrite)]
+    #[case::withdraw_untagged_rewrite(DependencySite::WithdrawUntaggedRewrite)]
+    #[case::withdraw_tagged_rewrite(DependencySite::WithdrawTaggedRewrite)]
+    #[case::prune_overlay_stale_fields(DependencySite::PruneOverlayStaleFields)]
+    #[case::retain_relevant_indices(DependencySite::RetainRelevantIndices)]
+    #[case::collect_overlay_stale_frags(DependencySite::CollectOverlayStaleFrags)]
+    #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
+    #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
+    #[case::reject_unknown_coverage_rewrite(DependencySite::RejectUnknownCoverageRewrite)]
+    fn test_covering_dependency(#[case] site: DependencySite) {
+        let schema = create_test_schema(&[KEYED, CARRIED, UNRELATED]);
+        for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
+            for (column, changed, stale) in [
+                ("keyed", KEYED, true),
+                ("carried", CARRIED, true),
+                ("unrelated", UNRELATED, false),
+            ] {
+                assert_eq!(
+                    site.marks_stale(shape.index(KEYED, CARRIED), &schema, changed),
+                    stale,
+                    "{site:?}, {shape:?}: a change to the {column} column"
+                );
+            }
+        }
+    }
+
+    /// Where a check matches whole subtrees, a carried struct goes stale on a
+    /// change to its child and a carried child on a change to its struct.
+    #[rstest]
+    #[case::withdraw_untagged_rewrite(DependencySite::WithdrawUntaggedRewrite)]
+    #[case::prune_overlay_stale_fields(DependencySite::PruneOverlayStaleFields)]
+    #[case::collect_overlay_stale_frags(DependencySite::CollectOverlayStaleFrags)]
+    #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
+    #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
+    #[case::reject_unknown_coverage_rewrite(DependencySite::RejectUnknownCoverageRewrite)]
+    fn test_nested_covering_dependency(#[case] site: DependencySite) {
+        let schema = create_nested_test_schema();
+        let (s, s_x, s_y, b) = (0, 1, 2, 3);
+        for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
+            for (carried, changed, stale) in [(s, s_y, true), (s_x, s, true), (s_x, s_y, false)] {
+                assert_eq!(
+                    site.marks_stale(shape.index(b, carried), &schema, changed),
+                    stale,
+                    "{site:?}, {shape:?}: carrying field {carried}, a change to field {changed}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1721,6 +2604,35 @@ mod withdrawal_tests {
         segment
     }
 
+    #[rstest::rstest]
+    #[case::user_field(vec![0], vec![0], true)]
+    #[case::other_user_field(vec![1], vec![0], false)]
+    #[case::row_id(vec![-3], vec![0], false)]
+    #[case::mixed_fields(vec![-3, 0], vec![0], true)]
+    #[case::no_unsigned_alias(vec![-1], vec![u32::MAX], false)]
+    #[case::largest_field(vec![i32::MAX], vec![i32::MAX as u32], true)]
+    #[test]
+    fn prune_updated_fields_preserves_system_fields(
+        #[case] fields: Vec<i32>,
+        #[case] modified: Vec<u32>,
+        #[case] is_modified: bool,
+    ) {
+        let mut indices = vec![segment(Some(&[0, 1, 2]), fields)];
+        Transaction::prune_updated_fragment_ids_from_indices(
+            &mut indices,
+            &RoaringBitmap::from_iter([1]),
+            &modified,
+        );
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter(if is_modified {
+                vec![0, 2]
+            } else {
+                vec![0, 1, 2]
+            }))
+        );
+    }
+
     fn lineage(entry: &IndexMetadata) -> TaggedLineage {
         TaggedLineage::from_indices_with_ledger(std::slice::from_ref(entry), None)
             .unwrap()
@@ -1730,6 +2642,41 @@ mod withdrawal_tests {
     /// F1, F2 -> F3 then F3 -> F4 (F4 live), plus an unrelated F6 -> F8.
     fn history() -> IndexMetadata {
         tagged_entry(&[(&[1, 2], &[3]), (&[3], &[4]), (&[6], &[8])])
+    }
+
+    #[rstest::rstest]
+    #[case::retired(Some(&[1, 2, 3, 6][..]), &[])]
+    #[case::live_only_remainder(Some(&[1, 2, 9][..]), &[])]
+    #[case::translating_remainder(Some(&[1, 2, 8][..]), &[8])]
+    #[case::unchanged_live(Some(&[8, 9][..]), &[8, 9])]
+    #[case::unknown(None, &[])]
+    #[test]
+    fn withdraws_unverified_retired_provenance(
+        #[case] bitmap: Option<&[u32]>,
+        #[case] expected: &[u32],
+    ) {
+        let entry = history();
+        let live = RoaringBitmap::from_iter([4u32, 8, 9]);
+        let mut indices = vec![segment(bitmap, vec![0]), entry.clone()];
+        Transaction::withdraw_unverified_retired_coverage(&mut indices, &lineage(&entry), &live);
+        assert_eq!(indices.len(), 2, "the last segment is kept for rebuilding");
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(expected.iter().copied().collect())
+        );
+        assert_eq!(indices[1].fragment_bitmap, entry.fragment_bitmap);
+    }
+
+    #[test]
+    fn unverified_retired_segment_leaves_a_serving_sibling() {
+        let entry = history();
+        let live = RoaringBitmap::from_iter([4u32, 8, 9]);
+        let sibling = segment(Some(&[8, 9]), vec![0]);
+        let mut indices = vec![segment(Some(&[1, 2]), vec![0]), sibling.clone()];
+        Transaction::withdraw_unverified_retired_coverage(&mut indices, &lineage(&entry), &live);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, sibling.uuid);
+        assert_eq!(indices[0].fragment_bitmap, sibling.fragment_bitmap);
     }
 
     #[test]
@@ -1856,6 +2803,39 @@ mod withdrawal_tests {
         assert!(indices[2].fragment_bitmap.is_none());
     }
 
+    /// A segment indexing none of the rewritten columns is outside the
+    /// rewrite, so an unwalkable history must not cost it its retired
+    /// coverage: the rewrite cannot have touched its rows.
+    #[test]
+    fn without_a_walkable_history_an_unindexed_field_is_untouched() {
+        let entry = history();
+        let live: RoaringBitmap = [4u32, 8, 9].into_iter().collect();
+        let on_x = segment(Some(&[1, 2]), vec![0]);
+        let on_y = segment(Some(&[1, 2]), vec![1]);
+        let mut indices = vec![on_x.clone(), on_y.clone()];
+        // The rewrite of F4 touches field 0 (column X) only.
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&TaggedLineage::new(&entry, None)),
+            &live,
+            &[(4, vec![0])],
+        );
+        let kept = indices
+            .iter()
+            .find(|index| index.uuid == on_y.uuid)
+            .expect("the segment on an unrewritten column is kept");
+        assert_eq!(
+            kept.fragment_bitmap, on_y.fragment_bitmap,
+            "the segment on an unrewritten column keeps its coverage"
+        );
+        // The segment on the rewritten column gives up its retired sources,
+        // empties, and is retired because its sibling still serves.
+        assert!(
+            !indices.iter().any(|index| index.uuid == on_x.uuid),
+            "the emptied segment on the rewritten column is retired behind its sibling"
+        );
+    }
+
     #[test]
     fn without_a_walkable_history_every_retired_fragment_goes() {
         let entry = history();
@@ -1870,6 +2850,254 @@ mod withdrawal_tests {
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter([9u32])
+        );
+    }
+}
+
+/// Feasibility probes for the compaction withdrawal described in
+/// planner-007: what the existing helper already decides, with no change to
+/// persisted semantics. These assert current behavior only.
+#[cfg(test)]
+mod withdrawal_feasibility {
+    use super::*;
+    use crate::system_index::frag_reuse::lineage::TaggedLineage;
+    use crate::transaction::test_support::{sample_index_metadata, tagged_entry};
+
+    fn walkable(entry: &IndexMetadata) -> TaggedLineage {
+        TaggedLineage::from_indices_with_ledger(std::slice::from_ref(entry), None)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn coverage(indices: &[IndexMetadata]) -> RoaringBitmap {
+        indices
+            .iter()
+            .find(|index| index.name == "vec_idx")
+            .unwrap()
+            .fragment_bitmap
+            .clone()
+            .unwrap()
+    }
+
+    /// Direct case: S1 stores {F1, F2}; F1 is rewritten into F1'. F1 is still
+    /// LIVE in the manifest the withdrawal is computed against (the rewrite
+    /// retires it in the same commit), so `retired = bitmap - live` is empty,
+    /// `withdrew_retired` is false, and the unsafe-raw-Identity fallback that
+    /// clears the whole remainder never fires. F2 survives.
+    #[test]
+    fn direct_withdrawal_keeps_f2_and_never_clears_the_remainder() {
+        // The history already records an unrelated transition so the table is
+        // tagged; F1(1) and F2(2) are original fragments on it.
+        let entry = tagged_entry(&[(&[90], &[91])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([1u32, 2].into_iter().collect());
+        // F1 and F2 are both live before the rewrite commits.
+        let live: RoaringBitmap = [1u32, 2, 91].into_iter().collect();
+
+        let mut indices = vec![segment];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert_eq!(
+            coverage(&indices),
+            [2u32].into_iter().collect::<RoaringBitmap>(),
+            "only F1 goes; F2's coverage is preserved"
+        );
+    }
+
+    /// Historical case: S1 stores {P}; an earlier tagged rewrite split
+    /// P -> F1 + F2; now F1 is rewritten. `destinations_of(P)` contains F1,
+    /// so P is withdrawn whole, which gives up derived coverage of F2 as
+    /// well. This is the planner-007 tradeoff, asserted rather than assumed.
+    #[test]
+    fn historical_withdrawal_of_p_gives_up_f2_as_well() {
+        // P(0) -> F1(1) + F2(2).
+        let entry = tagged_entry(&[(&[0], &[1, 2])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([0u32].into_iter().collect());
+        // P is retired by the earlier split; F1 and F2 are live.
+        let live: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        let lineage = walkable(&entry);
+        assert_eq!(lineage.destinations_of(0), Some(vec![1, 2]));
+
+        let mut indices = vec![segment];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&lineage),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert!(
+            coverage(&indices).is_empty(),
+            "withdrawing P loses F2's derived coverage too: {:?}",
+            coverage(&indices)
+        );
+    }
+
+    /// The information the existing representation lacks, as the smallest
+    /// example: {P} cannot say "P's rows reaching F2 still count, P's rows
+    /// reaching F1 do not". Removing F1 is a no-op (F1 is not in the bitmap)
+    /// and removing P takes F2 with it.
+    #[test]
+    fn removing_f1_from_a_p_bitmap_is_a_no_op() {
+        let entry = tagged_entry(&[(&[0], &[1, 2])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([0u32].into_iter().collect());
+        let mut projected = segment.fragment_bitmap.unwrap();
+        projected.remove(1);
+        assert_eq!(
+            projected,
+            [0u32].into_iter().collect::<RoaringBitmap>(),
+            "the stored bitmap holds P, not F1, so removing F1 changes nothing"
+        );
+        let _ = walkable(&entry);
+    }
+
+    /// The whole-remainder fallback fires only when a RETIRED fragment was
+    /// withdrawn AND the live-only remainder is absent from the history, in
+    /// which case the reader would load it raw. With the remainder still on
+    /// the history it is translated and filtered, so it is retained.
+    #[test]
+    fn the_remainder_fallback_fires_only_for_an_untranslated_live_remainder() {
+        // P(0) -> F1(1); unrelated Q(5) -> F3(6). The segment stores P and an
+        // original live fragment F9 the history never mentions.
+        let entry = tagged_entry(&[(&[0], &[1]), (&[5], &[6])]);
+        let live: RoaringBitmap = [1u32, 6, 9].into_iter().collect();
+        let lineage = walkable(&entry);
+
+        let mut untranslated = sample_index_metadata("vec_idx");
+        untranslated.fragment_bitmap = Some([0u32, 9].into_iter().collect());
+        let mut indices = vec![untranslated];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&lineage),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert!(
+            coverage(&indices).is_empty(),
+            "F9 is live and off the history, so the remainder would load raw \
+             and is withdrawn whole: {:?}",
+            coverage(&indices)
+        );
+
+        // The same withdrawal with the remainder ON the history keeps it.
+        let mut translated = sample_index_metadata("vec_idx");
+        translated.fragment_bitmap = Some([0u32, 5].into_iter().collect());
+        let mut indices = vec![translated];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&lineage),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert_eq!(
+            coverage(&indices),
+            [5u32].into_iter().collect::<RoaringBitmap>(),
+            "Q is retired and on the history, so it is translated and retained"
+        );
+    }
+
+    /// The compaction entry point selects by SEGMENT, not by rewritten
+    /// column: an undeferrable segment gives up the rewritten sources while
+    /// a deferrable sibling over the SAME column and fragments keeps its
+    /// provenance for the reader to translate.
+    #[test]
+    fn undeferrable_withdrawal_touches_only_the_listed_segments() {
+        let entry = tagged_entry(&[(&[90], &[91])]);
+        let mut undeferrable = sample_index_metadata("vec_idx");
+        undeferrable.fragment_bitmap = Some([1u32, 2, 3].into_iter().collect());
+        let mut deferrable = sample_index_metadata("i_idx");
+        deferrable.fragment_bitmap = Some([1u32, 2, 3].into_iter().collect());
+        let live: RoaringBitmap = [1u32, 2, 3, 91].into_iter().collect();
+        let rewritten: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        let mut indices = vec![undeferrable.clone(), deferrable.clone()];
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[undeferrable.uuid],
+            &rewritten,
+        );
+        assert_eq!(
+            coverage(&indices),
+            [3u32].into_iter().collect::<RoaringBitmap>(),
+            "the undeferrable segment gives up the rewritten sources only"
+        );
+        assert_eq!(
+            indices
+                .iter()
+                .find(|index| index.name == "i_idx")
+                .unwrap()
+                .fragment_bitmap,
+            deferrable.fragment_bitmap,
+            "the deferrable sibling is untouched"
+        );
+    }
+
+    /// An empty selection, or a compaction rewriting nothing, is a no-op: no
+    /// bitmap is touched and no segment is retired.
+    #[test]
+    fn undeferrable_withdrawal_of_nothing_is_a_no_op() {
+        let entry = tagged_entry(&[(&[90], &[91])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([1u32, 2].into_iter().collect());
+        let live: RoaringBitmap = [1u32, 2, 91].into_iter().collect();
+        let original = vec![segment.clone()];
+
+        let mut indices = original.clone();
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[],
+            &[1u32].into_iter().collect(),
+        );
+        assert_eq!(coverage(&indices), coverage(&original));
+
+        let mut indices = original.clone();
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[segment.uuid],
+            &RoaringBitmap::new(),
+        );
+        assert_eq!(coverage(&indices), coverage(&original));
+    }
+
+    /// The historical closure applies here too: a segment storing the
+    /// ancestor P of a now-rewritten F1 gives up P, and with it the derived
+    /// coverage of P's other destination F2. The accepted extra loss.
+    #[test]
+    fn undeferrable_withdrawal_follows_the_retired_ancestor() {
+        // P(0) -> F1(1) + F2(2); F1 is now rewritten.
+        let entry = tagged_entry(&[(&[0], &[1, 2])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([0u32].into_iter().collect());
+        let live: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        let mut indices = vec![segment.clone()];
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[segment.uuid],
+            &[1u32].into_iter().collect(),
+        );
+        assert!(
+            coverage(&indices).is_empty(),
+            "P is withdrawn, giving up F2's derived coverage as well"
+        );
+        assert_eq!(
+            indices.len(),
+            1,
+            "the last segment of a name stays as the definition to rebuild"
         );
     }
 }

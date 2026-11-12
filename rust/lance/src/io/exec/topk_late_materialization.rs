@@ -31,19 +31,24 @@
 //!   [`TopKLateMaterialization::with_pass_through`], such as one a
 //!   `TableProvider` wraps around the scan. A certified node that rewrites
 //!   schema metadata is applied again above the take, since [`TakeExec`] emits
-//!   the dataset's metadata.
+//!   the dataset's metadata. The rule declines if that node may reorder rows.
 //!
 //! A [`TakeExec`] or row-stream [`FilteredReadExec`] in the chain (the
 //! scanner's own late materialization behind a filter) is dropped: the take
 //! above the sort fetches its columns instead.
 //! Row-stream reads with a physical row selection prevent the rewrite, since
 //! dropping them would remove a restriction that must apply before sorting.
+//!
+//! Rebuilding the read and fetching deferred columns can replace the planner's
+//! field metadata with the dataset's storage metadata. Projections under the new
+//! sort and above the take restore the original field metadata, which sort
+//! expressions can inspect.
 
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Fields, Schema as ArrowSchema};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
@@ -53,6 +58,7 @@ use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
@@ -124,7 +130,9 @@ impl TopKLateMaterialization {
     /// (it may rewrite schema metadata), and must hold no column indices, as
     /// it is rebuilt over the narrowed read with `with_new_children`. It must
     /// also report [`CardinalityEffect::Equal`] and no fetch, or the rule
-    /// declines.
+    /// declines. A node that rewrites schema metadata is applied again above
+    /// the take, so it must also keep its input's row order and report that in
+    /// [`ExecutionPlan::maintains_input_order`], or the rule declines.
     pub fn with_pass_through(
         mut self,
         pass_through: impl Fn(&dyn ExecutionPlan) -> bool + Send + Sync + 'static,
@@ -233,6 +241,7 @@ impl TopKLateMaterialization {
         for node in chain.iter().rev() {
             input = rebuild(node, input)?;
         }
+        let input = with_field_metadata(input, &sort.input().schema())?;
 
         let schema = input.schema();
         let mut top: Arc<dyn ExecutionPlan> = Arc::new(
@@ -250,12 +259,10 @@ impl TopKLateMaterialization {
         let take = TakeExec::try_new(dataset, top, wanted)
             .map_err(|e| e.to_string())?
             .ok_or("the sort reads every output column")?;
-        let names = original.fields().iter().map(|f| f.name().as_str());
-        let mut output = project(Arc::new(take), names)?;
+        // Reapplied wrappers restore the schema's own metadata.
+        let mut output = select_columns(Arc::new(take), original.fields())?;
         for node in chain.iter().rev().filter(|node| rewrites_metadata(node)) {
-            output = node
-                .clone()
-                .with_new_children(vec![output])
+            output = replace_children_if_necessary(node.clone(), vec![output])
                 .map_err(|e| e.to_string())?;
         }
         if output.schema() != original {
@@ -319,6 +326,10 @@ impl TopKLateMaterialization {
         if node.schema().fields() != input.schema().fields() {
             return decline("changes the columns");
         }
+        // It is applied again above the take, where reordering would undo the sort.
+        if rewrites_metadata(node) && node.maintains_input_order() != [true] {
+            return decline("rewrites schema metadata and may reorder rows");
+        }
         Ok(())
     }
 }
@@ -380,9 +391,7 @@ fn rebuild(
             .collect::<Vec<_>>();
         return project(input, kept);
     }
-    node.clone()
-        .with_new_children(vec![input])
-        .map_err(|e| e.to_string())
+    replace_children_if_necessary(node.clone(), vec![input]).map_err(|e| e.to_string())
 }
 
 /// Select `names` from `input`, in that order.
@@ -403,6 +412,57 @@ fn project<'a>(
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Arc::new(
         ProjectionExec::try_new(columns, input).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// Copy field metadata by name from `original`, leaving unmatched input fields
+/// unchanged.
+fn with_field_metadata(
+    input: Arc<dyn ExecutionPlan>,
+    original: &ArrowSchema,
+) -> Result<Arc<dyn ExecutionPlan>, String> {
+    let schema = input.schema();
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| match original.field_with_name(field.name()) {
+            Ok(original_field) => Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_metadata(original_field.metadata().clone()),
+            ),
+            Err(_) => field.clone(),
+        })
+        .collect::<Fields>();
+    if &fields == schema.fields() {
+        return Ok(input);
+    }
+    select_columns(input, &fields)
+}
+
+/// Select `fields` from `input` by name. Each column keeps its type from
+/// `input` and takes its field metadata from `fields`.
+fn select_columns(
+    input: Arc<dyn ExecutionPlan>,
+    fields: &Fields,
+) -> Result<Arc<dyn ExecutionPlan>, String> {
+    let schema = input.schema();
+    let columns = fields
+        .iter()
+        .map(|field| {
+            let index = schema.index_of(field.name()).map_err(|e| e.to_string())?;
+            Ok((
+                Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>,
+                field.name().clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let projected_schema =
+        ArrowSchema::new_with_metadata(fields.clone(), schema.metadata().clone());
+    Ok(Arc::new(
+        ProjectionExec::try_new_with_schema_metadata(columns, input, &projected_schema)
+            .map_err(|e| e.to_string())?,
     ))
 }
 
@@ -447,12 +507,18 @@ fn max_rows(read: &FilteredReadExec) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{RecordBatch, RecordBatchIterator};
-    use arrow_schema::SortOptions;
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    };
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field, SortOptions};
+    use datafusion::common::DFSchema;
     use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::when;
     use datafusion::physical_plan::collect;
-    use datafusion::prelude::{col as logical_col, lit};
-    use datafusion_physical_expr::expressions::col;
+    use datafusion::prelude::{SessionContext, col as logical_col, lit};
+    use datafusion_functions::core::expr_fn::arrow_metadata;
+    use datafusion_physical_expr::expressions::{col, is_null};
     use rstest::rstest;
 
     use super::*;
@@ -464,8 +530,6 @@ mod tests {
     use crate::io::exec::filtered_read_proto::{
         filtered_read_exec_from_proto, filtered_read_exec_to_proto,
     };
-    #[cfg(feature = "substrait")]
-    use datafusion::prelude::SessionContext;
     #[cfg(feature = "substrait")]
     use lance_select::RowAddrTreeMap;
 
@@ -528,6 +592,15 @@ mod tests {
             },
         )])
         .unwrap();
+        top_k_by(input, ordering, is_partitioned)
+    }
+
+    /// `ORDER BY ordering LIMIT 3`, planned as [`top_k`] plans it.
+    fn top_k_by(
+        input: Arc<dyn ExecutionPlan>,
+        ordering: LexOrdering,
+        is_partitioned: bool,
+    ) -> Arc<dyn ExecutionPlan> {
         if is_partitioned {
             let input = Arc::new(
                 RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(4)).unwrap(),
@@ -540,6 +613,16 @@ mod tests {
             let input = Arc::new(CoalescePartitionsExec::new(input));
             Arc::new(SortExec::new(ordering, input).with_fetch(Some(3)))
         }
+    }
+
+    /// `SELECT names FROM input`.
+    fn select(input: Arc<dyn ExecutionPlan>, names: &[&str]) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        let indices = names
+            .iter()
+            .map(|name| schema.index_of(name).unwrap())
+            .collect::<Vec<_>>();
+        select_columns(input, schema.project(&indices).unwrap().fields()).unwrap()
     }
 
     fn optimize(
@@ -589,7 +672,7 @@ mod tests {
         let mut scan = read(&dataset, is_filtered, &["key", "wide", "other"]);
         if is_projected {
             // `SELECT wide, key`: reordered, and `other` dropped.
-            scan = project(scan, ["wide", "key"]).unwrap();
+            scan = select(scan, &["wide", "key"]);
         }
         let plan = top_k(scan, is_partitioned);
 
@@ -626,7 +709,7 @@ mod tests {
         let take = TakeExec::try_new(dataset.clone(), narrow, wide)
             .unwrap()
             .unwrap();
-        let scan = project(Arc::new(take), ["key", "wide", "other"]).unwrap();
+        let scan = select(Arc::new(take), &["key", "wide", "other"]);
         let plan = top_k(scan, true);
 
         let rewritten = optimize(&TopKLateMaterialization::new(), &plan);
@@ -728,5 +811,146 @@ mod tests {
         let rule = TopKLateMaterialization::new().with_read_eligibility(move |_, _| is_eligible);
 
         assert!(Arc::ptr_eq(&optimize(&rule, &plan), &plan));
+    }
+
+    /// A sort key can read the row id's field metadata, which a projection may
+    /// set.
+    #[rstest]
+    #[tokio::test]
+    async fn sorting_on_row_id_metadata_keeps_its_order(
+        #[values(false, true)] is_partitioned: bool,
+    ) {
+        let dataset = dataset(false, false).await;
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_projection(
+            dataset
+                .empty_projection()
+                .union_columns(["key", "wide", "other"], OnMissing::Error)
+                .unwrap()
+                .with_row_id(),
+        );
+        let scan: Arc<dyn ExecutionPlan> =
+            Arc::new(FilteredReadExec::try_new(dataset.clone(), options, None).unwrap());
+        let schema = scan.schema();
+        let fields = ["key", "wide", ROW_ID].map(|name| {
+            let field = schema.field_with_name(name).unwrap().clone();
+            if name == ROW_ID {
+                field.with_metadata([("k".into(), "v".into())].into())
+            } else {
+                field
+            }
+        });
+        let scan = select_columns(scan, &Fields::from(fields.to_vec())).unwrap();
+        // ORDER BY CASE WHEN arrow_metadata(_rowid, 'k') = 'v' THEN -key ELSE key END
+        let sort_key = when(
+            arrow_metadata(vec![logical_col(ROW_ID), lit("k")]).eq(lit("v")),
+            -logical_col("key"),
+        )
+        .otherwise(logical_col("key"))
+        .unwrap();
+        let sort_key = SessionContext::new()
+            .create_physical_expr(
+                sort_key,
+                &DFSchema::try_from(scan.schema().as_ref().clone()).unwrap(),
+            )
+            .unwrap();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(sort_key)]).unwrap();
+        let plan = top_k_by(scan, ordering, is_partitioned);
+
+        let rewritten = optimize(&TopKLateMaterialization::new(), &plan);
+
+        assert_eq!(reads(&rewritten), [["key", "_rowid"]]);
+        let expected = run(plan).await;
+        let keys: ArrayRef = Arc::new(Int32Array::from(vec![9, 8, 7]));
+        assert_eq!(&expected["key"], &keys);
+        assert_eq!(run(rewritten).await, expected);
+    }
+
+    /// `s` is `{x, y}`, with `x` falling and `y` rising in row order, and null
+    /// on even rows.
+    async fn struct_dataset() -> Arc<Dataset> {
+        let fields = Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]);
+        let s = StructArray::try_new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from_iter_values((0..12).rev())),
+                Arc::new(Int32Array::from_iter_values(0..12)),
+            ],
+            Some(NullBuffer::from(
+                (0..12).map(|i| i % 2 == 1).collect::<Vec<_>>(),
+            )),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("s", Arc::new(s) as ArrayRef),
+            ("other", Arc::new(Int32Array::from_iter_values(0..12))),
+            (
+                "t",
+                Arc::new(StringArray::from_iter_values(
+                    (0..12).map(|i| format!("t{i}")),
+                )),
+            ),
+        ])
+        .unwrap();
+        let params = WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(params),
+        )
+        .await
+        .unwrap();
+        Arc::new(dataset)
+    }
+
+    /// The read holds only `s.y`, while a narrowed read holds whole columns.
+    #[rstest]
+    #[tokio::test]
+    async fn declines_a_sort_on_a_partial_struct(
+        #[values(false, true)] is_null_key: bool,
+        #[values(false, true)] is_projected: bool,
+    ) {
+        let dataset = struct_dataset().await;
+        let mut scan = read(&dataset, false, &["s.y", "other", "t"]);
+        if is_projected {
+            scan = select(scan, &["t", "s", "other"]);
+        }
+        let schema = scan.schema();
+        let s = col("s", &schema).unwrap();
+        let ordering = if is_null_key {
+            // ORDER BY s IS NULL DESC, other
+            vec![
+                PhysicalSortExpr::new(
+                    is_null(s).unwrap(),
+                    SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                ),
+                PhysicalSortExpr::new_default(col("other", &schema).unwrap()),
+            ]
+        } else {
+            // ORDER BY s NULLS LAST
+            vec![PhysicalSortExpr::new(
+                s,
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )]
+        };
+        let input = Arc::new(CoalescePartitionsExec::new(scan));
+        let sort = SortExec::new(LexOrdering::new(ordering).unwrap(), input);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(sort.with_fetch(Some(2)));
+
+        assert!(Arc::ptr_eq(
+            &optimize(&TopKLateMaterialization::new(), &plan),
+            &plan
+        ));
     }
 }

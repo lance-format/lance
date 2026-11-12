@@ -19,6 +19,8 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, type
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     execution::memory_pool::{MemoryConsumer, MemoryReservation},
     physical_plan::{
@@ -34,8 +36,12 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
+    signed_zero::zero_encodings,
     utils::{
-        ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
+        ExecutionPlanMetricsSetExt, SCALAR_INDEX_MAX_ALLOWED_METRIC,
+        SCALAR_INDEX_MAX_BLOCKED_METRIC, SCALAR_INDEX_MIN_ALLOWED_METRIC,
+        SCALAR_INDEX_MIN_BLOCKED_METRIC, SCALAR_INDEX_SEARCH_TIME_METRIC,
+        SCALAR_INDEX_SER_TIME_METRIC,
     },
 };
 use lance_index::{
@@ -74,10 +80,9 @@ impl ScalarIndexLoader for Dataset {
             return Ok(result);
         }
 
-        let NullableIndexExprResult { lower, upper, .. } = result;
-        let lower = translate_addr_mask_to_row_ids(self, lower).await?;
-        let upper = translate_addr_mask_to_row_ids(self, upper).await?;
-        Ok(NullableIndexExprResult::new(lower, upper))
+        result
+            .try_map(|mask| translate_addr_mask_to_row_ids(self, mask))
+            .await
     }
 }
 
@@ -110,6 +115,32 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
+        let result = if self.dataset.manifest.uses_stable_row_ids()
+            && let Some(fragments) = self.fragments
+            && fragments != self.dataset.fragment_bitmap.as_ref()
+        {
+            let mut scope = RowAddrTreeMap::new();
+            for fragment in fragments {
+                scope.insert_fragment(fragment);
+            }
+            // A shared segment can match rows outside this scan. Restrict physical
+            // addresses before translation to avoid opening their row-id and
+            // deletion files. Scope TRUE and NULL rows together for boolean filters.
+            let restrict = |mask| match mask {
+                NullableRowAddrMask::AllowList(set) => {
+                    let (mut selected, mut nulls) = set.into_parts();
+                    selected &= &scope;
+                    nulls &= &scope;
+                    NullableRowAddrMask::AllowList(NullableRowAddrSet::new(selected, nulls))
+                }
+                mask => mask,
+            };
+            result
+                .try_map(|mask| std::future::ready(Ok::<_, Error>(restrict(mask))))
+                .await?
+        } else {
+            result
+        };
         self.dataset.row_addr_result_to_row_ids(result).await
     }
 }
@@ -198,15 +229,36 @@ impl ScalarIndexExec {
 
     /// Restrict which physical scalar index segments are loaded.
     ///
-    /// This does not restrict the result mask. The consumer remains responsible for applying
-    /// the exact fragment scope, deletion mask, and any required data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// Address-domain results are restricted before translation to stable row ids. Native
+    /// row-id results can still cover other fragments, so the consumer remains responsible
+    /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
+    /// Codecs can inspect this setting with [`Self::fragment_scope`].
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) {
+    /// let exec = exec.with_fragment_scope([1].into_iter().collect());
+    /// assert!(exec.fragment_scope().unwrap().contains(1));
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    /// Codecs can inspect this setting with [`Self::segment_uuids`].
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use uuid::Uuid;
+    /// # fn selected(exec: ScalarIndexExec, uuid: Uuid) {
+    /// let exec = exec.with_segment_uuids(Arc::new(HashSet::from([uuid])));
+    /// assert!(exec.segment_uuids().unwrap().contains(&uuid));
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
     }
@@ -224,6 +276,20 @@ impl ScalarIndexExec {
     /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
+    }
+
+    /// Fragment scope used for index loading and address-to-row-ID translation.
+    /// `None` searches every selected segment. Native row-ID results are not bounded by this scope.
+    /// See [`Self::with_fragment_scope`] for an example.
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
+    /// Explicit scalar segment selection to preserve across a codec round trip.
+    /// `None` searches all committed segments whose coverage intersects the scope.
+    /// See [`Self::with_segment_uuids`] for an example.
+    pub fn segment_uuids(&self) -> Option<&Arc<HashSet<uuid::Uuid>>> {
+        self.segment_uuids.as_ref()
     }
 
     #[async_recursion]
@@ -297,6 +363,7 @@ impl ScalarIndexExec {
                 (None, None) => expr.evaluate(dataset.as_ref(), &metrics).await?,
             }
         };
+        Self::record_match_bounds(&query_result, &plan_metrics);
         let mut fragments_covered_by_result =
             Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
         if let Some(fragment_scope) = fragment_scope {
@@ -307,6 +374,34 @@ impl ScalarIndexExec {
             let _timer = ser_time.timer();
             query_result.serialize(&fragments_covered_by_result, result_format)
         }
+    }
+
+    /// Record how many rows each bound of the index result covers
+    ///
+    /// The node serializes the result into a two-row batch regardless of how
+    /// selective the query was, so `output_rows` is always 2.  These metrics
+    /// describe the two bounds instead: `min_*` sizes the lower bound (rows
+    /// guaranteed to match) and `max_*` the upper bound (rows that may match).
+    ///
+    /// Each bound is a mask that either allows or blocks the rows it names, and
+    /// the metric is suffixed to match, so exactly two of the four are
+    /// reported.  A block list is not converted into a number of matching rows
+    /// because that needs the count of rows the scan will actually consider,
+    /// which is more than this node can know; deletions are only one of the
+    /// things that take rows out of a scan.
+    fn record_match_bounds(result: &IndexExprResult, plan_metrics: &ExecutionPlanMetricsSet) {
+        record_bound(
+            &result.lower,
+            SCALAR_INDEX_MIN_ALLOWED_METRIC,
+            SCALAR_INDEX_MIN_BLOCKED_METRIC,
+            plan_metrics,
+        );
+        record_bound(
+            &result.upper,
+            SCALAR_INDEX_MAX_ALLOWED_METRIC,
+            SCALAR_INDEX_MAX_BLOCKED_METRIC,
+            plan_metrics,
+        );
     }
 }
 
@@ -321,6 +416,13 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -381,6 +483,25 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+}
+
+/// Record the size of one bound under the metric matching how it selects rows
+///
+/// A mask that selects whole fragments does not know how many rows it names, in
+/// which case nothing is recorded rather than a guess.
+fn record_bound(
+    mask: &RowAddrMask,
+    allowed_metric: &'static str,
+    blocked_metric: &'static str,
+    plan_metrics: &ExecutionPlanMetricsSet,
+) {
+    let (metric, rows) = match mask {
+        RowAddrMask::AllowList(allowed) => (allowed_metric, allowed.len()),
+        RowAddrMask::BlockList(blocked) => (blocked_metric, blocked.len()),
+    };
+    if let Some(rows) = rows {
+        plan_metrics.new_count(metric, 0).add(rows as usize);
     }
 }
 
@@ -669,18 +790,28 @@ impl MapIndexExec {
     ///
     /// One NULL survives dedupe on purpose: an index reads a NULL in the list
     /// as "also match null rows", which is a flag rather than a count.
+    ///
+    /// A float zero is looked up under both encodings. The index compares keys
+    /// by encoding, but the hash join downstream matches `-0.0` and `+0.0` per
+    /// IEEE 754, so probing one encoding would miss rows the join would match.
     fn key_values(column: &ArrayRef, dedupe: bool) -> datafusion::error::Result<Vec<ScalarValue>> {
         let mut values = Vec::with_capacity(column.len());
         let mut seen = HashSet::with_capacity(if dedupe { column.len() } else { 0 });
         for row in 0..column.len() {
             let value = ScalarValue::try_from_array(column, row)?;
-            if dedupe {
-                if seen.contains(&value) {
-                    continue;
+            let encodings = match zero_encodings(&value) {
+                Some((negative, positive)) => vec![negative, positive],
+                None => vec![value],
+            };
+            for value in encodings {
+                if dedupe {
+                    if seen.contains(&value) {
+                        continue;
+                    }
+                    seen.insert(value.clone());
                 }
-                seen.insert(value.clone());
+                values.push(value);
             }
-            values.push(value);
         }
         Ok(values)
     }
@@ -790,7 +921,16 @@ impl MapIndexExec {
         }
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
+            // The deletion mask is shared by every batch of the stream, so apply
+            // it to an allow-list probe in place instead of copying it per batch.
+            // Other probes keep the by-value intersection.
+            row_addr_mask = match row_addr_mask {
+                RowAddrMask::AllowList(mut rows) => {
+                    rows.mask(deletion_mask);
+                    RowAddrMask::AllowList(rows)
+                }
+                probe => probe & deletion_mask.as_ref().clone(),
+            };
         }
 
         let row_id_iter = row_addr_mask
@@ -817,6 +957,13 @@ impl ExecutionPlan for MapIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -997,6 +1144,7 @@ impl MaterializeIndexExec {
             fragments: None,
             segment_uuids: segment_uuids.as_deref(),
         };
+        let needs_recheck = expr.needs_recheck();
         let expr_result = expr.evaluate(&loader, metrics.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
@@ -1015,9 +1163,10 @@ impl MaterializeIndexExec {
         // runs on the materialized batches via the scan plan, so any
         // non-matching candidates in `upper` are dropped before they
         // reach the user). `AtLeast` carries an unbounded upper, so the
-        // candidate set is the whole row space — not actionable here.
+        // candidate set is the whole row space, which is only usable when
+        // every row is rechecked.
         let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
-            if result.is_at_least() && !result.is_exact() {
+            if result.is_at_least() && !result.is_exact() && !needs_recheck {
                 todo!("Support AtLeast in MaterializeIndexExec")
             }
             Ok(result.upper)
@@ -1139,6 +1288,13 @@ impl ExecutionPlan for MaterializeIndexExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1198,13 +1354,18 @@ impl ExecutionPlan for MaterializeIndexExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use std::{ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
     use arrow::record_batch::RecordBatchIterator;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, UInt64Array, cast::AsArray, record_batch,
+    };
     use arrow_schema::Schema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::{
         error::DataFusionError,
         execution::{
@@ -1217,29 +1378,47 @@ mod tests {
     };
     use futures::TryStreamExt;
     use lance_core::{
+        ROW_ID,
         deepsize::DeepSizeOf,
         utils::{address::RowAddress, tempfile::TempStrDir},
+    };
+    use lance_datafusion::exec::OneShotExec;
+    use lance_datafusion::utils::{
+        MetricsExt, SCALAR_INDEX_MAX_ALLOWED_METRIC, SCALAR_INDEX_MAX_BLOCKED_METRIC,
+        SCALAR_INDEX_MIN_ALLOWED_METRIC, SCALAR_INDEX_MIN_BLOCKED_METRIC,
     };
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
+        metrics::NoOpMetricsCollector,
         scalar::{
-            SargableQuery, ScalarIndexParams,
-            expression::{ScalarIndexExpr, ScalarIndexSearch},
+            BuiltinIndexType, SargableQuery, ScalarIndexParams,
+            expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+            zonemap::ZoneMapIndexBuilderParams,
         },
     };
-    use lance_select::{RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat};
+    use lance_select::{
+        NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrTreeMap,
+        RowSetOps, result::IndexExprResultWireFormat,
+    };
+    use rstest::rstest;
 
     use crate::{
         Dataset,
-        dataset::WriteParams,
+        dataset::{
+            WriteParams,
+            optimize::{CompactionOptions, compact_files},
+        },
         io::exec::scalar_index::MaterializeIndexExec,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
+        utils::test::{
+            DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture,
+            copy_test_data_to_tmp,
+        },
     };
 
     use super::{
         DistinctRowAddrs, MAP_INDEX_CANDIDATES_MEMORY_CONSUMER, MapIndexExec,
-        ROW_ADDR_INSERT_RESERVATION_BYTES, ScalarIndexExec,
+        ROW_ADDR_INSERT_RESERVATION_BYTES, ScalarIndexExec, ScopedScalarIndexLoader,
     };
 
     struct TestFixture {
@@ -1276,6 +1455,45 @@ mod tests {
             dataset: Arc::new(dataset),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    #[test]
+    fn key_values_probes_both_zero_encodings() {
+        fn float_bits(values: &[ScalarValue]) -> Vec<u64> {
+            values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Float64(Some(v)) => v.to_bits(),
+                    other => panic!("unexpected key value {other:?}"),
+                })
+                .collect()
+        }
+        fn bits(values: &[f64]) -> Vec<u64> {
+            values.iter().map(|v| v.to_bits()).collect()
+        }
+
+        let floats: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![
+            1.0,
+            0.0,
+            1.0,
+            f64::NAN,
+        ]));
+
+        // A zero row yields both encodings, so without dedupe there are more
+        // values than rows. The values only build an `IsIn` set, so nothing
+        // depends on them lining up with input rows.
+        let values = MapIndexExec::key_values(&floats, false).unwrap();
+        assert_eq!(float_bits(&values), bits(&[1.0, -0.0, 0.0, 1.0, f64::NAN]));
+
+        let deduped = MapIndexExec::key_values(&floats, true).unwrap();
+        assert_eq!(float_bits(&deduped), bits(&[1.0, -0.0, 0.0, f64::NAN]));
+
+        // Integer zero has a single encoding and is not expanded.
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        assert_eq!(
+            MapIndexExec::key_values(&ints, false).unwrap(),
+            vec![ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(1))]
+        );
     }
 
     #[test]
@@ -1419,6 +1637,184 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(row_ids, vec![6, 8]);
+
+        let mut nulls = RowAddrTreeMap::new();
+        nulls.insert(RowAddress::new_from_parts(fragment_id, 3).into());
+        let mask = NullableRowAddrMask::AllowList(NullableRowAddrSet::new(partial_fragment, nulls));
+        let exact = dataset
+            .row_addr_result_to_row_ids(NullableIndexExprResult::exact(mask.clone()))
+            .await
+            .unwrap();
+        assert!(exact.is_exact());
+        assert!(exact.lower.selected(6));
+        assert!(!exact.lower.selected(8));
+        let NullableRowAddrMask::AllowList(set) = &exact.lower else {
+            unreachable!()
+        };
+        assert!(set.null_rows().contains(8));
+
+        let interval = dataset
+            .row_addr_result_to_row_ids(NullableIndexExprResult::at_most(mask.clone()))
+            .await
+            .unwrap();
+        assert!(!interval.is_exact());
+        assert!(!interval.lower.selected(6));
+        assert!(interval.upper.selected(6));
+
+        let scope = [0].into_iter().collect();
+        let loader = ScopedScalarIndexLoader {
+            dataset: &dataset,
+            fragments: Some(&scope),
+            segment_uuids: None,
+        };
+        let scoped = loader
+            .row_addr_result_to_row_ids(NullableIndexExprResult::exact(mask))
+            .await
+            .unwrap();
+        assert!(scoped.is_exact());
+        assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
+    }
+
+    #[rstest]
+    #[case::deleted(false)]
+    #[case::compacted(true)]
+    #[tokio::test]
+    async fn nullable_prefilter_preserves_sql_semantics(#[case] compact: bool) {
+        let zone: Vec<Option<i32>> = (0..24).map(|id| (id % 6 >= 3).then_some(id / 6)).collect();
+        let batch = record_batch!(
+            ("id", Int32, (0..24).collect::<Vec<_>>()),
+            ("zone", Int32, zone.clone())
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 6,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (1, 9)").await.unwrap();
+        if compact {
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+            assert_eq!(dataset.fragments().len(), 1);
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::to_value(ZoneMapIndexBuilderParams::new(3)).unwrap());
+        dataset
+            .create_index(&["zone"], IndexType::ZoneMap, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        type Predicate = fn(i32, Option<i32>) -> bool;
+        let cases: &[(&str, Predicate)] = &[
+            ("zone IS NULL", |_, value| value.is_none()),
+            ("zone IS NOT NULL", |_, value| value.is_some()),
+            ("zone = 1", |_, value| value == Some(1)),
+            ("zone = 99", |_, value| value == Some(99)),
+            ("zone >= 0 OR zone IS NULL", |_, _| true),
+            (
+                "(zone IS NULL AND id >= 8) OR (zone > 1 AND id < 20)",
+                |id, value| {
+                    (value.is_none() && id >= 8) || (value.is_some_and(|v| v > 1) && id < 20)
+                },
+            ),
+            ("NOT (zone = 1 OR id < 4)", |id, value| {
+                value.is_some_and(|v| v != 1) && id >= 4
+            }),
+        ];
+        for (filter, predicate) in cases {
+            let expected: Vec<i32> = (0..24)
+                .filter(|id| ![1, 9].contains(id) && predicate(*id, zone[*id as usize]))
+                .collect();
+            let mut scanner = dataset.scan();
+            scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndex"), "{filter}: {plan}");
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut actual = batch["id"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{filter}, compact={compact}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nullable_prefilter_combines_address_and_row_id_indices() {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::to_value(ZoneMapIndexBuilderParams::new(1)).unwrap());
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::ZoneMap,
+                Some("value_zonemap".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let old =
+            ScalarIndexLoader::load_index(&dataset, "value", "value_idx", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let current = ScalarIndexLoader::load_index(
+            &dataset,
+            "value",
+            "value_zonemap",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert!(!old.results_are_row_addresses());
+        assert!(current.results_are_row_addresses());
+        let query = |name: &str, index_type: &str, query: SargableQuery| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "value".into(),
+                index_name: name.into(),
+                index_type: index_type.into(),
+                query: Arc::new(query),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })
+        };
+        let range = query(
+            "value_idx",
+            "BTree",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(9))),
+                Bound::Excluded(ScalarValue::Int32(Some(12))),
+            ),
+        );
+        let nulls = query("value_zonemap", "ZoneMap", SargableQuery::IsNull());
+        let expression = ScalarIndexExpr::Or(Box::new(range), Box::new(nulls));
+        let result = expression
+            .evaluate_nullable(&dataset, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact());
+        for id in 0..16 {
+            assert_eq!(result.lower.selected(id), [0, 8, 9, 10, 11].contains(&id));
+            assert_eq!(result.upper.selected(id), [0, 8, 9, 10, 11].contains(&id));
+        }
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
@@ -1449,7 +1845,8 @@ mod tests {
         let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
             assert_eq!(plan.schema(), schema);
             assert_eq!(
-                plan.partition_statistics(None)
+                StatisticsContext::new()
+                    .compute(&plan, &StatisticsArgs::new())
                     .unwrap()
                     .column_statistics
                     .len(),
@@ -1476,6 +1873,107 @@ mod tests {
         let schema = IndexExprResultWireFormat::TwoMask.schema().clone();
 
         verify(plan, schema).await;
+    }
+
+    /// The node always emits a two-row batch, so `output_rows` says nothing
+    /// about selectivity.  The `min_` / `max_` metrics size the two bounds of
+    /// the result instead, under the name matching how each bound selects rows.
+    #[tokio::test]
+    async fn test_scalar_index_exec_reports_match_bounds() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        // 100 rows, of which 47 match
+        let less_than_47 = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::UInt64(Some(47))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let run = async |expr: ScalarIndexExpr| {
+            let plan =
+                ScalarIndexExec::new(dataset.clone(), expr, IndexExprResultWireFormat::default());
+            let batches = plan
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            // The output batch shape is fixed no matter how many rows matched
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+            let metrics = plan.metrics().unwrap();
+            let bound = |name| metrics.find_count(name).map(|count| count.value());
+            [
+                bound(SCALAR_INDEX_MIN_ALLOWED_METRIC),
+                bound(SCALAR_INDEX_MIN_BLOCKED_METRIC),
+                bound(SCALAR_INDEX_MAX_ALLOWED_METRIC),
+                bound(SCALAR_INDEX_MAX_BLOCKED_METRIC),
+            ]
+        };
+
+        // An exact result allows the matching rows at both bounds
+        let bounds = run(less_than_47.clone()).await;
+        assert_eq!(bounds, [Some(47), None, Some(47), None]);
+
+        // Negating it turns both bounds into block lists of the same rows
+        let bounds = run(ScalarIndexExpr::Not(Box::new(less_than_47))).await;
+        assert_eq!(bounds, [None, Some(47), None, Some(47)]);
+    }
+
+    /// Every batch of the stream applies the shared deletion mask: deleted
+    /// keys in any batch produce no candidates.
+    #[tokio::test]
+    async fn test_map_index_exec_drops_deleted_rows_in_every_batch() {
+        let mut dataset = gen_batch()
+            .col("key", lance_datagen::array::step::<UInt64Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset.delete("key % 2 = 0").await.unwrap();
+
+        let batches = [vec![0_u64, 1, 2, 3], vec![10, 11, 12, 13]]
+            .map(|keys| Ok(record_batch!(("key", UInt64, keys)).unwrap()));
+        let schema = batches[0].as_ref().unwrap().schema();
+        let input = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ))));
+        let plan = MapIndexExec::new(
+            Arc::new(dataset),
+            "key".to_string(),
+            "key_idx".to_string(),
+            input,
+        );
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut row_ids = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, vec![1, 3, 11, 13]);
     }
 
     #[test]

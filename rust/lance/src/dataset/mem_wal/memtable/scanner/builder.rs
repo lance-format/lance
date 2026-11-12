@@ -27,10 +27,11 @@ use super::exec::{
 use crate::dataset::mem_wal::index::{FtsQueryExpr, IndexedFilter, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsMemQuery, MemQuery, SearchOptions, VectorMemQuery, plan_filter,
 };
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// Vector search query parameters.
 #[derive(Debug, Clone)]
@@ -1487,7 +1488,8 @@ mod tests {
 
     /// A deduplicated filtered read from the filter indexes returns what
     /// reading every row returns, across overwrites, deletes, rows not yet
-    /// visible, and every key type, single and composite.
+    /// visible, every key type, single and composite, and filters over one
+    /// index, two, or an index beside a predicate it cannot answer.
     #[tokio::test]
     async fn memtable_filter_indexes_answer_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -1499,7 +1501,7 @@ mod tests {
             "red", "blue", "green", "amber", "black", "white", "grey", "pink", "cyan", "teal",
             "navy", "lime", "plum", "rose", "sand", "gold",
         ];
-        const FILTERS: [&str; 9] = [
+        const FILTERS: [&str; 17] = [
             "colour = 'red'",
             "colour IN ('red', 'blue')",
             "colour IS NULL",
@@ -1510,6 +1512,16 @@ mod tests {
             "colour BETWEEN 'red' AND 'blue'",
             "colour > 'red' AND colour < 'blue'",
             "colour > 'red' AND colour <= 'red'",
+            "n = 3",
+            "n IN (1, 2)",
+            "n < 3",
+            "n BETWEEN 30 AND 10",
+            "n > 20 AND n <= 20",
+            // Both indexes in one filter, and an index beside a predicate it
+            // cannot answer.
+            "n > 30 AND colour = 'red'",
+            "n = 3 OR colour = 'blue'",
+            "n = 3 AND colour LIKE 'r%'",
         ];
         // Every key type a memtable key index accepts.
         const KEY_TYPES: [DataType; 13] = [
@@ -1536,7 +1548,8 @@ mod tests {
             (seed >> 33) % bound
         };
         let (mut checked_reads, mut full_reads) = (0, 0);
-        for round in 0..150 {
+        // Twice through every pairing of key type with single or composite key.
+        for round in 0..2 * 3 * KEY_TYPES.len() {
             let composite = round % 3 == 1;
             let key_type = KEY_TYPES[round % KEY_TYPES.len()].clone();
             let string_key = matches!(
@@ -1547,11 +1560,15 @@ mod tests {
                 Field::new("a", key_type.clone(), false),
                 Field::new("b", DataType::Int32, false),
                 Field::new("colour", DataType::Utf8, true),
+                Field::new("n", DataType::Int32, true),
                 Field::new(TOMBSTONE, DataType::Boolean, false),
             ]));
             let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
             let mut indexes = IndexStore::from_specs(
-                &[MemIndexSpec::btree("colour_idx", 2, "colour")],
+                &[
+                    MemIndexSpec::btree("colour_idx", 2, "colour"),
+                    MemIndexSpec::btree("n_idx", 3, "n"),
+                ],
                 &lance_schema,
                 1024,
                 64,
@@ -1569,7 +1586,8 @@ mod tests {
             let batches = 1 + next(40) as usize;
             for position in 0..batches {
                 let rows = 1 + next(16) as usize;
-                let (mut a, mut b, mut colour, mut tombstone) = (vec![], vec![], vec![], vec![]);
+                let (mut a, mut b, mut colour, mut n, mut tombstone) =
+                    (vec![], vec![], vec![], vec![], vec![]);
                 for _ in 0..rows {
                     a.push(next(60) as i32);
                     b.push(if composite { next(3) as i32 } else { 1 });
@@ -1579,6 +1597,7 @@ mod tests {
                         16 => None,
                         c => Some(COLOURS[c as usize]),
                     });
+                    n.push((!deleted && next(12) != 0).then(|| next(40) as i32));
                     tombstone.push(deleted);
                 }
                 let batch = RecordBatch::try_new(
@@ -1597,6 +1616,7 @@ mod tests {
                         .unwrap(),
                         Arc::new(Int32Array::from(b)),
                         Arc::new(StringArray::from(colour)),
+                        Arc::new(Int32Array::from(n)),
                         Arc::new(BooleanArray::from(tombstone)),
                     ],
                 )
@@ -3499,7 +3519,8 @@ mod tests {
     }
 
     /// Twelve rows in three batches of the values a comparison most often gets
-    /// wrong: nulls, NaN, both zeros, the infinities, empty and non-ASCII text.
+    /// wrong: nulls, both NaN signs, both zeros, the infinities, empty and
+    /// non-ASCII text.
     /// Each `indexed` column has a B-tree, one on a `declining` column declines
     /// every filter, and `rid` names each row with no index.
     fn differential_memtable(
@@ -3540,7 +3561,7 @@ mod tests {
             Some(1.5),
             None,
             Some(3.0),
-            Some(-0.0),
+            Some(-f64::NAN),
         ];
         let strs = [
             Some("apple"),
@@ -3644,6 +3665,42 @@ mod tests {
         rids
     }
 
+    /// Float filters treat both signs of zero and NaN as one value, through the
+    /// B-tree and through a scan alike. The rows are asserted because a scan and an
+    /// index can agree on the same wrong total-order answer.
+    #[rstest::rstest]
+    #[case::zero("f = 0.0", &[0, 1])]
+    #[case::zero_list("f IN (0.0, 1.5)", &[0, 1, 4, 8])]
+    #[case::nan("f = 'NaN'", &[3, 11])]
+    #[case::upper_bound("f < 0.0", &[5, 7])]
+    #[case::lower_bound("f > 1.0", &[3, 4, 6, 8, 10, 11])]
+    #[case::two_sided_bound("f BETWEEN -3.0 AND 2.0", &[0, 1, 4, 5, 8])]
+    #[case::negative_infinity_lower_bound("f >= '-Infinity'", &[0, 1, 3, 4, 5, 6, 7, 8, 10, 11])]
+    #[case::infinity_upper_bound("f <= 'Infinity'", &[0, 1, 4, 5, 6, 7, 8, 10])]
+    #[tokio::test]
+    async fn indexed_float_filters_ignore_sign_encodings(
+        #[case] filter: &str,
+        #[case] expected: &[i32],
+    ) {
+        let memtable = differential_memtable(&["f"], &[]);
+        let (batch_store, indexes, schema) = &memtable;
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.filter(filter).unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(plan.contains("ScalarMemIndexExec"), "{filter}: {plan}");
+        for use_index in [false, true] {
+            assert_eq!(
+                filtered_rids(&memtable, filter, use_index).await,
+                expected,
+                "{filter} with use_index={use_index}"
+            );
+        }
+    }
+
     /// Every filter returns the same rows through the indexes as reading every
     /// row, with indexes on some columns so filters mix both, and with an index
     /// that declines inside `AND` and `OR`.
@@ -3701,6 +3758,8 @@ mod tests {
             "NOT (i = 7)",
             "i = 7 AND rid > 3",
             "i = 7 OR rid = 0",
+            "(i = 7 AND rid > 3) OR s = 'b'",
+            "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
             "rid >= 6 AND f > 0.0",
             "b",
             "NOT b",
@@ -3731,6 +3790,8 @@ mod tests {
                     "s LIKE 'ap%'",
                     "b",
                     "d = DATE '2022-01-08'",
+                    "(i = 7 AND rid > 3) OR s = 'b'",
+                    "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
                 ] {
                     let (batch_store, indexes, schema) = &memtable;
                     let mut scanner =
@@ -3917,7 +3978,7 @@ mod tests {
         for row in rows.iter().filter(|row| row.batch < visible_batches) {
             newest.insert(row.id, row);
         }
-        let l2 = DistanceType::L2.func::<f32>();
+        let l2 = DistanceType::L2.try_func::<f32>().unwrap();
         let mut out: Vec<(i64, f32)> = newest
             .values()
             .filter(|row| keep(row))

@@ -10,12 +10,17 @@
 //! This requires transparent compression and is most suitable for
 //! large data types.
 
+use std::sync::Arc;
+
 use crate::{
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
-    format::pb21::CompressiveEncoding,
+    format::metadata::CompressiveEncoding,
 };
 
+use arrow_buffer::BooleanBuffer;
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
+use lance_core::utils::tokio::spawn_cpu;
 
 /// Per-value compression must either:
 ///
@@ -51,4 +56,38 @@ pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)>;
+
+    /// Whether selection needs the structural validity of materialized tensor slots.
+    fn needs_row_validity(&self) -> bool {
+        false
+    }
+
+    /// Compress with an optional valid-row bitmap for sampling. Validity remains
+    /// owned by the structural encoder and is not part of the value payload.
+    fn compress_with_validity(
+        &self,
+        data: DataBlock,
+        _validity: Option<&BooleanBuffer>,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        self.compress(data)
+    }
+
+    /// Asynchronous counterpart of [`Self::compress_with_validity`].
+    ///
+    /// The default implementation runs the existing synchronous compressor on
+    /// the CPU pool. Implementations that can fan out internally may override
+    /// this method, but must keep the synchronous method above available for
+    /// callers that do not have an async context.
+    #[doc(hidden)]
+    fn compress_with_validity_async(
+        self: Arc<Self>,
+        data: DataBlock,
+        validity: Option<BooleanBuffer>,
+    ) -> BoxFuture<'static, Result<(PerValueDataBlock, CompressiveEncoding)>>
+    where
+        Self: 'static,
+    {
+        async move { spawn_cpu(move || self.compress_with_validity(data, validity.as_ref())).await }
+            .boxed()
+    }
 }

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! FM-Index for exact substring search (following the Infini-gram Mini paper)
+//! FM-Index for substring search (following the Infini-gram Mini paper)
 //!
 //! The FM-Index is a compressed full-text index based on the Burrows-Wheeler Transform (BWT).
-//! It supports exact substring matching via backward search and returns exact row ids.
+//! It supports substring matching via backward search. Patterns containing spaces
+//! return candidates that require source rechecking because indexing maps NUL to space.
 //!
 //! Architecture (matching the paper):
 //!   - Huffman-shaped Wavelet Tree over BWT for entropy-compressed rank queries (~0.26N)
@@ -29,10 +30,11 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
@@ -41,7 +43,7 @@ use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
 use crate::pb;
-use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
+use crate::scalar::expression::{ContainsQuerySupport, ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     TrainingRequest, VALUE_COLUMN_NAME,
@@ -71,6 +73,18 @@ const DEFAULT_DEMAND_PAGE_TARGET_BYTES: usize = 512 * 1024;
 const DEFAULT_PREWARM_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const FMINDEX_PARTITION_FINGERPRINT_KEY: &str = "partition_fingerprint";
 const SENTINEL_BYTE: u8 = 0xFF;
+
+fn contains_query_support(pattern: &str) -> ContainsQuerySupport {
+    // Index construction replaces NUL with space. Space matches are therefore
+    // a superset of source matches, while NUL matches cannot be recovered.
+    if pattern.as_bytes().contains(&0) {
+        ContainsQuerySupport::Unsupported
+    } else if pattern.contains(' ') {
+        ContainsQuerySupport::NeedsRecheck
+    } else {
+        ContainsQuerySupport::Exact
+    }
+}
 
 /// SA sampling rate. Store every D-th SA entry. Locate walks at most D LF steps.
 const SA_SAMPLE_RATE: usize = 32;
@@ -1139,6 +1153,7 @@ impl FMIndex {
 #[derive(Debug)]
 struct LazyFMIndex {
     wavelet: LazyHuffmanWaveletTree,
+    // Document positions must stay aligned even when remapping deletes a row.
     row_ids: Vec<u64>,
     sa_samples: Vec<u64>,
     doc_start_positions: Vec<u64>,
@@ -1247,7 +1262,10 @@ impl LazyFMIndex {
         for i in lo..hi {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
-            result.insert(self.row_ids[doc_idx] as u32);
+            let row_addr = self.row_ids[doc_idx];
+            if row_addr != RowAddress::TOMBSTONE_ROW {
+                result.insert(row_addr as u32);
+            }
         }
         result
     }
@@ -1264,7 +1282,7 @@ impl LazyFMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
+            if row_addr != RowAddress::TOMBSTONE_ROW && seen.insert(row_addr) {
                 result.push(row_addr);
             }
         }
@@ -1282,7 +1300,7 @@ impl LazyFMIndex {
             let text_pos = self.locate_async(i).await?;
             let doc_idx = self.doc_for_position(text_pos);
             let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
+            if row_addr != RowAddress::TOMBSTONE_ROW && seen.insert(row_addr) {
                 result.push(row_addr);
             }
         }
@@ -1511,7 +1529,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -1529,8 +1547,16 @@ impl FMIndexScalarIndex {
         let mut parts = futures::stream::iter(pfiles)
             .map(|(id, name)| {
                 let store = Arc::clone(&store);
+                let fri = fri.clone();
                 async move {
-                    let partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    let mut partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    if let Some(fri) = fri {
+                        for row_id in &mut partition.fm.row_ids {
+                            *row_id = fri
+                                .remap_row_id(*row_id)
+                                .unwrap_or(RowAddress::TOMBSTONE_ROW);
+                        }
+                    }
                     Result::<_>::Ok((id, Arc::new(partition)))
                 }
             })
@@ -1561,10 +1587,19 @@ impl FMIndexScalarIndex {
         Ok(())
     }
 
-    async fn search_string_contains(&self, pattern: &[u8]) -> Result<SearchResult> {
+    async fn search_string_contains(&self, pattern: &str) -> Result<SearchResult> {
         use lance_select::RowAddrTreeMap;
 
-        let pattern: Arc<[u8]> = Arc::from(pattern);
+        let needs_recheck = match contains_query_support(pattern) {
+            ContainsQuerySupport::Exact => false,
+            ContainsQuerySupport::NeedsRecheck => true,
+            ContainsQuerySupport::Unsupported => {
+                return Err(Error::not_supported(
+                    "FM-index cannot search patterns containing NUL bytes; evaluate the predicate against source data",
+                ));
+            }
+        };
+        let pattern: Arc<[u8]> = Arc::from(pattern.as_bytes());
         let tree = futures::stream::iter(self.partitions.iter().cloned())
             .map(|partition| {
                 let pattern = Arc::clone(&pattern);
@@ -1588,10 +1623,12 @@ impl FMIndexScalarIndex {
             })
             .await?;
 
-        Ok(SearchResult::Exact(lance_select::NullableRowAddrSet::new(
-            tree,
-            Default::default(),
-        )))
+        let rows = lance_select::NullableRowAddrSet::new(tree, Default::default());
+        Ok(if needs_recheck {
+            SearchResult::AtMost(rows)
+        } else {
+            SearchResult::Exact(rows)
+        })
     }
 }
 
@@ -1621,7 +1658,9 @@ impl Index for FMIndexScalarIndex {
         let mut frags = RoaringBitmap::new();
         for p in &self.partitions {
             for &rid in &p.fm.row_ids {
-                frags.insert((rid >> 32) as u32);
+                if rid != RowAddress::TOMBSTONE_ROW {
+                    frags.insert(RowAddress::from(rid).fragment_id());
+                }
             }
         }
         Ok(frags)
@@ -1640,9 +1679,7 @@ impl ScalarIndex for FMIndexScalarIndex {
             .downcast_ref::<TextQuery>()
             .ok_or_else(|| Error::invalid_input("Fm only supports TextQuery"))?;
         match tq {
-            TextQuery::StringContains(pattern) => {
-                self.search_string_contains(pattern.as_bytes()).await
-            }
+            TextQuery::StringContains(pattern) => self.search_string_contains(pattern).await,
             // Regex queries are routed only to the ngram index (the FM-index's
             // query parser advertises `supports_regex = false`), so this is
             // unreachable in practice; reject it explicitly rather than silently.
@@ -1659,6 +1696,7 @@ impl ScalarIndex for FMIndexScalarIndex {
     fn can_remap(&self) -> bool {
         false
     }
+
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
@@ -1779,7 +1817,7 @@ async fn write_partitioned_fmindex_stream_with_config(
     for _ in 0..config.num_workers {
         let receiver = receiver.clone();
         let store = store.clone();
-        worker_tasks.push(tokio::task::spawn(async move {
+        worker_tasks.push(lance_core::utils::tokio::spawn(async move {
             let mut files = Vec::new();
             while let Ok(job) = receiver.recv().await {
                 files.push(
@@ -2305,6 +2343,10 @@ impl BasicTrainer for FMIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -2313,7 +2355,8 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         "Fm"
     }
     fn provides_exact_answer(&self) -> bool {
-        true
+        // Patterns containing spaces can match NUL values normalized during indexing.
+        false
     }
     fn version(&self) -> u32 {
         FMINDEX_INDEX_VERSION
@@ -2323,16 +2366,19 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         index_name: String,
         _details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(TextQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            // needs_recheck: the FM-index returns exact substring matches.
-            false,
-            // supports_regex: regex acceleration is only implemented for ngram.
-            false,
-            // min_contains_chars: the FM-index can match a needle of any length.
-            0,
-        )))
+        Some(Box::new(
+            TextQueryParser::new(
+                index_name,
+                self.name().to_string(),
+                // needs_recheck: exactness is determined for each pattern below.
+                false,
+                // supports_regex: regex acceleration is only implemented for ngram.
+                false,
+                // min_contains_chars: the FM-index can match any non-empty needle.
+                0,
+            )
+            .with_contains_query_support(contains_query_support),
+        ))
     }
     async fn load_index(
         &self,
@@ -2358,7 +2404,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
 mod tests {
     use super::*;
     use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, UInt64Array};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::{ROW_ADDR, cache::LanceCache};
     use lance_io::object_store::ObjectStore;
@@ -2366,6 +2412,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::CompactedToFragmentOne;
     use crate::scalar::registry::BasicTrainer;
 
     #[derive(Debug, Clone)]
@@ -2637,10 +2684,10 @@ mod tests {
             .await
             .unwrap();
         match r {
-            SearchResult::Exact(set) => {
+            SearchResult::AtMost(set) => {
                 assert_eq!(set.len(), Some(30));
             }
-            _ => panic!("expected exact result"),
+            _ => panic!("expected candidate result"),
         }
 
         let r = index
@@ -2651,10 +2698,10 @@ mod tests {
             .await
             .unwrap();
         match r {
-            SearchResult::Exact(set) => {
+            SearchResult::AtMost(set) => {
                 assert_eq!(set.len(), Some(1));
             }
-            _ => panic!("expected exact result"),
+            _ => panic!("expected candidate result"),
         }
 
         let r = index
@@ -2670,6 +2717,77 @@ mod tests {
             }
             _ => panic!("expected exact result"),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::no_deletions(vec![])]
+    #[case::middle_deleted(vec![1])]
+    #[case::all_deleted(vec![0, 1, 2, 3])]
+    #[tokio::test]
+    async fn test_load_remaps_positional_row_addresses(
+        #[case] deleted: Vec<u64>,
+        #[values(false, true)] is_prewarmed: bool,
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tempdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let texts: Vec<(u64, &[u8])> = vec![
+            (0, b"alpha needle"),
+            (1, b"beta needle"),
+            (2, b"gamma needle needle"),
+            (3, b"delta needle"),
+        ];
+        for (id, texts) in texts.chunks(3).enumerate() {
+            write_fmindex(
+                &FMIndex::build(texts).unwrap(),
+                store.as_ref(),
+                &fmindex_partition_path(id as u64),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let remapper = Arc::new(CompactedToFragmentOne {
+            deleted: deleted.into_iter().collect(),
+        });
+        let index =
+            FMIndexScalarIndex::load(store, Some(remapper.clone()), &LanceCache::no_cache())
+                .await
+                .unwrap();
+        if is_prewarmed {
+            index.prewarm().await.unwrap();
+        }
+
+        for pattern in ["needle", "alpha", "beta", "gamma", "delta", "absent"] {
+            let expected: lance_select::RowAddrTreeMap = texts
+                .iter()
+                .filter(|(_, text)| text.windows(pattern.len()).any(|w| w == pattern.as_bytes()))
+                .filter_map(|(row_id, _)| remapper.remap_row_id(*row_id))
+                .collect();
+            let result = index
+                .search(
+                    &TextQuery::StringContains(pattern.to_string()),
+                    &crate::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let SearchResult::Exact(rows) = result else {
+                panic!("expected exact result");
+            };
+            assert_eq!(rows.selected_rows(), &expected, "{pattern}");
+        }
+        let expected_fragments: RoaringBitmap = if remapper.deleted.len() == texts.len() {
+            RoaringBitmap::new()
+        } else {
+            [1].into_iter().collect()
+        };
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            expected_fragments
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2713,10 +2831,10 @@ mod tests {
             .await
             .unwrap();
         match r {
-            SearchResult::Exact(set) => {
+            SearchResult::AtMost(set) => {
                 assert_eq!(set.len(), Some(30));
             }
-            _ => panic!("expected exact result"),
+            _ => panic!("expected candidate result"),
         }
         assert_eq!(loaded_wavelet_blocks(index.as_ref()), total_blocks);
     }
@@ -2796,10 +2914,10 @@ mod tests {
             .await
             .unwrap();
         match r {
-            SearchResult::Exact(set) => {
+            SearchResult::AtMost(set) => {
                 assert_eq!(set.len(), Some(1));
             }
-            _ => panic!("expected exact result"),
+            _ => panic!("expected candidate result"),
         }
 
         assert!(
@@ -2812,8 +2930,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_plugin_train_and_load() {
-        let docs = vec!["hello world", "hello rust", "goodbye world"];
-        let row_addrs: Vec<u64> = vec![0, 1, 2];
+        let docs = vec!["hello world", "hello rust", "goodbye world", "hello\0world"];
+        let row_addrs: Vec<u64> = vec![0, 1, 2, 3];
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(
                 crate::scalar::registry::VALUE_COLUMN_NAME,
@@ -2865,19 +2983,48 @@ mod tests {
             .await
             .unwrap();
 
-        let r = index
+        assert!(!FMIndexPlugin.provides_exact_answer());
+        for is_prewarmed in [false, true] {
+            if is_prewarmed {
+                index.prewarm().await.unwrap();
+            }
+
+            let result = index
+                .search(
+                    &TextQuery::StringContains("hello".to_string()),
+                    &crate::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let SearchResult::Exact(rows) = result else {
+                panic!("expected exact result for a pattern without spaces");
+            };
+            assert_eq!(rows.len(), Some(3));
+
+            let result = index
+                .search(
+                    &TextQuery::StringContains("hello world".to_string()),
+                    &crate::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let SearchResult::AtMost(rows) = result else {
+                panic!("expected candidates for a pattern containing spaces");
+            };
+            assert_eq!(rows.len(), Some(2));
+            assert!(rows.selected(0));
+            assert!(rows.selected(3));
+        }
+
+        let error = index
             .search(
-                &TextQuery::StringContains("hello".to_string()),
+                &TextQuery::StringContains("hello\0world".to_string()),
                 &crate::metrics::NoOpMetricsCollector,
             )
             .await
-            .unwrap();
-        match r {
-            SearchResult::Exact(set) => {
-                assert_eq!(set.len(), Some(2));
-            }
-            _ => panic!("expected exact result"),
-        }
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("patterns containing NUL bytes"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3133,8 +3280,8 @@ mod tests {
             .await
             .unwrap();
         match r {
-            SearchResult::Exact(set) => assert_eq!(set.len(), Some(1)),
-            _ => panic!("expected exact result"),
+            SearchResult::AtMost(set) => assert_eq!(set.len(), Some(1)),
+            _ => panic!("expected candidate result"),
         }
 
         let r = index
@@ -3145,8 +3292,8 @@ mod tests {
             .await
             .unwrap();
         match r {
-            SearchResult::Exact(set) => assert_eq!(set.len(), Some(0)),
-            _ => panic!("expected exact result"),
+            SearchResult::AtMost(set) => assert_eq!(set.len(), Some(0)),
+            _ => panic!("expected candidate result"),
         }
     }
 

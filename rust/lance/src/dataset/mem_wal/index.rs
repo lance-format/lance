@@ -41,6 +41,7 @@ pub(crate) use filter::{
 };
 pub use fts::{FtsEntry, FtsMemIndex, FtsMemIndexPlugin, FtsParams, FtsQueryExpr, SearchOptions};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats, search_cross_column};
+pub(crate) use hnsw::DEFAULT_SEARCH_EF as HNSW_DEFAULT_SEARCH_EF;
 pub use hnsw::{HnswMemIndex, HnswMemIndexPlugin, HnswParams};
 pub use pk_key::encode_pk_tuple;
 pub use plugin::{

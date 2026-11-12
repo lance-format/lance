@@ -18,11 +18,13 @@ import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
+import org.lance.index.scalar.FmIndexParams;
 import org.lance.index.scalar.InvertedIndexParams;
 import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.update.UpdateParams;
 import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -621,8 +623,14 @@ public class ScalarIndexTest {
       testDatasetB.createEmptyDataset().close();
       datasetA = testDatasetA.write(1, 20);
       datasetB = testDatasetB.write(1, 20);
-      optionsA = createInvertedSegmentOptions(datasetA.getFragments().get(0).getId());
-      optionsB = createInvertedSegmentOptions(datasetB.getFragments().get(0).getId());
+      // Committed builds, since only they hold the per-Dataset build lock.
+      optionsA =
+          IndexOptions.builder(
+                  Collections.singletonList("name"),
+                  IndexType.INVERTED,
+                  createInvertedIndexParams())
+              .build();
+      optionsB = optionsA;
     }
 
     private void runCreates(IndexBuildProgress progressA, IndexBuildProgress progressB)
@@ -822,6 +830,85 @@ public class ScalarIndexTest {
             "whitespace",
             ((Map<String, Object>) JsonUtils.fromJson(detailsJson).get("tokenizer"))
                 .get("base_tokenizer"));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFmIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      // The second fragment holds two NULL names and "P0" through "P5".
+      try (Dataset written = testDataset.writeSortByDataset(2);
+          Dataset dataset =
+              written
+                  .update(
+                      new UpdateParams(Collections.singletonMap("name", "'Person\0007'"))
+                          .withWhere("name = 'Person 0'"))
+                  .getDataset()) {
+        IndexParams indexParams =
+            IndexParams.builder()
+                .setScalarIndexParams(FmIndexParams.builder().numSegments(2).build())
+                .build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                .withIndexName("name_fm")
+                .build());
+
+        List<Index> segments = dataset.describeIndices().get(0).getSegments();
+        assertEquals(2, segments.size());
+        assertEquals(IndexType.FM, segments.get(0).indexType());
+        // Both the original "Person 7" and the NUL-containing name contain '7'.
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        // Every non-NULL name contains 'P'; the two NULL rows do not match.
+        assertEquals(
+            18, dataset.countIndexedRows("name_fm", "contains(name, 'P')", Optional.empty()));
+
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(1, dataset.countRows(spacedFilter));
+        // The normalized NUL is an FM candidate, but source rechecking excludes it.
+        assertEquals(1, dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
+        // NUL patterns still cannot produce a sound FM candidate set.
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                    dataset.countIndexedRows(
+                        "name_fm", "contains(name, 'Person\0')", Optional.empty()));
+        assertTrue(
+            error.getMessage().contains("Filter cannot be planned using scalar index 'name_fm'"));
+        assertEquals(1, dataset.countRows("contains(name, 'Person\0')"));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFmIndexDefaultsToOneSegment(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index_default").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(FmIndexParams.builder().build()).build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                .withIndexName("name_fm")
+                .build());
+
+        assertEquals(1, dataset.describeIndices().get(0).getSegments().size());
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(2, dataset.countRows(spacedFilter));
+        assertEquals(2, dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
       }
     }
   }
@@ -1497,7 +1584,7 @@ public class ScalarIndexTest {
   }
 
   @Test
-  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  @Timeout(value = 10, unit = TimeUnit.SECONDS)
   public void testCreateInvertedIndexAllowsConcurrentCreate(@TempDir Path tempDir)
       throws Exception {
     String datasetPath = tempDir.resolve("inverted_concurrent_create").toString();
@@ -1527,8 +1614,9 @@ public class ScalarIndexTest {
         Thread concurrentCreate =
             new Thread(() -> concurrentResult.set(dataset.createIndex(segmentOptions)));
         concurrentCreate.start();
-        concurrentCreate.join(100);
-        assertTrue(concurrentCreate.isAlive(), "Concurrent create should wait for active create");
+        concurrentCreate.join(3000);
+        assertFalse(
+            concurrentCreate.isAlive(), "Uncommitted create should not wait for active create");
 
         progress.release.countDown();
         outerCreate.join(5000);

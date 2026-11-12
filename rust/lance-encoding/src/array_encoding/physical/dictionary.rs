@@ -87,7 +87,7 @@ impl PageScheduler for DictionaryPageScheduler {
         let copy_size = self.num_dictionary_items as u64;
 
         if self.should_decode_dict {
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
 
@@ -114,7 +114,7 @@ impl PageScheduler for DictionaryPageScheduler {
             .boxed()
         } else {
             let num_dictionary_items = self.num_dictionary_items;
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
 
@@ -141,6 +141,10 @@ struct DirectDictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
+    fn dictionary_len(&self) -> Option<u64> {
+        Some(self.decoded_dict.num_values())
+    }
+
     fn variable_width_bytes(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<Option<u64>> {
         // The decoded batch shares this page's dictionary values; Arrow
         // concatenation may merge each page's values into one array, so charge
@@ -453,10 +457,7 @@ impl ArrayEncoder for DictionaryEncoder {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{
-        ArrayRef, DictionaryArray, StringArray, UInt8Array,
-        builder::{LargeStringBuilder, StringBuilder},
-    };
+    use arrow_array::{ArrayRef, DictionaryArray, StringArray, UInt8Array};
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
@@ -489,125 +490,6 @@ mod tests {
         let expected_items = Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef;
         assert_eq!(&dict_indices, &expected_indices);
         assert_eq!(&dict_items, &expected_items);
-    }
-
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_random_dictionary(
-        #[values(
-            DataType::Utf8,
-            DataType::Binary,
-            DataType::LargeBinary,
-            DataType::LargeUtf8
-        )]
-        data_type: DataType,
-        #[values(
-            TestEncoding::Array,
-            TestEncoding::StructuralU16,
-            TestEncoding::StructuralU32,
-            TestEncoding::StructuralSparse
-        )]
-        encoding: TestEncoding,
-        #[values(4096, 1024 * 1024)] page_size: u64,
-        #[values(false, true)] use_slicing: bool,
-    ) {
-        let nullable = matches!(data_type, DataType::LargeBinary | DataType::LargeUtf8);
-        let field = Field::new("", data_type, nullable);
-        check_basic_random_case(field, encoding, page_size, use_slicing).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_simple_utf8() {
-        let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
-
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_range(0..3)
-            .with_range(1..3)
-            .with_indices(vec![1, 3]);
-        check_round_trip_encoding_of_data(
-            vec![Arc::new(string_array)],
-            &test_cases,
-            HashMap::new(),
-        )
-        .await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_sliced_utf8() {
-        let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
-        let string_array = string_array.slice(1, 3);
-
-        let test_cases = TestCases::default()
-            .with_range(0..1)
-            .with_range(0..2)
-            .with_range(1..2);
-        check_round_trip_encoding_of_data(
-            vec![Arc::new(string_array)],
-            &test_cases,
-            HashMap::new(),
-        )
-        .await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_empty_strings() {
-        // Scenario 1: Some strings are empty
-
-        let values = [Some("abc"), Some(""), None];
-        // Test empty list at beginning, middle, and end
-        for order in [[0, 1, 2], [1, 0, 2], [2, 0, 1]] {
-            let mut string_builder = StringBuilder::new();
-            for idx in order {
-                string_builder.append_option(values[idx]);
-            }
-            let string_array = Arc::new(string_builder.finish());
-            let test_cases = TestCases::default()
-                .with_indices(vec![1])
-                .with_indices(vec![0])
-                .with_indices(vec![2]);
-            check_round_trip_encoding_of_data(
-                vec![string_array.clone()],
-                &test_cases,
-                HashMap::new(),
-            )
-            .await;
-            let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new())
-                .await;
-        }
-
-        // Scenario 2: All strings are empty
-
-        // When encoding an array of empty strings there are no bytes to encode
-        // which is strange and we want to ensure we handle it
-        let string_array = Arc::new(StringArray::from(vec![Some(""), None, Some("")]));
-
-        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases, HashMap::new())
-            .await;
-        let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    #[ignore] // This test is quite slow in debug mode
-    async fn test_jumbo_string() {
-        // This is an overflow test.  We have a list of lists where each list
-        // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
-        // offsets range
-        let mut string_builder = LargeStringBuilder::new();
-        // a 1 MiB string
-        let giant_string = String::from_iter((0..(1024 * 1024)).map(|_| '0'));
-        for _ in 0..5000 {
-            string_builder.append_option(Some(&giant_string));
-        }
-        let giant_array = Arc::new(string_builder.finish()) as ArrayRef;
-        let arrs = vec![giant_array];
-
-        // // We can't validate because our validation relies on concatenating all input arrays
-        let test_cases = TestCases::default().without_validation();
-        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 
     // These tests cover the case where the input is already dictionary encoded

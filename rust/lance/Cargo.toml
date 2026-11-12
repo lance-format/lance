@@ -26,6 +26,7 @@ lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
+lance-geo = { workspace = true, optional = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
@@ -98,16 +99,14 @@ semver.workspace = true
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { workspace = true, optional = true }
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
 lzma-sys = { version = "0.1" }
 
 [dev-dependencies]
+metrics.workspace = true
+metrics-util.workspace = true
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 lance-datafusion = { workspace = true, features = ["datagen"] }
@@ -141,6 +140,7 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
+parquet-variant-compute = "59.2.0"
 reqwest = { workspace = true, features = ["rustls"] }
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
@@ -152,6 +152,10 @@ reqwest = { workspace = true, features = ["rustls"] }
 name = "arrow_ordering"
 test = false
 
+[[test]]
+name = "memory_metrics"
+required-features = ["metrics"]
+
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]
@@ -161,13 +165,8 @@ cli = ["dep:clap", "lzma-sys/static"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
-protoc = [
-    "dep:protobuf-src",
-    "lance-encoding/protoc",
-    "lance-file/protoc",
-    "lance-index/protoc",
-    "lance-table/protoc",
-]
+# Retained for compatibility and forwarded to optional upstream protobuf code.
+protoc = ["lance-datafusion/protoc"]
 aws = ["lance-io/aws"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
@@ -176,11 +175,13 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
-# Publish object store metrics via the `metrics` crate.
-metrics = ["lance-io/metrics"]
-geo = ["lance-datafusion/geo", "lance-index/geo"]
+# Publish object store and memory metrics via the `metrics` crate.
+metrics = ["lance-core/metrics", "lance-io/metrics"]
+geo = ["dep:lance-geo", "lance-datafusion/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+# Expose internal update-join controls to the dedicated benchmark target.
+update-join-bench = []
 # Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup
 # bench. Commented out so it stays out of CI's all-features build.
 # bench-rocksdb = ["dep:rocksdb"]
@@ -202,12 +203,21 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "index_visibility"
+harness = false
+
+[[bench]]
 name = "regex_ngram"
 harness = false
 
 [[bench]]
 name = "merge_insert"
 harness = false
+
+[[bench]]
+name = "update_join"
+harness = false
+required-features = ["update-join-bench"]
 
 [[bench]]
 name = "scan"
@@ -223,6 +233,10 @@ harness = false
 
 [[bench]]
 name = "count_pushdown"
+harness = false
+
+[[bench]]
+name = "list_structure"
 harness = false
 
 [[bench]]
@@ -259,6 +273,10 @@ harness = false
 
 [[bench]]
 name = "fts_search"
+harness = false
+
+[[bench]]
+name = "scalar_prefilter"
 harness = false
 
 [[bench]]
@@ -360,6 +378,10 @@ harness = false
 
 [[bench]]
 name = "hamming_ivf_training"
+harness = false
+
+[[bench]]
+name = "cleanup"
 harness = false
 
 [lints]

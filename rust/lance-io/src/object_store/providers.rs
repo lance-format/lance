@@ -4,8 +4,8 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, RwLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -14,8 +14,9 @@ use url::Url;
 
 use crate::object_store::WrappingObjectStore;
 use crate::object_store::uri_to_url;
+use crate::scheduler::SchedulerErrorMode;
 
-use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
+use super::{ObjectStore, ObjectStoreParams, StorageOptions, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
@@ -30,6 +31,17 @@ pub mod goosefs;
 pub mod huggingface;
 pub mod local;
 pub mod memory;
+#[cfg(any(
+    feature = "aws",
+    feature = "azure",
+    feature = "gcp",
+    feature = "goosefs",
+    feature = "huggingface",
+    feature = "oss",
+    feature = "tencent",
+    feature = "tos"
+))]
+pub(in crate::object_store) mod opendal;
 #[cfg(feature = "oss")]
 pub mod oss;
 pub mod shared_memory;
@@ -80,6 +92,10 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     }
 }
 
+/// Default smallest cache size at which [`ObjectStoreRegistry::get_store()`]
+/// sweeps out dead entries; see [`ObjectStoreRegistry::set_min_prune_threshold()`].
+pub const DEFAULT_MIN_PRUNE_THRESHOLD: usize = 64;
+
 /// Statistics for the object store registry cache.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectStoreRegistryStats {
@@ -90,6 +106,9 @@ pub struct ObjectStoreRegistryStats {
     /// Number of currently active object stores in the cache.
     pub active_stores: usize,
 }
+
+/// Serializes the builds of one cached store key.
+type BuildLock = Arc<tokio::sync::Mutex<()>>;
 
 /// A registry of object store providers.
 ///
@@ -109,16 +128,27 @@ pub struct ObjectStoreRegistryStats {
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
 ///
 /// The registry also caches object stores that are currently in use. It holds
-/// weak references to the object stores, so they are not held onto. If an object
-/// store is no longer in use, it will be removed from the cache on the next
-/// call to either [`Self::active_stores()`] or [`Self::get_store()`].
+/// weak references to the object stores, so they are not held onto. Entries
+/// whose object store is no longer in use are removed by
+/// [`Self::active_stores()`], when [`Self::get_store()`] looks up the same key
+/// again, and in bulk once the cache outgrows its live entries (see
+/// [`Self::get_store()`]), so a long-lived registry that sees many distinct
+/// keys (e.g. one per namespace table) stays bounded.
 #[derive(Debug)]
 pub struct ObjectStoreRegistry {
     providers: RwLock<HashMap<String, Arc<dyn ObjectStoreProvider>>>,
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    active_stores:
+        RwLock<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), Weak<ObjectStore>>>,
+    // Held by `get_store` while it builds the store for a key, so concurrent
+    // cold calls for that key wait for one build instead of each making one.
+    building: Mutex<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), BuildLock>>,
+    // Floor for `prune_threshold`; 0 disables the sweep.
+    min_prune_threshold: AtomicUsize,
+    // Cache size at which `get_store` sweeps out dead entries before inserting.
+    prune_threshold: AtomicUsize,
     // Cache statistics
     hits: AtomicU64,
     misses: AtomicU64,
@@ -133,9 +163,25 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
+            min_prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
+            prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Set the smallest cache size at which [`Self::get_store()`] sweeps out
+    /// dead entries (default [`DEFAULT_MIN_PRUNE_THRESHOLD`]); `0` disables the
+    /// sweep. Applies to the whole registry, i.e. to every dataset sharing the
+    /// session. Also settable per call through the
+    /// [`OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION`] storage option, e.g. from
+    /// the storage options a namespace returns in `describe_table`.
+    ///
+    /// [`OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION`]: crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION
+    pub fn set_min_prune_threshold(&self, threshold: usize) {
+        self.min_prune_threshold.store(threshold, Ordering::Relaxed);
+        self.prune_threshold.store(threshold, Ordering::Relaxed);
     }
 
     /// Get the object store provider for a given scheme.
@@ -211,6 +257,7 @@ impl ObjectStoreRegistry {
         base_path: Url,
         params: &ObjectStoreParams,
         metrics_base: &str,
+        scheduler_error_mode: SchedulerErrorMode,
     ) -> Result<Arc<ObjectStore>> {
         let mut store = provider.new_store(base_path, params).await?;
         // Providers only know the explicit parameter; the storage option is
@@ -218,6 +265,10 @@ impl ObjectStoreRegistry {
         if let Some(block_size) = params.resolved_block_size()? {
             store.block_size = block_size;
         }
+        // Providers construct the physical store, while the registry owns policies
+        // that affect how the shared store is consumed. Applying the validated mode
+        // here covers built-in and out-of-tree providers uniformly.
+        store.scheduler_error_mode = scheduler_error_mode;
 
         store.inner = store.inner.traced();
 
@@ -251,6 +302,7 @@ impl ObjectStoreRegistry {
         // store for this location.
         let params = params.scoped_to_base(None);
         let params = params.as_ref();
+        let scheduler_error_mode = params.scheduler_error_mode()?;
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
             return Err(self.scheme_not_found_error(scheme));
@@ -259,15 +311,32 @@ impl ObjectStoreRegistry {
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let metrics_base = crate::object_store::metrics_base(&store_prefix, &base_path);
 
-        self.build_store(provider, base_path, params, &metrics_base)
-            .await
+        self.build_store(
+            provider,
+            base_path,
+            params,
+            &metrics_base,
+            scheduler_error_mode,
+        )
+        .await
     }
 
     /// Get an object store for a given base path and parameters.
     ///
     /// If the object store is already in use, it will return a strong reference
     /// to the object store. If the object store is not in use, it will create a
-    /// new object store and return a strong reference to it.
+    /// new object store and return a strong reference to it. Concurrent calls
+    /// for the same key build it once; the others wait and reuse it.
+    ///
+    /// A dead entry is only found again if the same key is looked up, which
+    /// never happens when every key is distinct (each namespace table gets its
+    /// own storage options provider, hence its own key). So before inserting,
+    /// once the cache reaches twice its live size (and at least the minimum
+    /// prune threshold), all dead entries are swept out; this keeps the cache
+    /// bounded at amortized O(1) cost per insert.
+    ///
+    /// If `params` carry the `object_store_cache_prune_threshold` storage
+    /// option, it is applied first via [`Self::set_min_prune_threshold()`].
     pub async fn get_store(
         &self,
         base_path: Url,
@@ -279,10 +348,20 @@ impl ObjectStoreRegistry {
         // base contain no scoped entries, so this is a no-op for them.
         let params = params.scoped_to_base(None);
         let params = params.as_ref();
+        // Validate before cache lookup so a cached store cannot hide an invalid
+        // value. The normalized mode also forms part of the cache identity.
+        let scheduler_error_mode = params.scheduler_error_mode()?;
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
             return Err(self.scheme_not_found_error(scheme));
         };
+        if let Some(options) = params.storage_options()
+            && let Some(threshold) =
+                StorageOptions(options.clone()).object_store_cache_prune_threshold()?
+            && threshold != self.min_prune_threshold.load(Ordering::Relaxed)
+        {
+            self.set_min_prune_threshold(threshold);
+        }
 
         // Keyed by the metrics identity rather than the bare prefix: in
         // `dataset` label mode that is the dataset URI, so datasets sharing a
@@ -290,7 +369,7 @@ impl ObjectStoreRegistry {
         let store_prefix =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_path = crate::object_store::metrics_base(&store_prefix, &base_path);
-        let cache_key = (cache_path.clone(), params.clone());
+        let cache_key = (cache_path.clone(), params.clone(), scheduler_error_mode);
 
         // Check if we have a cached store for this base path and params
         {
@@ -321,15 +400,58 @@ impl ObjectStoreRegistry {
             }
         }
 
+        // Locks that no call holds any more are swept first, so the map only
+        // grows with the builds in flight.
+        let build_lock = {
+            let mut building = self.building.lock().ok().expect_ok()?;
+            building.retain(|_, lock| Arc::strong_count(lock) > 1);
+            building.entry(cache_key.clone()).or_default().clone()
+        };
+        let _build_guard = match build_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            // Wait for the build in flight without then holding the lock, so if
+            // that build failed, the calls that waited retry together rather
+            // than one after another.
+            Err(_) => {
+                drop(build_lock.lock().await);
+                None
+            }
+        };
+        // Another call may have built the store while this one waited.
+        let maybe_store = self
+            .active_stores
+            .read()
+            .ok()
+            .expect_ok()?
+            .get(&cache_key)
+            .and_then(Weak::upgrade);
+        if let Some(store) = maybe_store {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(store);
+        }
+
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         let store = self
-            .build_store(provider, base_path, params, &cache_path)
+            .build_store(
+                provider,
+                base_path,
+                params,
+                &cache_path,
+                scheduler_error_mode,
+            )
             .await?;
 
         {
             // Insert the store into the cache
             let mut cache_lock = self.active_stores.write().ok().expect_ok()?;
+            let min_threshold = self.min_prune_threshold.load(Ordering::Relaxed);
+            if min_threshold > 0 && cache_lock.len() >= self.prune_threshold.load(Ordering::Relaxed)
+            {
+                cache_lock.retain(|_, weak| weak.strong_count() > 0);
+                self.prune_threshold
+                    .store((cache_lock.len() * 2).max(min_threshold), Ordering::Relaxed);
+            }
             cache_lock.insert(cache_key, Arc::downgrade(&store));
         }
 
@@ -406,6 +528,9 @@ impl Default for ObjectStoreRegistry {
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
+            min_prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
+            prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -427,11 +552,15 @@ impl ObjectStoreRegistry {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::*;
+    use crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION;
     use object_store::ObjectStore as OSObjectStore;
 
     use crate::object_store::providers::memory::MemoryStoreProvider;
+    use crate::object_store::{StorageOptionsAccessor, StorageOptionsProvider};
+    use crate::scheduler::SCHEDULER_ERROR_MODE_STORAGE_OPTION;
     use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
     use rstest::rstest;
 
@@ -446,6 +575,34 @@ mod tests {
             _params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
             unreachable!("This test doesn't create stores")
+        }
+    }
+
+    #[derive(Debug)]
+    struct StableStorageOptionsProvider;
+
+    #[async_trait::async_trait]
+    impl StorageOptionsProvider for StableStorageOptionsProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            Ok(None)
+        }
+
+        fn provider_id(&self) -> String {
+            "stable-scheduler-mode-provider".to_string()
+        }
+    }
+
+    #[derive(Debug)]
+    struct SchedulerModeIgnoringStoreProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for SchedulerModeIgnoringStoreProvider {
+        async fn new_store(
+            &self,
+            _base_path: Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            Ok(ObjectStore::memory())
         }
     }
 
@@ -551,7 +708,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.paginated_lister.is_some(), keep_pushdown);
-        assert!(!store.supports_conditional_multipart_put);
         // Both halves of the store are labelled with the same prefix.
         assert_eq!(
             *wrapper.prefixes.lock().unwrap(),
@@ -581,8 +737,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_store_resolves_base_scoped_options() {
-        use crate::object_store::StorageOptionsAccessor;
-
         let registry = ObjectStoreRegistry::default();
         let url = Url::parse("memory://test").unwrap();
 
@@ -607,6 +761,86 @@ mod tests {
         let store_scoped = registry.get_store(url.clone(), &with_scoped).await.unwrap();
         let store_plain = registry.get_store(url, &without_scoped).await.unwrap();
         assert!(Arc::ptr_eq(&store_scoped, &store_plain));
+    }
+
+    #[tokio::test]
+    async fn test_provider_cache_separates_and_validates_scheduler_error_mode() {
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory:///table").unwrap();
+        let storage_options_provider = Arc::new(StableStorageOptionsProvider);
+        let params_for = |value: &str| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    HashMap::from([(
+                        SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                        value.to_string(),
+                    )]),
+                    storage_options_provider.clone(),
+                ),
+            )),
+            ..Default::default()
+        };
+
+        let best_effort = registry
+            .get_store(url.clone(), &params_for("best_effort"))
+            .await
+            .unwrap();
+        let fail_fast = registry
+            .get_store(url.clone(), &params_for("fail_fast"))
+            .await
+            .unwrap();
+        let best_effort_again = registry
+            .get_store(url.clone(), &params_for("best_effort"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            best_effort.scheduler_error_mode(),
+            SchedulerErrorMode::BestEffort
+        );
+        assert_eq!(
+            fail_fast.scheduler_error_mode(),
+            SchedulerErrorMode::FailFast
+        );
+        assert!(!Arc::ptr_eq(&best_effort, &fail_fast));
+        assert!(Arc::ptr_eq(&best_effort, &best_effort_again));
+
+        let error = registry
+            .get_store(url, &params_for("invalid"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
+
+        let stats = registry.stats();
+        assert_eq!((stats.hits, stats.misses, stats.active_stores), (1, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn test_registry_applies_scheduler_error_mode_to_custom_provider_store() {
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert(
+            "custom-memory",
+            Arc::new(SchedulerModeIgnoringStoreProvider),
+        );
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    "fail_fast".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = registry
+            .get_store(Url::parse("custom-memory:///table").unwrap(), &params)
+            .await
+            .unwrap();
+
+        assert_eq!(store.scheduler_error_mode(), SchedulerErrorMode::FailFast);
     }
 
     #[test]
@@ -660,7 +894,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_hit_miss_tracking() {
-        use crate::object_store::StorageOptionsAccessor;
         let registry = ObjectStoreRegistry::default();
         let url = Url::parse("memory://test").unwrap();
 
@@ -691,6 +924,196 @@ mod tests {
 
         // Same params returns same instance
         assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+    }
+
+    /// A memory store provider whose builds are slow enough to overlap.
+    #[derive(Debug, Default)]
+    struct SlowProvider {
+        builds: AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for SlowProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            self.builds.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if self.fail {
+                return Err(Error::io("build failed"));
+            }
+            MemoryStoreProvider.new_store(base_path, params).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_get_store_builds_once() {
+        let provider = Arc::new(SlowProvider::default());
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("slowmem", provider.clone());
+        let url = Url::parse("slowmem:///").unwrap();
+        let params = ObjectStoreParams::default();
+
+        let stores =
+            futures::future::try_join_all((0..8).map(|_| registry.get_store(url.clone(), &params)))
+                .await
+                .unwrap();
+
+        assert_eq!(provider.builds.load(Ordering::Relaxed), 1);
+        assert!(stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])));
+        let stats = registry.stats();
+        assert_eq!((stats.hits, stats.misses), (7, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_get_store_failures_retry_together() {
+        let provider = Arc::new(SlowProvider {
+            fail: true,
+            ..Default::default()
+        });
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("slowmem", provider.clone());
+        let url = Url::parse("slowmem:///").unwrap();
+        let params = ObjectStoreParams::default();
+
+        let start = tokio::time::Instant::now();
+        let results =
+            futures::future::join_all((0..8).map(|_| registry.get_store(url.clone(), &params)))
+                .await;
+
+        for result in &results {
+            let Err(error) = result else {
+                panic!("expected the failed build's error");
+            };
+            assert!(matches!(error, Error::IO { .. }), "{error:?}");
+            assert!(error.to_string().contains("build failed"), "{error}");
+        }
+        // The first build fails, then the seven calls that waited retry at once.
+        assert_eq!(provider.builds.load(Ordering::Relaxed), 8);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(300), "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_get_store_prunes_dead_entries_with_distinct_keys() {
+        use crate::object_store::StorageOptionsAccessor;
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+        let params_for = |i: usize| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("table".into(), i.to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let cache_len = || registry.active_stores.read().unwrap().len();
+
+        // Every 10th store stays alive; the rest are dropped right away, like
+        // datasets opened once per sample, each on a different table.
+        let n = 10 * DEFAULT_MIN_PRUNE_THRESHOLD;
+        let mut alive = vec![];
+        for i in 0..n {
+            let store = registry
+                .get_store(url.clone(), &params_for(i))
+                .await
+                .unwrap();
+            if i % 10 == 0 {
+                alive.push((i, store));
+            }
+        }
+        // Without pruning this would be `n`.
+        assert!(cache_len() <= 2 * alive.len() + DEFAULT_MIN_PRUNE_THRESHOLD);
+        assert_eq!(registry.stats().active_stores, alive.len());
+
+        // Live entries survive pruning and are still reused.
+        for (i, store) in &alive {
+            let again = registry
+                .get_store(url.clone(), &params_for(*i))
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(store, &again));
+        }
+        assert_eq!(registry.stats().hits, alive.len() as u64);
+    }
+
+    /// Opens `n` stores with distinct keys, each carrying `extra` storage
+    /// options, drops them all, and returns the resulting cache size.
+    async fn cache_len_after_distinct_dropped_stores(
+        registry: &ObjectStoreRegistry,
+        n: usize,
+        extra: &[(&str, &str)],
+    ) -> usize {
+        use crate::object_store::StorageOptionsAccessor;
+        let url = Url::parse("memory://test").unwrap();
+        for i in 0..n {
+            let mut options = HashMap::from([("table".to_string(), i.to_string())]);
+            options.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            let params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(options),
+                )),
+                ..Default::default()
+            };
+            registry.get_store(url.clone(), &params).await.unwrap();
+        }
+        registry.active_stores.read().unwrap().len()
+    }
+
+    #[rstest]
+    #[case::disabled("0", 200, 200)]
+    #[case::custom("8", 200, 8)]
+    #[tokio::test]
+    async fn test_prune_threshold_from_storage_option(
+        #[case] threshold: &str,
+        #[case] n: usize,
+        #[case] max_cache_len: usize,
+    ) {
+        // A namespace configures this through the storage options it returns
+        // from `describe_table`.
+        let registry = ObjectStoreRegistry::default();
+        let extra = [(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION, threshold)];
+        let len = cache_len_after_distinct_dropped_stores(&registry, n, &extra).await;
+        assert!(len <= max_cache_len, "cache has {len} entries");
+        assert_eq!(registry.stats().active_stores, 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_min_prune_threshold() {
+        let registry = ObjectStoreRegistry::default();
+        registry.set_min_prune_threshold(0);
+        assert_eq!(
+            cache_len_after_distinct_dropped_stores(&registry, 200, &[]).await,
+            200
+        );
+        // Re-enabling sweeps on the next insert.
+        registry.set_min_prune_threshold(16);
+        assert!(cache_len_after_distinct_dropped_stores(&registry, 1, &[]).await <= 16);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_prune_threshold_option() {
+        use crate::object_store::StorageOptionsAccessor;
+        let registry = ObjectStoreRegistry::default();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION.to_string(),
+                    "lots".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let err = registry
+            .get_store(Url::parse("memory://test").unwrap(), &params)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION),
+            "{err}"
+        );
     }
 
     #[tokio::test]

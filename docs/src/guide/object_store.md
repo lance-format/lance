@@ -7,8 +7,8 @@ will use Azure, and `gs://bucket/path` will use GCS.
 
 These object stores take additional configuration objects. There are two ways to
 specify these configurations: by setting environment variables or by passing them
-to the `storage_options` parameter of `lance.dataset` and
-`lance.write_dataset`. So for example, to globally set a higher timeout,
+as storage options when opening or writing a dataset in Python, Rust, or Java.
+So for example, to globally set a higher timeout,
 you would run in your shell:
 
 ```bash
@@ -18,10 +18,42 @@ export TIMEOUT=60s
 If you only want to set the timeout for a single dataset, you can pass it as a
 storage option:
 
-```python
-import lance
-ds = lance.dataset("s3://path", storage_options={"timeout": "60s"})
-```
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset("s3://path", storage_options={"timeout": "60s"})
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::builder::DatasetBuilder;
+
+    let storage_options = HashMap::from([("timeout".to_string(), "60s".to_string())]);
+    let ds = DatasetBuilder::from_uri("s3://path")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+    import java.util.Map;
+
+    ReadOptions options =
+        new ReadOptions.Builder()
+            .setStorageOptions(Map.of("timeout", "60s"))
+            .build();
+    try (Dataset ds = Dataset.open("s3://path", options)) {
+      // read from ds
+    }
+    ```
 
 ## General Configuration
 
@@ -41,6 +73,94 @@ These options apply to all object stores.
 | `proxy_excludes`             | List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, `example.com, 192.168.1.0/24` would bypass `https://api.example.com`, `https://www.example.com`, and any IP in the range `192.168.1.0/24`. |
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
+| `scheduler_error_mode`       | Scheduler error handling. `best_effort` preserves the default behavior. `fail_fast` returns the first observed error and cancels the remaining physical reads in the same logical request. Other requests are not cancelled.                                                                            |
+| `object_store_cache_prune_threshold` | Smallest number of cached object stores at which a session's object store cache sweeps out entries for stores that are no longer in use. Default, `64`; `0` disables the sweep. The cache is shared by every dataset opened with the same session, and the last value seen applies to all of them. Mainly relevant when a shared session opens many tables with distinct storage options, such as tables opened through a namespace that vends per-table credentials. |
+
+An engine can apply `scheduler_error_mode` to every operation in a session by
+adding it to the storage options used for every dataset open. For example, a
+Python-based engine can merge the session setting before calling Lance:
+
+```python
+session_storage_options = {"scheduler_error_mode": "fail_fast"}
+dataset = lance.dataset(uri, storage_options=session_storage_options)
+```
+
+The engine-facing configuration name is engine-specific. It must ultimately be
+forwarded to Lance as the `scheduler_error_mode` storage option.
+
+For example, a Lance Spark catalog named `lance` forwards settings below its
+`storage` prefix:
+
+```bash
+spark-sql --conf "spark.sql.catalog.lance.storage.scheduler_error_mode=fail_fast"
+```
+
+### Local filesystem durability
+
+Set `local_fsync` to `"true"` for local datasets when writes must be durable
+before they return:
+
+=== "Python"
+
+    ```python
+    import lance
+    import pyarrow as pa
+
+    lance.write_dataset(
+        pa.table({"id": [1]}),
+        "/path/to/data.lance",
+        storage_options={"local_fsync": "true"},
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+    use lance::Dataset;
+
+    let storage_options = HashMap::from([("local_fsync".to_string(), "true".to_string())]);
+    let write_params = WriteParams {
+        mode: WriteMode::Overwrite,
+        store_params: Some(ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options),
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let ds = Dataset::write(reader, "/path/to/data.lance", Some(write_params)).await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+    import java.util.Map;
+
+    try (Dataset ds =
+        Dataset.write()
+            .allocator(allocator)
+            .reader(reader)
+            .uri("/path/to/data.lance")
+            .mode(WriteParams.WriteMode.OVERWRITE)
+            .storageOptions(Map.of("local_fsync", "true"))
+            .execute()) {
+      // durable write committed
+    }
+    ```
+
+The default is `"false"`. When enabled, Lance syncs local data, transaction,
+and manifest files before reporting successful writes, including copied files
+during deep clones. Local copies use the destination's setting. On Unix it also
+syncs their directory entries, including newly created directories. This increases
+write latency. Pass the option again when reopening a dataset for later writes;
+it is a store setting, not a dataset property. Only `"true"` and `"false"` are accepted.
 
 ### Bulk copy strategy
 
@@ -104,17 +224,57 @@ AWS credentials can be set in the environment variables `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`. Alternatively, they can be
 passed as parameters to the `storage_options` parameter:
 
-```python
-import lance
-ds = lance.dataset(
-    "s3://bucket/path",
-    storage_options={
-        "access_key_id": "my-access-key",
-        "secret_access_key": "my-secret-key",
-        "session_token": "my-session-token",
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset(
+        "s3://bucket/path",
+        storage_options={
+            "access_key_id": "my-access-key",
+            "secret_access_key": "my-secret-key",
+            "session_token": "my-session-token",
+        },
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::builder::DatasetBuilder;
+
+    let storage_options = HashMap::from([
+        ("access_key_id".to_string(), "my-access-key".to_string()),
+        ("secret_access_key".to_string(), "my-secret-key".to_string()),
+        ("session_token".to_string(), "my-session-token".to_string()),
+    ]);
+    let ds = DatasetBuilder::from_uri("s3://bucket/path")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+    import java.util.Map;
+
+    ReadOptions options =
+        new ReadOptions.Builder()
+            .setStorageOptions(
+                Map.of(
+                    "access_key_id", "my-access-key",
+                    "secret_access_key", "my-secret-key",
+                    "session_token", "my-session-token"))
+            .build();
+    try (Dataset ds = Dataset.open("s3://bucket/path", options)) {
+      // read from ds
     }
-)
-```
+    ```
 
 If you are using AWS SSO, you can specify the `AWS_PROFILE` environment variable.
 It cannot be specified in the `storage_options` parameter.
@@ -172,18 +332,86 @@ ds_b = lance.dataset(
 Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must
 specify both region and endpoint:
 
-```python
-import lance
-ds = lance.dataset(
-    "s3://bucket/path",
-    storage_options={
-        "region": "us-east-1",
-        "endpoint": "http://minio:9000",
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset(
+        "s3://bucket/path",
+        storage_options={
+            "region": "us-east-1",
+            "endpoint": "http://minio:9000",
+        },
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::builder::DatasetBuilder;
+
+    let storage_options = HashMap::from([
+        ("region".to_string(), "us-east-1".to_string()),
+        ("endpoint".to_string(), "http://minio:9000".to_string()),
+    ]);
+    let ds = DatasetBuilder::from_uri("s3://bucket/path")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+    import java.util.Map;
+
+    ReadOptions options =
+        new ReadOptions.Builder()
+            .setStorageOptions(
+                Map.of(
+                    "region", "us-east-1",
+                    "endpoint", "http://minio:9000"))
+            .build();
+    try (Dataset ds = Dataset.open("s3://bucket/path", options)) {
+      // read from ds
     }
-)
-```
+    ```
 
 This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environment variables.
+
+!!! warning
+
+    Safe concurrent writes through `s3://` require the store to atomically enforce
+    create-only `PutObject` requests with `If-None-Match: *`. Some S3-compatible
+    stores, including Garage, accept this header but ignore the condition and
+    overwrite existing objects. Concurrent writers can then both report success
+    while silently losing acknowledged data.
+
+    Lance does not check whether the store enforces this condition. Before using
+    concurrent writers, verify that your provider supports atomic conditional
+    writes, or configure a [custom distributed commit lock](#custom-commit-locks)
+    shared by every writer. Reads do not require a commit lock.
+
+#### Custom commit locks
+
+In Python, pass `commit_lock` to `lance.write_dataset` when creating or appending
+to a dataset, and to `lance.dataset` when opening a dataset for subsequent writes.
+The callback accepts the manifest version to commit and returns a context manager
+that acquires a distributed lock on entry and releases it on exit. Hold the lock
+for the entire context and release it even if the commit raises an exception.
+
+Every writer to the same dataset must use the same lock service and lock key for
+that dataset (optionally including the manifest version). The lock must coordinate
+writers across all processes and machines; a process-local lock is insufficient.
+
+Rust applications can provide a
+[`CommitLock`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitLock.html)
+implementation or a custom
+[`CommitHandler`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitHandler.html).
 
 ### S3 Express (Directory Bucket)
 

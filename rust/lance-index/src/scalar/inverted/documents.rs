@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use arc_swap::ArcSwapWeak;
 use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
-use lance_core::cache::{CacheKey, WeakLanceCache};
+use lance_core::cache::{CacheKey, CacheLoadOrigin, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
@@ -1026,6 +1026,15 @@ impl ResidentAddressProjection {
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
     fn dense_and_strictly_ascending(&self) -> bool {
+        // A cached invalid verdict already decides the answer. Asking for the
+        // ordered view would rebuild its diagnostics by rescanning the documents
+        // up to the first violation, only to discard them.
+        if matches!(
+            self.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder
+        ) {
+            return false;
+        }
         match self.try_ordered_row_addresses() {
             Ok(ordered) => !ordered.has_sparse_live_docs(),
             Err(_) => false,
@@ -1140,6 +1149,13 @@ impl DocVisibility {
             Self::All | Self::Filtered { .. } => None,
         }
     }
+}
+
+/// A request's row-ID translation, excluded from reader-free cache snapshots.
+#[derive(Clone)]
+pub(super) enum DocumentRemapping {
+    Sync(Arc<dyn RowIdRemapper>),
+    Batch(Arc<dyn BatchRowIdRemapper>),
 }
 
 /// Modern query-side document state for one partition.
@@ -1517,8 +1533,13 @@ impl PartitionDocuments {
     pub(crate) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Self {
+        let (remapper, batch_remapper) = match remapping {
+            Some(DocumentRemapping::Sync(remapper)) => (Some(remapper), None),
+            Some(DocumentRemapping::Batch(remapper)) => (None, Some(remapper)),
+            None => (None, None),
+        };
         Self {
             store,
             path: self.path.clone(),
@@ -1529,7 +1550,7 @@ impl PartitionDocuments {
             persisted_total_tokens: self.persisted_total_tokens,
             quantized_scoring: self.quantized_scoring,
             remapper,
-            batch_remapper: None,
+            batch_remapper,
             lengths: self.lengths.clone(),
             projection: self.projection.clone(),
             shared_addresses: self.shared_addresses.clone(),
@@ -1594,11 +1615,17 @@ impl PartitionDocuments {
     }
 
     async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+        self.row_ids_column_with_cache(&self.index_cache).await
+    }
+
+    async fn row_ids_column_with_cache(
+        &self,
+        index_cache: &WeakLanceCache,
+    ) -> Result<Arc<UInt64Array>> {
         let store = self.store.clone();
         let path = self.path.clone();
         let num_docs = self.num_docs;
-        let cached = self
-            .index_cache
+        let cached = index_cache
             .get_or_insert_with_key(
                 DocRowIdsKey {
                     partition_id: self.partition_id,
@@ -1698,11 +1725,18 @@ impl PartitionDocuments {
     }
 
     pub(crate) async fn address_projection(&self) -> Result<ResidentAddressProjection> {
+        self.address_projection_with_cache(&self.index_cache).await
+    }
+
+    async fn address_projection_with_cache(
+        &self,
+        index_cache: &WeakLanceCache,
+    ) -> Result<ResidentAddressProjection> {
         if let Some(projection) = self.resident_address_projection() {
             return Ok(projection);
         }
 
-        let row_ids = self.row_ids_column().await?;
+        let row_ids = self.row_ids_column_with_cache(index_cache).await?;
         let projection = self
             .projection
             .get_or_try_init(|| async {
@@ -2131,6 +2165,7 @@ impl PartitionDocuments {
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         self.prewarm_complete
             .get_or_try_init(|| async {
                 if self.lengths.get().is_none() && self.projection.get().is_none() {
@@ -2168,7 +2203,7 @@ impl PartitionDocuments {
                     let cached_row_ids = Arc::new(CachedDocRowIds {
                         row_ids: row_ids.clone(),
                     });
-                    self.index_cache
+                    warm_cache
                         .insert_with_key(
                             &DocRowIdsKey {
                                 partition_id: self.partition_id,
@@ -2191,14 +2226,14 @@ impl PartitionDocuments {
                     Result::Ok(())
                 })
                 .await?;
-                let projection = self.address_projection().await?;
+                let projection = self.address_projection_with_cache(&warm_cache).await?;
                 projection.doc_ids_by_address().await?;
                 self.strictly_ascending_addresses(&projection).await?;
                 Result::Ok(())
             })
             .await?;
         if !self.projection_resident() {
-            self.address_projection().await?;
+            self.address_projection_with_cache(&warm_cache).await?;
         }
         Ok(())
     }
@@ -3097,6 +3132,10 @@ mod tests {
         let projection = projection.resident(Some(raw)).unwrap();
 
         assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        // Later checks answer from the cached verdict without rescanning.
+        let visited = projection.ordered_validation_visited_docs();
+        assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        assert_eq!(projection.ordered_validation_visited_docs(), visited);
     }
 
     #[test]
@@ -3414,7 +3453,55 @@ mod tests {
         assert!(!documents.projection_resident());
         assert!(!documents.query_ready());
 
+        let before = cache.diagnostics().activity;
+        let before_by_type = cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Refreshed)
+            .await
+            .by_type
+            .unwrap();
         documents.prewarm().await.unwrap();
+        let after = cache.diagnostics().activity;
+        let after_by_type = cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Refreshed)
+            .await
+            .by_type
+            .unwrap();
+        assert!(after.warm.attempts > before.warm.attempts);
+        assert!(after.warm.loads_succeeded > before.warm.loads_succeeded);
+        let before_doc_row_ids = before_by_type
+            .activity
+            .iter()
+            .find(|row| row.type_name == "DocRowIds")
+            .unwrap()
+            .activity
+            .clone();
+        let after_doc_row_ids = after_by_type
+            .activity
+            .iter()
+            .find(|row| row.type_name == "DocRowIds")
+            .unwrap()
+            .activity
+            .clone();
+        assert!(after_doc_row_ids.warm.attempts > before_doc_row_ids.warm.attempts);
+        assert!(after_doc_row_ids.warm.loads_succeeded > before_doc_row_ids.warm.loads_succeeded);
+        assert_eq!(
+            after_doc_row_ids
+                .hits
+                .saturating_sub(after_doc_row_ids.warm.hits),
+            before_doc_row_ids
+                .hits
+                .saturating_sub(before_doc_row_ids.warm.hits),
+            "prewarm address reloads must not add demand hits"
+        );
+        assert_eq!(
+            after_doc_row_ids
+                .misses
+                .saturating_sub(after_doc_row_ids.warm.loads_succeeded),
+            before_doc_row_ids
+                .misses
+                .saturating_sub(before_doc_row_ids.warm.loads_succeeded),
+            "prewarm address reloads must not add demand misses"
+        );
         assert!(documents.query_ready());
         assert_eq!(
             documents

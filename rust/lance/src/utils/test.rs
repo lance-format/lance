@@ -257,6 +257,8 @@ impl TestDatasetGenerator {
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }
@@ -823,6 +825,8 @@ pub enum AmbiguousFailure {
     LandAndConflict,
     /// Apply the commit, then report an I/O error.
     LandAndError,
+    /// Apply the commit, then report an I/O error and make verification unavailable.
+    LandAndErrorWithoutVerification,
     /// Do not apply the commit; report an I/O error.
     FailOutright,
 }
@@ -846,6 +850,8 @@ pub struct AmbiguousCommitHandler {
     /// When set, version resolution fails, making commit-outcome verification
     /// impossible.
     pub fail_resolve: AtomicBool,
+    /// Preserve a handler error even when readback proves that the commit landed.
+    pub propagate_error_after_success: AtomicBool,
     /// Number of upcoming resolution calls that should return NotFound.
     resolve_not_found_remaining: AtomicUsize,
     /// Whether a persistent NotFound proves that the requested version is
@@ -861,6 +867,7 @@ impl Default for AmbiguousCommitHandler {
         Self {
             fail_next_commit: Mutex::new(None),
             fail_resolve: AtomicBool::new(false),
+            propagate_error_after_success: AtomicBool::new(false),
             resolve_not_found_remaining: AtomicUsize::new(0),
             not_found_is_definitive: AtomicBool::new(true),
             resolve_calls: AtomicUsize::new(0),
@@ -902,7 +909,7 @@ impl CommitHandler for AmbiguousCommitHandler {
     }
 
     fn propagate_commit_error_after_success(&self) -> bool {
-        false
+        self.propagate_error_after_success.load(Ordering::SeqCst)
     }
 
     async fn commit(
@@ -958,7 +965,10 @@ impl CommitHandler for AmbiguousCommitHandler {
                     .await?;
                 Err(CommitError::CommitConflict)
             }
-            Some(AmbiguousFailure::LandAndError) => {
+            Some(
+                failure @ (AmbiguousFailure::LandAndError
+                | AmbiguousFailure::LandAndErrorWithoutVerification),
+            ) => {
                 ConditionalPutCommitHandler
                     .commit(
                         manifest,
@@ -970,6 +980,9 @@ impl CommitHandler for AmbiguousCommitHandler {
                         transaction,
                     )
                     .await?;
+                if failure == AmbiguousFailure::LandAndErrorWithoutVerification {
+                    self.fail_resolve.store(true, Ordering::SeqCst);
+                }
                 Err(CommitError::OtherError(lance_core::Error::io(
                     "simulated ambiguous commit failure",
                 )))
@@ -1071,7 +1084,11 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
         ..Default::default()
     };
     let task = CompactionTask {
-        task: TaskData { fragments },
+        task: TaskData {
+            fragments,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
+        },
         read_version: dataset.manifest.version,
         options: options.clone(),
     };
@@ -1214,4 +1231,27 @@ pub mod geo {
             ..Default::default()
         }
     }
+}
+
+/// The schema a data file stores in its footer, as its writer saw it.
+pub async fn data_file_schema(dataset: &Dataset, path: &str) -> Schema {
+    let file_path = dataset.data_dir().join(path);
+    let scheduler = lance_io::scheduler::ScanScheduler::new(
+        dataset.object_store.clone(),
+        lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let file = scheduler
+        .open_file(&file_path, &lance_io::utils::CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let reader = lance_file::reader::FileReader::try_open(
+        file,
+        None,
+        Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
+        &lance_core::cache::LanceCache::no_cache(),
+        lance_file::reader::FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.schema().as_ref().clone()
 }

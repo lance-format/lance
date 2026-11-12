@@ -29,8 +29,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
     },
     format::{
-        ProtobufUtils21,
-        pb21::{CompressiveEncoding, PackedStruct, compressive_encoding::Compression},
+        EncodingUtils,
+        metadata::{CompressiveEncoding, PackedStruct, compressive_encoding::Compression},
     },
     statistics::{GetStat, Stat},
 };
@@ -48,15 +48,22 @@ fn struct_data_block_to_fixed_width_data_block(
     let mut output = Vec::with_capacity(data_size as usize);
     let num_values = struct_data_block.children[0].num_values();
 
+    // Borrow each child's bytes once rather than slicing a buffer per value
+    let children = struct_data_block
+        .children
+        .iter()
+        .zip(bits_per_values)
+        .map(|(child, bits)| {
+            (
+                child.as_fixed_width_ref().unwrap().data.as_ref(),
+                (bits / 8) as usize,
+            )
+        })
+        .collect::<Vec<_>>();
     for i in 0..num_values as usize {
-        for (j, child) in struct_data_block.children.iter().enumerate() {
-            let bytes_per_value = (bits_per_values[j] / 8) as usize;
-            let this_data = child
-                .as_fixed_width_ref()
-                .unwrap()
-                .data
-                .slice_with_length(bytes_per_value * i, bytes_per_value);
-            output.extend_from_slice(&this_data);
+        for &(data, bytes_per_value) in &children {
+            let start = bytes_per_value * i;
+            output.extend_from_slice(&data[start..start + bytes_per_value]);
         }
     }
 
@@ -91,7 +98,7 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
 
                 Ok((
                     value_miniblock_compressed,
-                    ProtobufUtils21::packed_struct(value_array_encoding, bits_per_values),
+                    EncodingUtils::packed_struct(value_array_encoding, bits_per_values),
                 ))
             }
             _ => Err(Error::invalid_input_source(format!(
@@ -185,6 +192,7 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
             prefix_sum[i + 1] = prefix_sum[i] + bytes_per_values[i];
         }
 
+        let bytes = encoded_data_block.data.as_ref();
         let mut children_data_block = vec![];
         for i in 0..self.bits_per_values.len() {
             let child_buf_size = bytes_per_values[i] * num_values as usize;
@@ -192,12 +200,8 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
 
             for j in 0..num_values as usize {
                 // the start of the data at this row is `j * encoded_bytes_per_row`, and the offset for this field is `prefix_sum[i]`, this field has length `bytes_per_values[i]`.
-                let this_value = encoded_data_block.data.slice_with_length(
-                    prefix_sum[i] + (j * encoded_bytes_per_row),
-                    bytes_per_values[i],
-                );
-
-                child_buf.extend_from_slice(&this_value);
+                let start = prefix_sum[i] + (j * encoded_bytes_per_row);
+                child_buf.extend_from_slice(&bytes[start..start + bytes_per_values[i]]);
             }
 
             let child = DataBlock::FixedWidth(FixedWidthDataBlock {
@@ -379,7 +383,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
             let (compressed, encoding) = compressor.compress(child_block)?;
             match compressed {
                 PerValueDataBlock::Fixed(block) => {
-                    field_metadata.push(ProtobufUtils21::packed_struct_field_fixed(
+                    field_metadata.push(EncodingUtils::packed_struct_field_fixed(
                         encoding,
                         block.bits_per_value,
                     ));
@@ -388,7 +392,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
                 }
                 PerValueDataBlock::Variable(block) => {
                     let bits_per_length = block.bits_per_offset as u64;
-                    field_metadata.push(ProtobufUtils21::packed_struct_field_variable(
+                    field_metadata.push(EncodingUtils::packed_struct_field_variable(
                         encoding,
                         bits_per_length,
                     ));
@@ -442,7 +446,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
 
         Ok((
             PerValueDataBlock::Variable(data_block),
-            ProtobufUtils21::packed_struct_variable(field_metadata),
+            EncodingUtils::packed_struct_variable(field_metadata),
         ))
     }
 }
@@ -516,8 +520,8 @@ impl PerValueCompressor for PackedStructFixedPerValueEncoder {
 
         Ok((
             PerValueDataBlock::Fixed(data_block),
-            ProtobufUtils21::packed_struct(
-                ProtobufUtils21::flat(bits_per_row, None),
+            EncodingUtils::packed_struct(
+                EncodingUtils::flat(bits_per_row, None),
                 field_bits_per_value,
             ),
         ))
@@ -930,7 +934,7 @@ impl PackedStructFixedPerValueDecompressor {
             .bits_per_value
             .iter()
             .map(|&bits_per_value| {
-                let flat = crate::format::pb21::Flat {
+                let flat = crate::format::metadata::Flat {
                     bits_per_value,
                     data: None,
                 };
@@ -1147,6 +1151,7 @@ mod tests {
         let DataBlock::Struct(decoded_struct) = decoded else {
             panic!("expected struct datablock after decode");
         };
+        assert_eq!(decoded_struct.children.len(), 2);
 
         let decoded_id = decoded_struct.children[0].as_fixed_width_ref().unwrap();
         assert_eq!(decoded_id.bits_per_value, 32);
@@ -1409,13 +1414,13 @@ mod tests {
         let fixed_decompressor = Arc::from(
             crate::compression::DecompressionStrategy::create_fixed_per_value_decompressor(
                 &strategy,
-                &ProtobufUtils21::flat(32, None),
+                &EncodingUtils::flat(32, None),
             )?,
         );
         let variable_decompressor = Arc::from(
             crate::compression::DecompressionStrategy::create_variable_per_value_decompressor(
                 &strategy,
-                &ProtobufUtils21::variable(ProtobufUtils21::flat(32, None), None),
+                &EncodingUtils::variable(EncodingUtils::flat(32, None), None),
             )?,
         );
 
@@ -1517,6 +1522,63 @@ mod tests {
             )?;
         let decoded = decompressor.decompress(zipped, 4)?;
 
+        let DataBlock::Struct(decoded_struct) = decoded else {
+            panic!("expected struct datablock after decode");
+        };
+
+        let decoded_id = decoded_struct.children[0].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_id.bits_per_value, 32);
+        assert_eq!(decoded_id.data.as_ref(), id_block.data.as_ref());
+
+        let decoded_value = decoded_struct.children[1].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_value.bits_per_value, 64);
+        assert_eq!(decoded_value.data.as_ref(), value_block.data.as_ref());
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_packed_struct_miniblock_round_trip() -> Result<()> {
+        let id_block = fixed_i32_block_from_array(Int32Array::from(vec![1, 2, 3]));
+        let value_block = fixed_block_from_array(Int64Array::from(vec![10, 20, 30]));
+
+        let mut struct_block = DataBlock::Struct(StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(id_block.clone()),
+                DataBlock::FixedWidth(value_block.clone()),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        });
+        struct_block.compute_stat();
+
+        let compressor = PackedStructFixedWidthMiniBlockEncoder::default();
+        let (compressed, encoding) = compressor.compress(
+            MiniBlockCompressionContext::new(0, false, true),
+            struct_block,
+        )?;
+
+        let Compression::PackedStruct(packed) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected packed struct mini-block encoding");
+        };
+        assert_eq!(packed.bits_per_value, vec![32, 64]);
+
+        let mut expected = Vec::new();
+        for row in 0..3 {
+            let id_start = row * 4;
+            expected.extend_from_slice(&id_block.data.as_ref()[id_start..id_start + 4]);
+            let value_start = row * 8;
+            expected.extend_from_slice(&value_block.data.as_ref()[value_start..value_start + 8]);
+        }
+        assert_eq!(compressed.data.len(), 1);
+        assert_eq!(compressed.data[0].as_ref(), expected.as_slice());
+
+        let decompressor = PackedStructFixedWidthMiniBlockDecompressor::try_new(packed)?;
+        let decoded = MiniBlockDecompressor::decompress(
+            &decompressor,
+            compressed.data,
+            compressed.num_values,
+        )?;
         let DataBlock::Struct(decoded_struct) = decoded else {
             panic!("expected struct datablock after decode");
         };

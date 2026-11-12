@@ -20,14 +20,18 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, OffsetSizeTrait, UInt64Array,
+    Array, ArrayRef, DictionaryArray, OffsetSizeTrait, UInt32Array, UInt64Array,
     cast::AsArray,
-    new_empty_array, new_null_array,
-    types::{ArrowDictionaryKeyType, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
+    make_array, new_empty_array, new_null_array,
+    types::{
+        ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+        UInt32Type, UInt64Type,
+    },
 };
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
+use arrow_select::dictionary::garbage_collect_dictionary;
 use lance_arrow::DataTypeExt;
 
 use lance_core::{Error, Result};
@@ -464,7 +468,7 @@ impl FixedSizeListBlock {
 
     /// Try to flatten a FixedSizeListBlock into a FixedWidthDataBlock
     ///
-    /// Returns None if any children are nullable
+    /// Returns None if any children are nullable or are not fixed width
     pub fn try_into_flat(self) -> Option<FixedWidthDataBlock> {
         match *self.child {
             // Cannot flatten a nullable child
@@ -480,10 +484,7 @@ impl FixedSizeListBlock {
                 inner.num_values /= self.dimension;
                 Some(inner)
             }
-            _ => panic!(
-                "Expected FixedSizeList or FixedWidth data block but found {:?}",
-                self
-            ),
+            _ => None,
         }
     }
 
@@ -946,8 +947,9 @@ impl VariableWidthBlock {
         _proof: ValidVariableWidthLayout,
     ) -> ArrayData {
         let builder = self.into_arrow_builder(data_type);
-        // SAFETY: `_proof` witnesses that `validate_layout` proved this block
-        // satisfies the Arrow layout contract for `data_type`.
+        // SAFETY: `_proof` witnesses that `validate_layout` checked this block's offsets and
+        // values against `data_type`. It does not check buffer alignment; Arrow checks that
+        // when the offsets are read as typed values and panics on a misaligned buffer.
         unsafe { builder.build_unchecked() }
     }
 
@@ -978,6 +980,50 @@ impl VariableWidthBlock {
 
     pub fn data_size(&self) -> u64 {
         (self.data.len() + self.offsets.len()) as u64
+    }
+
+    /// Returns how many `data` bytes the values at `indices` span, or `None` if
+    /// decoding them cannot succeed.  Runs before the offsets are validated, so it
+    /// checks every offset it reads.
+    fn selected_data_len<I: ArrowNativeType>(&self, indices: &[I]) -> Option<u64> {
+        match self.bits_per_offset {
+            32 => self.selected_data_len_typed::<i32, I>(indices),
+            64 => self.selected_data_len_typed::<i64, I>(indices),
+            _ => None,
+        }
+    }
+
+    fn selected_data_len_typed<T, I>(&self, indices: &[I]) -> Option<u64>
+    where
+        T: OffsetSizeTrait + bytemuck::Pod,
+        I: ArrowNativeType,
+    {
+        if !self.offsets.len().is_multiple_of(std::mem::size_of::<T>()) {
+            return None;
+        }
+        let offsets = self.offsets.borrow_to_typed_view::<T>();
+        let total = indices.iter().try_fold(0_usize, |total, index| {
+            let index = index.to_usize()?;
+            if index as u64 >= self.num_values {
+                return None;
+            }
+            let start = offsets.get(index)?.to_usize()?;
+            let end = offsets.get(index + 1)?.to_usize()?;
+            if start > end || end > self.data.len() {
+                return None;
+            }
+            total.checked_add(end - start)
+        })?;
+        // Appending fails once the output outgrows what `T` offsets can address
+        T::from_usize(total)?;
+        Some(total as u64)
+    }
+
+    fn has_large_average_value(&self) -> bool {
+        self.data.len() as u64
+            >= self
+                .num_values
+                .saturating_mul(MIN_AVERAGE_VALUE_BYTES_FOR_EXACT_SIZE)
     }
 }
 
@@ -1055,6 +1101,11 @@ impl StructDataBlock {
     }
 }
 
+/// Below this average value size, decoding a variable-width dictionary keeps the average-based
+/// reservation: it over-reserves at most this many bytes per row, while sizing the output
+/// exactly costs a pass over the indices.
+const MIN_AVERAGE_VALUE_BYTES_FOR_EXACT_SIZE: u64 = 1024;
+
 /// A data block for dictionary encoded data
 #[derive(Debug, Clone)]
 pub struct DictionaryDataBlock {
@@ -1065,6 +1116,341 @@ pub struct DictionaryDataBlock {
 }
 
 impl DictionaryDataBlock {
+    fn index_out_of_range_error(idx: u64, dict_num_values: u64) -> Error {
+        Error::corrupt_file_named(
+            "data block",
+            format!(
+                "cannot append selection {}..{} from a block with {} values",
+                idx,
+                idx.saturating_add(1),
+                dict_num_values
+            ),
+        )
+    }
+
+    fn gather_variable_width_typed<T, I>(
+        dictionary: &VariableWidthBlock,
+        indices: &[I],
+    ) -> Option<Result<VariableWidthBlock>>
+    where
+        T: OffsetSizeTrait + bytemuck::Pod,
+        I: ArrowNativeType,
+    {
+        if dictionary
+            .validate_offsets_for_append::<T>(&(0..dictionary.num_values))
+            .is_err()
+        {
+            return None;
+        }
+        let Ok(dict_len) = usize::try_from(dictionary.num_values) else {
+            return Some(Err(Error::corrupt_file_named(
+                "dictionary",
+                "dictionary size does not fit in usize",
+            )));
+        };
+        let dict_offsets = dictionary.offsets.borrow_to_typed_view::<T>();
+        let dict_data = dictionary.data.as_ref();
+
+        // Pass 1: validate every index against `dict_len` and compute exact byte output size.
+        // Using `u128` avoids per-row checked arithmetic (`usize::MAX * usize::MAX < u128::MAX`).
+        let mut total_bytes_u128 = 0_u128;
+        for &raw_idx in indices {
+            let Some(idx) = raw_idx.to_usize() else {
+                return Some(Err(Self::index_out_of_range_error(
+                    u64::MAX,
+                    dictionary.num_values,
+                )));
+            };
+            if idx >= dict_len {
+                return Some(Err(Self::index_out_of_range_error(
+                    idx as u64,
+                    dictionary.num_values,
+                )));
+            }
+            // SAFETY: `validate_offsets_for_append` proved `dict_offsets.len() > dict_len` and
+            // that all offsets in `0..=dict_len` are non-negative and monotonically non-decreasing.
+            let len = unsafe {
+                (*dict_offsets.get_unchecked(idx + 1)).as_usize()
+                    - (*dict_offsets.get_unchecked(idx)).as_usize()
+            };
+            total_bytes_u128 += len as u128;
+        }
+
+        let Ok(total_bytes) = usize::try_from(total_bytes_u128) else {
+            return Some(Err(Error::not_supported_source(
+                "appending variable-width data would overflow usize".into(),
+            )));
+        };
+        if T::from_usize(total_bytes).is_none() {
+            return Some(Err(Error::not_supported_source(
+                format!(
+                    "appending variable-width data would require {} bytes, which exceeds the capacity of {}-bit offsets",
+                    total_bytes,
+                    T::get_byte_width() * 8
+                )
+                .into(),
+            )));
+        }
+
+        // Pass 2: gather string/binary payloads and write rebased offsets in a single tight pass
+        // with zero reallocations or virtual dispatch.
+        let num_indices = indices.len();
+        let mut out_offsets = Vec::<T>::with_capacity(num_indices + 1);
+        let mut out_bytes = Vec::<u8>::with_capacity(total_bytes);
+        // SAFETY: `validate_offsets_for_append(0..dict_len)` proved `dict_offsets.len()` exceeds
+        // `dict_len` and that offsets in `0..=dict_len` are non-negative, non-decreasing, and at
+        // most `dict_data.len()`. Pass 1 proved every index converts to `usize`, so `as_usize`
+        // agrees, and that `idx < dict_len`: the unchecked reads stay within `0..=dict_len` and
+        // every `start..end` payload range is in bounds. `total_bytes` is their exact sum and fits
+        // both `usize` and `T`, so every rebased offset fits `T`. Both outputs are fresh
+        // allocations disjoint from `dict_data`, with capacity `num_indices + 1` and
+        // `total_bytes`, and the loop writes all `num_indices + 1` offsets and fills
+        // `0..total_bytes` contiguously before the two `set_len` calls.
+        unsafe {
+            let out_off_ptr = out_offsets.as_mut_ptr();
+            let out_byte_ptr = out_bytes.as_mut_ptr();
+            let dict_data_ptr = dict_data.as_ptr();
+            *out_off_ptr = T::usize_as(0);
+            let mut running = 0usize;
+            for (pos, &raw_idx) in indices.iter().enumerate() {
+                let idx = raw_idx.as_usize();
+                let start = (*dict_offsets.get_unchecked(idx)).as_usize();
+                let end = (*dict_offsets.get_unchecked(idx + 1)).as_usize();
+                let len = end - start;
+                std::ptr::copy_nonoverlapping(
+                    dict_data_ptr.add(start),
+                    out_byte_ptr.add(running),
+                    len,
+                );
+                running += len;
+                *out_off_ptr.add(pos + 1) = T::usize_as(running);
+            }
+            debug_assert_eq!(running, total_bytes);
+            out_offsets.set_len(num_indices + 1);
+            out_bytes.set_len(total_bytes);
+        }
+
+        Some(Ok(VariableWidthBlock {
+            data: LanceBuffer::from(out_bytes),
+            offsets: LanceBuffer::reinterpret_vec(out_offsets),
+            bits_per_offset: dictionary.bits_per_offset,
+            num_values: num_indices as u64,
+            block_info: BlockInfo::new(),
+        }))
+    }
+
+    fn gather_variable_width<I: ArrowNativeType>(
+        dictionary: &VariableWidthBlock,
+        indices: &[I],
+    ) -> Option<Result<DataBlock>> {
+        match dictionary.bits_per_offset {
+            32 => Self::gather_variable_width_typed::<i32, I>(dictionary, indices)
+                .map(|res| res.map(DataBlock::VariableWidth)),
+            64 => Self::gather_variable_width_typed::<i64, I>(dictionary, indices)
+                .map(|res| res.map(DataBlock::VariableWidth)),
+            _ => None,
+        }
+    }
+
+    fn gather_fixed_width_typed<V, I>(
+        dictionary: &FixedWidthDataBlock,
+        dict_len: usize,
+        indices: &[I],
+    ) -> Result<DataBlock>
+    where
+        V: ArrowNativeType + bytemuck::Pod,
+        I: ArrowNativeType,
+    {
+        let elem_bytes = std::mem::size_of::<V>();
+        let required_dict_bytes = dict_len.checked_mul(elem_bytes).ok_or_else(|| {
+            Error::corrupt_file_named("dictionary", "fixed-width dictionary byte size overflows")
+        })?;
+        if dictionary.data.len() < required_dict_bytes {
+            return Err(Error::corrupt_file_named(
+                "dictionary",
+                format!(
+                    "fixed-width dictionary holds {} bytes, expected at least {} bytes for {} values",
+                    dictionary.data.len(),
+                    required_dict_bytes,
+                    dict_len
+                ),
+            ));
+        }
+        let dict_buf = dictionary.data.slice_with_length(0, required_dict_bytes);
+        let dict_vals = dict_buf.borrow_to_typed_slice::<V>();
+        let dict_slice = dict_vals.as_ref();
+
+        let mut out = Vec::<V>::with_capacity(indices.len());
+        let out_ptr = out.as_mut_ptr();
+        for (pos, &raw_idx) in indices.iter().enumerate() {
+            let Some(idx) = raw_idx.to_usize() else {
+                return Err(Self::index_out_of_range_error(
+                    u64::MAX,
+                    dictionary.num_values,
+                ));
+            };
+            if idx >= dict_len {
+                return Err(Self::index_out_of_range_error(
+                    idx as u64,
+                    dictionary.num_values,
+                ));
+            }
+            // SAFETY: `idx < dict_len == dict_slice.len()` and `pos < indices.len() == out.capacity()`.
+            unsafe {
+                *out_ptr.add(pos) = *dict_slice.get_unchecked(idx);
+            }
+        }
+        // SAFETY: Every slot `0..indices.len()` was initialized in the loop above.
+        unsafe {
+            out.set_len(indices.len());
+        }
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(out),
+            bits_per_value: dictionary.bits_per_value,
+            num_values: indices.len() as u64,
+            block_info: BlockInfo::new(),
+        }))
+    }
+
+    fn gather_fixed_width<I: ArrowNativeType>(
+        dictionary: &FixedWidthDataBlock,
+        indices: &[I],
+    ) -> Option<Result<DataBlock>> {
+        if dictionary.bits_per_value == 0 || !dictionary.bits_per_value.is_multiple_of(8) {
+            return None;
+        }
+        let Ok(dict_len) = usize::try_from(dictionary.num_values) else {
+            return Some(Err(Error::corrupt_file_named(
+                "dictionary",
+                "dictionary size does not fit in usize",
+            )));
+        };
+        match dictionary.bits_per_value {
+            8 => Some(Self::gather_fixed_width_typed::<u8, I>(
+                dictionary, dict_len, indices,
+            )),
+            16 => Some(Self::gather_fixed_width_typed::<u16, I>(
+                dictionary, dict_len, indices,
+            )),
+            32 => Some(Self::gather_fixed_width_typed::<u32, I>(
+                dictionary, dict_len, indices,
+            )),
+            64 => Some(Self::gather_fixed_width_typed::<u64, I>(
+                dictionary, dict_len, indices,
+            )),
+            128 => Some(Self::gather_fixed_width_typed::<i128, I>(
+                dictionary, dict_len, indices,
+            )),
+            bits => {
+                let Ok(bytes_per_value) = usize::try_from(bits / 8) else {
+                    return None;
+                };
+                let Some(required_dict_bytes) = dict_len.checked_mul(bytes_per_value) else {
+                    return Some(Err(Error::corrupt_file_named(
+                        "dictionary",
+                        "fixed-width dictionary byte size overflows",
+                    )));
+                };
+                if dictionary.data.len() < required_dict_bytes {
+                    return Some(Err(Error::corrupt_file_named(
+                        "dictionary",
+                        format!(
+                            "fixed-width dictionary holds {} bytes, expected at least {} bytes for {} values",
+                            dictionary.data.len(),
+                            required_dict_bytes,
+                            dict_len
+                        ),
+                    )));
+                }
+                let Some(total_bytes) = indices.len().checked_mul(bytes_per_value) else {
+                    return Some(Err(Error::not_supported_source(
+                        "decoded fixed-width dictionary size overflows usize".into(),
+                    )));
+                };
+                let mut out = Vec::<u8>::with_capacity(total_bytes);
+                let out_ptr = out.as_mut_ptr();
+                let dict_ptr = dictionary.data.as_ptr();
+                for (pos, &raw_idx) in indices.iter().enumerate() {
+                    let Some(idx) = raw_idx.to_usize() else {
+                        return Some(Err(Self::index_out_of_range_error(
+                            u64::MAX,
+                            dictionary.num_values,
+                        )));
+                    };
+                    if idx >= dict_len {
+                        return Some(Err(Self::index_out_of_range_error(
+                            idx as u64,
+                            dictionary.num_values,
+                        )));
+                    }
+                    // SAFETY: `idx < dict_len`, `dict_len * bytes_per_value <= dictionary.data.len()`,
+                    // and `(pos + 1) * bytes_per_value <= total_bytes == out.capacity()`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            dict_ptr.add(idx * bytes_per_value),
+                            out_ptr.add(pos * bytes_per_value),
+                            bytes_per_value,
+                        );
+                    }
+                }
+                // SAFETY: Every byte `0..total_bytes` was initialized above.
+                unsafe {
+                    out.set_len(total_bytes);
+                }
+                Some(Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::from(out),
+                    bits_per_value: dictionary.bits_per_value,
+                    num_values: indices.len() as u64,
+                    block_info: BlockInfo::new(),
+                })))
+            }
+        }
+    }
+
+    fn try_fast_gather<I: ArrowNativeType>(
+        dictionary: &DataBlock,
+        indices: &[I],
+    ) -> Option<Result<DataBlock>> {
+        match dictionary {
+            DataBlock::VariableWidth(var_dict) => Self::gather_variable_width(var_dict, indices),
+            DataBlock::FixedWidth(fixed_dict) => Self::gather_fixed_width(fixed_dict, indices),
+            DataBlock::Nullable(nullable) => {
+                let inner_res = match nullable.data.as_ref() {
+                    DataBlock::VariableWidth(var_dict) => {
+                        Self::gather_variable_width(var_dict, indices)?
+                    }
+                    DataBlock::FixedWidth(fixed_dict) => {
+                        Self::gather_fixed_width(fixed_dict, indices)?
+                    }
+                    _ => return None,
+                };
+                let inner = match inner_res {
+                    Ok(block) => block,
+                    Err(err) => return Some(Err(err)),
+                };
+                let dict_num_values = nullable.data.num_values();
+                if (nullable.nulls.len() as u64) * 8 < dict_num_values {
+                    return Some(Err(Error::corrupt_file_named(
+                        "dictionary",
+                        "nullable dictionary validity buffer is shorter than dictionary length",
+                    )));
+                }
+                let null_bytes = nullable.nulls.as_ref();
+                // SAFETY in closure: `inner` succeeded above, which already verified
+                // `raw_idx.to_usize() < dict_num_values <= null_bytes.len() * 8` for all indices.
+                let validity = BooleanBuffer::collect_bool(indices.len(), |i| {
+                    arrow_buffer::bit_util::get_bit(null_bytes, indices[i].as_usize())
+                });
+                Some(Ok(DataBlock::Nullable(NullableDataBlock {
+                    data: Box::new(inner),
+                    nulls: LanceBuffer::from(validity.into_inner()),
+                    block_info: BlockInfo::new(),
+                })))
+            }
+            _ => None,
+        }
+    }
+
     fn decode_helper<K: ArrowDictionaryKeyType>(self) -> Result<DataBlock> {
         // Handle empty batch - this can happen when decoding a range that contains
         // only empty/null lists, or when reading sparse data
@@ -1072,14 +1458,61 @@ impl DictionaryDataBlock {
             return Ok(DataBlock::AllNull(AllNullDataBlock { num_values: 0 }));
         }
 
-        // assume the indices are uniformly distributed.
-        let estimated_size_bytes = self.dictionary.data_size()
-            * (self.indices.num_values + self.dictionary.num_values() - 1)
-            / self.dictionary.num_values();
-        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
-
-        let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
+        let num_indices = usize::try_from(self.indices.num_values).map_err(|_| {
+            Error::corrupt_file_named("dictionary", "dictionary index count overflows usize")
+        })?;
+        let elem_bytes = std::mem::size_of::<K::Native>();
+        let required_bytes = num_indices.checked_mul(elem_bytes).ok_or_else(|| {
+            Error::corrupt_file_named("dictionary", "dictionary indices byte size overflows")
+        })?;
+        if self.indices.data.len() < required_bytes {
+            return Err(Error::corrupt_file_named(
+                "dictionary",
+                format!(
+                    "dictionary indices buffer holds {} bytes, expected at least {} bytes",
+                    self.indices.data.len(),
+                    required_bytes
+                ),
+            ));
+        }
+        let sliced_indices = self.indices.data.slice_with_length(0, required_bytes);
+        let indices = sliced_indices.borrow_to_typed_slice::<K::Native>();
         let indices = indices.as_ref();
+
+        if let Some(result) = Self::try_fast_gather(&self.dictionary, indices) {
+            return result;
+        }
+
+        // Fallback for nested/composite dictionary blocks (e.g. Struct / FixedSizeList / Bitmap).
+        let selected_values = match self.dictionary.as_ref() {
+            DataBlock::VariableWidth(dictionary) if dictionary.has_large_average_value() => {
+                Some((dictionary, false))
+            }
+            DataBlock::Nullable(nullable) => match nullable.data.as_ref() {
+                DataBlock::VariableWidth(dictionary) if dictionary.has_large_average_value() => {
+                    Some((dictionary, true))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let estimated_size_bytes = match selected_values {
+            Some((dictionary, is_nullable)) => dictionary
+                .selected_data_len(indices)
+                .and_then(|data_len| {
+                    if is_nullable {
+                        data_len.checked_add(data_len.div_ceil(15))
+                    } else {
+                        Some(data_len)
+                    }
+                })
+                .unwrap_or(0),
+            None => (self.dictionary.data_size()
+                * (self.indices.num_values + self.dictionary.num_values() - 1))
+                .checked_div(self.dictionary.num_values())
+                .unwrap_or(0),
+        };
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         let selections = indices.iter().map(|idx| {
             let idx = idx.to_usize().unwrap() as u64;
@@ -1110,6 +1543,9 @@ impl DictionaryDataBlock {
         _validate: bool,
     ) -> Result<ArrayData> {
         let declared_key_bits = key_type.byte_width() as u64 * 8;
+        if self.indices.bits_per_value == 32 && declared_key_bits < 32 {
+            return self.narrow_widened_indices(key_type, value_type);
+        }
         if self.indices.bits_per_value != declared_key_bits {
             return Err(lance_core::Error::corrupt_file_named(
                 "dictionary",
@@ -1135,12 +1571,135 @@ impl DictionaryDataBlock {
         Ok(builder.build()?)
     }
 
+    /// Converts a decoded chunk whose indices are 32 bits wide although the field
+    /// declares a narrower key type.
+    ///
+    /// Before #8220 the 2.0 writer stored such pages when it appended a null slot
+    /// past the last key the declared type can address, or when the dictionaries of
+    /// the chunks buffered into one page did not fit that type together.  The 2.1
+    /// writer still stores them in the second case.  The indices still point at the
+    /// right values, so the chunk keeps only the entries it references, re-interned
+    /// when they do not fit the key type.
+    fn narrow_widened_indices(
+        self,
+        key_type: Box<DataType>,
+        value_type: Box<DataType>,
+    ) -> Result<ArrayData> {
+        let num_indices = self.indices.num_values;
+        let indices = UInt32Array::from(self.indices.do_into_arrow(
+            DataType::UInt32,
+            num_indices,
+            true,
+        )?);
+        let values = make_array(
+            self.dictionary
+                .into_arrow_impl((*value_type).clone(), true)?,
+        );
+        let dictionary = DictionaryArray::<UInt32Type>::try_new(indices, values).map_err(|err| {
+            lance_core::Error::corrupt_file_named(
+                "dictionary",
+                format!(
+                    "dictionary indices use 32 bits but the declared {key_type} key type uses {} bits, and they do not address the dictionary: {err}",
+                    key_type.byte_width() * 8
+                ),
+            )
+        })?;
+        let dictionary = garbage_collect_dictionary(&dictionary)?;
+        let max_keys = max_index_val(&key_type) + 1;
+        let declared_type = DataType::Dictionary(key_type.clone(), value_type);
+        if dictionary.values().len() as u64 <= max_keys {
+            // The referenced entries fit the declared key type, so only the keys are
+            // narrowed.  A null stored as a dictionary value stays a value, as it does
+            // on a page whose indices match the key type.
+            return Ok(arrow_cast::cast(&dictionary, &declared_type)?.to_data());
+        }
+        // The referenced entries can repeat a value or include the null slot, so intern
+        // them exactly.  This turns a null dictionary value into a null key.
+        let interned = match arrow_cast::cast(dictionary.values(), &declared_type) {
+            Ok(interned) => interned,
+            Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
+                return Err(lance_core::Error::not_supported(format!(
+                    "this batch references {} dictionary entries, more than the {max_keys} distinct values that {key_type} keys can address; read fewer rows per batch",
+                    dictionary.values().len()
+                )));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let interned = interned.as_any_dictionary();
+        let keys = arrow_select::take::take(interned.keys(), dictionary.keys(), None)?;
+        Ok(keys
+            .to_data()
+            .into_builder()
+            .data_type(declared_type)
+            .add_child_data(interned.values().to_data())
+            .build()?)
+    }
+
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         if let DataType::Dictionary(key_type, value_type) = data_type {
-            self.into_arrow_dict(key_type, value_type, validate)
-        } else {
-            self.decode()?.into_arrow_impl(data_type, validate)
+            return self.into_arrow_dict(key_type, value_type, validate);
         }
+
+        // When expanding a variable-width dictionary into Utf8 / LargeUtf8 / Binary / LargeBinary,
+        // validate the small dictionary once instead of re-validating UTF-8 and monotonicity
+        // across all N expanded rows. If the dictionary has unreferenced corrupt entries, fall
+        // back to per-output validation so behavior on partially referenced dictionaries is
+        // preserved identically.
+        if self.indices.num_values > 0
+            && let Some(expected_bits) = VariableWidthBlock::expected_bits_per_offset(&data_type)
+        {
+            let dict_proof = match self.dictionary.as_ref() {
+                DataBlock::VariableWidth(dict)
+                    if dict.num_values > 0 && dict.bits_per_offset == expected_bits =>
+                {
+                    dict.validate_layout(&data_type).ok()
+                }
+                DataBlock::Nullable(nullable) => match nullable.data.as_ref() {
+                    DataBlock::VariableWidth(dict)
+                        if dict.num_values > 0 && dict.bits_per_offset == expected_bits =>
+                    {
+                        dict.validate_layout(&data_type).ok()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            if let Some(proof) = dict_proof {
+                let decoded = self.decode()?;
+                return match decoded {
+                    DataBlock::VariableWidth(var_block) => {
+                        Ok(var_block.into_arrow_unchecked(data_type, proof))
+                    }
+                    DataBlock::Nullable(NullableDataBlock { data, nulls, .. }) => match *data {
+                        DataBlock::VariableWidth(var_block) => {
+                            let len = var_block.num_values as usize;
+                            let validity =
+                                NullBuffer::new(BooleanBuffer::new(nulls.into_buffer(), 0, len));
+                            // SAFETY: `proof` verified that every dictionary entry is valid for
+                            // `data_type` (including UTF-8 char boundaries), `gather_variable_width`
+                            // constructed valid monotonic offsets of length `len + 1`, and
+                            // `try_fast_gather` constructed `nulls` with exact bit length `len`.
+                            Ok(unsafe {
+                                var_block
+                                    .into_arrow_builder(data_type)
+                                    .nulls(Some(validity))
+                                    .build_unchecked()
+                            })
+                        }
+                        other => NullableDataBlock {
+                            data: Box::new(other),
+                            nulls,
+                            block_info: BlockInfo::new(),
+                        }
+                        .into_arrow(data_type, validate),
+                    },
+                    other => other.into_arrow_impl(data_type, validate),
+                };
+            }
+        }
+
+        self.decode()?.into_arrow_impl(data_type, validate)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -1159,6 +1718,21 @@ impl DictionaryDataBlock {
             dictionary: Box::new(dictionary),
         }
     }
+}
+
+/// Limits recovery batches only when a stored dictionary exceeds its declared key capacity.
+pub(crate) fn dictionary_batch_limit(data_type: &DataType, dictionary_len: u64) -> Option<u64> {
+    let DataType::Dictionary(key_type, _) = data_type else {
+        return None;
+    };
+    let capacity = match key_type.as_ref() {
+        DataType::Int8 => i8::MAX as u64 + 1,
+        DataType::UInt8 => u8::MAX as u64 + 1,
+        DataType::Int16 => i16::MAX as u64 + 1,
+        DataType::UInt16 => u16::MAX as u64 + 1,
+        _ => return None,
+    };
+    (dictionary_len > capacity).then_some(capacity)
 }
 
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
@@ -1637,9 +2211,32 @@ fn encode_bitmap_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
 fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     let value_type = arrays[0].as_any_dictionary().values().data_type();
     let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
+    // Arrow's concat reuses a dictionary only when every array shares the same one.  Otherwise
+    // it appends the dictionaries one after another, unless together they hold at least as
+    // many entries as there are rows or more than the keys can address.  Arrays that each
+    // carry their own copy of the same values, as the write queue's copies of one input do,
+    // would repeat them once per array, yet only need their keys concatenated.
+    if !shares_one_dictionary(&array_refs)
+        && let Some(concatenated) = concat_keys_of_equal_dictionaries(&array_refs)
+    {
+        return concatenated;
+    }
     match arrow_select::concat::concat(&array_refs) {
         Ok(array) => array,
         Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
+            // Arrow's concat merges dictionaries with a lossy, fixed-size
+            // interner.  Hash collisions can inflate the merged dictionary
+            // beyond the declared key type and report overflow even though the
+            // exact, deduplicated union still fits.  Rebuild the dictionary by
+            // re-encoding the logical values, which deduplicates exactly.
+            if let Some(reencoded) = reencode_dict_arrays(&array_refs) {
+                return reencoded;
+            }
+            // The merged values genuinely span more indices than the declared
+            // key type can address.  Widen so that the writer's key-type check
+            // can reject the mismatch instead of persisting a file whose
+            // physical index width contradicts the schema.
+            //
             // Slow, but hopefully a corner case.  Optimize later
             let upscaled = array_refs
                 .iter()
@@ -1675,6 +2272,178 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     }
 }
 
+/// Whether every dictionary array uses the very same values (the same buffers, not merely
+/// equal ones), which is when Arrow's concat keeps a single copy of them.
+fn shares_one_dictionary(arrays: &[&dyn Array]) -> bool {
+    let first = arrays[0].as_any_dictionary().values().to_data();
+    arrays[1..]
+        .iter()
+        .all(|array| array.as_any_dictionary().values().to_data().ptr_eq(&first))
+}
+
+/// Concatenates the keys of dictionary arrays whose dictionaries hold equal values, keeping
+/// one copy of the dictionary.  Returns `None` when the dictionaries differ, or when Arrow's
+/// concat merges them itself (they hold at least as many entries as there are rows, or more
+/// than the keys can address), which keeps only the distinct entries the keys use.
+fn concat_keys_of_equal_dictionaries(arrays: &[&dyn Array]) -> Option<ArrayRef> {
+    let DataType::Dictionary(key_type, _) = arrays[0].data_type() else {
+        return None;
+    };
+    let values = arrays[0].as_any_dictionary().values();
+    let entries = values.len().saturating_mul(arrays.len());
+    let rows = arrays.iter().map(|array| array.len()).sum::<usize>();
+    if entries >= rows || entries as u64 > max_index_val(key_type) {
+        return None;
+    }
+    let values_data = values.to_data();
+    if !arrays[1..]
+        .iter()
+        .all(|array| array.as_any_dictionary().values().to_data() == values_data)
+    {
+        return None;
+    }
+    let keys = arrays
+        .iter()
+        .map(|array| array.as_any_dictionary().keys())
+        .collect::<Vec<_>>();
+    let keys = arrow_select::concat::concat(&keys).ok()?;
+    make_dictionary_array(keys, values.clone())
+}
+
+/// Concatenates the arrays decoded from consecutive pages of one column.
+///
+/// Arrow merges dictionaries with a lossy interner, so a batch that spans pages
+/// whose dictionaries fit the key type together can still report an overflow.
+/// On overflow the dictionaries are merged exactly instead.  A null stored as a
+/// dictionary value (the 2.0 layout) becomes a null key in the merged array.
+pub(crate) fn concat_decoded_arrays(arrays: &[&dyn Array]) -> Result<ArrayRef> {
+    match arrow_select::concat::concat(arrays) {
+        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
+            let DataType::Dictionary(key_type, _) = arrays[0].data_type() else {
+                return Err(arrow_schema::ArrowError::DictionaryKeyOverflowError.into());
+            };
+            reencode_dict_arrays(arrays).ok_or_else(|| {
+                let entries = arrays
+                    .iter()
+                    .map(|array| array.as_any_dictionary().values().len())
+                    .sum::<usize>();
+                Error::not_supported(format!(
+                    "could not merge the dictionaries of the {} pages in this batch ({entries} entries) into {key_type} keys, which address at most {} distinct values; read fewer rows per batch",
+                    arrays.len(),
+                    max_index_val(key_type) + 1
+                ))
+            })
+        }
+        result => Ok(result?),
+    }
+}
+
+/// Rebuilds one dictionary array from `arrays` while preserving their declared
+/// dictionary key type.
+///
+/// Only the dictionary *entries* are expanded, never the rows: the referenced
+/// entries are deduplicated once and each array's keys are remapped into the
+/// merged dictionary.  Cost is therefore proportional to the number of entries
+/// plus one index per row, not to the value payload per row.  Returns `None`
+/// when the deduplicated entries do not fit the declared key type or the value
+/// type is not supported by the cast, letting the caller fall back to widening.
+fn reencode_dict_arrays(array_refs: &[&dyn Array]) -> Option<ArrayRef> {
+    let DataType::Dictionary(key_type, value_type) = array_refs[0].data_type() else {
+        return None;
+    };
+
+    // Drop entries the keys never reference first.  A backing dictionary can
+    // carry unused entries, and keeping them could overflow the declared key
+    // type for a merge whose referenced values actually fit.
+    let collected = array_refs
+        .iter()
+        .map(|array| {
+            arrow_select::dictionary::garbage_collect_any_dictionary(array.as_any_dictionary()).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let array_refs = collected
+        .iter()
+        .map(|array| array.as_ref())
+        .collect::<Vec<_>>();
+
+    // Concatenate the dictionary entries, capturing where each array's entries
+    // start in the combined array.
+    let mut entries = Vec::with_capacity(array_refs.len());
+    let mut entry_offsets = Vec::with_capacity(array_refs.len());
+    let mut entry_count = 0usize;
+    for array in &array_refs {
+        let dictionary = array.as_any_dictionary_opt()?;
+        entry_offsets.push(entry_count);
+        entry_count += dictionary.values().len();
+        entries.push(dictionary.values().clone());
+    }
+    let entry_refs = entries
+        .iter()
+        .map(|entry| entry.as_ref())
+        .collect::<Vec<_>>();
+    let entries = arrow_select::concat::concat(&entry_refs).ok()?;
+
+    // Exact entry deduplication: casting the entries to a dictionary interns
+    // them and yields the mapping from each original entry to its unique index.
+    let entry_map = arrow_cast::cast(
+        entries.as_ref(),
+        &DataType::Dictionary(key_type.clone(), value_type.clone()),
+    )
+    .ok()?;
+    let entry_map = entry_map.as_any_dictionary();
+    let merged_entries = entry_map.values().clone();
+    let mapping = entry_map.keys();
+
+    // Remap every key through its array's slice of the entry mapping.  This
+    // costs one index per row, never one value per row.
+    let mut remapped_keys = Vec::with_capacity(array_refs.len());
+    for (array, &offset) in array_refs.iter().zip(entry_offsets.iter()) {
+        let dictionary = array.as_any_dictionary_opt()?;
+        let entry_slice = mapping.slice(offset, dictionary.values().len());
+        let remapped = arrow_select::take::take(
+            &entry_slice,
+            dictionary.keys(),
+            Some(arrow_select::take::TakeOptions {
+                check_bounds: false,
+            }),
+        )
+        .ok()?;
+        remapped_keys.push(remapped);
+    }
+    let remapped_refs = remapped_keys
+        .iter()
+        .map(|keys| keys.as_ref())
+        .collect::<Vec<_>>();
+    let keys = arrow_select::concat::concat(&remapped_refs).ok()?;
+
+    make_dictionary_array(keys, merged_entries)
+}
+
+/// Assembles a [`DictionaryArray`](arrow_array::DictionaryArray) from remapped
+/// keys and deduplicated values.  Returns `None` if the key array is not a
+/// supported dictionary key type or the keys do not fit the values.
+fn make_dictionary_array(keys: ArrayRef, values: ArrayRef) -> Option<ArrayRef> {
+    macro_rules! build {
+        ($key:ty) => {{
+            let keys = keys.as_primitive_opt::<$key>()?.clone();
+            arrow_array::DictionaryArray::<$key>::try_new(keys, values)
+                .ok()
+                .map(|dictionary| Arc::new(dictionary) as ArrayRef)
+        }};
+    }
+    match keys.data_type() {
+        DataType::Int8 => build!(Int8Type),
+        DataType::Int16 => build!(Int16Type),
+        DataType::Int32 => build!(Int32Type),
+        DataType::Int64 => build!(Int64Type),
+        DataType::UInt8 => build!(UInt8Type),
+        DataType::UInt16 => build!(UInt16Type),
+        DataType::UInt32 => build!(UInt32Type),
+        DataType::UInt64 => build!(UInt64Type),
+        _ => None,
+    }
+}
+
 fn max_index_val(index_type: &DataType) -> u64 {
     match index_type {
         DataType::Int8 => i8::MAX as u64,
@@ -1702,8 +2471,7 @@ fn max_index_val(index_type: &DataType) -> u64 {
 // A simple way to do this today is to just concatenate all the arrays.  This is because
 // arrow's dictionary concatenation function already has the logic to merge dictionaries.
 //
-// TODO: We could be more efficient here by checking if the dictionaries are the same
-//       Also, if they aren't, we can possibly do something cheaper than concatenating
+// TODO: If the dictionaries differ, we can possibly do something cheaper than concatenating
 //
 // In addition, we want to normalize the representation of nulls.  The cheapest thing to
 // do (space-wise) is to put the nulls in the dictionary.
@@ -1896,6 +2664,16 @@ impl DataBlock {
     }
 
     pub fn from_arrays(arrays: &[ArrayRef], num_values: u64) -> Self {
+        Self::from_arrays_impl(arrays, num_values, true)
+    }
+
+    /// Rewrap decoded Arrow buffers without collecting encoder statistics.
+    pub(crate) fn from_decoded_array(array: ArrayRef) -> Self {
+        let len = array.len() as u64;
+        Self::from_arrays_impl(&[array], len, false)
+    }
+
+    fn from_arrays_impl(arrays: &[ArrayRef], num_values: u64, encoding: bool) -> Self {
         if arrays.is_empty() || num_values == 0 {
             return Self::AllNull(AllNullDataBlock { num_values: 0 });
         }
@@ -1965,7 +2743,16 @@ impl DataBlock {
             | DataType::UInt32
             | DataType::UInt64
             | DataType::UInt8 => {
-                let data = encode_flat_data(arrays, num_values);
+                let data = if arrays.len() == 1 {
+                    let data = arrays[0].to_data();
+                    let width = data_type.byte_width();
+                    LanceBuffer::from(
+                        data.buffers()[0]
+                            .slice_with_length(data.offset() * width, num_values as usize * width),
+                    )
+                } else {
+                    encode_flat_data(arrays, num_values)
+                };
                 Self::FixedWidth(FixedWidthDataBlock {
                     data,
                     bits_per_value: data_type.byte_width() as u64 * 8,
@@ -1983,7 +2770,7 @@ impl DataBlock {
                         .iter()
                         .map(|s| s.column(child_idx).clone())
                         .collect::<Vec<_>>();
-                    children.push(Self::from_arrays(&child_vec, num_values));
+                    children.push(Self::from_arrays_impl(&child_vec, num_values, encoding));
                 }
 
                 // Extract validity for the struct array
@@ -2004,7 +2791,8 @@ impl DataBlock {
                     .iter()
                     .map(|arr| arr.as_fixed_size_list().values().clone())
                     .collect::<Vec<_>>();
-                let child_block = Self::from_arrays(&children, num_values * *dim as u64);
+                let child_block =
+                    Self::from_arrays_impl(&children, num_values * *dim as u64, encoding);
                 Self::FixedSizeList(FixedSizeListBlock {
                     child: Box::new(child_block),
                     dimension: *dim as u64,
@@ -2025,7 +2813,9 @@ impl DataBlock {
         };
 
         // compute statistics
-        encoded.compute_stat();
+        if encoding {
+            encoded.compute_stat();
+        }
 
         if !matches!(data_type, DataType::Dictionary(_, _)) {
             match nulls {
@@ -2129,9 +2919,10 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, make_array,
-        new_null_array,
-        types::{Int8Type, Int32Type},
+        LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array,
+        cast::AsArray,
+        make_array, new_null_array,
+        types::{Int8Type, Int32Type, UInt8Type, UInt16Type},
     };
     use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
     use arrow_data::ArrayData;
@@ -2146,7 +2937,7 @@ mod tests {
 
     use super::{
         AllNullDataBlock, BlockInfo, DataBlock, DataBlockBuilder, DictionaryDataBlock,
-        FixedWidthDataBlock, VariableWidthBlock,
+        FixedWidthDataBlock, VariableWidthBlock, concat_decoded_arrays, reencode_dict_arrays,
     };
 
     use arrow_array::Array;
@@ -2343,6 +3134,9 @@ mod tests {
         #[case] data_type: DataType,
         #[case] offsets: Buffer,
     ) {
+        // SAFETY: the offsets are deliberately invalid. `build_unchecked` leaves validity to the
+        // caller, and the array only reaches `validate_array_data`, which must reject it before
+        // anything reads the strings.
         let array_data = unsafe {
             ArrayData::builder(data_type)
                 .len(1)
@@ -2412,6 +3206,188 @@ mod tests {
     }
 
     #[test]
+    fn test_dictionary_copies_of_one_dictionary_keep_one_copy() {
+        // Two batches with equal but separately allocated dictionaries
+        let arr1 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("b"), Some("a")]);
+        let arr2 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("b")]);
+
+        let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5);
+
+        let data = data.as_dictionary().unwrap();
+        assert_eq!(
+            data.indices.data,
+            LanceBuffer::reinterpret_vec::<i8>(vec![0, 1, 0, 0, 1])
+        );
+        let items = data.dictionary.as_variable_width().unwrap();
+        assert_eq!(items.data, LanceBuffer::copy_slice(b"ab"));
+
+        // Where Arrow merges the dictionaries itself (128 entries for 128 rows) it also
+        // collapses repeated values, which keeping one copy would not
+        let make = || -> ArrayRef {
+            let values = StringArray::from(vec!["same"; 64]);
+            let keys = Int8Array::from((0..64).collect::<Vec<i8>>());
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+        };
+        let data = DataBlock::from_arrays(&[make(), make()], 128);
+        assert_eq!(data.as_dictionary().unwrap().dictionary.num_values(), 1);
+    }
+
+    fn all_int8_dictionary() -> DictionaryArray<Int8Type> {
+        let values: Vec<u16> = (0..127u16).collect();
+        let keys: Vec<i8> = (0..127)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+            .collect();
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_dictionary_merge_keeps_declared_key_type() {
+        // Two identical Dictionary(Int8, UInt16) chunks holding every value an
+        // Int8 key can address.  Arrow's concat merges dictionaries with a
+        // lossy interner that can over-count on hash collisions, which used to
+        // widen the merged indices to UInt32 even though the exact union (127
+        // values) fits.  The block must keep the declared key type.
+        let a = Arc::new(all_int8_dictionary()) as ArrayRef;
+        let b = Arc::new(all_int8_dictionary()) as ArrayRef;
+        let data = DataBlock::from_arrays(&[a, b], 254);
+
+        let dict = data.as_dictionary().unwrap();
+        assert_eq!(dict.indices.bits_per_value, 8);
+        assert_eq!(dict.dictionary.num_values(), 127);
+    }
+
+    #[test]
+    fn test_dictionary_merge_keeps_declared_key_type_utf8() {
+        // Same shape as the integer case but through the byte-value entry path:
+        // the entries must be deduplicated without expanding them per row.
+        let make = || -> ArrayRef {
+            let values = StringArray::from(
+                (0..127)
+                    .map(|i| format!("value_{i:03}"))
+                    .collect::<Vec<_>>(),
+            );
+            let keys = Int8Array::from(
+                (0..127)
+                    .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+                    .collect::<Vec<_>>(),
+            );
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+        };
+        let data = DataBlock::from_arrays(&[make(), make()], 254);
+
+        let dict = data.as_dictionary().unwrap();
+        assert_eq!(dict.indices.bits_per_value, 8);
+        assert_eq!(dict.dictionary.num_values(), 127);
+    }
+
+    #[test]
+    fn test_dictionary_merge_ignores_unused_entries() {
+        // Each batch references only 0..127 but carries one extra entry the keys
+        // never use.  The referenced union (127) fits Int8; the unused entries
+        // must not force a wider key type.
+        let make = |unused: u16| -> ArrayRef {
+            let values = UInt16Array::from((0..127u16).chain([unused]).collect::<Vec<_>>());
+            let keys = Int8Array::from(
+                (0..127)
+                    .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+                    .collect::<Vec<_>>(),
+            );
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+        };
+        let data = DataBlock::from_arrays(&[make(1000), make(1001)], 254);
+
+        let dict = data.as_dictionary().unwrap();
+        assert_eq!(dict.indices.bits_per_value, 8);
+        assert_eq!(dict.dictionary.num_values(), 127);
+    }
+
+    fn uint16_dictionary(values: Vec<u16>, keys: Vec<Option<i8>>) -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn decoded_values(array: &dyn Array) -> Vec<Option<u16>> {
+        arrow_cast::cast(array, &DataType::UInt16)
+            .unwrap()
+            .as_primitive::<UInt16Type>()
+            .iter()
+            .collect()
+    }
+
+    #[test]
+    fn test_reencode_dict_arrays_remaps_each_array() {
+        // The dictionaries overlap and list their values in different orders,
+        // so every array's keys must be remapped through its own entries.
+        let a = uint16_dictionary(vec![10, 20, 30], vec![Some(2), Some(0), None, Some(1)]);
+        let b = uint16_dictionary(vec![30, 40, 10], vec![Some(0), Some(1), Some(2), None]);
+
+        let merged = reencode_dict_arrays(&[a.as_ref(), b.as_ref()]).unwrap();
+
+        assert_eq!(merged.data_type(), a.data_type());
+        assert_eq!(merged.as_any_dictionary().values().len(), 4);
+        assert_eq!(
+            decoded_values(merged.as_ref()),
+            [
+                Some(30),
+                Some(10),
+                None,
+                Some(20),
+                Some(30),
+                Some(40),
+                Some(10),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_concat_decoded_arrays_merges_dictionaries_exactly() {
+        // Two pages that each carry the same 127-value dictionary: Arrow's lossy
+        // merge overflows Int8, the exact merge fits.
+        let a = Arc::new(all_int8_dictionary()) as ArrayRef;
+        let b = Arc::new(all_int8_dictionary()) as ArrayRef;
+        assert!(
+            matches!(
+                arrow_select::concat::concat(&[a.as_ref(), b.as_ref()]),
+                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError)
+            ),
+            "Arrow no longer overflows here, so the exact merge is not exercised"
+        );
+
+        let merged = concat_decoded_arrays(&[a.as_ref(), b.as_ref()]).unwrap();
+
+        assert_eq!(merged.data_type(), a.data_type());
+        assert_eq!(merged.as_any_dictionary().values().len(), 127);
+        let expected = [decoded_values(a.as_ref()), decoded_values(b.as_ref())].concat();
+        assert_eq!(decoded_values(merged.as_ref()), expected);
+    }
+
+    #[test]
+    fn test_concat_decoded_arrays_rejects_dictionaries_beyond_key_type() {
+        let a = uint16_dictionary((0..100).collect(), (0..100).map(Some).collect());
+        let b = uint16_dictionary((1000..1100).collect(), (0..100).map(Some).collect());
+
+        let error = concat_decoded_arrays(&[a.as_ref(), b.as_ref()]).unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().contains(
+                "could not merge the dictionaries of the 2 pages in this batch (200 entries) into Int8 keys, which address at most 128 distinct values"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_dictionary_nulls() {
         // Test both ways of encoding nulls
 
@@ -2475,9 +3451,21 @@ mod tests {
         // We want to normalize this by pushing nulls into the dictionary, but we cannot because
         // the dictionary is too large for the index type
         let dict = DictionaryArray::new(indices, Arc::new(items));
-        let data = DataBlock::from_array(dict);
+        let data = DataBlock::from_array(dict.clone());
 
         assert_eq!(data.num_values(), 257);
+
+        // The reader narrows the widened indices back to the declared UInt8 keys.
+        let read = make_array(
+            data.clone()
+                .into_arrow(dict.data_type().clone(), false)
+                .unwrap(),
+        );
+        assert_eq!(read.data_type(), dict.data_type());
+        assert_eq!(
+            arrow_cast::cast(&read, &DataType::Utf8).unwrap().as_ref(),
+            arrow_cast::cast(&dict, &DataType::Utf8).unwrap().as_ref()
+        );
 
         let dict = data.as_dictionary().unwrap();
 
@@ -2502,6 +3490,83 @@ mod tests {
             nullable_items.data.as_variable_width().unwrap().data.len(),
             32640
         );
+    }
+
+    #[rstest]
+    #[case::utf8_mostly_small(DataType::Utf8, 4096, 1, 4096 + 999 * 5, 4096 + 999 * 5)]
+    #[case::utf8_mostly_large(DataType::Utf8, 4096, 0, 999 * 4096 + 5, 999 * 4096 + 5)]
+    #[case::large_binary_mostly_small(
+        DataType::LargeBinary,
+        4096,
+        1,
+        4096 + 999 * 5,
+        4096 + 999 * 5
+    )]
+    // Two-pass variable-width dictionary gather reserves the exact selected size even for small values
+    #[case::utf8_small_values(DataType::Utf8, 100, 1, 100 + 999 * 5, 100 + 999 * 5)]
+    fn test_dictionary_decode_reserves_selected_size(
+        #[case] value_type: DataType,
+        #[case] large_value_len: usize,
+        #[case] common_key: u8,
+        #[case] expected_size: usize,
+        #[case] expected_capacity: usize,
+    ) {
+        // The average value size is far from the size of the value most rows select
+        let values = arrow_cast::cast(
+            &StringArray::from(vec!["x".repeat(large_value_len), "small".to_string()]),
+            &value_type,
+        )
+        .unwrap();
+        let keys = UInt8Array::from_iter_values(
+            (0..1000).map(|row| if row == 0 { 1 - common_key } else { common_key }),
+        );
+        let dictionary = DictionaryArray::<UInt8Type>::try_new(keys, values).unwrap();
+        let expected = arrow_cast::cast(&dictionary, &value_type).unwrap();
+
+        let decoded = DataBlock::from_array(dictionary)
+            .as_dictionary()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let decoded_values = &decoded.as_variable_width_ref().unwrap().data;
+        assert_eq!(decoded_values.len(), expected_size);
+        assert_eq!(
+            decoded_values.clone().into_buffer().capacity(),
+            expected_capacity
+        );
+        let decoded = make_array(decoded.into_arrow(value_type, true).unwrap());
+        assert_eq!(decoded.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_nullable_dictionary_decode_reserves_selected_size() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("x".repeat(4096)),
+            Some("small".to_string()),
+            None,
+        ]));
+        let keys =
+            UInt8Array::from_iter_values((0..1000).map(|row| if row == 0 { 0_u8 } else { 1 }));
+        let dictionary = DictionaryArray::<UInt8Type>::try_new(keys, values).unwrap();
+        let expected = arrow_cast::cast(&dictionary, &DataType::Utf8).unwrap();
+
+        let decoded = DataBlock::from_array(dictionary)
+            .as_dictionary()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let nullable = decoded.as_nullable_ref().unwrap();
+        let decoded_values = &nullable.data.as_variable_width_ref().unwrap().data;
+        let expected_size = 4096 + 999 * 5;
+        assert_eq!(decoded_values.len(), expected_size);
+        assert!(
+            decoded_values.clone().into_buffer().capacity() <= expected_size + 1,
+            "nullable dictionary decode should reserve the selected size"
+        );
+        let decoded = make_array(decoded.into_arrow(DataType::Utf8, true).unwrap());
+        assert_eq!(decoded.as_ref(), expected.as_ref());
     }
 
     #[test]
@@ -2539,6 +3604,17 @@ mod tests {
         let dict2 = DictionaryArray::new(indices, Arc::new(other_items));
         let data = DataBlock::from_arrays(&[Arc::new(dict1), Arc::new(dict2)], 512);
         assert_eq!(data.num_values(), 512);
+
+        // 512 distinct values cannot be read back under the declared UInt8 keys.
+        let declared = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let error = data.clone().into_arrow(declared, false).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("the 256 distinct values that UInt8 keys can address"),
+            "unexpected error: {error}"
+        );
 
         let dict = data.as_dictionary().unwrap();
 
@@ -2718,6 +3794,67 @@ mod tests {
         );
     }
 
+    fn variable_width_block(offsets: &[i32], data: &[u8]) -> VariableWidthBlock {
+        VariableWidthBlock {
+            data: LanceBuffer::copy_slice(data),
+            offsets: LanceBuffer::reinterpret_vec(offsets.to_vec()),
+            bits_per_offset: 32,
+            num_values: offsets.len() as u64 - 1,
+            block_info: BlockInfo::new(),
+        }
+    }
+
+    #[rstest]
+    #[case::selected_values(variable_width_block(&[0, 1, 3, 6], b"abcdef"), vec![2, 0, 2, 1], Some(9))]
+    #[case::offsets_not_starting_at_zero(
+        variable_width_block(&[2, 3, 5], b"xxabc"),
+        vec![0, 1, 1],
+        Some(5)
+    )]
+    #[case::large_offsets(
+        VariableWidthBlock {
+            offsets: LanceBuffer::reinterpret_vec(vec![0_i64, 4, 6]),
+            bits_per_offset: 64,
+            ..variable_width_block(&[0, 4, 6], b"abcdef")
+        },
+        vec![1, 1, 0],
+        Some(8)
+    )]
+    #[case::index_out_of_range(variable_width_block(&[0, 1, 2], b"ab"), vec![2], None)]
+    #[case::index_past_num_values(
+        VariableWidthBlock { num_values: 2, ..variable_width_block(&[0, 1, 2, 3], b"abc") },
+        vec![2],
+        None
+    )]
+    #[case::short_offsets(
+        VariableWidthBlock { num_values: 2, ..variable_width_block(&[0, 1], b"ab") },
+        vec![1],
+        None
+    )]
+    #[case::offset_past_data(variable_width_block(&[0, 1, i32::MAX], b"ab"), vec![1], None)]
+    #[case::decreasing_offsets(variable_width_block(&[0, 2, 1], b"ab"), vec![1], None)]
+    #[case::negative_offset(variable_width_block(&[-1, 1, 2], b"ab"), vec![0], None)]
+    #[case::offsets_not_multiple_of_width(
+        VariableWidthBlock {
+            offsets: LanceBuffer::copy_slice(&[0, 0, 0, 0, 2]),
+            ..variable_width_block(&[0, 2], b"ab")
+        },
+        vec![0],
+        None
+    )]
+    #[case::beyond_offset_capacity(
+        variable_width_block(&[0, 1 << 20], &vec![0; 1 << 20]),
+        vec![0; 2048],
+        None
+    )]
+    fn variable_width_selected_data_len(
+        #[case] block: VariableWidthBlock,
+        #[case] indices: Vec<u64>,
+        #[case] expected: Option<u64>,
+    ) {
+        assert_eq!(block.selected_data_len(&indices), expected);
+    }
+
     #[rstest]
     #[case::binary_i32_tail_out_of_bounds(
         DataType::Binary,
@@ -2855,7 +3992,7 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_rejects_indices_wider_than_declared_key_type() {
+    fn dictionary_rejects_wide_indices_outside_dictionary() {
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
             indices: FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 128]),
@@ -2873,14 +4010,321 @@ mod tests {
         let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
         let error = dictionary
             .into_arrow(data_type, false)
-            .expect_err("mismatched dictionary index widths must be rejected");
+            .expect_err("indices outside the dictionary must be rejected");
 
         assert!(matches!(error, Error::CorruptFile { .. }));
         assert!(
             error.to_string().contains(
-                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits"
-            )
+                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits, and they do not address the dictionary"
+            ),
+            "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn dictionary_rejects_unsupported_index_width_mismatch() {
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u16]),
+                bits_per_value: 16,
+                num_values: 1,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec!["value"]))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let error = block.into_arrow(data_type, false).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("dictionary indices use 16 bits"));
+    }
+
+    #[rstest]
+    #[case::index_out_of_range(
+        DataBlock::VariableWidth(variable_width_block(&[0, 1, 2], b"ab")),
+        vec![0, 2],
+        "cannot append selection 2..3 from a block with 2 values"
+    )]
+    #[case::empty_dictionary(
+        DataBlock::VariableWidth(variable_width_block(&[0], b"")),
+        vec![0],
+        "cannot append selection 0..1 from a block with 0 values"
+    )]
+    #[case::empty_fixed_width_dictionary(
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::empty(),
+            bits_per_value: 64,
+            num_values: 0,
+            block_info: BlockInfo::new(),
+        }),
+        vec![0],
+        "cannot append selection 0..1 from a block with 0 values"
+    )]
+    fn dictionary_decode_rejects_malformed_input(
+        #[case] dictionary: DataBlock,
+        #[case] indices: Vec<u8>,
+        #[case] expected_message: &str,
+    ) {
+        let num_indices = indices.len() as u64;
+        let block = DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(indices),
+                bits_per_value: 8,
+                num_values: num_indices,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(dictionary),
+        };
+
+        let error = block
+            .decode()
+            .expect_err("a malformed dictionary must fail to decode");
+
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn widened_int8_dictionary(indices: Vec<u32>, values: Vec<Option<String>>) -> ArrayRef {
+        let num_values = indices.len() as u64;
+        let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(indices),
+                bits_per_value: 32,
+                num_values,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(values))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        make_array(dictionary.into_arrow(data_type, false).unwrap())
+    }
+
+    fn decode_strings(array: &ArrayRef) -> Vec<Option<String>> {
+        let strings = arrow_cast::cast(array, &DataType::Utf8).unwrap();
+        strings
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn dictionary_narrows_indices_widened_for_null_slot() {
+        // The 2.0 writer appended a null slot at index 128, past the last Int8 key.
+        let values = (0..128)
+            .map(|i| Some(format!("v{i}")))
+            .chain([None])
+            .collect();
+        let array = widened_int8_dictionary(vec![0, 128, 127, 128, 5], values);
+
+        assert_eq!(
+            array.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+        );
+        assert_eq!(
+            decode_strings(&array),
+            vec![
+                Some("v0".to_owned()),
+                None,
+                Some("v127".to_owned()),
+                None,
+                Some("v5".to_owned())
+            ]
+        );
+        let dictionary = array.as_dictionary::<Int8Type>();
+        // Only the four referenced entries remain, and the null slot stays a value.
+        assert_eq!(dictionary.values().len(), 4);
+        assert_eq!(dictionary.values().null_count(), 1);
+    }
+
+    #[test]
+    fn dictionary_narrows_indices_widened_at_key_capacity() {
+        // 127 values plus the null slot are exactly the 128 entries Int8 keys address.
+        let values = (0..128)
+            .map(|i| Some(format!("v{i}")))
+            .chain([None])
+            .collect();
+        let indices = (1..128).chain([128]).collect::<Vec<u32>>();
+        let array = widened_int8_dictionary(indices, values);
+
+        let expected = (1..128)
+            .map(|i| Some(format!("v{i}")))
+            .chain([None])
+            .collect::<Vec<_>>();
+        assert_eq!(decode_strings(&array), expected);
+        let dictionary = array.as_dictionary::<Int8Type>();
+        assert_eq!(dictionary.values().len(), 128);
+        assert_eq!(dictionary.values().null_count(), 1);
+    }
+
+    #[test]
+    fn dictionary_narrows_indices_widened_for_merged_dictionaries() {
+        // Two merged chunks of 100 values each; this batch references three of them.
+        let values = (0..200).map(|i| Some(format!("v{i}"))).collect();
+        let array = widened_int8_dictionary(vec![150, 3, 150, 199], values);
+
+        assert_eq!(
+            decode_strings(&array),
+            ["v150", "v3", "v150", "v199"]
+                .map(|value| Some(value.to_owned()))
+                .to_vec()
+        );
+        assert_eq!(array.as_dictionary::<Int8Type>().values().len(), 3);
+    }
+
+    #[test]
+    fn dictionary_narrows_indices_widened_with_repeated_entries() {
+        // Merging chunks that share 90 values could repeat them in the merged
+        // dictionary.  180 referenced entries do not fit Int8, but 90 distinct values do.
+        let values = (0..180).map(|i| Some(format!("v{}", i % 90))).collect();
+        let array = widened_int8_dictionary((0..180).rev().collect(), values);
+
+        assert_eq!(
+            decode_strings(&array),
+            (0..180)
+                .rev()
+                .map(|i| Some(format!("v{}", i % 90)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(array.as_dictionary::<Int8Type>().values().len(), 90);
+    }
+
+    #[test]
+    fn dictionary_rejects_widened_indices_beyond_declared_key_type() {
+        let num_values = 200;
+        let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec((0..num_values).collect::<Vec<u32>>()),
+                bits_per_value: 32,
+                num_values: num_values as u64,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(
+                (0..num_values).map(|i| format!("v{i}")).collect::<Vec<_>>(),
+            ))),
+        });
+
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let error = dictionary
+            .into_arrow(data_type, false)
+            .expect_err("200 distinct values cannot be addressed by Int8 keys");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error.to_string().contains(
+                "this batch references 200 dictionary entries, more than the 128 distinct values that Int8 keys can address"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::fits_int8(DataType::Int8, 128, None)]
+    #[case::overflow_int8(DataType::Int8, 129, Some(128))]
+    #[case::fits_uint8(DataType::UInt8, 256, None)]
+    #[case::overflow_uint8(DataType::UInt8, 257, Some(256))]
+    #[case::fits_int16(DataType::Int16, 32768, None)]
+    #[case::overflow_int16(DataType::Int16, 32769, Some(32768))]
+    #[case::fits_uint16(DataType::UInt16, 65536, None)]
+    #[case::overflow_uint16(DataType::UInt16, 65537, Some(65536))]
+    fn dictionary_recovery_batch_limit(
+        #[case] key_type: DataType,
+        #[case] dictionary_len: u64,
+        #[case] expected: Option<u64>,
+    ) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        assert_eq!(
+            super::dictionary_batch_limit(&data_type, dictionary_len),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::int8(DataType::Int8)]
+    #[case::uint8(DataType::UInt8)]
+    #[case::int16(DataType::Int16)]
+    #[case::uint16(DataType::UInt16)]
+    fn dictionary_recovers_widened_indices(#[case] key_type: DataType) {
+        // Duplicate values and a null beyond the declared key's range are both
+        // emitted by historical writers. Only the selected values need to fit.
+        let high_index = super::max_index_val(&key_type) as usize + 1;
+        let mut values = vec![Some("duplicate"); high_index + 2];
+        values[high_index] = Some("high");
+        values[high_index + 1] = None;
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![
+                    high_index as u32,
+                    0,
+                    high_index as u32 + 1,
+                    1,
+                ]),
+                bits_per_value: 32,
+                num_values: 4,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(values))),
+        });
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        for validate in [false, true] {
+            let array = make_array(
+                block
+                    .clone()
+                    .into_arrow(data_type.clone(), validate)
+                    .unwrap(),
+            );
+            assert_eq!(array.data_type(), &data_type);
+            let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+            assert_eq!(
+                decoded.as_ref(),
+                &StringArray::from(vec![
+                    Some("high"),
+                    Some("duplicate"),
+                    None,
+                    Some("duplicate")
+                ])
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::all_null(vec![None, None])]
+    fn dictionary_recovers_widened_nulls(#[case] values: Vec<Option<&str>>) {
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32; values.len()]),
+                bits_per_value: 32,
+                num_values: values.len() as u64,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec![None::<&str>]))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let array = make_array(block.into_arrow(data_type, false).unwrap());
+        let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        assert_eq!(decoded.as_ref(), &StringArray::from(values));
+    }
+
+    #[test]
+    fn dictionary_recovers_widened_duplicate_entries() {
+        let values =
+            StringArray::from((0..180).map(|i| format!("v{}", i % 90)).collect::<Vec<_>>());
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec((0_u32..180).collect()),
+                bits_per_value: 32,
+                num_values: 180,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(values.clone())),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let array = make_array(block.into_arrow(data_type, false).unwrap());
+        let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        assert_eq!(decoded.as_ref(), &values);
     }
 
     #[rstest]
@@ -2901,5 +4345,85 @@ mod tests {
             );
             assert_eq!(&round_tripped, &array);
         }
+    }
+
+    #[test]
+    fn dictionary_utf8_single_pass_validation_preserves_partial_ref_semantics() {
+        // Dictionary entry 1 contains invalid UTF-8 (`0xff`), while entries 0 and 2 are valid UTF-8.
+        let dict = DataBlock::VariableWidth(variable_width_block(&[0, 2, 3, 6], b"ok\xffend"));
+
+        // Referencing only valid entries (0 and 2) must still succeed via fallback validation.
+        let valid_only = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32, 2, 0]),
+                bits_per_value: 32,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(dict.clone()),
+        });
+        let arr = make_array(valid_only.into_arrow(DataType::Utf8, true).unwrap());
+        assert_eq!(
+            arr.as_ref(),
+            &StringArray::from(vec!["ok", "end", "ok"]) as &dyn Array
+        );
+
+        // Referencing the invalid UTF-8 entry (1) must fail validation.
+        let with_invalid = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 2]),
+                bits_per_value: 32,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(dict),
+        });
+        assert!(with_invalid.into_arrow(DataType::Utf8, true).is_err());
+    }
+
+    #[test]
+    fn dictionary_fast_gather_handles_fixed_widths_and_exact_small_string_capacity() {
+        // Small strings (< 1024B avg) now also reserve exact output byte capacity via 2-pass gather.
+        let small_dict = DataBlock::from_array(StringArray::from(vec!["a", "bbbb", "cc"]));
+        let decoded_var = DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![1_u16, 0, 2, 1]),
+                bits_per_value: 16,
+                num_values: 4,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(small_dict),
+        }
+        .decode()
+        .unwrap();
+        let vw = decoded_var.as_variable_width_ref().unwrap();
+        assert_eq!(vw.data.as_ref(), b"bbbbaccbbbb");
+        assert_eq!(vw.data.clone().into_buffer().capacity(), 11);
+
+        // Non-power-of-two byte-aligned FixedWidth (24 bytes = 192 bits) gather.
+        let mut dict_bytes = Vec::with_capacity(48);
+        dict_bytes.extend_from_slice(&[0x11_u8; 24]);
+        dict_bytes.extend_from_slice(&[0x22_u8; 24]);
+        let fixed_24 = DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![1_u8, 0, 1]),
+                bits_per_value: 8,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::from(dict_bytes),
+                bits_per_value: 192,
+                num_values: 2,
+                block_info: BlockInfo::new(),
+            })),
+        }
+        .decode()
+        .unwrap();
+        let fw = fixed_24.as_fixed_width_ref().unwrap();
+        assert_eq!(fw.num_values, 3);
+        assert_eq!(&fw.data[0..24], &[0x22_u8; 24]);
+        assert_eq!(&fw.data[24..48], &[0x11_u8; 24]);
+        assert_eq!(&fw.data[48..72], &[0x22_u8; 24]);
     }
 }

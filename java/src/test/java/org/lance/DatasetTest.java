@@ -18,8 +18,10 @@ import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.index.IndexFragmentCoverage;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.BTreeIndexParams;
@@ -41,8 +43,10 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -52,8 +56,14 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -256,6 +266,46 @@ public class DatasetTest {
         () -> {
           dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
         });
+  }
+
+  @Test
+  void testOpenMissingDatasetThrowsDatasetNotFound(@TempDir Path tempDir) {
+    String missingPath = tempDir.resolve("missing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DatasetNotFoundException error =
+          assertThrows(DatasetNotFoundException.class, () -> Dataset.open(missingPath, allocator));
+      assertTrue(error.getMessage().contains("missing_dataset"), error.getMessage());
+      // Handlers written for the IllegalArgumentException thrown before still catch it.
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testCreateExistingDatasetThrowsDatasetAlreadyExists(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("existing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      DatasetAlreadyExistsException error =
+          assertThrows(DatasetAlreadyExistsException.class, testDataset::createEmptyDataset);
+      assertTrue(error.getMessage().contains("existing_dataset"), error.getMessage());
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testOpenUnknownSchemeIsNotDatasetNotFound() {
+    // Invalid input is still reported as a plain IllegalArgumentException, so callers can tell it
+    // apart from a missing dataset.
+    try (BufferAllocator allocator = new RootAllocator()) {
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> Dataset.open("nosuchscheme://bucket/table.lance", allocator));
+      assertEquals(IllegalArgumentException.class, error.getClass(), error.getMessage());
+      assertTrue(error.getMessage().contains("nosuchscheme"), error.getMessage());
+    }
   }
 
   @Test
@@ -540,6 +590,14 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         dataset2.tags().delete("tag_on_branch");
         assertEquals(1, dataset2.tags().list().size());
+
+        dataset2.tags().update("tag1", 2);
+        assertEquals(2, dataset2.tags().getVersion("tag1"));
+        Dataset.Tags tags = dataset2.tags();
+        dataset2.close();
+        IllegalArgumentException closed =
+            assertThrows(IllegalArgumentException.class, () -> tags.update("tag1", 1));
+        assertTrue(closed.getMessage().contains("Dataset is closed"));
       }
     }
   }
@@ -1626,6 +1684,46 @@ public class DatasetTest {
   }
 
   @Test
+  void testGetRowAddresses(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
+      dataset =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build());
+      testDataset.write(1, 5).close();
+      try (Dataset ds = testDataset.write(2, 5)) {
+        // Row ids 0-4 live in the first fragment and 5-9 in the second.
+        long second = ds.getFragments().get(1).getId();
+        assertEquals(
+            Arrays.asList(second << 32 | 2, null), ds.getRowAddresses(Arrays.asList(7L, 99L)));
+
+        // Compaction moves every row into one new fragment but keeps its id; deleted rows
+        // (ids 2 and 7 hold id = 2) no longer resolve.
+        ds.compact();
+        ds.delete("id = 2");
+        assertEquals(1, ds.getFragments().size());
+        long compacted = ds.getFragments().get(0).getId();
+        assertEquals(
+            Arrays.asList(compacted << 32 | 8, null, compacted << 32 | 1, compacted << 32 | 8),
+            ds.getRowAddresses(Arrays.asList(8L, 7L, 1L, 8L)));
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("plain").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset ds = testDataset.write(1, 5)) {
+        // Without stable row ids a row id is its address, so ids pass through unchanged.
+        List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
+        assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -2074,8 +2172,32 @@ public class DatasetTest {
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
 
-                  // Delete branch1 and verify listing
+                  // Delete branch2 and reject checkout and writes through its stale handle.
                   mainV2.branches().delete("branch2");
+                  assertEquals(1, mainV2.branches().list().size());
+                  RuntimeException deletedBranch =
+                      assertThrows(
+                          RuntimeException.class, () -> mainV2.checkout(Ref.ofBranch("branch2")));
+                  assertTrue(
+                      deletedBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      deletedBranch.getMessage());
+                  RuntimeException staleCommit =
+                      assertThrows(
+                          RuntimeException.class,
+                          () ->
+                              branch2V4
+                                  .newTransactionBuilder()
+                                  .operation(appendC)
+                                  .build()
+                                  .commit());
+                  assertTrue(
+                      staleCommit
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      staleCommit.getMessage());
+                  assertEquals(4, branch2V4.version());
                   assertEquals(1, mainV2.branches().list().size());
 
                   // Step 6. use checkout_branch to checkout branch1
@@ -2135,11 +2257,15 @@ public class DatasetTest {
                     assertEquals(8, opened.countRows()); // A(5) + B(3)
                     assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
                   }
-                  IOException missing =
+                  RuntimeException missingBranch =
                       assertThrows(
-                          IOException.class,
+                          RuntimeException.class,
                           () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
-                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  assertTrue(
+                      missingBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch no_such_branch does not exist"),
+                      missingBranch.getMessage());
                   RuntimeException missingTag =
                       assertThrows(
                           RuntimeException.class,
@@ -2240,6 +2366,262 @@ public class DatasetTest {
   }
 
   // ===== Blob API tests =====
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testTakeBlobsSelectorsAcrossCompaction(boolean buffered, @TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("blob_selectors").toString();
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset original = createBlobV2SelectorDataset(allocator, path);
+        Dataset current = Dataset.open().allocator(allocator).uri(path).build()) {
+      assertTrue(original.hasStableRowIds());
+      assertEquals(2, original.getFragments().size());
+      List<Long> originalAddresses = assertBlobSelectors(original, false, buffered);
+      assertNotEquals(3L, originalAddresses.get(0).longValue());
+
+      IllegalArgumentException missingId =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> current.takeBlobs(Arrays.asList(3L, 6L, 1L), "blobs"));
+      assertTrue(missingId.getMessage().contains("first missing row ID 6"));
+      IllegalArgumentException addressAsId =
+          assertThrows(
+              IllegalArgumentException.class, () -> current.takeBlobs(originalAddresses, "blobs"));
+      assertTrue(
+          addressAsId.getMessage().contains("first missing row ID " + originalAddresses.get(0)));
+      IllegalArgumentException missingIndex =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> current.takeBlobsByIndices(Collections.singletonList(6L), "blobs"));
+      assertTrue(missingIndex.getMessage().contains("non-existent fragment"));
+      IllegalArgumentException missingAddress =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> current.takeBlobsByAddresses(Collections.singletonList(-1L), "blobs"));
+      assertTrue(missingAddress.getMessage().contains("non-existent fragment: 4294967295"));
+
+      current.delete("id = 0");
+      IllegalArgumentException deletedId =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> current.takeBlobs(Arrays.asList(3L, 0L, 1L), "blobs"));
+      assertTrue(deletedId.getMessage().contains("first missing row ID 0"));
+      UnsupportedOperationException deletedAddress =
+          assertThrows(
+              UnsupportedOperationException.class,
+              () -> current.takeBlobsByAddresses(Collections.singletonList(0L), "blobs"));
+      assertTrue(deletedAddress.getMessage().contains("must not target deleted rows"));
+      assertBlobSelectors(current, true, buffered);
+
+      current.compact(CompactionOptions.builder().withTargetRowsPerFragment(6L).build());
+      assertTrue(current.version() > original.version());
+      assertEquals(1, current.getFragments().size());
+      List<Long> compactedAddresses = assertBlobSelectors(current, true, buffered);
+      assertNotEquals(originalAddresses, compactedAddresses);
+      IllegalArgumentException staleAddress =
+          assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  current.takeBlobsByAddresses(
+                      Collections.singletonList(originalAddresses.get(0)), "blobs"));
+      assertTrue(staleAddress.getMessage().contains("non-existent fragment"));
+
+      for (List<Long> addresses :
+          List.of(
+              List.of(0L, 1L << 32),
+              List.of(1L << 32, 0L),
+              originalAddresses,
+              List.of(compactedAddresses.get(0), 0L))) {
+        IllegalArgumentException staleAddresses =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> {
+                  if (buffered) {
+                    current.takeBlobsByAddresses(addresses, "blobs", 16L);
+                  } else {
+                    current.takeBlobsByAddresses(addresses, "blobs");
+                  }
+                });
+        assertTrue(staleAddresses.getMessage().contains("fragment"));
+      }
+
+      assertEquals(originalAddresses, assertBlobSelectors(original, false, buffered));
+      try (Dataset reopened = current.checkoutVersion(original.version())) {
+        assertEquals(originalAddresses, assertBlobSelectors(reopened, false, buffered));
+        try (BlobFile blob = reopened.takeBlobsByAddresses(List.of(0L), "blobs").get(0)) {
+          assertArrayEquals(new byte[] {0, 10}, blob.read());
+        }
+      }
+    }
+  }
+
+  private static Dataset createBlobV2SelectorDataset(BufferAllocator allocator, String path) {
+    Field blobField =
+        new Field(
+            "blobs",
+            new FieldType(
+                true,
+                ArrowType.Struct.INSTANCE,
+                null,
+                Collections.singletonMap("ARROW:extension:name", "lance.blob.v2")),
+            Arrays.asList(
+                Field.nullable("data", ArrowType.LargeBinary.INSTANCE),
+                Field.nullable("uri", ArrowType.Utf8.INSTANCE)));
+    Schema schema =
+        new Schema(Arrays.asList(Field.notNullable("id", new ArrowType.Int(32, true)), blobField));
+    try (Dataset empty =
+            Dataset.write()
+                .allocator(allocator)
+                .uri(path)
+                .schema(schema)
+                .enableStableRowIds(true)
+                .dataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_2)
+                .execute();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector ids = (IntVector) root.getVector("id");
+      StructVector blobs = (StructVector) root.getVector("blobs");
+      LargeVarBinaryVector data = (LargeVarBinaryVector) blobs.getChild("data");
+      for (int i = 0; i < 6; i++) {
+        ids.setSafe(i, i);
+        if (i % 3 == 1) {
+          blobs.setNull(i);
+        } else {
+          blobs.setIndexDefined(i);
+          data.setSafe(i, i % 3 == 2 ? new byte[0] : new byte[] {(byte) i, 10});
+        }
+      }
+      root.setRowCount(6);
+      List<FragmentMetadata> fragments =
+          Fragment.create(
+              path,
+              allocator,
+              root,
+              new WriteParams.Builder()
+                  .withMode(WriteParams.WriteMode.APPEND)
+                  .withEnableStableRowIds(true)
+                  .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_2)
+                  .withMaxRowsPerFile(3)
+                  .build());
+      try (Transaction transaction =
+          new Transaction.Builder()
+              .readVersion(empty.version())
+              .operation(Append.builder().fragments(fragments).build())
+              .build()) {
+        return new CommitBuilder(empty).execute(transaction);
+      }
+    }
+  }
+
+  private static List<Long> assertBlobSelectors(Dataset dataset, boolean deleted, boolean buffered)
+      throws Exception {
+    Map<Long, Long> addressesById = new HashMap<>();
+    try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .columns(List.of("id"))
+                    .withRowId(true)
+                    .withRowAddress(true)
+                    .build());
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        IntVector ids = (IntVector) root.getVector("id");
+        UInt8Vector rowIds = (UInt8Vector) root.getVector("_rowid");
+        UInt8Vector rowAddresses = (UInt8Vector) root.getVector("_rowaddr");
+        for (int i = 0; i < root.getRowCount(); i++) {
+          assertEquals(ids.get(i), rowIds.get(i));
+          addressesById.put(rowIds.get(i), rowAddresses.get(i));
+        }
+      }
+    }
+    List<Long> rowIds = Arrays.asList(3L, 1L, 5L, 3L, 4L, 2L, 1L, 5L);
+    List<Long> rowAddresses = rowIds.stream().map(addressesById::get).collect(Collectors.toList());
+    List<Long> rowIndices =
+        rowIds.stream().map(id -> deleted ? id - 1 : id).collect(Collectors.toList());
+    assertBlobSelection(dataset.takeBlobs(rowIds, "blobs"));
+    assertBlobSelection(dataset.takeBlobsByIndices(rowIndices, "blobs"));
+    assertBlobSelection(
+        buffered
+            ? dataset.takeBlobsByAddresses(rowAddresses, "blobs", 16L)
+            : dataset.takeBlobsByAddresses(rowAddresses, "blobs"));
+    return rowAddresses;
+  }
+
+  private static void assertBlobSelection(List<BlobFile> blobs) throws IOException {
+    byte[][] expected = {
+      new byte[] {3, 10},
+      null,
+      new byte[0],
+      new byte[] {3, 10},
+      null,
+      new byte[0],
+      null,
+      new byte[0]
+    };
+    try {
+      assertEquals(expected.length, blobs.size());
+      for (int i = 0; i < expected.length; i++) {
+        if (expected[i] == null) {
+          assertNull(blobs.get(i));
+        } else {
+          assertNotNull(blobs.get(i));
+          assertEquals(expected[i].length, blobs.get(i).size());
+          assertArrayEquals(expected[i], blobs.get(i).read());
+        }
+      }
+    } finally {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.close();
+        }
+      }
+    }
+  }
+
+  @Test
+  void testTakeBlobsByAddressesValidatesInputs(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            createBlobV2SelectorDataset(allocator, tempDir.resolve("blobs").toString())) {
+      IllegalArgumentException nullList =
+          assertThrows(
+              IllegalArgumentException.class, () -> dataset.takeBlobsByAddresses(null, "blobs"));
+      assertTrue(nullList.getMessage().contains("rowAddresses cannot be null or empty"));
+      IllegalArgumentException emptyList =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.takeBlobsByAddresses(Collections.emptyList(), "blobs"));
+      assertTrue(emptyList.getMessage().contains("rowAddresses cannot be null or empty"));
+      IllegalArgumentException nullAddress =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.takeBlobsByAddresses(Arrays.asList(0L, null), "blobs"));
+      assertTrue(nullAddress.getMessage().contains("rowAddresses[1] cannot be null"));
+      for (String column : Arrays.asList(null, "")) {
+        IllegalArgumentException invalidColumn =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> dataset.takeBlobsByAddresses(List.of(0L), column));
+        assertTrue(invalidColumn.getMessage().contains("column cannot be null or empty"));
+      }
+      IllegalArgumentException negativeBuffer =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.takeBlobsByAddresses(Collections.emptyList(), "blobs", -1L));
+      assertTrue(negativeBuffer.getMessage().contains("bufferSize must be non-negative"));
+      try (BlobFile blob = dataset.takeBlobsByAddresses(List.of(0L), "blobs", 0L).get(0)) {
+        assertArrayEquals(new byte[] {0, 10}, blob.read());
+      }
+      dataset.close();
+      IllegalArgumentException closed =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.takeBlobsByAddresses(List.of(0L), "blobs"));
+      assertTrue(closed.getMessage().contains("Dataset is closed"));
+    }
+  }
+
   @Test
   void testReadZeroLengthBlob(@TempDir Path tempDir) throws Exception {
     String base = tempDir.resolve("testReadZeroLengthBlob").toString();
@@ -2402,6 +2784,90 @@ public class DatasetTest {
             "BTree",
             stats.get("index_type"),
             "Index statistics should contain index_type information");
+
+        Index physicalSegment =
+            dataset.getIndexes().stream()
+                .filter(index -> TestVectorDataset.indexName.equals(index.name()))
+                .findFirst()
+                .orElseThrow();
+        IndexSegmentStatistics segmentStatistics =
+            dataset
+                .getIndexSegmentStatistics(
+                    TestVectorDataset.indexName, Collections.singletonList(physicalSegment.uuid()))
+                .get(0);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+          output.writeObject(segmentStatistics);
+        }
+        IndexSegmentStatistics restored;
+        try (ObjectInputStream input =
+            new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+          restored = (IndexSegmentStatistics) input.readObject();
+        }
+        assertEquals(segmentStatistics.getIndexUuid(), restored.getIndexUuid());
+        assertEquals(
+            stats,
+            dataset.getIndexStatisticsFromSegments(
+                TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Arrays.asList(restored, restored)));
+        dataset.delete("i = 0");
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexSegmentStatistics(
+                    "", Collections.singletonList(physicalSegment.uuid())));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexSegmentStatistics(TestVectorDataset.indexName, null));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexStatisticsFromSegments(TestVectorDataset.indexName, null));
+      }
+    }
+  }
+
+  @Test
+  public void testIndexStatisticsForDetachedVersion(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.toString());
+      testDataset.createEmptyDataset(true).close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            true);
+        Append append =
+            Append.builder()
+                .fragments(Collections.singletonList(testDataset.createNewFragment(3)))
+                .build();
+        SourcedTransaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        try (Dataset detached = dataset.commitTransaction(transaction.transaction(), true, false)) {
+          assertTrue(detached.version() < 0);
+          Map<String, Object> expected = detached.getIndexStatistics("id_idx");
+          assertEquals(5L, ((Number) expected.get("num_indexed_rows")).longValue());
+          assertEquals(3L, ((Number) expected.get("num_unindexed_rows")).longValue());
+          List<IndexSegmentStatistics> statistics =
+              detached.getIndexSegmentStatistics(
+                  "id_idx", Collections.singletonList(detached.getIndexes().get(0).uuid()));
+          assertEquals(1, statistics.size());
+          assertEquals(detached.version(), statistics.get(0).getReadVersion());
+          assertEquals(expected, detached.getIndexStatisticsFromSegments("id_idx", statistics));
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.getIndexStatisticsFromSegments("id_idx", statistics));
+        }
       }
     }
   }
@@ -2453,6 +2919,33 @@ public class DatasetTest {
             desc.getSegments().get(0).getSizeBytes(),
             desc.getTotalSizeBytes(),
             "single-segment size should equal the logical index size");
+        IndexFragmentCoverage coverage =
+            desc.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertTrue(coverage.getCurrentFragmentCount() > 0);
+        assertEquals(coverage.getCurrentFragmentCount(), coverage.getCoveredFragmentCount());
+        assertEquals(0, coverage.getMissingFragmentCount());
+        assertEquals(0, coverage.getStaleFragmentCount());
+        assertTrue(coverage.getFragmentBitmapSizeBytes() > 0);
+        assertEquals(1.0, coverage.getCoverageRatio().orElseThrow(AssertionError::new));
+
+        List<IndexDescription> summaries = dataset.describeIndexSummaries(criteria);
+        assertEquals(1, summaries.size());
+        IndexDescription summary = summaries.get(0);
+        assertEquals(desc.getName(), summary.getName());
+        assertEquals(desc.getRowsIndexed(), summary.getRowsIndexed());
+        assertEquals(desc.getTotalSizeBytes(), summary.getTotalSizeBytes());
+        assertTrue(summary.getSegments().isEmpty());
+        IndexFragmentCoverage summaryCoverage =
+            summary.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertEquals(coverage.getCoveredFragmentCount(), summaryCoverage.getCoveredFragmentCount());
+        assertEquals(coverage.getCurrentFragmentCount(), summaryCoverage.getCurrentFragmentCount());
+        assertEquals(coverage.getMissingFragmentCount(), summaryCoverage.getMissingFragmentCount());
+        assertEquals(coverage.getStaleFragmentCount(), summaryCoverage.getStaleFragmentCount());
+        assertEquals(
+            coverage.getFragmentBitmapSizeBytes(), summaryCoverage.getFragmentBitmapSizeBytes());
+        assertTrue(
+            new IndexFragmentCoverage(0, 0, 0, 0, 0).getCoverageRatio().isEmpty(),
+            "an empty fragment set has no coverage ratio");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");

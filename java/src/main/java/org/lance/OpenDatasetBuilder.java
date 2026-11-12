@@ -170,6 +170,8 @@ public class OpenDatasetBuilder {
    *
    * @return Dataset
    * @throws IllegalArgumentException if required parameters are missing or invalid
+   * @throws DatasetNotFoundException if no dataset exists at the URI, or at the location returned
+   *     by the namespace client
    */
   public Dataset build() {
     // Validate that exactly one of uri or namespaceClient+tableId is provided
@@ -236,6 +238,7 @@ public class OpenDatasetBuilder {
             .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
             .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
 
+    options.getSession().ifPresent(optionsBuilder::setSession);
     options.getVersion().ifPresent(optionsBuilder::setVersion);
     options.getRef().ifPresent(optionsBuilder::setRef);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);

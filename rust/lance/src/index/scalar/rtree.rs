@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
+use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::rtree::RTreeIndex;
 use lance_index::scalar::{OldIndexDataFilter, index_files_to_table};
 use lance_select::RowSetOps;
 use lance_table::format::IndexMetadata;
@@ -15,7 +15,10 @@ use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
-        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(
+            OldIndexDataFilter::Fragments { to_keep, .. }
+            | OldIndexDataFilter::RowAddresses { to_keep, .. },
+        ) => to_keep.is_empty(),
         Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
         None => false,
     }
@@ -80,12 +83,7 @@ pub(in crate::index) async fn merge_segments(
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = lance_index::scalar::rtree::merge_rtree_indices(
-        &source_indices,
-        &new_store,
-        &source_filters,
-    )
-    .await?;
+    let created_index = merge_rtree_indices(&source_indices, &new_store, &source_filters).await?;
 
     Ok(IndexMetadata {
         uuid: new_uuid,
@@ -96,6 +94,8 @@ pub(in crate::index) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }

@@ -2,15 +2,25 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+};
+use std::time::Duration;
 use std::vec;
 
 use crate::Dataset;
-use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::{
+    AutoCleanupParams, MergeInsertBuilder, NewColumnTransform, UpdateBuilder, WhenNotMatched,
+};
 use crate::datatypes::Schema;
-use lance_table::io::commit::ManifestNamingScheme;
+use crate::io::commit::load_and_sort_new_transactions;
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+};
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
@@ -20,19 +30,28 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
+use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_io::local::to_local_path;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreProvider};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
-use crate::dataset::refs::branch_contents_path;
-use crate::utils::test::copy_test_data_to_tmp;
+use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
+use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_data_to_tmp};
 use futures::TryStreamExt;
+use futures::stream::BoxStream;
 use lance_core::Error;
-use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, path::Path,
+};
 use rstest::rstest;
 use std::cmp::Ordering;
+use url::Url;
 
 fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNamingScheme) {
     let entries_names = test_dir
@@ -50,6 +69,68 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         "Entries: {:?}",
         entries_names
     );
+}
+
+#[rstest]
+#[case::one_io(1)]
+#[case::two_io(2)]
+fn test_transaction_reads_with_low_io_parallelism(#[case] io_parallelism: usize) {
+    // Isolate the process-wide I/O setting from concurrently running tests.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "dataset::tests::dataset_versioning::test_low_io_transaction_child",
+            "--nocapture",
+        ])
+        .env("LANCE_LOW_IO_TRANSACTION_TEST", "1")
+        .env("LANCE_IO_THREADS", io_parallelism.to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "child process failed: {output:?}");
+}
+
+#[tokio::test]
+async fn test_low_io_transaction_child() {
+    if std::env::var_os("LANCE_LOW_IO_TRANSACTION_TEST").is_none() {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let data = gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(4))
+            .unwrap();
+        let reader = || RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader(),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // An empty history must finish too: no sender will publish a manifest.
+        let (current, transactions) = load_and_sort_new_transactions(&dataset).await.unwrap();
+        assert_eq!(current.version().version, 1);
+        assert!(transactions.is_empty());
+
+        let stale = dataset.clone();
+        dataset.append(reader(), None).await.unwrap();
+        let (current, transactions) = load_and_sort_new_transactions(&stale).await.unwrap();
+        assert_eq!(current.version().version, 2);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].0, 2);
+
+        dataset.delete("key = 1").await.unwrap();
+        assert_eq!(dataset.version().version, 3);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+        assert_eq!(dataset.count_rows(Some("key = 1".into())).await.unwrap(), 0);
+    })
+    .await
+    .expect("transaction reads and delete must progress with one I/O slot");
 }
 
 #[tokio::test]
@@ -765,6 +846,51 @@ async fn test_concurrent_tag_creation_conflict() {
     );
 }
 
+/// A tag on an old version must not stop auto cleanup: the tagged version stays
+/// and the untagged ones are still removed.
+#[tokio::test]
+async fn test_auto_cleanup_keeps_tagged_versions() {
+    let test_uri = TempStrDir::default();
+    let mut tagged_batch = None;
+    for version in 1..=4u32 {
+        // The mock clock does not advance on its own, and with `older_than` zero a
+        // version is old only if it was committed before the current time.
+        MockClock::set_system_time(Duration::from_secs(version.into()));
+        let batch = u32_batch(version * 10..version * 10 + 10);
+        let params = if version == 1 {
+            WriteParams {
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                ..Default::default()
+            }
+        } else {
+            WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }
+        };
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(reader, test_uri.as_str(), Some(params))
+            .await
+            .unwrap();
+        if version == 1 {
+            dataset.tags().create("keep", 1).await.unwrap();
+            tagged_batch = Some(dataset.scan().try_into_batch().await.unwrap());
+        }
+    }
+
+    // A commit cleans up from the version before it, so that version stays.
+    let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let versions = dataset.versions().await.unwrap();
+    let versions: Vec<u64> = versions.iter().map(|v| v.version).collect();
+    assert_eq!(versions, [1, 3, 4]);
+    let tagged = dataset.checkout_version("keep").await.unwrap();
+    let batch = tagged.scan().try_into_batch().await.unwrap();
+    assert_eq!(Some(batch), tagged_batch);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_fragment_id_zero_not_reused() {
@@ -1172,6 +1298,2149 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
     dataset.checkout_version("keep-dev").await.unwrap();
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_deleted_branch_rejects_stale_writes(
+    #[values(false, true)] recreate: bool,
+    #[values(false, true)] reopen: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let mut root = Dataset::write(
+        id_rows(0, 4),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(root.get_fragments().len(), 2);
+    let mut stale = root.create_branch("exp", 1, None).await.unwrap();
+    if reopen {
+        stale = Dataset::open(stale.uri()).await.unwrap();
+    }
+    let identifier = stale.branch_identifier().await.unwrap();
+    root.delete_branch("exp").await.unwrap();
+    if recreate {
+        let current = root.create_branch("exp", 1, None).await.unwrap();
+        assert_ne!(identifier, current.branch_identifier().await.unwrap());
+    }
+
+    let error = stale.append(id_rows(100, 1), None).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch exp"), "{error}");
+    let error = stale.delete("id = 0").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = MergeInsertBuilder::try_new(Arc::new(stale.clone()), vec!["id".into()])
+        .unwrap()
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(id_rows(100, 1)) as Box<dyn RecordBatchReader + Send>)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = UpdateBuilder::new(Arc::new(stale.clone()))
+        .set("id", "id + 1")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = stale
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("twice".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = CommitBuilder::new(Arc::new(stale.clone()))
+        .with_detached(true)
+        .execute(Transaction::new(
+            stale.version().version,
+            Operation::Append { fragments: vec![] },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+
+    assert_eq!(stale.version().version, 1);
+    let error = stale.checkout_version(1).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch exp"), "{error}");
+    assert_eq!(root.count_rows(None).await.unwrap(), 4);
+    if recreate {
+        let mut current = root.checkout_branch("exp").await.unwrap();
+        assert_eq!(current.version().version, 1);
+        assert_eq!(current.count_rows(None).await.unwrap(), 4);
+        current.append(id_rows(10, 1), None).await.unwrap();
+        assert_eq!(current.count_rows(None).await.unwrap(), 5);
+    } else {
+        assert!(root.list_branches().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_deleted_branch_cannot_checkout_retained_manifests() {
+    let mut root = Dataset::write(
+        id_rows(0, 2),
+        "memory://",
+        Some(WriteParams {
+            session: Some(Arc::default()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut stale = root.create_branch("exp", 1, None).await.unwrap();
+    root.tags().create("snapshot", ("exp", 1)).await.unwrap();
+    // Model an interrupted cleanup or an in-flight writer leaving manifests.
+    let metadata = branch_contents_path(&root.base, "exp");
+    root.object_store.delete(&metadata).await.unwrap();
+
+    for version in [None, Some(1)] {
+        let error = root.checkout_version(("exp", version)).await.unwrap_err();
+        assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+        assert!(error.to_string().contains("branch exp"), "{error}");
+    }
+    let error = root.checkout_version("snapshot").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = DatasetBuilder::from_uri(root.uri())
+        .with_session(root.session())
+        .with_branch("exp", None)
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = DatasetBuilder::from_uri(stale.uri())
+        .with_session(root.session())
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = stale.checkout_latest().await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+}
+
+#[derive(Debug)]
+struct DeleteBranchOnCommit {
+    root: Dataset,
+    after_publish: bool,
+    inner: AmbiguousCommitHandler,
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for DeleteBranchOnCommit {
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base_path: &Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        if !self.after_publish {
+            self.root
+                .branches()
+                .delete("exp", false)
+                .await
+                .map_err(CommitError::OtherError)?;
+        }
+        let result = self
+            .inner
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await;
+        if self.after_publish {
+            self.root
+                .branches()
+                .delete("exp", false)
+                .await
+                .map_err(CommitError::OtherError)?;
+        }
+        result
+    }
+}
+
+#[rstest]
+#[case::success(None)]
+#[case::ambiguous_conflict(Some(AmbiguousFailure::LandAndConflict))]
+#[case::ambiguous_error(Some(AmbiguousFailure::LandAndError))]
+#[tokio::test]
+async fn test_deleted_branch_during_commit_is_not_acknowledged(
+    #[case] failure: Option<AmbiguousFailure>,
+    #[values(false, true)] after_publish: bool,
+    #[values(false, true)] detached: bool,
+) {
+    let mut root = Dataset::write(id_rows(0, 2), "memory://", None)
+        .await
+        .unwrap();
+    let stale = root.create_branch("exp", 1, None).await.unwrap();
+    let handler = Arc::new(DeleteBranchOnCommit {
+        root: root.clone(),
+        after_publish,
+        inner: AmbiguousCommitHandler::default(),
+    });
+    if let Some(failure) = failure {
+        handler.inner.fail_next(failure);
+    }
+    let error = CommitBuilder::new(Arc::new(stale))
+        .with_commit_handler(handler)
+        .with_detached(detached)
+        .execute(Transaction::new(
+            1,
+            Operation::Append { fragments: vec![] },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch exp"), "{error}");
+    assert!(root.list_branches().await.unwrap().is_empty());
+    let error = root.checkout_branch("exp").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
+    #[values(false, true)] local: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let uri = if local { tempdir.as_ref() } else { "memory://" };
+    let mut root = Dataset::write(id_rows(0, 2), uri, None).await.unwrap();
+    root.append(id_rows(2, 1), None).await.unwrap();
+    let mut deleted = root.create_branch("a", 2, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+    let mut store = root.object_store.as_ref().clone();
+    store.inner = Arc::new(DirectoryMarkerStore {
+        inner: store.inner.clone(),
+        marker: deleted.base.clone(),
+        // Force the shared-directory traversal to fail before removing files.
+        listings: AtomicUsize::new(1),
+    });
+    root.refs.object_store = Arc::new(store);
+
+    let error = root.delete_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("shared directory was listed more than once"),
+        "{error}"
+    );
+    assert!(
+        deleted
+            .object_store
+            .exists(&deleted.manifest_location.path)
+            .await
+            .unwrap()
+    );
+    assert!(!root.list_branches().await.unwrap().contains_key("a"));
+    let error = root.checkout_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
+    let error = deleted.append(id_rows(3, 1), None).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
+    let child = root.checkout_branch("a/b").await.unwrap();
+    assert_eq!(child.count_rows(None).await.unwrap(), 2);
+
+    // Finish the failed cleanup before reusing the name for a different history.
+    root.refs.object_store = root.object_store.clone();
+    root.force_delete_branch("a").await.unwrap();
+    let recreated = root.create_branch("a", 1, None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    let reopened = root.checkout_branch("a").await.unwrap();
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 2);
+    let child = root.checkout_branch("a/b").await.unwrap();
+    assert_eq!(child.count_rows(None).await.unwrap(), 2);
+}
+
+#[rstest]
+#[case::older_source(1, 2)]
+#[case::newer_source(2, 1)]
+#[tokio::test]
+async fn test_duplicate_branch_creation_preserves_dataset(
+    #[case] source_version: u64,
+    #[case] conflicting_version: u64,
+) {
+    let tempdir = TempStrDir::default();
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(
+        data(),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.append(data(), None).await.unwrap();
+
+    let branch = dataset
+        .create_branch("race", source_version, None)
+        .await
+        .unwrap();
+    let expected = branch.scan().try_into_batch().await.unwrap();
+    let contents = dataset.branches().get("race").await.unwrap();
+
+    let error = dataset
+        .create_branch("race", conflicting_version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch race already exists"));
+
+    let branch = dataset.checkout_branch("race").await.unwrap();
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(
+        branch
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![source_version]
+    );
+    assert_eq!(
+        serde_json::to_value(dataset.branches().get("race").await.unwrap()).unwrap(),
+        serde_json::to_value(contents).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_branch_creation_preserves_winner() {
+    let tempdir = TempStrDir::default();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.delete("id >= 2").await.unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (1..=2)
+        .map(|version| {
+            let mut dataset = dataset.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (version, dataset.create_branch("race", version, None).await)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut successful_version = None;
+    let mut conflicts = 0;
+    for handle in handles {
+        let (version, result) = handle.await.unwrap();
+        match result {
+            Ok(_) => {
+                assert!(successful_version.replace(version).is_none());
+            }
+            Err(error) => {
+                // A concurrent loser can observe either the reserved branch
+                // name or the winner's version directory first. Both paths are
+                // valid RefConflict outcomes; the winner invariants below are
+                // the contract exercised here.
+                assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+                conflicts += 1;
+            }
+        }
+    }
+    assert_eq!(conflicts, 1);
+    let successful_version = successful_version.unwrap();
+    let branch = dataset.checkout_branch("race").await.unwrap();
+    let source = dataset.checkout_version(successful_version).await.unwrap();
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        source.scan().try_into_batch().await.unwrap()
+    );
+    assert_eq!(
+        branch
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![successful_version]
+    );
+    let contents = dataset.branches().get("race").await.unwrap();
+    assert_eq!(contents.parent_version, successful_version);
+    assert_eq!(contents.parent_branch, None);
+}
+
+#[tokio::test]
+async fn test_failed_branch_clone_retains_reservation_until_explicit_cleanup() {
+    let tempdir = TempStrDir::default();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &tempdir,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    handler.fail_next(AmbiguousFailure::FailOutright);
+
+    let error = dataset.create_branch("retry", 1, None).await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated outright commit failure")
+    );
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    let reservation = branches.get("retry").unwrap();
+    assert_eq!(reservation.parent_version, 1);
+    let error = dataset.create_branch("retry", 1, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch retry already exists"));
+
+    dataset.force_delete_branch("retry").await.unwrap();
+    let mut branch = dataset.create_branch("retry", 1, None).await.unwrap();
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        dataset.scan().try_into_batch().await.unwrap()
+    );
+    let replacement = dataset.branches().get("retry").await.unwrap();
+    assert_ne!(replacement.identifier, reservation.identifier);
+    branch.append(id_rows(99, 1), None).await.unwrap();
+    assert_eq!(
+        dataset.branches().get("retry").await.unwrap().identifier,
+        replacement.identifier
+    );
+    let reopened = dataset.checkout_branch("retry").await.unwrap();
+    assert_eq!(
+        reopened.scan().try_into_batch().await.unwrap(),
+        branch.scan().try_into_batch().await.unwrap()
+    );
+}
+
+#[rstest]
+#[case::lost_conflict_response(AmbiguousFailure::LandAndConflict, false)]
+#[case::lost_error_response(AmbiguousFailure::LandAndError, false)]
+#[case::unknown_outcome(AmbiguousFailure::LandAndErrorWithoutVerification, false)]
+#[case::custom_handler_error(AmbiguousFailure::LandAndError, true)]
+#[tokio::test]
+async fn test_branch_clone_preserves_landed_commit(
+    #[case] failure: AmbiguousFailure,
+    #[case] propagate_error: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let mut dataset = Dataset::write(
+        id_rows(0, 4),
+        &tempdir,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    handler
+        .propagate_error_after_success
+        .store(propagate_error, AtomicOrdering::SeqCst);
+    handler.fail_next(failure);
+
+    let result = dataset.create_branch("retry", 2, None).await;
+    if failure == AmbiguousFailure::LandAndErrorWithoutVerification {
+        let error = result.unwrap_err();
+        assert!(error.is_commit_status_unknown(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated ambiguous commit failure"),
+            "{error}"
+        );
+        handler.fail_resolve.store(false, AtomicOrdering::SeqCst);
+    } else if propagate_error {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated ambiguous commit failure"),
+            "{error}"
+        );
+    } else {
+        assert_eq!(result.unwrap().version().version, 2);
+    }
+    assert_eq!(
+        dataset
+            .branches()
+            .get("retry")
+            .await
+            .unwrap()
+            .parent_version,
+        2
+    );
+    let error = dataset.create_branch("retry", 2, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch retry already exists"));
+    let branch = dataset.checkout_branch("retry").await.unwrap();
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        dataset.scan().try_into_batch().await.unwrap()
+    );
+    assert_eq!(branch.versions().await.unwrap().len(), 1);
+}
+
+#[rstest]
+#[case::complete_history(false)]
+#[case::missing_first_manifest(true)]
+#[tokio::test]
+async fn test_create_branch_rejects_orphaned_versions(
+    #[case] remove_first_manifest: bool,
+    #[values(false, true)] enable_v2_manifest_paths: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 4),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let branch_location = dataset.branch_location().find_branch(Some("exp")).unwrap();
+    dataset.branches().create("exp", 1, None).await.unwrap();
+    // Choose the branch's naming scheme independently of create_branch's default.
+    let mut orphan = CommitBuilder::new(branch_location.uri.as_str())
+        .with_object_store(dataset.object_store.clone())
+        .with_commit_handler(dataset.commit_handler.clone())
+        .enable_v2_manifest_paths(enable_v2_manifest_paths)
+        .execute(Transaction::new(
+            1,
+            Operation::Clone {
+                is_shallow: true,
+                ref_name: None,
+                ref_version: 1,
+                ref_path: dataset.uri().to_string(),
+                branch_name: Some("exp".to_string()),
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let first_manifest = orphan.manifest_location.path.clone();
+    orphan.append(id_rows(999, 1), None).await.unwrap();
+    // Leave the same storage state as a write racing branch deletion, without
+    // depending on whether writes through deleted handles are permitted.
+    dataset
+        .object_store
+        .delete(&branch_contents_path(&dataset.base, "exp"))
+        .await
+        .unwrap();
+    if remove_first_manifest {
+        dataset.object_store.delete(&first_manifest).await.unwrap();
+    }
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    let source_version = if remove_first_manifest { 1 } else { 2 };
+    let expected = dataset
+        .checkout_version(source_version)
+        .await
+        .unwrap()
+        .scan()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = dataset
+            .create_branch("exp", source_version, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert!(error.to_string().contains("exp"), "{error}");
+        assert!(error.to_string().contains("_versions"), "{error}");
+        assert!(dataset.list_branches().await.unwrap().is_empty());
+        assert!(
+            dataset
+                .object_store
+                .exists(&orphan.manifest_location.path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            dataset.object_store.exists(&first_manifest).await.unwrap(),
+            !remove_first_manifest
+        );
+    }
+
+    dataset.force_delete_branch("exp").await.unwrap();
+    let recreated = dataset
+        .create_branch("exp", source_version, None)
+        .await
+        .unwrap();
+    assert_eq!(recreated.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(recreated.versions().await.unwrap().len(), 1);
+    assert_eq!(recreated.version().version, source_version);
+}
+
+#[rstest]
+#[case::dot(".".to_string(), Some("'.' segment"))]
+#[case::leading_dot_segment("./feature".to_string(), Some("'.' segment"))]
+#[case::trailing_dot_segment("feature/.".to_string(), Some("'.' segment"))]
+#[case::middle_dot_segment("feature/./child".to_string(), Some("'.' segment"))]
+#[case::ascii_boundary("x".repeat(211), None)]
+#[case::ascii_too_long("x".repeat(212), Some("maximum is 211 bytes"))]
+#[case::reported_name("x".repeat(300), Some("maximum is 211 bytes"))]
+#[case::nested_boundary(format!("{}/{}", "x".repeat(101), "y".repeat(105)), None)]
+#[case::nested_too_long(format!("{}/{}", "x".repeat(102), "y".repeat(105)), Some("maximum is 211 bytes"))]
+#[case::unicode_boundary(format!("{}x", "é".repeat(21)), None)]
+#[case::unicode_too_long("é".repeat(22), Some("maximum is 211 bytes"))]
+#[tokio::test]
+async fn test_create_branch_name_storage_limits(
+    #[case] branch_name: String,
+    #[case] expected_error: Option<&str>,
+) {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let result = dataset.create_branch(&branch_name, 1, None).await;
+
+    if let Some(expected_error) = expected_error {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert!(dataset.list_branches().await.unwrap().is_empty());
+        assert!(!std::path::Path::new(tempdir.as_str()).join("tree").exists());
+        assert!(
+            dataset
+                .object_store
+                .list(Some(base_branches_contents_path(&dataset.base)))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    } else {
+        let branch = result.unwrap();
+        assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            dataset
+                .checkout_branch(&branch_name)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            dataset
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key(&branch_name)
+        );
+    }
+}
+
+#[derive(Debug)]
+struct FixedMemoryStoreProvider(Arc<ObjectStore>);
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for FixedMemoryStoreProvider {
+    async fn new_store(
+        &self,
+        _base_path: Url,
+        _params: &ObjectStoreParams,
+    ) -> lance_core::Result<ObjectStore> {
+        Ok(self.0.as_ref().clone())
+    }
+}
+
+#[rstest]
+#[case::released_local("é".repeat(22), false)]
+#[case::object_store("x".repeat(300), true)]
+#[tokio::test]
+async fn test_existing_branch_above_creation_limit(
+    #[case] branch_name: String,
+    #[case] in_memory: bool,
+    #[values(false, true)] force_delete: bool,
+) {
+    let test_dir = copy_test_data_to_tmp("v14.0.2/long_branch.lance").unwrap();
+    let mut dataset = if in_memory {
+        let dataset = Dataset::write(
+            id_rows(0, 2),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Reopening the clone and its source must resolve to the same memory backend.
+        dataset.session.store_registry().insert(
+            "memory",
+            Arc::new(FixedMemoryStoreProvider(dataset.object_store.clone())),
+        );
+        create_branch_before_name_check(&dataset, &branch_name).await;
+        dataset
+    } else {
+        Dataset::open(&test_dir.path_str()).await.unwrap()
+    };
+
+    assert!(
+        dataset
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&branch_name)
+    );
+    assert_eq!(
+        dataset
+            .branches()
+            .get(&branch_name)
+            .await
+            .unwrap()
+            .parent_version,
+        1
+    );
+    let expected = dataset.scan().try_into_batch().await.unwrap();
+    let branch = dataset.checkout_branch(&branch_name).await.unwrap();
+    assert_eq!(branch.get_fragments().len(), 2);
+    assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    let reopened = DatasetBuilder::from_uri(dataset.uri())
+        .with_session(dataset.session.clone())
+        .with_branch(&branch_name, None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+
+    let metadata = HashMap::from([("description".to_string(), "existing branch".to_string())]);
+    dataset
+        .branches()
+        .replace_metadata(&branch_name, metadata.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.branches().get(&branch_name).await.unwrap().metadata,
+        metadata
+    );
+
+    if force_delete {
+        dataset.force_delete_branch(&branch_name).await.unwrap();
+    } else {
+        dataset.delete_branch(&branch_name).await.unwrap();
+    }
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    let branch_path = dataset
+        .branch_location()
+        .find_branch(Some(&branch_name))
+        .unwrap()
+        .path;
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_list_hierarchical_branches() {
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+    dataset.create_branch("release", 1, None).await.unwrap();
+    dataset
+        .create_branch("features/nested", 1, None)
+        .await
+        .unwrap();
+
+    // OpenDAL-backed stores such as OSS may decode the '%2F' path part and
+    // expose the branch metadata as a nested object during listing.
+    let root_path = dataset.refs.root().unwrap().path;
+    let encoded_path = branch_contents_path(&root_path, "features/nested");
+    let nested_path = Path::parse(format!(
+        "{}/features/nested.json",
+        base_branches_contents_path(&root_path)
+    ))
+    .unwrap();
+    dataset
+        .object_store
+        .inner
+        .copy(&encoded_path, &nested_path)
+        .await
+        .unwrap();
+    dataset.object_store.delete(&encoded_path).await.unwrap();
+
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("release"));
+    assert!(branches.contains_key("features/nested"));
+}
+
+#[rstest]
+#[case::deleted_ref(true)]
+#[case::storage_error(false)]
+#[tokio::test]
+async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: bool) {
+    let tempdir = TempDir::default();
+    let path_prefix = if cfg!(windows) { "/" } else { "" };
+    let uri = format!("file-object-store://{path_prefix}{}", tempdir.path_str());
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.create_branch("deleted", 1, None).await.unwrap();
+    dataset.create_branch("retained", 1, None).await.unwrap();
+
+    let deleted_ref = branch_contents_path(&dataset.base, "deleted");
+    let mut policy = ProxyObjectStorePolicy::new();
+    let has_deleted_ref = AtomicBool::new(false);
+    policy.set_before_policy(
+        "ref_disappears_after_listing",
+        Arc::new(move |method, path| {
+            if method == "get_opts" && path == &deleted_ref {
+                if is_not_found {
+                    if !has_deleted_ref.swap(true, AtomicOrdering::SeqCst) {
+                        std::fs::remove_file(to_local_path(path)).unwrap();
+                    }
+                } else {
+                    return Err(object_store::Error::PermissionDenied {
+                        path: path.to_string(),
+                        source: "ref cannot be read".into(),
+                    }
+                    .into());
+                }
+            }
+            Ok(())
+        }),
+    );
+    let mut store = dataset.object_store.as_ref().clone();
+    store.inner = Arc::new(ProxyObjectStore::new(
+        store.inner.clone(),
+        Arc::new(Mutex::new(policy)),
+    ));
+    dataset.refs.object_store = Arc::new(store);
+
+    if is_not_found {
+        let branches = dataset.list_branches().await.unwrap();
+        assert_eq!(branches.len(), 1);
+        assert!(branches.contains_key("retained"));
+        let ordered = dataset.branches().list_ordered(None).await.unwrap();
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].0, "retained");
+        dataset.delete_branch("retained").await.unwrap();
+        assert!(dataset.list_branches().await.unwrap().is_empty());
+        assert!(
+            dataset
+                .object_store
+                .list(Some(dataset.base.clone().join("tree").join("retained")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    } else {
+        let error = dataset.list_branches().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains("ref cannot be read"), "{error}");
+        let error = dataset.delete_branch("retained").await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains("ref cannot be read"), "{error}");
+        assert!(
+            dataset
+                .object_store
+                .exists(&branch_contents_path(&dataset.base, "retained"))
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[rstest]
+#[case::local(false)]
+#[case::object_store(true)]
+#[tokio::test]
+async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_store: bool) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let branch = dataset.create_branch("deleted", 1, None).await.unwrap();
+    let concurrent = dataset.create_branch("concurrent", 1, None).await.unwrap();
+    let concurrent_ref = branch_contents_path(&dataset.base, "concurrent");
+    let deleted_ref = branch_contents_path(&dataset.base, "deleted");
+    let mut policy = ProxyObjectStorePolicy::new();
+    let has_deleted_ref = Arc::new(AtomicBool::new(false));
+    let has_deleted_ref_for_directory_policy = has_deleted_ref.clone();
+    let has_deleted_ref_for_ref_policy = has_deleted_ref.clone();
+    let has_removed_concurrent_ref = Arc::new(AtomicBool::new(false));
+    let has_removed_concurrent_ref_for_policy = has_removed_concurrent_ref.clone();
+    let concurrent_ref_reads = Arc::new(AtomicUsize::new(0));
+    let concurrent_ref_reads_for_policy = concurrent_ref_reads.clone();
+    let concurrent_base_for_policy = concurrent.base.clone();
+    let concurrent_ref_for_policy = concurrent_ref.clone();
+    policy.set_before_policy(
+        "target_ref_removed",
+        Arc::new(move |method, path| {
+            if method == "delete" && path == &deleted_ref {
+                has_deleted_ref_for_directory_policy.store(true, AtomicOrdering::SeqCst);
+                // The other delete has removed the branch directory but not its ref.
+                std::fs::remove_dir_all(to_local_path(&concurrent_base_for_policy)).unwrap();
+            }
+            Ok(())
+        }),
+    );
+    policy.set_before_policy(
+        "concurrent_ref_disappears_before_recheck",
+        Arc::new(move |method, path| {
+            if method == "get_opts"
+                && path == &concurrent_ref_for_policy
+                && has_deleted_ref_for_ref_policy.load(AtomicOrdering::SeqCst)
+            {
+                let reads =
+                    concurrent_ref_reads_for_policy.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                // Local file reads bypass the proxy. Object-store refs are read once
+                // during the cleanup list before the existence recheck.
+                let recheck_read = if use_object_store { 2 } else { 1 };
+                if reads == recheck_read {
+                    std::fs::remove_file(to_local_path(&concurrent_ref_for_policy)).unwrap();
+                    has_removed_concurrent_ref_for_policy.store(true, AtomicOrdering::SeqCst);
+                }
+            }
+            Ok(())
+        }),
+    );
+    let mut store = dataset.object_store.as_ref().clone();
+    store.inner = Arc::new(ProxyObjectStore::new(
+        store.inner.clone(),
+        Arc::new(Mutex::new(policy)),
+    ));
+    dataset.refs.object_store = Arc::new(store);
+
+    assert!(
+        dataset
+            .object_store
+            .exists(&branch.manifest_location.path)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !dataset
+            .object_store
+            .list(Some(branch.base.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.delete_branch("deleted").await.unwrap();
+    assert!(has_deleted_ref.load(AtomicOrdering::SeqCst));
+    assert!(has_removed_concurrent_ref.load(AtomicOrdering::SeqCst));
+    assert!(
+        !dataset
+            .object_store
+            .exists(&branch.manifest_location.path)
+            .await
+            .unwrap()
+    );
+    assert!(!dataset.object_store.exists(&concurrent_ref).await.unwrap());
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch.base.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        dataset
+            .object_store
+            .list(Some(concurrent.base.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[case::local(false)]
+#[case::object_store(true)]
+#[tokio::test]
+async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_object_store: bool) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset.create_branch("a", 1, None).await.unwrap();
+
+    let mut creator = dataset.clone();
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    // The proxy hook is synchronous, so keep the other client on a separate
+    // runtime and OS thread rather than blocking the async or CPU pools.
+    let creator_thread = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let mut child = creator.create_branch("a/b", 1, None).await.unwrap();
+                child.append(id_rows(10, 2), None).await.unwrap();
+                assert_eq!(child.count_rows(None).await.unwrap(), 4);
+                done_tx.send(()).unwrap();
+            });
+    });
+
+    let target = branch_contents_path(&dataset.base, "a");
+    let done_rx = Mutex::new(done_rx);
+    let has_created_child = AtomicBool::new(false);
+    let mut policy = ProxyObjectStorePolicy::new();
+    policy.set_before_policy(
+        "create_before_ref_removal",
+        Arc::new(move |method, path| {
+            if method == "delete"
+                && path == &target
+                && !has_created_child.swap(true, AtomicOrdering::SeqCst)
+            {
+                start_tx.send(()).unwrap();
+                done_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+            }
+            Ok(())
+        }),
+    );
+    let mut store = dataset.object_store.as_ref().clone();
+    store.inner = Arc::new(ProxyObjectStore::new(
+        store.inner.clone(),
+        Arc::new(Mutex::new(policy)),
+    ));
+    dataset.refs.object_store = Arc::new(store);
+
+    dataset.delete_branch("a").await.unwrap();
+    creator_thread.join().unwrap();
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert!(branches.contains_key("a/b"));
+    let child = dataset.checkout_branch("a/b").await.unwrap();
+    let batch = child.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 1, 10, 11]
+    );
+}
+
+#[rstest]
+#[case::local(false)]
+#[case::object_store(true)]
+#[tokio::test]
+async fn test_concurrent_branch_deletes_and_listing(#[case] use_object_store: bool) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    const BRANCH_COUNT: usize = 8;
+    for i in 0..BRANCH_COUNT {
+        dataset
+            .create_branch(&format!("b{i}"), 1, None)
+            .await
+            .unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(BRANCH_COUNT + 1));
+    let deletes = (0..BRANCH_COUNT).map(|i| {
+        let mut dataset = dataset.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            dataset.delete_branch(&format!("b{i}")).await.unwrap();
+        }
+    });
+    let list = async {
+        barrier.wait().await;
+        for _ in 0..BRANCH_COUNT {
+            dataset.list_branches().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::join!(futures::future::join_all(deletes), list);
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    let files = dataset
+        .object_store
+        .list(Some(dataset.base.clone().join("tree")))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(files.is_empty(), "orphaned branch files: {files:?}");
+    for i in 0..BRANCH_COUNT {
+        let branch = dataset
+            .create_branch(&format!("b{i}"), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+    }
+}
+
+#[derive(Debug)]
+struct DirectoryMarkerStore {
+    inner: Arc<dyn OSObjectStore>,
+    marker: Path,
+    listings: AtomicUsize,
+}
+
+impl std::fmt::Display for DirectoryMarkerStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DirectoryMarkerStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for DirectoryMarkerStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let mut entries = self.inner.list_with_delimiter(prefix).await?;
+        if prefix == Some(&self.marker) {
+            // Fail promptly if cleanup requeues the marker instead of hanging.
+            if self.listings.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
+                return Err(object_store::Error::Generic {
+                    store: "DirectoryMarkerStore",
+                    source: "shared directory was listed more than once".into(),
+                });
+            }
+            // Hierarchical OpenDAL stores can return the listed directory itself.
+            entries.common_prefixes.push(self.marker.clone());
+        }
+        Ok(entries)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[rstest]
+#[case::child("a/b", false, false)]
+#[case::nested_child("a/b/c", false, false)]
+#[case::data_directory("a/data/child", false, true)]
+#[case::force("a/b", true, false)]
+#[case::sibling("ab", false, false)]
+#[tokio::test]
+async fn test_delete_branch_with_shared_directory(
+    #[case] remaining_branch: &str,
+    #[case] force: bool,
+    #[case] use_legacy_branch_creation: bool,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_directory_marker: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let data = |start| {
+        gen_batch()
+            .col("id", array::step_custom::<Int32Type>(start, 1))
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1))
+    };
+    let params = || WriteParams {
+        max_rows_per_file: 1,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(data(0), &uri, Some(params())).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let mut deleted = dataset.create_branch("a", 1, None).await.unwrap();
+    deleted.append(data(10), Some(params())).await.unwrap();
+    if use_legacy_branch_creation {
+        create_branch_before_name_check(&dataset, remaining_branch).await;
+    } else {
+        dataset
+            .create_branch(remaining_branch, 1, None)
+            .await
+            .unwrap();
+    }
+    let mut remaining = dataset.checkout_branch(remaining_branch).await.unwrap();
+    remaining.append(data(20), Some(params())).await.unwrap();
+
+    let marker_store = has_directory_marker.then(|| {
+        let mut store = dataset.object_store.as_ref().clone();
+        let marker_store = Arc::new(DirectoryMarkerStore {
+            inner: store.inner.clone(),
+            marker: deleted.base.clone(),
+            listings: AtomicUsize::new(0),
+        });
+        store.inner = marker_store.clone();
+        let store = Arc::new(store);
+        dataset.object_store = store.clone();
+        dataset.refs.object_store = store;
+        marker_store
+    });
+    if force {
+        let metadata = branch_contents_path(&dataset.base, "a");
+        dataset.object_store.delete(&metadata).await.unwrap();
+        dataset.force_delete_branch("a").await.unwrap();
+    } else {
+        dataset.delete_branch("a").await.unwrap();
+    }
+    if let Some(marker_store) = marker_store {
+        assert_eq!(
+            marker_store.listings.load(AtomicOrdering::SeqCst),
+            usize::from(remaining_branch.starts_with("a/"))
+        );
+    }
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert!(branches.contains_key(remaining_branch));
+    for version in [None, Some(1), Some(2)] {
+        let error = dataset.checkout_version(("a", version)).await.unwrap_err();
+        assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+        assert!(error.to_string().contains("branch a"), "{error}");
+    }
+    let files = dataset
+        .object_store
+        .list(Some(deleted.base.clone()))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        files
+            .iter()
+            .all(|file| file.location.prefix_matches(&remaining.base))
+    );
+
+    let mut recreated = dataset.create_branch("a", 1, None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    recreated.append(data(30), Some(params())).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 4);
+
+    let mut remaining = dataset.checkout_branch(remaining_branch).await.unwrap();
+    remaining.append(data(40), Some(params())).await.unwrap();
+    let batch = remaining.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 1, 20, 21, 40, 41]
+    );
+}
+
+#[rstest]
+#[case::direct(false, false)]
+#[case::object_store(true, false)]
+#[case::rooted(false, true)]
+#[tokio::test]
+async fn test_delete_branch_preserves_case_aliased_shared_directories(
+    #[case] use_object_store: bool,
+    #[case] is_rooted_store: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut deleted = root.create_branch("a", 1, None).await.unwrap();
+    deleted.append(id_rows(10, 1), None).await.unwrap();
+    // Exercise physical aliases on case-sensitive hosts as well as Windows.
+    #[cfg(unix)]
+    if !tempdir.std_path().join("tree/A").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/a"),
+            tempdir.std_path().join("tree/A"),
+        )
+        .unwrap();
+    }
+    let mut lower_child = root.create_branch("a/b", 1, None).await.unwrap();
+    lower_child.append(id_rows(20, 1), None).await.unwrap();
+    let mut case_child = root.create_branch("A/c", 1, None).await.unwrap();
+    case_child.append(id_rows(30, 1), None).await.unwrap();
+    if is_rooted_store {
+        // A provider without native path resolution must preserve ambiguous subtrees.
+        let mut store = root.object_store.as_ref().clone();
+        store.store_prefix = "file$rooted-test".to_owned();
+        assert!(!store.has_direct_local_paths());
+        let store = Arc::new(store);
+        root.object_store = store.clone();
+        root.refs.object_store = store;
+    }
+
+    root.delete_branch("a").await.unwrap();
+
+    let branches = root.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("a/b"));
+    assert!(branches.contains_key("A/c"));
+
+    for (branch, expected_before, appended, expected_after) in [
+        ("a/b", [0, 20], 40, [0, 20, 40]),
+        ("A/c", [0, 30], 50, [0, 30, 50]),
+    ] {
+        let mut dataset = root.checkout_branch(branch).await.unwrap();
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref(),
+            &expected_before
+        );
+        dataset.append(id_rows(appended, 1), None).await.unwrap();
+        assert_eq!(
+            root.checkout_branch(branch)
+                .await
+                .unwrap()
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref(),
+            &expected_after
+        );
+    }
+}
+
+#[rstest]
+#[case::same_name(false, false)]
+#[case::alias(true, false)]
+#[case::alias_object_store(true, true)]
+#[tokio::test]
+async fn test_delete_branch_preserves_aliased_parent_data(
+    #[case] has_alias: bool,
+    #[case] use_object_store: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let parent_branch = if has_alias { "A" } else { "a" };
+    let mut parent = root.create_branch(parent_branch, 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+    #[cfg(unix)]
+    if has_alias && !tempdir.std_path().join("tree/a").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/A"),
+            tempdir.std_path().join("tree/a"),
+        )
+        .unwrap();
+    }
+    create_branch_before_name_check(&parent, "a/data").await;
+    create_branch_before_name_check(&root, "a/data/x").await;
+
+    root.delete_branch("a/data").await.unwrap();
+
+    let mut parent = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch(parent_branch)
+        .await
+        .unwrap();
+    let batch = parent.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+    parent.append(id_rows(20, 1), None).await.unwrap();
+    assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+    assert!(root.list_branches().await.unwrap().contains_key("a/data/x"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_branch_preserves_unicode_aliased_parent_data() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("a", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+
+    let versions = tempdir.std_path().join("tree/a/_versions");
+    let unicode_alias = tempdir.std_path().join("tree/a/_ver\u{017f}ions");
+    if !unicode_alias.exists() {
+        std::os::unix::fs::symlink(&versions, &unicode_alias).unwrap();
+    }
+
+    let middle_name = "a/_ver\u{017f}ions";
+    let mut middle = root.create_branch(middle_name, 1, None).await.unwrap();
+    middle.append(id_rows(20, 1), None).await.unwrap();
+    let mut leaf = root
+        .create_branch("a/_ver\u{017f}ions/x", 1, None)
+        .await
+        .unwrap();
+    leaf.append(id_rows(30, 1), None).await.unwrap();
+
+    root.delete_branch(middle_name).await.unwrap();
+
+    assert!(
+        root.list_branches()
+            .await
+            .unwrap()
+            .contains_key("a/_ver\u{017f}ions/x")
+    );
+    let mut parent = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("a")
+        .await
+        .unwrap();
+    let batch = parent.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+    parent.append(id_rows(40, 1), None).await.unwrap();
+    assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::data("data", "data")]
+#[case::unicode_versions("_versions", "_ver\u{017f}ions")]
+#[tokio::test]
+async fn test_delete_branch_preserves_relocated_parent_data(
+    #[case] dataset_dir: &str,
+    #[case] alias: &str,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_child: bool,
+    #[values(false, true)] has_sibling: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("A", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+
+    let owned_path = tempdir.std_path().join("tree/A").join(dataset_dir);
+    let relocated_path = tempdir.std_path().join("relocated");
+    std::fs::rename(&owned_path, &relocated_path).unwrap();
+    std::os::unix::fs::symlink(&relocated_path, &owned_path).unwrap();
+    let alias_path = tempdir.std_path().join("tree/A").join(alias);
+    if !alias_path.exists() {
+        std::os::unix::fs::symlink(&owned_path, &alias_path).unwrap();
+    }
+    if !tempdir.std_path().join("tree/a").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/A"),
+            tempdir.std_path().join("tree/a"),
+        )
+        .unwrap();
+    }
+    let deleted_branch = format!("a/{alias}");
+    create_branch_before_name_check(&parent, &deleted_branch).await;
+    if has_sibling {
+        // Keep recursive cleanup rooted at the dataset directory without a child branch.
+        root.create_branch("a/sibling", 1, None).await.unwrap();
+    }
+    let child_branch = format!("{deleted_branch}/x");
+    if has_child {
+        create_branch_before_name_check(&root, &child_branch).await;
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch(&deleted_branch).await.unwrap();
+            let branches = root.list_branches().await.unwrap();
+            assert!(!branches.contains_key(&deleted_branch));
+            assert!(branches.contains_key("A"));
+            assert_eq!(branches.contains_key("a/sibling"), has_sibling);
+            assert_eq!(branches.contains_key(&child_branch), has_child);
+        }
+        let mut parent = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("A")
+            .await
+            .unwrap();
+        let batch = parent.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            parent.append(id_rows(20, 1), None).await.unwrap();
+            assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+        }
+    }
+    for branch in [
+        has_sibling.then_some("a/sibling"),
+        has_child.then_some(child_branch.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut survivor = root.checkout_branch(branch).await.unwrap();
+        survivor.append(id_rows(30, 1), None).await.unwrap();
+        let batch = survivor.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 30]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::direct_nested(false, true)]
+#[case::object_store_nested(true, true)]
+#[case::direct_alias(false, false)]
+#[case::object_store_alias(true, false)]
+#[tokio::test]
+async fn test_delete_branch_preserves_nested_dataset_data(
+    #[case] use_object_store: bool,
+    #[case] relocate_into_deleted: bool,
+    #[values(false, true)] deep_alias: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("retained", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+    let mut deleted = root.create_branch("a", 1, None).await.unwrap();
+    deleted.append(id_rows(20, 1), None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+
+    let parent_data = tempdir.std_path().join("tree/retained/data");
+    let container = tempdir.std_path().join(if deep_alias {
+        "tree/a/container"
+    } else {
+        "tree/a"
+    });
+    std::fs::create_dir_all(&container).unwrap();
+    let nested_data = container.join("parent-data");
+    if relocate_into_deleted {
+        std::fs::rename(&parent_data, &nested_data).unwrap();
+        std::os::unix::fs::symlink(&nested_data, &parent_data).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&parent_data, &nested_data).unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+            assert!(!root.list_branches().await.unwrap().contains_key("a"));
+        }
+        let mut parent = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("retained")
+            .await
+            .unwrap();
+        let batch = parent.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            parent.append(id_rows(30, 1), None).await.unwrap();
+            assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+        }
+    }
+    let error = root.checkout_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
+    let mut recreated = root.create_branch("a", 1, None).await.unwrap();
+    recreated.append(id_rows(40, 1), None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    if has_child {
+        let mut child = root.checkout_branch("a/b").await.unwrap();
+        child.append(id_rows(50, 1), None).await.unwrap();
+        let batch = child.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 50]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::data("data")]
+#[case::versions("_versions")]
+#[tokio::test]
+async fn test_delete_branch_preserves_aliased_main_dataset(
+    #[case] dataset_dir: &str,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.append(id_rows(10, 1), None).await.unwrap();
+    std::fs::create_dir_all(tempdir.std_path().join("tree")).unwrap();
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join(dataset_dir),
+        tempdir.std_path().join("tree/a"),
+    )
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+            assert!(!root.list_branches().await.unwrap().contains_key("a"));
+        }
+        let mut main = Dataset::open(&uri).await.unwrap();
+        let batch = main.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            main.append(id_rows(20, 1), None).await.unwrap();
+            let batch = main.scan().try_into_batch().await.unwrap();
+            assert_eq!(
+                batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+                &[0, 10, 20]
+            );
+        }
+    }
+    if has_child {
+        let mut child = root.checkout_branch("a/b").await.unwrap();
+        child.append(id_rows(30, 1), None).await.unwrap();
+        let batch = child.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 30]
+        );
+    }
+}
+
+#[derive(Debug)]
+struct GateSpelledRefsStore {
+    inner: Arc<dyn OSObjectStore>,
+    root: Path,
+    spelling: &'static str,
+}
+
+impl std::fmt::Display for GateSpelledRefsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GateSpelledRefsStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for GateSpelledRefsStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let mut entries = self.inner.list_with_delimiter(prefix).await?;
+        if prefix == Some(&self.root) {
+            for directory in &mut entries.common_prefixes {
+                if directory.filename() == Some("_refs") {
+                    *directory = self.root.clone().join(self.spelling);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[tokio::test]
+async fn test_delete_branch_preserves_shared_refs(
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] deep_alias: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.tags().create("checkpoint", 1).await.unwrap();
+    let mut survivor = root.create_branch("retained", 1, None).await.unwrap();
+    survivor.append(id_rows(10, 1), None).await.unwrap();
+    let metadata = HashMap::from([("owner".to_string(), "retained".to_string())]);
+    root.refs
+        .branches()
+        .replace_metadata("retained", metadata.clone())
+        .await
+        .unwrap();
+    root.refs
+        .tags()
+        .replace_metadata("checkpoint", metadata)
+        .await
+        .unwrap();
+    if !deep_alias {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("_refs"),
+            tempdir.std_path().join("tree/a"),
+        )
+        .unwrap();
+    }
+    root.create_branch("a", 1, None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+    if deep_alias {
+        let container = tempdir.std_path().join("tree/a/container");
+        std::fs::create_dir_all(&container).unwrap();
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("_refs"),
+            container.join("shared-refs"),
+        )
+        .unwrap();
+    }
+    let mut expected_branches = root.list_branches().await.unwrap();
+    expected_branches.remove("a").unwrap();
+    let expected_tags = root.tags().list().await.unwrap();
+
+    root.delete_branch("a").await.unwrap();
+
+    let fresh = Dataset::open(&uri).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(fresh.list_branches().await.unwrap()).unwrap(),
+        serde_json::to_value(expected_branches).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(fresh.tags().list().await.unwrap()).unwrap(),
+        serde_json::to_value(expected_tags).unwrap()
+    );
+    let mut survivor = fresh.checkout_branch("retained").await.unwrap();
+    survivor.append(id_rows(20, 1), None).await.unwrap();
+    let batch = survivor.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10, 20]
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::normal("_refs")]
+#[case::uppercase("_REFS")]
+#[case::unicode("_ref\u{017f}")]
+#[tokio::test]
+async fn test_gatekeeper_case_spelled_shared_refs(
+    #[case] spelling: &'static str,
+    #[values(false, true)] use_object_store: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.tags().create("checkpoint", 1).await.unwrap();
+    let mut survivor = root.create_branch("retained", 1, None).await.unwrap();
+    survivor.append(id_rows(10, 1), None).await.unwrap();
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join("_refs"),
+        tempdir.std_path().join("tree/a"),
+    )
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+    let mut expected_branches = root.list_branches().await.unwrap();
+    expected_branches.remove("a").unwrap();
+    let expected_tags = root.tags().list().await.unwrap();
+    assert_eq!(
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("retained")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10],
+    );
+
+    let mut store = root.object_store.as_ref().clone();
+    store.inner = Arc::new(GateSpelledRefsStore {
+        inner: store.inner.clone(),
+        root: root.refs.root().unwrap().path,
+        spelling,
+    });
+    let store = Arc::new(store);
+    root.object_store = store.clone();
+    root.refs.object_store = store;
+    assert!(root.list_branches().await.unwrap().contains_key("retained"));
+    root.delete_branch("a").await.unwrap();
+
+    let fresh = Dataset::open(&uri).await.unwrap();
+    let branches = fresh.list_branches().await.unwrap();
+    let tags = fresh.tags().list().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&branches).unwrap(),
+        serde_json::to_value(expected_branches).unwrap(),
+        "shared branch records lost: {:?}",
+        branches.keys().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        serde_json::to_value(tags).unwrap(),
+        serde_json::to_value(expected_tags).unwrap(),
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
+#[tokio::test]
+async fn test_delete_branch_preserves_nested_blob_target(
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] relocate_owned_child: bool,
+    #[values(false, true)] is_file_alias: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let owned_dir = tempdir.std_path().join("_blobs/nested/deeper");
+    std::fs::create_dir_all(&owned_dir).unwrap();
+    std::fs::write(owned_dir.join("payload.blob"), b"payload").unwrap();
+    let mut values = crate::blob::BlobDescriptorArrayBuilder::new("blob");
+    values
+        .push(crate::blob::BlobDescriptor::Managed {
+            base_id: None,
+            uri: "_blobs/nested/deeper/payload.blob".to_string(),
+            offset: 0,
+            size: 7,
+        })
+        .unwrap();
+    let (field, values) = values.finish().unwrap().into_parts();
+    let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
+        field,
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+    let mut root = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+    let container = tempdir.std_path().join("tree/a/container");
+    std::fs::create_dir_all(&container).unwrap();
+    let target = container.join("blob-payload");
+    let owned_path = if is_file_alias {
+        owned_dir.join("payload.blob")
+    } else {
+        owned_dir
+    };
+    if relocate_owned_child {
+        std::fs::rename(&owned_path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &owned_path).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&owned_path, &target).unwrap();
+    }
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join("_blobs"),
+        tempdir.std_path().join("_blobs/cycle"),
+    )
+    .unwrap();
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+        }
+        let fresh = Arc::new(Dataset::open(&uri).await.unwrap());
+        let handles = fresh.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let bytes = handles[0].as_ref().unwrap().read().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_branch_preserves_symlink_routed_child_namespace() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("p", 1, None).await.unwrap();
+    parent.append(id_rows(10, 2), None).await.unwrap();
+    let mut removed = root.create_branch("a", 1, None).await.unwrap();
+    removed.append(id_rows(20, 1), None).await.unwrap();
+
+    let data_path = tempdir.std_path().join("tree/p/data");
+    let relocated_data = tempdir.std_path().join("relocated-data");
+    std::fs::rename(&data_path, &relocated_data).unwrap();
+    std::os::unix::fs::symlink(&relocated_data, &data_path).unwrap();
+    let route = tempdir.std_path().join("tree/a/b");
+    std::os::unix::fs::symlink(&relocated_data, &route).unwrap();
+
+    let mut child = root.create_branch("a/b/x", 1, None).await.unwrap();
+    child.append(id_rows(30, 1), None).await.unwrap();
+
+    root.delete_branch("a").await.unwrap();
+
+    assert!(route.is_symlink(), "the surviving branch route was removed");
+    assert!(root.list_branches().await.unwrap().contains_key("a/b/x"));
+    let parent = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("p")
+        .await
+        .unwrap();
+    assert_eq!(
+        parent.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10, 11]
+    );
+    let child = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("a/b/x")
+        .await
+        .unwrap();
+    assert_eq!(
+        child.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 30]
+    );
+    match Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_version(("a", None))
+        .await
+    {
+        Err(Error::RefNotFound { .. }) => {}
+        Err(error) => panic!("unexpected checkout error: {error}"),
+        Ok(still_readable) => panic!(
+            "deleted branch is still readable: {:?}",
+            still_readable.scan().try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref()
+        ),
+    }
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
@@ -1532,10 +3801,8 @@ async fn test_branch() {
     assert_eq!(main_by_ref.manifest.branch, None);
 
     // A checkout whose resolved manifest is not on the requested branch must
-    // error loudly instead of handing back another branch's data: stage main's
-    // manifest under a branch path that was never created, so resolution finds
-    // a manifest belonging to main.
-    use object_store::ObjectStoreExt as _;
+    // error loudly instead of handing back another branch's data: reserve a
+    // branch name but stage main's manifest there instead of cloning it.
     let staged_manifest = main_dataset.manifest_location().path.clone();
     let staged_copy = Path::parse(format!(
         "{}/tree/ghost/_versions/{}",
@@ -1549,6 +3816,11 @@ async fn test_branch() {
         .copy(&staged_manifest, &staged_copy)
         .await
         .unwrap();
+    main_dataset
+        .branches()
+        .create("ghost", 1, None)
+        .await
+        .unwrap();
     let err = main_dataset.checkout_branch("ghost").await.unwrap_err();
     assert!(
         err.to_string().contains("resolved a manifest belonging to"),
@@ -1558,6 +3830,11 @@ async fn test_branch() {
     main_dataset
         .object_store
         .remove_dir_all(Path::parse(format!("{}/tree/ghost", test_uri)).unwrap())
+        .await
+        .unwrap();
+    main_dataset
+        .object_store
+        .delete(&branch_contents_path(&main_dataset.base, "ghost"))
         .await
         .unwrap();
 
@@ -1597,4 +3874,126 @@ async fn test_branch() {
         .await
         .unwrap();
     assert!(branches.is_empty());
+}
+
+fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
+    gen_batch()
+        .col("id", array::step_custom::<Int32Type>(start, 1))
+        .into_reader_rows(RowCount::from(rows), BatchCount::from(1))
+}
+
+// Simulate a branch created before the new name validation.
+async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
+    let version = source.version().version;
+    let source_branch = source.manifest.branch.clone();
+    let source_location = source
+        .branch_location()
+        .find_branch(source_branch.as_deref())
+        .unwrap();
+    let location = source.branch_location().find_branch(Some(branch)).unwrap();
+    let clone = Operation::Clone {
+        is_shallow: true,
+        ref_name: source_branch.clone(),
+        ref_version: version,
+        ref_path: source_location.uri,
+        branch_name: Some(branch.to_string()),
+    };
+    source
+        .branches()
+        .create(branch, version, source_branch.as_deref())
+        .await
+        .unwrap();
+    CommitBuilder::new(location.uri.as_str())
+        .with_store_params(source.store_params.as_deref().cloned().unwrap_or_default())
+        .with_object_store(Arc::new(source.object_store.as_ref().clone()))
+        .with_commit_handler(source.commit_handler.clone())
+        .with_exact_storage_format(source.manifest.data_storage_format.lance_file_format())
+        .execute(Transaction::new(version, clone, None))
+        .await
+        .unwrap();
+}
+
+#[rstest]
+#[case::data_directory("data", true)]
+#[case::data_directory_case_alias("Data", true)]
+#[case::versions_directory("_versions", true)]
+#[case::deletions_directory("_deletions", true)]
+#[case::dir_id_mem_wal_directory("_a1b2c3d4_mem_wal", true)]
+#[case::ordinary_name("child", false)]
+#[tokio::test]
+async fn deleting_nested_branch_preserves_parent(
+    #[case] segment: &str,
+    #[case] directory_stays: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.as_str();
+    let mut root = Dataset::write(id_rows(0, 4), uri, None).await.unwrap();
+    let mut outer = root
+        .create_branch("outer", root.version().version, None)
+        .await
+        .unwrap();
+    outer.delete("id = 0").await.unwrap();
+    outer.append(id_rows(4, 2), None).await.unwrap();
+    let nested = format!("outer/{segment}");
+    create_branch_before_name_check(&outer, &nested).await;
+    assert!(root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_rows = root.checkout_branch(&nested).await.unwrap();
+    assert_eq!(nested_rows.count_rows(None).await.unwrap(), 5);
+
+    root.delete_branch(&nested).await.unwrap();
+
+    assert!(!root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_dir = std::path::Path::new(uri).join("tree/outer").join(segment);
+    let error = root.checkout_branch(&nested).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains(&nested), "{error}");
+    if !directory_stays {
+        assert!(
+            !nested_dir.exists(),
+            "ordinary nested branch directory should be removed: {}",
+            nested_dir.display()
+        );
+    }
+    let outer = Dataset::open(uri)
+        .await
+        .unwrap()
+        .checkout_branch("outer")
+        .await
+        .unwrap_or_else(|error| panic!("branch outer is gone: {error}"));
+    let rows = outer
+        .count_rows(Some("id >= 0".to_string()))
+        .await
+        .unwrap_or_else(|error| panic!("branch outer cannot be scanned: {error}"));
+    assert_eq!(rows, 5);
+}
+
+#[rstest]
+#[case::data_directory("data")]
+#[case::versions_directory("_versions")]
+#[case::deletions_directory("_deletions")]
+#[tokio::test]
+async fn create_branch_refuses_a_nested_name_of_a_dataset_directory(#[case] segment: &str) {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.as_str();
+    let mut root = Dataset::write(id_rows(0, 4), uri, None).await.unwrap();
+    let mut outer = root
+        .create_branch("outer", root.version().version, None)
+        .await
+        .unwrap();
+    let nested = format!("outer/{segment}");
+
+    let error = outer
+        .create_branch(&nested, outer.version().version, None)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+    assert!(!root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_versions = std::path::Path::new(uri)
+        .join("tree/outer")
+        .join(segment)
+        .join("_versions");
+    assert!(!nested_versions.exists(), "{}", nested_versions.display());
+    let outer = root.checkout_branch("outer").await.unwrap();
+    assert_eq!(outer.count_rows(None).await.unwrap(), 4);
 }

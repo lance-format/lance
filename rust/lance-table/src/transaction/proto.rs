@@ -10,6 +10,7 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
+use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
@@ -22,6 +23,7 @@ use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -225,6 +227,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows,
                 updated_fragment_offsets,
                 updated_fragment_offset_bitmaps,
+                mem_wal_dir_id,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -240,6 +243,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
@@ -372,8 +376,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 }
             }
+            // `data_change` is not acted on yet: every replacement is still
+            // applied as a data change.
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement { replacements, .. },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
@@ -381,12 +387,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState { compacted_sstables },
+                pb::transaction::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
+                dir_id,
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -401,6 +411,19 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::CompositeOperation(_)) => {
+                // This version of Lance recognizes action-based transactions
+                // (Transaction V2) but has no support for them yet: reject on
+                // load, fail-closed. Because
+                // load_and_sort_new_transactions collects transactions with
+                // try_collect, a concurrent V2 commit in the conflict window
+                // aborts the whole commit rather than being silently skipped.
+                // Do NOT make this parsing lenient.
+                return Err(Error::not_supported(
+                    "action-based transactions (Transaction V2) are not supported \
+                     by this version of Lance; please upgrade",
+                ));
+            }
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
             None => Operation::Unknown {},
@@ -460,6 +483,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         .map(|f| IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                         })
                         .collect(),
                 )
@@ -596,6 +620,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
@@ -612,6 +637,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                     .iter()
                     .map(pb::CompactedSsTable::from)
                     .collect(),
+                mem_wal_dir_id: mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
                     .as_ref()
@@ -652,19 +678,17 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                config_updates: config_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                config_updates: config_updates.as_ref().map(pb_actions::UpdateMap::from),
                 table_metadata_updates: table_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 schema_metadata_updates: schema_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 field_metadata_updates: field_metadata_updates
                     .iter()
                     .map(|(field_id, update_map)| {
-                        (*field_id, pb::transaction::UpdateMap::from(update_map))
+                        (*field_id, pb_actions::UpdateMap::from(update_map))
                     })
                     .collect(),
                 // Leave old fields empty - we only write new-style fields
@@ -679,6 +703,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .iter()
                         .map(pb::transaction::DataReplacementGroup::from)
                         .collect(),
+                    data_change: None,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -689,12 +714,16 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
+                    dir_id: dir_id.clone(),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -746,6 +775,9 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
                         .map(|f| pb::IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: f
+                                .file_metadata_size_bytes
+                                .map_or(0, NonZero::get),
                         })
                         .collect()
                 })
@@ -771,13 +803,13 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     }
 }
 
-impl From<&UpdateMap> for pb::transaction::UpdateMap {
+impl From<&UpdateMap> for pb_actions::UpdateMap {
     fn from(update_map: &UpdateMap) -> Self {
         Self {
             update_entries: update_map
                 .update_entries
                 .iter()
-                .map(|entry| pb::transaction::UpdateMapEntry {
+                .map(|entry| pb_actions::UpdateMapEntry {
                     key: entry.key.clone(),
                     value: entry.value.clone(),
                 })
@@ -787,8 +819,8 @@ impl From<&UpdateMap> for pb::transaction::UpdateMap {
     }
 }
 
-impl From<&pb::transaction::UpdateMap> for UpdateMap {
-    fn from(pb_update_map: &pb::transaction::UpdateMap) -> Self {
+impl From<&pb_actions::UpdateMap> for UpdateMap {
+    fn from(pb_update_map: &pb_actions::UpdateMap) -> Self {
         Self {
             update_entries: pb_update_map
                 .update_entries
@@ -890,5 +922,67 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_rewritten_index_roundtrips() {
+        let rewritten_index = RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any::default(),
+            new_index_version: 1,
+            new_index_files: Some(vec![
+                IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 4_096,
+                    file_metadata_size_bytes: NonZero::new(256),
+                },
+                IndexFile {
+                    path: "auxiliary.idx".to_string(),
+                    size_bytes: 1_024,
+                    file_metadata_size_bytes: None,
+                },
+            ]),
+        };
+
+        let message = pb::transaction::rewrite::RewrittenIndex::from(&rewritten_index);
+        assert_eq!(RewrittenIndex::try_from(&message).unwrap(), rewritten_index);
+    }
+
+    #[test]
+    fn test_composite_operation_rejected_on_load() {
+        // This version of Lance does not yet support action-based transactions
+        // (Transaction V2). Loading one must fail closed
+        // (never be silently skipped or leniently parsed), so that a concurrent
+        // V2 commit in the conflict window aborts an in-flight commit.
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::CompositeOperation(
+                pb_actions::CompositeOperation {
+                    steps: vec![pb_actions::UserStep {
+                        description: "append batch".to_string(),
+                        actions: vec![pb_actions::Action {
+                            action: Some(pb_actions::action::Action::AddFragment(
+                                pb_actions::AddFragment {
+                                    id: Some(pb_actions::Ref {
+                                        kind: Some(pb_actions::r#ref::Kind::Local(0)),
+                                    }),
+                                    physical_rows: 1,
+                                    ..Default::default()
+                                },
+                            )),
+                        }],
+                    }],
+                },
+            )),
+            ..Default::default()
+        };
+
+        let err = Transaction::try_from(message).unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
     }
 }

@@ -844,7 +844,8 @@ impl InvertedIndexParams {
     /// Set whether to store the position of the term in the document.
     /// This can significantly increase the size of the index.
     /// If false, only store the frequency of the term in the document.
-    /// This doesn't work with `ngram` tokenizer.
+    /// This is not supported with the `ngram` tokenizer; creating an index with
+    /// both is rejected.
     /// Default to `false`.
     pub fn with_position(mut self, with_position: bool) -> Self {
         self.with_position = with_position;
@@ -1076,6 +1077,33 @@ impl InvertedIndexParams {
         Ok(params)
     }
 
+    /// Checks settings that a new index cannot use but an existing one may
+    /// carry. Indexes built this way by earlier releases must still load,
+    /// optimize and remap, so this is not part of [`Self::build`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .base_tokenizer("ngram".to_string())
+    ///     .with_position(true);
+    /// let error = params.validate_for_creation().unwrap_err();
+    /// assert!(error.to_string().contains("set with_position=false"));
+    /// ```
+    pub fn validate_for_creation(&self) -> Result<()> {
+        // The ngram tokenizer puts every token at position 0, so its positions
+        // carry nothing a phrase query could use.
+        if self.with_position && self.base_tokenizer == "ngram" {
+            return Err(Error::invalid_input(
+                "with_position is not supported with base_tokenizer='ngram'; set with_position=false"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         self.validate()?;
         let mut builder = self.build_base_tokenizer()?;
@@ -1096,10 +1124,15 @@ impl InvertedIndexParams {
         }
         let tokenizer = builder.build();
 
-        match self.lance_tokenizer {
-            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
-            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+        match self.lance_tokenizer.as_deref() {
+            Some("text") | None => {
+                let mut tokenizer = TextTokenizer::new(tokenizer);
+                tokenizer.discount_overlaps =
+                    self.base_tokenizer == "code" && self.split_identifiers;
+                tokenizer.has_independent_query_tokens = self.base_tokenizer == "ngram";
+                Ok(Box::new(tokenizer))
+            }
+            Some("json") => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
                 self.lance_tokenizer.as_ref().unwrap()
@@ -1153,10 +1186,11 @@ impl InvertedIndexParams {
                 }
                 Ok(builder)
             }
-            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
-            "icu/split" => {
-                Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
-            }
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default().into_streaming()).dynamic()),
+            "icu/split" => Ok(TextAnalyzer::builder(
+                IcuTokenizer::default().with_simple_split().into_streaming(),
+            )
+            .dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -1543,6 +1577,23 @@ mod tests {
             err.to_string()
                 .contains("code_config requires base_tokenizer='code'")
         );
+    }
+
+    #[test]
+    fn test_creation_rejects_with_position_for_ngram_tokenizer() {
+        let params = r#"{"base_tokenizer": "ngram", "with_position": true}"#;
+        let loaded = InvertedIndexParams::from_training_json(params).unwrap();
+        let err = loaded.validate_for_creation().unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("with_position is not supported with base_tokenizer='ngram'")
+        );
+
+        // An existing index with these params still loads and builds its tokenizer.
+        let loaded: InvertedIndexParams = serde_json::from_str(params).unwrap();
+        assert!(loaded.with_position);
+        loaded.build().unwrap();
     }
 
     #[test]

@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Int32Type, UInt64Type};
 use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, RecordBatchOptions};
-use arrow_schema::{DataType, Schema, SchemaRef, SortOptions};
+use arrow_array::{
+    Int32Array, RecordBatch, RecordBatchIterator, RecordBatchOptions, StringArray, UInt32Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
+use arrow_select::take::take_record_batch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ScalarValue;
@@ -21,7 +24,9 @@ use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, Task
 use datafusion::logical_expr::var_provider::{VarProvider, VarType};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
@@ -32,12 +37,13 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
-use lance::Dataset;
 use lance::datafusion::LanceTableProvider;
 use lance::dataset::WriteParams;
 use lance::io::exec::TakeExec;
 use lance::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
 use lance::io::exec::topk_late_materialization::TopKLateMaterialization;
+use lance::{BlobArrayBuilder, Dataset, blob_field};
+use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::{BYTES_READ_METRIC, MetricsExt};
 use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
 use lance_select::RowAddrTreeMap;
@@ -218,6 +224,120 @@ async fn sql_topk_keeps_its_ordering_for_the_parent() {
     assert_eq!(actual, expected, "{shown}");
 }
 
+/// 3 fragments of 4 rows: `id` is the row number, `text` is derived from it,
+/// and `blob` is a blob v2 column holding `id` bytes, null every third row.
+async fn make_blob_dataset() -> Arc<Dataset> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+        blob_field("blob", true),
+    ]));
+    let ids = (0..12).collect::<Vec<i32>>();
+    let texts = StringArray::from_iter_values(ids.iter().map(|id| format!("text {id}")));
+    let mut blobs = BlobArrayBuilder::new(ids.len());
+    for id in &ids {
+        if id % 3 == 0 {
+            blobs.push_null().unwrap();
+        } else {
+            // Distinct non-null blob sizes expose incorrect row fetches in
+            // either the descriptor or binary representation.
+            blobs.push_bytes(vec![*id as u8; *id as usize]).unwrap();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(texts),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // A wrapping provider erases this, so the eraser must apply above the take.
+    dataset
+        .update_schema_metadata([("owner", "test")])
+        .await
+        .unwrap();
+    Arc::new(dataset)
+}
+
+/// In descriptor mode, the planner stamps the provider's logical blob metadata
+/// onto its projection, while the take fetches descriptors with storage metadata.
+/// Binary mode also checks the representation of deferred payloads, and a
+/// wrapping provider checks that schema metadata stays erased after the take.
+#[rstest]
+#[case::expression_sort_key("SELECT id, blob FROM t ORDER BY md5(text), id LIMIT 2", 1)]
+#[case::filtered_subquery(
+    "WITH s AS (SELECT id, blob, text FROM t WHERE blob IS NOT NULL \
+     ORDER BY md5(concat(text, ':42')), id LIMIT 2) \
+     SELECT id, blob FROM s ORDER BY id",
+    0
+)]
+#[tokio::test]
+async fn sql_topk_takes_a_blob_column(
+    #[case] sql: &str,
+    #[case] expected_nulls: usize,
+    #[values(None, Some(BlobHandling::AllBinary))] blob_handling: Option<BlobHandling>,
+    #[values(false, true)] is_wrapped: bool,
+) {
+    let mut provider = LanceTableProvider::new(make_blob_dataset().await, false, false);
+    if let Some(blob_handling) = blob_handling {
+        provider = provider.with_blob_handling(blob_handling);
+    }
+    let provider: Arc<dyn TableProvider> = if is_wrapped {
+        Arc::new(ErasingTableProvider {
+            inner: provider,
+            is_row_preserving: true,
+            is_reversing: false,
+        })
+    } else {
+        Arc::new(provider)
+    };
+    let (_, expected) = run(&context(provider.clone(), false), sql).await;
+    let (rewritten, actual) = run(&context(provider, true), sql).await;
+    let shown = displayable(rewritten.as_ref()).indent(true).to_string();
+
+    assert_eq!(take_output_rows(&rewritten), [2], "{shown}");
+    assert_eq!(scans(&rewritten), [["id", "text", "_rowid"]], "{shown}");
+    assert_eq!(actual["blob"].null_count(), expected_nulls, "{shown}");
+    assert_eq!(actual, expected, "{shown}");
+}
+
+/// A sort key can read a field's metadata, so the sort over the narrowed read
+/// must see the metadata the planner gave `blob`.
+#[tokio::test]
+async fn sql_topk_sorting_on_field_metadata_keeps_its_order() {
+    let provider = Arc::new(LanceTableProvider::new(
+        make_blob_dataset().await,
+        false,
+        false,
+    ));
+    let sql = "SELECT blob, text FROM t \
+               ORDER BY CASE WHEN arrow_metadata(blob, 'ARROW:extension:name') = 'lance.blob.v2' \
+               THEN -id ELSE id END LIMIT 2";
+    let (_, expected) = run(&context(provider.clone(), false), sql).await;
+    let (rewritten, actual) = run(&context(provider, true), sql).await;
+    let shown = displayable(rewritten.as_ref()).indent(true).to_string();
+
+    assert_eq!(
+        actual["text"].as_string::<i32>(),
+        &StringArray::from(vec!["text 11", "text 10"]),
+        "{shown}"
+    );
+    assert_eq!(take_output_rows(&rewritten), [2], "{shown}");
+    assert_eq!(actual, expected, "{shown}");
+}
+
 #[tokio::test]
 async fn sql_limit_covering_the_table_is_left_alone() {
     let dataset = make_dataset().await;
@@ -243,11 +363,14 @@ fn erase_metadata(schema: &Schema) -> Schema {
 struct MetadataEraserExec {
     input: Arc<dyn ExecutionPlan>,
     is_row_preserving: bool,
+    /// Reverses each batch, which a node that does not report keeping its
+    /// input's order may do.
+    is_reversing: bool,
     properties: Arc<PlanProperties>,
 }
 
 impl MetadataEraserExec {
-    fn new(input: Arc<dyn ExecutionPlan>, is_row_preserving: bool) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, is_row_preserving: bool, is_reversing: bool) -> Self {
         let schema = Arc::new(erase_metadata(&input.schema()));
         let properties = Arc::new(
             input
@@ -259,6 +382,7 @@ impl MetadataEraserExec {
         Self {
             input,
             is_row_preserving,
+            is_reversing,
             properties,
         }
     }
@@ -283,6 +407,13 @@ impl ExecutionPlan for MetadataEraserExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -290,6 +421,7 @@ impl ExecutionPlan for MetadataEraserExec {
         Ok(Arc::new(Self::new(
             children.remove(0),
             self.is_row_preserving,
+            self.is_reversing,
         )))
     }
 
@@ -299,10 +431,15 @@ impl ExecutionPlan for MetadataEraserExec {
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let schema = self.schema();
+        let is_reversing = self.is_reversing;
         let stream = self.input.execute(partition, context)?.map({
             let schema = schema.clone();
             move |batch| {
-                let batch = batch?;
+                let mut batch = batch?;
+                if is_reversing {
+                    let indices = UInt32Array::from_iter_values((0..batch.num_rows() as u32).rev());
+                    batch = take_record_batch(&batch, &indices)?;
+                }
                 Ok(RecordBatch::try_new_with_options(
                     schema.clone(),
                     batch.columns().to_vec(),
@@ -320,6 +457,10 @@ impl ExecutionPlan for MetadataEraserExec {
             CardinalityEffect::Unknown
         }
     }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![!self.is_reversing]
+    }
 }
 
 /// [`LanceTableProvider`] with its scan wrapped in a [`MetadataEraserExec`].
@@ -327,6 +468,7 @@ impl ExecutionPlan for MetadataEraserExec {
 struct ErasingTableProvider {
     inner: LanceTableProvider,
     is_row_preserving: bool,
+    is_reversing: bool,
 }
 
 #[async_trait]
@@ -349,6 +491,7 @@ impl TableProvider for ErasingTableProvider {
         Ok(Arc::new(MetadataEraserExec::new(
             self.inner.scan(state, projection, filters, limit).await?,
             self.is_row_preserving,
+            self.is_reversing,
         )))
     }
 
@@ -362,17 +505,23 @@ impl TableProvider for ErasingTableProvider {
 
 /// The rule looks through a certified custom node only when it reports
 /// `CardinalityEffect::Equal`, and re-applies a metadata-erasing one above the
-/// take so the plan keeps its schema.
+/// take so the plan keeps its schema. It declines when that node may reorder
+/// rows, which would undo the sort.
 #[rstest]
-#[case::keeps_every_row(true)]
-#[case::unknown_cardinality(false)]
+#[case::keeps_every_row(true, false)]
+#[case::unknown_cardinality(false, false)]
+#[case::reorders_rows(true, true)]
 #[tokio::test]
-async fn sql_topk_through_a_wrapping_provider(#[case] is_row_preserving: bool) {
+async fn sql_topk_through_a_wrapping_provider(
+    #[case] is_row_preserving: bool,
+    #[case] is_reversing: bool,
+) {
     let sql = "SELECT id, wide FROM t WHERE cat = 3 ORDER BY id DESC LIMIT 5";
     let dataset = make_dataset().await;
     let provider = Arc::new(ErasingTableProvider {
         inner: LanceTableProvider::new(dataset, false, false),
         is_row_preserving,
+        is_reversing,
     });
     let (plain, expected) = run(&context(provider.clone(), false), sql).await;
     let (rewritten, actual) = run(&context(provider, true), sql).await;
@@ -382,7 +531,7 @@ async fn sql_topk_through_a_wrapping_provider(#[case] is_row_preserving: bool) {
     assert_eq!(rewritten.schema(), plain.schema());
     assert_eq!(actual, expected, "{shown}");
     let take_rows = take_output_rows(&rewritten);
-    if is_row_preserving {
+    if is_row_preserving && !is_reversing {
         assert_eq!(take_rows, [5], "{shown}");
         assert_eq!(scans(&rewritten), [["id", "_rowid"]], "{shown}");
     } else {
@@ -508,6 +657,13 @@ impl ExecutionPlan for AdjustCatExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -580,7 +736,7 @@ async fn sort_stays_above_a_take_that_extends_a_struct(#[case] field_name: &str)
     use arrow_schema::Field;
     use datafusion::common::DFSchema;
     use datafusion::functions::core::expr_fn::get_field;
-    use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+    use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
     use datafusion::prelude::col as logical_col;
     use lance_core::datatypes::OnMissing;
 
@@ -645,7 +801,7 @@ async fn sort_stays_above_a_take_that_extends_a_struct(#[case] field_name: &str)
         Arc::new(SortExec::new(ordering, take)) as Arc<dyn ExecutionPlan>
     };
     let expected = execute(make_plan()).await;
-    let optimized = EnforceSorting::new()
+    let optimized = EnsureRequirements::new()
         .optimize(make_plan(), &ConfigOptions::default())
         .unwrap();
     let shown = displayable(optimized.as_ref()).indent(true).to_string();

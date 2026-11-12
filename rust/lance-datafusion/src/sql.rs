@@ -42,6 +42,16 @@ impl Dialect for LanceDialect {
     fn supports_bitwise_shift_operators(&self) -> bool {
         self.0.supports_bitwise_shift_operators()
     }
+
+    /// Parse `x -> body` as a lambda, for
+    /// `array_any_match(list, x -> x.a = 1 AND x.b > 2)`, which the planner
+    /// rewrites to `any_element`.
+    ///
+    /// Without this, `->` is the JSON arrow operator, which Lance rejects
+    /// anyway, so no accepted filter changes meaning. `->>` is unaffected.
+    fn supports_lambda_functions(&self) -> bool {
+        true
+    }
 }
 
 /// Parse sql filter to Expression.
@@ -69,14 +79,19 @@ pub(crate) fn parse_sql_expr(expr: &str) -> Result<Expr> {
 
     if let Statement::Query(query) = statement
         && let SetExpr::Select(select) = *query.body
-        && let Some(SelectItem::UnnamedExpr(expr)) = select.projection.into_iter().next()
     {
-        Ok(expr)
-    } else {
-        Err(Error::invalid_input(format!(
-            "Expression is not valid: {expr}"
-        )))
+        let mut projection = select.projection.into_iter();
+        // Exactly one unnamed expression: a comma-separated list must not be
+        // silently truncated to its first item.
+        if let Some(SelectItem::UnnamedExpr(expr)) = projection.next()
+            && projection.next().is_none()
+        {
+            return Ok(expr);
+        }
     }
+    Err(Error::invalid_input(format!(
+        "Expression is not valid: {expr}"
+    )))
 }
 
 fn parse_statement(statement: &str) -> Result<Statement> {
@@ -114,9 +129,13 @@ mod tests {
     use super::*;
 
     use datafusion::sql::sqlparser::{
-        ast::{BinaryOperator, Ident, Value, ValueWithSpan},
+        ast::{
+            BinaryOperator, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Value,
+            ValueWithSpan,
+        },
         tokenizer::Span,
     };
+    use rstest::rstest;
 
     #[test]
     fn test_double_equal() {
@@ -147,6 +166,48 @@ mod tests {
             },
             expr
         );
+    }
+
+    #[rstest]
+    #[case::bare_parameter("array_any_match(dets, d -> d.label = 'car' AND d.confidence > 0.9)")]
+    #[case::parenthesized_parameter(
+        "array_any_match(dets, (d) -> d.label = 'car' AND d.confidence > 0.9)"
+    )]
+    fn test_lambda_argument(#[case] filter: &str) {
+        let Expr::Function(function) = parse_sql_filter(filter).unwrap() else {
+            panic!("{filter} did not parse as a function call");
+        };
+        let FunctionArguments::List(args) = &function.args else {
+            panic!("{filter} has no argument list");
+        };
+        let [
+            _,
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Lambda(lambda))),
+        ] = args.args.as_slice()
+        else {
+            panic!(
+                "{filter}: the second argument is not a lambda: {:?}",
+                args.args
+            );
+        };
+        // The whole conjunction belongs to the lambda body, not to an outer AND.
+        assert!(
+            matches!(
+                lambda.body.as_ref(),
+                Expr::BinaryOp {
+                    op: BinaryOperator::And,
+                    ..
+                }
+            ),
+            "{filter}: the body is {:?}",
+            lambda.body
+        );
+    }
+
+    #[test]
+    fn test_long_json_arrow_is_not_a_lambda() {
+        let expr = parse_sql_filter("a ->> 'b' = 'c'").unwrap();
+        assert!(!format!("{expr:?}").contains("Lambda"), "{expr:?}");
     }
 
     #[test]

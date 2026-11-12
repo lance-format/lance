@@ -69,11 +69,17 @@ pub trait VectorSource: Send + Sync {
         compute_f32_distance(self.vector(left), self.vector(right), self.distance_type())
     }
 
-    /// HNSW neighbor diversity heuristic.
+    /// HNSW neighbor diversity heuristic. A tie keeps the candidate, unless it
+    /// repeats a selected neighbor's vector: pruning ties lets a node linked to
+    /// its exact copy drop every other neighbor, leaving copies linked only to
+    /// each other.
     fn prefers_candidate(&self, candidate: ScoredPoint, selected: &[ScoredPoint]) -> bool {
-        selected
-            .iter()
-            .all(|other| candidate.distance < self.distance_between(candidate.id, other.id))
+        selected.iter().all(|other| {
+            let between = self.distance_between(candidate.id, other.id);
+            candidate.distance < between
+                || (candidate.distance == between
+                    && self.vector(candidate.id) != self.vector(other.id))
+        })
     }
 }
 

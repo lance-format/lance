@@ -8,14 +8,13 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions};
+use lance::dataset::optimize::{CompactionMode, CompactionOptions, SourceBudgetMode};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_index::IndexParams;
-use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -24,6 +23,7 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::rq_model::extract_rq_build_params;
 
 use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::{ApproxMode, Query};
@@ -205,6 +205,7 @@ pub fn build_compaction_options(
     target_rows_per_fragment: &JObject,        // Optional<Long>
     max_rows_per_group: &JObject,              // Optional<Long>
     max_bytes_per_file: &JObject,              // Optional<Long>
+    min_bytes_per_file: &JObject,              // Optional<Long>
     materialize_deletions: &JObject,           // Optional<Boolean>
     materialize_deletions_threshold: &JObject, // Optional<Float>
     num_threads: &JObject,                     // Optional<Long>
@@ -217,6 +218,7 @@ pub fn build_compaction_options(
     max_source_bytes: &JObject,                // Optional<Long>
     excluded_fragment_ids: &JObject,           // List<Long>
     data_storage_version: &JObject,            // Optional<String>
+    source_budget_mode: Option<&JObject>,      // Optional<String>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -229,6 +231,13 @@ pub fn build_compaction_options(
     }
     if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
         compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    }
+    if let Some(bytes) = env.get_long_opt(min_bytes_per_file)? {
+        compaction_options.min_bytes_per_file = Some(usize::try_from(bytes).map_err(|_| {
+            lance::Error::invalid_input(format!(
+                "min_bytes_per_file must be a positive integer, got {bytes}"
+            ))
+        })?);
     }
     if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
         compaction_options.materialize_deletions = materialize_deletions_val;
@@ -282,6 +291,12 @@ pub fn build_compaction_options(
     if let Some(version) = env.get_string_opt(data_storage_version)? {
         compaction_options.data_storage_version = Some(LanceFileVersion::from_str(&version)?);
     }
+    if let Some(source_budget_mode) = source_budget_mode
+        && let Some(source_budget_mode) = env.get_string_opt(source_budget_mode)?
+    {
+        compaction_options.source_budget_mode =
+            SourceBudgetMode::try_from(source_budget_mode.as_str())?;
+    }
 
     Ok(compaction_options)
 }
@@ -294,12 +309,24 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let key = Arc::new(Float32Array::from(key_array));
 
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
+        let lower_bound =
+            env.get_optional_from_method(&java_obj, "getLowerBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        let upper_bound =
+            env.get_optional_from_method(&java_obj, "getUpperBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
+        // Query filters cannot represent scanner execution stages, but read the
+        // property here so JNI contract tests cover the Java method signature.
+        let _quantized_refine_factor =
+            env.get_optional_u32_from_method(&java_obj, "getQuantizedRefineFactor")?;
 
         let distance_type = if let Some(distance_type_str) =
             env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
@@ -323,8 +350,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             column,
             key,
             k,
-            lower_bound: None,
-            upper_bound: None,
+            lower_bound,
+            upper_bound,
             minimum_nprobes,
             maximum_nprobes,
             search_effort,
@@ -531,10 +558,7 @@ pub fn get_vector_index_params(
             let rq_params = env.get_optional_from_method(
                 &vector_index_params_obj,
                 "getRqParams",
-                |env, rq_obj| {
-                    let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
-                    Ok(RQBuildParams::new(num_bits))
-                },
+                extract_rq_build_params,
             )?;
 
             if let Some(rq_params) = rq_params {

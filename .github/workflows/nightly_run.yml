@@ -45,6 +45,231 @@ jobs:
           # to avoid OOM issues (these tests use >5GiB memory each)
           cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1
 
+  # Full Rust test suite on Windows. PRs only test lance-io on Windows (see
+  # windows-build in rust.yml) to keep that job on the free 4-core runner.
+  windows-rust-tests:
+    if: github.repository == 'lance-format/lance'
+    name: Windows Rust tests (full)
+    runs-on: windows-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install Protoc v21.12
+        working-directory: C:\
+        run: |
+          New-Item -Path 'C:\protoc' -ItemType Directory
+          Set-Location C:\protoc
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
+          7z x protoc.zip
+          Add-Content $env:GITHUB_PATH "C:\protoc\bin"
+        shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci
+
+  windows-arm-rust-tests:
+    if: github.repository == 'lance-format/lance'
+    name: Windows ARM Rust tests (full)
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci
+
+  # Full Rust test suite on macOS. PRs only test lance-io on macOS (see
+  # mac-build in rust.yml) to keep that job on the free runner.
+  mac-rust-tests:
+    if: github.repository == 'lance-format/lance'
+    name: macOS Rust tests (full)
+    runs-on: macos-14
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Select new xcode
+        # Default Xcode has a bug that breaks backtraces; see
+        # https://github.com/rust-lang/rust/issues/113783
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+      - name: Install dependencies
+        run: brew install protobuf
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
+
+  # Python tests on macOS and Windows. These are too slow on the free runners
+  # to run per PR, and the larger runners are billed, so they run nightly.
+  mac-python-tests:
+    if: github.repository == 'lance-format/lance'
+    permissions:
+      contents: read
+    env:
+      CI: "true"
+      PYTEST_ADDOPTS: "--color=yes"
+      FORCE_COLOR: "1"
+    timeout-minutes: 90
+    name: Python macOS 3.14 ARM
+    runs-on: macos-14
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+      - uses: ./.github/workflows/build_mac_wheel
+        with:
+          args: "--profile ci"
+      - uses: ./.github/workflows/run_tests
+        with:
+          skip-torch: "true"
+
+  windows-python-tests:
+    if: github.repository == 'lance-format/lance'
+    name: Python Windows
+    permissions:
+      contents: read
+    env:
+      CI: "true"
+      PYTEST_ADDOPTS: "--color=yes"
+      FORCE_COLOR: "1"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+        working-directory: python
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+      - uses: ./.github/workflows/build_windows_wheel
+        with:
+          args: "--profile ci"
+      - uses: ./.github/workflows/run_tests
+
+  # AddressSanitizer over lance-linalg's tests. Its public entry points validate
+  # the lengths a caller passes, but the SIMD kernels then walk the output buffer
+  # with their own pointer arithmetic, and nothing checks that. An off-by-one in
+  # a chunk count writes past the end while every entry assert still passes, and
+  # whether the process notices depends on the allocator. This job is here to
+  # make that class fail with a file and a line.
+  #
+  # Not in rust.yml because -Zsanitizer needs a nightly toolchain, which this
+  # repo otherwise only uses on a schedule. RUSTUP_TOOLCHAIN below says why the
+  # pin is set the way it is.
+  linalg-asan:
+    if: github.repository == 'lance-format/lance'
+    name: lance-linalg AddressSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      # build.rs compiles dist_table.c with whatever CC provides and only warns
+      # on failure, so CC decides whether kernel_support = "avx512_dist_table" is
+      # set, and with it whether an AVX-512 host runs the C kernel or the Rust
+      # arm. rust.yml's linux-build sets clang for the same reason.
+      #
+      # Default features, unlike linux-build's --features "${ALL_FEATURES}":
+      # turning on fp16kernels would route the f16 and bf16 dispatch into C that
+      # RUSTFLAGS cannot instrument, so leaving it off gives the sanitizer more
+      # Rust to check rather than less.
+      CC: clang
+      # Setting RUSTFLAGS replaces the per-target rustflags in
+      # .cargo/config.toml wholesale, so the baseline has to be repeated here:
+      # without it this would instrument a build no release ever ships, and the
+      # arms selected by all(target_feature = "avx2", target_feature = "fma")
+      # would not be compiled at all.
+      RUSTFLAGS: "-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c -Zsanitizer=address"
+      # This job is after memory errors. LeakSanitizer is on by default with
+      # ASan on Linux.
+      ASAN_OPTIONS: "detect_leaks=0"
+      # rust.yml sets this workflow-wide. It matters here once a Rust panic
+      # rather than a sanitizer report is the likely failure.
+      RUST_BACKTRACE: "1"
+      # rust-toolchain.toml pins a stable release, and a rustup override file
+      # outranks `rustup default`, so without this the sanitizer flag reaches a
+      # stable compiler and cargo stops at "the option `Z` is only accepted on
+      # the nightly compiler". daily-code-coverage.yml solves the same problem
+      # with `cargo +nightly-...`.
+      RUSTUP_TOOLCHAIN: nightly-2026-07-13
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      # Without this the report is bare hex addresses and module offsets:
+      # ubuntu-24.04 ships llvm-symbolizer only under a versioned name, and ASan
+      # looks for the unversioned one on PATH.
+      - name: Point ASan at llvm-symbolizer
+        run: |
+          set -euo pipefail
+          symbolizer=$(command -v llvm-symbolizer \
+            || ls -1 /usr/lib/llvm-*/bin/llvm-symbolizer | sort -V | tail -1)
+          "$symbolizer" --version
+          echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
+      # No protoc step: lance-linalg's dependency closure contains no
+      # prost-build or tonic-build, dev-dependencies included.
+      #
+      # --target keeps the sanitizer off build scripts and proc macros, which
+      # run on the host and do not need it.
+      - name: Run lance-linalg tests under AddressSanitizer
+        run: |
+          cargo test -p lance-linalg --tests --locked \
+            --target x86_64-unknown-linux-gnu
+
   # Cross-version index maintenance-sequence search (see python/tests/compat/compat_sequence.py).
   # Ages an index under the latest release of each of the two previous majors and exercises it
   # under this commit, searching op sequences for panics or correctness divergence. The search is

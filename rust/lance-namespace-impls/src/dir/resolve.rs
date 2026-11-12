@@ -346,15 +346,16 @@ impl DirectoryNamespace {
 
     /// Map lance-core ref errors from branch operations to namespace errors.
     ///
-    /// `RefConflict` is intentionally not handled here: create-time duplicates are rejected by
-    /// the existence pre-check before `create_branch` runs, and delete maps its own `RefConflict`
-    /// (branch still has dependents) inline.
     pub(super) fn map_branch_error(
         err: lance_core::Error,
         branch: &str,
         table_uri: &str,
     ) -> lance_core::Error {
         match err {
+            lance_core::Error::RefConflict { .. } => NamespaceError::TableBranchAlreadyExists {
+                message: format!("branch '{}' for table at '{}'", branch, table_uri),
+            }
+            .into(),
             lance_core::Error::RefNotFound { .. } => NamespaceError::TableBranchNotFound {
                 message: format!("branch '{}' for table at '{}'", branch, table_uri),
             }
@@ -432,6 +433,7 @@ impl DirectoryNamespace {
                     "Too many concurrent writes for {} on table at '{}', please retry later: {}",
                     operation, table_uri, detail
                 ),
+                retry_after: None,
             },
             // Semantic conflicts: a concurrent change is incompatible with this one and retrying
             // as-is would not help, so surface them as `ConcurrentModification` (kept aligned with
@@ -577,6 +579,18 @@ impl DirectoryNamespace {
         }
     }
 
+    /// Refuse a non-main branch for an operation that only runs on main, rather
+    /// than running it on main.
+    pub(super) fn ensure_main_branch(branch: Option<&str>, operation: &str) -> Result<()> {
+        match Self::normalized_branch(branch)? {
+            Some(branch) => Err(NamespaceError::Unsupported {
+                message: format!("{} does not support branch '{}'", operation, branch),
+            }
+            .into()),
+            None => Ok(()),
+        }
+    }
+
     pub(super) async fn open_validated_branch(
         &self,
         table_uri: &str,
@@ -694,6 +708,7 @@ impl DirectoryNamespace {
     pub(super) async fn write_reader_to_table(
         &self,
         table_uri: &str,
+        branch: Option<&str>,
         reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
         mode: WriteMode,
         extra_storage_options: Option<HashMap<String, String>>,
@@ -720,11 +735,18 @@ impl DirectoryNamespace {
             ..Default::default()
         };
 
-        let dataset = Dataset::write(reader, table_uri, Some(write_params))
-            .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to write table at '{}': {}", table_uri, e),
-            })?;
+        let written = match branch {
+            // Writing through the branch dataset puts the data files and the commit
+            // under the branch tree.
+            Some(branch) => {
+                let dataset = self.open_validated_branch(table_uri, branch).await?;
+                Dataset::write(reader, Arc::new(dataset), Some(write_params)).await
+            }
+            None => Dataset::write(reader, table_uri, Some(write_params)).await,
+        };
+        let dataset = written.map_err(|e| NamespaceError::Internal {
+            message: format!("Failed to write table at '{}': {}", table_uri, e),
+        })?;
 
         Ok(dataset)
     }
@@ -805,6 +827,7 @@ impl DirectoryNamespace {
                     message: format!(
                         "Storage request was throttled while resolving table: {detail}"
                     ),
+                    retry_after: None,
                 }
                 .into();
             }
@@ -850,12 +873,15 @@ impl DirectoryNamespace {
         false
     }
 
-    /// Map a dataset/version/branch open error: a transient IO error propagates
-    /// typed via [`classify_storage_error`], while a genuine not-found (missing
-    /// dataset, version, or ref) keeps the caller's `not_found` variant.
+    /// Map a dataset/version/branch open error: a transient IO error or a corrupt
+    /// file propagates typed via [`classify_storage_error`], while a genuine
+    /// not-found (missing dataset, version, or ref) keeps the caller's `not_found`
+    /// variant.
     pub(super) fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
-        if matches!(err.find_root(), Error::IO { .. })
-            && !manifest::ManifestNamespace::is_not_found_load_error(&err)
+        if matches!(
+            err.find_root(),
+            Error::IO { .. } | Error::CorruptFile { .. }
+        ) && !manifest::ManifestNamespace::is_not_found_load_error(&err)
         {
             return Self::classify_storage_error(err);
         }

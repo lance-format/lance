@@ -34,7 +34,7 @@ use lance_index::vector::sq::builder::SQBuildParams;
 
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
-use crate::index::open_index_proto;
+use crate::index::loading::open_index_proto;
 use crate::{Error, Result};
 
 // Private structs for JSON serialization of VectorIndexDetails.
@@ -83,7 +83,14 @@ enum CompressionDetailsJson {
 }
 
 /// Build a `VectorIndexDetails` proto from build params at index creation time.
-pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
+///
+/// `built_target` is the vectors per partition the build settled on, which
+/// `params` may not carry: an index built from a partition count or centroids
+/// records the size they gave. A target in `params` wins.
+pub fn vector_index_details(
+    params: &VectorIndexParams,
+    built_target: Option<usize>,
+) -> prost_types::Any {
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -99,7 +106,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     for stage in &params.stages {
         match stage {
             StageParams::Ivf(ivf) => {
-                if let Some(tps) = ivf.target_partition_size {
+                if let Some(tps) = ivf.target_partition_size.or(built_target) {
                     target_partition_size = tps as u64;
                 }
                 runtime_hints.insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
@@ -285,17 +292,17 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
                 ..Default::default()
             },
         ),
-        (None, Some(Compression::Rq(rq))) => {
+        (hnsw, Some(Compression::Rq(rq))) => {
             let rotation_type =
                 match rabit_quantization::RotationType::try_from(rq.rotation_type).ok()? {
                     rabit_quantization::RotationType::Matrix => RQRotationType::Matrix,
                     rabit_quantization::RotationType::Fast => RQRotationType::Fast,
                 };
-            VectorIndexParams::with_ivf_rq_params(
-                metric,
-                ivf,
-                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type),
-            )
+            let rq = RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type);
+            match hnsw {
+                Some(hnsw) => VectorIndexParams::with_ivf_hnsw_rq_params(metric, ivf, hnsw, rq),
+                None => VectorIndexParams::with_ivf_rq_params(metric, ivf, rq),
+            }
         }
         (Some(hnsw), Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_hnsw_pq_params(
             metric,
@@ -619,6 +626,7 @@ async fn convert_v3_metadata_to_details(
         SupportedIvfIndexType::IvfHnswFlat => (true, CompressionKind::Flat),
         SupportedIvfIndexType::IvfHnswPq => (true, CompressionKind::Pq),
         SupportedIvfIndexType::IvfHnswSq => (true, CompressionKind::Sq),
+        SupportedIvfIndexType::IvfHnswRq => (true, CompressionKind::Rq),
     };
 
     let hnsw_index_config = if has_hnsw {
@@ -941,6 +949,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -964,6 +974,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -985,6 +997,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -1023,6 +1037,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1110,6 +1126,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
 
             let metric = metric_type_from_index_metadata(&index);
@@ -1144,7 +1162,7 @@ mod tests {
             },
         );
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details
@@ -1260,7 +1278,7 @@ mod tests {
         );
         params.skip_transpose = true;
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1313,7 +1331,7 @@ mod tests {
         };
         let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1351,7 +1369,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let json = vector_details_as_json(&any).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
@@ -1369,6 +1387,7 @@ mod tests {
         IvfHnswFlat,
         IvfHnswPq,
         IvfHnswSq,
+        IvfHnswRq,
     }
 
     fn build_roundtrip_params(combo: Combo, metric: DistanceType) -> VectorIndexParams {
@@ -1425,6 +1444,12 @@ mod tests {
             Combo::IvfHnswFlat => VectorIndexParams::ivf_hnsw(metric, ivf, hnsw),
             Combo::IvfHnswPq => VectorIndexParams::with_ivf_hnsw_pq_params(metric, ivf, hnsw, pq),
             Combo::IvfHnswSq => VectorIndexParams::with_ivf_hnsw_sq_params(metric, ivf, hnsw, sq),
+            Combo::IvfHnswRq => VectorIndexParams::with_ivf_hnsw_rq_params(
+                metric,
+                ivf,
+                hnsw,
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+            ),
         }
     }
 
@@ -1437,6 +1462,7 @@ mod tests {
     #[case::ivf_hnsw_flat(Combo::IvfHnswFlat)]
     #[case::ivf_hnsw_pq(Combo::IvfHnswPq)]
     #[case::ivf_hnsw_sq(Combo::IvfHnswSq)]
+    #[case::ivf_hnsw_rq(Combo::IvfHnswRq)]
     fn test_vector_index_details_roundtrip(
         #[case] combo: Combo,
         #[values(DistanceType::L2, DistanceType::Cosine)] metric: DistanceType,
@@ -1446,7 +1472,7 @@ mod tests {
 
         let params = build_roundtrip_params(combo, metric);
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let restored = vector_params_from_details(&any)
             .expect("non-empty details should round-trip to params");
 
@@ -1527,6 +1553,14 @@ mod tests {
                     panic!("expected SQ stage");
                 };
                 assert_eq!(sq.num_bits, 8);
+            }
+            Combo::IvfHnswRq => {
+                let [_, StageParams::Hnsw(hnsw), StageParams::RQ(rq)] = restored.stages.as_slice()
+                else {
+                    panic!("expected IVF, HNSW and RQ stages");
+                };
+                assert_eq!((hnsw.m, hnsw.ef_construction, hnsw.max_level), (30, 200, 5));
+                assert_eq!((rq.num_bits, rq.rotation_type), (5, RQRotationType::Fast));
             }
         }
     }

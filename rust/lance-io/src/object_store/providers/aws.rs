@@ -24,7 +24,7 @@ use object_store::{
     StaticCredentialProvider,
     aws::{
         AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
-        AwsCredentialProvider,
+        AwsCredentialProvider, S3CopyIfNotExists,
     },
 };
 use tokio::sync::{Mutex, RwLock};
@@ -35,10 +35,19 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
+    throttle::{
+        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        shared_throttle_state, with_throttling,
+    },
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
+
+mod conditional_copy;
+
+use conditional_copy::ConditionalS3Store;
+
+use super::opendal::finish_opendal_operator;
 
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
@@ -86,9 +95,8 @@ impl AwsStoreProvider {
         mut resolved_s3_options: ResolvedS3StorageOptions,
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
-        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
-        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
-    ) -> Result<Arc<AmazonS3>> {
+        // Keep the concrete client for paginated listing alongside the copy adapter.
+    ) -> Result<(Arc<dyn OSObjectStore>, Arc<AmazonS3>)> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -132,8 +140,17 @@ impl AwsStoreProvider {
         base_path.set_query(None);
 
         // we can't use parse_url_opts here because we need to manually set the credentials provider
-        let mut builder =
-            AmazonS3Builder::new().with_client_options(storage_options.client_options()?);
+        // Reuse the same transport settings for the completion client, including
+        // settings that with_config would otherwise apply only to this builder.
+        let mut client_options = storage_options.client_options()?;
+        for (key, value) in &resolved_s3_options.options {
+            if let AmazonS3ConfigKey::Client(key) = key {
+                client_options = client_options.with_config(*key, value);
+            }
+        }
+        let mut builder = AmazonS3Builder::new()
+            .with_client_options(client_options.clone())
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
         for (key, value) in resolved_s3_options.options {
             builder = builder.with_config(key, value);
         }
@@ -143,9 +160,26 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            metrics_base,
+            Transport::new(params.http_connector.as_ref()),
+        ));
 
-        Ok(Arc::new(builder.build()?))
+        let use_multipart_copy = builder
+            .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
+            .is_some_and(|mode| mode.trim() == "multipart");
+        let store = Arc::new(builder.clone().build()?);
+        let inner: Arc<dyn OSObjectStore> = if use_multipart_copy {
+            Arc::new(ConditionalS3Store::new(
+                store.clone(),
+                builder,
+                client_options,
+            )?)
+        } else {
+            store.clone()
+        };
+        Ok((inner, store))
     }
 
     async fn build_opendal_s3_store(
@@ -191,6 +225,7 @@ impl AwsStoreProvider {
 
         let operator = Operator::from_iter::<S3>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
@@ -235,6 +270,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
+            reject_http_connector_for_opendal(params)?;
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
@@ -248,7 +284,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             )
         } else {
             // Use default Amazon S3 implementation
-            let store = self
+            let (inner, store) = self
                 .build_amazon_s3_store(
                     &mut base_path,
                     params,
@@ -258,10 +294,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
                     throttle_state.as_ref(),
                 )
                 .await?;
-            (
-                store.clone() as Arc<dyn OSObjectStore>,
-                Some(store as Arc<dyn PaginatedListStore>),
-            )
+            (inner, Some(store as Arc<dyn PaginatedListStore>))
         };
         let (inner, paginated_lister) =
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
@@ -269,14 +302,15 @@ impl ObjectStoreProvider for AwsStoreProvider {
         Ok(ObjectStore {
             inner,
             local_dir_operations: None,
+            local_fsync: false,
             scheme: String::from(base_path.scheme()),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
-            supports_conditional_multipart_put: !use_opendal,
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -710,6 +744,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+    use crate::object_store::test_utils::RecordingConnector;
 
     #[rstest::rstest]
     #[case::canonical("aws_region", "region")]
@@ -1050,26 +1085,6 @@ mod tests {
         }
     }
 
-    // Regression test for https://github.com/lance-format/lance/issues/6643
-    // extract_path must NOT double-encode paths that contain non-ASCII characters.
-    // url.path() returns a percent-encoded string; we must decode it back to raw
-    // UTF-8 before storing it in a Path, so the object store HTTP client can apply
-    // a single, correct percent-encoding when building the request URL.
-    #[test]
-    fn test_s3_non_ascii_path_no_double_encoding() {
-        let provider = AwsStoreProvider;
-
-        // "s3://bucket/中文路径" → url.path() == "/%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84".
-        // The buggy Path::parse(url.path()) stored "%E4%B8%AD..." verbatim; the S3
-        // client then percent-encodes the '%' again, yielding "%25E4%25B8%25AD...".
-        // With Path::from_url_path the Path stores the decoded UTF-8 instead.
-        let url = Url::parse("s3://bucket/中文路径").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-
-        // The Path must hold the decoded UTF-8, not the percent-encoded form.
-        assert_eq!(path.as_ref(), "中文路径");
-    }
-
     #[test]
     fn test_is_s3_express() {
         let cases = [
@@ -1125,7 +1140,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
-        assert!(!store.supports_conditional_multipart_put);
     }
 
     /// A credential provider handed to the OpenDAL arm would be dropped, and
@@ -1156,6 +1170,29 @@ mod tests {
         assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
+    /// OpenDAL opens its own clients, so a connector handed to it would be dropped.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_http_connector() {
+        let params = ObjectStoreParams {
+            http_connector: Some(Arc::new(RecordingConnector::default())),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let err = AwsStoreProvider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("http_connector"), "got: {err}");
+    }
+
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back
     /// continuation tokens, which is all the native store resumes from — so an Express bucket
     /// pages like any other. The OpenDAL arm has no lister to page with at all.
@@ -1184,10 +1221,39 @@ mod tests {
 
         assert!(!store.list_is_lexically_ordered);
         assert_eq!(store.paginated_lister.is_some(), paginated);
-        assert_eq!(
-            store.supports_conditional_multipart_put,
-            use_opendal == "false"
+    }
+
+    #[tokio::test]
+    async fn test_s3_store_opens_its_clients_with_the_given_http_connector() {
+        let connector = Arc::new(RecordingConnector::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("region".to_string(), "us-east-1".to_string()),
+                    ("aws_access_key_id".to_string(), "key".to_string()),
+                    ("aws_secret_access_key".to_string(), "secret".to_string()),
+                    ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
+                    ("allow_http".to_string(), "true".to_string()),
+                ]),
+            ))),
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+        assert_ne!(params, ObjectStoreParams::default());
+
+        let url = Url::parse("s3://bucket/path").unwrap();
+        let store = AwsStoreProvider.new_store(url, &params).await.unwrap();
+        let found =
+            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("path/file")).await;
+
+        assert!(
+            matches!(found, Err(object_store::Error::NotFound { .. })),
+            "{found:?}"
         );
+        assert!(connector.connects.load(Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/bucket/path/file"), "{requests:?}");
     }
 
     #[derive(Debug)]

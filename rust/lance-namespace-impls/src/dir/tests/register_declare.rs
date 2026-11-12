@@ -320,12 +320,18 @@ async fn test_namespace_write() {
     use arrow::record_batch::{RecordBatch, RecordBatchIterator};
     use lance::dataset::{Dataset, WriteMode, WriteParams};
     use lance_namespace::LanceNamespace;
+    use lance_namespace::models::CreateNamespaceRequest;
 
     let (namespace, _temp_dir) = create_test_namespace().await;
     let namespace = Arc::new(namespace) as Arc<dyn LanceNamespace>;
 
     // Use child namespace instead of root
     let table_id = vec!["test_ns".to_string(), "test_table".to_string()];
+
+    // Writing into a namespace that does not exist is rejected, so create it first.
+    let mut create_ns_req = CreateNamespaceRequest::new();
+    create_ns_req.id = Some(vec!["test_ns".to_string()]);
+    namespace.create_namespace(create_ns_req).await.unwrap();
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("a", DataType::Int32, false),
         ArrowField::new("b", DataType::Int32, false),
@@ -1335,6 +1341,20 @@ async fn test_declare_table_with_manifest_marker_already_exists() {
         ErrorCode::TableAlreadyExists,
         "expected TableAlreadyExists error code"
     );
+
+    // A namespace holding the name is the same conflict, and the declare
+    // must leave no marker behind.
+    let mut create_req = CreateNamespaceRequest::new();
+    create_req.id = Some(vec!["taken".to_string()]);
+    namespace.create_namespace(create_req).await.unwrap();
+    let mut declare_req = DeclareTableRequest::new();
+    declare_req.id = Some(vec!["taken".to_string()]);
+    let err = namespace
+        .declare_table(declare_req)
+        .await
+        .expect_err("declare over a namespace must fail");
+    assert_eq!(mutation_error_code(err), ErrorCode::TableAlreadyExists);
+    assert!(!temp_dir.join("taken.lance").exists());
 }
 
 #[tokio::test]

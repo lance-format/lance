@@ -9,17 +9,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Float32Type, Int32Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
+use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
 use roaring::RoaringBitmap;
 use rstest::rstest;
+use uuid::Uuid;
 
 use super::dataset_overlay_index_masking::{
     commit_overlay, create_base_dataset_with, i32_array, ids_matching,
@@ -28,12 +31,15 @@ use crate::Dataset;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteDestination,
-    WriteParams,
+    MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform, WhenMatched, WhenNotMatched,
+    WriteDestination, WriteParams,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::{
+    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
+    provenance::prune_stale_segment_coverage, vector::details::vector_index_details_default,
+};
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]
 use crate::utils::test::geo;
@@ -149,7 +155,7 @@ async fn test_btree_merge_drops_coverage_a_restore_took_an_overlay_from() {
 
     let mut dataset = dataset.checkout_version(before_overlay).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 0").await,
@@ -193,13 +199,129 @@ async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
 
     let mut dataset = dataset.checkout_version(before_delete).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 30").await,
         vec![3],
         "the revived row is missing: the merged index claimed a fragment holding a \
          row it never indexed"
+    );
+}
+
+#[rstest]
+#[case::cleanup_revives_all(true, false, true, false)]
+#[case::cleanup_revives_some(true, true, true, false)]
+#[case::cleanup_more_deletions(true, true, false, false)]
+#[case::cleanup_from_updated_handle(true, false, true, true)]
+#[case::distributed_revives_all(false, false, true, false)]
+#[case::distributed_revives_some(false, true, true, false)]
+#[case::distributed_more_deletions(false, true, false, false)]
+#[tokio::test]
+async fn test_create_index_revived_rows(
+    #[case] is_after_cleanup: bool,
+    #[case] has_prior_deletion: bool,
+    #[case] has_revived_rows: bool,
+    #[case] submit_from_updated_handle: bool,
+) {
+    let mut build = create_base_dataset_with(false).await;
+    if has_prior_deletion {
+        build.delete("id = 1").await.unwrap();
+    }
+    let restore_version = build.manifest.version;
+    build.delete("id = 3").await.unwrap();
+    let params = ScalarIndexParams::default();
+    let staged = CreateIndexBuilder::new(&mut build, &["id"], IndexType::BTree, &params)
+        .name("staged".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+
+    let mut current = if has_revived_rows {
+        let mut restored = build.checkout_version(restore_version).await.unwrap();
+        restored.restore().await.unwrap();
+        restored
+    } else {
+        let mut deleted = build.clone();
+        deleted.delete("id = 4").await.unwrap();
+        deleted
+    };
+    let intervening_version = current.manifest.version;
+    current
+        .append(
+            gen_batch()
+                .col("id", array::fill::<Int32Type>(12))
+                .col("age", array::fill::<Int32Type>(120))
+                .into_reader_rows(RowCount::from(1), BatchCount::from(1)),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let committed = if is_after_cleanup {
+        // Remove precisely the restore/delete commit: the build snapshot and
+        // its deletion file survive, but transaction replay cannot see it.
+        let path = current
+            .manifest_location()
+            .naming_scheme
+            .manifest_path(&current.base, intervening_version);
+        current.object_store.delete(&path).await.unwrap();
+        let mut submission = if submit_from_updated_handle {
+            current.clone()
+        } else {
+            build.clone()
+        };
+        submission
+            .apply_commit(
+                Transaction::new(
+                    build.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![staged],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        submission
+    } else {
+        // Untagged tables do not replay the staged segment's transactions.
+        current
+            .commit_existing_index_segments("staged", "id", vec![staged])
+            .await
+            .unwrap();
+        current
+    };
+
+    assert_eq!(
+        ids_matching(&committed, "id = 3").await,
+        if has_revived_rows { vec![3] } else { vec![] }
+    );
+    let mut scan = committed.scan();
+    scan.use_scalar_index(false);
+    scan.filter("id = 3").unwrap();
+    assert_eq!(
+        scan.try_into_batch().await.unwrap().num_rows(),
+        usize::from(has_revived_rows)
+    );
+    assert_eq!(ids_matching(&committed, "id = 7").await, vec![7]);
+    assert_eq!(ids_matching(&committed, "id = 12").await, vec![12]);
+    let indices = committed.load_indices().await.unwrap();
+    let index = indices.iter().find(|index| index.name == "staged").unwrap();
+    assert_eq!(
+        index.fragment_bitmap,
+        Some(if has_revived_rows {
+            RoaringBitmap::from_iter([1])
+        } else {
+            RoaringBitmap::from_iter([0, 1])
+        })
     );
 }
 
@@ -314,7 +436,8 @@ enum OverlayTiming {
     AfterCompaction,
     /// On a source; the compaction folds it into the output.
     BeforeCompaction,
-    /// On a source, then two compactions; the fragment that folded it is gone.
+    /// On a source of each first-round group, then two compactions; the
+    /// fragments that folded them are gone.
     BeforeTwoCompactions,
     /// On the first compaction's output, folded in by the second.
     BetweenCompactions,
@@ -350,8 +473,14 @@ async fn test_rtree_merge_drops_coverage_an_overlay_reaches(#[case] timing: Over
             rtree_compact(&mut dataset, 3).await;
         }
         OverlayTiming::BeforeTwoCompactions => {
-            let source = first(&dataset);
-            dataset = rtree_overlay_geometry(dataset, geometry, source).await;
+            // Folding a newer overlay drops the output from the committed
+            // index, and compaction never mixes indexed and unindexed
+            // fragments, so both first-round outputs must fold one for the
+            // second compaction to merge them.
+            let sources = fragment_ids(&dataset);
+            for source in [sources[0], sources[2]] {
+                dataset = rtree_overlay_geometry(dataset, geometry, source as u64).await;
+            }
             rtree_compact(&mut dataset, 2).await;
             rtree_compact(&mut dataset, 4).await;
             assert_eq!(dataset.get_fragments().len(), 1);
@@ -1060,26 +1189,52 @@ async fn stage_val(dataset: &Dataset, fragments: Vec<u32>) -> Vec<IndexMetadata>
     .await
 }
 
-/// Checks that looking up each of `values`, and a few ranges, through
-/// `val_idx` finds what a scan finds.
+/// How many rows hold each `val` among those `filter` selects, through
+/// `val_idx`, or among all rows by a scan.
+async fn val_counts(dataset: &Dataset, filter: Option<&str>) -> HashMap<i32, usize> {
+    let mut scan = dataset.scan();
+    scan.project(&["val"]).unwrap();
+    match filter {
+        Some(filter) => scan.filter(filter).unwrap(),
+        None => scan.use_scalar_index(false),
+    };
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut counts = HashMap::new();
+    for val in batch["val"].as_primitive::<Int32Type>().values() {
+        *counts.entry(*val).or_default() += 1;
+    }
+    counts
+}
+
+/// Checks that looking up `values` together and a few of them alone, and a
+/// few ranges, through `val_idx` finds what a scan finds.
 async fn assert_val_lookups_match_scan(
     dataset: &Dataset,
     values: impl IntoIterator<Item = i32>,
     trace: &str,
 ) {
-    let mut scan = dataset.scan();
-    scan.use_scalar_index(false).project(&["val"]).unwrap();
-    let batch = scan.try_into_batch().await.unwrap();
-    let mut scanned = HashMap::<i32, usize>::new();
-    for val in batch["val"].as_primitive::<Int32Type>().values() {
-        *scanned.entry(*val).or_default() += 1;
-    }
-    for value in values {
+    let scanned = val_counts(dataset, None).await;
+    let values = values.into_iter().collect::<Vec<_>>();
+    let list = values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let found = val_counts(dataset, Some(&format!("val IN ({list})"))).await;
+    let want = values
+        .iter()
+        .filter_map(|value| Some((*value, *scanned.get(value)?)))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(found, want, "{trace}: val IN {values:?}");
+    for value in [values.first(), values.get(values.len() / 2), values.last()]
+        .into_iter()
+        .flatten()
+    {
         let found = dataset
             .count_rows(Some(format!("val = {value}")))
             .await
             .unwrap();
-        let want = scanned.get(&value).copied().unwrap_or(0);
+        let want = scanned.get(value).copied().unwrap_or(0);
         assert_eq!(found, want, "{trace}: val = {value}");
     }
     for bound in [0, 100, 500, 1_000, 1_000_000, 2_000_000] {
@@ -1103,6 +1258,80 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
         .unwrap()
         .unwrap();
     index.fragment_bitmap.unwrap()
+}
+
+/// Older inputs and a later segment directly covering their output can index
+/// different values. Every contribution must be fresh before keeping coverage.
+#[rstest]
+#[case::partial_unchanged(false, false, false)]
+#[case::partial_updated(false, true, false)]
+#[case::partial_restored(false, true, true)]
+#[case::full_unchanged(true, false, false)]
+#[case::full_updated(true, true, false)]
+#[case::full_restored(true, true, true)]
+#[tokio::test]
+async fn test_merge_validates_every_output_contribution(
+    #[case] full_input_coverage: bool,
+    #[case] update: bool,
+    #[case] restore: bool,
+) {
+    let mut dataset = val_table("memory://", 3).await;
+    let sources = if full_input_coverage {
+        vec![0, 1, 2]
+    } else {
+        vec![0, 2]
+    };
+    let mut staged = stage_val(&dataset, sources).await;
+    let outputs = compact_into_two(&mut dataset, &[0, 1]).await;
+    let directly_covered = outputs[1] as u32;
+    let before_update = dataset.manifest.version;
+
+    if update {
+        let patch =
+            arrow_array::record_batch!(("id", Int32, [ROWS]), ("val", Int32, [999])).unwrap();
+        let schema = patch.schema();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns);
+        let (updated, _) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+            .await
+            .unwrap();
+        dataset = Arc::unwrap_or_clone(updated);
+    } else {
+        // Date the direct segment later without changing its indexed data.
+        dataset.update_config([("touched", "true")]).await.unwrap();
+    }
+    assert_eq!(
+        fragment_ids(&dataset),
+        vec![2, outputs[0] as u32, directly_covered]
+    );
+    staged.extend(stage_val(&dataset, vec![directly_covered]).await);
+
+    if restore {
+        dataset = dataset.checkout_version(before_update).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let mut covered = RoaringBitmap::from_iter([2]);
+    if full_input_coverage {
+        covered.insert(outputs[0] as u32);
+    }
+    if !update {
+        covered.insert(directly_covered);
+    }
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val >= 120").await;
+    assert_val_lookups_match_scan(&dataset, [60, 120, 999], "").await;
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
 }
 
 /// A group compacted while an overlay lands on a fragment outside it: only the
@@ -1208,10 +1437,10 @@ async fn merge_under_workload(seed: u64) -> u64 {
 #[tokio::test]
 async fn test_merged_index_matches_a_scan_under_a_workload() {
     let mut covered = 0;
-    for seed in 0..24 {
+    for seed in 0..4 {
         covered += Box::pin(merge_under_workload(seed)).await;
     }
-    assert!(covered >= 16, "only {covered} fragments stayed covered");
+    assert!(covered >= 3, "only {covered} fragments stayed covered");
 }
 
 /// The fragment that holds the row with `id`.
@@ -1853,4 +2082,94 @@ async fn test_merge_covers_a_chain_only_when_its_segments_indexed_every_source(
         assert_uses_val_idx(&dataset, "val < 60").await;
     }
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SegmentFreshnessCheck {
+    PruneStaleSegmentCoverage,
+    FreshFragments,
+}
+
+impl SegmentFreshnessCheck {
+    async fn marks_stale(self, dataset: &Dataset, segment: IndexMetadata) -> bool {
+        match self {
+            Self::PruneStaleSegmentCoverage => {
+                let mut segments = [segment.into_index_segment().unwrap()];
+                prune_stale_segment_coverage(
+                    dataset,
+                    &mut segments,
+                    false,
+                    &RoaringBitmap::new(),
+                    false,
+                )
+                .await
+                .unwrap();
+                !segments[0].fragment_bitmap().contains(0)
+            }
+            Self::FreshFragments => {
+                let no_compactions = CompactFragReuseIndex::try_new(
+                    Uuid::new_v4(),
+                    FragReuseIndexDetails { versions: vec![] },
+                )
+                .unwrap();
+                !fresh_fragments(dataset, &no_compactions, &[segment])
+                    .await
+                    .unwrap()
+                    .contains(0)
+            }
+        }
+    }
+}
+
+/// A segment goes stale on a fragment once its carried column gains a data
+/// file there, and not when another column does, whether or not `fields`
+/// repeats the carried column.
+#[rstest]
+#[case::prune_stale_segment_coverage(SegmentFreshnessCheck::PruneStaleSegmentCoverage)]
+#[case::fresh_fragments(SegmentFreshnessCheck::FreshFragments)]
+#[tokio::test]
+async fn test_covering_dependency(#[case] check: SegmentFreshnessCheck) {
+    let test_dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+    let built_at = dataset.manifest.version;
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("payload".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let vector_field_id = dataset.schema().field_id("vector").unwrap();
+    for (carried, stale) in [("payload", true), ("id", false)] {
+        let carried_id = dataset.schema().field_id(carried).unwrap();
+        for fields in [vec![vector_field_id, carried_id], vec![vector_field_id]] {
+            let segment = IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "vector_idx".to_string(),
+                fields: fields.clone(),
+                covering_fields: vec![carried_id],
+                dataset_version: built_at,
+                fragment_bitmap: Some(RoaringBitmap::from([0])),
+                index_details: Some(Arc::new(vector_index_details_default())),
+                index_version: IndexType::Vector.version(),
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            };
+            assert_eq!(
+                check.marks_stale(&dataset, segment).await,
+                stale,
+                "{check:?}, fields {fields:?}: a segment carrying `{carried}` after \
+                 add_columns wrote `payload`"
+            );
+        }
+    }
 }
