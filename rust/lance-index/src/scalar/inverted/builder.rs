@@ -2505,15 +2505,13 @@ impl FinalizeOptions {
 
 /// Planning estimate of decoded builder bytes per stored byte, as a ratio of
 /// `DECODED_PER_STORED_NUM / DECODED_PER_STORED_DEN`. Measured at 1.47-1.51
-/// on two corpora (positions on, v3 format). It sizes merge groups: a
-/// partition is a consolidation candidate while two of them are estimated to
-/// fit the worker limit together, so the candidate ceiling is
-/// `limit / (2 * ratio)`, and a group's members are estimated to fit the limit
-/// as one decoded builder. Partitions the build cut at the limit sit well
-/// above the ceiling and are copied. The stored size only plans; the decoded
-/// size is checked against the limit again while merging, as the build does
-/// when it splits partitions, and decoding itself cannot be interrupted, so
-/// the ceiling is what bounds one decode.
+/// on two corpora (positions on, v3 format). Partitions estimated below the
+/// effective target are candidates, including a larger partial partition
+/// that can still take a small tail. Candidates are packed into groups under
+/// that target; inputs at or above it are copied. Stored size only plans:
+/// decoded size is checked against the worker limit again while merging,
+/// and a group may produce multiple partitions. Decoding one input cannot be
+/// interrupted, so this estimate does not establish a hard memory cap.
 const DECODED_PER_STORED_NUM: u64 = 3;
 const DECODED_PER_STORED_DEN: u64 = 2;
 /// A merge group's working set is more than its decoded members: both inputs
@@ -2544,13 +2542,13 @@ fn estimated_merge_working_set_bytes(stored_bytes: u64) -> u64 {
 /// candidate may have, and the largest estimated decoded size of one group.
 /// A group is planned to the worker limit, but its working set must also fit
 /// the whole finalize budget, which a build with fewer workers than the
-/// working-set factor makes the tighter bound; the candidate ceiling follows
-/// the same cap so two candidates always fit one group.
+/// working-set factor makes the tighter bound. The candidate ceiling follows
+/// this effective target; candidates that cannot share a group are copied.
 fn consolidation_limits(memory_limit_bytes: u64, total_budget_bytes: u64) -> (u64, u64) {
     let group_max_decoded_bytes =
         memory_limit_bytes.min(total_budget_bytes * MERGE_WORKING_SET_DEN / MERGE_WORKING_SET_NUM);
     let candidate_max_stored_bytes =
-        group_max_decoded_bytes * DECODED_PER_STORED_DEN / (2 * DECODED_PER_STORED_NUM);
+        group_max_decoded_bytes * DECODED_PER_STORED_DEN / DECODED_PER_STORED_NUM;
     (candidate_max_stored_bytes, group_max_decoded_bytes)
 }
 
@@ -6469,6 +6467,34 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![(vec![1, 2], 1..3), (vec![3, 4], 3..5)]);
+    }
+
+    #[rstest::rstest]
+    #[case::fill_below_target(900, vec![100, 400], vec![vec![0, 1]])]
+    #[case::five_into_two(600, vec![120; 5], vec![vec![0, 1, 2], vec![3, 4]])]
+    fn test_consolidation_groups_to_target(
+        #[case] target: u64,
+        #[case] sizes: Vec<u64>,
+        #[case] expected_groups: Vec<Vec<u64>>,
+    ) {
+        let (ceiling, group_max) = consolidation_limits(target, 4 * target);
+        let mut partitions = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(id, size)| staged_for_plan(id as u64, size))
+            .collect::<Vec<_>>();
+        // An input at the target and one above it must remain unchanged.
+        let at_target = target * 2 / 3;
+        partitions.push(staged_for_plan(100, at_target));
+        partitions.push(staged_for_plan(101, at_target + 1));
+        let plan = plan_finalize(partitions, ceiling, group_max);
+        assert_eq!(plan.copies, vec![(100, 0), (101, 1)]);
+        let groups = plan
+            .groups
+            .iter()
+            .map(|group| group.members.iter().map(|member| member.old_id).collect())
+            .collect::<Vec<Vec<u64>>>();
+        assert_eq!(groups, expected_groups);
     }
 
     /// A build with fewer workers than the working-set factor makes the
