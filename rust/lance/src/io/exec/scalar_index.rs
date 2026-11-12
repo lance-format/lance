@@ -1681,6 +1681,52 @@ mod tests {
         assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
     }
 
+    /// An empty block-list (e.g. NGram's "cannot tell, scan everything" result
+    /// for an untokenizable query -- see `test_basic_ngram_index`'s "too short"
+    /// cases) blocks the same set of rows in either domain, so it passes
+    /// through unchanged; any other block-list is unsupported and must error.
+    #[tokio::test]
+    async fn test_translate_addr_mask_to_row_ids_block_list() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..4).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::empty());
+        let translated = super::translate_addr_mask_to_row_ids(&dataset, empty)
+            .await
+            .unwrap();
+        assert!(matches!(
+            translated,
+            NullableRowAddrMask::BlockList(set) if set.is_empty()
+        ));
+
+        let mut selected = RowAddrTreeMap::new();
+        selected.insert(RowAddress::new_from_parts(0, 0).into());
+        let non_empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::new(
+            selected,
+            RowAddrTreeMap::new(),
+        ));
+        let err = super::translate_addr_mask_to_row_ids(&dataset, non_empty)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot translate a block-list address mask"),
+            "{err}"
+        );
+    }
+
     #[rstest]
     #[case::deleted(false)]
     #[case::compacted(true)]

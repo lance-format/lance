@@ -383,15 +383,30 @@ pub(crate) async fn live_row_addr_to_row_id_lookup(
     dataset: &Dataset,
     fragment_ids: impl IntoIterator<Item = u32>,
 ) -> Result<impl Fn(u64) -> Option<u64> + Send + Sync + 'static> {
-    let mut fragments = std::collections::HashMap::new();
-    for fragment_id in fragment_ids {
-        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
-            continue;
-        };
-        let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
-        let deletion_vector = fragment.get_deletion_vector().await?;
-        fragments.insert(fragment_id, (sequence, deletion_vector));
-    }
+    // Loaded concurrently (bounded by io_parallelism): on a dataset with many
+    // fragments, loading each one's row id sequence and deletion vector in
+    // turn serializes IO that has no reason to wait on the last one.
+    let to_load: Vec<_> = fragment_ids
+        .into_iter()
+        .filter_map(|fragment_id| {
+            dataset
+                .get_fragment(fragment_id as usize)
+                .map(|fragment| (fragment_id, fragment))
+        })
+        .collect();
+    let loaded: Vec<_> = futures::stream::iter(to_load)
+        .map(|(fragment_id, fragment)| async move {
+            let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+            let deletion_vector = fragment.get_deletion_vector().await?;
+            Result::Ok((fragment_id, sequence, deletion_vector))
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    let fragments: std::collections::HashMap<_, _> = loaded
+        .into_iter()
+        .map(|(fragment_id, sequence, deletion_vector)| (fragment_id, (sequence, deletion_vector)))
+        .collect();
     Ok(move |row_addr: u64| {
         let row_addr = RowAddress::from(row_addr);
         let (sequence, deletion_vector) = fragments.get(&row_addr.fragment_id())?;

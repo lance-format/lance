@@ -910,9 +910,11 @@ class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
 
+        # A row-count match alone would still pass if the rebuild silently
+        # left the column unindexed (a full scan gives the same counts), so
+        # also check the rebuilt index is actually used.
+        self._assert_queryable(expect_index_used=True)
         ds = lance.dataset(self.path)
-        table = ds.to_table(filter="contains(ngram, 'word7')")
-        assert table.num_rows == 111
         table = ds.to_table(filter=f"contains(ngram, '{word}')")
         assert table.num_rows == 1
 
