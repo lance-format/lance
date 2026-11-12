@@ -41,6 +41,7 @@ class DatasetOptimizer:
         max_source_fragments: Optional[int] = None,
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
+        source_budget_mode: Optional[Literal["hard", "soft"]] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
         max_data_files_per_fragment: Optional[int] = None,
@@ -83,6 +84,7 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
         ``lance.compaction.max_data_files_per_fragment``,
+        ``lance.compaction.source_budget_mode``,
         ``lance.compaction.data_storage_version``.
 
         Parameters
@@ -158,6 +160,16 @@ class DatasetOptimizer:
             would exceed this limit. Blob v2 payloads live in separate
             blob files and are not counted, so this is not a cap on total
             compaction I/O for datasets with blob columns.
+        source_budget_mode: {"hard", "soft"}, optional
+            Controls how all configured ``max_source_*`` budgets are applied
+            to cumulative totals across the tasks selected for one plan.
+            ``"hard"`` rejects a task when adding it would exceed any
+            cumulative budget and is the default. ``"soft"`` always admits
+            the first indivisible task. If that task exceeds a budget, the
+            plan stops there; otherwise later tasks use the same cumulative
+            checks as ``"hard"``. If a byte budget is set but the first task
+            has a source file without a recorded size, ``"soft"`` admits that
+            task and stops; ``"hard"`` reports an error.
         excluded_fragment_ids: list[int], optional
             Fragment IDs to exclude from compaction planning. Excluded
             fragments remain unchanged and act as boundaries, so fragments
@@ -207,6 +219,7 @@ class DatasetOptimizer:
                 max_source_fragments=max_source_fragments,
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
+                source_budget_mode=source_budget_mode,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
                 max_data_files_per_fragment=max_data_files_per_fragment,

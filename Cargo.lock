@@ -3196,7 +3196,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -4508,7 +4508,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4585,6 +4585,7 @@ dependencies = [
  "num-traits",
  "object_store 0.14.2",
  "parquet",
+ "parquet-variant-compute",
  "permutation",
  "pin-project",
  "pprof",
@@ -4617,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4667,18 +4668,19 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrayref",
  "bitpacking",
  "crunchy",
  "paste",
+ "rstest",
  "seq-macro",
 ]
 
 [[package]]
 name = "lance-core"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4721,7 +4723,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4758,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion-exec"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4786,7 +4788,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4806,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4815,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4848,7 +4850,6 @@ dependencies = [
  "rand_xoshiro",
  "rstest",
  "serde_json",
- "serial_test",
  "test-log",
  "tokio",
  "tracing",
@@ -4858,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4884,7 +4885,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4924,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4965,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "approx",
  "arc-swap",
@@ -5049,7 +5050,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5072,7 +5073,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5127,7 +5128,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -5147,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "approx",
  "argminmax",
@@ -5169,7 +5170,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5183,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5199,7 +5200,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -5261,7 +5262,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5277,7 +5278,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5325,7 +5326,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5334,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5347,7 +5348,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5361,7 +5362,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "15.0.0-beta.12"
+version = "15.0.0-beta.19"
 dependencies = [
  "arrow-array",
  "chrono",
@@ -6744,6 +6745,53 @@ dependencies = [
  "snap",
  "tokio",
  "twox-hash",
+]
+
+[[package]]
+name = "parquet-variant"
+version = "59.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3950502c5d383bc98ac83424c50ad06214cfb8a8554ef6f19413e71894079288"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "num-traits",
+ "simdutf8",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-compute"
+version = "59.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28c4fc004d60a76d727fe4a383b48e8c4d629384b9d9f0cc359164ec2cbd3326"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "parquet-variant",
+ "parquet-variant-json",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-json"
+version = "59.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "216b1aecab3ee2e8f429ade4dfef24e233d008ee91ce745fb273c39fc5936b85"
+dependencies = [
+ "arrow-schema",
+ "base64 0.23.0",
+ "chrono",
+ "parquet-variant",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

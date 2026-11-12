@@ -695,6 +695,7 @@ pub fn two_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'stat
 pub enum UnreadableIndexKind {
     NewerVersion,
     UnknownType,
+    ReservedField,
 }
 
 /// Make `index_name` unreadable to this build, and give it the full fragment
@@ -723,6 +724,9 @@ pub async fn hide_index_as(dataset: &mut Dataset, index_name: &str, kind: Unread
                 type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
                 value: Vec::new(),
             }));
+        }
+        UnreadableIndexKind::ReservedField => {
+            unreadable[0].fields = vec![lance_table::format::ROW_ID_FIELD_ID];
         }
     }
     unreadable[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());

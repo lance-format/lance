@@ -107,8 +107,9 @@ pub use execution::{CompactionMetrics, CompactionTask, RepackedFiles, RewriteRes
 use planning::validate_fragment_groups_preserve_index_boundaries;
 pub use planning::{
     COMPACTION_CONFIG_PREFIX, CompactionGroup, CompactionMode, CompactionOptions, CompactionPlan,
-    CompactionPlanner, CompactionScope, CompactionTaskKind, DefaultCompactionPlanner,
-    IndexRemapMode, TaskData, plan_compaction,
+    CompactionPlanner, CompactionPlanningResult, CompactionScope, CompactionTaskKind,
+    DefaultCompactionPlanner, IndexRemapMode, SourceBudgetLimit, SourceBudgetMode,
+    SourceBudgetSummary, TaskData, plan_compaction,
 };
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 

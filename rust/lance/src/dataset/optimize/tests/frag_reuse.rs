@@ -882,9 +882,10 @@ async fn test_defer_index_remap() {
     assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
 }
 #[tokio::test]
-async fn test_defer_index_remap_skips_fri_when_no_indexed_data() {
-    // A deferred compaction touching no indexed data must write no FRI --
-    // such a version is un-drainable (remap no-ops, trim retains it forever).
+async fn test_defer_index_remap_records_and_trims_unindexed_data() {
+    // A deferred compaction records groups no index covers (an index build in
+    // flight may cover them), and trim drops the record since no committed
+    // index needs it.
     let mut data_gen =
         BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
 
@@ -916,16 +917,130 @@ async fn test_defer_index_remap_skips_fri_when_no_indexed_data() {
         dataset.get_fragments().len() < fragments_before,
         "compaction should have merged fragments"
     );
-    // ...but no fragment-reuse index was created.
+    // ...and recorded its groups.
     assert!(
         dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
             .await
             .unwrap()
-            .is_none(),
-        "deferred compaction with no indexed data must not create an FRI"
+            .is_some(),
+        "deferred compaction must record unindexed groups"
+    );
+
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert!(
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .is_none_or(|fri| fri.details.versions.is_empty()),
+        "trim must drop a record no index needs"
     );
 }
+/// Recording unindexed groups must not pin the history behind an index that
+/// lags it (#7774): uncovered versions trim without a remap, and in a mixed
+/// history they trim with the covered versions once the lagging index is
+/// remapped.
+#[tokio::test]
+async fn test_unindexed_records_trim_behind_a_lagging_index() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = |start: i32, rows: i32| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(start..start + rows))],
+        )
+        .unwrap()
+    };
+    let write = |rows_per_file: usize, mode: WriteMode| WriteParams {
+        max_rows_per_file: rows_per_file,
+        mode,
+        ..Default::default()
+    };
+    let uri = "memory://test/lagging";
+    let b = batch(0, 400);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(b)], schema.clone()),
+        uri,
+        Some(write(100, WriteMode::Create)),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let versions = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .map_or(0, |fri| fri.details.versions.len())
+        }
+    };
+    let deferred = |target: usize| CompactionOptions {
+        target_rows_per_fragment: target,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+
+    // Rounds of small appends, each compacted on its own: the indexed base is
+    // at target, so every version rewrites only unindexed fragments, and the
+    // index (never remapped) predates all of them.
+    for round in 0..4 {
+        let b = batch(1000 + round * 10, 10);
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(b)], schema.clone()),
+                Some(write(5, WriteMode::Append)),
+            )
+            .await
+            .unwrap();
+        compact_files(&mut dataset, deferred(100), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(versions(&dataset).await, 4);
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(versions(&dataset).await, 0);
+
+    // A covered version (the indexed base folds pairwise), then an uncovered
+    // one: both stay while the index lags, and both go once it is remapped.
+    compact_files(&mut dataset, deferred(200), None)
+        .await
+        .unwrap();
+    let b = batch(2000, 10);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(b)], schema.clone()),
+            Some(write(5, WriteMode::Append)),
+        )
+        .await
+        .unwrap();
+    compact_files(&mut dataset, deferred(200), None)
+        .await
+        .unwrap();
+    assert_eq!(versions(&dataset).await, 2);
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(versions(&dataset).await, 2);
+    remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+        .await
+        .unwrap();
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert_eq!(versions(&dataset).await, 0);
+}
+
 #[tokio::test]
 async fn test_defer_index_remap_multiple_compactions() {
     let mut data_gen = BatchGenerator::new()

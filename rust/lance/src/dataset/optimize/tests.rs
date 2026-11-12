@@ -15,6 +15,7 @@ mod lineage;
 mod overlays;
 mod planning;
 mod repack;
+mod undeferrable_withdrawal;
 mod vector;
 use self::remapping::RemappedIndex;
 use super::*;

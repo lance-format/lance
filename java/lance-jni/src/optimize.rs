@@ -13,7 +13,7 @@ use lance::dataset::{
     optimize::{
         CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionScope,
         CompactionTask, CompactionTaskKind, IndexRemapperOptions, RepackedFiles, RewriteResult,
-        TaskData, commit_compaction, plan_compaction,
+        SourceBudgetMode, TaskData, commit_compaction, plan_compaction,
     },
 };
 
@@ -53,6 +53,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
+    source_budget_mode: JObject,              // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
     scope: JObject,                           // Optional<String>
 ) -> JObject<'local> {
@@ -77,6 +78,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             max_source_bytes,
             excluded_fragment_ids,
             data_storage_version,
+            source_budget_mode,
             max_data_files_per_fragment,
             scope
         ),
@@ -104,6 +106,7 @@ fn inner_plan_compaction<'local>(
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
+    source_budget_mode: JObject,              // Optional<String>
     max_data_files_per_fragment: JObject,     // Optional<Long>
     scope: JObject,                           // Optional<String>
 ) -> Result<JObject<'local>> {
@@ -130,6 +133,7 @@ fn inner_plan_compaction<'local>(
         &max_source_bytes,
         &excluded_fragment_ids,
         &data_storage_version,
+        Some(&source_budget_mode),
         &config,
     )?;
     apply_repack_options(
@@ -236,6 +240,7 @@ fn inner_commit_compaction<'local>(
         &max_source_bytes,
         &excluded_fragment_ids,
         &JObject::null(),
+        None,
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -360,6 +365,7 @@ fn inner_execute_task<'local>(
         &max_source_bytes,
         &excluded_fragment_ids,
         &data_storage_version,
+        None,
         &config,
     )?;
     apply_repack_options(
@@ -395,7 +401,8 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[BLjava/lang/Long;Ljava/util/List;)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const SOURCE_BUDGET_MODE_CLASS: &str = "org/lance/compaction/SourceBudgetMode";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 /// The Java `TaskData` carries no output properties, so a task whose outputs
 /// carry a clustering id or metadata cannot cross into Java without losing
@@ -523,6 +530,18 @@ impl IntoJava for &CompactionOptions {
             None => JObject::null(),
         };
         let data_storage_version_opt = to_java_optional(env, data_storage_version)?;
+        let source_budget_mode_name = match self.source_budget_mode {
+            SourceBudgetMode::Hard => "HARD",
+            SourceBudgetMode::Soft => "SOFT",
+        };
+        let source_budget_mode = env
+            .get_static_field(
+                SOURCE_BUDGET_MODE_CLASS,
+                source_budget_mode_name,
+                format!("L{};", SOURCE_BUDGET_MODE_CLASS),
+            )?
+            .l()?;
+        let source_budget_mode_opt = to_java_optional(env, source_budget_mode)?;
         let max_data_files_per_fragment =
             to_java_long_obj(env, self.max_data_files_per_fragment.map(|v| v as i64))?;
         let max_data_files_per_fragment_opt = to_java_optional(env, max_data_files_per_fragment)?;
@@ -554,6 +573,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&max_source_bytes_opt),
                 JValueGen::Object(&excluded_fragment_ids),
                 JValueGen::Object(&data_storage_version_opt),
+                JValueGen::Object(&source_budget_mode_opt),
                 JValueGen::Object(&max_data_files_per_fragment_opt),
                 JValueGen::Object(&scope_opt),
             ],
