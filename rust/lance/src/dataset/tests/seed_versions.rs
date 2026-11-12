@@ -460,6 +460,11 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
                 .filter(|r| r.method == method && r.path.to_string().ends_with(&path))
                 .count()
         };
+    // A file no larger than the store's block size is read whole through
+    // `get_opts` rather than in ranges, so either method counts as a read.
+    let reads_on = |io: &lance_io::utils::tracking_store::IoStats, fragment: &Fragment| {
+        requests_on(io, fragment, "get_range") + requests_on(io, fragment, "get_opts")
+    };
 
     // The build: both seeds reused, no size probe on either data file.
     dataset.object_store.io_stats_incremental();
@@ -487,7 +492,7 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
             io.requests
         );
         assert!(
-            requests_on(&io, fragment, "get_range") >= 1,
+            reads_on(&io, fragment) >= 1,
             "the seed is read from the file: {:?}",
             io.requests
         );
@@ -512,7 +517,7 @@ async fn test_seed_harvest_uses_the_manifest_file_size() {
         "an unknown size is probed once: {:?}",
         io.requests
     );
-    assert!(requests_on(&io, &without_size, "get_range") >= 1);
+    assert!(reads_on(&io, &without_size) >= 1);
     dataset.object_store.io_stats_incremental();
     assert!(harvester.harvest(&fragments[1]).await.unwrap().is_some());
     let io = dataset.object_store.io_stats_incremental();
