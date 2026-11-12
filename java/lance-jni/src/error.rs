@@ -18,6 +18,8 @@ pub enum JavaExceptionClass {
     AlreadyInException,
     LanceNamespaceException,
     LanceTimeoutException,
+    DatasetNotFoundException,
+    DatasetAlreadyExistsException,
 }
 
 impl JavaExceptionClass {
@@ -31,6 +33,8 @@ impl JavaExceptionClass {
             Self::AlreadyInException => "AlreadyInException",
             Self::LanceNamespaceException => "org/lance/namespace/errors/LanceNamespaceException",
             Self::LanceTimeoutException => "org/lance/LanceTimeoutException",
+            Self::DatasetNotFoundException => "org/lance/DatasetNotFoundException",
+            Self::DatasetAlreadyExistsException => "org/lance/DatasetAlreadyExistsException",
         }
     }
 }
@@ -73,6 +77,14 @@ impl Error {
 
     pub fn timeout_error(message: String) -> Self {
         Self::new(message, JavaExceptionClass::LanceTimeoutException)
+    }
+
+    pub fn dataset_not_found_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::DatasetNotFoundException)
+    }
+
+    pub fn dataset_already_exists_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::DatasetAlreadyExistsException)
     }
 
     pub fn namespace_error(code: u32, message: String) -> Self {
@@ -190,10 +202,13 @@ impl From<LanceError> for Error {
         // Classify by the root error so a coalesced `Error::Shared(..)` maps to
         // the same Java exception as the error it wraps, not a RuntimeException.
         match err.find_root() {
-            LanceError::DatasetNotFound { .. }
-            | LanceError::DatasetAlreadyExists { .. }
-            | LanceError::CommitConflict { .. }
-            | LanceError::InvalidInput { .. } => Self::input_error(message),
+            // Both Java classes extend IllegalArgumentException, which these errors mapped to
+            // before, so existing handlers still catch them.
+            LanceError::DatasetNotFound { .. } => Self::dataset_not_found_error(message),
+            LanceError::DatasetAlreadyExists { .. } => Self::dataset_already_exists_error(message),
+            LanceError::CommitConflict { .. } | LanceError::InvalidInput { .. } => {
+                Self::input_error(message)
+            }
             LanceError::IO { .. } => Self::io_error(message),
             LanceError::Timeout { .. } => Self::timeout_error(message),
             LanceError::NotSupported { .. } => Self::unsupported_error(message),
@@ -272,25 +287,40 @@ mod tests {
     }
 
     #[test]
-    fn test_dataset_not_found_maps_to_illegal_argument() {
+    fn test_dataset_not_found_maps_to_dataset_not_found() {
         let lance_err = LanceError::dataset_not_found("my_dataset", "not found".to_string().into());
         let jni_err: Error = lance_err.into();
         assert_eq!(
             *java_class(&jni_err),
-            JavaExceptionClass::IllegalArgumentException
+            JavaExceptionClass::DatasetNotFoundException
         );
         assert!(jni_err.message.contains("my_dataset"));
     }
 
     #[test]
-    fn test_dataset_already_exists_maps_to_illegal_argument() {
+    fn test_dataset_already_exists_maps_to_dataset_already_exists() {
         let lance_err = LanceError::dataset_already_exists("my_dataset");
         let jni_err: Error = lance_err.into();
         assert_eq!(
             *java_class(&jni_err),
-            JavaExceptionClass::IllegalArgumentException
+            JavaExceptionClass::DatasetAlreadyExistsException
         );
         assert!(jni_err.message.contains("my_dataset"));
+    }
+
+    #[test]
+    fn test_shared_dataset_not_found_maps_to_dataset_not_found() {
+        let lance_err = LanceError::Shared {
+            source: std::sync::Arc::new(LanceError::dataset_not_found(
+                "my_dataset",
+                "not found".to_string().into(),
+            )),
+        };
+        let jni_err: Error = lance_err.into();
+        assert_eq!(
+            *java_class(&jni_err),
+            JavaExceptionClass::DatasetNotFoundException
+        );
     }
 
     #[test]
