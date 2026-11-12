@@ -22,6 +22,7 @@ use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
+use lance_table::format::Manifest;
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
@@ -84,6 +85,39 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// The manifests a mixed pair's footprints are taken against. Boxed: the
+    /// commit loop holds the rebase across awaits.
+    manifests: Box<ManifestHistory>,
+}
+
+/// The manifest a transaction read and, by version, the ones committed since,
+/// as far as the caller has recorded them.
+#[derive(Debug, Default)]
+struct ManifestHistory {
+    read: Option<Arc<Manifest>>,
+    by_version: HashMap<u64, Arc<Manifest>>,
+}
+
+impl ManifestHistory {
+    fn read_at(dataset: &Dataset) -> Box<Self> {
+        let mut history = Box::new(Self {
+            read: Some(dataset.manifest.clone()),
+            ..Default::default()
+        });
+        history.record(dataset.manifest.clone());
+        history
+    }
+
+    fn record(&mut self, manifest: Arc<Manifest>) {
+        self.by_version.insert(manifest.version, manifest);
+    }
+
+    /// The manifests either side of the commit of `version`.
+    fn around(&self, version: u64) -> Option<(&Manifest, &Manifest)> {
+        let before = self.by_version.get(&version.checked_sub(1)?)?;
+        let after = self.by_version.get(&version)?;
+        Some((before, after))
+    }
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.

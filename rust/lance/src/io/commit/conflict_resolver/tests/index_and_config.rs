@@ -65,6 +65,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            manifests: Default::default(),
         };
         let result = rebase.check_txn(&merge, 1);
         assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -94,6 +95,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
     let result = rebase.check_txn(&install, 1);
     assert!(
@@ -148,6 +150,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let same_name = Transaction::new(
@@ -213,6 +216,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
     let different_name_result = rebase.check_txn(&different_name, 1);
     assert!(
@@ -281,6 +285,7 @@ fn test_create_index_conflicts_with_concurrent_drop(
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
     let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -331,6 +336,7 @@ fn test_concurrent_index_drops_are_compatible() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -383,6 +389,7 @@ fn test_index_replacement_compatible_with_removing_disjoint_segment() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -464,6 +471,7 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            manifests: Default::default(),
         };
         let result = rebase.check_txn(&rewrite, 2);
         if expect_conflict {
@@ -552,6 +560,8 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
             reuse: Default::default(),
 
             staged_replay: false,
+
+            manifests: Default::default(),
         };
         // Disjoint from the rewritten fragment, so this only exercises the
         // stable-row-ids check and not the group-straddling check below it.
@@ -634,12 +644,17 @@ fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
     )])
 }
 
-/// Assert the verdict holds whichever transaction is the one rebasing.
+/// Assert the verdict holds whichever transaction is the one rebasing, the
+/// other having committed version 2.
 async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expected: bool) {
+    let mut committed = dataset.manifest.as_ref().clone();
+    committed.version = 2;
+    let committed = Arc::new(committed);
     for (ours, theirs) in [(a.clone(), b.clone()), (b, a)] {
         let mut rebase = TransactionRebase::try_new(dataset, ours, None)
             .await
             .unwrap();
+        rebase.record_manifests([committed.clone()]);
         assert_eq!(rebase.check_txn(&theirs, 2).is_err(), expected);
     }
 }
@@ -657,111 +672,206 @@ async fn test_action_txns_writing_the_same_field_data_conflict() {
     assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 0), true).await;
 }
 
-/// A named operation on the other side conflicts whatever it names, even
-/// when it plainly touches nothing the action set does. Footprints are only
-/// defined over actions, so there is nothing to compare a post-image
-/// against; the pair fails closed rather than guessing.
+/// A named operation is compared with an action set by footprint, in
+/// either order, so it conflicts only where it touches what the set does.
 #[rstest::rstest]
-#[case::append(Operation::Append {
-    fragments: vec![{
-        let mut fragment = Fragment::new(0);
-        fragment.physical_rows = Some(5);
-        fragment
-    }],
-})]
-#[case::delete(Operation::Delete {
-    updated_fragments: vec![],
-    deleted_fragment_ids: vec![7],
-    predicate: "a > 5".into(),
-})]
-#[case::update_config(Operation::UpdateConfig {
-    config_updates: None,
-    table_metadata_updates: None,
-    schema_metadata_updates: None,
-    field_metadata_updates: HashMap::new(),
-})]
-// The two operations whose checkers would otherwise answer Ok without
-// inspecting the other side: UpdateBases, which treats every named operation
-// as compatible, and Clone, which has no checker of its own.
-#[case::update_bases(Operation::UpdateBases {
-    new_bases: vec![lance_table::format::BasePath {
-        id: 1,
-        path: "s3://bucket/base".to_string(),
-        name: Some("base".to_string()),
-        is_dataset_root: false,
-    }],
-})]
-#[case::clone(Operation::Clone {
-    is_shallow: true,
-    ref_name: None,
-    ref_version: 1,
-    ref_path: "memory://source".to_string(),
-    branch_name: None,
-})]
-#[case::update(Operation::Update {
-    removed_fragment_ids: vec![],
-    updated_fragments: vec![],
-    new_fragments: vec![],
-    fields_modified: vec![],
-    compacted_sstables: vec![],
-    mem_wal_dir_id: None,
-    fields_for_preserving_frag_bitmap: vec![],
-    update_mode: None,
-    inserted_rows_filter: None,
-    updated_fragment_offsets: None,
-})]
-#[case::create_index(Operation::CreateIndex {
-    new_indices: vec![],
-    removed_indices: vec![],
-})]
-#[case::rewrite(Operation::Rewrite {
-    groups: vec![],
-    rewritten_indices: vec![],
-    frag_reuse_index: None,
-})]
+#[case::append(
+    Operation::Append {
+        fragments: vec![{
+            let mut fragment = Fragment::new(0);
+            fragment.physical_rows = Some(5);
+            fragment
+        }],
+    },
+    false
+)]
+#[case::delete_elsewhere(
+    Operation::Delete {
+        updated_fragments: vec![],
+        deleted_fragment_ids: vec![7],
+        predicate: "a > 5".into(),
+    },
+    false
+)]
+// The post-image of fragment 0 would put back the tombstoned data.
+#[case::delete_restating_the_fragment(
+    Operation::Delete {
+        updated_fragments: vec![Fragment::new(0)],
+        deleted_fragment_ids: vec![],
+        predicate: "a > 5".into(),
+    },
+    true
+)]
+#[case::update_config(
+    Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        schema_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+    },
+    false
+)]
+// The two operations whose checkers answer Ok without inspecting the other
+// side: UpdateBases matched with a wildcard, and Clone has no checker at
+// all. Both have to reach the comparison from either side.
+#[case::update_bases(
+    Operation::UpdateBases {
+        new_bases: vec![lance_table::format::BasePath {
+            id: 1,
+            path: "s3://bucket/base".to_string(),
+            name: Some("base".to_string()),
+            is_dataset_root: false,
+        }],
+    },
+    false
+)]
+#[case::clone(
+    Operation::Clone {
+        is_shallow: true,
+        ref_name: None,
+        ref_version: 1,
+        ref_path: "memory://source".to_string(),
+        branch_name: None,
+    },
+    false
+)]
+#[case::update(
+    Operation::Update {
+        removed_fragment_ids: vec![],
+        updated_fragments: vec![],
+        new_fragments: vec![],
+        fields_modified: vec![],
+        compacted_sstables: vec![],
+        mem_wal_dir_id: None,
+        fields_for_preserving_frag_bitmap: vec![],
+        update_mode: None,
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    },
+    false
+)]
+#[case::create_index(
+    Operation::CreateIndex {
+        new_indices: vec![],
+        removed_indices: vec![],
+    },
+    false
+)]
+#[case::rewrite(
+    Operation::Rewrite {
+        groups: vec![],
+        rewritten_indices: vec![],
+        frag_reuse_index: None,
+    },
+    false
+)]
+#[case::data_replacement(Operation::DataReplacement { replacements: vec![] }, false)]
+#[case::data_overlay(Operation::DataOverlay { groups: vec![] }, false)]
+#[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 }, false)]
+// Opaque: their post-image is the whole schema or the MemWAL state, which
+// no coordinates describe yet.
+#[case::merge(
+    Operation::Merge {
+        fragments: vec![],
+        schema: lance_core::datatypes::Schema::default(),
+        preserves_nullability: true,
+    },
+    true
+)]
+#[case::project(
+    Operation::Project {
+        schema: lance_core::datatypes::Schema::default(),
+        preserves_nullability: true,
+    },
+    true
+)]
+#[case::update_mem_wal_state(
+    Operation::UpdateMemWalState {
+        compacted_sstables: vec![],
+        dir_id: String::new(),
+    },
+    true
+)]
+#[tokio::test]
+async fn test_a_legacy_operation_against_an_action_txn(
+    #[case] legacy: Operation,
+    #[case] expected: bool,
+) {
+    let dataset = test_dataset(10, 2).await;
+    let legacy = Transaction::new_from_version(1, legacy);
+    let action = tombstone_txn(0, 0);
+
+    for (ours, theirs) in [(action.clone(), legacy.clone()), (legacy, action)] {
+        assert_retryable_or_ok(&dataset, ours, &theirs, expected).await;
+    }
+}
+
+/// A reset is asymmetric: one that landed first conflicts with the action
+/// set, and one landing second wins over it.
+#[rstest::rstest]
 #[case::overwrite(Operation::Overwrite {
     fragments: vec![],
     schema: lance_core::datatypes::Schema::default(),
     config_upsert_values: None,
     initial_bases: None,
 })]
-#[case::data_replacement(Operation::DataReplacement { replacements: vec![] })]
-#[case::data_overlay(Operation::DataOverlay { groups: vec![] })]
-#[case::merge(Operation::Merge {
-    fragments: vec![],
-    schema: lance_core::datatypes::Schema::default(),
-    preserves_nullability: true,
-})]
 #[case::restore(Operation::Restore { version: 1 })]
-#[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 })]
-#[case::project(Operation::Project {
-    schema: lance_core::datatypes::Schema::default(),
-    preserves_nullability: true,
-})]
-#[case::update_mem_wal_state(Operation::UpdateMemWalState {
-    compacted_sstables: vec![],
-    dir_id: String::new(),
-})]
 #[tokio::test]
-async fn test_a_legacy_operation_conflicts_with_an_action_txn(#[case] legacy: Operation) {
+async fn test_a_legacy_reset_against_an_action_txn(#[case] reset: Operation) {
     let dataset = test_dataset(10, 2).await;
-    let legacy = Transaction::new_from_version(1, legacy);
+    let reset = Transaction::new_from_version(1, reset);
     let action = tombstone_txn(0, 0);
 
-    // Retryable, not incompatible: the mixed pair may well commute, so the
-    // loser re-runs against the winner rather than giving up.
-    for (ours, theirs) in [(action.clone(), legacy.clone()), (legacy, action)] {
-        let ours_name = ours.operation.to_string();
-        let mut rebase = TransactionRebase::try_new(&dataset, ours, None)
-            .await
-            .unwrap();
-        let result = rebase.check_txn(&theirs, 2);
+    assert_retryable_or_ok(&dataset, action.clone(), &reset, true).await;
+    assert_retryable_or_ok(&dataset, reset, &action, false).await;
+}
+
+/// Check `ours` against `theirs`, committed as version 2. A conflict must be
+/// retryable, not incompatible: the loser re-runs against the winner rather
+/// than giving up.
+async fn assert_retryable_or_ok(
+    dataset: &Dataset,
+    ours: Transaction,
+    theirs: &Transaction,
+    expected: bool,
+) {
+    let mut committed = dataset.manifest.as_ref().clone();
+    committed.version = 2;
+    let ours_name = ours.operation.to_string();
+    let mut rebase = TransactionRebase::try_new(dataset, ours, None)
+        .await
+        .unwrap();
+    rebase.record_manifests([Arc::new(committed)]);
+    let result = rebase.check_txn(theirs, 2);
+    if expected {
         assert!(
             matches!(result, Err(Error::RetryableCommitConflict { .. })),
             "{ours_name} against {}: expected a retryable conflict, got {result:?}",
             theirs.operation
         );
+    } else {
+        assert!(
+            result.is_ok(),
+            "{ours_name} against {}: expected no conflict, got {result:?}",
+            theirs.operation
+        );
     }
+}
+
+/// Without the manifests either side of the concurrent commit there is
+/// nothing to take its footprint against, so the pair fails closed.
+#[tokio::test]
+async fn test_a_pair_without_its_manifests_fails_closed() {
+    let dataset = test_dataset(10, 2).await;
+    let mut rebase = TransactionRebase::try_new(&dataset, tombstone_txn(0, 0), None)
+        .await
+        .unwrap();
+
+    let result = rebase.check_txn(&tombstone_txn(1, 0), 2);
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "expected a retryable conflict, got {result:?}",
+    );
 }
 
 #[tokio::test]
@@ -1099,6 +1209,7 @@ fn test_compacted_sstables_conflict_lower_generation_fails() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1147,6 +1258,7 @@ fn test_compacted_sstables_conflict_equal_generation_fails() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1196,6 +1308,7 @@ fn test_compacted_sstables_conflict_higher_generation_retryable() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1245,6 +1358,7 @@ fn test_compacted_sstables_different_shards_ok() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1304,6 +1418,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1338,6 +1453,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -1393,6 +1509,7 @@ fn test_create_index_vs_update_mem_wal_state_rebase() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        manifests: Default::default(),
     };
 
     // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
