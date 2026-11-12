@@ -935,7 +935,21 @@ def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset)
 
 
 def test_ann(indexed_dataset):
-    run(indexed_dataset)
+    # run() searches a single partition, so query the largest one. Every row
+    # lands in one partition, so its size is at least num_rows / num_partitions
+    # regardless of how k-means balances the data.
+    index_name = indexed_dataset.describe_indices()[0].name
+    reader = VectorIndexReader(indexed_dataset, index_name)
+    partition_sizes = [
+        reader.read_partition(part).num_rows for part in range(reader.num_partitions())
+    ]
+    largest_partition = max(
+        range(len(partition_sizes)), key=partition_sizes.__getitem__
+    )
+    assert partition_sizes[largest_partition] >= 15
+    centroids = indexed_dataset.centroids(index_name=index_name)
+    query = np.asarray(centroids[largest_partition].as_py(), dtype=np.float32)
+    run(indexed_dataset, q=query)
 
 
 def test_create_index_progress_callback_vector(tmp_path):
