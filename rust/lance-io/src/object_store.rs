@@ -61,8 +61,9 @@ pub mod metrics;
     feature = "huggingface",
     feature = "tos",
     feature = "goosefs",
+    feature = "opendal",
 ))]
-pub(crate) mod opendal_store;
+pub mod opendal_store;
 pub mod providers;
 pub(crate) mod read_dir;
 pub mod storage_options;
@@ -98,8 +99,11 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
     feature = "huggingface",
     feature = "tos",
     feature = "goosefs",
+    feature = "opendal",
 ))]
-const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
+/// The block size used for cloud and OpenDAL-backed stores when a caller does
+/// not provide an explicit block size.
+pub const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
 pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
     std::env::var("LANCE_MAX_IOP_SIZE")

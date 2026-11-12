@@ -39,9 +39,10 @@ pub mod memory;
     feature = "huggingface",
     feature = "oss",
     feature = "tencent",
-    feature = "tos"
+    feature = "tos",
+    feature = "opendal",
 ))]
-pub(in crate::object_store) mod opendal;
+pub mod opendal;
 #[cfg(feature = "oss")]
 pub mod oss;
 pub mod shared_memory;
