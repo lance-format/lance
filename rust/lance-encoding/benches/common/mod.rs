@@ -16,6 +16,7 @@ use lance_encoding::{
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
         try_variable_packed_struct_per_value, try_variable_rle_block, try_variable_width_miniblock,
         try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
+        try_wide_bitpacking_block, try_wide_bitpacking_miniblock,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -35,6 +36,8 @@ pub enum BenchEncoding {
     Array,
     StructuralU16,
     StructuralU32,
+    /// The 2.3 shape. It is the only one that offers 128-bit bitpacking, so the u128
+    /// dispatch arms are reached through this variant alone.
     StructuralSparse,
 }
 
@@ -92,7 +95,10 @@ impl CompressionStrategy for BenchCompressionStrategy {
                 | BenchEncoding::StructuralU32 => try_fixed_u8_rle_miniblock(data, &params),
             } {
                 compressor
-            } else if let Some(compressor) = try_bitpacking_miniblock(data) {
+            } else if let Some(compressor) = match self.encoding {
+                BenchEncoding::StructuralSparse => try_wide_bitpacking_miniblock(data),
+                _ => try_bitpacking_miniblock(data),
+            } {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
@@ -168,7 +174,11 @@ impl CompressionStrategy for BenchCompressionStrategy {
         if let Some(compressor) = rle {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_bitpacking_block(data) {
+        let bitpacking = match self.encoding {
+            BenchEncoding::StructuralSparse => try_wide_bitpacking_block(data),
+            _ => try_bitpacking_block(data),
+        };
+        if let Some(compressor) = bitpacking {
             return Ok(compressor);
         }
         if matches!(
