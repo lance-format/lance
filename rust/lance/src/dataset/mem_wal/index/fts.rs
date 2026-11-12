@@ -697,15 +697,16 @@ pub fn levenshtein_distance(a: &str, b: &str) -> u32 {
 }
 
 /// Longest ASCII term, in bytes, that fuzzy expansion builds a Levenshtein
-/// automaton for. The work and memory per automaton state grow with the term
-/// length, and with two edits `fst` already gives up at about 50 bytes for
-/// most terms, so a longer term scans the dictionary.
+/// automaton for. The work per automaton state grows with the term length,
+/// and with two edits `fst` already gives up at about 50 bytes for most terms,
+/// so a longer term scans the dictionary.
 const FUZZY_AUTOMATON_MAX_TERM_BYTES: usize = 64;
 
-/// Partition terms per automaton state that fuzzy expansion may build.
-/// Building a state costs about as much as a few edit distances, so a build
-/// that reaches this limit and falls back adds less than the dictionary scan
-/// that follows it.
+/// Prefixed partition terms per automaton state that fuzzy expansion may
+/// build. Building a state costs about as much as an edit distance or two, so
+/// with more than a few hundred such terms, a build that reaches this limit
+/// and falls back costs less than the edit distances the fallback then
+/// computes.
 const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
 
 /// Most automaton states fuzzy expansion builds, `fst`'s default limit for
@@ -713,13 +714,14 @@ const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
 const FUZZY_AUTOMATON_MAX_STATES: usize = 10_000;
 
 /// The Levenshtein automaton that expands `term` over partitions holding
-/// `partition_terms` terms, or `None` to scan their dictionaries instead.
-/// `fst`'s automaton can miss matches for a non-ASCII term (lance-index keeps
-/// its own Unicode automaton for those), and building one for a long term or
-/// a small dictionary can cost far more than the scan it replaces.
-fn fuzzy_automaton(term: &str, max_distance: u32, partition_terms: usize) -> Option<Levenshtein> {
+/// `prefixed_terms` terms with the required prefix, or `None` to scan their
+/// dictionaries instead. `fst`'s automaton can miss matches for a non-ASCII
+/// term (lance-index keeps its own Unicode automaton for those), and building
+/// one for a long term or a small dictionary can cost far more than the scan
+/// it replaces.
+fn fuzzy_automaton(term: &str, max_distance: u32, prefixed_terms: usize) -> Option<Levenshtein> {
     let state_limit =
-        (partition_terms / FUZZY_AUTOMATON_TERMS_PER_STATE).min(FUZZY_AUTOMATON_MAX_STATES);
+        (prefixed_terms / FUZZY_AUTOMATON_TERMS_PER_STATE).min(FUZZY_AUTOMATON_MAX_STATES);
     if !term.is_ascii() || term.len() > FUZZY_AUTOMATON_MAX_TERM_BYTES || state_limit == 0 {
         return None;
     }
@@ -2792,8 +2794,12 @@ impl FtsMemIndex {
         // A partition's dictionary is an FST, so a Levenshtein automaton
         // yields only the terms within `max_distance`, as the committed index
         // does. Without one, every partition term with the prefix is checked.
-        let partition_terms = st.partitions.iter().map(|p| p.term_fst.len()).sum();
-        let automaton = fuzzy_automaton(term, max_distance, partition_terms);
+        let prefixed_terms = st
+            .partitions
+            .iter()
+            .map(|p| p.count_terms_with_prefix(prefix))
+            .sum();
+        let automaton = fuzzy_automaton(term, max_distance, prefixed_terms);
         for p in st.partitions.iter() {
             match &automaton {
                 Some(automaton) => {
@@ -4547,6 +4553,28 @@ impl Partition {
             out[id as usize] = Arc::from(std::str::from_utf8(key).expect("utf8 term"));
         }
         out
+    }
+
+    /// Number of terms that start with `prefix`. Term ids are dense and follow
+    /// term order, so this is the difference between the ids of the first
+    /// terms at or after two keys, found without walking the terms in between.
+    fn count_terms_with_prefix(&self, prefix: &str) -> usize {
+        if prefix.is_empty() {
+            return self.term_fst.len();
+        }
+        let first_id_at_or_after = |key: &[u8]| {
+            self.term_fst
+                .range()
+                .ge(key)
+                .into_stream()
+                .next()
+                .map_or(self.term_fst.len(), |(_, id)| id as usize)
+        };
+        // A UTF-8 term never contains the byte 0xFF, so every term with the
+        // prefix sorts before the prefix followed by 0xFF.
+        let mut end = prefix.as_bytes().to_vec();
+        end.push(0xFF);
+        first_id_at_or_after(&end) - first_id_at_or_after(prefix.as_bytes())
     }
 
     /// Exact upper bound on a term's BM25 contribution to any doc: the max over
@@ -6945,13 +6973,36 @@ mod tests {
     fn test_fuzzy_automaton_bounds(
         #[case] term: &str,
         #[case] max_distance: u32,
-        #[case] partition_terms: usize,
+        #[case] prefixed_terms: usize,
         #[case] builds: bool,
     ) {
         assert_eq!(
-            fuzzy_automaton(term, max_distance, partition_terms).is_some(),
+            fuzzy_automaton(term, max_distance, prefixed_terms).is_some(),
             builds
         );
+    }
+
+    #[rstest]
+    #[case::empty("", 7)]
+    #[case::shared("bra", 3)]
+    #[case::whole_term("brave", 2)]
+    #[case::past_terms("bravest", 0)]
+    #[case::before_all("a", 0)]
+    #[case::between_terms("zz", 0)]
+    #[case::non_ascii("caf", 2)]
+    #[case::last_term("ü", 1)]
+    fn test_count_terms_with_prefix(#[case] prefix: &str, #[case] expected: usize) {
+        let terms = [
+            "banana", "brava", "brave", "bravery", "cafe", "café", "über",
+        ];
+        let mut docs = DocSet::default();
+        docs.append(0, terms.len() as u32);
+        let entries = terms
+            .iter()
+            .map(|term| (Arc::from(*term), vec![(0, 1, vec![0])]))
+            .collect();
+        let partition = build_partition(entries, docs);
+        assert_eq!(partition.count_terms_with_prefix(prefix), expected);
     }
 
     /// Partitions expand an ASCII term with a Levenshtein automaton over their
@@ -6965,6 +7016,8 @@ mod tests {
     #[case::non_ascii_query("café", 1, 0, 50, 2_000, false)]
     // Too few terms to pay for building the automaton.
     #[case::small_dictionary("bravo", 2, 0, 50, 0, false)]
+    // Plenty of terms, but few of them with the prefix.
+    #[case::few_prefixed_terms("cafe", 2, 1, 50, 2_000, false)]
     fn test_expand_fuzzy_matches_dictionary_scan(
         #[case] term: &str,
         #[case] max_distance: u32,
@@ -6995,9 +7048,10 @@ mod tests {
             )
             .unwrap()
         };
-        // Far from every query term, these only grow the dictionary.
+        // Far from every query term, these only grow the dictionary, and the
+        // set of terms starting with "b".
         let fillers: Vec<String> = (0..fillers_per_partition)
-            .map(|i| format!("x{i:05}"))
+            .map(|i| format!("b{i:05}"))
             .collect();
         let fillers = fillers.join(" ");
         // The first two rows freeze into separate partitions, the third stays
@@ -7063,9 +7117,8 @@ mod tests {
             })
             .sum();
         let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
-        let dictionary_size = st.partitions.iter().map(|p| p.term_fst.len()).sum();
         assert_eq!(
-            fuzzy_automaton(term, max_distance, dictionary_size).is_some(),
+            fuzzy_automaton(term, max_distance, partition_terms).is_some(),
             uses_automaton
         );
         if uses_automaton {
