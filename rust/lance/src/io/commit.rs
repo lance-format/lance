@@ -666,8 +666,14 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            record_new_dataset_commit(metadata_cache, transaction, &manifest, &manifest_location)
-                .await;
+            record_new_dataset_commit(
+                metadata_cache,
+                object_store,
+                transaction,
+                &manifest,
+                &manifest_location,
+            )
+            .await;
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
@@ -691,6 +697,7 @@ async fn do_commit_new_dataset(
                     let committed_manifest = *committed_manifest;
                     record_new_dataset_commit(
                         metadata_cache,
+                        object_store,
                         transaction,
                         &committed_manifest,
                         &location,
@@ -730,6 +737,7 @@ async fn do_commit_new_dataset(
                     let committed_manifest = *committed_manifest;
                     record_new_dataset_commit(
                         metadata_cache,
+                        object_store,
                         transaction,
                         &committed_manifest,
                         &location,
@@ -759,6 +767,7 @@ async fn do_commit_new_dataset(
 /// direct-success and verified-own-commit paths of `do_commit_new_dataset`.
 async fn record_new_dataset_commit(
     metadata_cache: &DSMetadataCache,
+    object_store: &ObjectStore,
     transaction: &Transaction,
     manifest: &Manifest,
     location: &ManifestLocation,
@@ -770,13 +779,14 @@ async fn record_new_dataset_commit(
         .insert_with_key(&tx_key, Arc::new(transaction.clone()))
         .await;
 
-    let manifest_key = crate::session::caches::ManifestKey {
-        version: location.version,
-        e_tag: location.e_tag.as_deref(),
-    };
-    metadata_cache
-        .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
-        .await;
+    crate::session::caches::cache_manifest(
+        metadata_cache,
+        object_store,
+        location,
+        Arc::new(manifest.clone()),
+        Arc::new(tokio::sync::OnceCell::new()),
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1733,15 +1743,15 @@ async fn record_successful_commit(
         .insert_with_key(&tx_key, Arc::new(transaction.clone()))
         .await;
 
-    let manifest_key = crate::session::caches::ManifestKey {
-        version: location.version,
-        e_tag: location.e_tag.as_deref(),
-    };
-    dataset
-        .metadata_cache
-        .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
-        .await;
-    if !indices.is_empty() {
+    crate::session::caches::cache_manifest(
+        &dataset.metadata_cache,
+        &dataset.object_store,
+        location,
+        Arc::new(manifest.clone()),
+        Arc::new(tokio::sync::OnceCell::new()),
+    )
+    .await;
+    if !indices.is_empty() && location.e_tag.is_some() {
         let key = IndexMetadataKey {
             version: manifest.version,
             store_identity: &dataset.object_store.store_prefix,

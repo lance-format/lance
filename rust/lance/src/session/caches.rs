@@ -10,7 +10,13 @@
 //!     │    │
 //!     └────┴──► FileMetadataCache (prefixed by file path)
 
-use std::{borrow::Cow, ops::Deref};
+use std::{
+    borrow::Cow,
+    ops::Deref,
+    sync::{Arc, Weak},
+};
+
+use tokio::sync::OnceCell;
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
@@ -96,6 +102,113 @@ impl CacheKey for ManifestKey<'_> {
             builder.write_none();
         }
     }
+}
+
+/// Runtime provenance without retaining a second owner of the manifest. The weak
+/// pointer prevents association with a replacement entry at the same URI/version.
+#[derive(Debug)]
+pub struct ManifestDigest {
+    pub manifest: Weak<Manifest>,
+    pub store: Weak<dyn object_store::ObjectStore>,
+    pub digest: Arc<OnceCell<[u8; 32]>>,
+}
+
+impl DeepSizeOf for ManifestDigest {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // Weak handles do not own the manifest or storage allocations.
+        if context.mark_seen(Arc::as_ptr(&self.digest) as usize) {
+            std::mem::size_of::<OnceCell<[u8; 32]>>()
+        } else {
+            0
+        }
+    }
+}
+
+/// Digest and runtime provenance of a cached manifest; never a persisted cache key.
+#[derive(Debug)]
+pub struct ManifestDigestKey<'a> {
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub manifest_path: &'a Path,
+    pub manifest_identity: Option<&'a str>,
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for ManifestDigestKey<'_> {
+    type ValueType = ManifestDigest;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "manifest_digest/{}/{:?}/{:?}/{:?}/{:?}",
+            self.version,
+            self.store_identity,
+            self.manifest_path,
+            self.manifest_identity,
+            self.e_tag,
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "ManifestDigest"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.manifest-digest-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(self.store_identity);
+        builder.write_str(self.manifest_path.as_ref());
+        if let Some(identity) = self.manifest_identity {
+            builder.write_some();
+            builder.write_str(identity);
+        } else {
+            builder.write_none();
+        }
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
+    }
+}
+
+/// Cache metadata and its shared, possibly uninitialized original-byte digest.
+/// Writes defer hashing until snapshot capture, preserving metadata-only opens.
+pub async fn cache_manifest(
+    cache: &DSMetadataCache,
+    object_store: &lance_io::object_store::ObjectStore,
+    location: &lance_table::io::commit::ManifestLocation,
+    manifest: Arc<Manifest>,
+    digest: Arc<OnceCell<[u8; 32]>>,
+) {
+    cache
+        .insert_with_key(
+            &ManifestKey {
+                version: location.version,
+                e_tag: location.e_tag.as_deref(),
+            },
+            manifest.clone(),
+        )
+        .await;
+    cache
+        .insert_with_key(
+            &ManifestDigestKey {
+                version: location.version,
+                store_identity: &object_store.store_prefix,
+                manifest_path: &location.path,
+                manifest_identity: location.identity.as_deref(),
+                e_tag: location.e_tag.as_deref(),
+            },
+            Arc::new(ManifestDigest {
+                manifest: Arc::downgrade(&manifest),
+                store: Arc::downgrade(&object_store.inner),
+                digest,
+            }),
+        )
+        .await;
 }
 
 #[derive(Debug)]

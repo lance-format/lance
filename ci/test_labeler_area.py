@@ -8,9 +8,11 @@ ROOT = Path(__file__).parent.parent
 LABELER_CONFIG = ROOT / ".github" / "labeler-area.yml"
 EXECUTION_PROTO_PATHS = {
     "protos/ann.proto",
+    "protos/blob_reference.proto",
     "protos/cache_diagnostics.proto",
     "protos/filtered_read.proto",
     "protos/fts.proto",
+    "protos/snapshot.proto",
     "protos/table_identifier.proto",
 }
 

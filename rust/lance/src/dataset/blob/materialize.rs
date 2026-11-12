@@ -28,7 +28,7 @@ use lance_core::{Error, ROW_ADDR, Result};
 
 #[derive(Debug)]
 pub(super) struct BlobMaterializationBudget {
-    limit: u64,
+    pub(super) limit: u64,
     pub(super) state: std::sync::Mutex<BlobMaterializationBudgetState>,
     notify: Notify,
 }
@@ -52,7 +52,7 @@ impl BlobMaterializationBudgetState {
 }
 
 impl BlobMaterializationBudget {
-    fn admission(self: &Arc<Self>) -> BlobMaterializationAdmission {
+    pub(super) fn admission(self: &Arc<Self>) -> BlobMaterializationAdmission {
         let ticket = {
             let mut state = self.state.lock().unwrap();
             let ticket = state.next_ticket;
@@ -72,6 +72,8 @@ impl BlobMaterializationBudget {
     }
 }
 
+/// A FIFO position for reserving materialization bytes. Dropping an unfulfilled
+/// admission cancels its position without blocking later callers.
 pub struct BlobMaterializationAdmission {
     budget: Option<Arc<BlobMaterializationBudget>>,
     ticket: u64,
@@ -79,7 +81,10 @@ pub struct BlobMaterializationAdmission {
 }
 
 impl BlobMaterializationAdmission {
-    async fn reserve(mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
+    /// Wait for `bytes` of capacity. The returned reservation releases capacity
+    /// when dropped. One oversized reservation may run alone when the budget is idle.
+    /// An internally unbounded context returns `None`.
+    pub async fn reserve(mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
         let Some(budget) = self.budget.clone() else {
             self.acquired = true;
             return None;
@@ -132,9 +137,18 @@ impl Drop for BlobMaterializationAdmission {
 }
 
 #[derive(Debug)]
-struct BlobMaterializationReservation {
+/// Ownership of reserved materialization bytes. Drop this value after the
+/// corresponding output has been consumed, including any copies made by an adapter.
+pub struct BlobMaterializationReservation {
     budget: Arc<BlobMaterializationBudget>,
     bytes: u64,
+}
+
+impl BlobMaterializationReservation {
+    /// Number of bytes held until this reservation is dropped.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Drop for BlobMaterializationReservation {
@@ -149,8 +163,9 @@ impl Drop for BlobMaterializationReservation {
 /// Shared state for asynchronously materializing blob v2 descriptor batches.
 #[derive(Debug)]
 pub struct BlobMaterializationContext {
-    execution: Arc<ReadBlobsExecution>,
+    pub(super) execution: Arc<ReadBlobsExecution>,
     pub(super) budget: Option<Arc<BlobMaterializationBudget>>,
+    pub(super) io_budget: Option<Arc<BlobMaterializationBudget>>,
 }
 
 impl BlobMaterializationContext {
@@ -167,10 +182,56 @@ impl BlobMaterializationContext {
                     notify: Notify::new(),
                 })
             }),
+            io_budget: io_buffer_size_bytes.map(|limit| {
+                Arc::new(BlobMaterializationBudget {
+                    limit,
+                    state: std::sync::Mutex::new(BlobMaterializationBudgetState::default()),
+                    notify: Notify::new(),
+                })
+            }),
         })
     }
 
-    pub(crate) fn admission(&self) -> BlobMaterializationAdmission {
+    /// Create a shared context with finite, nonzero I/O and materialization limits.
+    ///
+    /// Reference readers sharing this context share both budgets and schedulers.
+    /// A single request larger than a limit is admitted alone; these limits do
+    /// not impose a hard cap on the size of one blob.
+    ///
+    /// ```
+    /// use lance::blob::reference::BlobMaterializationContext;
+    /// let context = BlobMaterializationContext::try_new(1 << 20, 8 << 20)?;
+    /// # Ok::<(), lance::Error>(())
+    /// ```
+    pub fn try_new(
+        io_buffer_size_bytes: u64,
+        materialization_readahead_bytes: u64,
+    ) -> Result<Arc<Self>> {
+        if io_buffer_size_bytes == 0 || materialization_readahead_bytes == 0 {
+            return Err(Error::invalid_input(format!(
+                "Blob budgets must be nonzero: io_buffer_size_bytes={io_buffer_size_bytes}, materialization_readahead_bytes={materialization_readahead_bytes}"
+            )));
+        }
+        Ok(Self::new(
+            Some(io_buffer_size_bytes),
+            Some(materialization_readahead_bytes),
+        ))
+    }
+
+    /// Reserve a FIFO position before waiting for materialization capacity.
+    ///
+    /// ```
+    /// # use lance::blob::reference::BlobMaterializationContext;
+    /// # async fn example() -> lance::Result<()> {
+    /// let budget = BlobMaterializationContext::try_new(1024, 4096)?;
+    /// let reservation = budget.admission().reserve(128).await;
+    /// assert_eq!(reservation.as_ref().map(|reservation| reservation.bytes()), Some(128));
+    /// // Retain this reservation alongside an adapter's separately allocated output.
+    /// drop(reservation);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn admission(&self) -> BlobMaterializationAdmission {
         match &self.budget {
             Some(budget) => budget.admission(),
             None => BlobMaterializationAdmission {
@@ -179,6 +240,36 @@ impl BlobMaterializationContext {
                 acquired: false,
             },
         }
+    }
+
+    /// Materialization bytes currently owned by active reads or returned buffers.
+    pub fn reserved_bytes(&self) -> Result<u64> {
+        self.budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .state
+                    .lock()
+                    .map(|state| state.reserved)
+                    .map_err(|_| Error::internal("Blob materialization budget lock was poisoned"))
+            })
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+    }
+
+    /// Physical bytes admitted by reference readers and still in flight.
+    pub fn io_reserved_bytes(&self) -> Result<u64> {
+        self.io_budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .state
+                    .lock()
+                    .map(|state| state.reserved)
+                    .map_err(|_| Error::internal("Blob I/O budget lock was poisoned"))
+            })
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
     }
 
     #[cfg(test)]
