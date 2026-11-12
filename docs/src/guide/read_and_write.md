@@ -802,7 +802,10 @@ Repacking is off by default. Set `max_data_files_per_fragment`, as a
 its columns in more files than this.
 
 `scope` limits a run to one kind of work: `"rewrite_fragments"`,
-`"repack_columns"`, or `"all"` (the default).
+`"repack_columns"`, or `"all"` (the default). Repack tasks come after the
+rewrite tasks, so `max_source_fragments`, `max_source_rows` and
+`max_source_bytes` reach them only once the rewrites fit; use
+`scope="repack_columns"` to budget repacks on their own.
 
 ```python
 dataset.optimize.compact_files(max_data_files_per_fragment=2)

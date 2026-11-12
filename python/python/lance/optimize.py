@@ -105,7 +105,8 @@ class CompactionOptions(TypedDict, total=False):
     Maximum number of source fragments to compact in a single run. Tasks
     are included until adding the next task would exceed this limit,
     allowing for incremental compaction (e.g., compact 20 fragments at a
-    time). Fragments are processed oldest first.
+    time). Rewrite tasks are admitted first, in fragment order, then repack
+    tasks.
     (default: None, no limit)
     """
     max_source_rows: Optional[int]

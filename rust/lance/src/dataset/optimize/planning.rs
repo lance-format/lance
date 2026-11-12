@@ -294,7 +294,10 @@ pub struct CompactionOptions {
     /// stay, as do files sharing a column with the lineage file, so a fragment
     /// can stay above the limit. Above a limit of 1, when every file could go,
     /// one is kept if a merge can leave it, the largest if possible. Not
-    /// planned under `ForceBinaryCopy`.
+    /// planned under `ForceBinaryCopy`. Repack tasks come after every rewrite
+    /// task, so the `max_source_*` budgets reach them only once the rewrites
+    /// fit; with [`CompactionScope::RepackColumns`] they are budgeted on their
+    /// own.
     ///
     /// Defaults to `None` (no repack). Must be at least 1.
     ///
@@ -718,7 +721,8 @@ pub struct SourceBudgetSummary {
     pub next_task_source_rows: Option<usize>,
     /// Source fragments in the first task excluded by a budget.
     pub next_task_source_fragments: Option<usize>,
-    /// Source data and overlay bytes in the first excluded task. `None` when
+    /// Source bytes in the first excluded task, using the same accounting as
+    /// [`Self::selected_source_bytes`]. `None` when
     /// no task was excluded, [`CompactionOptions::max_source_bytes`] is unset,
     /// grouped fragment admission encounters unrecorded sizes, or soft mode stops
     /// after admitting an oversized or unmeasurable first task.
