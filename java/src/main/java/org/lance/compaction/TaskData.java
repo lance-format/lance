@@ -50,6 +50,13 @@ public class TaskData implements Serializable {
     return fragments;
   }
 
+  /** What the task does: a column repack exactly when {@link #getRepackFiles()} is non-null. */
+  public CompactionTaskKind getKind() {
+    return repackFiles == null
+        ? CompactionTaskKind.REWRITE_FRAGMENTS
+        : CompactionTaskKind.REPACK_COLUMNS;
+  }
+
   /**
    * The new data files of a column repack, each the field ids of the top-level columns it holds.
    *

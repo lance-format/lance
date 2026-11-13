@@ -20,6 +20,7 @@ import org.lance.compaction.CompactionOptions;
 import org.lance.compaction.CompactionPlan;
 import org.lance.compaction.CompactionScope;
 import org.lance.compaction.CompactionTask;
+import org.lance.compaction.CompactionTaskKind;
 import org.lance.compaction.RewriteResult;
 import org.lance.compaction.SourceBudgetMode;
 import org.lance.compaction.TaskData;
@@ -325,6 +326,7 @@ public class CompactionTest {
         List<RewriteResult> results = new ArrayList<>();
         for (CompactionTask task : plan.getCompactionTasks()) {
           task = serializeAndDeserialize(task);
+          assertEquals(CompactionTaskKind.REPACK_COLUMNS, task.getTaskData().getKind());
           assertEquals(
               Collections.singletonList(Arrays.asList(0, 1, 2)),
               task.getTaskData().getRepackFiles());
@@ -369,6 +371,7 @@ public class CompactionTest {
     TaskData task = deserialize(PRE_REPACK_TASK_DATA_BASE64);
     assertEquals(Collections.emptyList(), task.getFragments());
     assertNull(task.getRepackFiles(), "an older task reads as a fragment rewrite");
+    assertEquals(CompactionTaskKind.REWRITE_FRAGMENTS, task.getKind());
 
     RewriteResult result = deserialize(PRE_REPACK_REWRITE_RESULT_BASE64);
     assertEquals(7L, result.getReadVersion());

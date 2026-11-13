@@ -284,22 +284,27 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
-    /// Repack the columns of a fragment that holds them in more than this many
-    /// data files ([`FragmentColumnLayoutStats::live_file_count`]) into fewer
-    /// files. Each `add_columns` backfill adds a file per fragment, and no
-    /// rewrite trigger counts files. A repack keeps rows, fragment ids and
-    /// index coverage (see [`CompactionTaskKind::RepackColumns`]) and writes
-    /// each new file whole, ignoring `max_bytes_per_file`. Files holding a blob
-    /// column, a column only partly in the fragment, or spilled row lineage
-    /// stay, as do files sharing a column with the lineage file, so a fragment
-    /// can stay above the limit. Above a limit of 1, when every file could go,
-    /// one is kept if a merge can leave it, the largest if possible. Not
-    /// planned under `ForceBinaryCopy`. Repack tasks come after every rewrite
-    /// task, so the `max_source_*` budgets reach them only once the rewrites
-    /// fit; with [`CompactionScope::RepackColumns`] they are budgeted on their
-    /// own.
+    /// Repack a fragment's columns into fewer data files when it holds them in
+    /// more than this many ([`FragmentColumnLayoutStats::live_file_count`]);
+    /// this is the only repack trigger. Each `add_columns` backfill adds a
+    /// file per fragment, and no rewrite trigger counts files. A repack keeps
+    /// rows, fragment ids and index coverage (see
+    /// [`CompactionTaskKind::RepackColumns`]) and writes each new file whole,
+    /// ignoring `max_bytes_per_file`.
     ///
-    /// Defaults to `None` (no repack). Must be at least 1.
+    /// A fragment over the limit is still left alone when `scope` excludes
+    /// repacks, a rewrite task takes it, it is in `excluded_fragment_ids`, the
+    /// mode is `ForceBinaryCopy`, it holds a legacy (V1) file, or fewer than
+    /// two of its files can be emptied: files holding a blob column, a column
+    /// only partly in the fragment, or spilled row lineage stay, as do files
+    /// sharing a column with the lineage file. Above a limit of 1, when every
+    /// file could go, one is kept if a merge can leave it, the largest if
+    /// possible. Repack tasks come after every rewrite task, so the
+    /// `max_source_*` budgets reach them only once the rewrites fit.
+    ///
+    /// Defaults to `None` (no repack). Must be at least 1, and must be set
+    /// with [`CompactionScope::RepackColumns`], which also refuses
+    /// `ForceBinaryCopy`.
     ///
     /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
     #[serde(default)]
@@ -615,6 +620,22 @@ impl CompactionOptions {
                  (use None for no limit)",
             ));
         }
+        // The file count is the only repack trigger, so these runs could
+        // never plan a task.
+        if self.scope == CompactionScope::RepackColumns {
+            if self.max_data_files_per_fragment.is_none() {
+                return Err(Error::invalid_input(
+                    "CompactionOptions::scope is RepackColumns but \
+                     max_data_files_per_fragment is not set, so no repack would be planned",
+                ));
+            }
+            if matches!(self.compaction_mode(), CompactionMode::ForceBinaryCopy) {
+                return Err(Error::invalid_input(
+                    "CompactionOptions::scope is RepackColumns but compaction_mode is \
+                     ForceBinaryCopy, which does not reencode, and a repack does",
+                ));
+            }
+        }
 
         for (name, value) in [
             (
@@ -854,7 +875,8 @@ pub enum CompactionScope {
     All,
     /// Only rewrite fragments.
     RewriteFragments,
-    /// Only repack columns.
+    /// Only repack columns. Requires
+    /// [`CompactionOptions::max_data_files_per_fragment`].
     RepackColumns,
 }
 
@@ -1516,31 +1538,6 @@ impl DefaultCompactionPlanner {
             dataset.manifest.data_storage_format.lance_file_format(),
             write_version,
         )?;
-        // A repack keeps every row where it is, so it neither records moves
-        // nor remaps an index.
-        let moves_rows_with_stable_row_ids = dataset.manifest.uses_stable_row_ids()
-            && self.options.scope != CompactionScope::RepackColumns;
-        if self.options.defer_index_remap && moves_rows_with_stable_row_ids {
-            ensure_frag_reuse_recording_allowed(
-                &dataset.manifest,
-                &load_all_indices(dataset).await?,
-            )?;
-        }
-        // Computed at most once here, rather than reloaded by every task in
-        // `rewrite_files` and the planner above: see the doc comment on
-        // `CompactionOptions::has_eager_remappable_index`.
-        let eager_remap_capable =
-            if !self.options.defer_index_remap && moves_rows_with_stable_row_ids {
-                Some(has_eager_remappable_index(dataset).await?)
-            } else {
-                None
-            };
-        if !self.options.defer_index_remap
-            && (!dataset.manifest.uses_stable_row_ids() || eager_remap_capable == Some(true))
-        {
-            reject_eager_remap_over_undrained_fri(dataset).await?;
-        }
-
         let mut all_tasks = if self.options.scope == CompactionScope::RepackColumns {
             Vec::new()
         } else {
@@ -1556,6 +1553,34 @@ impl DefaultCompactionPlanner {
 
         let (tasks, source_budget) =
             limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+
+        // A repack keeps every row where it is, so it neither records moves
+        // nor remaps an index: only a plan that rewrites fragments is checked.
+        let moves_rows = tasks
+            .iter()
+            .any(|task| task.kind == CompactionTaskKind::RewriteFragments);
+        let moves_rows_with_stable_row_ids = moves_rows && dataset.manifest.uses_stable_row_ids();
+        if self.options.defer_index_remap && moves_rows_with_stable_row_ids {
+            ensure_frag_reuse_recording_allowed(
+                &dataset.manifest,
+                &load_all_indices(dataset).await?,
+            )?;
+        }
+        // Computed at most once here, rather than reloaded by every task in
+        // `rewrite_files` and the planner above: see the doc comment on
+        // `CompactionOptions::has_eager_remappable_index`.
+        let eager_remap_capable =
+            if !self.options.defer_index_remap && moves_rows_with_stable_row_ids {
+                Some(has_eager_remappable_index(dataset).await?)
+            } else {
+                None
+            };
+        if moves_rows
+            && !self.options.defer_index_remap
+            && (!dataset.manifest.uses_stable_row_ids() || eager_remap_capable == Some(true))
+        {
+            reject_eager_remap_over_undrained_fri(dataset).await?;
+        }
         warn_blocked_source_budget(&self.options, &source_budget);
 
         let mut options = self.options.clone();

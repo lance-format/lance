@@ -62,6 +62,7 @@ class RewriteResult:
 class CompactionTask:
     read_version: int
     kind: Literal["rewrite_fragments", "repack_columns"]
+    repack_files: Optional[List[List[int]]]
     fragments: List["FragmentMetadata"]
 
     def execute(self, dataset: "LanceDataset") -> RewriteResult: ...

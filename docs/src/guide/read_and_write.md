@@ -799,11 +799,14 @@ addresses, deletions, data overlays and index coverage stay as they are.
 Repacking is off by default. Set `max_data_files_per_fragment`, as a
 `compact_files` argument or as the table config key
 `lance.compaction.max_data_files_per_fragment`, to repack a fragment that holds
-its columns in more files than this.
+its columns in more files than this. The file count is the only thing that
+triggers a repack.
 
 `scope` limits a run to one kind of work: `"rewrite_fragments"`,
-`"repack_columns"`, or `"all"` (the default). Repack tasks come after the
-rewrite tasks, so `max_source_fragments`, `max_source_rows` and
+`"repack_columns"`, or `"all"` (the default). `scope="repack_columns"` is
+refused without `max_data_files_per_fragment` or with the `force_binary_copy`
+compaction mode, since such a run could plan nothing. Repack tasks come after
+the rewrite tasks, so `max_source_fragments`, `max_source_rows` and
 `max_source_bytes` reach them only once the rewrites fit; use
 `scope="repack_columns"` to budget repacks on their own.
 

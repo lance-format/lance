@@ -307,6 +307,17 @@ impl PyCompactionTask {
         }
     }
 
+    /// Optional[List[List[int]]] : For a column repack, the new data files it
+    /// writes, each the field ids of the top-level columns it holds. ``None``
+    /// for a task that rewrites its fragments.
+    #[getter]
+    pub fn repack_files(&self) -> Option<Vec<Vec<i32>>> {
+        match &self.0.task.kind {
+            CompactionTaskKind::RewriteFragments => None,
+            CompactionTaskKind::RepackColumns { files } => Some(files.clone()),
+        }
+    }
+
     /// List[lance.fragment.FragmentMetadata] : The fragments that will be compacted.
     #[getter]
     pub fn fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {

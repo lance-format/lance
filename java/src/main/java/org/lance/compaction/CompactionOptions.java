@@ -509,16 +509,21 @@ public class CompactionOptions implements Serializable {
     /**
      * Maximum number of data files a fragment may hold columns in before its columns are repacked
      * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
-     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are.
-     * Unset uses {@code lance.compaction.max_data_files_per_fragment} from the table config, or no
-     * repack. Must be at least 1; checked when the compaction is planned.
+     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are. The
+     * file count is the only repack trigger. Unset uses {@code
+     * lance.compaction.max_data_files_per_fragment} from the table config, or no repack. Must be at
+     * least 1; checked when the compaction is planned.
      */
     public Builder withMaxDataFilesPerFragment(long maxDataFilesPerFragment) {
       this.maxDataFilesPerFragment = Optional.of(maxDataFilesPerFragment);
       return this;
     }
 
-    /** Which kinds of task to plan. Defaults to {@link CompactionScope#ALL}. */
+    /**
+     * Which kinds of task to plan. Defaults to {@link CompactionScope#ALL}. {@link
+     * CompactionScope#REPACK_COLUMNS} requires a max data file count and refuses {@link
+     * CompactionMode#FORCE_BINARY_COPY}; checked when the compaction is planned.
+     */
     public Builder withScope(CompactionScope scope) {
       this.scope = Optional.of(Objects.requireNonNull(scope, "scope"));
       return this;

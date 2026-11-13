@@ -234,6 +234,8 @@ def test_distributed_repack(tmp_path: Path):
         dataset, options=dict(max_data_files_per_fragment=2, scope="repack_columns")
     )
     assert [task.kind for task in plan.tasks] == ["repack_columns"] * 2
+    # Field ids 2 and 3 are c and d, merged into one file.
+    assert [task.repack_files for task in plan.tasks] == [[[2, 3]]] * 2
     results = [
         pickle.loads(pickle.dumps(pickle.loads(pickle.dumps(task)).execute(dataset)))
         for task in plan.tasks
@@ -314,6 +316,10 @@ def test_repack_rejects_bad_options(tmp_path: Path):
     dataset = _backfilled(tmp_path)
     with pytest.raises(ValueError, match="Invalid compaction scope"):
         dataset.optimize.compact_files(scope="nonsense")
+
+    # A repack-only run with nothing to trigger a repack.
+    with pytest.raises(OSError, match="max_data_files_per_fragment is not set"):
+        dataset.optimize.compact_files(scope="repack_columns")
 
     dataset.update_config({"lance.compaction.max_data_files_per_fragment": "lots"})
     with pytest.raises(ValueError, match="expected a positive integer"):

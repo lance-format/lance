@@ -186,12 +186,15 @@ class DatasetOptimizer:
             backfill adds one file per fragment. A repack rewrites only the
             columns that move and keeps rows, fragment ids and indices as they
             are. If not specified, uses the manifest config value, or no limit.
+            The file count is the only repack trigger.
         scope: str, optional
             Which tasks to plan: ``"rewrite_fragments"`` only rewrites
             fragments, ``"repack_columns"`` only repacks columns, and
-            ``"all"`` (the default) does both. A run that does both commits
-            the rewrites and the repacks separately; if the repack commit
-            fails, the dataset is left at the rewrite's version.
+            ``"all"`` (the default) does both. ``"repack_columns"`` requires
+            ``max_data_files_per_fragment``, as an argument or from the table
+            config, and refuses the ``"force_binary_copy"`` mode. A run that
+            does both commits the rewrites and the repacks separately; if the
+            repack commit fails, the dataset is left at the rewrite's version.
 
         Returns
         -------

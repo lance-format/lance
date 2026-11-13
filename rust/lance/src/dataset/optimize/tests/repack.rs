@@ -219,6 +219,8 @@ async fn repack_keeps_scalar_index() {
 #[derive(Debug)]
 enum BeforeTheRepack {
     Nothing,
+    /// An in-place update that stays visible to the CreateIndex rebase.
+    VisibleUpdate,
     /// An in-place update whose version is then cleaned up.
     CleanedUpUpdate,
     /// A `Merge` that points `d` at a new file holding a new value.
@@ -227,10 +229,12 @@ enum BeforeTheRepack {
 
 /// An index built before a repack and committed after it keeps its coverage
 /// of the repacked fragments, since the repack only moved the values the
-/// index read. A change to those values before the repack that the rebase
-/// cannot see withdraws it, and so does any `Merge` in between.
+/// index read. An in-place update of those values before the repack withdraws
+/// the coverage of its fragment. One whose version was cleaned up, or any
+/// `Merge` in between, withdraws the coverage of every repacked fragment.
 #[rstest]
 #[case::nothing(BeforeTheRepack::Nothing, vec![0, 1], "d = 6")]
+#[case::visible_update(BeforeTheRepack::VisibleUpdate, vec![1], "d = 100")]
 #[case::cleaned_up_update(BeforeTheRepack::CleanedUpUpdate, vec![], "d = 100")]
 #[case::in_place_merge(BeforeTheRepack::InPlaceMerge, vec![], "d = 100")]
 #[tokio::test]
@@ -264,7 +268,7 @@ async fn index_built_across_a_repack(
     let mut latest = stale.clone();
     match before {
         BeforeTheRepack::Nothing => {}
-        BeforeTheRepack::CleanedUpUpdate => {
+        BeforeTheRepack::VisibleUpdate | BeforeTheRepack::CleanedUpUpdate => {
             write_new_value_of_d(&mut latest, NewValueOfD::InPlaceUpdate).await;
         }
         BeforeTheRepack::InPlaceMerge => {
@@ -492,16 +496,29 @@ async fn compaction_plans_no_repack_by_default() {
     .await
     .unwrap();
     assert!(plan.tasks.is_empty(), "{plan:?}");
-    let plan = plan_compaction(
-        &dataset,
-        &CompactionOptions {
-            scope: CompactionScope::RepackColumns,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert!(plan.tasks.is_empty(), "{plan:?}");
+}
+
+/// A repack-only run that could plan nothing is refused instead.
+#[rstest]
+#[case::without_a_limit(repack_options(None), "max_data_files_per_fragment is not set")]
+#[case::under_force_binary_copy(
+    CompactionOptions {
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+        ..repack_options(Some(1))
+    },
+    "ForceBinaryCopy"
+)]
+#[tokio::test]
+async fn repack_only_run_that_plans_nothing_is_refused(
+    #[case] options: CompactionOptions,
+    #[case] message: &str,
+) {
+    let dataset = write_backfilled().await;
+    let err = plan_compaction(&dataset, &options).await.unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidInput { .. }) && err.to_string().contains(message),
+        "{err}"
+    );
 }
 
 /// The limit is an upper bound: a fragment already at it is left alone.
@@ -1115,9 +1132,13 @@ fn repack_merges_every_movable_file_next_to_one_that_stays() {
 #[tokio::test]
 async fn repack_is_not_planned_under_force_binary_copy() {
     let dataset = write_backfilled().await;
+    // A target that leaves the 4-row fragments alone, so that the plan would
+    // hold only repacks.
     let options = CompactionOptions {
         compaction_mode: Some(CompactionMode::ForceBinaryCopy),
-        ..repack_options(Some(1))
+        target_rows_per_fragment: 4,
+        max_data_files_per_fragment: Some(1),
+        ..Default::default()
     };
     let plan = plan_compaction(&dataset, &options).await.unwrap();
     assert!(plan.tasks.is_empty(), "{plan:?}");

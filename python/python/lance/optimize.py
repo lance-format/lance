@@ -150,14 +150,16 @@ class CompactionOptions(TypedDict, total=False):
     Maximum number of data files a fragment may hold columns in before its
     columns are repacked into fewer files. Each ``add_columns`` backfill adds
     one file per fragment. A repack rewrites only the columns that move and
-    keeps rows, fragment ids and indices as they are. (default: the table
-    config ``lance.compaction.max_data_files_per_fragment``, else None, no
-    repack)
+    keeps rows, fragment ids and indices as they are. The file count is the
+    only repack trigger. (default: the table config
+    ``lance.compaction.max_data_files_per_fragment``, else None, no repack)
     """
     scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]
     """
     Which tasks to plan: ``"rewrite_fragments"`` only rewrites fragments,
     ``"repack_columns"`` only repacks columns, ``"all"`` does both.
+    ``"repack_columns"`` requires ``max_data_files_per_fragment``, as an option
+    or from the table config, and refuses the ``"force_binary_copy"`` mode.
     (default: "all")
     """
     data_storage_version: Optional[str]

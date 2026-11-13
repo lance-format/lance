@@ -480,10 +480,33 @@ async fn test_eager_remap_refuses_undrained_fri_over_address_domain_index(
     assert_answers(&dataset).await;
 }
 /// A repack-only run remaps no index, so an undrained FRI doesn't refuse
-/// it, and the FRI still resolves the btree's stale addresses after it.
+/// it, and the FRI still resolves the btree's stale addresses after it. Under
+/// `CompactionScope::All` the run is repack-only because the one fragment left
+/// has no rewrite to plan.
+#[rstest]
+#[case::stable_row_ids(true, CompactionScope::RepackColumns)]
+#[case::row_addresses(false, CompactionScope::RepackColumns)]
+#[case::stable_row_ids_any_scope(true, CompactionScope::All)]
+#[case::row_addresses_any_scope(false, CompactionScope::All)]
 #[tokio::test]
-async fn test_undrained_fri_allows_a_repack_only_plan() {
-    let mut dataset = stable_row_id_dataset("memory://", 5).await;
+async fn test_undrained_fri_allows_a_repack_only_plan(
+    #[case] enable_stable_row_ids: bool,
+    #[case] scope: CompactionScope,
+) {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_dataset_with_params(
+            "memory://",
+            FragmentCount::from(5),
+            FragmentRowCount::from(10),
+            Some(WriteParams {
+                enable_stable_row_ids,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
     dataset
         .create_index(
             &["i"],
@@ -514,11 +537,12 @@ async fn test_undrained_fri_allows_a_repack_only_plan() {
         .await
         .unwrap();
     let fragment_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(fragment_ids.len(), 1);
 
     compact_files(
         &mut dataset,
         CompactionOptions {
-            scope: CompactionScope::RepackColumns,
+            scope,
             max_data_files_per_fragment: Some(1),
             ..Default::default()
         },
