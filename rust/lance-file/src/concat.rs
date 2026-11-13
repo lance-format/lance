@@ -31,7 +31,7 @@ use prost::Message;
 use prost_types::Any;
 
 use crate::{
-    reader::{CachedFileMetadata, FileReader, RawFileMetadataOpen, normalize_blob_footer_schema},
+    reader::{CachedFileMetadata, FileReader, RawFileMetadataOpen},
     version::ConcreteFileVersion,
     versions,
     writer::{FileWriteSummary, FileWriterOptions},
@@ -157,7 +157,7 @@ impl DataFilePart {
     ) -> Result<Self> {
         validate_blob_id_range(blob_ids.as_ref())?;
         let metadata = Arc::new(FileReader::read_all_metadata(&input.scheduler()).await?);
-        let schema = Arc::new(normalize_blob_footer_schema(metadata.file_schema.as_ref()));
+        let schema = metadata.file_schema.clone();
         if let Some(expected_num_rows) = input.expected_num_rows
             && metadata.num_rows != expected_num_rows
         {

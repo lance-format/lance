@@ -627,29 +627,29 @@ fn attach_blob_descriptor_children(
 /// does not add persisted metadata or alter the file grammar.
 ///
 /// The function is idempotent: a schema whose Blob fields already have
-/// children is returned unchanged.
-pub(crate) fn normalize_blob_footer_schema(schema: &Schema) -> Schema {
+/// children is returned unchanged. It takes ownership so decoding a footer
+/// does not clone a schema that is about to be wrapped in an `Arc` anyway.
+pub(crate) fn normalize_blob_footer_schema(mut schema: Schema) -> Schema {
     let expected = &BLOB_V2_DESC_LANCE_FIELD.children;
     let missing_descriptor_count = schema
         .fields_pre_order()
         .filter(|field| is_childless_blob_v2_descriptor(field))
         .count();
     if missing_descriptor_count == 0 {
-        return schema.clone();
+        return schema;
     }
-    let mut normalized = schema.clone();
-    let mut descriptor_children = VecDeque::new();
+    let mut descriptor_children = VecDeque::with_capacity(missing_descriptor_count);
     let mut field_index = 0;
     while descriptor_children.len() < missing_descriptor_count
-        && field_index + expected.len() <= normalized.fields.len()
+        && field_index + expected.len() <= schema.fields.len()
     {
-        if normalized.fields[field_index..field_index + expected.len()]
+        if schema.fields[field_index..field_index + expected.len()]
             .iter()
             .zip(expected)
             .all(|(field, expected)| descriptor_child_matches(field, expected))
         {
             descriptor_children.push_back(
-                normalized
+                schema
                     .fields
                     .drain(field_index..field_index + expected.len())
                     .collect(),
@@ -658,8 +658,8 @@ pub(crate) fn normalize_blob_footer_schema(schema: &Schema) -> Schema {
             field_index += 1;
         }
     }
-    attach_blob_descriptor_children(&mut normalized.fields, &mut descriptor_children);
-    normalized
+    attach_blob_descriptor_children(&mut schema.fields, &mut descriptor_children);
+    schema
 }
 
 impl FileReader {
@@ -1159,10 +1159,7 @@ impl FileReader {
             fields: Fields(pb_schema.fields),
             metadata: pb_schema.metadata,
         };
-        let schema = Schema::try_from(fields_with_meta)?;
-        // Blob v2 descriptor children are persisted with anonymous field ids
-        // and would otherwise be rebuilt as orphan top-level fields.
-        let schema = normalize_blob_footer_schema(&schema);
+        let schema = normalize_blob_footer_schema(Schema::try_from(fields_with_meta)?);
         Ok((num_rows, schema))
     }
 
@@ -2741,10 +2738,11 @@ mod tests {
     };
 
     use arrow_array::{
-        Array, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array, ListArray,
-        RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+        Array, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array,
+        LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+        UInt8Array, UInt32Array, UInt64Array,
         cast::AsArray,
-        types::{Float64Type, Int8Type, Int32Type},
+        types::{Float64Type, Int8Type, Int32Type, UInt8Type, UInt32Type, UInt64Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -5825,15 +5823,29 @@ mod tests {
         );
     }
 
-    /// Writes a v2.2 file with one Blob v2 column (in the prepared writer
-    /// layout) and, optionally, a legacy Blob v1 column and an ordinary `id`
-    /// column in front of it.
-    async fn write_blob_v2_raw_file(fs: &FsFixture, has_legacy_blob: bool, has_id: bool) {
-        use arrow_array::{
-            ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array,
-            UInt64Array,
-        };
+    fn prepared_blob_field(name: &str) -> Field {
+        Field::new(
+            name,
+            DataType::Struct(
+                vec![
+                    Field::new("kind", DataType::UInt8, true),
+                    Field::new("data", DataType::LargeBinary, true),
+                    Field::new("uri", DataType::Utf8, true),
+                    Field::new("blob_id", DataType::UInt32, true),
+                    Field::new("blob_size", DataType::UInt64, true),
+                    Field::new("position", DataType::UInt64, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]))
+    }
 
+    fn prepared_blob_array(payloads: &[Option<&'static [u8]>]) -> StructArray {
         let blob_fields = Fields::from(vec![
             Field::new("kind", DataType::UInt8, true),
             Field::new("data", DataType::LargeBinary, true),
@@ -5842,30 +5854,40 @@ mod tests {
             Field::new("blob_size", DataType::UInt64, true),
             Field::new("position", DataType::UInt64, true),
         ]);
-        let blob = StructArray::try_new(
-            blob_fields.clone(),
+        let nulls = NullBuffer::from(payloads.iter().map(Option::is_some).collect::<Vec<_>>());
+        StructArray::try_new(
+            blob_fields,
             vec![
-                Arc::new(UInt8Array::from(vec![0, 0, 0])),
-                Arc::new(LargeBinaryArray::from(vec![
-                    Some(b"first".as_ref()),
-                    None,
-                    Some(b"".as_ref()),
-                ])),
-                Arc::new(StringArray::from(vec![None::<&str>, None, None])),
-                Arc::new(UInt32Array::from(vec![0, 0, 0])),
-                Arc::new(UInt64Array::from(vec![0, 0, 0])),
-                Arc::new(UInt64Array::from(vec![0, 0, 0])),
+                Arc::new(UInt8Array::from(vec![0; payloads.len()])),
+                Arc::new(LargeBinaryArray::from(payloads.to_vec())),
+                Arc::new(StringArray::from(vec![None::<&str>; payloads.len()])),
+                Arc::new(UInt32Array::from(vec![0; payloads.len()])),
+                Arc::new(UInt64Array::from(vec![0; payloads.len()])),
+                Arc::new(UInt64Array::from(vec![0; payloads.len()])),
             ],
-            Some(NullBuffer::from(vec![true, false, true])),
+            Some(nulls),
+        )
+        .unwrap()
+    }
+
+    /// Writes a v2.2 file with two top-level Blob v2 columns and one nested Blob
+    /// v2 column (in the prepared writer layout), plus optional legacy Blob v1
+    /// and ordinary `id` columns.
+    async fn write_blob_v2_raw_file(fs: &FsFixture, has_legacy_blob: bool, has_id: bool) {
+        use arrow_array::ArrayRef;
+
+        let blob_a = prepared_blob_array(&[Some(b"first".as_ref()), None, Some(b"".as_ref())]);
+        let blob_b =
+            prepared_blob_array(&[Some(b"second".as_ref()), Some(b"third".as_ref()), None]);
+        let nested =
+            prepared_blob_array(&[Some(b"nested-0".as_ref()), None, Some(b"nested-2".as_ref())]);
+        let info = StructArray::try_new(
+            Fields::from(vec![prepared_blob_field("payload")]),
+            vec![Arc::new(nested) as ArrayRef],
+            None,
         )
         .unwrap();
-        let blob_field =
-            Field::new("blob", DataType::Struct(blob_fields), true).with_metadata(HashMap::from([
-                (
-                    lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
-                    lance_arrow::BLOB_V2_EXT_NAME.to_string(),
-                ),
-            ]));
+
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
         if has_legacy_blob {
@@ -5885,8 +5907,16 @@ mod tests {
             fields.push(Field::new("id", DataType::Int32, false));
             columns.push(Arc::new(Int32Array::from(vec![1, 2, 3])));
         }
-        fields.push(blob_field);
-        columns.push(Arc::new(blob));
+        fields.push(prepared_blob_field("blob_a"));
+        fields.push(prepared_blob_field("blob_b"));
+        fields.push(Field::new(
+            "info",
+            DataType::Struct(Fields::from(vec![prepared_blob_field("payload")])),
+            true,
+        ));
+        columns.push(Arc::new(blob_a));
+        columns.push(Arc::new(blob_b));
+        columns.push(Arc::new(info));
         let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
         let schema = batch.schema();
         write_lance_file(
@@ -5896,6 +5926,47 @@ mod tests {
             FileWriterOptions::default(),
         )
         .await;
+    }
+
+    fn descriptor_sizes(descriptor: &StructArray) -> Vec<Option<u64>> {
+        descriptor
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .collect()
+    }
+
+    fn descriptor_kinds(descriptor: &StructArray) -> Vec<Option<u8>> {
+        descriptor
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>()
+            .iter()
+            .collect()
+    }
+
+    fn descriptor_blob_ids(descriptor: &StructArray) -> Vec<Option<u32>> {
+        descriptor
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .iter()
+            .collect()
+    }
+
+    fn assert_descriptor(descriptor: &StructArray, sizes: &[Option<u64>], null_row: usize) {
+        assert_eq!(descriptor_sizes(descriptor), sizes);
+        assert_eq!(
+            descriptor_kinds(descriptor),
+            sizes.iter().map(|size| size.map(|_| 0)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            descriptor_blob_ids(descriptor),
+            sizes.iter().map(|size| size.map(|_| 0)).collect::<Vec<_>>()
+        );
+        assert_eq!(descriptor.null_count(), 1);
+        assert!(descriptor.is_null(null_row));
     }
 
     #[rstest]
@@ -5925,19 +5996,52 @@ mod tests {
         .await
         .unwrap();
 
-        // The anonymous descriptor children must stay under the Blob field
+        // The anonymous descriptor children must stay under their Blob parents
         // instead of being promoted to top-level fields.
         let schema = reader.schema();
-        let expected_top_level = 1 + usize::from(has_legacy_blob) + usize::from(has_id);
+        let expected_top_level = 3 + usize::from(has_legacy_blob) + usize::from(has_id);
         assert_eq!(schema.fields.len(), expected_top_level, "{schema:?}");
+        let mut expected_names = Vec::new();
         if has_legacy_blob {
-            // Legacy Blob v1 columns have no descriptor children to restore.
-            assert!(schema.field("legacy").unwrap().children.is_empty());
+            expected_names.push("legacy");
         }
-        let blob = schema.field("blob").unwrap();
-        assert!(blob.is_blob_v2());
+        if has_id {
+            expected_names.push("id");
+        }
+        expected_names.extend(["blob_a", "blob_b", "info"]);
         assert_eq!(
-            blob.children.len(),
+            schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        if has_legacy_blob {
+            let legacy = schema.field("legacy").unwrap();
+            assert!(legacy.is_blob());
+            assert!(!legacy.is_blob_v2());
+            assert!(legacy.children.is_empty());
+        }
+        for name in ["blob_a", "blob_b"] {
+            let blob = schema.field(name).unwrap();
+            assert!(blob.is_blob_v2());
+            assert!(blob.parent_id == -1);
+            assert_eq!(
+                blob.children.len(),
+                lance_core::datatypes::BLOB_V2_DESC_LANCE_FIELD
+                    .children
+                    .len()
+            );
+        }
+        let info = schema.field("info").unwrap();
+        assert_eq!(info.children.len(), 1);
+        let payload = &info.children[0];
+        assert_eq!(payload.name, "payload");
+        assert_eq!(payload.parent_id, info.id);
+        assert!(payload.is_blob_v2());
+        assert_eq!(
+            payload.children.len(),
             lance_core::datatypes::BLOB_V2_DESC_LANCE_FIELD
                 .children
                 .len()
@@ -5958,17 +6062,40 @@ mod tests {
         let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), expected_top_level);
-        let descriptor = batch.column_by_name("blob").unwrap().as_struct();
-        assert_eq!(descriptor.num_columns(), blob.children.len());
-        assert_eq!(descriptor.null_count(), 1);
-        assert!(descriptor.is_null(1));
+        if has_legacy_blob {
+            let legacy = batch["legacy"].as_binary::<i64>();
+            assert_eq!(
+                legacy.iter().collect::<Vec<_>>(),
+                vec![Some(b"legacy".as_ref()), Some(b"".as_ref()), None]
+            );
+        }
+        if has_id {
+            assert_eq!(
+                batch["id"]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some(1), Some(2), Some(3)]
+            );
+        }
 
-        // An explicit projection of the Blob column must decode its
-        // descriptor children too.
+        let blob_a = batch["blob_a"].as_struct();
+        let blob_b = batch["blob_b"].as_struct();
+        let nested = batch["info"]
+            .as_struct()
+            .column_by_name("payload")
+            .unwrap()
+            .as_struct();
+        assert_descriptor(blob_a, &[Some(5), None, Some(0)], 1);
+        assert_descriptor(blob_b, &[Some(6), Some(5), None], 2);
+        assert_descriptor(nested, &[Some(8), None, Some(8)], 1);
+
+        // An explicit projection of a top-level Blob and the nested Blob must
+        // decode the same descriptor values as the default projection.
         let projection = versions::reader_projection_from_column_names(
             ConcreteFileVersion::V2_2,
             schema,
-            &["blob"],
+            &["blob_b", "info.payload"],
         )
         .unwrap();
         let projected = reader
@@ -5985,8 +6112,20 @@ mod tests {
             .await
             .unwrap();
         let projected = concat_batches(&projected[0].schema(), &projected).unwrap();
-        assert_eq!(projected.num_columns(), 1);
-        assert_eq!(projected["blob"].to_data(), descriptor.to_data());
+        assert_eq!(projected.num_columns(), 2);
+        assert_eq!(projected["blob_b"].to_data(), batch["blob_b"].to_data());
+        assert_eq!(
+            projected["info"]
+                .as_struct()
+                .column_by_name("payload")
+                .unwrap()
+                .to_data(),
+            batch["info"]
+                .as_struct()
+                .column_by_name("payload")
+                .unwrap()
+                .to_data()
+        );
     }
 
     #[test]
