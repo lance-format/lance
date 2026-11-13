@@ -24,7 +24,9 @@
 //! own module.
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
-use crate::feature_flags::{apply_index_object_metadata_flag, inherit_sticky_feature_flags};
+use crate::feature_flags::{
+    apply_index_object_metadata_flag, inherit_sticky_feature_flags, validate_auto_cleanup_config,
+};
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
@@ -39,7 +41,7 @@ use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -322,6 +324,13 @@ impl<'a> ApplyState<'a> {
         )?;
         // After assembly, which may promote a blob to v2.
         check_blob_nesting(&manifest, Some(current_manifest))?;
+        // Checked on the final schema because several actions shape the key: a
+        // ConfigUpdate declares it, an AlterField can loosen a key column's
+        // nullability. A table whose key was invalid before this check existed
+        // stays committable.
+        if current_manifest.schema.verify_primary_key().is_ok() {
+            manifest.schema.verify_primary_key()?;
+        }
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         apply_index_object_metadata_flag(&mut manifest, &indices);
 
@@ -331,6 +340,13 @@ impl<'a> ApplyState<'a> {
 
         manifest.config = dataset_config;
         manifest.table_metadata = table_metadata;
+        // Only a change is validated: settings inherited as they were, even
+        // invalid ones, must not block an unrelated commit.
+        if auto_cleanup_settings(&current_manifest.config)
+            != auto_cleanup_settings(&manifest.config)
+        {
+            validate_auto_cleanup_config(&manifest)?;
+        }
 
         // The assembly derives the marks from what the manifest still holds,
         // which misses ids this operation reserved or minted and then
@@ -1050,6 +1066,14 @@ fn prune_rebound_fields_from_indices(
         }
     }
     Ok(())
+}
+
+fn auto_cleanup_settings(config: &HashMap<String, String>) -> BTreeMap<&str, &str> {
+    config
+        .iter()
+        .filter(|(key, _)| key.starts_with("lance.auto_cleanup."))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 fn beyond_read_mark_err(space: &str, id: impl std::fmt::Display, mark: String) -> Error {

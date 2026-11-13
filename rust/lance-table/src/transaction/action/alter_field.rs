@@ -106,11 +106,13 @@ impl TryFrom<pb_actions::AlterField> for AlterField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction::UpdateMap;
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest,
     };
-    use crate::transaction::action::{Action, AddField};
+    use crate::transaction::action::{Action, AddField, ConfigUpdate, FieldMetadataUpdate};
     use crate::transaction::test_support::sample_index_metadata;
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 
     #[test]
     fn test_alter_field_renames_without_touching_indices() {
@@ -130,6 +132,41 @@ mod tests {
         assert!(field.nullable);
         // A rename does not change the values the index recorded.
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
+    }
+
+    #[test]
+    fn test_alter_field_rejects_loosening_a_primary_key_column() {
+        let mut manifest = backed_manifest();
+        manifest.schema.field_by_id_mut(0).unwrap().nullable = false;
+        let keyed = apply(
+            &manifest,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                field_metadata: vec![FieldMetadataUpdate {
+                    field: FieldRef::Committed(0),
+                    updates: UpdateMap {
+                        update_entries: vec![(LANCE_UNENFORCED_PRIMARY_KEY, Some("true")).into()],
+                        replace: false,
+                    },
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        let error = apply(
+            &keyed,
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(0),
+                name: None,
+                nullable: Some(true),
+            })],
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("must not be nullable"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

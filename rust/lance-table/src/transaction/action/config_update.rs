@@ -473,19 +473,26 @@ mod tests {
         assert!(error.to_string().contains("field 7"), "{error}");
     }
 
+    fn declare_primary_key(field: i32) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            field_metadata: vec![FieldMetadataUpdate {
+                field: FieldRef::Committed(field),
+                updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
+            }],
+            ..Default::default()
+        })
+    }
+
+    /// `backed_manifest` with its one column required, so it can be a key.
+    fn required_column_manifest() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.schema.field_by_id_mut(0).unwrap().nullable = false;
+        manifest
+    }
+
     #[test]
     fn test_config_update_sets_then_refuses_to_change_the_primary_key() {
-        let set_key = |field: i32| {
-            Action::ConfigUpdate(ConfigUpdate {
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(field),
-                    updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
-                }],
-                ..Default::default()
-            })
-        };
-
-        let next = apply(&backed_manifest(), vec![set_key(0)]).unwrap();
+        let next = apply(&required_column_manifest(), vec![declare_primary_key(0)]).unwrap();
         assert_eq!(
             next.schema
                 .unenforced_primary_key()
@@ -495,11 +502,43 @@ mod tests {
             vec![0]
         );
 
-        let error = apply(&next, vec![set_key(0)]).unwrap_err();
+        let error = apply(&next, vec![declare_primary_key(0)]).unwrap_err();
         assert!(
             error.to_string().contains("cannot be changed once set"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Declaring a key through field metadata skips the Arrow conversion that
+    /// would validate it, so apply checks the schema it publishes.
+    #[test]
+    fn test_config_update_rejects_a_primary_key_on_a_nullable_field() {
+        let error = apply(&backed_manifest(), vec![declare_primary_key(0)]).unwrap_err();
+
+        assert!(
+            error.to_string().contains("must not be nullable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_primary_key_invalid_before_the_commit_does_not_block_it() {
+        let mut manifest = backed_manifest();
+        let field = manifest.schema.field_by_id_mut(0).unwrap();
+        field
+            .metadata
+            .insert(LANCE_UNENFORCED_PRIMARY_KEY.into(), "true".into());
+        refresh_reserved_key_positions(field);
+        assert!(manifest.schema.verify_primary_key().is_err());
+
+        apply(
+            &manifest,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                schema_metadata: Some(merge(&[("note", Some("unrelated"))])),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -525,6 +564,48 @@ mod tests {
                 .contains("cannot be set to an invalid value"),
             "unexpected error: {error}"
         );
+    }
+
+    fn set_config(entries: &[(&str, Option<&str>)]) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            config: Some(merge(entries)),
+            ..Default::default()
+        })
+    }
+
+    /// Each update alone is valid; together they name both the retention
+    /// policy and the legacy interval it replaces.
+    #[test]
+    fn test_config_update_validates_the_auto_cleanup_settings_it_leaves() {
+        let error = apply(
+            &backed_manifest(),
+            vec![
+                set_config(&[("lance.auto_cleanup.interval", Some("10"))]),
+                set_config(&[
+                    ("lance.auto_cleanup.policy", Some("keep_last")),
+                    ("lance.auto_cleanup.policy_interval", Some("10")),
+                ]),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("remove lance.auto_cleanup.interval"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_auto_cleanup_settings_invalid_before_the_commit_do_not_block_it() {
+        let mut manifest = backed_manifest();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "10".into());
+        assert!(crate::feature_flags::validate_auto_cleanup_config(&manifest).is_err());
+
+        apply(&manifest, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
     }
 
     #[test]

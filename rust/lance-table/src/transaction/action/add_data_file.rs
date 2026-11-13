@@ -117,7 +117,7 @@ impl AddDataFile {
         file.fields = field_ids.into();
 
         let fragment = state.fragment_mut(fragment_id, "AddDataFile")?;
-        for field_id in exclusive_fields {
+        for &field_id in &exclusive_fields {
             if let Some(existing) = fragment
                 .files
                 .iter()
@@ -135,6 +135,14 @@ impl AddDataFile {
         fragment.files.push(file);
         for field_id in bound_fields.iter() {
             state.note_rebind(fragment_id, *field_id, self.data_change)?;
+        }
+        // A field with no file in this fragment reads as null, and an index
+        // may cover the fragment having recorded those nulls; no tombstone
+        // precedes the new values to withdraw that coverage. A struct parent
+        // listed only to place a new child holds no values, so it is left out:
+        // invalidating it would also prune indices on its other children.
+        if self.data_change {
+            state.rebind_fields(fragment_id, exclusive_fields);
         }
         Ok(())
     }
@@ -210,17 +218,19 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::RowIdMeta;
+    use crate::format::{IndexMetadata, RowIdMeta};
     use crate::rowids::write_row_ids;
     use crate::transaction::action::test_support::{
-        added_field, apply, backed_manifest, manifest_with_base, mint_base, one_column_file,
-        unbacked_manifest,
+        added_field, apply, apply_with_indices, backed_manifest, manifest_with_base, mint_base,
+        one_column_file, unbacked_manifest,
     };
     use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
-    use crate::transaction::test_support::make_stable_row_id_manifest;
+    use crate::transaction::test_support::{make_stable_row_id_manifest, sample_index_metadata};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
+    use std::sync::Arc;
 
     #[test]
     fn test_add_data_file_rejects_an_unbound_local_token() {
@@ -574,6 +584,85 @@ mod tests {
             error.to_string().contains("already backed by data/0.lance"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Field 0 has no file in fragment 0, so it reads as null there, and the
+    /// index recorded those nulls. Filling it in changes the values unless the
+    /// writer says otherwise.
+    #[rstest]
+    #[case::new_values(true, false)]
+    #[case::unchanged_values(false, true)]
+    fn test_add_data_file_withdraws_index_coverage_only_on_a_data_change(
+        #[case] data_change: bool,
+        #[case] kept: bool,
+    ) {
+        let (_, indices) = apply_with_indices(
+            &unbacked_manifest(),
+            vec![Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file: one_column_file("data/x.lance"),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change,
+                base: None,
+            })],
+            vec![sample_index_metadata("idx")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
+            kept
+        );
+    }
+
+    /// A file adding `s.y` lists the struct `s` too, but `s` holds no values of
+    /// its own, so an index on its other child `s.x` still describes the data.
+    #[test]
+    fn test_add_data_file_keeps_coverage_of_a_sibling_under_a_listed_parent() {
+        let mut manifest = backed_manifest();
+        manifest.schema =
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            )]))
+            .unwrap();
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.files[0].fields = vec![0, 1].into();
+        fragment.files[0].column_indices = vec![-1, 0].into();
+        manifest.fragments = Arc::new(vec![fragment]);
+        let index_on_x = IndexMetadata {
+            fields: vec![1],
+            ..sample_index_metadata("idx")
+        };
+        let mut file = one_column_file("data/y.lance");
+        file.column_indices = vec![-1, 0].into();
+
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: Some(FieldRef::Committed(0)),
+                    def: added_field("y"),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0), FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+            vec![index_on_x],
+        )
+        .unwrap();
+
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
     }
 
     #[test]
