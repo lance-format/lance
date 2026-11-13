@@ -1007,10 +1007,12 @@ impl PostingListReader {
                         .as_primitive::<UInt32Type>()
                         .values()
                         .to_vec();
+                    let positions = batch[COMPRESSED_POSITION_COL].as_binary::<i64>().clone();
+                    drop(batch);
                     CompressedPositionStorage::SharedStream(SharedPositionStream::from_arrow(
                         codec,
                         block_offsets,
-                        batch[COMPRESSED_POSITION_COL].as_binary::<i64>(),
+                        positions,
                     ))
                 }
             };

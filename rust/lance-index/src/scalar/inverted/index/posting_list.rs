@@ -491,7 +491,11 @@ impl CompressedPostingList {
                     .expect("shared position stream codec metadata should be valid")
             });
             Some(CompressedPositionStorage::SharedStream(
-                SharedPositionStream::from_arrow(codec, block_offsets, col.as_binary::<i64>()),
+                SharedPositionStream::from_arrow(
+                    codec,
+                    block_offsets,
+                    col.as_binary::<i64>().clone(),
+                ),
             ))
         } else {
             batch.column_by_name(POSITION_COL).map(|col| {

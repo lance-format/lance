@@ -8,66 +8,94 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 #[rstest::rstest]
 #[case::exact(1024, 0, true)]
 #[case::alignment_tail(1088, 0, true)]
-#[case::oversized_tail(1089, 0, false)]
+#[case::alignment_prefix(1088, 64, true)]
+#[case::oversized_tail(1152, 0, false)]
 #[case::rare_slice(16 * 1024, 512, false)]
 fn test_shared_positions_bound_retained_allocation_and_preserve_lifetime(
     #[case] capacity: usize,
     #[case] offset: i64,
     #[case] shares_backing: bool,
+    #[values(false, true)] arrow_aligned: bool,
 ) {
-    let backing = Buffer::from_vec(vec![7_u8; capacity]);
+    let data = (0..capacity).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let expected = data[offset as usize..offset as usize + 1024].to_vec();
+    let backing = if arrow_aligned {
+        Buffer::from(data.as_slice())
+    } else {
+        Buffer::from_vec(data)
+    };
+    assert_eq!(backing.capacity(), capacity);
     let values = LargeBinaryArray::new(
         arrow::buffer::OffsetBuffer::new(vec![offset, offset + 1024].into()),
-        backing.clone(),
+        backing,
         None,
     );
+    let address = values.value(0).as_ptr();
     let stream =
-        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0, 512], &values);
-    assert_eq!(
-        stream.bytes().as_ptr() == values.value(0).as_ptr(),
-        shares_backing
-    );
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0, 512], values);
+    assert_eq!(stream.bytes().as_ptr() == address, shares_backing);
     let retained = if shares_backing { capacity } else { 1024 };
     assert_eq!(stream.size(), retained + 2 * std::mem::size_of::<u32>());
+    assert_eq!(stream.block(0), &expected[..512]);
     let clone = stream.clone();
-    drop(values);
-    assert_eq!(backing.strong_count(), if shares_backing { 2 } else { 1 });
-    assert_eq!(stream.block(0), &[7_u8; 512]);
     drop(stream);
-    assert_eq!(clone.block(1), &[7_u8; 512]);
+    assert_eq!(clone.block(1), &expected[512..]);
     // Allocation accounting is not part of position-stream value equality.
     assert_eq!(
         clone,
         SharedPositionStream::new(
             PositionStreamCodec::PackedDelta,
             vec![0, 512],
-            bytes::Bytes::from(vec![7_u8; 1024]),
+            bytes::Bytes::from(expected),
         )
     );
-    drop(clone);
-    assert_eq!(backing.strong_count(), 1);
 }
 
 #[test]
-fn test_shared_positions_copy_external_owner_with_unknown_capacity() {
-    let backing = lance_encoding::buffer::LanceBuffer::from_bytes(
-        bytes::Bytes::from(vec![9_u8; 16 * 1024]),
-        1,
-    )
-    .into_buffer();
-    assert_eq!(backing.capacity(), 0);
+fn test_shared_positions_do_not_retain_an_aliased_owned_buffer() {
+    let backing = Buffer::from_vec(vec![7_u8; 1024]);
     let values = LargeBinaryArray::new(
-        arrow::buffer::OffsetBuffer::new(vec![512_i64, 1536].into()),
+        arrow::buffer::OffsetBuffer::new(vec![0_i64, 1024].into()),
         backing.clone(),
         None,
     );
+    let address = values.value(0).as_ptr();
     let stream =
-        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], &values);
-    assert_ne!(stream.bytes().as_ptr(), values.value(0).as_ptr());
-    assert_eq!(stream.size(), 1024 + std::mem::size_of::<u32>());
-    drop(values);
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], values);
+    assert_ne!(stream.bytes().as_ptr(), address);
     assert_eq!(backing.strong_count(), 1);
-    assert_eq!(stream.block(0), &[9_u8; 1024]);
+    assert_eq!(stream.block(0), &[7_u8; 1024]);
+}
+
+#[test]
+fn test_shared_positions_copy_external_owner_with_hidden_capacity() {
+    struct Owner(Arc<Vec<u8>>);
+    impl AsRef<[u8]> for Owner {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+    let parent = Arc::new((0..16 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let expected = parent[512..1536].to_vec();
+    let owner = Arc::downgrade(&parent);
+    let bytes = bytes::Bytes::from_owner(Owner(parent)).slice(512..1536);
+    let backing = lance_encoding::buffer::LanceBuffer::from_bytes(bytes, 1).into_buffer();
+    // Custom capacity is only the visible span, not its owner's allocation.
+    assert_eq!(backing.capacity(), 1024);
+    assert!(owner.upgrade().is_some());
+    let values = LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(vec![0_i64, 1024].into()),
+        backing,
+        None,
+    );
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], values);
+    assert!(
+        owner.upgrade().is_none(),
+        "the hidden 16 KiB owner must be released"
+    );
+    assert_eq!(stream.size(), 1024 + std::mem::size_of::<u32>());
+    assert_eq!(stream.block(0), expected.as_slice());
 }
 
 #[rstest::rstest]
