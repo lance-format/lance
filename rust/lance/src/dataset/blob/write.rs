@@ -410,6 +410,7 @@ impl BlobPreprocessor {
         source_store_params: ObjectStoreParams,
         pack_file_size_override: Option<usize>,
     ) -> Result<Self> {
+        schema.check_blob_nesting(lance_core::datatypes::Field::is_blob_v2)?;
         let arrow_schema = arrow_schema::Schema::from(schema);
         let field_processors = arrow_schema
             .fields()
@@ -811,6 +812,19 @@ impl BlobPreprocessor {
         };
         if let Some(mapped) = mapped {
             return Ok((mapped.base_id, mapped.relative_path));
+        }
+
+        if self
+            .external_base_resolver
+            .as_ref()
+            .is_some_and(|resolver| {
+                resolver.unregistered_external_blob_policy
+                    == crate::session::UnregisteredExternalBlobPolicy::Deny
+            })
+        {
+            return Err(Error::invalid_input(
+                "Remote tables only support external blobs under registered storage bases",
+            ));
         }
 
         if self.allow_external_blob_outside_bases {

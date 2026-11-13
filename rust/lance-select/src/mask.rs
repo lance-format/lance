@@ -598,37 +598,41 @@ impl RowAddrTreeMap {
         }
     }
 
-    /// Insert a range of values into the set
+    /// Insert a range of values into the set, returning the number of new values.
+    /// Empty ranges leave the set unchanged.
     pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
-        // Separate the start and end into high and low bits.
-        let (mut start_high, mut start_low) = match range.start_bound() {
-            std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
-            std::ops::Bound::Excluded(&start) => {
-                let start = start.saturating_add(1);
-                ((start >> 32) as u32, start as u32)
-            }
-            std::ops::Bound::Unbounded => (0, 0),
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&start) => start,
+            std::ops::Bound::Excluded(&start) => match start.checked_add(1) {
+                Some(start) => start,
+                None => return 0,
+            },
+            std::ops::Bound::Unbounded => 0,
         };
 
-        let (end_high, end_low) = match range.end_bound() {
-            std::ops::Bound::Included(&end) => ((end >> 32) as u32, end as u32),
-            std::ops::Bound::Excluded(&end) => {
-                let end = end.saturating_sub(1);
-                ((end >> 32) as u32, end as u32)
-            }
-            std::ops::Bound::Unbounded => (u32::MAX, u32::MAX),
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&end) => end,
+            std::ops::Bound::Excluded(&end) => match end.checked_sub(1) {
+                Some(end) => end,
+                None => return 0,
+            },
+            std::ops::Bound::Unbounded => u64::MAX,
         };
+        if start > end {
+            return 0;
+        }
 
+        let (start_high, start_low) = ((start >> 32) as u32, start as u32);
+        let (end_high, end_low) = ((end >> 32) as u32, end as u32);
         let mut count = 0;
 
-        while start_high <= end_high {
-            let start = start_low;
-            let end = if start_high == end_high {
+        for fragment in start_high..=end_high {
+            let start = if fragment == start_high { start_low } else { 0 };
+            let end = if fragment == end_high {
                 end_low
             } else {
                 u32::MAX
             };
-            let fragment = start_high;
             match self.inner.get_mut(&fragment) {
                 None => {
                     let mut set = RoaringBitmap::new();
@@ -640,8 +644,6 @@ impl RowAddrTreeMap {
                     count += set.insert_range(start..=end);
                 }
             }
-            start_high += 1;
-            start_low = 0;
         }
 
         count
@@ -1393,8 +1395,11 @@ impl RowIdMask {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound::{self, Excluded, Included, Unbounded};
+
     use super::*;
     use proptest::{prop_assert, prop_assert_eq};
+    use rstest::rstest;
 
     fn rows(ids: &[u64]) -> RowAddrTreeMap {
         RowAddrTreeMap::from_iter(ids)
@@ -1970,6 +1975,37 @@ mod tests {
         mask.insert_fragment(0);
         let count = mask.insert_range(100..200);
         assert_eq!(count, 0);
+    }
+
+    #[rstest]
+    #[case::zero(Included(0), Excluded(0))]
+    #[case::before_zero(Unbounded, Excluded(0))]
+    #[case::equal(Included(5), Excluded(5))]
+    #[case::reversed(Included(7), Included(3))]
+    #[case::fragment_boundary(Included(1 << 32), Excluded(1 << 32))]
+    #[case::after_max(Excluded(u64::MAX), Unbounded)]
+    #[case::excluded_max(Excluded(u64::MAX), Included(u64::MAX))]
+    fn test_map_insert_range_empty(#[case] start: Bound<u64>, #[case] end: Bound<u64>) {
+        let mut map = RowAddrTreeMap::new();
+        assert_eq!(map.insert_range((start, end)), 0);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), Some(0));
+
+        map.insert(1);
+        map.insert(1 << 32);
+        let original = map.clone();
+        assert_eq!(map.insert_range((start, end)), 0);
+        assert_eq!(map, original);
+    }
+
+    #[rstest]
+    #[case::inclusive(Included(u64::MAX))]
+    #[case::unbounded(Unbounded)]
+    fn test_map_insert_range_terminal(#[case] end: Bound<u64>) {
+        let mut map = RowAddrTreeMap::new();
+        assert_eq!(map.insert_range((Included(u64::MAX - 2), end)), 3);
+        assert_eq!(map, RowAddrTreeMap::from_iter(u64::MAX - 2..=u64::MAX));
+        assert_eq!(map.insert_range((Included(u64::MAX - 2), end)), 0);
     }
 
     #[test]

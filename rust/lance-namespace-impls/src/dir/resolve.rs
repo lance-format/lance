@@ -873,12 +873,15 @@ impl DirectoryNamespace {
         false
     }
 
-    /// Map a dataset/version/branch open error: a transient IO error propagates
-    /// typed via [`classify_storage_error`], while a genuine not-found (missing
-    /// dataset, version, or ref) keeps the caller's `not_found` variant.
+    /// Map a dataset/version/branch open error: a transient IO error or a corrupt
+    /// file propagates typed via [`classify_storage_error`], while a genuine
+    /// not-found (missing dataset, version, or ref) keeps the caller's `not_found`
+    /// variant.
     pub(super) fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
-        if matches!(err.find_root(), Error::IO { .. })
-            && !manifest::ManifestNamespace::is_not_found_load_error(&err)
+        if matches!(
+            err.find_root(),
+            Error::IO { .. } | Error::CorruptFile { .. }
+        ) && !manifest::ManifestNamespace::is_not_found_load_error(&err)
         {
             return Self::classify_storage_error(err);
         }

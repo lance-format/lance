@@ -154,8 +154,9 @@ use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
-    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, preserve_managed_descriptors,
+    BlobFile, BlobRangeRequest, BlobReadRange, BlobV2BatchRewritePlan, ReadBlob, ReadBlobRange,
+    ReadBlobRangesBuilder, ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    preserve_managed_descriptors,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -164,8 +165,9 @@ use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, apply_index_object_metadata_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, validate_non_reusable_field_id_flags, validate_paired_feature_flags,
+    CoveringContract, apply_feature_flags, apply_index_object_metadata_flag,
+    ensure_can_read_manifest, ensure_can_write_manifest, validate_non_reusable_field_id_flags,
+    validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -277,7 +279,7 @@ pub struct Dataset {
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
     /// File reader options to use when reading data files.
-    pub(crate) file_reader_options: Option<FileReaderOptions>,
+    pub(crate) file_reader_options: Option<Arc<FileReaderOptions>>,
 
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
@@ -473,6 +475,30 @@ impl Default for ReadParams {
     }
 }
 
+/// Runtime-only configuration applied to an already-open [`Dataset`] handle.
+///
+/// Every field is optional so a caller can change one part of the handle without
+/// rebuilding the manifest, object stores, or inherited base bindings.
+#[derive(Default)]
+pub struct DatasetRuntimeConfig {
+    /// New index cache capacity. Ignored when `session` is also set.
+    pub index_cache_size_bytes: Option<usize>,
+    /// New metadata cache capacity. Ignored when `session` is also set.
+    pub metadata_cache_size_bytes: Option<usize>,
+    /// New primary object-store block-size hint.
+    pub block_size: Option<usize>,
+    /// Replacement session. Wins over the cache sizes above.
+    pub session: Option<Arc<Session>>,
+    /// Replacement commit handler.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
+    /// Replacement storage-options accessor for the primary store. The primary
+    /// store is rebuilt through the session registry so subsequent primary I/O
+    /// consults this accessor.
+    pub storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    /// Explicit per-base bindings to merge. Caller entries win over inherited ones.
+    pub base_store_params: HashMap<String, ObjectStoreParams>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProjectionRequest {
     Schema(Arc<Schema>),
@@ -654,6 +680,14 @@ impl Dataset {
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
+    /// A literal `.` path segment is rejected.
+    ///
+    /// New branch names are limited to a portable budget of 211 bytes, measured
+    /// after the name is path-part encoded twice: once for the branch metadata
+    /// filename and once for the local atomic staging filename. The check runs
+    /// before any branch metadata or dataset files are written. Longer names
+    /// that already exist remain available for lookup, checkout, metadata
+    /// updates, and deletion.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -836,7 +870,7 @@ impl Dataset {
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
-            self.file_reader_options.clone(),
+            self.file_reader_options.as_deref().cloned(),
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
@@ -914,19 +948,27 @@ impl Dataset {
 
         // A stale cached size yields a bogus footer offset. Detect it (the block
         // lacks the trailing magic) and retry with the true size, like
-        // read_manifest.
-        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
-            let manifest_location = ManifestLocation {
-                size: None,
-                ..manifest_location.clone()
-            };
-            return Box::pin(Self::load_manifest(
-                object_store,
-                &manifest_location,
-                uri,
-                session,
-            ))
-            .await;
+        // read_manifest. At the true size, the file itself is damaged.
+        if !last_block.ends_with(MAGIC) {
+            if manifest_location.size.is_some() {
+                let manifest_location = ManifestLocation {
+                    size: None,
+                    ..manifest_location.clone()
+                };
+                return Box::pin(Self::load_manifest(
+                    object_store,
+                    &manifest_location,
+                    uri,
+                    session,
+                ))
+                .await;
+            }
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: magic number does not match, manifest is {manifest_size} bytes"
+                ),
+            ));
         }
 
         let offset = read_metadata_offset(&last_block)?;
@@ -946,6 +988,17 @@ impl Dataset {
             Ok(manifest)
         }?;
 
+        // A zeroed length prefix decodes to an empty message without an error, which would
+        // open as an empty dataset. Versions start at 1.
+        if manifest.version == 0 {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: manifest at offset {offset} of {manifest_size} bytes has version 0"
+                ),
+            ));
+        }
+
         ensure_can_read_manifest(&manifest)?;
 
         versions::check_manifest_storage_version(&mut manifest)?;
@@ -964,10 +1017,11 @@ impl Dataset {
             // from, and an index this build cannot decode still has to survive
             // into the next manifest. Version filtering happens on the way out,
             // in `DatasetIndexExt::load_indices`.
+            let contract = CoveringContract::of(&manifest);
             let indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
-                .map(IndexMetadata::try_from)
+                .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
                 .collect::<Result<Vec<_>>>()?;
             crate::index::loading::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
@@ -1086,7 +1140,7 @@ impl Dataset {
             fragment_bitmap,
             metadata_cache,
             index_cache,
-            file_reader_options,
+            file_reader_options: file_reader_options.map(Arc::new),
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
@@ -2418,8 +2472,12 @@ impl Dataset {
     /// Clone this dataset with a different object store binding.
     ///
     /// The returned dataset shares metadata, session state, and caches with the
-    /// original dataset, but all subsequent operations on the returned dataset
-    /// use the supplied object store.
+    /// original dataset, but its primary object store — and the dataset-level
+    /// default params used for base paths that have no explicit binding — are
+    /// replaced by the supplied ones. Explicit per-base bindings still win: a base
+    /// path bound through [`DatasetBuilder::with_base_store_params`], or inherited
+    /// from the dataset a shallow clone was taken from, keeps reading through its
+    /// own store.
     pub fn with_object_store(
         &self,
         object_store: Arc<ObjectStore>,
@@ -2432,6 +2490,102 @@ impl Dataset {
             cloned.store_params = Some(Box::new(store_params));
         }
         cloned
+    }
+
+    /// Apply runtime configuration to this dataset handle.
+    ///
+    /// The returned handle keeps the loaded manifest and every store binding that
+    /// `config` does not replace. An explicit session wins over cache sizes, and
+    /// cache sizes create a new session on the same store registry so custom
+    /// object-store providers keep resolving. When `block_size` is set, the
+    /// primary store keeps its existing backend and only changes its read hint.
+    /// Replacing `storage_options_accessor` rebuilds the primary store through
+    /// the session's registry, because the accessor is consumed when the store is
+    /// constructed and must reach the backend that serves primary I/O.
+    pub async fn reconfigure(&self, config: DatasetRuntimeConfig) -> Result<Self> {
+        let mut ds = self.clone();
+
+        let session = match config.session {
+            Some(session) => Some(session),
+            None if config.index_cache_size_bytes.is_some()
+                || config.metadata_cache_size_bytes.is_some() =>
+            {
+                Some(Arc::new(Session::new(
+                    config
+                        .index_cache_size_bytes
+                        .unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
+                    config
+                        .metadata_cache_size_bytes
+                        .unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
+                    ds.session.store_registry(),
+                )))
+            }
+            None => None,
+        };
+        if let Some(session) = session {
+            ds.index_cache = Arc::new(session.index_cache.for_dataset(&ds.uri));
+            ds.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&ds.uri));
+            ds.session = session;
+        }
+
+        let mut store_params = ds.store_params.as_deref().cloned();
+        let accessor_replaced = config.storage_options_accessor.is_some();
+        if let Some(accessor) = config.storage_options_accessor {
+            let params = store_params.get_or_insert_default();
+            params.storage_options_accessor = Some(accessor);
+        }
+        if let Some(block_size) = config.block_size {
+            let params = store_params.get_or_insert_default();
+            params.block_size = Some(block_size);
+        }
+
+        if accessor_replaced {
+            // A store consumes its accessor at construction time, so replacing it
+            // in `store_params` alone leaves the opened backend on the previous
+            // (possibly expiring) credentials. Rebuild through the handle's
+            // session registry so the new accessor, and every other params-bound
+            // setting, reach the backend that serves primary metadata, refs, and
+            // commits. Explicit base bindings stay untouched; `with_object_store`
+            // drops the derived fallback cache so bases are re-resolved from their
+            // own bindings, or from the new default params when they have none,
+            // instead of keeping the replaced stores.
+            let params = store_params.clone().unwrap_or_default();
+            let (object_store, _) =
+                ObjectStore::from_uri_and_params(ds.session.store_registry(), &ds.uri, &params)
+                    .await?;
+            ds = ds.with_object_store(object_store, Some(params));
+        } else if let Some(block_size) = config.block_size {
+            let params = store_params.unwrap_or_default();
+            ds = ds.with_object_store(
+                Arc::new(ds.object_store.with_block_size(block_size)),
+                Some(params),
+            );
+        } else if store_params.is_some() {
+            ds.store_params = store_params.map(Box::new);
+        }
+
+        let commit_handler_replaced = config.commit_handler.is_some();
+        if let Some(commit_handler) = config.commit_handler {
+            ds.commit_handler = commit_handler;
+        }
+        if accessor_replaced || config.block_size.is_some() || commit_handler_replaced {
+            // Refs binds the primary store and commit handler when it is built.
+            ds.refs = Refs::new(
+                ds.object_store.clone(),
+                ds.commit_handler.clone(),
+                ds.branch_location(),
+            );
+        }
+
+        if !config.base_store_params.is_empty() {
+            let mut base_store_params =
+                ds.base_store_params.as_deref().cloned().unwrap_or_default();
+            base_store_params.extend(config.base_store_params);
+            ds.base_store_params = Some(Arc::new(base_store_params));
+            ds.base_object_stores = Default::default();
+        }
+
+        Ok(ds)
     }
 
     /// Clone this dataset with extra object store wrappers applied to all read stores.
@@ -2715,6 +2869,8 @@ impl Dataset {
             file_field: &lance_core::datatypes::Field,
             path: &str,
         ) -> Result<()> {
+            use arrow_schema::DataType::{LargeList, List, Timestamp};
+
             if dataset_field.name != file_field.name {
                 return Err(Error::invalid_input(format!(
                     "Schema mismatch: expected field '{}' but file has '{}'",
@@ -2724,6 +2880,31 @@ impl Dataset {
 
             if dataset_field.is_blob() && file_field.is_blob() {
                 return Ok(());
+            }
+
+            // Reads decode a replacement file's values as the dataset field
+            // types, so values stored as another type read back as other
+            // values or fail to decode. List offset widths and timestamp time
+            // zone names do not change the stored values, and list items are
+            // compared as children below. Blob columns are skipped: their
+            // file layout can legitimately differ from the dataset's type.
+            let same_values = match (dataset_field.data_type(), file_field.data_type()) {
+                (List(_) | LargeList(_), List(_) | LargeList(_)) => true,
+                // A naive timestamp is a wall-clock time and one with a time
+                // zone is an instant, so only the zone's name may differ.
+                (Timestamp(dataset_unit, dataset_tz), Timestamp(file_unit, file_tz)) => {
+                    dataset_unit == file_unit && dataset_tz.is_some() == file_tz.is_some()
+                }
+                _ => dataset_field.logical_type == file_field.logical_type,
+            };
+            if !same_values
+                && !field_contains_blob(dataset_field)
+                && !field_contains_blob(file_field)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: field '{}' has type {} in dataset schema but {} in file schema",
+                    path, dataset_field.logical_type, file_field.logical_type
+                )));
             }
 
             if dataset_field.children.len() != file_field.children.len() {
@@ -2927,6 +3108,39 @@ impl Dataset {
         self.store_params.as_deref()
     }
 
+    /// Dataset-level file-reader defaults supplied through [`ReadParams`].
+    ///
+    /// `None` means no explicit options were supplied and readers use their
+    /// defaults. Clone these options when creating a per-read override so that
+    /// unrelated settings are preserved without changing the shared dataset.
+    ///
+    /// ```
+    /// # use lance::Dataset;
+    /// # use lance::dataset::scanner::Scanner;
+    /// fn scan_with_byte_limit(dataset: &Dataset) -> Scanner {
+    ///     let mut options = dataset.file_reader_options().cloned().unwrap_or_default();
+    ///     options.batch_size_bytes = Some(1024 * 1024);
+    ///     let mut scanner = dataset.scan();
+    ///     scanner.with_file_reader_options(options);
+    ///     scanner
+    /// }
+    /// ```
+    pub fn file_reader_options(&self) -> Option<&FileReaderOptions> {
+        self.file_reader_options.as_deref()
+    }
+
+    /// Return a copy of this dataset with updated dataset-level file-reader
+    /// defaults.
+    ///
+    /// The returned handle shares the manifest, object stores, session, and
+    /// caches with this dataset. Only the defaults used by subsequent scans
+    /// change; see [`Self::file_reader_options`].
+    pub fn with_file_reader_options(&self, file_reader_options: Option<FileReaderOptions>) -> Self {
+        let mut cloned = self.clone();
+        cloned.file_reader_options = file_reader_options.map(Arc::new);
+        cloned
+    }
+
     pub(crate) async fn object_store_for_data_file(
         &self,
         data_file: &DataFile,
@@ -3052,29 +3266,83 @@ impl Dataset {
         self.session.deep_size_of() as u64
     }
 
-    /// Get all versions.
+    /// Get all versions, in ascending order.
+    ///
+    /// Every manifest in the history is read. Use [`Self::versions_with_options`] to
+    /// read only a page, or [`Self::count_versions`] to avoid reading manifests at all.
     pub async fn versions(&self) -> Result<Vec<Version>> {
-        let mut versions: Vec<Version> = self
-            .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_filter_map(|location| async move {
-                let manifest_size = location.size;
-                match read_manifest(&self.object_store, &location.path, manifest_size).await {
-                    Ok(manifest) => {
-                        let mut version = Version::from(&manifest);
-                        version.manifest_size = manifest_size;
-                        Ok(Some(version))
-                    }
-                    Err(e) => Err(e),
+        self.versions_with_options(0, None, false).await
+    }
+
+    /// Get one page of versions in the current version history.
+    ///
+    /// Versions are ordered ascending by version, or descending when `descending`
+    /// is true. `offset` is the number of versions to skip and `limit` is the
+    /// maximum number to return, so `versions_with_options(0, None, false)` is the
+    /// whole history. `None` means no limit, `Some(0)` returns an empty page without
+    /// listing or reading any manifest, and an `offset` past the end of the history
+    /// returns an empty page. Detached versions are never part of the history.
+    ///
+    /// Only the manifests in the returned page are read, concurrently within the
+    /// store's effective IO window.
+    ///
+    /// With `descending` on a store whose listing is lexically ordered and whose
+    /// manifests are V2 paths, listing stops after `offset + limit` manifest entries
+    /// have been observed, so a page near the newest version does not enumerate the
+    /// history. Every other case (ascending pages, V1 manifest paths, or a listing
+    /// that is not lexically ordered) enumerates every manifest location before
+    /// selecting the page. These are listing-entry bounds: a store may still
+    /// materialize more keys, or issue more requests, than the entries it yields.
+    pub async fn versions_with_options(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> Result<Vec<Version>> {
+        let limit = limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let locations: Vec<ManifestLocation> = if descending {
+            let mut stream =
+                self.commit_handler
+                    .list_manifest_locations(&self.base, &self.object_store, true);
+            let mut skipped = 0;
+            let mut page = Vec::new();
+            while page.len() < limit {
+                let Some(location) = stream.try_next().await? else {
+                    break;
+                };
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    page.push(location);
                 }
+            }
+            page
+        } else {
+            let mut all: Vec<ManifestLocation> = self
+                .commit_handler
+                .list_manifest_locations(&self.base, &self.object_store, false)
+                .try_collect()
+                .await?;
+            all.sort_unstable_by_key(|location| location.version);
+            all.into_iter().skip(offset).take(limit).collect()
+        };
+
+        stream::iter(locations)
+            .map(|location| async move {
+                let manifest_size = location.size;
+                let manifest =
+                    read_manifest(&self.object_store, &location.path, manifest_size).await?;
+                let mut version = Version::from(&manifest);
+                version.manifest_size = manifest_size;
+                Ok::<_, Error>(version)
             })
+            .buffered(self.object_store.io_parallelism())
             .try_collect()
-            .await?;
-
-        // TODO: this API should support pagination
-        versions.sort_by_key(|v| v.version);
-
-        Ok(versions)
+            .await
     }
 
     /// Get the number of versions in the current version history.
@@ -3789,12 +4057,35 @@ impl Dataset {
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
     /// 'store_params': the object store params to use for the new dataset.
+    ///
+    /// The returned handle retains the source's store parameters for shared files.
+    /// When reopening a clone across stores, supply the source parameters with
+    /// [`DatasetBuilder::with_base_store_params`].
     pub async fn shallow_clone(
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        let store_params = match store_params {
+            Some(params) => params,
+            None => {
+                let mut params = self.store_params.as_deref().cloned().unwrap_or_default();
+                // Inherit the custom store, but not its source dataset location.
+                #[allow(deprecated)]
+                if let Some((_, location)) = params.object_store.as_mut() {
+                    *location = lance_io::object_store::uri_to_url(target_path)?;
+                }
+                params
+            }
+        };
+        let (target_store, _) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            target_path,
+            &store_params,
+        )
+        .await?;
+
         // Prevent cloning into an existing target dataset (parity with
         // `deep_clone`) before anything is written there: a tagged clone
         // stages its relocated FRI details in the target's `_indices/`
@@ -3802,12 +4093,13 @@ impl Dataset {
         // dataset. The check goes through the same store and commit handler
         // the commit below writes through. Only a definitive "no dataset
         // here" permits the clone; see `ensure_clone_target_absent`.
+        // CommitBuilder extracts its path from the URI when given an explicit store.
         let target_base =
             ObjectStore::extract_path_from_uri(self.session.store_registry(), target_path)?;
         Self::ensure_clone_target_absent(
             self.commit_handler.as_ref(),
             &target_base,
-            &self.object_store,
+            &target_store,
             target_path,
         )
         .await?;
@@ -3818,19 +4110,37 @@ impl Dataset {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: source_location.uri,
+            ref_path: source_location.uri.clone(),
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(
-                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-            )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+            .with_store_params(store_params)
+            .with_object_store(target_store)
+            .with_source_store(self.object_store.clone())
+            .with_session(self.session.clone())
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        builder.execute(transaction).await
+        let mut cloned = builder.execute(transaction).await?;
+        // Destination credentials must not replace the bindings for shared
+        // source files, including bases inherited through earlier shallow clones.
+        cloned.base_store_params = Some(Arc::new(
+            cloned
+                .manifest
+                .base_paths
+                .values()
+                .map(|base| {
+                    let params = if base.path == source_location.uri {
+                        self.store_params_for_base(None)
+                    } else {
+                        self.store_params_for_base(Some(base))
+                    };
+                    (base.path.clone(), params)
+                })
+                .collect(),
+        ));
+        Ok(cloned)
     }
 
     /// Deep clone the target version into a new dataset at target_path.
