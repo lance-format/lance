@@ -6,7 +6,7 @@
 use super::current_thread::{UringCurrentThreadReader, push_request};
 use super::current_thread_future::UringCurrentThreadFuture;
 use super::future::UringReadFuture;
-use super::reader::{CacheKey, HANDLE_CACHE};
+use super::reader::UringReader;
 use super::requests::{IoRequest, PendingRequests, RequestState};
 use super::thread::push_to_sq;
 use crate::object_store::ObjectStore;
@@ -14,9 +14,11 @@ use crate::utils::tracking_store::IOTracker;
 use bytes::BytesMut;
 use io_uring::IoUring;
 use lance_core::Result;
+use rstest::rstest;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -49,6 +51,48 @@ fn create_test_file(size: usize) -> Result<(NamedTempFile, Vec<u8>)> {
     file.write_all(&data)?;
     file.flush()?;
     Ok((file, data))
+}
+
+fn open_files_in_dir(directory: &Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.unwrap().path()).ok())
+        .filter(|path| path.starts_with(directory))
+        .count()
+}
+
+#[rstest]
+#[case::background(false)]
+#[case::current_thread(true)]
+#[tokio::test(flavor = "current_thread")]
+async fn test_reader_drop_closes_files(
+    #[case] is_current_thread: bool,
+    #[values(false, true)] is_deleted: bool,
+) -> Result<()> {
+    // Opening a reader does not require a ring, so this also runs without io_uring support.
+    let directory = tempfile::tempdir()?;
+    for i in 0..16 {
+        let file_path = directory.path().join(format!("{i}.dat"));
+        std::fs::write(&file_path, b"data")?;
+        let path = object_store::path::Path::from_filesystem_path(&file_path)?;
+        let tracker = Arc::new(IOTracker::default());
+        let reader = if is_current_thread {
+            UringCurrentThreadReader::open(&path, 4096, None, tracker).await?
+        } else {
+            UringReader::open(&path, 4096, None, tracker).await?
+        };
+        assert_eq!(open_files_in_dir(directory.path()), 1);
+        if is_deleted {
+            std::fs::remove_file(&file_path)?;
+        }
+        drop(reader);
+        assert_eq!(
+            open_files_in_dir(directory.path()),
+            0,
+            "dropping a reader must release its file without further cache activity"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -439,29 +483,28 @@ fn test_thread_exit_waits_for_reads_in_flight() -> Result<()> {
 }
 
 /// A read that the current-thread reader has queued, but not yet submitted, must still read its
-/// own file after the reader and the cached handle are dropped and another file is opened.
+/// own file after the reader is dropped and another file is opened.
 #[tokio::test(flavor = "current_thread")]
 async fn test_queued_read_keeps_its_file_open() -> Result<()> {
     skip_if_no_thread_local_uring!();
     // `create_test_file` writes a different pattern, so bytes read from any other test file
     // cannot match.
     let expected_data = vec![0x5A; 4096];
-    let mut file = NamedTempFile::new()?;
+    let directory = tempfile::tempdir()?;
+    let mut file = NamedTempFile::new_in(directory.path())?;
     file.write_all(&expected_data)?;
-    let uri = format!("file+uring://{}", file.path().to_str().unwrap());
+    let file = file.into_temp_path();
+    let uri = format!("file+uring://{}", file.to_str().unwrap());
     let (_, path) = ObjectStore::from_uri(&uri).await?;
 
     let reader =
         UringCurrentThreadReader::open(&path, 4096, None, Arc::new(IOTracker::default())).await?;
-    let cache_key = CacheKey::new(&path, reader.block_size());
-    let cached_file = Arc::downgrade(&HANDLE_CACHE.get(&cache_key).await.unwrap().handle.file);
     // The read is queued here and submitted only when the future is first polled.
     let read = reader.get_range(0..4096);
     drop(reader);
-    HANDLE_CACHE.invalidate(&cache_key).await;
-    HANDLE_CACHE.run_pending_tasks().await;
-    assert!(
-        cached_file.strong_count() == 1,
+    assert_eq!(
+        open_files_in_dir(directory.path()),
+        1,
         "only the queued request must keep the file open"
     );
     // Had the file been closed, this would likely take over its descriptor number.
@@ -469,6 +512,7 @@ async fn test_queued_read_keeps_its_file_open() -> Result<()> {
 
     let data = read.await.unwrap();
     assert_eq!(data.as_ref(), expected_data.as_slice());
+    assert_eq!(open_files_in_dir(directory.path()), 0);
     Ok(())
 }
 

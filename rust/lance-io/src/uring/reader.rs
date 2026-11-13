@@ -23,47 +23,13 @@ use std::io::{self, ErrorKind};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 use tracing::instrument;
-
-/// Cache key for UringReader instances.
-/// We cache by (path, block_size) because block_size affects reader behavior.
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-pub(super) struct CacheKey {
-    path: String,
-    block_size: usize,
-}
-
-impl CacheKey {
-    pub(super) fn new(path: &Path, block_size: usize) -> Self {
-        Self {
-            path: path.to_string(),
-            block_size,
-        }
-    }
-}
-
-/// Data stored in the cache for each opened file.
-#[derive(Clone)]
-pub(super) struct CachedReaderData {
-    pub(super) handle: Arc<UringFileHandle>,
-    pub(super) size: usize,
-}
-
-/// Global cache of open file handles.
-/// Entries expire after 60 seconds to ensure files are eventually closed.
-pub(super) static HANDLE_CACHE: LazyLock<moka::future::Cache<CacheKey, CachedReaderData>> =
-    LazyLock::new(|| {
-        moka::future::Cache::builder()
-            .time_to_live(Duration::from_secs(60))
-            .max_capacity(10_000)
-            .build()
-    });
 
 /// File handle for io_uring operations.
 ///
 /// Keeps the file open; each read request issued against it holds the file too.
+/// The file closes when the reader and its outstanding reads are dropped.
 #[derive(Debug)]
 pub(super) struct UringFileHandle {
     /// The file to read from
@@ -123,25 +89,10 @@ impl UringReader {
         // Determine block size with environment variable override
         let block_size = URING_BLOCK_SIZE.unwrap_or(block_size.max(DEFAULT_URING_BLOCK_SIZE));
 
-        let cache_key = CacheKey::new(path, block_size);
-
-        // Try to get from cache first
-        if let Some(data) = HANDLE_CACHE.get(&cache_key).await {
-            // Use known_size if provided, otherwise use cached size
-            let size = known_size.unwrap_or(data.size);
-            return Ok(Box::new(Self {
-                handle: data.handle,
-                block_size,
-                size,
-                io_tracker,
-            }) as Box<dyn Reader>);
-        }
-
-        // Cache miss - open file and get size
         let path_clone = path.clone();
         let local_path = to_local_path(path);
 
-        let data = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
                 ErrorKind::NotFound => Error::not_found(path_clone.to_string()),
                 _ => e.into(),
@@ -153,23 +104,14 @@ impl UringReader {
                 None => file.metadata()?.len() as usize,
             };
 
-            Ok::<_, Error>(CachedReaderData {
+            Ok(Box::new(Self {
                 handle: Arc::new(UringFileHandle::new(file, path_clone)),
+                block_size,
                 size,
-            })
+                io_tracker,
+            }) as Box<dyn Reader>)
         })
-        .await??;
-
-        // Insert into cache
-        HANDLE_CACHE.insert(cache_key, data.clone()).await;
-
-        // Return new reader instance
-        Ok(Box::new(Self {
-            handle: data.handle.clone(),
-            block_size,
-            size: data.size,
-            io_tracker,
-        }) as Box<dyn Reader>)
+        .await?
     }
 
     /// Submit a read request to the io_uring thread via channel and return a future.
