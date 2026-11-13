@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{Error, Result, RowAddress, RowIdIndex, SegmentLookup};
+use crate::rowids::encoded_array::EncodedU64Array;
 
 /// Independent searches to advance together, hiding dependent-load latency
 /// without the register pressure and long scalar tails of wider batches.
@@ -88,12 +89,39 @@ impl RowIdIndex {
     }
 }
 
-pub(super) fn search_sorted(
+/// Dispatch once on the stored width rather than on every binary-search step.
+pub(super) fn search_encoded(
+    ids: &EncodedU64Array,
+    queries: &[(u64, usize)],
+    emit: &mut impl FnMut(u64, usize, usize) -> Result<()>,
+) -> Result<()> {
+    match ids {
+        EncodedU64Array::U16 { base, offsets } => search_sorted(
+            offsets.len(),
+            |i| *base + u64::from(offsets[i]),
+            |i| i,
+            queries,
+            emit,
+        ),
+        EncodedU64Array::U32 { base, offsets } => search_sorted(
+            offsets.len(),
+            |i| *base + u64::from(offsets[i]),
+            |i| i,
+            queries,
+            emit,
+        ),
+        EncodedU64Array::U64(values) => {
+            search_sorted(values.len(), |i| values[i], |i| i, queries, emit)
+        }
+    }
+}
+
+pub(super) fn search_sorted<T>(
     len: usize,
     key: impl Fn(usize) -> u64,
-    offset: impl Fn(usize) -> u32,
+    offset: impl Fn(usize) -> T,
     queries: &[(u64, usize)],
-    emit: &mut impl FnMut(u64, usize, u32) -> Result<()>,
+    emit: &mut impl FnMut(u64, usize, T) -> Result<()>,
 ) -> Result<()> {
     if len == 0 {
         return Ok(());
@@ -247,6 +275,53 @@ mod tests {
             fragment_id: id,
             row_id_sequence: Arc::new(RowIdSequence(segments)),
             deletion_vector: Arc::new(DeletionVector::Bitmap(deleted.iter().copied().collect())),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::u16(128, 1 << 50)]
+    #[case::u32(1 << 16, 1 << 50)]
+    #[case::u64(1 << 40, u64::MAX - (256 << 40))]
+    fn sparse_merged_batches_preserve_physical_offsets(#[case] stride: u64, #[case] base: u64) {
+        let ids: Vec<_> = (0..257).rev().map(|i| base + i * stride).collect();
+        let live: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| ![3, 100].contains(offset) && offset % 5 != 2)
+            .map(|(offset, &id)| (id, RowAddress::new_from_parts(7, offset as u32)))
+            .collect();
+        let index = RowIdIndex::new(&[fragment(
+            7,
+            vec![U64Segment::Array(ids.clone().into())],
+            &[3, 100],
+        )])
+        .unwrap();
+        let merged = index.merged.as_ref().unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(
+            merged.iter().next().unwrap().1.segments.0,
+            U64Segment::SortedArray(_)
+        ));
+        for count in [0, 1, 31, 32, 33, 63, 64, 65, 1000] {
+            let queries: Vec<_> = (0..count)
+                .rev()
+                .map(|i| match i % 9 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    2 => base + stride / 2,
+                    _ => ids[i * 17 % ids.len()],
+                })
+                .collect();
+            let expected: Vec<_> = queries
+                .iter()
+                .map(|id| live.iter().find(|row| row.0 == *id).map(|row| row.1))
+                .collect();
+            assert_eq!(
+                index
+                    .get_many_with_filter(&queries, |address| address.row_offset() % 5 != 2)
+                    .unwrap(),
+                expected
+            );
         }
     }
 

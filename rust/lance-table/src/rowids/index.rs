@@ -605,6 +605,27 @@ impl RowIdIndex {
             return Ok(out);
         };
 
+        // A prepared fragment commonly has one sparse merged chunk. Advance
+        // independent searches together instead of serializing their memory
+        // loads. Keep positions as usize: a complete merged index can span
+        // more than one fragment's u32 address space.
+        if n >= batch::LANES
+            && merged.len() == 1
+            && let Some((_, chunk)) = merged.iter().next()
+            && let U64Segment::SortedArray(ids) = &chunk.segments.0
+        {
+            batch::search_encoded(ids, &sorted, &mut |_, ordinal, position| {
+                if let Some(addr) = chunk.segments.1.get(position) {
+                    let address = RowAddress::from(addr);
+                    if is_visible(address) {
+                        out[ordinal] = Some(address);
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(out);
+        }
+
         let mut chunks = merged.iter().peekable();
         for (id, orig_idx) in sorted {
             // Advance past chunks that end before this id.
