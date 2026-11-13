@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::index::tests::support::*;
 use std::collections::HashMap;
 
 use arrow::datatypes::{Float32Type, Int32Type};
@@ -9,6 +10,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_index::scalar::BuiltinIndexType;
 use lance_linalg::distance::DistanceType;
+use lance_table::feature_flags::FLAG_INDEPENDENT_COVERING_FIELDS;
 use rstest::rstest;
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -222,12 +224,12 @@ async fn test_remap_index_rejects_composite_index() {
 /// malformed by that route -- but it is not the only route: metadata
 /// constructed in-process (segment conversion, a distributed build's output)
 /// reaches this guard without ever passing through
-/// `TryFrom<pb::IndexMetadata>`. This guard is therefore load-bearing on its
-/// own, and must produce a named error rather than either a panic (plain
-/// subtraction on `usize` underflows) or a silent
-/// saturation that lets corrupt metadata through as an ordinary covered index
-/// and gets it quietly withdrawn. The test reaches it by seeding the index
-/// cache, the same way the migration-path test in `dataset/index.rs` does.
+/// `IndexMetadata::from_manifest_proto`. This guard is therefore load-bearing on its
+/// own, and must produce a named error rather than let corrupt metadata
+/// through as an ordinary covered index and get it quietly withdrawn. A
+/// repeated carried field is invalid under either covering layout. The test
+/// reaches it by seeding the index cache, the same way the migration-path
+/// test in `dataset/index.rs` does.
 #[tokio::test]
 async fn test_remap_index_rejects_malformed_covering_fields() {
     let data = gen_batch()
@@ -247,25 +249,20 @@ async fn test_remap_index_rejects_malformed_covering_fields() {
 
     let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
 
-    // Malform the cached metadata directly: more carried fields than fields
-    // at all. No commit and no manifest decode can produce this -- both run
-    // `validate_covering_fields` -- which is exactly why the guard has to
-    // stand on its own for metadata that reached it by neither route.
+    // Malform the cached metadata directly: one carried field declared
+    // twice. No commit and no manifest decode can produce this -- both
+    // reject a repeated carried field -- which is exactly why the guard has
+    // to stand on its own for metadata that reached it by neither route.
     let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
     for idx in &mut indices {
         if idx.uuid == index_uuid {
-            idx.covering_fields = idx
-                .fields
-                .iter()
-                .copied()
-                .chain(std::iter::once(999))
-                .collect();
+            idx.covering_fields = vec![999, 999];
         }
     }
     assert!(
         indices
             .iter()
-            .any(|idx| idx.uuid == index_uuid && idx.covering_fields.len() > idx.fields.len()),
+            .any(|idx| idx.uuid == index_uuid && idx.covering_fields == [999, 999]),
         "test setup should have produced a malformed entry"
     );
     let metadata_key = crate::session::index_caches::IndexMetadataKey {
@@ -289,7 +286,42 @@ async fn test_remap_index_rejects_malformed_covering_fields() {
     .await
     .expect_err("malformed covering metadata must not be silently accepted");
     assert!(
-        error.to_string().contains("are not among its fields"),
+        error.to_string().contains("more than once"),
         "expected the validator's message, got: {error}"
     );
+}
+
+/// Remap withdraws a covered index in either layout: no index type carries
+/// the payload through a remap, and the check reads only whether
+/// `covering_fields` is empty.
+#[rstest]
+#[case::suffix(false)]
+#[case::keys_only(true)]
+#[tokio::test]
+async fn test_remap_index_drops_a_covered_index(#[case] keys_only: bool) {
+    let mut dataset = write_btree_table("memory://", &["a"], None).await;
+    let a = dataset.schema().field_id("a").unwrap();
+    let b = dataset.schema().field_id("b").unwrap();
+    let plain = dataset.load_indices().await.unwrap()[0].clone();
+    let fields = if keys_only { vec![a] } else { vec![a, b] };
+    let transaction = redeclare_covering(&dataset, &plain, fields, vec![b]);
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        covering_bits(&dataset).0 & FLAG_INDEPENDENT_COVERING_FIELDS != 0,
+        keys_only,
+        "precondition: the committed layout"
+    );
+
+    let result = remap_index(
+        &dataset,
+        &plain.uuid,
+        &RowAddrTranslator::sync(RowAddrRemap::empty()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, RemapResult::Drop);
 }

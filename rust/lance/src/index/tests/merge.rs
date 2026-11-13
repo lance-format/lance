@@ -4,11 +4,15 @@
 use super::support::*;
 use super::*;
 
-/// Premise guard, not a regression test: confirms that the broken shape
-/// (`fields` truncated to the keyed field while `covering_fields` is
-/// inherited unchanged) is actually rejected by `validate_covering_fields`,
-/// and that the fixed shape (both fields carried through) is accepted.
-/// Both shapes are hand-built here, so this exercises no `merge_segments`
+/// Premise guard, not a regression test: confirms that a broken merged
+/// shape (the carried field appended once per merged segment) is actually
+/// rejected by `validate_covering_fields` under either covering layout, and
+/// that the fixed shape (both fields carried through once) is accepted.
+/// The other broken shape, `fields` truncated to the keyed field while
+/// `covering_fields` is inherited unchanged, validates as a keys-only
+/// declaration that only the independent contract can store, so committing
+/// it would fence older readers out of the table.
+/// These shapes are hand-built here, so this exercises no `merge_segments`
 /// code and would keep passing even if every impl regressed to the broken
 /// shape. The real regression coverage is
 /// `test_merge_existing_index_segments_preserves_covering_bitmap`,
@@ -32,17 +36,27 @@ fn test_merged_covered_metadata_is_committable() {
         metadata: Default::default(),
     };
 
-    // The shape every merge_segments impl builds: keyed field only, carried
-    // inherited from the source.
-    let field_id = *source.fields.first().unwrap();
     let merged = IndexMetadata {
         uuid: Uuid::new_v4(),
-        fields: vec![field_id],
+        fields: vec![7, 11, 11],
+        covering_fields: vec![11, 11],
         ..source.clone()
     };
     assert!(
         merged.validate_covering_fields().is_err(),
         "this is the broken shape; if it validates, the premise has changed"
+    );
+
+    let field_id = *source.fields.first().unwrap();
+    let truncated = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        fields: vec![field_id],
+        ..source.clone()
+    };
+    assert_eq!(truncated.keyed_fields(), source.keyed_fields());
+    assert!(
+        truncated.requires_independent_contract(),
+        "a truncated merge needs the independent layout; if not, the premise has changed"
     );
 
     // What the fix must produce instead.
