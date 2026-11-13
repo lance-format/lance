@@ -1077,7 +1077,7 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
         let partition_loads = Arc::new(tokio::sync::Semaphore::new(
-            search_guard.partition_load_limit(workers),
+            search_guard.partition_load_limit(workers)?,
         ));
         let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
         let buffered_chunks = super::scheduling::buffered_search_chunks(

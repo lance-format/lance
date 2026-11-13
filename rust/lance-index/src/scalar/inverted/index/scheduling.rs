@@ -1,16 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use futures::{Stream, TryStreamExt};
 use lance_core::{
     Error, Result,
     utils::tokio::{spawn, spawn_cpu},
 };
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::format::{DEFAULT_FTS_SEARCH_CHUNK, configured_fts_search_chunk};
+
+fn partition_load_window_from_value(
+    value: Option<&str>,
+) -> std::result::Result<Option<usize>, String> {
+    value
+        .map(|value| {
+            let window = value.trim().parse::<usize>().map_err(|_| {
+                format!("LANCE_FTS_SEARCH_LOAD_WINDOW must be a positive integer, got {value:?}")
+            })?;
+            if window == 0 || window > Semaphore::MAX_PERMITS {
+                return Err(format!(
+                    "LANCE_FTS_SEARCH_LOAD_WINDOW must be between 1 and {}, got {window}",
+                    Semaphore::MAX_PERMITS
+                ));
+            }
+            Ok(window)
+        })
+        .transpose()
+}
+
+fn configured_partition_load_window() -> Result<Option<usize>> {
+    static WINDOW: LazyLock<std::result::Result<Option<usize>, String>> =
+        LazyLock::new(|| match std::env::var("LANCE_FTS_SEARCH_LOAD_WINDOW") {
+            Ok(value) => partition_load_window_from_value(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(format!("invalid LANCE_FTS_SEARCH_LOAD_WINDOW: {error}")),
+        });
+    WINDOW
+        .as_ref()
+        .copied()
+        .map_err(|error| Error::invalid_input(error.clone()))
+}
 
 /// Score loaded partitions without waiting for unrelated remote reads. At most
 /// two CPU batches per load window overlap, keeping both stages bounded.
@@ -88,11 +123,19 @@ impl SearchConcurrency {
 pub(super) struct SearchGuard<'a>(&'a SearchConcurrency);
 
 impl SearchGuard<'_> {
-    pub(super) fn partition_load_limit(&self, workers: usize) -> usize {
-        // Share two waves of loading/scoring work across active queries. Keep
-        // two slots even with one CPU so I/O and pure CPU work can overlap.
+    /// Bound in-flight loads and scoring independently of CPU batch size.
+    /// `LANCE_FTS_SEARCH_LOAD_WINDOW` can explicitly override the per-query
+    /// partition count. This is not a byte or process-memory limit.
+    pub(super) fn partition_load_limit(&self, workers: usize) -> Result<usize> {
+        if let Some(window) = configured_partition_load_window()? {
+            return Ok(window);
+        }
+        // Query pressure estimates CPU share, not remote read latency. Retain
+        // half a normal chunk of I/O overlap even when queries fill the pool.
         let active = self.0.active.load(Ordering::Relaxed).max(1);
-        (workers * 2).div_ceil(active).max(2)
+        Ok((workers * 2)
+            .div_ceil(active)
+            .max(DEFAULT_FTS_SEARCH_CHUNK / 2))
     }
 
     pub(super) fn chunk_size(&self, partitions: usize, workers: usize) -> usize {
@@ -123,6 +166,37 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    #[rstest::rstest]
+    #[case::unset(None, None)]
+    #[case::one(Some("1"), Some(1))]
+    #[case::eight(Some("8"), Some(8))]
+    #[case::whitespace(Some(" 16 "), Some(16))]
+    fn load_window_override_is_independent_of_cpu_chunks(
+        #[case] value: Option<&str>,
+        #[case] expected: Option<usize>,
+    ) {
+        assert_eq!(partition_load_window_from_value(value).unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::empty("")]
+    #[case::zero("0")]
+    #[case::negative("-1")]
+    #[case::not_an_integer("many")]
+    #[case::integer_overflow("18446744073709551616")]
+    fn invalid_load_window_override_reports_its_name(#[case] value: &str) {
+        let error = partition_load_window_from_value(Some(value)).unwrap_err();
+        assert!(error.contains("LANCE_FTS_SEARCH_LOAD_WINDOW"));
+    }
+
+    #[test]
+    fn load_window_override_rejects_semaphore_overflow() {
+        let value = (Semaphore::MAX_PERMITS + 1).to_string();
+        let error = partition_load_window_from_value(Some(&value)).unwrap_err();
+        assert!(error.contains("between 1 and"));
+        assert!(error.contains(&value));
+    }
 
     fn admitted<T>(
         loads: impl Stream<Item = Result<T>>,
@@ -187,9 +261,12 @@ mod tests {
         assert!(peak.load(Ordering::Relaxed) <= 8);
     }
 
+    #[rstest::rstest]
+    #[case::one_slot(1)]
+    #[case::two_slots(2)]
     #[tokio::test]
-    async fn large_load_window_drains_with_two_slots() {
-        let permits = Arc::new(Semaphore::new(2));
+    async fn large_load_window_drains_with_fewer_slots(#[case] slots: usize) {
+        let permits = Arc::new(Semaphore::new(slots));
         let loads = futures::stream::iter(0..33)
             .map(|id| {
                 let permits = permits.clone();
@@ -205,7 +282,7 @@ mod tests {
         .unwrap();
         result.sort_unstable();
         assert_eq!(result, (0..33).collect::<Vec<_>>());
-        assert_eq!(permits.available_permits(), 2);
+        assert_eq!(permits.available_permits(), slots);
     }
 
     #[tokio::test]
@@ -307,18 +384,18 @@ mod tests {
         let concurrency = SearchConcurrency::default();
         let first = concurrency.enter();
         assert_eq!(first.chunk_size(128, 32), 2);
-        assert_eq!(first.partition_load_limit(32), 64);
+        assert_eq!(first.partition_load_limit(32).unwrap(), 64);
         let second = concurrency.enter();
         assert_eq!(second.chunk_size(128, 32), 4);
-        assert_eq!(second.partition_load_limit(32), 32);
+        assert_eq!(second.partition_load_limit(32).unwrap(), 32);
         let third = concurrency.enter();
         let fourth = concurrency.enter();
         assert_eq!(fourth.chunk_size(128, 32), 8);
-        assert_eq!(fourth.partition_load_limit(32), 16);
-        assert_eq!(fourth.partition_load_limit(1), 2);
+        assert_eq!(fourth.partition_load_limit(32).unwrap(), 16);
+        assert_eq!(fourth.partition_load_limit(1).unwrap(), 8);
         drop((second, third, fourth));
         assert_eq!(first.chunk_size(128, 32), 2);
-        assert_eq!(first.partition_load_limit(32), 64);
+        assert_eq!(first.partition_load_limit(32).unwrap(), 64);
     }
 
     #[rstest::rstest]
