@@ -17,6 +17,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_io::read_budget::{Admission, Reservation};
 use tokio::sync::Notify;
 
 use super::locate::{BlobLocator, StoredBlob, blob_version_from_descriptions};
@@ -63,12 +64,13 @@ impl BlobMaterializationBudget {
             budget: Some(self.clone()),
             ticket,
             acquired: false,
+            read_budget: None,
         }
     }
 
     #[cfg(test)]
     async fn reserve(self: &Arc<Self>, bytes: u64) -> BlobMaterializationReservation {
-        self.admission().reserve(bytes).await.unwrap()
+        self.admission().reserve_own(bytes).await.unwrap()
     }
 }
 
@@ -76,10 +78,28 @@ pub struct BlobMaterializationAdmission {
     budget: Option<Arc<BlobMaterializationBudget>>,
     ticket: u64,
     acquired: bool,
+    /// The payloads' place in line for the session's read memory budget,
+    /// when the read is under one.
+    read_budget: Option<Admission>,
 }
 
 impl BlobMaterializationAdmission {
-    async fn reserve(mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
+    /// Waits for `bytes` of payloads under the scan's own readahead limit and
+    /// the session's read memory budget, whichever apply.
+    async fn reserve(mut self, bytes: u64) -> Vec<Arc<dyn Send + Sync>> {
+        let read_budget = self.read_budget.take();
+        let mut reservations: Vec<Arc<dyn Send + Sync>> = Vec::new();
+        if let Some(own) = self.reserve_own(bytes).await {
+            reservations.push(Arc::new(own));
+        }
+        if let Some(admission) = read_budget {
+            let reservation: Reservation = admission.reserve(bytes).await;
+            reservations.push(Arc::new(reservation));
+        }
+        reservations
+    }
+
+    async fn reserve_own(&mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
         let Some(budget) = self.budget.clone() else {
             self.acquired = true;
             return None;
@@ -170,15 +190,20 @@ impl BlobMaterializationContext {
         })
     }
 
-    pub(crate) fn admission(&self) -> BlobMaterializationAdmission {
-        match &self.budget {
+    /// The next batch's place in line, under the session's read memory
+    /// budget too when `read_budget` is given.
+    pub(crate) fn admission(&self, read_budget: Option<Admission>) -> BlobMaterializationAdmission {
+        let mut admission = match &self.budget {
             Some(budget) => budget.admission(),
             None => BlobMaterializationAdmission {
                 budget: None,
                 ticket: 0,
                 acquired: false,
+                read_budget: None,
             },
-        }
+        };
+        admission.read_budget = read_budget;
+        admission
     }
 
     #[cfg(test)]
@@ -422,7 +447,7 @@ pub fn materialize_blob_v2_binary_batch_with_context<'a>(
     batch: RecordBatch,
     context: &'a Arc<BlobMaterializationContext>,
 ) -> BoxFuture<'a, Result<MaterializedBlobBatch>> {
-    let admission = context.admission();
+    let admission = context.admission(None);
     materialize_blob_v2_binary_batch_with_admission(
         dataset,
         output_schema,
@@ -442,7 +467,7 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
     async move {
         let materialized_bytes =
             estimate_blob_v2_materialized_batch_bytes(dataset, output_schema, &batch).await?;
-        let reservation = admission.reserve(materialized_bytes).await;
+        let reservations = admission.reserve(materialized_bytes).await;
         let row_addr_idx = batch
             .schema()
             .column_with_name(ROW_ADDR)
@@ -496,10 +521,7 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
                 )),
                 columns,
             )?,
-            _reservations: reservation
-                .into_iter()
-                .map(|reservation| Arc::new(reservation) as Arc<dyn Send + Sync>)
-                .collect(),
+            _reservations: reservations,
         })
     }
     .boxed()
@@ -911,9 +933,9 @@ mod tests {
             state: std::sync::Mutex::new(BlobMaterializationBudgetState::default()),
             notify: Notify::new(),
         });
-        let first = budget.admission();
-        let second = budget.admission();
-        let later = tokio::spawn(async move { second.reserve(60).await.unwrap() });
+        let mut first = budget.admission();
+        let mut second = budget.admission();
+        let later = tokio::spawn(async move { second.reserve_own(60).await.unwrap() });
         assert!(
             tokio::time::timeout(Duration::from_millis(20), waiting_budget_wait(&later))
                 .await
@@ -921,7 +943,7 @@ mod tests {
         );
         assert_eq!(budget.state.lock().unwrap().reserved, 0);
 
-        let earlier = first.reserve(80).await.unwrap();
+        let earlier = first.reserve_own(80).await.unwrap();
         assert_eq!(budget.state.lock().unwrap().reserved, 80);
         drop(earlier);
         let later = later.await.unwrap();

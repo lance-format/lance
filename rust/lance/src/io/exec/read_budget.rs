@@ -80,20 +80,20 @@ pub(super) fn split_ranges(ranges: &[Range<u64>], rows_per_chunk: u64) -> Vec<Ve
     chunks
 }
 
-/// Splits `ranges` of `reader` into chunks of about `chunk_bytes` on disk, or
-/// of whole batches when `keep_batch_size` is set.
+/// Splits `ranges` of `reader` into chunks of about one `chunk_size` of
+/// memory each, or of whole batches when `keep_batch_size` is set.
 pub(super) async fn plan_chunks(
     reader: &FragmentReader,
     ranges: &[Range<u64>],
     batch_size: u32,
     keep_batch_size: bool,
-    chunk_bytes: u64,
+    chunk_size: &ChunkSize,
 ) -> Result<Vec<ReadChunk>> {
     let estimate = reader.estimate_read(ranges.to_vec().into()).await?;
-    let bytes = estimate.bytes;
     let rows: u64 = ranges.iter().map(|r| r.end - r.start).sum();
     let batch_size = (batch_size as u64).max(1);
-    let rows_per_chunk = rows.div_ceil(bytes.div_ceil(chunk_bytes).max(1));
+    let chunks = (chunk_size.memory(estimate) / chunk_size.chunk_bytes as f64).ceil();
+    let rows_per_chunk = rows.div_ceil((chunks as u64).max(1));
     // Whole batches avoid short batches at chunk ends, but a chunk smaller than
     // one batch is decoded as its own smaller batch rather than rounded up past
     // the target.
@@ -117,8 +117,9 @@ pub(super) async fn plan_chunks(
     .await
 }
 
-/// Decoded bytes per byte read, learned from each chunk's first batch and
-/// shared by all of a scan's chunks.
+/// What the bytes whose decoded size the metadata does not give decode to,
+/// per byte read: learned from each chunk's first batch and shared by all of
+/// a scan's chunks.
 struct DecodedSize {
     /// NaN until a batch has been decoded.
     decoded_per_raw: AtomicU64,
@@ -140,17 +141,27 @@ impl DecodedSize {
         self.learned().unwrap_or(UNMEASURED_DECODED_PER_RAW)
     }
 
-    /// What `estimate` decodes to: as learned once a batch is. Before that,
-    /// the assumed ratio, but only up to a chunk of `chunk_bytes` in all: a
-    /// unit larger than a chunk, such as a take's whole batch, would otherwise
-    /// reserve several times its size. The metadata's figure when larger.
+    /// What `estimate` decodes to: the metadata's figure where it knows, and
+    /// the learned or assumed ratio for the rest.
+    fn expected(&self, estimate: ReadEstimate) -> f64 {
+        known_decoded(estimate) + estimate.unknown_bytes as f64 * self.per_raw()
+    }
+
+    /// What to reserve for `estimate`'s decoded data. Until a batch is
+    /// decoded, the assumed ratio raises it at most to a chunk of
+    /// `chunk_bytes` in all: a unit larger than a chunk, such as a take's
+    /// whole batch, would otherwise reserve several times its size.
     fn decoded(&self, estimate: ReadEstimate, chunk_bytes: u64) -> u64 {
-        match self.learned() {
-            Some(ratio) => (estimate.bytes as f64 * ratio) as u64,
-            None => ((estimate.bytes as f64 * UNMEASURED_DECODED_PER_RAW) as u64)
-                .min(chunk_bytes.saturating_sub(estimate.bytes))
-                .max(estimate.decoded_bytes),
+        if self.learned().is_some() {
+            return self.expected(estimate).round() as u64;
         }
+        let known = known_decoded(estimate);
+        let unknown = estimate.unknown_bytes as f64;
+        let room = chunk_bytes as f64 - estimate.bytes as f64 - known;
+        (known
+            + (unknown * UNMEASURED_DECODED_PER_RAW)
+                .min(room)
+                .max(unknown)) as u64
     }
 
     fn learn(&self, observed: f64) {
@@ -166,6 +177,13 @@ impl DecodedSize {
                 Some(next.to_bits())
             });
     }
+}
+
+/// What the metadata knows `estimate` decodes to.
+fn known_decoded(estimate: ReadEstimate) -> f64 {
+    estimate
+        .decoded_bytes
+        .saturating_sub(estimate.unknown_bytes) as f64
 }
 
 /// One scan's use of the read memory budget.
@@ -215,7 +233,12 @@ impl ScanBudget {
         self.whole_read
     }
 
-    /// The size on disk the scan splits fragments into.
+    /// A reader for blob payloads the scan reads after their descriptors.
+    pub fn payload_reader(&self) -> BudgetReader {
+        self.reader.sibling()
+    }
+
+    /// The memory per chunk the scan splits fragments into.
     pub fn chunk_size(&self) -> ChunkSize {
         ChunkSize {
             chunk_bytes: self.reader.chunk_bytes(),
@@ -228,6 +251,7 @@ impl ScanBudget {
     pub fn admission(&self) -> ChunkAdmission {
         ChunkAdmission {
             admission: self.reader.admission(),
+            reader: self.reader.clone(),
             decoded: self.decoded.clone(),
             chunk_bytes: self.reader.chunk_bytes(),
             wait_time: self.wait_time.clone(),
@@ -235,23 +259,26 @@ impl ScanBudget {
     }
 }
 
-/// The size on disk of a scan's chunks, chosen so that a chunk's pages and
-/// their decoded data, which a chunk reserves together, are about one chunk of
-/// the budget. Follows the decoded size the scan learns.
+/// A scan's chunks: their pages and decoded data, which a chunk reserves
+/// together, are about one chunk of the budget. Follows the decoded size the
+/// scan learns.
 #[derive(Clone)]
 pub struct ChunkSize {
-    chunk_bytes: u64,
+    pub chunk_bytes: u64,
     decoded: Arc<DecodedSize>,
 }
 
 impl ChunkSize {
-    pub fn bytes(&self) -> u64 {
-        ((self.chunk_bytes as f64 / (1.0 + self.decoded.per_raw())) as u64).max(1)
+    /// The memory a read of `estimate` is expected to take: its pages and
+    /// their decoded data.
+    pub fn memory(&self, estimate: ReadEstimate) -> f64 {
+        estimate.bytes as f64 + self.decoded.expected(estimate)
     }
 }
 
 pub struct ChunkAdmission {
     admission: Admission,
+    reader: BudgetReader,
     decoded: Arc<DecodedSize>,
     chunk_bytes: u64,
     wait_time: Time,
@@ -268,7 +295,8 @@ impl ChunkAdmission {
         };
         Arc::new(ChunkBudget {
             reservation,
-            raw_bytes: estimate.bytes,
+            reader: self.reader,
+            estimate,
             rows,
             decoded: self.decoded,
             measured: Mutex::new(false),
@@ -281,7 +309,8 @@ impl ChunkAdmission {
 /// out with [`ChunkBudget::charge_output`] and keep it until emitted.
 pub struct ChunkBudget {
     reservation: Reservation,
-    raw_bytes: u64,
+    reader: BudgetReader,
+    estimate: ReadEstimate,
     rows: u64,
     decoded: Arc<DecodedSize>,
     /// Held while the first batch resizes the reservation, so no batch moves
@@ -291,26 +320,41 @@ pub struct ChunkBudget {
 
 impl ChunkBudget {
     /// Charges an output batch of the chunk until the batch is dropped, moving
-    /// it out of the chunk's reservation so it is not counted twice. It is
-    /// already in memory, so this never waits.
+    /// it out of the chunk's reservation so it is not counted twice. The
+    /// chunk keeps its pages' share while it holds them, and a batch larger
+    /// than what is left is charged the rest. It is already in memory, so
+    /// this never waits.
     pub fn charge_output(&self, bytes: u64) -> Reservation {
-        self.reservation.split_off(bytes)
+        self.reservation.split_off(bytes, self.estimate.bytes)
+    }
+
+    /// A reader for the blob payloads of the chunk's batches, which are
+    /// admitted after the chunk itself.
+    pub fn payload_reader(&self) -> BudgetReader {
+        self.reader.sibling()
     }
 
     /// Sizes the reservation from the chunk's first decoded batch, which shows
-    /// how much the chunk's data grows when decoded.
+    /// how much the chunk's data grows when decoded. Every batch teaches the
+    /// scan's decoded size.
     pub fn observe_decoded(&self, batch: &RecordBatch) {
-        if batch.num_rows() == 0 || self.raw_bytes == 0 {
-            return;
-        }
-        let mut measured = self.measured.lock().unwrap();
-        if std::mem::replace(&mut *measured, true) {
+        if batch.num_rows() == 0 || self.estimate.bytes == 0 {
             return;
         }
         let decoded =
             batch.get_array_memory_size() as f64 * self.rows as f64 / batch.num_rows() as f64;
-        self.reservation.resize(self.raw_bytes + decoded as u64);
-        self.decoded.learn(decoded / self.raw_bytes as f64);
+        {
+            let mut measured = self.measured.lock().unwrap();
+            if !std::mem::replace(&mut *measured, true) {
+                self.reservation
+                    .resize(self.estimate.bytes + decoded as u64);
+            }
+        }
+        if self.estimate.unknown_bytes > 0 {
+            let unknown = (decoded - known_decoded(self.estimate)).max(0.0);
+            self.decoded
+                .learn(unknown / self.estimate.unknown_bytes as f64);
+        }
     }
 }
 
@@ -320,32 +364,54 @@ mod tests {
 
     use super::*;
 
-    fn estimate(bytes: u64, decoded_bytes: u64) -> ReadEstimate {
+    /// `bytes` on disk, of which `unknown` have a decoded size the metadata
+    /// does not give, and the rest decode to `known`.
+    fn estimate(bytes: u64, known: u64, unknown: u64) -> ReadEstimate {
         ReadEstimate {
             bytes,
-            decoded_bytes,
+            decoded_bytes: known + unknown,
+            unknown_bytes: unknown,
         }
     }
 
-    /// Before a batch is decoded, chunks reserve the assumed decoded size, or
-    /// the metadata's when larger, and are admitted without waiting on each
-    /// other; after, what batches decoded to per byte read. Output moves out
-    /// of its chunk's reservation and is charged until dropped.
+    /// Before a batch is decoded, chunks reserve what the metadata knows plus
+    /// the assumed ratio for the rest, and are admitted without waiting on
+    /// each other; after, what batches decoded to per unknown byte read.
+    /// Output moves out of its chunk's reservation and is charged until
+    /// dropped.
     #[tokio::test]
     async fn test_chunk_budget_learns_decoded_size() {
         let budget = Arc::new(ReadMemoryBudget::new(1 << 30));
         let scan = ScanBudget::new(budget.reader(QueryId::unique()), Time::new());
-        let unmeasured = 1000 + ((1000.0 * UNMEASURED_DECODED_PER_RAW) as u64).max(3000);
-        let chunk = scan.admission().reserve(100, estimate(1000, 3000)).await;
-        let unused = scan.admission().reserve(100, estimate(1000, 3000)).await;
+        let unmeasured = 1000 + 100 + (500.0 * UNMEASURED_DECODED_PER_RAW) as u64;
+        let chunk = scan
+            .admission()
+            .reserve(100, estimate(1000, 100, 500))
+            .await;
+        let unused = scan
+            .admission()
+            .reserve(100, estimate(1000, 100, 500))
+            .await;
         assert_eq!(budget.reserved_bytes(), 2 * unmeasured);
         drop(unused);
+        // Exactly what the metadata says when it knows every byte, and nothing
+        // is learned from it.
+        let known = scan.admission().reserve(100, estimate(1000, 100, 0)).await;
+        assert_eq!(budget.reserved_bytes(), unmeasured + 1100);
+        drop(known);
         let batch =
             arrow_array::record_batch!(("x", Int32, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])).unwrap();
         let decoded = (batch.get_array_memory_size() as f64 * 10.0) as u64;
         chunk.observe_decoded(&batch);
         assert_eq!(budget.reserved_bytes(), 1000 + decoded);
-        let next = scan.admission().reserve(100, estimate(1000, 3000)).await;
+        // The next chunk keeps the known 100 and learns the rest per unknown
+        // byte.
+        let per_unknown = (decoded as f64 - 100.0) / 500.0;
+        assert_eq!(scan.decoded.learned(), Some(per_unknown));
+        let next = scan
+            .admission()
+            .reserve(100, estimate(1000, 100, 500))
+            .await;
         assert_eq!(budget.reserved_bytes(), 2 * (1000 + decoded));
         // Output moves out of its chunk's reservation, not on top of it.
         let output = chunk.charge_output(500);
@@ -353,6 +419,23 @@ mod tests {
         drop(chunk);
         assert_eq!(budget.reserved_bytes(), 1000 + decoded + 500);
         drop((output, next));
+        assert_eq!(budget.reserved_bytes(), 0);
+    }
+
+    /// Output larger than the chunk's decoded share never takes the share of
+    /// its pages, which the chunk still holds.
+    #[tokio::test]
+    async fn test_output_keeps_the_pages_share() {
+        let budget = Arc::new(ReadMemoryBudget::new(1 << 30));
+        let scan = ScanBudget::new(budget.reader(QueryId::unique()), Time::new());
+        let chunk = scan.admission().reserve(100, estimate(1000, 500, 0)).await;
+        assert_eq!(budget.reserved_bytes(), 1500);
+        // 500 moves out of the chunk and 1500 more is charged.
+        let output = chunk.charge_output(2000);
+        assert_eq!(budget.reserved_bytes(), 3000);
+        drop(chunk);
+        assert_eq!(budget.reserved_bytes(), 2000);
+        drop(output);
         assert_eq!(budget.reserved_bytes(), 0);
     }
 

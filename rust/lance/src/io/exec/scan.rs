@@ -146,14 +146,9 @@ fn budgeted_fragment_batches(
                         Some(range) => range.start as u64..range.end as u64,
                         None => 0..file_fragment.fragment.physical_rows().await? as u64,
                     };
-                    let chunks = plan_chunks(
-                        &reader,
-                        &[rows],
-                        batch_size,
-                        keep_batch_size,
-                        chunk_size.bytes(),
-                    )
-                    .await?;
+                    let chunks =
+                        plan_chunks(&reader, &[rows], batch_size, keep_batch_size, &chunk_size)
+                            .await?;
                     Ok::<_, DataFusionError>(stream::iter(chunks.into_iter().map(move |chunk| {
                         Ok::<_, DataFusionError>((reader.clone(), range.is_some(), chunk))
                     })))
@@ -458,6 +453,7 @@ impl LanceStream {
             config.materialization_readahead_bytes,
         );
         let config_for_stream = config.clone();
+        let payload_reader = read_budget.as_ref().map(BudgetReader::sibling);
         let batches = if let Some(budget_reader) = read_budget {
             budgeted_fragment_batches(
                 file_fragments,
@@ -551,7 +547,8 @@ impl LanceStream {
                     let dataset = materialize_dataset.clone();
                     let output_projection = output_projection.clone();
                     let materialization_context = materialization_context.clone();
-                    let admission = materialization_context.admission();
+                    let admission = materialization_context
+                        .admission(payload_reader.as_ref().map(BudgetReader::admission));
                     async move {
                         crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
                             &dataset,

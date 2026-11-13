@@ -491,13 +491,14 @@ impl Reservation {
     }
 
     /// Moves `bytes` of this reservation to a new one, such as a batch decoded
-    /// from this reservation's unit that outlives it, and reserves without
-    /// waiting whatever part this one no longer holds. Memory that came
-    /// through the overdraft keeps it until released.
-    pub fn split_off(&self, bytes: u64) -> Self {
+    /// from this reservation's unit that outlives it, keeping at least `keep`
+    /// here for memory this one still covers, and reserves without waiting
+    /// whatever part it cannot move. Memory that came through the overdraft
+    /// keeps it until released.
+    pub fn split_off(&self, bytes: u64, keep: u64) -> Self {
         let reader = &self.reader;
         let mut state = reader.0.budget.state.lock().unwrap();
-        let moved = self.bytes().min(bytes);
+        let moved = self.bytes().saturating_sub(keep).min(bytes);
         self.bytes.fetch_sub(moved, Ordering::Relaxed);
         state.reserved -= moved;
         reader.0.queue.lock().unwrap().held -= moved;
@@ -762,11 +763,11 @@ mod tests {
             .await;
         // What the overdrawn unit decodes to keeps the overdraft, and moves
         // out of the unit's reservation rather than adding to it.
-        let output = first.split_off(50);
+        let output = first.split_off(50, 0);
         assert_eq!(budget.reserved_bytes(), 500);
-        // Past what the unit still holds, the rest is reserved.
-        let more = first.split_off(500);
-        assert_eq!(budget.reserved_bytes(), 550);
+        // Past what the unit can give up, the rest is reserved.
+        let more = first.split_off(500, 100);
+        assert_eq!(budget.reserved_bytes(), 650);
         drop((first, more));
         // Another query's reader that holds nothing must wait for the overdraft.
         let waiting = assert_waits(budget.reader(QueryId::unique()).admission(), 200).await;

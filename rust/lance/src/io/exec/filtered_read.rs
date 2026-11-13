@@ -58,7 +58,7 @@ use lance_index::scalar::expression::FilterPlan;
 use lance_io::object_store::{
     METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
 };
-use lance_io::read_budget::QueryId;
+use lance_io::read_budget::{BudgetReader, QueryId};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
@@ -575,13 +575,13 @@ impl OpenedFragmentRead {
             .is_some_and(|limit| self.rows_read.load(Ordering::Relaxed) >= limit as usize)
     }
 
-    async fn plan_chunks(&self, chunk_bytes: u64) -> Result<Vec<ReadChunk>> {
+    async fn plan_chunks(&self, chunk_size: &ChunkSize) -> Result<Vec<ReadChunk>> {
         read_budget::plan_chunks(
             &self.reader,
             &self.ranges,
             self.batch_size,
             self.keep_batch_size,
-            chunk_bytes,
+            chunk_size,
         )
         .await
     }
@@ -602,6 +602,7 @@ impl OpenedFragmentRead {
         let output_schema = self.output_schema.clone();
         let batch_size_bytes = self.batch_size_bytes;
         let chunk_budget_for_output = chunk_budget.clone();
+        let payload_reader = chunk_budget.as_ref().map(|chunk| chunk.payload_reader());
         let fragment_stream = self
             .reader
             .read_ranges(ranges.into(), self.batch_size)
@@ -634,17 +635,31 @@ impl OpenedFragmentRead {
                     let dataset = dataset.clone();
                     let output_read_schema = output_read_schema.clone();
                     let materialization_context = materialization_context.clone();
-                    let admission = materialization_context.admission();
+                    let admission = materialization_context
+                        .admission(payload_reader.as_ref().map(BudgetReader::admission));
+                    let chunk_budget = chunk_budget.clone();
                     batch_fut
                         .and_then(move |batch| async move {
-                            crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
-                                &dataset,
-                                output_read_schema.as_ref(),
-                                batch,
-                                &materialization_context,
-                                admission,
-                            )
-                            .await
+                            // The descriptors are charged as output; the
+                            // payloads are admitted before they are read.
+                            let descriptors = chunk_budget.map(|chunk_budget| {
+                                chunk_budget.charge_output(batch.get_array_memory_size() as u64)
+                            });
+                            let materialized =
+                                crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
+                                    &dataset,
+                                    output_read_schema.as_ref(),
+                                    batch,
+                                    &materialization_context,
+                                    admission,
+                                )
+                                .await?;
+                            Ok(match descriptors {
+                                Some(descriptors) => {
+                                    materialized.with_reservation(Arc::new(descriptors))
+                                }
+                                None => materialized,
+                            })
                         })
                         .boxed()
                 } else {
@@ -664,8 +679,9 @@ impl OpenedFragmentRead {
                 Ok(batch_fut
                     .and_then(move |batch| {
                         // The batch takes its share of the chunk's reservation
-                        // until the scan emits it.
-                        let batch = match chunk_budget {
+                        // until the scan emits it; materialized blob batches
+                        // were charged before their payloads were read.
+                        let batch = match chunk_budget.filter(|_| !materialize_blob_v2_binary) {
                             Some(chunk_budget) => {
                                 let bytes = batch.batch().get_array_memory_size() as u64;
                                 batch.with_reservation(Arc::new(chunk_budget.charge_output(bytes)))
@@ -1888,7 +1904,7 @@ impl FilteredReadStream {
                 SpawnedTask::spawn(
                     async move {
                         let fragment = open.await?;
-                        let chunks = fragment.plan_chunks(chunk_size.bytes()).await?;
+                        let chunks = fragment.plan_chunks(&chunk_size).await?;
                         Ok::<_, Error>(futures::stream::iter(
                             chunks
                                 .into_iter()
@@ -3693,11 +3709,12 @@ impl RowStreamRead {
             .map(|row| row..row + 1)
             .collect();
         let rows = sample.len() as u64;
-        let Ok(ReadEstimate { bytes, .. }) = reader.estimate_read(sample.into()).await else {
+        let Ok(estimate) = reader.estimate_read(sample.into()).await else {
             return batch_rows;
         };
-        let bytes_per_row = (bytes / rows).max(1);
-        (scan_budget.chunk_size().bytes() / bytes_per_row).clamp(1, batch_rows as u64) as usize
+        let chunk_size = scan_budget.chunk_size();
+        let memory_per_row = (chunk_size.memory(estimate) / rows as f64).max(1.0);
+        (chunk_size.chunk_bytes as f64 / memory_per_row).clamp(1.0, batch_rows as f64) as usize
     }
 
     async fn load_fragments(&self) -> Result<&StreamFragments> {
@@ -4019,7 +4036,11 @@ impl RowStreamRead {
             .map(move |(batch_index, batch)| {
                 let batch = batch?;
                 let this = self.clone();
-                let admission = this.materialization_context.admission();
+                let admission = this.materialization_context.admission(
+                    this.scan_budget
+                        .as_ref()
+                        .map(|scan_budget| scan_budget.payload_reader().admission()),
+                );
                 DataFusionResult::Ok(
                     // SpawnedTask aborts on drop: cancelling the query
                     // cancels in-flight batches

@@ -969,10 +969,15 @@ async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
 
     let unbudgeted = open(&dir, None).await;
     let budgeted = open(&dir, Some(limit)).await;
+    let budget = budgeted.session.read_budget().unwrap();
     for filter in [None, Some("id % 5 = 0")] {
         let expected = read_payloads(&unbudgeted, filter).await;
         assert!(expected.iter().all(|(_, len, _)| *len == 8 * 1024));
+        budget.reset_peak();
         assert_eq!(read_payloads(&budgeted, filter).await, expected);
+        // Payloads are reserved, not just their descriptors: a batch of 32.
+        let peak = budget.stats().peak_reserved_bytes;
+        assert!(peak >= 32 * 8 * 1024, "{filter:?}: peak {peak}");
         let concurrent =
             futures::future::join_all((0..8).map(|_| read_payloads(&budgeted, filter))).await;
         assert!(concurrent.iter().all(|rows| *rows == expected));
