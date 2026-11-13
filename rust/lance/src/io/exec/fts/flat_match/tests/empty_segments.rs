@@ -10,6 +10,7 @@ use rstest::rstest;
 #[rstest]
 #[case::small_index(1)]
 #[case::large_index(20)]
+#[case::no_index(0)]
 #[tokio::test]
 async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] indexed_rows: u32) {
     let mut dataset = lance_datagen::gen_batch()
@@ -17,17 +18,22 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
             "text",
             lance_datagen::array::cycle_utf8_literals(&["hello hello hello"]),
         )
-        .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(indexed_rows))
+        .into_ram_dataset(
+            FragmentCount::from(1),
+            FragmentRowCount::from(indexed_rows.max(1)),
+        )
         .await
         .unwrap();
     let params = InvertedIndexParams::default()
         .lower_case(false)
         .stem(false)
         .remove_stop_words(false);
-    dataset
-        .create_index(&["text"], IndexType::Inverted, None, &params, true)
-        .await
-        .unwrap();
+    if indexed_rows > 0 {
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+    }
     let corpus = record_batch!(
         (
             "text",
@@ -64,11 +70,17 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
             .values()
             .to_vec();
         ids.sort_unstable();
-        assert_eq!(ids, vec![10, 11]);
+        let (expected_ids, expected_score) = if indexed_rows > 0 {
+            (vec![10, 11], 1.6_f32.ln())
+        } else {
+            // The unindexed default tokenizer folds case: N=DF=3.
+            (vec![10, 11, 12], (8_f32 / 7.0).ln())
+        };
+        assert_eq!(ids, expected_ids);
         let scores = batch["_score"].as_primitive::<arrow_array::types::Float32Type>();
         for score in scores.values() {
             assert!(
-                (score - 1.6_f32.ln()).abs() < 1e-6,
+                (score - expected_score).abs() < 1e-6,
                 "unexpected score {score}"
             );
         }

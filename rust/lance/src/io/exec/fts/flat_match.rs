@@ -41,8 +41,8 @@ use lance_index::scalar::inverted::query::{
     uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
-    DocumentGranularity, FlatBm25SearchOptions, MemBM25Scorer, build_global_bm25_scorer,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
+    DocumentGranularity, FlatBm25SearchOptions, InvertedIndexParams, MemBM25Scorer,
+    build_global_bm25_scorer, flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use tracing::instrument;
 
@@ -773,7 +773,9 @@ impl FlatMatchQueryExec {
         }
     }
 
-    /// See [`super::MatchQueryExec::new_with_segments`].
+    /// See [`super::MatchQueryExec::new_with_segments`]. An empty selection adds
+    /// no indexed corpus statistics. It retains the snapshot's index tokenizer
+    /// configuration, or the default tokenizer when the column has no index.
     pub fn new_with_segments(
         dataset: Arc<Dataset>,
         query: MatchQuery,
@@ -1047,6 +1049,27 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     None => load_segments(&ds, &column, document_granularity).await?,
                 };
                 let (tokenizer, base_scorer) = match segments {
+                    Some(segments) if segments.is_empty() => {
+                        // A residual-only distributed scope must not implicitly
+                        // open every committed segment. Read tokenizer metadata
+                        // from the pinned snapshot without constructing an index
+                        // or borrowing any of its document/term statistics.
+                        let mut tokenizer = match load_segments(&ds, &column, document_granularity)
+                            .await?
+                        {
+                            Some(metadata) => {
+                                let details = load_segment_details(&ds, &column, &metadata).await?;
+                                InvertedIndexParams::try_from(&details)?.build()?
+                            }
+                            None => default_text_tokenizer(),
+                        };
+                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                        record_tokenized_query(&tokenized_query, &query_tokens);
+                        (
+                            tokenizer,
+                            preset_base_scorer.map(|scorer| (*scorer).clone()),
+                        )
+                    }
                     Some(segments) => {
                         let _details = load_segment_details(&ds, &column, &segments).await?;
                         let indices =
