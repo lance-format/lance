@@ -475,6 +475,28 @@ impl Default for ReadParams {
     }
 }
 
+/// Runtime-only configuration applied to an already-open [`Dataset`] handle.
+///
+/// Every field is optional so a caller can change one part of the handle without
+/// rebuilding the manifest, object stores, or inherited base bindings.
+#[derive(Default)]
+pub struct DatasetRuntimeConfig {
+    /// New index cache capacity. Ignored when `session` is also set.
+    pub index_cache_size_bytes: Option<usize>,
+    /// New metadata cache capacity. Ignored when `session` is also set.
+    pub metadata_cache_size_bytes: Option<usize>,
+    /// New primary object-store block-size hint.
+    pub block_size: Option<usize>,
+    /// Replacement session. Wins over the cache sizes above.
+    pub session: Option<Arc<Session>>,
+    /// Replacement commit handler.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
+    /// Replacement storage-options accessor for the primary store params.
+    pub storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    /// Explicit per-base bindings to merge. Caller entries win over inherited ones.
+    pub base_store_params: HashMap<String, ObjectStoreParams>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProjectionRequest {
     Schema(Arc<Schema>),
@@ -2468,6 +2490,80 @@ impl Dataset {
         cloned
     }
 
+    /// Apply runtime configuration to this dataset handle.
+    ///
+    /// The returned handle keeps the loaded manifest and every store binding that
+    /// `config` does not replace. An explicit session wins over cache sizes, and
+    /// cache sizes create a new session on the same store registry so custom
+    /// object-store providers keep resolving. When `block_size` is set, the
+    /// primary store keeps its existing backend and only changes its read hint.
+    pub async fn reconfigure(&self, config: DatasetRuntimeConfig) -> Result<Self> {
+        let mut ds = self.clone();
+
+        let session = match config.session {
+            Some(session) => Some(session),
+            None if config.index_cache_size_bytes.is_some()
+                || config.metadata_cache_size_bytes.is_some() =>
+            {
+                Some(Arc::new(Session::new(
+                    config
+                        .index_cache_size_bytes
+                        .unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
+                    config
+                        .metadata_cache_size_bytes
+                        .unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
+                    ds.session.store_registry(),
+                )))
+            }
+            None => None,
+        };
+        if let Some(session) = session {
+            ds.index_cache = Arc::new(session.index_cache.for_dataset(&ds.uri));
+            ds.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&ds.uri));
+            ds.session = session;
+        }
+
+        let mut store_params = ds.store_params.as_deref().cloned();
+        if let Some(accessor) = config.storage_options_accessor {
+            let params = store_params.get_or_insert_default();
+            params.storage_options_accessor = Some(accessor);
+        }
+        if let Some(block_size) = config.block_size {
+            let params = store_params.get_or_insert_default();
+            params.block_size = Some(block_size);
+            ds = ds.with_object_store(
+                Arc::new(ds.object_store.with_block_size(block_size)),
+                Some(params.clone()),
+            );
+            ds.refs = Refs::new(
+                ds.object_store.clone(),
+                ds.commit_handler.clone(),
+                ds.branch_location(),
+            );
+        } else if store_params.is_some() {
+            ds.store_params = store_params.map(Box::new);
+        }
+
+        if let Some(commit_handler) = config.commit_handler {
+            ds.commit_handler = commit_handler;
+            ds.refs = Refs::new(
+                ds.object_store.clone(),
+                ds.commit_handler.clone(),
+                ds.branch_location(),
+            );
+        }
+
+        if !config.base_store_params.is_empty() {
+            let mut base_store_params =
+                ds.base_store_params.as_deref().cloned().unwrap_or_default();
+            base_store_params.extend(config.base_store_params);
+            ds.base_store_params = Some(Arc::new(base_store_params));
+            ds.base_object_stores = Default::default();
+        }
+
+        Ok(ds)
+    }
+
     /// Clone this dataset with extra object store wrappers applied to all read stores.
     ///
     /// The returned dataset uses the wrappers for the already-open primary object
@@ -2980,6 +3076,18 @@ impl Dataset {
     /// ```
     pub fn file_reader_options(&self) -> Option<&FileReaderOptions> {
         self.file_reader_options.as_deref()
+    }
+
+    /// Return a copy of this dataset with updated dataset-level file-reader
+    /// defaults.
+    ///
+    /// The returned handle shares the manifest, object stores, session, and
+    /// caches with this dataset. Only the defaults used by subsequent scans
+    /// change; see [`Self::file_reader_options`].
+    pub fn with_file_reader_options(&self, file_reader_options: Option<FileReaderOptions>) -> Self {
+        let mut cloned = self.clone();
+        cloned.file_reader_options = file_reader_options.map(Arc::new);
+        cloned
     }
 
     pub(crate) async fn object_store_for_data_file(

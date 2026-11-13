@@ -20,7 +20,7 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    DatasetRuntimeConfig, ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
     parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
     write_manifest_file,
 };
@@ -3059,6 +3059,75 @@ async fn test_shallow_clone_cross_store(
         .await
         .unwrap();
     assert_eq!(chained.scan().try_into_batch().await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_reconfigure_preserves_clone_bindings_and_read_options() {
+    let source_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let source_uri = "memory:///reconfigure-source";
+    let target_uri = "memory:///reconfigure-target";
+    #[allow(deprecated)] // Exercise caller-supplied, independent object stores.
+    let store_params = |store: Arc<dyn object_store::ObjectStore>, uri: &str| ObjectStoreParams {
+        object_store: Some((store, url::Url::parse(uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(store_params(source_store.clone(), source_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = source.scan().try_into_batch().await.unwrap();
+    let cloned = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(store_params(target_store, target_uri)),
+        )
+        .await
+        .unwrap();
+    let session = cloned.session();
+
+    let mut configured = cloned
+        .reconfigure(DatasetRuntimeConfig {
+            block_size: Some(1024),
+            base_store_params: HashMap::from([(
+                source_uri.to_string(),
+                store_params(source_store, source_uri),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&session, &configured.session()));
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+
+    configured = configured.with_file_reader_options(Some(FileReaderOptions {
+        decoder_config: lance_encoding::decoder::DecoderConfig {
+            cache_repetition_index: false,
+            validate_on_decode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let options = configured.file_reader_options().unwrap();
+    assert!(!options.decoder_config.cache_repetition_index);
+    assert!(options.decoder_config.validate_on_decode);
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)

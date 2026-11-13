@@ -10046,24 +10046,107 @@ def test_shallow_clone_cross_store_returns_readable_dataset():
     assert target_paths
     assert not [path for path in target_paths if path.startswith("data/")]
 
+    # Constructor-only options reconfigure the returned handle, but must keep the
+    # inherited source binding and session so a cross-store clone still reads.
+    configured_uri = "test-clone-dst://bucket/configured.lance"
+    configured = source.shallow_clone(
+        configured_uri,
+        source.version,
+        storage_options=target_options,
+        block_size=1024,
+    )
+    assert configured.uri == configured_uri
+    assert {base.path for base in configured.base_paths().values()} == {source_uri}
+    assert configured.to_table() == expected
 
-def test_shallow_clone_rejects_dataset_constructor_kwargs(tmp_path: Path):
-    """shallow_clone no longer reopens the target, so reopen-only args are rejected."""
-    expected = pa.table({"id": [1, 2, 3]})
+    explicit = source.shallow_clone(
+        "test-clone-dst://bucket/explicit.lance",
+        source.version,
+        storage_options=target_options,
+        session=session,
+        base_store_params={source_uri: source_options},
+    )
+    assert explicit.to_table() == expected
+
+
+def test_shallow_clone_applies_session_and_cache_sizes(tmp_path: Path):
+    """Constructor cache/session options still configure the returned handle."""
+    expected = pa.table({"id": range(8)})
     source = lance.write_dataset(expected, tmp_path / "source")
 
-    with pytest.raises(TypeError, match="does not accept"):
-        source.shallow_clone(tmp_path / "clone", source.version, block_size=1024)
-
-    assert not (tmp_path / "clone").exists()
-
-    cloned = source.shallow_clone(
-        tmp_path / "clone_ok",
+    cache_configured = source.shallow_clone(
+        tmp_path / "cache_configured",
         source.version,
-        default_scan_options={"batch_size": 2},
+        index_cache_size_bytes=8 * 1024 * 1024,
+        metadata_cache_size_bytes=2 * 1024 * 1024,
     )
-    assert cloned.to_table() == expected
-    assert cloned._default_scan_options == {"batch_size": 2}
+    diagnostics = cache_configured.session().cache_diagnostics()
+    assert diagnostics["index"]["backend"]["capacity_bytes"] == 8 * 1024 * 1024
+    assert diagnostics["metadata"]["backend"]["capacity_bytes"] == 2 * 1024 * 1024
+    assert cache_configured.to_table() == expected
+
+    session = lance.Session(
+        index_cache_size_bytes=4 * 1024 * 1024,
+        metadata_cache_size_bytes=1024 * 1024,
+    )
+    session_configured = source.shallow_clone(
+        tmp_path / "session_configured", source.version, session=session
+    )
+    diagnostics = session_configured.session().cache_diagnostics()
+    assert diagnostics["index"]["backend"]["capacity_bytes"] == 4 * 1024 * 1024
+    assert diagnostics["metadata"]["backend"]["capacity_bytes"] == 1024 * 1024
+    assert session_configured.to_table() == expected
+
+    class RecordingLock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, version):
+            self.calls += 1
+            return contextlib.nullcontext()
+
+    lock = RecordingLock()
+    writable = source.shallow_clone(
+        tmp_path / "writable", source.version, commit_lock=lock
+    )
+    writable.delete("id < 2")
+    assert lock.calls == 1
+    assert writable.count_rows() == 6
+
+
+def test_shallow_clone_applies_read_params_to_native_handle(tmp_path: Path):
+    """read_params must configure the returned native handle, not only its state.
+
+    Nested data uses the full-zip repetition index, so disabling the repetition
+    index cache removes the extra initialization read from a scanner over the
+    returned handle. The native parsing of both read_params keys is covered by
+    the pylance crate Rust test for ``file_reader_options_from_read_params``.
+    """
+    n = 10_000
+    values = [[f"value-{i}", "x" * 1000] for i in range(n)]
+    table = pa.table({"vals": pa.array(values, type=pa.list_(pa.string()))})
+    source = lance.write_dataset(table, tmp_path / "source")
+    expected = table
+
+    def read_iops(name: str, cache_repetition_index: bool) -> int:
+        read_params = {
+            "cache_repetition_index": cache_repetition_index,
+            "validate_on_decode": True,
+        }
+        cloned = source.shallow_clone(
+            tmp_path / name, source.version, read_params=read_params
+        )
+        assert cloned._read_params == read_params
+
+        before = lance.iops_counter()
+        result = cloned.scanner(columns=["vals"]).to_table()
+        iops = lance.iops_counter() - before
+        assert result == expected
+        return iops
+
+    without_cache = read_iops("without_cache", False)
+    with_cache = read_iops("with_cache", True)
+    assert with_cache > without_cache
 
 
 def test_deep_clone(tmp_path: Path):
