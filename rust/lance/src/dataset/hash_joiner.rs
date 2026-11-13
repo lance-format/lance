@@ -65,6 +65,17 @@ impl HashJoiner {
         // Check column exist
         let schema = reader.schema();
         schema.field_with_name(on)?;
+        let keep_indices: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, field)| if field.name() == on { None } else { Some(i) })
+            .collect();
+        if keep_indices.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "The right side has no columns besides the join key '{on}', so there is nothing to merge"
+            )));
+        }
 
         // Hold all data in memory for simple implementation. Can do external sort later.
         // This is a blocking operation, so we'll run it in a separate thread.
@@ -79,12 +90,6 @@ impl HashJoiner {
 
         let map = DashMap::new();
 
-        let keep_indices: Vec<usize> = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, field)| if field.name() == on { None } else { Some(i) })
-            .collect();
         let out_schema: Arc<arrow_schema::Schema> = Arc::new(schema.project(&keep_indices)?);
         let right_batches = batches
             .iter()

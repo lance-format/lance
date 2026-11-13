@@ -166,18 +166,7 @@ async fn do_take_rows(
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
-        let empty_batch = RecordBatch::new_empty(Arc::new(builder.projection.output_schema()?));
-        // If row addresses were requested, add an empty row address column.
-        // This ensures callers that expect the _rowaddr column don't panic.
-        if builder.with_row_address {
-            let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
-            let row_addr_field =
-                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            return to_logical_json_batch(
-                empty_batch.try_with_column(row_addr_field, row_addr_col)?,
-            );
-        }
-        return to_logical_json_batch(empty_batch);
+        return builder.empty_batch();
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
@@ -385,9 +374,7 @@ async fn do_take_rows(
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
-        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
-            builder.projection.output_schema()?,
-        )));
+        return builder.empty_batch();
     }
 
     let projection = builder.projection.clone();
@@ -552,6 +539,17 @@ impl TakeBuilder {
         }
     }
 
+    fn empty_batch(&self) -> Result<RecordBatch> {
+        let mut batch = RecordBatch::new_empty(Arc::new(self.projection.output_schema()?));
+        if self.with_row_address && batch.column_by_name(ROW_ADDR).is_none() {
+            batch = batch.try_with_column(
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false),
+                Arc::new(UInt64Array::from(Vec::<u64>::new())),
+            )?;
+        }
+        to_logical_json_batch(batch)
+    }
+
     async fn get_row_addrs(&mut self) -> Result<&Vec<u64>> {
         if self.row_addrs.is_none() {
             let row_ids = self
@@ -647,6 +645,55 @@ mod test {
     };
 
     use super::*;
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::missing(vec![100])]
+    #[tokio::test]
+    async fn test_take_empty_row_address_schema(
+        #[case] ids: Vec<u64>,
+        #[values(false, true)] explicit_address: bool,
+        #[values(false, true)] with_row_address: bool,
+    ) {
+        let data = test_batch(0..4);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let columns = if explicit_address {
+            vec!["i", ROW_ADDR]
+        } else {
+            vec!["i"]
+        };
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let expected = dataset
+            .take_builder(&[0], projection.clone())
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap();
+        let actual = dataset
+            .take_builder(&ids, projection)
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(actual.num_rows(), 0);
+        assert_eq!(actual.schema(), expected.schema());
+    }
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {

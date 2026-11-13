@@ -117,12 +117,20 @@ async fn native_plane_prewarm_overlaps_partitions(#[case] gated: bool) {
     assert!(futures::poll!(&mut warm).is_pending());
     let starts = backend.starts.lock().unwrap().clone();
     let parallelism = lance_core::utils::tokio::get_num_compute_intensive_cpus().min(4);
+    let planes_per_partition = if gated { 1 } else { 2 };
     assert_eq!(
         starts.len(),
-        parallelism,
-        "independent partitions must overlap before any read completes"
+        parallelism * planes_per_partition,
+        "independent partition and ungated plane reads must overlap before any read completes"
     );
-    assert!(starts.iter().all(|(_, plane)| *plane == 0));
+    assert_eq!(
+        starts.iter().filter(|(_, plane)| *plane == 0).count(),
+        parallelism
+    );
+    assert_eq!(
+        starts.iter().filter(|(_, plane)| *plane == 1).count(),
+        if gated { 0 } else { parallelism }
+    );
     backend.permits.add_permits(16);
     let (first, second) = tokio::join!(warm, index.storage.prewarm_planes(&weak));
     first.unwrap();
@@ -209,10 +217,15 @@ async fn native_plane_prewarm_preserves_rejected_sign_policy(
 }
 
 #[rstest]
-#[case::cancel(false)]
-#[case::read_error(true)]
+#[case::shared_cancel(false, false)]
+#[case::shared_read_error(false, true)]
+#[case::gated_cancel(true, false)]
+#[case::gated_read_error(true, true)]
 #[tokio::test]
-async fn native_plane_prewarm_releases_loaders_and_can_retry(#[case] fail: bool) {
+async fn native_plane_prewarm_releases_loaders_and_can_retry(
+    #[case] gated: bool,
+    #[case] fail: bool,
+) {
     let dir = TempStrDir::default();
     let (dataset, _) = native_fixture(dir.as_str()).await;
     let uuid = dataset.load_indices().await.unwrap()[0].uuid;
@@ -226,7 +239,7 @@ async fn native_plane_prewarm_releases_loaders_and_can_retry(#[case] fail: bool)
         .unwrap();
     let backend = Arc::new(PausedPlaneCache {
         inner: MokaCacheBackend::with_capacity(1024 * 1024),
-        gated: true,
+        gated,
         permits: Semaphore::new(0),
         starts: Mutex::new(Vec::new()),
         rejected: None,
