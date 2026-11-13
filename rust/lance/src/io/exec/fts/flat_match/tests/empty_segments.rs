@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::index::LanceIndexStoreExt;
 use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt64Array, record_batch};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::collect;
+use lance_index::scalar::IndexStore;
+use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use rstest::rstest;
 
 #[rstest]
@@ -124,7 +128,30 @@ async fn explicit_empty_segments_retain_complete_persisted_tokenizer(
         .create_index(&["text"], IndexType::Inverted, None, &params, true)
         .await
         .unwrap();
+    let segments = load_segments(&dataset, "text", DocumentGranularity::Row)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = LanceIndexStore::from_dataset_for_existing(&dataset, &segments[0])
+        .await
+        .unwrap();
+    let files = store.list_files_with_sizes().await.unwrap();
+    assert!(files.iter().any(|file| file.path == METADATA_FILE));
+    let mut removed = 0;
+    for file in files {
+        if file.path != METADATA_FILE {
+            store.delete_index_file(&file.path).await.unwrap();
+            removed += 1;
+        }
+    }
+    assert!(
+        removed > 0,
+        "fixture must have unavailable index partitions"
+    );
     dataset.session().index_cache.clear().await;
+    // The manifest's index listing also lives in index_cache. Bind that
+    // metadata before the baseline; no index partition data remains to open.
+    dataset.load_indices().await.unwrap();
     let cache_entries = dataset.index_cache_entry_count().await;
     let dataset = Arc::new(dataset);
     let corpus = RecordBatch::try_from_iter([
