@@ -313,7 +313,7 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}"
-      - name: Run FTS queries with one compute worker
+      - name: Run FTS queries and pipeline drain with one compute worker
         env:
           LANCE_CPU_THREADS: "1"
           TOKIO_WORKER_THREADS: "2"
@@ -324,7 +324,7 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}" \
-            -E 'package(lance-index) & test(scalar::inverted::index)'
+            -E 'package(lance-index) & (test(scalar::inverted::index) | (test(scalar::inverted::builder) & test(pipeline)))'
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x
