@@ -21,6 +21,7 @@ jobs:
         run: |
           c++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread research/fts-format/block_io.cpp -o /tmp/block-io
           /tmp/block-io --self-check
+          python3 research/fts-format/check_block_io.py /tmp/block-io
   native-contract:
     runs-on: ubuntu-24.04
     timeout-minutes: 90

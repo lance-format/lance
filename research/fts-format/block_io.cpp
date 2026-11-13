@@ -118,6 +118,15 @@ int main(int argc, char** argv) {
         int fd=open(argv[1],O_RDONLY | (direct?O_DIRECT:0));
         if (fd<0) throw std::runtime_error(std::strerror(errno));
         struct stat info{}; if(fstat(fd,&info) || uint64_t(info.st_size)!=terms*span) throw std::runtime_error("data length mismatch");
+        const char* directory_path=std::getenv("FTS_IO_DIRECTORY_FILE");
+        int directory_fd=-1;
+        uint64_t directory_span=(offsets.size()*sizeof(uint64_t)+ALIGN-1)/ALIGN*ALIGN;
+        if(directory_path) {
+            directory_fd=open(directory_path,O_RDONLY | (direct?O_DIRECT:0));
+            if(directory_fd<0) throw std::runtime_error("cannot open directory");
+            struct stat directory_info{};
+            if(fstat(directory_fd,&directory_info) || uint64_t(directory_info.st_size)!=terms*directory_span) throw std::runtime_error("directory length mismatch");
+        }
         // Each expected block hash is computed from the native template outside timing.
         std::vector<unsigned char> reference(offsets.back());
         std::string template_path=argv[2];
@@ -131,7 +140,7 @@ int main(int argc, char** argv) {
         for(size_t b=0;b+1<offsets.size();++b) expected.push_back(hash_bytes(reference.data()+offsets[b],offsets[b+1]-offsets[b]));
         reference.clear(); reference.shrink_to_fit();
         std::atomic<size_t> next{0};
-        std::atomic<uint64_t> io_bytes{0},io_requests{0},logical_bytes{0},checksum{0};
+        std::atomic<uint64_t> io_bytes{0},io_requests{0},logical_bytes{0},checksum{0},metadata_bytes{0},payload_bytes{0};
         std::vector<double> latencies(requests);
         std::mutex error_mutex; std::string error;
         double cpu_start=cpu_seconds(); uint64_t device_start=proc_read_bytes();
@@ -140,36 +149,55 @@ int main(int argc, char** argv) {
             void* allocation=nullptr;
             if(posix_memalign(&allocation,ALIGN,span)) {std::lock_guard<std::mutex> g(error_mutex);error="allocation failed";return;}
             auto* buffer=static_cast<unsigned char*>(allocation);
+            void* directory_allocation=nullptr;
+            if(directory_fd>=0 && posix_memalign(&directory_allocation,ALIGN,directory_span)) {
+                free(allocation);std::lock_guard<std::mutex> g(error_mutex);error="directory allocation failed";return;
+            }
+            std::vector<uint64_t> active_offsets(offsets.size());
             try {
                 for(size_t q;(q=next.fetch_add(1))<requests;) {
                     uint64_t state=mix(q+42);
                     size_t term=state%terms;
                     if(skew && state%10<9) term=state%std::min<size_t>(8,terms);
-                    std::set<size_t> selection;
-                    size_t first=mix(state)%expected.size();
-                    for(size_t k=0;selection.size()<wanted;++k) selection.insert(cluster?(first+k)%expected.size():mix(state+k)%expected.size());
-                    std::vector<size_t> blocks(selection.begin(),selection.end());
-                    auto ranges=plan(offsets,blocks,window,span);
+                    std::vector<size_t> blocks;
+                    if(wanted==expected.size()) {blocks.resize(wanted);std::iota(blocks.begin(),blocks.end(),0);}
+                    else {
+                        std::set<size_t> selection;
+                        size_t first=mix(state)%expected.size();
+                        for(size_t k=0;selection.size()<wanted;++k) selection.insert(cluster?(first+k)%expected.size():mix(state+k)%expected.size());
+                        blocks.assign(selection.begin(),selection.end());
+                    }
                     auto query_start=Clock::now();
+                    uint64_t directory_read=0;
+                    if(directory_fd>=0) {
+                        if(pread(directory_fd,directory_allocation,directory_span,term*directory_span)!=ssize_t(directory_span)) throw std::runtime_error("directory read failed");
+                        std::memcpy(active_offsets.data(),directory_allocation,offsets.size()*sizeof(uint64_t));
+                        if(active_offsets!=offsets) throw std::runtime_error("directory content mismatch");
+                        directory_read=directory_span;
+                    }
+                    const auto& query_offsets=directory_fd>=0?active_offsets:offsets;
+                    // A complete demand needs no per-block range planning.
+                    auto ranges=plan(query_offsets,blocks,wanted==expected.size()?0:window,span);
                     uint64_t sum=0,read=0,calls=0,logical=0;
                     size_t cursor=0;
                     for(auto [lo,hi]:ranges) {
                         auto got=pread(fd,buffer,hi-lo,term*span+lo);
                         if(got!=ssize_t(hi-lo)) throw std::runtime_error("short/failed read: "+std::string(std::strerror(errno)));
                         read+=got; ++calls;
-                        while(cursor<blocks.size() && offsets[blocks[cursor]]<hi) {
+                        while(cursor<blocks.size() && query_offsets[blocks[cursor]]<hi) {
                             size_t b=blocks[cursor++];
-                            auto h=hash_bytes(buffer+offsets[b]-lo,offsets[b+1]-offsets[b]);
+                            auto h=hash_bytes(buffer+query_offsets[b]-lo,query_offsets[b+1]-query_offsets[b]);
                             if(h!=expected[b]) throw std::runtime_error("payload verification failed");
-                            sum+=h; logical+=offsets[b+1]-offsets[b];
+                            sum+=h; logical+=query_offsets[b+1]-query_offsets[b];
                         }
                     }
                     if(cursor!=blocks.size()) throw std::runtime_error("selected block not covered");
                     latencies[q]=std::chrono::duration<double,std::milli>(Clock::now()-query_start).count();
-                    io_bytes+=read;io_requests+=calls;logical_bytes+=logical;checksum+=sum;
+                    io_bytes+=read+directory_read;io_requests+=calls+(directory_read?1:0);logical_bytes+=logical;checksum+=sum;
+                    metadata_bytes+=directory_read;payload_bytes+=read;
                 }
             } catch(const std::exception& e) {std::lock_guard<std::mutex> g(error_mutex);error=e.what();}
-            free(allocation);
+            free(directory_allocation);free(allocation);
         };
         std::vector<std::thread> workers;
         for(size_t t=0;t<concurrency;++t) workers.emplace_back(worker);
@@ -187,8 +215,12 @@ int main(int argc, char** argv) {
                  <<",\"p95_ms\":"<<percentile(.95)<<",\"p99_ms\":"<<percentile(.99)<<",\"cpu_s\":"<<cpu
                  <<",\"logical_selected_bytes\":"<<logical_bytes<<",\"syscall_bytes\":"<<io_bytes
                  <<",\"syscall_requests\":"<<io_requests<<",\"proc_read_bytes\":"<<physical
+                 <<",\"metadata_read_bytes\":"<<metadata_bytes<<",\"payload_read_bytes\":"<<payload_bytes
+                 <<",\"directory_mode\":\""<<(directory_fd>=0?"read_per_request":"resident_template")<<"\""
+                 <<",\"directory_span_bytes\":"<<directory_span<<",\"dense_full_fallback\":"<<(wanted==expected.size())
+                 <<",\"latency_includes_range_planning\":true"
                  <<",\"peak_rss_kib\":"<<usage.ru_maxrss<<",\"checksum\":"<<checksum<<",\"latency_ms\":[";
         for(size_t i=0;i<latencies.size();++i){if(i)std::cout<<",";std::cout<<latencies[i];}
-        std::cout<<"]}\n";close(fd);return 0;
+        std::cout<<"]}\n";if(directory_fd>=0)close(directory_fd);close(fd);return 0;
     } catch(const std::exception& e) {std::cerr<<e.what()<<"\n";return 1;}
 }
