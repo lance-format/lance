@@ -1128,6 +1128,15 @@ fn write_transaction_operation(
                 .sum::<usize>();
             write_kv(f, indent, "overlays", &overlay_count.to_string())
         }
+        // The format reserves these operations ahead of their implementation.
+        pb::transaction::Operation::AcquireLease(_)
+        | pb::transaction::Operation::RenewLease(_)
+        | pb::transaction::Operation::ReleaseLease(_) => write_kv(
+            f,
+            indent,
+            "operation",
+            "unsupported retention lease operation",
+        ),
         pb::transaction::Operation::CompositeOperation(composite) => {
             write_kv(f, indent, "operation", "composite_operation")?;
             write_kv(f, indent, "steps", &composite.steps.len().to_string())?;

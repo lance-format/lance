@@ -625,6 +625,36 @@ An UpdateBases operation only modifies the base paths. As a result, it only conf
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
 
+## Retention Lease Transactions
+
+`AcquireLease` (field 117), `RenewLease` (118), and `ReleaseLease` (119) update the
+current lease list. An ordinary commit whose `Transaction.uuid`, parsed as a UUID,
+equals a listed lease ID removes that lease atomically. Detached commits cannot
+use lease operations. The [Retention Leases specification](retention_leases.md)
+defines their behavior.
+
+### Directional conflict rules
+
+Lease operations do not conflict with concurrent data or lease commits; a retry
+re-applies them against the new head.
+
+For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLease:
+
+| Incoming operation | Required behavior |
+| --- | --- |
+| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive leases from the attempt's predecessor, remove expired records, release the lease matching the transaction UUID if listed, and preserve the rest. |
+| Rewrite | If the rewrite replaces fragments a listed lease requires, it must record FRI transitions for them; otherwise it conflicts and must be replanned. |
+| Restore, Overwrite | Remove all leases. Existing data conflicts remain. |
+| Clone | Start the destination with no leases and no lease flag. |
+| AcquireLease | Add the lease against the new head with an unexpired request if the ID is not listed. Otherwise, return it without changing it. |
+| RenewLease | Recheck membership and expiration. Missing or expired is an error; a requested time not later than the current one is a no-op; otherwise extend only `expires_at`. |
+| ReleaseLease | Remove the target ID; absent is a no-op. |
+
+Every retry **must recompute expiration** from its new predecessor, so a
+renewal that commits first wins over a concurrent commit's expiry check. FRI
+trimming **must revalidate** the transitions listed leases and existing indices
+require, using the [retention rules](retention_leases.md#required-transitions).
+
 ## Action-Based Transactions (Transaction V2)
 
 !!! note "Readers before v14.0.0 fail on a `CompositeOperation`"

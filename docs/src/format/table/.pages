@@ -5,6 +5,7 @@ nav:
   - Table Config: table_config.md
   - Versioning: versioning.md
   - Transactions: transaction.md
+  - Retention Leases: retention_leases.md
   - Layout: layout.md
   - Branch & Tag: branch_tag.md
   - Row ID & Lineage: row_id_lineage.md

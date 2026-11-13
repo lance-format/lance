@@ -411,6 +411,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            // Reserved format operations remain unsupported until runtime
+            // handling is implemented. Unknown operations fail closed.
+            Some(pb::transaction::Operation::AcquireLease(_))
+            | Some(pb::transaction::Operation::RenewLease(_))
+            | Some(pb::transaction::Operation::ReleaseLease(_)) => Operation::Unknown {},
             Some(pb::transaction::Operation::CompositeOperation(_)) => {
                 // This version of Lance recognizes action-based transactions
                 // (Transaction V2) but has no support for them yet: reject on
@@ -850,6 +855,30 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use prost::Message;
+
+    #[rstest::rstest]
+    #[case::acquire(pb::transaction::Operation::AcquireLease(Default::default()))]
+    #[case::renew(pb::transaction::Operation::RenewLease(Default::default()))]
+    #[case::release(pb::transaction::Operation::ReleaseLease(Default::default()))]
+    fn test_retention_lease_operations_remain_unsupported(
+        #[case] operation: pb::transaction::Operation,
+    ) {
+        let message = pb::Transaction {
+            read_version: 12,
+            uuid: "lease-operation".to_string(),
+            operation: Some(operation),
+            ..Default::default()
+        };
+        let decoded = pb::Transaction::decode(message.encode_to_vec().as_slice()).unwrap();
+        let transaction = Transaction::try_from(decoded).unwrap();
+        assert!(matches!(transaction.operation, Operation::Unknown {}));
+        assert_eq!(transaction.read_version, 12);
+        assert_eq!(transaction.uuid, "lease-operation");
+        let error = pb::Transaction::try_from(&transaction).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be re-encoded"));
+    }
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
