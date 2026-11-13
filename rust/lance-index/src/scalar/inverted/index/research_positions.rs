@@ -48,13 +48,25 @@ pub(super) fn export(
     source: Option<&str>,
     token: u32,
     offsets: &[u32],
-    bytes: &[u8],
+    bytes: &bytes::Bytes,
+    codec: PositionStreamCodec,
 ) -> Result<()> {
-    if !std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| m == "export") {
+    let mode = std::env::var("FTS_RESEARCH_POSITIONS_MODE").unwrap_or_default();
+    if mode != "export" && mode != "export-cache" {
         return Ok(());
     }
     let path = location(source, token)?;
     fs::create_dir_all(path.parent().unwrap())?;
+    if mode == "export-cache" {
+        // Existing production Positions codec and envelope. No new byte grammar.
+        let value: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(Positions(CompressedPositionStorage::SharedStream(
+                SharedPositionStream::new(codec, offsets.to_vec(), bytes.clone()),
+            )));
+        let mut file = fs::File::create(path.with_extension("cache"))?;
+        CacheCodec::from_impl::<Positions>().serialize(&value, &mut file)?;
+        return Ok(());
+    }
     fs::write(path.with_extension("data"), bytes)?;
     fs::write(
         path.with_extension("json"),
@@ -64,6 +76,60 @@ pub(super) fn export(
         })?,
     )?;
     Ok(())
+}
+
+fn load_cache(path: &Path, expected_codec: PositionStreamCodec) -> Result<SharedPositionStream> {
+    let file = fs::File::open(path.with_extension("cache"))?;
+    let len = usize::try_from(file.metadata()?.len())
+        .map_err(|_| Error::index("research cache entry too large"))?;
+    if len == 0 {
+        return Err(Error::index("empty research cache entry"));
+    }
+    // SAFETY: same private immutable-file contract as the raw sidecar mapping.
+    let pointer = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if pointer == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let pointer = NonNull::new(pointer.cast::<u8>()).expect("non-null mmap region");
+    let advice = unsafe { libc::madvise(pointer.as_ptr().cast(), len, libc::MADV_NORMAL) };
+    if advice != 0 {
+        unsafe {
+            libc::munmap(pointer.as_ptr().cast(), len);
+        }
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mapped = bytes::Bytes::from_owner(Mapping { pointer, len });
+    let value = CacheCodec::from_impl::<Positions>()
+        .deserialize(&mapped)
+        .hit()
+        .ok_or_else(|| Error::index("invalid mapped Positions cache entry"))?;
+    let value = value
+        .downcast::<Positions>()
+        .map_err(|_| Error::index("mapped cache entry has wrong type"))?;
+    let CompressedPositionStorage::SharedStream(stream) = value.0.clone() else {
+        return Err(Error::index("mapped cache requires shared positions"));
+    };
+    if stream.codec() != expected_codec {
+        return Err(Error::index("mapped cache position codec mismatch"));
+    }
+    // Existing codec read_raw returns a Bytes slice owning the mmap, so mapping
+    // lifetime survives dropping both `mapped` and the type-erased decoded value.
+    if tracing_enabled() {
+        trace(
+            serde_json::json!({"event":"term","pointer":stream.bytes().as_ptr() as usize,
+            "source":path.to_str().unwrap(),"token":0,"length":stream.bytes().len()}),
+        );
+    }
+    Ok(stream)
 }
 
 struct Mapping {
@@ -150,12 +216,19 @@ pub(super) fn read_mapped(
     token: u32,
     codec: PositionStreamCodec,
 ) -> Result<Option<SharedPositionStream>> {
-    if !std::env::var("FTS_RESEARCH_POSITIONS_MODE")
-        .is_ok_and(|m| matches!(m.as_str(), "map" | "map-normal" | "map-sequential"))
-    {
+    if !std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| {
+        matches!(
+            m.as_str(),
+            "map" | "map-normal" | "map-sequential" | "map-cache"
+        )
+    }) {
         return Ok(None);
     }
-    Ok(Some(load(&location(source, token)?, codec)?))
+    let path = location(source, token)?;
+    if std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| m == "map-cache") {
+        return Ok(Some(load_cache(&path, codec)?));
+    }
+    Ok(Some(load(&path, codec)?))
 }
 
 // Traces run separately from performance measurements. No per-block output is
@@ -237,6 +310,20 @@ mod tests {
             panic!("shared stream expected")
         };
         assert_eq!(restored.bytes(), data);
+        let value: Arc<dyn std::any::Any + Send + Sync> = Arc::new(entry);
+        let mut encoded = Vec::new();
+        CacheCodec::from_impl::<Positions>()
+            .serialize(&value, &mut encoded)
+            .unwrap();
+        fs::write(path.with_extension("cache"), &encoded).unwrap();
+        let mapped_cache = load_cache(&path, codec).unwrap();
+        assert_eq!(mapped_cache.block(2), &data[4090..4200]);
+        let survivor = mapped_cache.clone();
+        drop(mapped_cache);
+        assert_eq!(survivor.block(3), &data[4200..]);
+        let bad = root.path().join("bad");
+        fs::write(bad.with_extension("cache"), b"invalid cache envelope").unwrap();
+        assert!(load_cache(&bad, codec).is_err());
         fs::write(
             path.with_extension("json"),
             b"{\"length\":9000,\"offsets\":[0,9001]}",
