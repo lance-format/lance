@@ -1917,6 +1917,34 @@ mod tests {
     use super::*;
     use crate::scalar::inverted::document_tokenizer::DocType;
 
+    #[test]
+    fn fetched_postings_weight_counts_shared_backing_once() {
+        let unrelated = vec![7u8; 32 * 1024];
+        // VarintDelta tail: document 0, frequency 1. The preceding value is
+        // outside this posting but its allocation remains owned by the slice.
+        let blocks = LargeBinaryArray::from_iter_values([unrelated.as_slice(), &[0, 1]]);
+        let posting = PostingList::Compressed(CompressedPostingList::new(
+            blocks.slice(1, 1),
+            1.0,
+            1,
+            PostingTailCodec::VarintDelta,
+            128,
+            None,
+            None,
+        ));
+        let fetched = FetchedPostings {
+            postings: vec![(0, 0, 0, posting.clone()), (1, 1, 1, posting)],
+            num_docs: 1,
+            is_and_query: true,
+            is_phrase_query: false,
+            exact_scoring_required: false,
+            docs_for_union: None,
+        };
+        let retained = fetched.retained_bytes();
+        assert!(retained >= unrelated.len());
+        assert!(retained < 2 * unrelated.len());
+    }
+
     fn dictionary(terms: &[&str]) -> TokenSet {
         let mut dictionary = TokenSet::default();
         for term in terms {
