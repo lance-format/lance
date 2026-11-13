@@ -54,7 +54,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     ))
                 })
                 .await?;
-            Ok(())
+            Ok::<(), Error>(())
         };
         if !cache.plane_admission_gated() {
             return run(
