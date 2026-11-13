@@ -104,6 +104,10 @@ impl CommitIndexHook for LanceCommitHook {
         segment_supports_batch_remapping(&self.dataset(table), index).await
     }
 
+    fn is_stale_segment(&self, table: &Table, index: &IndexMetadata) -> Result<bool> {
+        crate::index::scalar::list_element::is_stale(table.schema(), index)
+    }
+
     fn validate_stable_row_id_indices(
         &self,
         manifest: &Manifest,

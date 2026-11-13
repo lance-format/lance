@@ -150,6 +150,19 @@ pub fn key_fields_resolve(
     Ok(bind_key_fields(column, details)?.is_some())
 }
 
+/// Whether `index` is a list-element segment whose key fields no longer
+/// resolve in `schema`: one was dropped or changed type. Such a segment is
+/// never queried and `optimize_indices` never rebuilds it.
+pub fn is_stale(schema: &lance_core::datatypes::Schema, index: &IndexMetadata) -> Result<bool> {
+    let Some(details) = index.index_details.as_ref() else {
+        return Ok(false);
+    };
+    if !is_list_element(details) {
+        return Ok(false);
+    }
+    Ok(!key_fields_resolve(schema, index)?)
+}
+
 /// Whether `index`, possibly cached before a rename, names its keys other than
 /// `details` do. Searching does not use the names, but updating does.
 pub fn has_other_key_names(index: &dyn ScalarIndex, details: &prost_types::Any) -> bool {
