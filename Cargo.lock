@@ -5297,6 +5297,7 @@ dependencies = [
  "lance-core",
  "proptest",
  "roaring",
+ "rstest",
  "tracing",
 ]
 
