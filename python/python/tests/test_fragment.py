@@ -23,7 +23,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileReader, LanceFileWriter
-from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
+from lance.fragment import DeletionFile, RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 from pyarrow.fs import FileInfo, FileType
 
@@ -694,6 +694,32 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_deletion_file_explicit_path_ignores_fragment_id():
+    path = f"_deletions/{uuid.uuid4()}.bin"
+    deletion_file = DeletionFile(
+        read_version=1, id=123, file_type="bitmap", num_deleted_rows=1, path=path
+    )
+    assert deletion_file.asdict()["path"] == path
+    assert deletion_file.path(5) == deletion_file.path(6) == path
+    with pytest.raises(ValueError, match="both path and inline"):
+        DeletionFile(
+            read_version=1,
+            id=123,
+            file_type="bitmap",
+            num_deleted_rows=1,
+            inline=b"\x01",
+            path=path,
+        )
+    with pytest.raises(ValueError, match="Invalid deletion file path"):
+        DeletionFile(
+            read_version=1,
+            id=123,
+            file_type="bitmap",
+            num_deleted_rows=1,
+            path="_deletions/name.bin",
+        )
 
 
 def test_fragment_metadata_json_round_trips_clustering_metadata():

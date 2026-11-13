@@ -20,7 +20,8 @@ use roaring::bitmap::RoaringBitmap;
 use snafu::ResultExt;
 use tracing::{info, instrument};
 
-use crate::format::{DeletionFile, DeletionFileType};
+use crate::feature_flags::ensure_deletion_file_paths_enabled;
+use crate::format::{DeletionFile, DeletionFilePath, DeletionFileType};
 
 pub const DELETIONS_DIR: &str = "_deletions";
 
@@ -33,29 +34,44 @@ static DELETION_ARROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-/// Get the file path for a deletion file. This is relative to the dataset root.
+/// Path of a deletion file under `base` (the dataset root that holds it).
+///
+/// An explicit [`DeletionFile::path`] is the location. Otherwise this is
+/// `_deletions/{fragment_id}-{read_version}-{id}.{extension}`.
 pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &DeletionFile) -> Path {
-    let DeletionFile {
-        read_version,
-        id,
-        file_type,
-        ..
-    } = deletion_file;
-    let suffix = file_type.suffix();
     base.clone()
         .join(DELETIONS_DIR)
-        .join(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
+        .join(deletion_file_name(fragment_id, deletion_file))
 }
 
+/// [`deletion_file_path`] relative to the dataset root that holds the file.
 pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFile) -> String {
-    let DeletionFile {
-        read_version,
-        id,
-        file_type,
-        ..
-    } = deletion_file;
-    let suffix = file_type.suffix();
-    format!("{DELETIONS_DIR}/{fragment_id}-{read_version}-{id}.{suffix}")
+    format!(
+        "{DELETIONS_DIR}/{}",
+        deletion_file_name(fragment_id, deletion_file)
+    )
+}
+
+fn deletion_file_name(fragment_id: u64, deletion_file: &DeletionFile) -> String {
+    if let Some(path) = &deletion_file.path {
+        path.file_name(&deletion_file.file_type)
+    } else {
+        format!(
+            "{fragment_id}-{}-{}.{}",
+            deletion_file.read_version,
+            deletion_file.id,
+            deletion_file.file_type.suffix()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionFileNaming {
+    /// `_deletions/{fragment_id}-{read_version}-{id}.{extension}`.
+    FragmentId(u64),
+    /// `_deletions/{uuid}.{extension}`, recorded on [`DeletionFile::path`].
+    /// Always writes a file and requires [`deletion_file_paths_enabled`](crate::feature_flags::deletion_file_paths_enabled).
+    Uuid,
 }
 
 /// Write a deletion file for a fragment for a given deletion vector.
@@ -74,7 +90,37 @@ pub async fn write_deletion_file(
     object_store: &ObjectStore,
     inline_max_bytes: usize,
 ) -> Result<Option<DeletionFile>> {
-    if inline_max_bytes > 0 && !removed_rows.is_empty() {
+    write_deletion_file_with_naming(
+        base,
+        DeletionFileNaming::FragmentId(fragment_id),
+        read_version,
+        removed_rows,
+        object_store,
+        inline_max_bytes,
+    )
+    .await
+}
+
+/// [`write_deletion_file`], with `naming` selecting the file name.
+///
+/// [`DeletionFileNaming::Uuid`] always writes a file.
+pub async fn write_deletion_file_with_naming(
+    base: &Path,
+    naming: DeletionFileNaming,
+    read_version: u64,
+    removed_rows: &DeletionVector,
+    object_store: &ObjectStore,
+    inline_max_bytes: usize,
+) -> Result<Option<DeletionFile>> {
+    let (fragment_id, path) = match naming {
+        DeletionFileNaming::FragmentId(fragment_id) => (fragment_id, None),
+        DeletionFileNaming::Uuid => {
+            ensure_deletion_file_paths_enabled()?;
+            (0, Some(DeletionFilePath::new_random()))
+        }
+    };
+    // Explicit paths always write a file, bypassing inline deletions.
+    if path.is_none() && inline_max_bytes > 0 && !removed_rows.is_empty() {
         let bitmap = RoaringBitmap::from(removed_rows);
         let encoded_size = bitmap.serialized_size();
         if encoded_size <= inline_max_bytes {
@@ -86,6 +132,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
+                path: None,
                 inline: Some(encoded.into()),
             }));
         }
@@ -100,6 +147,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
                 base_id: None,
+                path,
                 inline: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
@@ -138,6 +186,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
+                path,
                 inline: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
@@ -251,6 +300,8 @@ pub async fn read_deletion_file(
 
 #[cfg(test)]
 mod test {
+
+    use crate::feature_flags::deletion_file_paths_enabled;
 
     use super::*;
     use object_store::ObjectStoreExt;
@@ -448,5 +499,65 @@ mod test {
             .await
             .unwrap();
         assert_eq!(read_dv, dv);
+    }
+
+    #[tokio::test]
+    async fn test_uuid_naming_is_independent_of_fragment_id() {
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter([5, 9]));
+        let object_store = ObjectStore::memory();
+        let base = Path::from("/uuid");
+        let written = write_deletion_file_with_naming(
+            &base,
+            DeletionFileNaming::Uuid,
+            12,
+            &dv,
+            &object_store,
+            1024,
+        )
+        .await;
+        if !deletion_file_paths_enabled() {
+            let err = written.unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+            return;
+        }
+        let file = written.unwrap().unwrap();
+        assert!(file.path.is_some());
+        assert!(file.inline.is_none());
+        let stored = deletion_file_path(&base, 0, &file);
+        assert!(object_store.exists(&stored).await.unwrap());
+        for fragment_id in [0, 42, 43] {
+            assert_eq!(deletion_file_path(&base, fragment_id, &file), stored);
+            assert_eq!(
+                read_deletion_file(fragment_id, &file, &base, &object_store)
+                    .await
+                    .unwrap(),
+                dv
+            );
+        }
+    }
+
+    #[test]
+    fn test_deletion_file_path_derives_legacy_location_only_without_path() {
+        let legacy = DeletionFile {
+            read_version: 3,
+            id: 77,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: None,
+            inline: None,
+        };
+        assert_eq!(
+            relative_deletion_file_path(9, &legacy),
+            "_deletions/9-3-77.arrow"
+        );
+        let explicit = DeletionFile {
+            path: Some(DeletionFilePath::new_random()),
+            ..legacy
+        };
+        let location = relative_deletion_file_path(9, &explicit);
+        assert_eq!(location, relative_deletion_file_path(10, &explicit));
+        assert!(location.starts_with("_deletions/"));
+        assert!(location.ends_with(".arrow"));
     }
 }

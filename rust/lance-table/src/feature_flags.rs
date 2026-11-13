@@ -136,8 +136,15 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// A deletion file records its location in `DeletionFile.path`.
+///
+/// Both feature words carry the bit, and it stays set on later versions.
+/// This build understands it in debug builds, or when
+/// [`ENABLE_UNSTABLE_DELETION_FILE_PATHS_ENV`] is set. Bit 20 was the unknown
+/// boundary, so a build that does not know the flag refuses the table.
+pub const FLAG_UNSTABLE_DELETION_FILE_PATHS: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 20;
+pub const FLAG_UNKNOWN: u64 = 1 << 21;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -158,11 +165,14 @@ const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_UNSTABLE_DELETION_FILE_PATHS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_UNSTABLE_DELETION_FILE_PATHS >= 1 << 20);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
     | FLAG_MANAGED_BLOBS
-    | FLAG_ZONE_WRITE_SEEDS;
+    | FLAG_ZONE_WRITE_SEEDS
+    | FLAG_UNSTABLE_DELETION_FILE_PATHS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
 pub(crate) const COVERING_FLAGS: u64 =
@@ -213,6 +223,10 @@ impl CoveringContract {
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
+
+/// Opts a release build into deletion files that record their own path.
+pub const ENABLE_UNSTABLE_DELETION_FILE_PATHS_ENV: &str =
+    "LANCE_ENABLE_UNSTABLE_DELETION_FILE_PATHS";
 
 /// Validate a change to automatic cleanup configuration.
 ///
@@ -321,6 +335,16 @@ pub fn apply_feature_flags(
     if has_inline_deletions {
         manifest.reader_feature_flags |= FLAG_INLINE_DELETIONS;
         manifest.writer_feature_flags |= FLAG_INLINE_DELETIONS;
+    }
+    let has_deletion_file_paths = manifest.fragments.iter().any(|frag| {
+        frag.deletion_file
+            .as_ref()
+            .is_some_and(|deletion_file| deletion_file.path.is_some())
+    });
+    if has_deletion_file_paths {
+        ensure_deletion_file_paths_enabled()?;
+        manifest.reader_feature_flags |= FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags |= FLAG_UNSTABLE_DELETION_FILE_PATHS;
     }
 
     // If any fragment has row ids, they must all have row ids.
@@ -492,6 +516,24 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
+/// Whether this build understands deletion files with explicit paths.
+pub fn deletion_file_paths_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DELETION_FILE_PATHS_ENV).is_some()
+}
+
+pub(crate) fn ensure_deletion_file_paths_enabled() -> Result<()> {
+    if deletion_file_paths_enabled() {
+        return Ok(());
+    }
+    Err(Error::not_supported_source(
+        format!(
+            "Explicit deletion file paths are not yet a released feature; set \
+             {ENABLE_UNSTABLE_DELETION_FILE_PATHS_ENV} to read and write them"
+        )
+        .into(),
+    ))
+}
+
 /// Refuse to publish a manifest that carries data overlay files from a build that
 /// does not understand them: every later open of the dataset by this build would
 /// be refused.
@@ -552,6 +594,7 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 fn supported_flags_when(
     overlay_enabled: bool,
     frag_reuse_with_stable_row_ids_enabled: bool,
+    deletion_paths_enabled: bool,
 ) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
@@ -564,6 +607,11 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
+    mark_supported(
+        &mut supported,
+        FLAG_UNSTABLE_DELETION_FILE_PATHS,
+        deletion_paths_enabled,
+    );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
@@ -575,6 +623,7 @@ fn supported_flags() -> u64 {
     supported_flags_when(
         data_overlay_files_enabled(),
         frag_reuse_with_stable_row_ids_enabled(),
+        deletion_file_paths_enabled(),
     )
 }
 
@@ -659,6 +708,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
         (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
+        (FLAG_UNSTABLE_DELETION_FILE_PATHS, "deletion file paths"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -867,7 +917,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 20);
+        assert_eq!(FLAG_UNKNOWN, 1 << 21);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -980,10 +1030,10 @@ mod tests {
     fn test_frag_reuse_with_stable_row_ids_flag_release_gating() {
         // v12.0.0's unknown boundary, so every released client refuses it.
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, 512);
-        let without_support = supported_flags_when(true, false);
+        let without_support = supported_flags_when(true, false, false);
         assert_ne!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !without_support, 0);
         assert_eq!(FLAG_STABLE_ROW_IDS & !without_support, 0);
-        let enabled = supported_flags_when(false, true);
+        let enabled = supported_flags_when(false, true, false);
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !enabled, 0);
         for unrelated in [
             FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -1094,12 +1144,12 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false, false);
+        let supported = supported_flags_when(false, false, false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true, false);
+        let supported = supported_flags_when(true, false, false);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 
@@ -1107,7 +1157,7 @@ mod tests {
     fn test_spilled_row_lineage_flag_is_stable() {
         assert_eq!(FLAG_SPILLED_ROW_LINEAGE, 2048);
         // Support must not depend on enabling unrelated experimental formats.
-        let supported = supported_flags_when(false, false);
+        let supported = supported_flags_when(false, false, false);
         let flags = FLAG_STABLE_ROW_IDS | FLAG_SPILLED_ROW_LINEAGE;
         assert_eq!(flags & !supported, 0);
         assert!(can_read_dataset(flags));
@@ -1550,5 +1600,92 @@ mod tests {
         assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_feature_gate() {
+        assert_eq!(FLAG_UNSTABLE_DELETION_FILE_PATHS, 1 << 20);
+        let off = supported_flags_when(true, true, false);
+        assert_ne!(FLAG_UNSTABLE_DELETION_FILE_PATHS & !off, 0);
+        let on = supported_flags_when(false, false, true);
+        assert_eq!(FLAG_UNSTABLE_DELETION_FILE_PATHS & !on, 0);
+        assert_eq!(
+            can_read_dataset(FLAG_UNSTABLE_DELETION_FILE_PATHS),
+            deletion_file_paths_enabled()
+        );
+        assert_eq!(
+            can_write_dataset(FLAG_UNSTABLE_DELETION_FILE_PATHS),
+            deletion_file_paths_enabled()
+        );
+    }
+
+    #[test]
+    fn test_deletion_file_paths_sticky_and_paired() {
+        use crate::format::{DeletionFile, DeletionFilePath, DeletionFileType, Fragment};
+
+        let deletion_file = |path| DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path,
+            inline: None,
+        };
+        let manifest_with = |path| {
+            let mut fragment = Fragment::new(1);
+            fragment.deletion_file = Some(deletion_file(path));
+            let mut manifest = empty_manifest();
+            manifest.fragments = std::sync::Arc::new(vec![fragment]);
+            manifest
+        };
+
+        let mut legacy = manifest_with(None);
+        apply_feature_flags(&mut legacy, false, false).unwrap();
+        assert_eq!(
+            legacy.reader_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+            0
+        );
+
+        let mut explicit = manifest_with(Some(DeletionFilePath::new_random()));
+        if deletion_file_paths_enabled() {
+            apply_feature_flags(&mut explicit, false, false).unwrap();
+            assert_ne!(
+                explicit.reader_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+                0
+            );
+            assert_ne!(
+                explicit.writer_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+                0
+            );
+        } else {
+            let error = apply_feature_flags(&mut explicit, false, false).unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        }
+
+        let mut later = empty_manifest();
+        later.reader_feature_flags = FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        later.writer_feature_flags = FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        apply_feature_flags(&mut later, false, false).unwrap();
+        assert_ne!(
+            later.reader_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+            0
+        );
+        assert_ne!(
+            later.writer_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+            0
+        );
+
+        for (reader, writer) in [
+            (FLAG_UNSTABLE_DELETION_FILE_PATHS, 0),
+            (0, FLAG_UNSTABLE_DELETION_FILE_PATHS),
+        ] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer;
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(error.to_string().contains("deletion file paths"), "{error}");
+        }
     }
 }
