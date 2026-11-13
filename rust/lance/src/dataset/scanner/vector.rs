@@ -598,25 +598,18 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no quantized refine step (exact refinement is supported);
-    /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
+    /// - no quantized refine step; exact refinement requires fixed nprobes;
+    /// - a positive `minimum_nprobes`;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
     ///   `fast_search`, which searches only the selected segments anyway).
     ///
-    /// The fixed-nprobes requirement is a *correctness* gate, not just an
-    /// optimization. The shared-scan path searches exactly `minimum_nprobes`
-    /// partitions per query, but the single-query path is adaptive: it applies a
-    /// k-dependent `early_pruning` floor and then expands probes up to
-    /// `maximum_nprobes` (late search) when a query has fewer than `k` results.
-    /// When `minimum_nprobes == maximum_nprobes` neither adjustment can fire
-    /// (pruning is capped at the maximum, and the late-search range is empty), so
-    /// the batch result is provably identical to repeated single-query search.
-    /// With adaptive nprobes the two would diverge, so we fall back to the
-    /// per-query loop, which reuses the real adaptive search and stays exact.
-    ///
-    /// Extending the shared-scan path to adaptive nprobes (a batched early/late
-    /// search) is left as a follow-up.
+    /// Both fixed and adaptive nprobes are supported: the batch node applies the
+    /// same initial probe budget and sequential late-search cut. Across deltas
+    /// it consumes results round-robin, while single-query search follows their
+    /// nondeterministic completion order. Explicit parallel adaptive probing
+    /// falls back because it can search beyond the sequential cut. Adaptive RQ
+    /// also falls back until its scalar and batch scoring paths agree.
     async fn batch_index_search_supported(
         &self,
         index_name: &str,
@@ -628,17 +621,23 @@ impl Scanner {
         if self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
-        // Only fixed nprobes is provably equivalent to single-query search; see
-        // the method docs. Adaptive nprobes falls back to the per-query loop.
-        if q.maximum_nprobes != Some(q.minimum_nprobes) {
+        // `minimum_nprobes(0)` is not rejected by the query builder. The
+        // single-query path then probes nothing up front and leaves every probe
+        // to its late search; fall back so the per-query loop keeps defining
+        // those semantics rather than reproducing them in the batch node.
+        if q.minimum_nprobes == 0 {
             return Ok(false);
         }
-        // `nprobes(0)` is not rejected by the query builder, so `min == max == 0`
-        // slips past the fixed-nprobes check above. The single-query path probes
-        // nothing and returns an empty result, whereas the batch node would probe
-        // one partition's worth of neighbors — a silent divergence. Fall back so
-        // the per-query loop defines the semantics of `nprobes(0)`.
-        if q.minimum_nprobes == 0 {
+        // Parallel late search can admit more partitions before observing the
+        // shared stop count. Preserve that behavior for callers that requested it.
+        if q.maximum_nprobes != Some(q.minimum_nprobes)
+            && (q.query_parallelism == -1 || q.query_parallelism > 1)
+        {
+            return Ok(false);
+        }
+        // Batched refinement shares candidate reads across the batch for fixed
+        // nprobes. Keep exact refinement with adaptive nprobes on the per-query path.
+        if q.refine_factor.is_some() && q.maximum_nprobes != Some(q.minimum_nprobes) {
             return Ok(false);
         }
         // The per-query path threads a caller-supplied external row-address mask
@@ -653,10 +652,10 @@ impl Scanner {
         // to call `supports_batch_partition_search()`: this is a planning-time
         // gate and the single-query path likewise avoids opening the index here.
         // An IVF index with a flat-style sub-index (i.e. not HNSW) is exactly the
-        // set for which `supports_batch_partition_search()` is true; the exec
-        // re-checks that trait as a defensive invariant. Legacy segments without
-        // details fall back.
-        let all_ivf_flat_style = index_segments.iter().all(|index| {
+        // set for which `supports_batch_partition_search()` is true; adaptive RQ
+        // compatibility further restricts eligibility below. The exec re-checks
+        // the trait as a defensive invariant. Legacy segments without details fall back.
+        let all_support_batch_search = index_segments.iter().all(|index| {
             index
                 .index_details
                 .as_ref()
@@ -664,11 +663,17 @@ impl Scanner {
                 .map(|details| {
                     let index_type =
                         crate::index::vector::details::derive_vector_index_type(details);
-                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
+                    // RQ's filtered batch accumulator can differ from scalar
+                    // single-query scoring. Preserve the per-query adaptive path.
+                    let is_adaptive_rq =
+                        index_type == "IVF_RQ" && q.maximum_nprobes != Some(q.minimum_nprobes);
+                    index_type.starts_with("IVF_")
+                        && !index_type.contains("HNSW")
+                        && !is_adaptive_rq
                 })
                 .unwrap_or(false)
         });
-        if !all_ivf_flat_style {
+        if !all_support_batch_search {
             return Ok(false);
         }
         // The batch node searches only the index's own entries; unlike the

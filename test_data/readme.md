@@ -8,6 +8,16 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 
 ## List of datasets
 
+* `v14.0.2/stable_row_id_*.lance`: Seven datasets written by Lance 14.0.2 with
+  stable row IDs enabled. They cover a contiguous `Range`, sparse
+  `RangeWithHoles`, dense `RangeWithBitmap`, `SortedArray` with both 16-bit and
+  32-bit offsets, an unsorted `Array` from a reverse-order merge, and inline
+  row version sequences with multiple update versions. `expected.json` records
+  the exact `_rowid`, `_row_created_at_version`, and
+  `_row_last_updated_at_version` values plus the `next_row_id` high-water mark
+  of the writer. `datagen.py` regenerates the datasets and expected values with
+  pylance 14.0.2.
+
 * `v6.0.1/wrapped_bitpacked_levels.lance`: Synthetic nullable half-float lists
   with a dense prefix and a long null run. The legacy writer wraps a mini-block
   structural count at 65,536; its out-of-line bitpacked buffers retain all levels.
