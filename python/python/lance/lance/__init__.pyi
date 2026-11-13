@@ -432,6 +432,21 @@ class _Session:
     def set_index_cache_capacity(self, capacity_bytes: int) -> None: ...
     def set_metadata_cache_capacity(self, capacity_bytes: int) -> None: ...
 
+def read_blob_files(
+    blob_files: List[Optional[LanceBlobFile]],
+    *,
+    io_parallelism: Optional[int] = None,
+    io_buffer_size: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]: ...
+def read_blob_file_ranges(
+    requests: List[Tuple[Optional[LanceBlobFile], int, int]],
+    *,
+    io_parallelism: Optional[int] = None,
+    io_buffer_size: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]: ...
+
 class LanceBlobFile:
     def close(self): ...
     def is_closed(self) -> bool: ...
