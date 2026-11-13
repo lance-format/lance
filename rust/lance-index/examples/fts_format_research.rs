@@ -6,7 +6,7 @@
 use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 use arrow_array::cast::AsArray;
-use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, LargeStringArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, stream};
@@ -89,7 +89,7 @@ fn export_blocks(root: &std::path::Path, rows: usize) -> Result<(), Box<dyn std:
     fs::write(root.join("positions.blocks"), positions)?;
     let pos_offsets = batch[POSITION_BLOCK_OFFSET_COL].as_list::<i32>().value(0);
     let mut pos_offsets: Vec<u64> = pos_offsets
-        .as_primitive::<arrow_schema::UInt32Type>()
+        .as_primitive::<arrow_array::types::UInt32Type>()
         .values()
         .iter()
         .map(|x| u64::from(*x))
