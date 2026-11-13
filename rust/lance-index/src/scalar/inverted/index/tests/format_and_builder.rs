@@ -17,7 +17,7 @@ fn test_shared_positions_bound_retained_allocation_and_preserve_lifetime(
 ) {
     let backing = Buffer::from_vec(vec![7_u8; capacity]);
     let values = LargeBinaryArray::new(
-        arrow_buffer::OffsetBuffer::new(vec![offset, offset + 1024].into()),
+        arrow::buffer::OffsetBuffer::new(vec![offset, offset + 1024].into()),
         backing.clone(),
         None,
     );
@@ -57,7 +57,7 @@ fn test_shared_positions_copy_external_owner_with_unknown_capacity() {
     .into_buffer();
     assert_eq!(backing.capacity(), 0);
     let values = LargeBinaryArray::new(
-        arrow_buffer::OffsetBuffer::new(vec![512_i64, 1536].into()),
+        arrow::buffer::OffsetBuffer::new(vec![512_i64, 1536].into()),
         backing.clone(),
         None,
     );

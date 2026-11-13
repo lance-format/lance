@@ -343,7 +343,9 @@ impl SharedPositionStream {
         // Allow at most one 64-byte Arrow alignment tail and charge it in full.
         if capacity > 0 && capacity <= value.len().saturating_add(64) {
             let offset = values.value_offsets()[0] as usize;
-            let buffer = values.values().slice_with_length(offset, value.len());
+            let buffer = arrow::buffer::ScalarBuffer::<u8>::from(
+                values.values().slice_with_length(offset, value.len()),
+            );
             let mut stream = Self::new(codec, block_offsets, bytes::Bytes::from_owner(buffer));
             stream.retained_bytes = capacity;
             stream
