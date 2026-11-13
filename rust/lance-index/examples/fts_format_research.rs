@@ -3,7 +3,16 @@
 
 //! Research-only driver. No production defaults or persistent format changes.
 
-use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, LargeStringArray, RecordBatch, UInt64Array};
@@ -378,14 +387,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map_err(Into::into)
         });
-        let batches: Box<dyn Iterator<Item = lance_core::Result<RecordBatch>> + Send> =
+        let batches: Box<dyn Iterator<Item = datafusion_common::Result<RecordBatch>> + Send> =
             if mode == "build-ipc" {
                 let path = args.get(4).ok_or("build-ipc requires an Arrow IPC file")?;
                 let reader = arrow_ipc::reader::FileReader::try_new(fs::File::open(path)?, None)?;
                 if reader.schema().fields() != schema.fields() {
                     return Err("IPC input must contain text: LargeUtf8 and _rowid: UInt64".into());
                 }
-                Box::new(reader.map(|batch| batch.map_err(Into::into)))
+                Box::new(reader.scan(rows, |remaining, batch| {
+                    if *remaining == 0 {
+                        return None;
+                    }
+                    Some(
+                        batch
+                            .map(|batch| {
+                                let keep = batch.num_rows().min(*remaining);
+                                *remaining -= keep;
+                                batch.slice(0, keep)
+                            })
+                            .map_err(Into::into),
+                    )
+                }))
             } else {
                 Box::new(synthetic_batches)
             };
@@ -396,6 +418,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .num_workers(2)
             .memory_limit_mb(512);
         let mut builder = InvertedIndexBuilder::new(params);
+        let processed = Arc::new(AtomicUsize::new(0));
+        let count = processed.clone();
+        let batches = batches.map(move |batch| {
+            batch.inspect(|batch| {
+                count.fetch_add(batch.num_rows(), Ordering::Relaxed);
+            })
+        });
         let start = Instant::now();
         builder
             .update(
@@ -406,7 +435,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         let io = object_store.io_stats_incremental();
         emit(
-            json!({"phase":"build", "rows":rows, "container":format!("{container:?}"), "elapsed_s":start.elapsed().as_secs_f64(),
+            json!({"phase":"build", "rows":processed.load(Ordering::Relaxed), "requested_rows":rows, "input":mode,
+            "container":format!("{container:?}"), "elapsed_s":start.elapsed().as_secs_f64(),
             "read_bytes":io.read_bytes, "write_bytes":io.written_bytes, "process":process_snapshot()}),
         );
         return Ok(());
