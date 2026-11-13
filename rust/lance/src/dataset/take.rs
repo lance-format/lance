@@ -309,42 +309,43 @@ async fn do_take_rows(
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-        let one_batch = if batches.len() > 1 {
-            concat_batches(&batches[0].schema(), &batches)?
+        // Deletions can remove requested rows. Map the addresses actually read
+        // to their fragment batches, then gather directly in the requested order.
+        // This avoids copying all payloads into a concatenated intermediate batch.
+        let mut addr_to_pos = HashMap::with_capacity(sorted_row_addrs.len());
+        for (batch_index, batch) in batches.iter().enumerate() {
+            let returned_row_addrs = batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::internal("_rowaddr column not found"))?
+                .as_primitive::<UInt64Type>()
+                .values();
+            addr_to_pos.extend(
+                returned_row_addrs
+                    .iter()
+                    .enumerate()
+                    .map(|(row_index, addr)| (*addr, (batch_index, row_index))),
+            );
+        }
+        let remapping_indices = row_addrs
+            .iter()
+            .filter_map(|addr| addr_to_pos.get(addr).copied());
+        if batches.len() > 1 {
+            let remapping_indices: Vec<_> = remapping_indices.collect();
+            let batches: Vec<_> = batches.iter().collect();
+            Ok(arrow_select::interleave::interleave_record_batch(
+                &batches,
+                &remapping_indices,
+            )?)
         } else {
-            batches.pop().unwrap()
-        };
-        // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted. Because of this, we
-        // get the results with row ids so that we can re-order the results
-        // to match the requested order.
-
-        let returned_row_addr = one_batch
-            .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
-            .as_primitive::<UInt64Type>()
-            .values();
-
-        let addr_to_pos: HashMap<u64, u64> = returned_row_addr
-            .iter()
-            .enumerate()
-            .map(|(i, addr)| (*addr, i as u64))
-            .collect();
-        let remapping_index: UInt64Array = row_addrs
-            .iter()
-            .filter_map(|o| addr_to_pos.get(o).copied())
-            .collect();
-
-        // remapping_index may be greater than the number of rows in one_batch
-        // if there are duplicates in the requested row ids. This is expected.
-        debug_assert!(remapping_index.len() >= one_batch.num_rows());
-
-        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
-        // so we need to handle it manually here.
-        // TODO: remove this once the bug is fixed.
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
-        Ok(reordered.into())
+            let one_batch = batches.pop().unwrap();
+            let remapping_indices: UInt64Array = remapping_indices
+                .map(|(_, row_index)| row_index as u64)
+                .collect();
+            // Arrow take does not handle empty structs, including nested ones.
+            let struct_arr: StructArray = one_batch.into();
+            let reordered = take_struct_array(&struct_arr, &remapping_indices)?;
+            Ok(reordered.into())
+        }
     }?;
 
     if builder.with_row_address || projection.must_add_row_offset {
