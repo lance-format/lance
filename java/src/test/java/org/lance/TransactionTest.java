@@ -21,6 +21,7 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.memwal.CompactedSsTable;
 import org.lance.memwal.InitializeMemWalParams;
+import org.lance.operation.AcquireLease;
 import org.lance.operation.Append;
 import org.lance.operation.Clone;
 import org.lance.operation.CreateIndex;
@@ -30,6 +31,8 @@ import org.lance.operation.Delete;
 import org.lance.operation.KeyExistenceFilter;
 import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
+import org.lance.operation.ReleaseLease;
+import org.lance.operation.RenewLease;
 import org.lance.operation.ReserveFragments;
 import org.lance.operation.Restore;
 import org.lance.operation.Rewrite;
@@ -44,7 +47,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.beans.Introspector;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -257,6 +265,105 @@ public class TransactionTest {
           }
         }
       }
+    }
+  }
+
+  @Test
+  public void testRetentionLeasePublicationReleasesLease(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("retention_lease_publication").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        RetentionLease lease =
+            dataset.acquireRetentionLease(
+                LeaseOptions.builder().ttl(Duration.ofMinutes(10)).label("index build").build());
+        assertEquals(1, dataset.version());
+        assertEquals(2, lease.getVersion());
+        assertEquals(Optional.of("index build"), lease.getLabel());
+        assertEquals(
+            Duration.ofMinutes(10), Duration.between(lease.getCreatedAt(), lease.getExpiresAt()));
+
+        FragmentMetadata fragment = testDataset.createNewFragment(10);
+        try (Dataset worker = dataset.checkoutLease(lease);
+            Transaction publication =
+                new Transaction.Builder()
+                    .forLease(lease)
+                    .operation(
+                        Append.builder().fragments(Collections.singletonList(fragment)).build())
+                    .build()) {
+          assertEquals(lease.getVersion(), worker.version());
+          assertEquals(Collections.singletonList(lease), worker.getRetentionLeases());
+          assertEquals(lease.getVersion(), publication.readVersion());
+          assertEquals(lease.getId().toString(), publication.uuid());
+          try (Dataset published = new CommitBuilder(worker).execute(publication)) {
+            assertEquals(3, published.version());
+            assertEquals(10, published.countRows());
+            assertTrue(published.getRetentionLeases().isEmpty());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testRetentionLeaseRenewReleaseAndSerialization(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("retention_lease_renew_release").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        RetentionLease lease = dataset.acquireRetentionLease(LeaseOptions.builder().build());
+        assertTrue(lease.getLabel().isEmpty());
+        assertEquals(
+            Duration.ofMinutes(30), Duration.between(lease.getCreatedAt(), lease.getExpiresAt()));
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+          out.writeObject(lease);
+        }
+        RetentionLease shipped;
+        try (ObjectInputStream in =
+            new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+          shipped = (RetentionLease) in.readObject();
+        }
+        assertEquals(lease, shipped);
+        assertEquals(lease.hashCode(), shipped.hashCode());
+
+        RetentionLease renewed = dataset.renewRetentionLease(shipped, Duration.ofHours(1));
+        assertEquals(lease.getId(), renewed.getId());
+        assertTrue(renewed.getExpiresAt().isAfter(lease.getExpiresAt()));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.renewRetentionLease(lease, Duration.ofSeconds(-1)));
+
+        dataset.releaseRetentionLease(lease);
+        try (Dataset latest = dataset.checkoutVersion(dataset.latestVersion())) {
+          assertTrue(latest.getRetentionLeases().isEmpty());
+        }
+        AcquireLease acquired = (AcquireLease) operationAt(dataset, 2);
+        assertEquals(lease.getId(), acquired.getLeaseId());
+        assertEquals(lease.getCreatedAt(), acquired.getCreatedAt());
+        assertEquals(lease.getExpiresAt(), acquired.getExpiresAt());
+        assertTrue(acquired.getLabel().isEmpty());
+        RenewLease renewal = (RenewLease) operationAt(dataset, 3);
+        assertEquals(lease.getId(), renewal.getLeaseId());
+        assertEquals(renewed.getExpiresAt(), renewal.getExpiresAt());
+        assertEquals(lease.getId(), ((ReleaseLease) operationAt(dataset, 4)).getLeaseId());
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> dataset.renewRetentionLease(lease, Duration.ofHours(1)));
+        assertTrue(error.getMessage().contains("it is not listed"), error.getMessage());
+      }
+    }
+  }
+
+  private static Operation operationAt(Dataset dataset, long version) {
+    try (Dataset snapshot = dataset.checkoutVersion(version);
+        Transaction transaction = snapshot.readTransaction().orElseThrow()) {
+      return transaction.operation();
     }
   }
 

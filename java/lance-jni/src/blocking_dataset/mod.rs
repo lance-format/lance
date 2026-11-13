@@ -8,6 +8,7 @@ mod maintenance;
 mod mutation;
 mod read;
 mod refs;
+pub(crate) mod retention_lease;
 mod schema;
 
 pub(crate) use index::optimize_options_from_java;

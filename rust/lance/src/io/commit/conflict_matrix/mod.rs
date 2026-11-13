@@ -94,6 +94,12 @@ enum Outcome {
     Incompatible,
     /// Commits. The invariant battery then runs against the resulting manifest.
     Lands,
+    /// A retention lease request that changes nothing against the new head,
+    /// so it succeeds without writing a version.
+    Unchanged,
+    /// A retention lease request the new head makes invalid, such as renewing
+    /// a lease that is no longer listed.
+    Rejected,
 }
 
 #[cfg(test)]
@@ -104,6 +110,8 @@ impl Outcome {
             Self::Retryable => 'R',
             Self::Incompatible => 'X',
             Self::Lands => 'L',
+            Self::Unchanged => 'N',
+            Self::Rejected => 'E',
         }
     }
 
@@ -112,13 +120,19 @@ impl Outcome {
             "R" => Self::Retryable,
             "X" => Self::Incompatible,
             "L" => Self::Lands,
+            "N" => Self::Unchanged,
+            "E" => Self::Rejected,
             other => panic!("unknown matrix symbol {other:?}"),
         }
     }
 
-    fn of(result: &crate::Result<crate::Dataset>) -> Self {
+    /// `head` is the latest version before the commit, to tell a landing from
+    /// a lease request that wrote nothing.
+    fn of(result: &crate::Result<crate::Dataset>, head: u64) -> Self {
         match result {
+            Ok(dataset) if dataset.manifest.version == head => Self::Unchanged,
             Ok(_) => Self::Lands,
+            Err(Error::InvalidInput { .. }) => Self::Rejected,
             Err(Error::RetryableCommitConflict { .. }) => Self::Retryable,
             Err(Error::CommitConflict { .. } | Error::IncompatibleTransaction { .. }) => {
                 Self::Incompatible

@@ -11,18 +11,72 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
+use lance_table::feature_flags::validate_retention_leases;
+use lance_table::format::RetentionLease;
 use lance_table::io::commit::read_version_hint;
 
 use super::Dataset;
 use crate::Result;
 
+/// How far before the oldest lease's `created_at` an unreferenced file is still treated
+/// as a holder's staged output.
+///
+/// `created_at` comes from the acquirer's clock while a file's last-modified time comes
+/// from the store's, so the margin only has to absorb skew between those clocks, not a
+/// stalled writer: the holder writes after it acquires. An hour is far beyond the skew of
+/// any synchronized clock and costs nothing but a short delay in reclaiming garbage.
+pub(crate) const LEASE_CLOCK_SKEW_MARGIN: TimeDelta = TimeDelta::hours(1);
+
+/// What the retention leases listed on a branch's latest version protect.
+///
+/// Expired leases still listed count: cleanup never judges expiry, a commit removes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LeaseRetention {
+    /// The oldest leased version. It and every later version must survive.
+    pub(crate) oldest_version: u64,
+    /// Unreferenced files last modified at or after this may be a holder's staged output.
+    pub(crate) staged_files_since: DateTime<Utc>,
+}
+
+impl LeaseRetention {
+    /// Read the leases listed on the latest version of `dataset`'s branch.
+    ///
+    /// The latest version's list is the authoritative one; a handle checked out at an
+    /// older version may not list a lease acquired since. Cleanup reads its read
+    /// version's list instead; see the `lease_retention` field of its task for why that
+    /// suffices there.
+    pub(crate) async fn resolve(dataset: &Dataset) -> Result<Option<Self>> {
+        // Expiry promises not to read manifests, so skip the read whenever the handle
+        // already holds the latest one.
+        let latest = if dataset.latest_version_id().await? == dataset.manifest.version {
+            dataset.manifest.clone()
+        } else {
+            dataset.latest_manifest().await?.0
+        };
+        // A list that failed to decode must not read as "no leases".
+        validate_retention_leases(&latest)?;
+        Ok(Self::from_leases(latest.retention_leases()))
+    }
+
+    pub(crate) fn from_leases(leases: &[RetentionLease]) -> Option<Self> {
+        let oldest_version = leases.iter().map(RetentionLease::version).min()?;
+        let oldest_created_at = leases.iter().map(RetentionLease::created_at).min()?;
+        Some(Self {
+            oldest_version,
+            staged_files_since: oldest_created_at
+                .checked_sub_signed(LEASE_CLOCK_SKEW_MARGIN)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+        })
+    }
+}
+
 /// Versions that must survive regardless of age or policy.
 ///
-/// Resolved by reading the dataset's refs, never by reading manifests. Listing failures
-/// propagate rather than yielding an empty set: a tag that cannot be read must never
-/// license a deletion.
+/// Resolved from the dataset's refs and the lease list of the branch's latest manifest,
+/// never by reading older manifests. Listing failures propagate rather than yielding an
+/// empty set: a tag that cannot be read must never license a deletion.
 #[derive(Clone, Debug, Default)]
 pub struct ProtectedVersions {
     /// The newest version. Deleting it would destroy the dataset.
@@ -40,6 +94,9 @@ pub struct ProtectedVersions {
     /// hinted version itself is survivable, since a miss there falls back to a full listing,
     /// but there is nothing to gain by allowing it.
     pub hint_floor: Option<u64>,
+    /// The oldest version a listed retention lease holds. Everything from here up must
+    /// survive so the holder can check out its version and rebase over the later ones.
+    pub lease_floor: Option<u64>,
 }
 
 impl ProtectedVersions {
@@ -61,12 +118,16 @@ impl ProtectedVersions {
             .collect();
 
         let hint_floor = read_version_hint(&dataset.object_store, &dataset.base).await?;
+        let lease_floor = LeaseRetention::resolve(dataset)
+            .await?
+            .map(|leases| leases.oldest_version);
 
         Ok(Self {
             latest: dataset.manifest.version,
             tagged,
             branch_referenced,
             hint_floor,
+            lease_floor,
         })
     }
 
@@ -91,6 +152,7 @@ impl ProtectedVersions {
             || self.tagged.contains(&version)
             || self.branch_referenced.contains(&version)
             || self.hint_floor.is_some_and(|floor| version >= floor)
+            || self.lease_floor.is_some_and(|floor| version >= floor)
     }
 
     /// Protected versions that the policy would otherwise have expired, so a caller can
@@ -161,6 +223,7 @@ mod tests {
             tagged: HashSet::from([7]),
             branch_referenced: HashSet::from([42]),
             hint_floor: None,
+            lease_floor: None,
         };
 
         assert!(protected.contains(100), "the latest version is protected");
@@ -186,6 +249,7 @@ mod tests {
             tagged: HashSet::new(),
             branch_referenced: HashSet::new(),
             hint_floor: Some(50),
+            lease_floor: None,
         };
 
         assert!(
@@ -209,6 +273,45 @@ mod tests {
         };
         assert!(!no_hint.contains(50));
         assert!(!no_hint.contains(99));
+    }
+
+    fn lease(version: u64, created_at: i64) -> RetentionLease {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "version": version,
+            "created_at": ts(created_at),
+            "expires_at": ts(created_at + 60),
+            "label": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn lease_retention_takes_the_oldest_version_and_creation_independently() {
+        assert_eq!(LeaseRetention::from_leases(&[]), None);
+
+        // The lease on the older version was created later: a holder may acquire on a
+        // version its clock places after another holder's, so each floor is its own min.
+        let leases = [lease(7, 10_000), lease(4, 20_000), lease(9, 5_000)];
+        assert_eq!(
+            LeaseRetention::from_leases(&leases),
+            Some(LeaseRetention {
+                oldest_version: 4,
+                staged_files_since: ts(5_000) - LEASE_CLOCK_SKEW_MARGIN,
+            })
+        );
+    }
+
+    #[test]
+    fn protected_versions_keeps_everything_from_the_lease_floor() {
+        let protected = ProtectedVersions {
+            latest: 100,
+            lease_floor: Some(60),
+            ..Default::default()
+        };
+        assert!(!protected.contains(59));
+        assert!(protected.contains(60));
+        assert!(protected.contains(99));
     }
 
     #[test]

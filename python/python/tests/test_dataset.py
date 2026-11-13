@@ -9324,6 +9324,79 @@ def test_transaction_audit_fields(tmp_path):
     assert rewrite.operation.frag_reuse_index is None
 
 
+def test_retention_lease_publication_releases_lease(tmp_path: Path):
+    uri = tmp_path / "leased"
+    dataset = lance.write_dataset(pa.table({"a": [1, 2]}), uri)
+    lease, leased = dataset.acquire_retention_lease(
+        ttl=timedelta(minutes=10), label="index build"
+    )
+    assert dataset.version == 1
+    assert leased.version == lease.version == 2
+    assert lease.label == "index build"
+    assert lease.expires_at - lease.created_at == timedelta(minutes=10)
+    assert lease.created_at.tzinfo is not None
+    uuid.UUID(lease.id)
+    assert leased.retention_leases() == [lease]
+
+    dataset = lance.write_dataset(pa.table({"a": [3]}), uri, mode="append")
+    assert dataset.retention_leases() == [lease]
+    worker = dataset.checkout_lease(lease)
+    assert worker.version == lease.version
+    assert worker.count_rows() == 2
+
+    fragment = lance.LanceFragment.create(uri, pa.table({"a": [4]}))
+    transaction = lance.Transaction.for_lease(
+        lease, lance.LanceOperation.Append([fragment])
+    )
+    assert transaction.read_version == lease.version
+    assert transaction.uuid == lease.id
+    published = lance.LanceDataset.commit(uri, transaction)
+    assert published.version == 4
+    assert published.count_rows() == 4
+    assert published.retention_leases() == []
+
+
+def test_retention_lease_renew_and_release(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path / "leased")
+    lease, _ = dataset.acquire_retention_lease(ttl=timedelta(minutes=10))
+    assert lease.label is None
+
+    renewed = dataset.renew_retention_lease(lease, timedelta(hours=1))
+    assert renewed.id == lease.id
+    assert renewed.expires_at > lease.expires_at
+    assert renewed != lease
+    dataset.checkout_latest()
+    assert dataset.retention_leases() == [renewed]
+
+    dataset.release_retention_lease(lease)
+    dataset.checkout_latest()
+    assert dataset.retention_leases() == []
+    with pytest.raises(ValueError, match="it is not listed"):
+        dataset.renew_retention_lease(lease, timedelta(hours=1))
+
+
+@pytest.mark.parametrize("ttl", [timedelta(0), timedelta(days=-1)])
+def test_retention_lease_rejects_invalid_ttl(tmp_path: Path, ttl: timedelta):
+    dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path / "leased")
+    with pytest.raises(ValueError):
+        dataset.acquire_retention_lease(ttl=ttl)
+    assert dataset.latest_version == 1
+
+
+def test_retention_lease_pickle_roundtrip(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path / "leased")
+    lease, _ = dataset.acquire_retention_lease(label="shipped")
+    shipped = pickle.loads(pickle.dumps(lease))
+    assert isinstance(shipped, lance.RetentionLease)
+    assert shipped == lease
+    assert repr(shipped) == repr(lease)
+    assert "shipped" in repr(lease)
+    with pytest.raises(ValueError, match="version 0"):
+        lance.RetentionLease._from_json(
+            lease.__reduce__()[1][0].replace('"version":2', '"version":0')
+        )
+
+
 def test_read_transaction_properties(tmp_path):
     """Test retrieving properties from transactions at different versions."""
     # Create schema and data for the dataset

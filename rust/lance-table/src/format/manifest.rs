@@ -19,9 +19,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
-use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
+use super::{ClusteringDefinition, Fragment, InlineRowIds, RetentionLease, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_RETENTION_LEASES, FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -122,6 +124,15 @@ pub struct Manifest {
     /// decreases, including after definition removal or restore.
     pub max_clustering_id: u32,
 
+    /// Listed retention leases. Private outside this crate so that every
+    /// change goes through [`Self::set_retention_leases`], which keeps
+    /// [`FLAG_RETENTION_LEASES`] in sync.
+    pub(crate) retention_leases: Vec<RetentionLease>,
+
+    /// Why the stored lease list is invalid, if it is. Readers ignore the
+    /// list, so decoding keeps the valid records and only writers reject it.
+    retention_lease_error: Option<String>,
+
     /// Encoded bytes of `fragments`, reused when this manifest, or one derived
     /// from it, is written. Ignored by equality.
     encoded_fragments: EncodedFragmentCache,
@@ -191,6 +202,30 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Why the stored retention lease list is invalid, if it is.
+    pub(crate) fn retention_lease_error(&self) -> Option<&str> {
+        self.retention_lease_error.as_deref()
+    }
+
+    /// Listed retention leases, including expired ones that no commit has
+    /// removed yet. Only the current manifest's list is authoritative.
+    pub fn retention_leases(&self) -> &[RetentionLease] {
+        &self.retention_leases
+    }
+
+    /// Replace the lease list with one the caller derived, setting
+    /// [`FLAG_RETENTION_LEASES`] exactly when it is nonempty. A list read with invalid records
+    /// is replaced whole, so its decode error no longer applies.
+    pub fn set_retention_leases(&mut self, leases: Vec<RetentionLease>) {
+        if leases.is_empty() {
+            self.writer_feature_flags &= !FLAG_RETENTION_LEASES;
+        } else {
+            self.writer_feature_flags |= FLAG_RETENTION_LEASES;
+        }
+        self.retention_leases = leases;
+        self.retention_lease_error = None;
+    }
+
     /// Whether this table requires independently addressed Managed Blob support.
     pub fn has_managed_blobs(&self) -> bool {
         self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
@@ -228,6 +263,8 @@ impl Manifest {
             base_paths,
             clustering: Vec::new(),
             max_clustering_id: 0,
+            retention_leases: Vec::new(),
+            retention_lease_error: None,
             encoded_fragments: EncodedFragmentCache::default(),
         }
     }
@@ -263,6 +300,10 @@ impl Manifest {
             base_paths: previous.base_paths.clone(),
             clustering: previous.clustering.clone(),
             max_clustering_id: previous.max_clustering_id,
+            // Carried so that a build path that does not derive the list
+            // keeps retention in force rather than silently releasing leases.
+            retention_leases: previous.retention_leases.clone(),
+            retention_lease_error: previous.retention_lease_error.clone(),
             encoded_fragments: EncodedFragmentCache::default(),
         }
     }
@@ -345,6 +386,9 @@ impl Manifest {
             // the definitions they reference and the allocation high-water mark.
             clustering: self.clustering.clone(),
             max_clustering_id: self.max_clustering_id,
+            // Clones and branches start with no leases.
+            retention_leases: Vec::new(),
+            retention_lease_error: None,
             encoded_fragments: EncodedFragmentCache::default(),
         }
     }
@@ -861,6 +905,13 @@ pub struct ManifestBuildConfig {
     pub auto_set_feature_flags: bool,
     /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
     pub timestamp_nanos: u128,
+    /// The time this commit attempt judges retention lease expiry against.
+    /// The caller reads it once per attempt, so every derivation in the
+    /// attempt agrees on which leases have expired. It is the real clock even
+    /// when `timestamp_nanos` is overridden: a caller-chosen manifest
+    /// timestamp, such as one replayed from another table, must not decide
+    /// which leases have expired.
+    pub now: DateTime<Utc>,
     /// Request the stable row id feature. The flag is also inherited from the
     /// previous manifest, so false does not turn it off for a dataset that has it.
     pub use_stable_row_ids: bool,
@@ -1168,6 +1219,19 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
+        let mut retention_lease_error = None;
+        let retention_leases = p
+            .retention_leases
+            .iter()
+            .filter_map(|record| match RetentionLease::try_from(record) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    retention_lease_error.get_or_insert_with(|| error.to_string());
+                    None
+                }
+            })
+            .collect();
+
         Ok(Self {
             schema,
             version: p.version,
@@ -1208,6 +1272,8 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .map(ClusteringDefinition::try_from)
                 .collect::<Result<Vec<_>>>()?,
             max_clustering_id: p.max_clustering_id,
+            retention_leases,
+            retention_lease_error,
         })
     }
 }
@@ -1247,6 +1313,11 @@ pub fn pb_manifest_without_fragments(m: &Manifest) -> pb::Manifest {
         branch: m.branch.clone(),
         clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
         max_clustering_id: m.max_clustering_id,
+        retention_leases: m
+            .retention_leases
+            .iter()
+            .map(pb::RetentionLease::from)
+            .collect(),
         writer_version: m
             .writer_version
             .as_ref()
@@ -1667,6 +1738,90 @@ mod tests {
                 .to_string()
                 .contains("All data files must have the same version")
         );
+    }
+
+    fn lease_record(id: u8) -> pb::RetentionLease {
+        pb::RetentionLease {
+            id: Some(pb::Uuid { uuid: vec![id; 16] }),
+            version: Some(1),
+            created_at: Some(Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
+            expires_at: Some(Timestamp {
+                seconds: 20,
+                nanos: 0,
+            }),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn test_retention_leases_roundtrip_and_carry_forward() {
+        let mut encoded = pb::Manifest::from(&Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        ));
+        encoded.writer_feature_flags = FLAG_RETENTION_LEASES;
+        encoded.retention_leases = vec![lease_record(1), lease_record(2)];
+
+        let decoded = Manifest::try_from(encoded.clone()).unwrap();
+        assert_eq!(decoded.retention_leases.len(), 2);
+        assert_eq!(decoded.retention_lease_error(), None);
+        assert_eq!(pb::Manifest::from(&decoded), encoded);
+
+        let next = Manifest::new_from_previous(&decoded, decoded.schema.clone(), Arc::new(vec![]));
+        assert_eq!(next.retention_leases, decoded.retention_leases);
+        let clone = decoded.shallow_clone(None, "ref".into(), 1, None, "tx".into());
+        assert!(clone.retention_leases.is_empty());
+    }
+
+    #[test]
+    fn test_valid_retention_leases_writable() {
+        let mut encoded = pb::Manifest::from(&Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        ));
+        encoded.writer_feature_flags = FLAG_RETENTION_LEASES;
+        encoded.retention_leases = vec![lease_record(1)];
+        let decoded = Manifest::try_from(encoded).unwrap();
+
+        crate::feature_flags::ensure_can_read_manifest(&decoded).unwrap();
+        crate::feature_flags::ensure_can_write_manifest(&decoded).unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::flag_missing(0, vec![lease_record(1)], "writer feature flag is unset")]
+    #[case::incomplete_record(
+        0,
+        vec![pb::RetentionLease { expires_at: None, ..lease_record(1) }],
+        "retention lease 01010101-0101-0101-0101-010101010101 expires_at is missing"
+    )]
+    #[case::duplicate_ids(0, vec![lease_record(1), lease_record(1)], "duplicate lease id")]
+    fn test_listed_retention_leases_block_writes_but_not_reads(
+        #[case] writer_flags: u64,
+        #[case] records: Vec<pb::RetentionLease>,
+        #[case] message: &str,
+    ) {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.writer_feature_flags = writer_flags;
+        encoded.retention_leases = records;
+
+        let decoded = Manifest::try_from(encoded).unwrap();
+
+        crate::feature_flags::ensure_can_read_manifest(&decoded).unwrap();
+        let error = crate::feature_flags::ensure_can_write_manifest(&decoded).unwrap_err();
+        assert!(error.to_string().contains(message), "got: {error}");
     }
 
     #[test]

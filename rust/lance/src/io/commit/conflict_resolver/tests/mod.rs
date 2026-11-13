@@ -176,7 +176,10 @@ fn modified_fragment_ids(operation: &Operation) -> Box<dyn Iterator<Item = u64> 
         | Operation::UpdateConfig { .. }
         | Operation::UpdateBases { .. }
         | Operation::Restore { .. }
-        | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
+        | Operation::UpdateMemWalState { .. }
+        | Operation::AcquireLease { .. }
+        | Operation::RenewLease { .. }
+        | Operation::ReleaseLease { .. } => Box::new(std::iter::empty()),
         Operation::Delete {
             updated_fragments,
             deleted_fragment_ids,

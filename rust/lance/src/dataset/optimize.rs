@@ -146,7 +146,13 @@ pub async fn compact_files_with_planner(
 ) -> Result<CompactionMetrics> {
     let remap_options =
         remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
-    let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+    let mut compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+    // A custom planner may not know that listed retention leases require
+    // this compaction to record its moves (see
+    // `DefaultCompactionPlanner::deferring_under_leases`).
+    if !dataset.manifest.retention_leases().is_empty() {
+        compaction_plan.options.defer_index_remap = true;
+    }
     if !remap_options.supports_vector_segment_replacement()
         || compaction_plan.options.defer_index_remap
         || dataset.manifest.uses_stable_row_ids()

@@ -8,6 +8,7 @@ import "table.proto";
 import "transaction/actions.proto";
 import "transaction/common.proto";
 import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
 
 package lance.table;
 
@@ -365,6 +366,48 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  /* Acquire a lease on the version this commit creates. Acquisition may rebase;
+   * the successful publishing version becomes the fixed leased version.
+   */
+  message AcquireLease {
+    /* The UUID of the transaction the holder intends to publish. Committing an
+     * ordinary transaction with this UUID releases the lease.
+     * Absent, any length other than 16 bytes, or equal to this transaction's
+     * own UUID is invalid. Retries preserve it.
+     */
+    UUID lease_id = 1;
+    /* UTC request creation time, fixed before the first send.
+     * Absent is invalid. The lease retains this value through retries/renewals.
+     */
+    google.protobuf.Timestamp created_at = 2;
+    /* Absolute UTC expiry time fixed before the first send.
+     * Absent or not later than created_at is invalid.
+     * Fresh acquisition requires a future deadline at each attempt's validation.
+     */
+    google.protobuf.Timestamp expires_at = 3;
+    /* Optional immutable context. Absent or empty means no label.
+     * Re-acquiring a listed ID returns the stored label.
+     */
+    optional string label = 4;
+  }
+
+  // Extend an existing lease; this operation never creates a missing lease.
+  message RenewLease {
+    // Target lease ID. Absent or any length other than 16 UUID bytes is invalid.
+    UUID lease_id = 1;
+    /* Fixed requested absolute UTC expiry time. Absent is invalid.
+     * The current lease must still be unexpired at each attempt's validation.
+     * A current expires_at that meets or exceeds this request is a successful no-op.
+     */
+    google.protobuf.Timestamp expires_at = 2;
+  }
+
+  // Remove one lease; an absent target is a successful no-op.
+  message ReleaseLease {
+    // Target lease ID. Absent or any length other than 16 UUID bytes is invalid.
+    UUID lease_id = 1;
+  }
+
   /* The operation of this transaction.
    *
    * Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -396,6 +439,9 @@ message Transaction {
      * manifest field it ignores (#9482).
      */
     lance.transaction.CompositeOperation composite_operation = 116;
+    AcquireLease acquire_lease = 117;
+    RenewLease renew_lease = 118;
+    ReleaseLease release_lease = 119;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

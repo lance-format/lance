@@ -288,6 +288,13 @@ Vector indices, scalar indices, full-text search, and index management.
 
 See [Index Formats](../index/index.md)
 
+### Retention Leases
+
+Temporarily retaining a version, the history after it, and the FRI transitions
+a long-running job needs to publish a result computed from that version.
+
+See [Retention Leases Specification](retention_leases.md)
+
 ### Versioning
 
 Feature flags and format version compatibility.

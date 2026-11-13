@@ -87,6 +87,7 @@ from .lance import (
     ExpireVersionsStats,
     IOStats,
     LanceSchema,
+    RetentionLease,
     ScanStatistics,
     _Dataset,
     _write_dataset,
@@ -122,6 +123,8 @@ if TYPE_CHECKING:
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 # Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
 _DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
+# Mirrors Rust's `LeaseOptions::default().ttl`; keep the two in sync.
+_DEFAULT_RETENTION_LEASE_TTL = timedelta(minutes=30)
 
 
 def _resolve_blob_selection(
@@ -2770,6 +2773,153 @@ class LanceDataset(pa.dataset.Dataset):
         This creates a new commit.
         """
         self._ds.restore()
+
+    def acquire_retention_lease(
+        self,
+        ttl: timedelta = _DEFAULT_RETENTION_LEASE_TTL,
+        label: Optional[str] = None,
+    ) -> Tuple[RetentionLease, "LanceDataset"]:
+        """Acquire a retention lease on a new version of this dataset.
+
+        While the lease is listed, cleanup keeps the leased version and every
+        later one, so the holder can build on the leased version for as long
+        as it keeps the lease. The lease ends when the holder commits a
+        transaction for it (see :meth:`Transaction.for_lease`), releases it
+        with :meth:`release_retention_lease`, or lets it expire without
+        :meth:`renew_retention_lease`.
+
+        The acquisition commits a new version on the latest version of this
+        dataset's branch; that version is the leased one. This dataset stays
+        at its current version.
+
+        Parameters
+        ----------
+        ttl: timedelta, default 30 minutes
+            How long the lease lasts unless renewed. Must be positive.
+        label: str, optional
+            Human-readable context stored with the lease.
+
+        Returns
+        -------
+        Tuple[RetentionLease, LanceDataset]
+            The lease and the dataset checked out at the leased version.
+
+        Raises
+        ------
+        NotImplementedError
+            If this build of Lance cannot honor leases on this dataset, for
+            example on a dataset with stable row IDs.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, leased = dataset.acquire_retention_lease(label="backfill")
+        >>> leased.version == lease.version
+        True
+        >>> fragment = lance.LanceFragment.create("example", pa.table({"a": [3]}))
+        >>> transaction = lance.Transaction.for_lease(
+        ...     lease, lance.LanceOperation.Append([fragment])
+        ... )
+        >>> dataset = lance.LanceDataset.commit("example", transaction)
+        >>> dataset.retention_leases()
+        []
+        """
+        lease, leased_ds = self._ds.acquire_retention_lease(ttl, label)
+        leased = copy.copy(self)
+        leased._ds = leased_ds
+        return lease, leased
+
+    def checkout_lease(self, lease: RetentionLease) -> "LanceDataset":
+        """Check out the version ``lease`` retains.
+
+        Use this on a worker that received the lease from its holder.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease whose version to check out.
+
+        Returns
+        -------
+        LanceDataset
+        """
+        leased = copy.copy(self)
+        leased._ds = self._ds.checkout_lease(lease)
+        return leased
+
+    def renew_retention_lease(
+        self, lease: RetentionLease, ttl: timedelta
+    ) -> RetentionLease:
+        """Extend ``lease`` to expire ``ttl`` from now.
+
+        A time not later than the current expiry changes nothing and commits
+        no version.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease to renew.
+        ttl: timedelta
+            How long from now the lease should last. Must be positive.
+
+        Returns
+        -------
+        RetentionLease
+            The lease as listed after the renewal.
+
+        Raises
+        ------
+        ValueError
+            If the lease is no longer listed or has already expired.
+
+        Examples
+        --------
+        >>> from datetime import timedelta
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, _ = dataset.acquire_retention_lease(ttl=timedelta(minutes=5))
+        >>> renewed = dataset.renew_retention_lease(lease, timedelta(hours=1))
+        >>> renewed.expires_at > lease.expires_at
+        True
+        """
+        return self._ds.renew_retention_lease(lease, ttl)
+
+    def release_retention_lease(self, lease: RetentionLease) -> None:
+        """Release ``lease``, ending its retention without publishing a result.
+
+        Releasing a lease that is no longer listed changes nothing.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease to release.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, _ = dataset.acquire_retention_lease()
+        >>> dataset.release_retention_lease(lease)
+        >>> lance.dataset("example").retention_leases()
+        []
+        """
+        self._ds.release_retention_lease(lease)
+
+    def retention_leases(self) -> List[RetentionLease]:
+        """The retention leases listed in this version of the dataset.
+
+        Expired leases stay listed until a later commit removes them. Only the
+        latest version's list is authoritative.
+
+        Returns
+        -------
+        List[RetentionLease]
+        """
+        return self._ds.retention_leases()
 
     def base_paths(self) -> Dict[int, DatasetBasePath]:
         """Return the base paths registered in the current dataset snapshot.
