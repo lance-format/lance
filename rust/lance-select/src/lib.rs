@@ -21,7 +21,7 @@ pub mod mask;
 pub mod result;
 
 pub use mask::{
-    NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
-    RowIdMask, RowIdSet, RowSetOps, bitmap_to_ranges, ranges_to_bitmap,
+    NullableRowAddrMask, NullableRowAddrSet, PreparedRowAddrMask, RowAddrMask, RowAddrSelection,
+    RowAddrTreeMap, RowIdMask, RowIdSet, RowSetOps, bitmap_to_ranges, ranges_to_bitmap,
 };
 pub use result::{IndexExprResult, NullableIndexExprResult};

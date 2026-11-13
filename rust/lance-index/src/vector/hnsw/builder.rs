@@ -63,19 +63,51 @@ fn build_prefilter_bitset<'a>(
         return (bitset.count_ones() != storage.len()).then_some(bitset);
     }
 
+    let prepared = prefilter.prepared_mask();
+    if let Some(mask) = prepared
+        .as_ref()
+        .filter(|mask| mask.is_dense_selection_eligible(storage.row_ids().size_hint().0))
+    {
+        // Scan the accepted prefix once; on the first rejected row, switch to
+        // writing selected positions without revisiting that prefix.
+        let mut rows = storage.row_ids();
+        let mut prefix = 0;
+        let rejected = loop {
+            match rows.next() {
+                Some(&row_id) if mask.selected(row_id) => prefix += 1,
+                Some(_) => break true,
+                None => break false,
+            }
+        };
+        // Prove all actual positions, rather than inferring All from metadata
+        // or mask cardinality. The all-pass path need not generate a bitmap.
+        if !rejected && prefix == storage.len() {
+            return None;
+        }
+        let mut bitset = generator.generate(storage.len());
+        for position in 0..prefix {
+            bitset.insert(position as u32);
+        }
+        if rejected {
+            // The first rejected row has already been consumed. Continue once
+            // from the next position; never rescan the accepted prefix.
+            for (offset, &row_id) in rows.enumerate() {
+                if mask.selected(row_id) {
+                    bitset.insert((prefix + 1 + offset) as u32);
+                }
+            }
+        }
+        return Some(bitset);
+    }
+
     let mut bitset = generator.generate(storage.len());
     let mut prefix = 0..storage.len();
     let mut is_prefix = true;
-    let mask = prefilter.mask();
-    // Match mask.selected_indices without boxing the iterator or collecting it.
-    for (position, &row_id) in storage.row_ids().enumerate() {
-        if !mask.selected(row_id) {
-            continue;
-        }
-        // Delay a consecutive prefix until the first selected position after a
-        // gap. All-pass queries leave both the bitmap and its dirty log clean.
+    let mut select = |position: usize, _: u64| {
+        // A consecutive prefix need not touch the bitmap until a rejection is
+        // observed. All-pass queries then avoid both its dirty log and clearing.
         if is_prefix && position == prefix.start && prefix.next().is_some() {
-            continue;
+            return;
         }
         if is_prefix {
             for index in 0..prefix.start {
@@ -84,14 +116,25 @@ fn build_prefilter_bitset<'a>(
             is_prefix = false;
         }
         bitset.insert(position as u32);
+    };
+    if let Some(mask) = prepared {
+        mask.for_each_selected(storage.row_ids(), &mut select);
+    } else {
+        let mask = prefilter.mask();
+        for (position, &row_id) in storage.row_ids().enumerate() {
+            if mask.selected(row_id) {
+                select(position, row_id);
+            }
+        }
     }
 
     if is_prefix {
         if prefix.is_empty() {
             // Every actual input position was checked, in order, through N-1.
+            // This is not a proof from mask cardinality or fragment metadata.
             return None;
         }
-        // A rejected suffix has no later selected position to reveal its gap.
+        // A rejected suffix has no later selected callback to reveal its gap.
         for index in 0..prefix.start {
             bitset.insert(index as u32);
         }
@@ -2180,6 +2223,160 @@ mod tests {
                 let clean = generator.generate(storage.len());
                 assert_eq!(clean.count_ones(), 0);
                 assert!((0..storage.len()).all(|position| !clean.contains(position as u32)));
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_membership_reaches_hnsw_bitset_once() {
+        struct Filter {
+            mask: Arc<RowAddrMask>,
+            view: Arc<lance_select::PreparedRowAddrMask>,
+            lookups: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl PreFilter for Filter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_empty(&self) -> bool {
+                false
+            }
+            fn mask(&self) -> Arc<RowAddrMask> {
+                self.mask.clone()
+            }
+            fn is_mask_equivalent(&self) -> bool {
+                true
+            }
+            fn prepared_mask(&self) -> Option<Arc<lance_select::PreparedRowAddrMask>> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Some(self.view.clone())
+            }
+            fn filter_row_ids<'a>(
+                &self,
+                _rows: Box<dyn Iterator<Item = &'a u64> + 'a>,
+            ) -> Vec<u64> {
+                panic!("the prepared HNSW consumer must not use the legacy selection hook")
+            }
+        }
+        let rows: Vec<u64> = (0..32)
+            .flat_map(|key| {
+                (0..128).map(move |offset| u64::from(RowAddress::new_from_parts(key, offset)))
+            })
+            .collect();
+        let storage = prefilter_test_storage(rows.clone());
+        let mask = Arc::new(RowAddrMask::from_allowed(
+            rows.iter()
+                .copied()
+                .filter(|row| (*row as u32) < 64)
+                .collect(),
+        ));
+        let view = Arc::new(
+            lance_select::PreparedRowAddrMask::try_new(mask.clone(), [rows.len()]).unwrap(),
+        );
+        let expected = mask.selected_indices(rows.iter());
+        let filter = Filter {
+            mask,
+            view,
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut generator = VisitedGenerator::new(0);
+        let bits = build_prefilter_bitset(&storage, &filter, &mut generator).unwrap();
+        assert_eq!(
+            bits.iter_ones()
+                .map(|position| position as u64)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(filter.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case::all(256, vec![])]
+    #[case::first_rejected(256, vec![0])]
+    #[case::second_rejected(256, vec![1])]
+    #[case::middle_rejected(256, vec![127])]
+    #[case::last_rejected(256, vec![255])]
+    #[case::rejected_suffix(256, (128..256).collect())]
+    #[case::alternating(256, (0..256).step_by(2).collect())]
+    #[case::none_selected(256, (0..256).collect())]
+    #[case::small_partition_fallback(16, vec![0, 15])]
+    #[case::empty_partition_fallback(0, vec![])]
+    fn test_prepared_prefilter_prefix_boundary(#[case] count: usize, #[case] rejected: Vec<usize>) {
+        let mask = Arc::new(RowAddrMask::from_allowed(
+            (0..32)
+                .flat_map(|fragment| {
+                    (1..=3)
+                        .map(move |offset| u64::from(RowAddress::new_from_parts(fragment, offset)))
+                })
+                .collect(),
+        ));
+        let row_ids = (0..count)
+            .map(|position| {
+                // Duplicate, unordered row addresses must still select positions.
+                let fragment = ((position * 7) % 32) as u32;
+                let offset = if rejected.contains(&position) { 4 } else { 2 };
+                u64::from(RowAddress::new_from_parts(fragment, offset))
+            })
+            .collect();
+        let storage = prefilter_test_storage(row_ids);
+        let legacy = LegacyPreFilter { mask: mask.clone() };
+        let expected = legacy.filter_row_ids(Box::new(storage.row_ids()));
+        let base: Arc<dyn PreFilter> = Arc::new(MaskPreFilter { mask: mask.clone() });
+        // Another initial partition can fund the shared view for a small one.
+        struct PreparedFilter {
+            mask: Arc<RowAddrMask>,
+            view: Arc<lance_select::PreparedRowAddrMask>,
+        }
+        #[async_trait]
+        impl PreFilter for PreparedFilter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_empty(&self) -> bool {
+                false
+            }
+            fn mask(&self) -> Arc<RowAddrMask> {
+                self.mask.clone()
+            }
+            fn prepared_mask(&self) -> Option<Arc<lance_select::PreparedRowAddrMask>> {
+                Some(self.view.clone())
+            }
+            fn is_mask_equivalent(&self) -> bool {
+                true
+            }
+            fn filter_row_ids<'a>(
+                &self,
+                _rows: Box<dyn Iterator<Item = &'a u64> + 'a>,
+            ) -> Vec<u64> {
+                panic!("prepared membership must preserve the mask-only path")
+            }
+        }
+        let prepared: Arc<dyn PreFilter> = Arc::new(PreparedFilter {
+            view: Arc::new(
+                lance_select::PreparedRowAddrMask::try_new(mask.clone(), [4096]).unwrap(),
+            ),
+            mask,
+        });
+        assert!(prepared.prepared_mask().is_some());
+        let mut generator = VisitedGenerator::new(0);
+        for _ in 0..2 {
+            for filter in [&base, &prepared] {
+                {
+                    let bitset = build_prefilter_bitset(&storage, filter.as_ref(), &mut generator);
+                    assert_eq!(bitset.is_none(), expected.len() == count);
+                    if let Some(bitset) = bitset {
+                        assert_eq!(
+                            bitset
+                                .iter_ones()
+                                .map(|position| position as u64)
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                }
+                let clean = generator.generate(count);
+                assert_eq!(clean.count_ones(), 0);
             }
         }
     }

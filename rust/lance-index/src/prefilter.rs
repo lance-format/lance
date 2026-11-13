@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{PreparedRowAddrMask, RowAddrMask, RowAddrTreeMap};
 
 /// A trait to be implemented by anything supplying a prefilter row addr mask
 ///
@@ -69,6 +69,21 @@ pub trait PreFilter: Send + Sync {
     /// from their stored mask without scanning it.
     fn selects_nothing(&self) -> bool {
         false
+    }
+
+    /// Optional exact membership view of this query's immutable final mask.
+    /// Call after [`Self::wait_for_ready`]. Custom filters retain the original path.
+    ///
+    /// ```
+    /// # use lance_index::prefilter::PreFilter;
+    /// # async fn example(filter: &dyn PreFilter) -> lance_core::Result<()> {
+    /// filter.wait_for_ready().await?;
+    /// if let Some(view) = filter.prepared_mask() { let _ = view.selected(1); }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn prepared_mask(&self) -> Option<Arc<PreparedRowAddrMask>> {
+        None
     }
 
     /// Whether position filtering is exactly the membership of [`Self::mask`].

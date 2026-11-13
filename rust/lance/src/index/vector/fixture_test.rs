@@ -281,6 +281,7 @@ mod test {
                     deleted_fragments: None,
                     overlay_block: None,
                     final_mask: Mutex::new(OnceCell::new()),
+                    query_membership: tokio::sync::OnceCell::new(),
                 }),
                 &NoOpMetricsCollector,
             )
