@@ -17,16 +17,22 @@ use crate::session::caches::{DeletionFileKey, RowIdSequenceKey};
 use crate::session::index_caches::RowIdFragmentDeletionKey;
 use crate::{Dataset, Error, Result};
 
-/// Locks live only while a caller builds or waits. The registry holds no indices
-/// and prunes expired entries, including datasets no longer used by the session.
+/// Share source preparation and active lookups, including lookups too large for
+/// cache admission. Unlike a final cache entry, a source can yield just a span or
+/// a lookup pruned for a particular snapshot. Only callers and caches own those
+/// allocations; this registry holds weak references and prunes expired entries.
 #[derive(Default)]
-pub struct RowIdIndexBuildLocks {
+pub struct RowIdFragmentRegistry {
     fragments: Mutex<FragmentBuilds>,
 }
 
 type FragmentBuildKey = (String, InternalCacheKey, Option<InternalCacheKey>);
 type FragmentBuild = tokio::sync::Mutex<Option<Arc<super::resolve::PreparedFragment>>>;
-type FragmentBuilds = HashMap<FragmentBuildKey, FragmentBuildEntry>;
+#[derive(Default)]
+struct FragmentBuilds {
+    entries: HashMap<FragmentBuildKey, FragmentBuildEntry>,
+    requests_until_prune: usize,
+}
 
 #[derive(Default)]
 struct FragmentBuildEntry {
@@ -34,7 +40,7 @@ struct FragmentBuildEntry {
     active: Weak<super::resolve::PreparedFragment>,
 }
 
-impl RowIdIndexBuildLocks {
+impl RowIdFragmentRegistry {
     pub(super) fn for_fragment(
         &self,
         uri: &str,
@@ -43,9 +49,22 @@ impl RowIdIndexBuildLocks {
         let mut fragments = self.fragments.lock().map_err(|error| {
             Error::internal(format!("row id fragment build registry poisoned: {error}"))
         })?;
-        fragments
-            .retain(|_, entry| entry.build.strong_count() > 0 || entry.active.strong_count() > 0);
+        if fragments.requests_until_prune == 0 {
+            fragments.entries.retain(|_, entry| {
+                entry.build.strong_count() > 0 || entry.active.strong_count() > 0
+            });
+            // Amortize cleanup across requests instead of scanning all resident
+            // fragments for every miss. Retain scans capacity, so also release
+            // a sparse high-water allocation after readers or datasets expire.
+            let interval = fragments.entries.len().max(64);
+            if fragments.entries.capacity() > interval.saturating_mul(4) {
+                fragments.entries.shrink_to(interval);
+            }
+            fragments.requests_until_prune = interval;
+        }
+        fragments.requests_until_prune -= 1;
         let entry = fragments
+            .entries
             .entry((uri.to_owned(), key.source, key.deletion))
             .or_default();
         if let Some(build) = entry.build.upgrade() {
@@ -65,33 +84,31 @@ impl RowIdIndexBuildLocks {
         let mut fragments = self.fragments.lock().map_err(|error| {
             Error::internal(format!("row id fragment build registry poisoned: {error}"))
         })?;
-        if let Some(entry) = fragments.get_mut(&(uri.to_owned(), key.source, key.deletion)) {
+        if let Some(entry) = fragments
+            .entries
+            .get_mut(&(uri.to_owned(), key.source, key.deletion))
+        {
             entry.active = Arc::downgrade(active);
         }
         Ok(())
     }
 }
 
-impl DeepSizeOf for RowIdIndexBuildLocks {
+impl DeepSizeOf for RowIdFragmentRegistry {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         self.fragments
             .lock()
             .map(|fragments| {
-                fragments.capacity() * std::mem::size_of::<(FragmentBuildKey, FragmentBuildEntry)>()
+                fragments.entries.capacity()
+                    * std::mem::size_of::<(FragmentBuildKey, FragmentBuildEntry)>()
                     + fragments
+                        .entries
                         .keys()
                         .map(|(uri, _, _)| uri.capacity())
                         .sum::<usize>()
             })
             .unwrap_or(0)
     }
-}
-
-#[cfg(test)]
-pub(super) fn entry_bytes(value: &impl DeepSizeOf) -> usize {
-    value.deep_size_of()
-        + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-        + std::mem::size_of::<InternalCacheKey>()
 }
 
 pub(super) fn deletion_identity(
@@ -253,7 +270,37 @@ pub(super) mod tests {
     use crate::dataset::write::CommitBuilder;
     use crate::dataset::{ProjectionRequest, WriteParams};
     use crate::session::Session;
+    use crate::session::index_caches::PreparedRowIdFragmentKey;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[test]
+    fn registry_reclaims_expired_metadata_without_losing_live_builds() {
+        let registry = RowIdFragmentRegistry::default();
+        let key = |id: u128| PreparedRowIdFragmentKey {
+            source: InternalCacheKey::from_bytes(id.to_le_bytes()),
+            deletion: None,
+        };
+        let live = registry.for_fragment("memory://", &key(0)).unwrap();
+        let expired: Vec<_> = (1..=256)
+            .map(|id| registry.for_fragment("memory://", &key(id)).unwrap())
+            .collect();
+        let weak = Arc::downgrade(&expired[0]);
+        drop(expired);
+        assert!(weak.upgrade().is_none());
+
+        // Churn through unrelated sources after a large set of readers expires.
+        // Metadata must stay bounded while the live source keeps its same lock.
+        for id in 257..=2304 {
+            drop(registry.for_fragment("memory://", &key(id)).unwrap());
+            assert!(Arc::ptr_eq(
+                &live,
+                &registry.for_fragment("memory://", &key(0)).unwrap()
+            ));
+        }
+        let fragments = registry.fragments.lock().unwrap();
+        assert!(fragments.entries.len() < 128);
+        assert!(fragments.entries.capacity() < 512);
+    }
 
     pub async fn dataset(spilled: bool) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()

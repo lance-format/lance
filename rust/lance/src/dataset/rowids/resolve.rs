@@ -137,8 +137,12 @@ impl PreparedFragment {
     }
 }
 
-/// Resolve all unknown candidates; cached fragment lookups answer different IDs
-/// without keeping original row-ID arrays or caching individual query answers.
+/// Map stable row IDs to physical row addresses, preserving input order and
+/// duplicates. Return `None` when stable row IDs are disabled; otherwise each
+/// unknown ID maps to `None`, as do deleted IDs when `with_deletions` is true.
+/// Fragment lookups share immutable source mappings across snapshots and apply
+/// the requested snapshot's deletions. Ignoring deletions or lacking a manifest
+/// e-tag uses the complete-index path instead.
 pub async fn resolve_row_ids(
     dataset: &Dataset,
     row_ids: &[u64],
@@ -318,7 +322,7 @@ async fn prepare_shared(
     };
     let build = dataset
         .session()
-        .row_id_index_builds
+        .row_id_fragment_registry
         .for_fragment(&dataset.uri, &source_key)?;
     let mut slot = build.lock().await;
     if let Some(active) = slot.as_ref()
@@ -399,7 +403,7 @@ async fn prepare_shared(
     }
     dataset
         .session()
-        .row_id_index_builds
+        .row_id_fragment_registry
         .prepared(&dataset.uri, &source_key, &active)?;
     *slot = Some(active.clone());
     Ok(active)
@@ -1364,7 +1368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounds_survive_graph_eviction_without_retaining_prepared_state() {
+    async fn bounds_survive_lookup_eviction_without_retaining_prepared_state() {
         let dataset = cold_dataset(shuffled_dataset(true, false).await, 1 << 20, 1 << 20);
         let expected = RowAddress::new_from_parts(dataset.manifest.fragments[0].id as u32, 9);
         assert_eq!(
@@ -1413,7 +1417,7 @@ mod tests {
         assert!(view.upgrade().is_none());
         let before = dataset.object_store.io_stats_snapshot();
         // ID31 is in another fragment; immutable bounds rule out fragment0
-        // even after its prepared graph has been reclaimed.
+        // even after its prepared lookup has been reclaimed.
         let result = resolve_row_ids(&dataset, &[31, 34, 31], true)
             .await
             .unwrap()
@@ -1443,16 +1447,26 @@ mod tests {
             .unwrap();
         let index = RowIdIndex::new(&[source]).unwrap();
         let index = Arc::new(index);
-        let sizing = PreparedFragment {
-            index: Some(index.clone()),
-            span: span.clone(),
-            deletion: None,
+        let key = PreparedRowIdFragmentKey {
+            source: sequence_identity(&dataset, fragment).unwrap(),
+            deletion: deletion_identity(&dataset, fragment, true).unwrap(),
+        };
+        let prepared = Arc::new(PreparedFragment {
+            index: Some(index),
+            span,
+            deletion: key.deletion,
             source_rows: 10,
             is_range_only: false,
             retained: None,
-        };
-        let weight = super::super::cache::entry_bytes(&sizing);
-        drop(sizing);
+        });
+        // Measure the real cache charge, including the current entry overhead.
+        let sizing_session = Session::new(1 << 20, 0, dataset.session().store_registry());
+        let sizing_cache = sizing_session.index_cache.for_dataset(&dataset.uri);
+        sizing_cache.insert_with_key(&key, prepared.clone()).await;
+        assert!(sizing_cache.get_with_key(&key).await.is_some());
+        let weight = sizing_cache.size_bytes().await;
+        drop(sizing_cache);
+        drop(sizing_session);
         // QuickCache also limits entry admission to about 97% of a shard.
         // This budget admits either unit while still excluding both together.
         let capacity = weight * 3 / 2;
@@ -1467,23 +1481,7 @@ mod tests {
         }
         let source_bytes = dataset.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
         assert!(source_bytes > 0);
-        let fragment = &dataset.manifest.fragments[3];
-        let key = PreparedRowIdFragmentKey {
-            source: sequence_identity(&dataset, fragment).unwrap(),
-            deletion: deletion_identity(&dataset, fragment, true).unwrap(),
-        };
-        let prepared = PreparedFragment {
-            index: Some(index),
-            span,
-            deletion: key.deletion,
-            source_rows: 10,
-            is_range_only: false,
-            retained: None,
-        };
-        dataset
-            .index_cache
-            .insert_with_key(&key, Arc::new(prepared))
-            .await;
+        dataset.index_cache.insert_with_key(&key, prepared).await;
         assert!(dataset.index_cache.get_with_key(&key).await.is_some());
         let before = dataset.object_store.io_stats_snapshot();
         assert_eq!(
@@ -1506,12 +1504,12 @@ mod tests {
             .unwrap()
             .occupancy
             .unwrap();
-        let graph_entries = occupancy
+        let lookup_entries = occupancy
             .types
             .iter()
             .find(|entry| entry.type_name == PreparedRowIdFragmentKey::stable_type_id())
             .map_or(0, |entry| entry.num_entries);
-        assert!(graph_entries < dataset.manifest.fragments.len() as u64);
+        assert!(lookup_entries < dataset.manifest.fragments.len() as u64);
         // A later request must rebuild only what is absent, while preserving
         // answers even if this budget cannot retain both fragment lookups.
         assert_eq!(
@@ -1530,12 +1528,12 @@ mod tests {
             .unwrap()
             .occupancy
             .unwrap();
-        let graph_entries = occupancy
+        let lookup_entries = occupancy
             .types
             .iter()
             .find(|entry| entry.type_name == PreparedRowIdFragmentKey::stable_type_id())
             .map_or(0, |entry| entry.num_entries);
-        assert!(graph_entries < dataset.manifest.fragments.len() as u64);
+        assert!(lookup_entries < dataset.manifest.fragments.len() as u64);
     }
 
     #[rstest]
@@ -1621,7 +1619,7 @@ mod tests {
             vec![Some(expected_31)]
         );
         let after_distinct = current.object_store.io_stats_snapshot();
-        assert!(after_distinct.read_bytes >= before.read_bytes);
+        assert_eq!(after_distinct.read_bytes, before.read_bytes);
         assert_eq!(
             resolve_row_ids(&current, &[31], true)
                 .await
@@ -1651,7 +1649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_distinct_requests_share_preparation_and_release_evicted_graphs() {
+    async fn concurrent_distinct_requests_share_preparation_and_release_evicted_lookups() {
         let dataset = cold_dataset(shuffled_dataset(true, true).await, 1 << 20, 1 << 20);
         let expected_7 = scan_address(&dataset, 1).await;
         let expected_31 = scan_address(&dataset, 33).await;
@@ -1702,7 +1700,7 @@ mod tests {
         drop(held);
         assert!(
             weak.upgrade().is_none(),
-            "the preparation registry must not retain an evicted graph"
+            "the preparation registry must not retain an evicted lookup"
         );
         assert!(dataset.index_cache.size_bytes().await <= 1 << 20);
     }
@@ -1718,13 +1716,13 @@ mod tests {
                 .unwrap(),
             vec![Some(expected)]
         );
-        let builds = &dataset.session.row_id_index_builds;
+        let registry = &dataset.session.row_id_fragment_registry;
         let fragment = &dataset.manifest.fragments[3];
         let key = PreparedRowIdFragmentKey {
             source: sequence_identity(&dataset, fragment).unwrap(),
             deletion: deletion_identity(&dataset, fragment, true).unwrap(),
         };
-        let cold = builds.for_fragment(&dataset.uri, &key).unwrap();
+        let cold = registry.for_fragment(&dataset.uri, &key).unwrap();
         let _cold_guard = cold.lock().await;
         let pending = resolve_row_ids(&dataset, &[31], true);
         tokio::pin!(pending);
@@ -1759,6 +1757,21 @@ mod tests {
         let held = prepare_shared(&dataset, fragment, &key, &[7])
             .await
             .unwrap();
+        // Expired unrelated builds trigger registry cleanup. The completed
+        // lookup still held by this reader must remain shareable without a cache.
+        for id in 0_u128..512 {
+            let unrelated = PreparedRowIdFragmentKey {
+                source: InternalCacheKey::from_bytes(id.to_le_bytes()),
+                deletion: None,
+            };
+            drop(
+                dataset
+                    .session
+                    .row_id_fragment_registry
+                    .for_fragment(&dataset.uri, &unrelated)
+                    .unwrap(),
+            );
+        }
         let before = dataset.object_store.io_stats_snapshot();
         let other = prepare_shared(&dataset, fragment, &key, &[7])
             .await
