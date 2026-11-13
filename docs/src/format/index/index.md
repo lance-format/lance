@@ -54,7 +54,7 @@ Each segment is an independent, self-contained index covering a subset of the da
 Each index segment covers a disjoint subset of fragments in the dataset. The segments must cover
 all rows in the fragments they cover, with one exception: if a fragment has delete markers at the time
 of index creation, the index segment is allowed to not contain the deleted rows. The fragments an index
-covers are those recorded in the `fragment_bitmap` field.
+covers are the committed fragment IDs recorded in the `fragment_bitmap` field.
 
 Index segments together **do not** need to cover all fragments. This means an index isn't required to
 be fully up-to-date. When this happens, engines can split their queries into indexed and unindexed
@@ -104,7 +104,10 @@ Index segments are created and updated through a transactional process:
      may appear in both lists when the index carries a value it is also keyed on. Empty for an index
      that carries no extra columns. Declaring a column here does not by itself make it servable --
      see [Serving carried columns](#serving-carried-columns).
-   - `fragment_bitmap`: The set of fragment IDs covered by this segment
+   - `fragment_bitmap`: The committed fragment IDs covered by this segment
+   - `local_fragment_aliases`: fragment IDs referenced by the segment's files, mapped
+     to committed fragment IDs. An empty map means no mapping
+     (see [Local fragment aliases](#local-fragment-aliases)).
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
@@ -229,7 +232,10 @@ The `IndexMetadata` message contains important information about the index segme
   authoritative for what the segment can serve -- see
   [Serving carried columns](#serving-carried-columns) and the legacy interpretation under
   [Covering-field contracts](#covering-field-contracts).
-- `fragment_bitmap`: the set of fragment IDs covered by this index segment.
+- `fragment_bitmap`: the committed fragment IDs covered by this index segment.
+- `local_fragment_aliases`: fragment IDs referenced by the segment's files, mapped
+  to committed fragment IDs. An empty map means no mapping
+  (see [Local fragment aliases](#local-fragment-aliases)).
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
 
@@ -245,6 +251,45 @@ There are both part of the `table.proto` file in the Lance source code.
 ```
 
 </details>
+
+### Local fragment aliases
+
+`IndexMetadata.local_fragment_aliases` (field 14) translates fragment IDs
+referenced by a segment's files so a commit retry can reuse prepared index
+files when fragment allocation changes. An empty map means no mapping. An
+entry `{17: 42}` maps fragment 17 to 42, and any unmapped fragment ID keeps
+its original ID. Each stored fragment ID is looked up once.
+
+The map applies to fragment IDs referenced by the segment's files.
+Apply it once, before any later transformation, including
+[Fragment Reuse Index (FRI)](system/frag_reuse.md) remap. A physical row
+address keeps its 32-bit row offset. Stable logical row IDs and user column
+values are unchanged. With entry `17 -> 42` and FRI translation
+`(42, 5) -> (60, 3)`, stored address `(17, 5)` resolves to `(60, 3)`.
+Retargeting the map directly to fragment 60 would lose the row offset change.
+
+`fragment_bitmap` stores committed source fragment IDs before FRI remapping,
+while `local_fragment_aliases` translates fragment IDs referenced by the index
+files. A commit or rebase updates the bitmap and aliases together without
+rewriting the index files. For example, local fragment 17 committing as
+dataset fragment 42 records `local_fragment_aliases: {17: 42}` and
+`fragment_bitmap: {42}`. If conflict resolution rebases that fragment to 43,
+the manifest updates to `local_fragment_aliases: {17: 43}` and
+`fragment_bitmap: {43}`.
+
+Operations that retain index files must retain their aliases. Index rewrites
+and merges must resolve aliases before writing replacement files.
+
+Keys and values must be less than `2^32 - 1`. `u32::MAX` (`2^32 - 1`) is
+reserved for `RowAddress::TOMBSTONE_FRAG`. Two stored fragment IDs in the same
+segment must not resolve to the same final fragment ID. `{17: 42}` is invalid
+when the segment also stores 42 and leaves 42 unmapped.
+
+A nonempty map requires `FLAG_LOCAL_FRAGMENT_ALIASES` (`2^20`) in both reader
+and writer [feature flags](../table/versioning.md#feature-flags). Both bits
+are set while any retained segment has a nonempty map, including when
+`fragment_bitmap` is empty, and cleared when none do. The flag is reserved.
+Readers and writers reject it until alias support lands.
 
 ### Index Segment Metadata
 

@@ -371,6 +371,11 @@ message IndexMetadata {
 
   /* A bitmap of the included fragment ids.
    *
+   * Stores committed dataset fragment IDs (before FRI remapping), not local
+   * fragment IDs stored inside index files. When `local_fragment_aliases` is
+   * used, a commit or rebase updates this bitmap and the aliases together
+   * without rewriting the index files.
+   *
    * This may by used to determine how much of the dataset is covered by the
    * index. This information can be retrieved from the dataset by looking at
    * the dataset at `dataset_version`. However, since the old version may be
@@ -459,6 +464,25 @@ message IndexMetadata {
    * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
+
+  /* Sparse map from fragment IDs stored in this segment's files to committed
+   * fragment IDs. An empty map means no mapping. Unmapped IDs keep their
+   * value. Each stored ID is translated once.
+   *
+   * Applies to fragment references in the segment, including physical row
+   * addresses, BTree, ZoneMap, and BloomFilter. A row address keeps its row
+   * offset. Stable logical row IDs and user column values are not translated.
+   *
+   * Keys and values must be less than 2^32 - 1. u32::MAX (2^32 - 1) is
+   * reserved for RowAddress::TOMBSTONE_FRAG. Two referenced IDs must not
+   * resolve to the same final fragment ID.
+   *
+   * Requires flag 1 << 20 (FLAG_LOCAL_FRAGMENT_ALIASES) in both reader and
+   * writer feature flags while nonempty. Both bits are cleared when no
+   * retained segment has a nonempty map. Reserved until readers and index
+   * maintenance support aliases.
+   */
+  map<uint32, uint32> local_fragment_aliases = 14;
 }
 
 // Metadata about a single file within an index segment.

@@ -547,6 +547,13 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             })
             .transpose()?;
 
+        // An empty map means the segment uses its stored fragment IDs.
+        if !proto.local_fragment_aliases.is_empty() {
+            return Err(Error::not_supported(
+                "index segment has local fragment aliases, which this build does not support yet",
+            ));
+        }
+
         let metadata = Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
@@ -630,6 +637,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            local_fragment_aliases: Default::default(),
         }
     }
 }
@@ -711,6 +719,7 @@ pub async fn list_index_files_with_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use rstest::rstest;
     use std::collections::HashMap;
 
@@ -785,6 +794,32 @@ mod tests {
         let err = IndexMetadata::try_from(proto).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "got: {err:?}");
         assert!(err.to_string().contains("created_at"), "got: {err}");
+    }
+
+    #[test]
+    fn test_index_metadata_empty_local_fragment_aliases_round_trip() {
+        let metadata = index_metadata_with(vec![0], vec![]);
+        let proto = pb::IndexMetadata::from(&metadata);
+        assert!(proto.local_fragment_aliases.is_empty());
+
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.local_fragment_aliases.is_empty());
+        assert_eq!(IndexMetadata::try_from(decoded).unwrap(), metadata);
+    }
+
+    #[test]
+    fn test_index_metadata_rejects_local_fragment_aliases() {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.local_fragment_aliases.insert(17, 42);
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.local_fragment_aliases.get(&17), Some(&42));
+
+        let err = IndexMetadata::try_from(decoded).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
+        assert!(
+            err.to_string().contains("local fragment aliases"),
+            "got: {err}"
+        );
     }
 
     #[test]
