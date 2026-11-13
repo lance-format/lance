@@ -4940,6 +4940,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.9.5",
+ "roaring",
  "rstest",
  "serde",
  "test-log",

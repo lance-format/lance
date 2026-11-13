@@ -5,6 +5,7 @@ pub mod concat;
 pub mod datatypes;
 pub mod format;
 pub(crate) mod io;
+pub mod prewarm;
 pub mod reader;
 pub mod testing;
 pub mod version;
