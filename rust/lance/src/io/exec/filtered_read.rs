@@ -5627,6 +5627,25 @@ mod tests {
         assert_eq!(batch_sizes, vec![35, 35, 30, 35, 15, 35, 35, 30]);
     }
 
+    /// Each execution of a single-partition plan reads every row, however much
+    /// of an earlier execution was read.
+    #[tokio::test]
+    async fn test_reexecuting_reads_every_row() {
+        let fixture = TestFixture::new().await;
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset).with_batch_size(35);
+        let plan = fixture.make_plan(options).await;
+
+        let mut partial = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        partial.try_next().await.unwrap().unwrap();
+        drop(partial);
+        for _ in 0..2 {
+            let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            assert_eq!(rows, 250);
+        }
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_recheck() {
         let fixture = TestFixture::new().await;
