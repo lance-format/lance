@@ -447,7 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    if mode != "query" && mode != "stats" {
+    if mode != "query" && mode != "stats" && mode != "merge" {
         return Err("unknown mode".into());
     }
     let start = Instant::now();
@@ -459,6 +459,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "index_cache_bytes":index_cache.size_bytes().await,
         "metadata_cache_bytes":metadata_cache.size_bytes().await,"index_heap_estimate_bytes":index.deep_size_of(),"process":process_snapshot()}),
     );
+    if mode == "merge" {
+        let destination = PathBuf::from(args.get(4).ok_or("merge destination directory")?);
+        fs::create_dir(&destination)?;
+        let destination_store = LanceIndexStore::with_format_version(
+            object_store.clone(),
+            Path::from_filesystem_path(fs::canonicalize(&destination)?)?,
+            metadata_cache.clone(),
+            container,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::LargeUtf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let started = Instant::now();
+        let result = InvertedIndex::merge_segments(
+            &[index],
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty())),
+            &destination_store,
+            &[None],
+            Arc::new(lance_index::progress::NoopIndexBuildProgress),
+        )
+        .await?;
+        let io = object_store.io_stats_incremental();
+        emit(
+            json!({"phase":"merge", "elapsed_s":started.elapsed().as_secs_f64(),
+            "files":result.files.len(), "read_bytes":io.read_bytes, "write_bytes":io.written_bytes,
+            "process":process_snapshot()}),
+        );
+        return Ok(());
+    }
     if mode == "stats" {
         let path = args.get(4).ok_or("stats query JSON file")?;
         let queries: Vec<(String, bool, bool)> = serde_json::from_slice(&fs::read(path)?)?;
