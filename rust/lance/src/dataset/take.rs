@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::BTreeMap,
-    collections::HashMap,
-    ops::Range,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index_with;
 use crate::io::exec::AddRowOffsetExec;
-use crate::io::exec::column_width::MeasuredWidths;
-use crate::io::exec::utils::estimated_bytes_per_row;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
@@ -320,42 +309,43 @@ async fn do_take_rows(
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-        let one_batch = if batches.len() > 1 {
-            concat_batches(&batches[0].schema(), &batches)?
+        // Deletions can remove requested rows. Map the addresses actually read
+        // to their fragment batches, then gather directly in the requested order.
+        // This avoids copying all payloads into a concatenated intermediate batch.
+        let mut addr_to_pos = HashMap::with_capacity(sorted_row_addrs.len());
+        for (batch_index, batch) in batches.iter().enumerate() {
+            let returned_row_addrs = batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::internal("_rowaddr column not found"))?
+                .as_primitive::<UInt64Type>()
+                .values();
+            addr_to_pos.extend(
+                returned_row_addrs
+                    .iter()
+                    .enumerate()
+                    .map(|(row_index, addr)| (*addr, (batch_index, row_index))),
+            );
+        }
+        let remapping_indices = row_addrs
+            .iter()
+            .filter_map(|addr| addr_to_pos.get(addr).copied());
+        if batches.len() > 1 {
+            let remapping_indices: Vec<_> = remapping_indices.collect();
+            let batches: Vec<_> = batches.iter().collect();
+            Ok(arrow_select::interleave::interleave_record_batch(
+                &batches,
+                &remapping_indices,
+            )?)
         } else {
-            batches.pop().unwrap()
-        };
-        // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted. Because of this, we
-        // get the results with row ids so that we can re-order the results
-        // to match the requested order.
-
-        let returned_row_addr = one_batch
-            .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
-            .as_primitive::<UInt64Type>()
-            .values();
-
-        let addr_to_pos: HashMap<u64, u64> = returned_row_addr
-            .iter()
-            .enumerate()
-            .map(|(i, addr)| (*addr, i as u64))
-            .collect();
-        let remapping_index: UInt64Array = row_addrs
-            .iter()
-            .filter_map(|o| addr_to_pos.get(o).copied())
-            .collect();
-
-        // remapping_index may be greater than the number of rows in one_batch
-        // if there are duplicates in the requested row ids. This is expected.
-        debug_assert!(remapping_index.len() >= one_batch.num_rows());
-
-        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
-        // so we need to handle it manually here.
-        // TODO: remove this once the bug is fixed.
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
-        Ok(reordered.into())
+            let one_batch = batches.pop().unwrap();
+            let remapping_indices: UInt64Array = remapping_indices
+                .map(|(_, row_index)| row_index as u64)
+                .collect();
+            // Arrow take does not handle empty structs, including nested ones.
+            let struct_arr: StructArray = one_batch.into();
+            let reordered = take_struct_array(&struct_arr, &remapping_indices)?;
+            Ok(reordered.into())
+        }
     }?;
 
     if builder.with_row_address || projection.must_add_row_offset {
@@ -559,9 +549,9 @@ impl TakeBuilder {
     ///
     /// `batch_size` is the maximum number of requested rows per read (1 through
     /// [`u32::MAX`]). `batch_size_bytes` is a positive target for decoded Arrow
-    /// bytes per output batch. Schema estimates and observed batch widths reduce
-    /// the number of rows requested before reading; oversized output batches are
-    /// split. A single indivisible row may exceed the byte target.
+    /// bytes per output batch. Reads request up to `batch_size` rows, then split
+    /// oversized output batches. A single indivisible row may exceed the byte
+    /// target.
     ///
     /// `batch_readahead` must be positive and limits concurrent batch reads,
     /// including completed batches waiting for earlier reads. Reads start only
@@ -571,10 +561,11 @@ impl TakeBuilder {
     /// as [`Self::execute`]. A read error terminates the stream after any earlier
     /// batches have been returned. Empty selections produce no batches.
     ///
-    /// The byte target is not a process memory limit: variable-width rows may
-    /// exceed estimates, and decoders, projections, caches, and concurrently
-    /// decoded batches require additional memory. The input ID vector is retained
-    /// for the stream's lifetime; result payloads are never collected in full.
+    /// The byte target does not limit the memory used by a read: all requested
+    /// rows are decoded before splitting. Use `batch_size` to limit each read.
+    /// Decoders, projections, caches, and concurrent reads require additional
+    /// memory. The input ID vector is retained for the stream's lifetime; result
+    /// payloads are never collected in full.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -618,17 +609,6 @@ impl TakeBuilder {
             ])?;
         }
         let schema = to_logical_json_batch(RecordBatch::new_empty(Arc::new(schema)))?.schema();
-        let physical_schema = (&self.projection.physical_projection.to_bare_schema()).into();
-        let widths = MeasuredWidths::default();
-        let input_width = estimated_bytes_per_row(&physical_schema, self.dataset.schema(), &widths);
-        let output_width = estimated_bytes_per_row(&schema, self.dataset.schema(), &widths);
-        // Unknown widths start with one row; observations can then inform later
-        // requests without first materializing the complete selection.
-        let width = input_width
-            .zip(output_width)
-            .map(|(input, output)| input.max(output).ceil() as usize)
-            .unwrap_or(0);
-        let observed_width = Arc::new(AtomicUsize::new(width));
         let use_row_ids = self.row_addrs.is_none();
         let mut selection = self
             .row_addrs
@@ -638,13 +618,8 @@ impl TakeBuilder {
             .into_iter();
         // Do not clone the complete selection into every in-flight read.
         self.row_ids = None;
-        let request_width = observed_width.clone();
         let requests = std::iter::from_fn(move || {
-            let width = request_width.load(Ordering::Relaxed);
-            let rows = (batch_size_bytes / if width == 0 { batch_size_bytes } else { width })
-                .max(1)
-                .min(batch_size);
-            let selection = selection.by_ref().take(rows).collect::<Vec<_>>();
+            let selection = selection.by_ref().take(batch_size).collect::<Vec<_>>();
             (!selection.is_empty()).then_some(selection)
         });
         let stream_schema = schema.clone();
@@ -656,19 +631,12 @@ impl TakeBuilder {
                 } else {
                     builder.row_addrs = Some(selection);
                 }
-                let observed_width = observed_width.clone();
                 let schema = stream_schema.clone();
                 async move {
                     // Take paths can narrow nullability, for example when they
                     // synthesize _rowaddr instead of reading it from a fragment.
                     // Every batch in a stream must use its declared schema.
                     let batch = take_rows(builder).await?.with_schema(schema)?;
-                    if batch.num_rows() > 0 {
-                        observed_width.fetch_max(
-                            batch.get_array_memory_size().div_ceil(batch.num_rows()),
-                            Ordering::Relaxed,
-                        );
-                    }
                     super::blob::split_batch_by_bytes(batch, batch_size_bytes)
                 }
             })
