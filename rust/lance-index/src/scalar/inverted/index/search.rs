@@ -1109,11 +1109,15 @@ impl InvertedIndex {
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let shared_norm_addends = shared_norm_addends.clone();
                 async move {
-                    let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
-                        let tokens = tokens.clone();
-                        let params = params.clone();
-                        let mask = mask.clone();
-                        let metrics = metrics.clone();
+                    let load_tokens = tokens.clone();
+                    let load_params = params.clone();
+                    let load_mask = mask.clone();
+                    let load_metrics = metrics.clone();
+                    let loads = chunk.into_iter().map(move |(partition_ordinal, part)| {
+                        let tokens = load_tokens.clone();
+                        let params = load_params.clone();
+                        let mask = load_mask.clone();
+                        let metrics = load_metrics.clone();
                         let partition_term_ids =
                             term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
