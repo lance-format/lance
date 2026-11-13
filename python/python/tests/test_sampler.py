@@ -59,7 +59,18 @@ def preserve_random_state():
 @pytest.mark.parametrize("randomize", [False, True])
 @pytest.mark.parametrize(
     "total_rows,world_size,batch_size",
-    [(1000, 4, 250), (23, 4, 3), (24, 4, 3), (5, 4, 2), (2, 4, 10), (0, 4, 0)],
+    [
+        (1000, 4, 250),
+        (23, 4, 3),
+        (24, 4, 3),
+        (5, 4, 2),
+        (10, 3, 2),
+        (2, 4, 10),
+        (0, 4, 0),
+        (0, 4, 2),
+        (5, 1, 2),
+        (4, 2, 1),
+    ],
 )
 def test_consecutive_index_blocks(
     total_rows, world_size, batch_size, randomize, preserve_random_state
@@ -75,6 +86,7 @@ def test_consecutive_index_blocks(
             randomize=randomize,
         )
         batches = list(sampler)
+        assert len(sampler) == len(batches) == sum(1 for _ in sampler)
         start = rank * per_rank
         end = min(start + per_rank, total_rows)
         expected = (
@@ -97,6 +109,28 @@ def test_consecutive_index_blocks(
         assert seen.isdisjoint(rows)
         seen.update(rows)
     assert seen == set(range(total_rows))
+
+
+@pytest.mark.parametrize(
+    "rank,world_size,batch_size,total_rows,error",
+    [
+        (0, 0, 2, 5, "world_size"),
+        (0, -1, 2, 5, "world_size"),
+        (-1, 4, 2, 5, "rank"),
+        (4, 4, 2, 5, "rank"),
+        (0, 4, 2, -1, "total_num_rows"),
+        (0, 4, 0, 5, "batch_size"),
+        (0, 4, -1, 5, "batch_size"),
+        (0, 4, -1, 0, "batch_size"),
+    ],
+)
+def test_fixed_batch_sampler_invalid_configuration(
+    rank, world_size, batch_size, total_rows, error
+):
+    with pytest.raises(ValueError, match=error):
+        ShardedFixedBatchSampler(
+            rank, world_size, batch_size=batch_size, total_num_rows=total_rows
+        )
 
 
 @pytest.mark.parametrize("randomize", [False, True])
@@ -268,6 +302,7 @@ def test_randomization_effect(seed, epoch, preserve_random_state):
             seed=seed,
         )
         sampler.set_epoch(epoch)
+        assert len(sampler) == sum(1 for _ in sampler)
         # Reproduce the former eager layout and shuffle to pin seeded batch order.
         start, end = rank * 26, min((rank + 1) * 26, 101)
         expected = [list(range(i, min(i + 7, end))) for i in range(start, end, 7)]
