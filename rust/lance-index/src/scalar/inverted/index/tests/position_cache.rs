@@ -7,8 +7,11 @@ use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey};
 use std::future::Future;
 use std::pin::Pin;
 
+#[rstest::rstest]
 #[tokio::test]
-async fn test_positions_reuse_held_stream_after_cache_eviction() {
+async fn test_positions_reuse_held_stream_after_cache_eviction(
+    #[values(false, true)] rebind: bool,
+) {
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::memory().into(),
         object_store::path::Path::from("positions-reuse"),
@@ -41,7 +44,7 @@ async fn test_positions_reuse_held_stream_after_cache_eviction() {
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
         QuickCacheBackend::with_capacity(1 << 20),
     )));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
     let reader = &index.partitions[0].inverted_list;
@@ -57,6 +60,8 @@ async fn test_positions_reuse_held_stream_after_cache_eviction() {
             .await
             .is_none()
     );
+    let rebound = rebind.then(|| reader.with_store(store, posting_file_path(0)).unwrap());
+    let reader = rebound.as_ref().unwrap_or(reader);
     let second = reader
         .read_positions(0, &NoOpMetricsCollector)
         .await
@@ -75,6 +80,45 @@ async fn test_positions_reuse_held_stream_after_cache_eviction() {
         second.bytes().as_ptr(),
         "another query still owns this immutable stream; eviction must not duplicate its payload"
     );
+}
+
+#[test]
+fn test_positions_active_reuse_releases_payload_and_checks_token_identity() {
+    struct Owner(Arc<Vec<u8>>);
+    impl AsRef<[u8]> for Owner {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+    let payload = Arc::new(vec![7_u8; 1024]);
+    let weak_payload = Arc::downgrade(&payload);
+    let stream = SharedPositionStream::new(
+        PositionStreamCodec::PackedDelta,
+        vec![0],
+        bytes::Bytes::from_owner(Owner(payload)),
+    );
+    let streams = ActivePositionStreams::default();
+    streams.remember(3, &stream);
+    let held = streams.get(3).unwrap();
+    assert_eq!(held.bytes().as_ptr(), stream.bytes().as_ptr());
+    // The fixed table must not return a colliding token's bytes, or grow as
+    // new tokens replace old entries. A separate immutable file has no entry.
+    assert!(streams.get(3 + 256).is_none());
+    let other = SharedPositionStream::new(
+        PositionStreamCodec::PackedDelta,
+        vec![0],
+        bytes::Bytes::from_static(&[9]),
+    );
+    streams.remember(3 + 256, &other);
+    assert!(streams.get(3).is_none());
+    assert_eq!(streams.get(3 + 256).unwrap().bytes(), &[9]);
+    assert!(ActivePositionStreams::default().get(3).is_none());
+    streams.remember(3, &held);
+    drop(stream);
+    assert!(weak_payload.upgrade().is_some());
+    drop(held);
+    assert!(weak_payload.upgrade().is_none());
+    assert!(streams.get(3).is_none());
 }
 
 #[derive(Debug)]

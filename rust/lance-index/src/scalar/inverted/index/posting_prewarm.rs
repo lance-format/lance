@@ -968,6 +968,11 @@ impl PostingListReader {
         metrics: &dyn MetricsCollector,
     ) -> Result<CompressedPositionStorage> {
         let result = self.index_cache.get_or_insert_with_key_hit(PositionKey { token_id }, || async move {
+            if self.modern_num_docs.is_some()
+                && let Some(stream) = self.active_positions.as_ref().and_then(|streams| streams.get(token_id))
+            {
+                return Ok(Positions(CompressedPositionStorage::SharedStream(stream)));
+            }
             let positions = match self.positions_layout {
                 PositionsLayout::None => {
                     return Err(Error::invalid_input(
@@ -1023,6 +1028,12 @@ impl PostingListReader {
             _ => metrics.record_index_cache_miss(),
         }
         let (positions, _) = result?;
+        if self.modern_num_docs.is_some()
+            && let CompressedPositionStorage::SharedStream(stream) = &positions.0
+            && let Some(streams) = &self.active_positions
+        {
+            streams.remember(token_id, stream);
+        }
         Ok(positions.0.clone())
     }
 
