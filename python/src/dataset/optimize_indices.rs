@@ -252,8 +252,7 @@ impl PyIndexSegmentResult {
 /// Index optimization as plan, execute, merge and commit, the stages
 /// :py:meth:`lance.dataset.DatasetOptimizer.optimize_indices` runs in one
 /// process: :py:meth:`plan`, execute every task of the plan, then every merge
-/// over the task results, and :py:meth:`commit` the merge results with the
-/// options the plan was made with.
+/// over the task results, and :py:meth:`commit` the merge results.
 #[pyclass(name = "OptimizeIndices", module = "lance.optimize")]
 pub struct PyOptimizeIndices;
 
@@ -282,17 +281,22 @@ impl PyOptimizeIndices {
 
     /// Commit the merge ``results`` in one transaction, ``None`` entries
     /// ignored; whatever they do not cover stays unindexed for the next
-    /// optimize. ``dataset`` is updated to the new version. ``options`` are
-    /// the keyword options the plan was made with: they decide how the
-    /// results are checked, as a consolidation (``max_rows_to_consolidate``)
-    /// is checked against the segments the dataset has now.
+    /// optimize. ``dataset`` is updated to the new version.
+    ///
+    /// ``options`` are the keyword options of
+    /// :py:meth:`lance.dataset.DatasetOptimizer.optimize_indices` the plan was
+    /// made with, for the ones that decide how the results are checked: a
+    /// consolidation (``max_rows_to_consolidate``) is checked against the
+    /// segments the dataset has now, so pass those options here as well.
+    /// Omitted, the commit uses the defaults, as it always has.
     #[staticmethod]
+    #[pyo3(signature = (dataset, results, options = None))]
     fn commit(
         dataset: Bound<PyAny>,
         results: Vec<Option<PyIndexSegmentResult>>,
-        options: &Bound<'_, PyDict>,
+        options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let options = optimize_options(Some(options))?;
+        let options = optimize_options(options)?;
         let dataset_ref = unwrap_dataset(dataset)?;
         // Taken before the commit, so a handle another thread is using is
         // refused with nothing committed, not after the commit went through.

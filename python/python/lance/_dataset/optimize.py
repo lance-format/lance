@@ -302,7 +302,10 @@ class DatasetOptimizer:
             re-encoding tasks, each of which must fit its fragments.
 
         See :py:class:`lance.optimize.OptimizeIndices` to run the same
-        optimization as a plan whose tasks execute on several workers.
+        optimization as a plan whose tasks execute on several workers. Options
+        that decide commit-time checks, such as `max_rows_to_consolidate`, also
+        belong to :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses
+        the defaults when they are omitted.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

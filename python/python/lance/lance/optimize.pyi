@@ -182,5 +182,5 @@ class OptimizeIndices:
     def commit(
         dataset: "LanceDataset",
         results: List[Optional[IndexSegmentResult]],
-        options: Dict[str, Any],
+        options: Optional[Dict[str, Any]] = None,
     ) -> None: ...

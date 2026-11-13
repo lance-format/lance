@@ -1351,8 +1351,9 @@ def test_optimize_indices_distributed(tmp_path: Path):
         ).get(timeout=300)
     assert {result.group for result in merged} == {merge.group for merge in plan.merges}
 
-    # The commit takes the options of the plan.
-    OptimizeIndices.commit(dataset, merged, {"max_rows_per_task": 128})
+    # The two-argument form is the original one: the commit takes the
+    # defaults, which is all a non-consolidating merge needs.
+    OptimizeIndices.commit(dataset, merged)
     assert dataset.version == version + 2
     # The vector tasks appended a segment; the BTree merge absorbed the old one.
     assert dataset.stats.index_stats("vector_idx")["num_indices"] == 2
