@@ -26,7 +26,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ///
     /// Gated backends finish all sign planes before checking which partitions
     /// still have a resident sign plane and warming their ex planes. Other
-    /// backends warm both planes of every partition, sign first, including
+    /// backends warm both planes of every partition concurrently, including
     /// entries that can only be retained by a persistent tier.
     pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
         let row_bytes = self
@@ -62,8 +62,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 parallelism,
                 PREWARM_VALUE_BYTES,
                 |part_id| async move {
-                    load(part_id, 0).await?;
-                    load(part_id, 1).await
+                    // Keep both loaders under the same partition reservation.
+                    // Shared admission does not depend on sign residency, so
+                    // neither source read needs to wait for the other plane.
+                    futures::try_join!(load(part_id, 0), load(part_id, 1))?;
+                    Ok(())
                 },
             )
             .await;
