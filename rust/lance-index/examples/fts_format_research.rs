@@ -451,7 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unknown mode".into());
     }
     let start = Instant::now();
-    let index = Arc::new(InvertedIndex::load(store, None, &index_cache).await?);
+    let index = InvertedIndex::load(store, None, &index_cache).await?;
     let io = object_store.io_stats_incremental();
     emit(
         json!({"phase":"open", "elapsed_s":start.elapsed().as_secs_f64(),

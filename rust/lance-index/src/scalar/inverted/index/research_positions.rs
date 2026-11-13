@@ -216,6 +216,27 @@ mod tests {
         assert_eq!(clone.block(1), &data[100..4090]);
         assert_eq!(clone.block(2), &data[4090..4200]);
         assert_eq!(clone.block(3), &data[4200..]);
+        // Representative Sophon boundary: the actual Lance Positions codec
+        // serializes the entire stream and offers no row-selective decoding.
+        use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+        let entry = Positions(CompressedPositionStorage::SharedStream(clone));
+        let mut body = Vec::new();
+        entry
+            .serialize(&mut CacheEntryWriter::new(&mut body))
+            .unwrap();
+        assert!(body.len() >= data.len());
+        assert!(!CacheCodec::from_impl::<Positions>().supports_row_selection());
+        let body = bytes::Bytes::from(body);
+        let restored = Positions::deserialize(&mut CacheEntryReader::new(
+            &body,
+            0,
+            Positions::CURRENT_VERSION,
+        ))
+        .unwrap();
+        let CompressedPositionStorage::SharedStream(restored) = restored.0 else {
+            panic!("shared stream expected")
+        };
+        assert_eq!(restored.bytes(), data);
         fs::write(
             path.with_extension("json"),
             b"{\"length\":9000,\"offsets\":[0,9001]}",
