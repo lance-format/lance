@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.compaction.CompactionOptions;
 import org.lance.file.FileWriteOptions;
+import org.lance.fragment.DeletionFile;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -266,6 +267,46 @@ public class DatasetTest {
         () -> {
           dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
         });
+  }
+
+  @Test
+  void testOpenMissingDatasetThrowsDatasetNotFound(@TempDir Path tempDir) {
+    String missingPath = tempDir.resolve("missing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DatasetNotFoundException error =
+          assertThrows(DatasetNotFoundException.class, () -> Dataset.open(missingPath, allocator));
+      assertTrue(error.getMessage().contains("missing_dataset"), error.getMessage());
+      // Handlers written for the IllegalArgumentException thrown before still catch it.
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testCreateExistingDatasetThrowsDatasetAlreadyExists(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("existing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      DatasetAlreadyExistsException error =
+          assertThrows(DatasetAlreadyExistsException.class, testDataset::createEmptyDataset);
+      assertTrue(error.getMessage().contains("existing_dataset"), error.getMessage());
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testOpenUnknownSchemeIsNotDatasetNotFound() {
+    // Invalid input is still reported as a plain IllegalArgumentException, so callers can tell it
+    // apart from a missing dataset.
+    try (BufferAllocator allocator = new RootAllocator()) {
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> Dataset.open("nosuchscheme://bucket/table.lance", allocator));
+      assertEquals(IllegalArgumentException.class, error.getClass(), error.getMessage());
+      assertTrue(error.getMessage().contains("nosuchscheme"), error.getMessage());
+    }
   }
 
   @Test
@@ -550,6 +591,14 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         dataset2.tags().delete("tag_on_branch");
         assertEquals(1, dataset2.tags().list().size());
+
+        dataset2.tags().update("tag1", 2);
+        assertEquals(2, dataset2.tags().getVersion("tag1"));
+        Dataset.Tags tags = dataset2.tags();
+        dataset2.close();
+        IllegalArgumentException closed =
+            assertThrows(IllegalArgumentException.class, () -> tags.update("tag1", 1));
+        assertTrue(closed.getMessage().contains("Dataset is closed"));
       }
     }
   }
@@ -1636,7 +1685,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testGetRowAddresses(@TempDir Path tempDir) {
+  void testGetRowAddresses(@TempDir Path tempDir) throws IOException {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
@@ -1671,6 +1720,39 @@ public class DatasetTest {
         // Without stable row ids a row id is its address, so ids pass through unchanged.
         List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
         assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String datasetPath = tempDir.resolve("deletion-io").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset
+          .createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())
+          .close();
+      testDataset.write(1, 5).close();
+
+      Path deletionFile;
+      try (Dataset ds = testDataset.write(2, 5)) {
+        ds.delete("id = 2");
+        Fragment fragment = ds.getFragments().get(0);
+        DeletionFile deletion = fragment.metadata().getDeletionFile();
+        assertNotNull(deletion);
+        String relativePath = deletion.getRelativePath(fragment.getId());
+        assertNotNull(relativePath);
+        deletionFile = Path.of(datasetPath).resolve(relativePath);
+      }
+
+      assertTrue(Files.deleteIfExists(deletionFile), "deletion file should exist");
+
+      try (Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        // A cold empty lookup must return before loading row-id metadata or deletion files.
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+        IOException error =
+            assertThrows(
+                IOException.class, () -> ds.getRowAddresses(Collections.singletonList(0L)));
+        assertTrue(error.getMessage().contains("_deletions"), error.getMessage());
       }
     }
   }

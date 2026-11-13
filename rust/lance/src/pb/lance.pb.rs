@@ -62,8 +62,10 @@ pub struct VectorQueryProto {
     pub dist_q_c: ::core::option::Option<f32>,
     #[prost(int32, optional, tag = "13")]
     pub query_parallelism: ::core::option::Option<i32>,
-    /// Query-time approximation mode. Currently only affects RQ-quantized vector
-    /// indexes, such as IVF_RQ. Other index types ignore this setting.
+    /// Query-time approximation mode. Currently affects RQ-quantized vector
+    /// indexes (such as IVF_RQ) and HNSW sub-index searches that exclude rows
+    /// (for example through a prefilter or deletions), where Fast enables the
+    /// ACORN traversal. Other index types ignore this setting.
     #[prost(enumeration = "VectorApproxMode", tag = "14")]
     pub approx_mode: i32,
     /// Which covering columns the index must materialize for this query. Absent means
@@ -174,14 +176,18 @@ impl ::prost::Name for AnnIvfPartitionExecProto {
 }
 /// Query-time approximation mode for vector search.
 ///
-/// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-/// Other index types ignore this setting.
+/// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where Fast enables the ACORN traversal. Other index types
+/// ignore this setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum VectorApproxMode {
     /// Use all RQ bits for query-time scoring with u8-quantized lookup tables.
     Normal = 0,
     /// Use only one RQ bit for query-time scoring, even for multi-bit indexes.
+    /// On HNSW sub-indexes, also enable the ACORN traversal for searches that
+    /// exclude rows.
     Fast = 1,
     /// Use all RQ bits for query-time scoring with u16-quantized lookup tables
     /// to reduce estimator quantization error.

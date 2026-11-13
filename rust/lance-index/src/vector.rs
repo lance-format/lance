@@ -92,8 +92,9 @@ pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 /// Controls the speed / accuracy tradeoff for approximate vector search.
 ///
 /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
-/// prefiltered search on HNSW sub-indexes, where `Fast` enables the ACORN
-/// traversal. Other index types ignore this setting.
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where `Fast` enables the ACORN traversal. Other index types
+/// ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
     /// Prefer lower query latency, which can reduce recall.
@@ -242,8 +243,10 @@ pub struct Query {
 
     /// Controls the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-    /// Other index types ignore this setting.
+    /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+    /// HNSW sub-index searches that exclude rows (for example through a
+    /// prefilter or deletions), where `Fast` enables the ACORN traversal. Other
+    /// index types ignore this setting.
     pub approx_mode: ApproxMode,
 
     /// How an `IVF_HNSW_RQ` graph search scores visited nodes. Other index
@@ -605,6 +608,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
+    }
+
+    /// A partition's stored rows, read without caching the partition.
+    async fn partition_storage_batches(&self, _partition_id: usize) -> Result<Vec<RecordBatch>> {
+        Err(Error::not_supported(
+            "partition_storage_batches is only supported by IVF indices",
+        ))
     }
 
     /// Whether bounded native code-to-code scoring is available (current format).

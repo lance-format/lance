@@ -399,13 +399,14 @@ def dataset(tmp_path):
 def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
+    # Train on all rows to avoid the tiny partitions caused by undersampling.
     yield dataset.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
         max_iters=2,
-        sample_rate=2,
+        sample_rate=tbl.num_rows // 4,
     )
 
 
@@ -934,7 +935,21 @@ def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset)
 
 
 def test_ann(indexed_dataset):
-    run(indexed_dataset)
+    # run() searches a single partition, so query the largest one. Every row
+    # lands in one partition, so its size is at least num_rows / num_partitions
+    # regardless of how k-means balances the data.
+    index_name = indexed_dataset.describe_indices()[0].name
+    reader = VectorIndexReader(indexed_dataset, index_name)
+    partition_sizes = [
+        reader.read_partition(part).num_rows for part in range(reader.num_partitions())
+    ]
+    largest_partition = max(
+        range(len(partition_sizes)), key=partition_sizes.__getitem__
+    )
+    assert partition_sizes[largest_partition] >= 15
+    centroids = indexed_dataset.centroids(index_name=index_name)
+    query = np.asarray(centroids[largest_partition].as_py(), dtype=np.float32)
+    run(indexed_dataset, q=query)
 
 
 def test_create_index_progress_callback_vector(tmp_path):
@@ -2909,35 +2924,45 @@ def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
     scanner.explain_plan(True)
 
 
-def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_fragment_ann_with_scoped_scalar_prefilter(tmp_path, hybrid):
     tbl = create_table()
-    dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_file=250)
-    dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    dataset = lance.write_dataset(
+        tbl.slice(0, 500) if hybrid else tbl, tmp_path, max_rows_per_file=250
     )
     dataset.create_scalar_index("id", index_type="BTREE")
+    if hybrid:
+        dataset = lance.write_dataset(
+            tbl.slice(500), tmp_path, mode="append", max_rows_per_file=250
+        )
+    dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
 
     assert len(dataset.get_fragments()) == 4
 
-    q = np.random.randn(128)
+    q = np.random.default_rng(42).standard_normal(128)
+    selected = [dataset.get_fragment(1), dataset.get_fragment(2)]
     results = dataset.scanner(
         prefilter=True,
         filter="id > 50",
         columns=["id"],
-        nearest={"column": "vector", "q": q, "use_index": True},
-        fragments=[dataset.get_fragment(1)],
+        nearest={"column": "vector", "q": q, "k": 500, "nprobes": 4},
+        fragments=selected,
     ).to_table()
 
     results_no_scalar_index = dataset.scanner(
         prefilter=True,
         filter="id > 50",
         columns=["id"],
-        nearest={"column": "vector", "q": q, "use_index": True},
-        fragments=[dataset.get_fragment(1)],
+        nearest={"column": "vector", "q": q, "k": 500, "use_index": False},
+        fragments=selected,
         use_scalar_index=False,
     ).to_table()
 
-    assert results == results_no_scalar_index
+    actual_ids = set(results["id"].to_pylist())
+    expected_ids = set(results_no_scalar_index["id"].to_pylist())
+    assert actual_ids == expected_ids == set(range(250, 750))
+    assert len(results) == len(actual_ids)
+    assert len(actual_ids & expected_ids) / len(expected_ids) == 1.0
 
 
 def test_describe_indices(dataset):
@@ -3261,6 +3286,7 @@ def test_drop_indices(indexed_dataset):
 def test_read_partition(indexed_dataset):
     idx_name = indexed_dataset.describe_indices()[0].name
     reader = VectorIndexReader(indexed_dataset, idx_name)
+    assert reader.num_partitions() == 4
 
     num_rows = indexed_dataset.count_rows()
     row_sum = 0
@@ -3410,7 +3436,7 @@ def test_vector_search_effort(
         )
     if effort == 1:
         assert actual == ds.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
-    # Batch queries use the same effort on every per-query search.
+    # Batch queries use the same effort for every query.
     batch_stats = []
     batch = ds.scanner(
         columns=["id"],
@@ -3423,7 +3449,11 @@ def test_vector_search_effort(
         scan_stats_callback=batch_stats.append,
     ).to_table()
     assert batch["id"].to_pylist() == actual["id"].to_pylist() * 2
-    assert batch_stats[0].all_counts["partitions_searched"] == probes * 2
+    # IVF_FLAT shares one scan across the batch, so the two identical queries
+    # load each partition once. Adaptive IVF_RQ searches each query separately.
+    shared_scan = index_type == "IVF_FLAT"
+    batch_probes = probes if shared_scan else probes * 2
+    assert batch_stats[0].all_counts["partitions_searched"] == batch_probes
     if metric == "l2" and index_type == "IVF_FLAT":
         captured.clear()
         ds.create_scalar_index("text", "INVERTED")

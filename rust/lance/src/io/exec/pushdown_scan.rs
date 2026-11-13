@@ -356,12 +356,14 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
-                    .map(|res| match res {
-                        Ok(Ok(batch)) => Ok(batch),
-                        Ok(Err(err)) => Err(err),
-                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                    })
+                lance_core::utils::tokio::spawn(async move {
+                    scanner_ref.read_batch(batch_id, predicate).await
+                })
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                })
             });
 
         let stream = if ordered_output {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -363,9 +363,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionCount(
 }
 
 fn inner_get_version_count(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.count_versions()
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.count_versions()
 }
 
 fn inner_list_versions<'local>(
@@ -373,9 +372,8 @@ fn inner_list_versions<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let versions = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_versions()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_versions()?
     };
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
@@ -425,9 +423,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetLatestVersionId(
 }
 
 fn inner_latest_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.latest_version()
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.latest_version()
 }
 
 #[unsafe(no_mangle)]
@@ -472,9 +469,8 @@ fn inner_get_latest_storage_options<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let storage_options = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.latest_storage_options()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.latest_storage_options()?
     };
     match storage_options {
         Some(opts) => opts.into_java(env),
@@ -501,9 +497,8 @@ fn inner_count_rows(
     filter_jobj: JObject,
 ) -> Result<usize> {
     let filter = env.get_string_opt(&filter_jobj)?;
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.count_rows(filter)
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.count_rows(filter)
 }
 
 #[unsafe(no_mangle)]
@@ -519,9 +514,8 @@ fn inner_get_data_statistics<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let stats = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.calculate_data_stats()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.calculate_data_stats()?
     };
     let data_stats = env.new_object("org/lance/ipc/DataStatistics", "()V", &[])?;
 
@@ -617,11 +611,8 @@ fn inner_get_row_addresses<'local>(
         .into_iter()
         .map(|id| id as u64)
         .collect();
-    let addrs = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(row_ids_to_row_addrs(&dataset_guard.inner, &row_ids))?
-    };
+    let dataset = clone_dataset(env, &java_dataset)?;
+    let addrs = block_on(row_ids_to_row_addrs(&dataset.inner, &row_ids))?;
     let addrs: Vec<i64> = addrs
         .into_iter()
         .map(|addr| addr.map_or(-1, |addr| addr as i64))
@@ -721,9 +712,7 @@ fn inner_take(
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
 
     let result = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
+        let dataset = clone_dataset(env, &java_dataset)?.inner;
 
         let projection = ProjectionRequest::from_columns(columns, dataset.schema());
 
@@ -773,9 +762,7 @@ fn inner_take_rows(
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
 
     let result = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
+        let dataset = clone_dataset(env, &java_dataset)?.inner;
 
         let projection = ProjectionRequest::from_columns(columns, dataset.schema());
 
@@ -828,9 +815,7 @@ fn inner_sample(
         fragment_ids.map(|ids| ids.iter().map(|&id| id as u32).collect());
 
     let result = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
+        let dataset = clone_dataset(env, &java_dataset)?.inner;
 
         let projection = dataset
             .schema()
@@ -869,9 +854,8 @@ fn inner_get_table_metadata<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let table_metadata = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.get_table_metadata()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.get_table_metadata()?
     };
 
     let java_hashmap = env

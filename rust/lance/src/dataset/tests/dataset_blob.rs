@@ -14,6 +14,7 @@ use crate::{
     },
     dataset::{
         CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
+        builder::DatasetBuilder,
         transaction::{DataReplacementGroup, Operation, Transaction},
     },
 };
@@ -45,7 +46,7 @@ use lance_core::{
 };
 use lance_datagen::{BatchCount, RowCount, array};
 use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
-use lance_io::stream::RecordBatchStream;
+use lance_io::{object_store::ObjectStoreParams, stream::RecordBatchStream};
 use lance_table::feature_flags::{FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY};
 use lance_table::format::BasePath;
 use rstest::rstest;
@@ -1485,6 +1486,118 @@ async fn test_v2_0_legacy_blob_descriptor_projection_and_reads() {
 }
 
 #[rstest]
+#[case::v20("v8.0.0/blobs/v2.0.lance", 1)]
+#[case::v21("v8.0.0/blobs/v2.1.lance", 1)]
+#[case::multiple_fragments("v12.0.0/blobs/legacy_fragment.lance", 2)]
+#[tokio::test]
+async fn test_released_legacy_blob_reads_from_shallow_clone(
+    #[case] fixture: &str,
+    #[case] num_fragments: usize,
+) {
+    let source_dir = crate::utils::test::copy_test_data_to_tmp(fixture).unwrap();
+    let source_uri = source_dir.path_str();
+    let clone_dir = TempStrDir::default();
+    let mut source = Dataset::open(&source_uri).await.unwrap();
+    let source_base = source.uri().to_string();
+    source
+        .shallow_clone(&clone_dir, source.version_id(), None)
+        .await
+        .unwrap();
+    drop(source);
+    assert!(
+        !std::path::Path::new(clone_dir.as_str())
+            .join("data")
+            .exists()
+    );
+
+    let payloads = [
+        Some(b"legacy bytes".as_slice()),
+        None,
+        Some(b"".as_slice()),
+        Some(b"fragment bytes".as_slice()),
+        None,
+        Some(b"".as_slice()),
+    ];
+    let expected = &payloads[..3 * num_fragments];
+    // Select across fragments in reverse order, including a duplicate payload.
+    let indices = (0..expected.len() as u64)
+        .rev()
+        .chain([0])
+        .collect::<Vec<_>>();
+    for uri in [source_uri.as_str(), clone_dir.as_str()] {
+        // Distinct base settings let us check which store performs payload I/O.
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(uri)
+                .with_base_store_params(
+                    &source_base,
+                    ObjectStoreParams {
+                        block_size: Some(512),
+                        ..Default::default()
+                    },
+                )
+                .load()
+                .await
+                .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), num_fragments);
+        assert!(!dataset.schema().field("blob").unwrap().is_blob_v2());
+        let scalars = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            scalars["id"].as_primitive::<UInt32Type>().values(),
+            &(0..expected.len() as u32).collect::<Vec<_>>()
+        );
+
+        let files = dataset
+            .take_blobs_by_indices(&indices, "blob")
+            .await
+            .unwrap();
+        let base_id = dataset.get_fragments()[0].metadata().files[0].base_id;
+        let store = dataset.object_store(base_id).await.unwrap();
+        if base_id.is_some() {
+            assert_eq!(store.block_size(), 512);
+        }
+        let _ = store.io_stats_incremental();
+        assert_eq!(files.len(), indices.len());
+        for (file, &index) in files.iter().zip(&indices) {
+            match (file, expected[index as usize]) {
+                (Some(file), Some(payload)) => {
+                    assert_eq!(file.read().await.unwrap().as_ref(), payload);
+                }
+                (None, None) => {}
+                _ => panic!("blob nullability changed at row {index}"),
+            }
+        }
+        assert!(store.io_stats_incremental().read_iops > 0);
+
+        let blobs = dataset
+            .read_blobs("blob")
+            .unwrap()
+            .with_row_indices(indices.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), indices.len());
+        for (blob, &index) in blobs.iter().zip(&indices) {
+            assert_eq!(blob.data.as_deref(), expected[index as usize]);
+        }
+        let ranges = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices(vec![BlobRangeRequest::new(0, 1, 3)])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(ranges[0].data.as_deref(), Some(&b"ega"[..]));
+    }
+}
+
+#[rstest]
 #[case::v20("v2.0.lance")]
 #[case::v21("v2.1.lance")]
 #[tokio::test]
@@ -1539,6 +1652,12 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
     let legacy_field = schema.field_with_name("blob").unwrap();
     let old_values = [Some(b"legacy bytes".as_slice()), None, Some(b"".as_slice())];
     let old_snapshot = dataset.version_id();
+    let default_file_version = dataset.manifest.data_storage_format.clone();
+    let legacy_descriptors = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        legacy_descriptors["blob"].as_struct().fields(),
+        &*lance_core::datatypes::BLOB_DESC_FIELDS
+    );
     let field_id = dataset.schema().field("blob").unwrap().id;
     let old_fragment = dataset.manifest.fragments[0].clone();
     let old_path = std::path::Path::new(dir.as_str())
@@ -1628,6 +1747,28 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
         .chain([legacy_again])
         .collect::<Vec<_>>();
 
+    // Compaction must not silently upgrade the table's default file version.
+    let mixed_snapshot = dataset.version_id();
+    let error = crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions {
+            target_rows_per_fragment: 100,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("Blob v2 requires file version >= 2.2")
+    );
+    dataset = Dataset::open(&dir).await.unwrap();
+    assert_eq!(dataset.version_id(), mixed_snapshot);
+    assert_eq!(dataset.manifest.fragments.len(), 3);
+
     for compact in [false, true] {
         if compact {
             crate::dataset::optimize::compact_files(
@@ -1644,6 +1785,7 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
             assert_eq!(dataset.manifest.fragments.len(), 1);
             dataset = Dataset::open(&dir).await.unwrap();
         }
+        assert_eq!(dataset.manifest.data_storage_format, default_file_version);
         let dataset = Arc::new(dataset.clone());
         let descriptors = dataset.scan().try_into_batch().await.unwrap();
         assert_eq!(
@@ -1696,6 +1838,10 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
     }
     let historical = Arc::new(dataset.checkout_version(old_snapshot).await.unwrap());
     assert!(!historical.schema().field("blob").unwrap().is_blob_v2());
+    assert_eq!(
+        historical.scan().try_into_batch().await.unwrap(),
+        legacy_descriptors
+    );
     let handles = historical
         .take_blobs_by_indices(&[0, 1, 2], "blob")
         .await
