@@ -21,11 +21,12 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, NGram, Inverted) is split: tasks build one uncommitted segment each
-//! over a group of fragments, encoded against the model of a reference
+//! Bitmap, NGram, Inverted, LabelList) is split: tasks build one uncommitted
+//! segment each over a group of fragments, encoded against the model of a reference
 //! segment; merges combine the task results that carry their `group` with the
 //! committed segments they list into one segment. A task that is the only
-//! input of its merge folds those old segments in itself, in one pass. For a
+//! input of its merge folds those old segments in itself, in one pass, except
+//! LabelList, whose old segments remain in the merge stage. For a
 //! vector index `num_indices_to_merge` unset means append only: the
 //! single-process optimize appends a delta too, unless the partitions need
 //! rebalancing, which a split build does not do (set `retrain` for that). The
@@ -92,6 +93,9 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::label_list::{
+    LABEL_LIST_ROW_ADDR_DOMAIN_VERSION, LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+};
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -111,8 +115,8 @@ use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
-    segment_has_inverted_details, segment_has_merge_primitive, segment_has_vector_details,
-    unsupported_index_version, validate_segment_metadata,
+    segment_has_inverted_details, segment_has_label_list_details, segment_has_merge_primitive,
+    segment_has_vector_details, unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -332,6 +336,7 @@ pub struct OptimizeIndexTask {
     /// The committed segments this task may fold into its output. For an
     /// unsplit index these are all of its segments; for a split one, the
     /// segments its merge absorbs when this task is the merge's only input.
+    /// LabelList keeps its old segments in the merge stage instead.
     #[serde(with = "index_metadata_hex::vec")]
     pub old_segments: Vec<IndexMetadata>,
     /// How many of `old_segments` to fold in, as
@@ -682,6 +687,18 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
+        // Split tasks write the dataset's current LabelList domain. Keep an
+        // incompatible group unsplit so the existing append path can rebuild
+        // it, rather than independently migrating the old data in each task.
+        let label_list_version = if dataset.manifest.uses_stable_row_ids() {
+            LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
+        } else {
+            LABEL_LIST_ROW_ID_DOMAIN_VERSION
+        } as i32;
+        let label_list_compatible = !segment_has_label_list_details(last)
+            || segments
+                .iter()
+                .all(|segment| segment.index_version == label_list_version);
         // Without an N:1 merge the single-process optimize rebuilds the
         // absorbed segments from scratch, and the only split that reproduces
         // it is none. Inverted stays unsplit under stable row ids until its
@@ -689,6 +706,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         let split = bounded
             && !consolidate::is_consolidation(options)
             && segment_has_merge_primitive(last)
+            && label_list_compatible
             && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids());
         // Split scalar planning needs the tokenizer on the driver before it
         // can dispatch tasks. Tagged histories are refused before that open.
@@ -1218,12 +1236,15 @@ async fn pack_split_index(
         }
         let (plan_id, read_version) = (plan.plan_id, plan.read_version);
         let group = plan.merges.len() as u32;
-        // A single task folds the old segments in itself, in one pass.
-        let (absorbed_by_task, absorbed_by_merge) = if builds.len() == 1 {
-            (absorbed, Vec::new())
-        } else {
-            (Vec::new(), absorbed)
-        };
+        // LabelList has a pure segment merger, but its append path would
+        // rescan several old segments. Keep those in the merge stage even
+        // when only one task builds new fragments.
+        let (absorbed_by_task, absorbed_by_merge) =
+            if builds.len() == 1 && !segment_has_label_list_details(&reference) {
+                (absorbed, Vec::new())
+            } else {
+                (Vec::new(), absorbed)
+            };
         for fragments in builds {
             plan.tasks.push(OptimizeIndexTask {
                 plan_id,
