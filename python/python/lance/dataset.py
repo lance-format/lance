@@ -411,7 +411,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         branch: str
             Name of the branch to create. ``"main"`` is reserved for the
-            default branch and cannot be used as a new branch name.
+            default branch and cannot be used as a new branch name. A literal
+            ``"."`` path segment is rejected. New names are limited to a
+            portable budget of 211 bytes measured after the name is storage
+            path encoded twice; longer names that already exist remain
+            available for lookup, checkout, metadata updates, and deletion.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
@@ -631,6 +635,8 @@ class LanceDataset(pa.dataset.Dataset):
             used for batch nearest-neighbor search. When ``use_index`` is true and a
             vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
+            For multivector columns, ``"warp_imputation_rank"`` tunes WARP search;
+            see :meth:`ScannerBuilder.nearest`.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
@@ -955,6 +961,46 @@ class LanceDataset(pa.dataset.Dataset):
         whether the current version has any fragments.
         """
         return self._ds.has_stable_row_ids
+
+    def get_row_addresses(
+        self, row_ids: Union[List[int], pa.Array, pa.ChunkedArray]
+    ) -> pa.UInt64Array:
+        """
+        Resolve row IDs to their current row addresses, in input order.
+
+        A row address is ``(fragment_id << 32) | offset``. With stable row IDs,
+        null, unknown and deleted IDs come back as null. Without stable row IDs,
+        row IDs are row addresses, so each non-null ID is returned unchanged.
+
+        Parameters
+        ----------
+        row_ids : list of int, pyarrow.Array or pyarrow.ChunkedArray
+            Row IDs from ``_rowid``. Integer arrays are cast to uint64, so
+            negative values raise an error.
+
+        Returns
+        -------
+        pyarrow.UInt64Array
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> ds = lance.write_dataset(
+        ...     table, "memory://get_row_addresses", enable_stable_row_ids=True
+        ... )
+        >>> _ = ds.delete("x = 2")
+        >>> ds.get_row_addresses([0, 1, 2, 100]).to_pylist()
+        [0, None, 2, None]
+        """
+        if isinstance(row_ids, pa.ChunkedArray):
+            row_ids = row_ids.combine_chunks()
+        if isinstance(row_ids, pa.Array):
+            row_ids = row_ids.cast(pa.uint64())
+        else:
+            row_ids = pa.array(row_ids, type=pa.uint64())
+        return pa.array(self._ds.row_ids_to_row_addrs(row_ids))
 
     @property
     def max_field_id(self) -> int:
@@ -3436,6 +3482,8 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+            This option is not supported with the ``ngram`` tokenizer when creating
+            a new index.
         block_size: int, default 128
             This is for the ``INVERTED`` index. Number of documents per compressed
             posting block. Must be one of ``128`` or ``256``.
@@ -4921,25 +4969,162 @@ class LanceDataset(pa.dataset.Dataset):
             explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
-            endpoints). If not specified, the storage options of the source dataset
-            will be used.
+            endpoints). This replaces the store the target metadata is written
+            through; it does not replace the bindings used to read files that stay
+            in the source dataset. If not specified, the storage options of the
+            source dataset will be used.
+        **kwargs
+            Additional :class:`LanceDataset` constructor arguments for the returned
+            handle. ``read_params`` is applied to the returned native handle
+            directly. Arguments that configure native handle state, such as
+            ``block_size``, ``session``, cache sizes, ``commit_lock``, or
+            ``base_store_params``, reconfigure the returned handle while preserving
+            the clone's inherited source bindings and session.
 
         Returns
         -------
         LanceDataset
             A new LanceDataset representing the shallow-cloned dataset.
+
+        Notes
+        -----
+        Only metadata is copied, so the returned handle keeps the source dataset's
+        store bindings and session to read the shared data files. Reopening it later
+        in another process therefore requires the source store options, passed as
+        :func:`lance.dataset`'s ``base_store_params``.
         """
         if isinstance(target_path, Path):
             target_uri = os.fspath(target_path)
         else:
             target_uri = target_path
 
+        default_scan_options = kwargs.pop("default_scan_options", None)
+        read_params = kwargs.pop("read_params", None)
+
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, reference, storage_options)
+        # The native handle keeps the source store bindings for the files that stay
+        # behind. Reopening the target here would only have the target's options and
+        # could not read a single row of a cross-store clone.
+        new_ds = self._ds.shallow_clone(target_uri, reference, storage_options)
 
-        # Open and return a fresh dataset at the target URI to avoid manual overrides
-        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+        # Mirror the native bindings for Python-side reconstruction (e.g. pickling)
+        # and for the constructor-only arguments below: the clone's own base is this
+        # dataset, and bases inherited through earlier shallow clones keep the
+        # bindings this dataset was opened with. Binding the source explicitly, even
+        # with no options, prevents a rebuild from falling back to target options.
+        base_store_params = dict(self._base_store_params or {})
+        base_store_params[self.uri] = self._storage_options or {}
+
+        if not kwargs:
+            if read_params is not None:
+                new_ds = new_ds._with_read_params(read_params)
+
+            ds = LanceDataset.__new__(LanceDataset)
+            ds._ds = new_ds
+            ds._uri = new_ds.uri
+            ds._storage_options = storage_options
+            ds._base_store_params = base_store_params
+            ds._namespace_client = None
+            ds._table_id = None
+            ds._namespace_client_managed_versioning = False
+            ds._default_scan_options = default_scan_options
+            ds._read_params = read_params
+            return ds
+
+        # Constructor-only arguments reconfigure the native clone handle in place,
+        # so its inherited stores, session, and providers stay exactly as the native
+        # clone bound them. Only the caller's explicit options change.
+        version = kwargs.pop("version", None)
+        serialized_manifest = kwargs.pop("serialized_manifest", None)
+        explicit_base_store_params = kwargs.pop("base_store_params", None)
+        if explicit_base_store_params:
+            base_store_params.update(explicit_base_store_params)
+
+        cache_size_options = {
+            "index_cache_size",
+            "index_cache_size_bytes",
+            "metadata_cache_size",
+            "metadata_cache_size_bytes",
+        }
+
+        if serialized_manifest is not None:
+            # An explicit manifest replaces the target's, so reopen through the
+            # public constructor; inherited bindings and session keep shared files
+            # readable.
+            if "session" not in kwargs and cache_size_options.isdisjoint(kwargs):
+                kwargs["session"] = new_ds.session()
+            return LanceDataset(
+                target_uri,
+                version,
+                storage_options=storage_options,
+                serialized_manifest=serialized_manifest,
+                base_store_params=base_store_params,
+                default_scan_options=default_scan_options,
+                read_params=read_params,
+                **kwargs,
+            )
+
+        if "index_cache_size" in kwargs:
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated. "
+                "Use 'index_cache_size_bytes' instead. "
+                "The old parameter will be converted to bytes using 20 MiB per entry.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if "index_cache_size_bytes" not in kwargs:
+                kwargs["index_cache_size_bytes"] = (
+                    kwargs["index_cache_size"] * 20 * 1024 * 1024
+                )
+            kwargs.pop("index_cache_size")
+        if "metadata_cache_size" in kwargs:
+            if "metadata_cache_size_bytes" not in kwargs:
+                kwargs["metadata_cache_size_bytes"] = (
+                    kwargs["metadata_cache_size"] * 10 * 1024 * 1024
+                )
+            kwargs.pop("metadata_cache_size")
+
+        namespace_client = kwargs.pop("namespace_client", None)
+        table_id = kwargs.pop("table_id", None)
+        namespace_client_managed_versioning = kwargs.pop(
+            "namespace_client_managed_versioning", False
+        )
+
+        new_ds = new_ds._reconfigure(
+            block_size=kwargs.pop("block_size", None),
+            index_cache_size_bytes=kwargs.pop("index_cache_size_bytes", None),
+            metadata_cache_size_bytes=kwargs.pop("metadata_cache_size_bytes", None),
+            commit_lock=kwargs.pop("commit_lock", None),
+            session=kwargs.pop("session", None),
+            namespace_client=namespace_client,
+            table_id=table_id,
+            namespace_client_managed_versioning=namespace_client_managed_versioning,
+            # The native clone already carries inherited bindings. Only explicit
+            # caller entries are reapplied, so those exact bindings stay untouched.
+            base_store_params=explicit_base_store_params,
+            storage_options=storage_options,
+        )
+        if kwargs:
+            raise TypeError(
+                f"shallow_clone() got unexpected keyword arguments {sorted(kwargs)}"
+            )
+        if read_params is not None:
+            new_ds = new_ds._with_read_params(read_params)
+        if version is not None:
+            new_ds = new_ds.checkout_version(version)
+
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._storage_options = storage_options
+        ds._base_store_params = base_store_params
+        ds._namespace_client = namespace_client
+        ds._table_id = table_id
+        ds._namespace_client_managed_versioning = namespace_client_managed_versioning
+        ds._default_scan_options = default_scan_options
+        ds._read_params = read_params
+        return ds
 
     def deep_clone(
         self,

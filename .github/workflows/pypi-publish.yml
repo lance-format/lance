@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   linux:
-    timeout-minutes: 60
+    timeout-minutes: 120
     name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.config.platform }} manylinux${{ matrix.config.manylinux }}
     strategy:
       matrix:
@@ -188,7 +188,7 @@ jobs:
           fury_token: ${{ secrets.FURY_TOKEN }}
           repo: ${{ steps.handle_tag.outputs.repo }}
   windows:
-    timeout-minutes: 60
+    timeout-minutes: 120
     runs-on: ${{ matrix.config.runner }}
     strategy:
       matrix:

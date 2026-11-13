@@ -94,7 +94,7 @@ impl BlobSource {
         if should_spawn {
             let source = self.clone();
             let scheduler = scheduler.clone();
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let result = AssertUnwindSafe(source.clone().drain_pending_reads(scheduler))
                     .catch_unwind()
                     .await;
@@ -128,7 +128,7 @@ impl BlobSource {
                 std::mem::take(&mut pending_reads.requests)
             };
             let scheduler = scheduler.clone();
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 fulfill_pending_blob_reads(&scheduler, batch).await;
             });
         }
@@ -227,11 +227,11 @@ async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<Pendin
 
 /// Cache key for sharing one [`BlobSource`] across multiple blob descriptors.
 ///
-/// We include the store prefix as well as the path so the same path string in
-/// different object stores is never conflated.
+/// Store allocation identity keeps wrappers and credentials isolated even when
+/// two stores have the same prefix and physical path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BlobSourceKey {
-    pub(super) store_prefix: String,
+    pub(super) store_id: usize,
     pub(super) path: String,
 }
 
@@ -239,7 +239,7 @@ impl BlobSourceKey {
     /// Build the cache key for one shared [`BlobSource`].
     pub(super) fn new(source: &BlobSource) -> Self {
         Self {
-            store_prefix: source.object_store.store_prefix.clone(),
+            store_id: Arc::as_ptr(&source.object_store) as usize,
             path: source.path.to_string(),
         }
     }
@@ -255,7 +255,7 @@ pub(super) fn shared_blob_source(
     path: &Path,
 ) -> Arc<BlobSource> {
     let key = BlobSourceKey {
-        store_prefix: object_store.store_prefix.clone(),
+        store_id: Arc::as_ptr(&object_store) as usize,
         path: path.to_string(),
     };
     source_cache
