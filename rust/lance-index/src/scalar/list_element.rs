@@ -51,7 +51,9 @@
 //! # Maintenance
 //!
 //! Update, remap and fragment coverage delegate to the B-tree. New rows are
-//! exploded and encoded the same way as at training.
+//! exploded and encoded the same way as at training. So does the fragment
+//! reuse index: the B-tree translates the row addresses it returns, whether
+//! the history is handed to it as a legacy remapper or a batch one.
 
 use std::{collections::HashSet, ops::Bound, sync::Arc};
 
@@ -77,7 +79,7 @@ use lance_core::{
 };
 use lance_datafusion::udf::{ANY_ELEMENT, any_element_predicate, plan_element_predicate};
 use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
-use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{BatchRowIdRemapper, RowAddrTranslator};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -90,7 +92,7 @@ use crate::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, SargableQuery,
         ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult, UpdateCriteria,
-        btree::BTreeIndexPlugin,
+        btree::{BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndexPlugin},
         expression::{IndexedExpression, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -111,6 +113,10 @@ const MAX_NULL_SEEKS: usize = 8192;
 /// The plugin's display name. The registry derives the name users pass to
 /// [`ScalarIndexParams`], `listelement`, from the details message instead.
 const INDEX_TYPE_NAME: &str = "ListElement";
+
+/// The namespace, within the index's cache, of the B-tree that holds its
+/// entries.
+const TARGET_CACHE_PREFIX: &str = "element_target";
 
 /// Training parameters, as JSON: `{"keys": ["label", "confidence"]}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -900,6 +906,22 @@ impl DeepSizeOf for ListElementIndex {
 }
 
 impl ListElementIndex {
+    /// Wrap a loaded target B-tree. Its zone size is read back so that
+    /// [`ScalarIndex::derive_index_params`] reproduces the training parameters.
+    fn over_target(target: Arc<dyn ScalarIndex>, codec: KeyCodec) -> Self {
+        let zone_size = target
+            .derive_index_params()
+            .ok()
+            .and_then(|p| p.params)
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+            .and_then(|p| p.get("zone_size").and_then(|z| z.as_u64()));
+        Self {
+            target,
+            codec,
+            zone_size,
+        }
+    }
+
     /// The names this index reads its keys by, in key order: the names the
     /// key fields had when the index was opened.
     pub fn key_names(&self) -> Vec<String> {
@@ -1231,6 +1253,62 @@ fn target_details(details: &ListElementIndexDetails) -> Result<&prost_types::Any
     Ok(target)
 }
 
+/// How the target B-tree translates row addresses when it is loaded.
+enum TargetRemapper {
+    /// v0 fragment reuse index, applied synchronously; None = no translation.
+    Legacy(Option<Arc<dyn RowIdRemapper>>),
+    /// v1 (tagged) translation, awaited as each page is read; None = no translation.
+    Batch(Option<Arc<dyn BatchRowIdRemapper>>),
+}
+
+/// Loads the target B-tree named by `index_details` and wraps it. Every load
+/// path goes through here, so each applies the same checks.
+async fn load_over_target(
+    index_store: Arc<dyn IndexStore>,
+    index_details: &prost_types::Any,
+    remapper: TargetRemapper,
+    cache: &LanceCache,
+) -> Result<Arc<dyn ScalarIndex>> {
+    let details = decode_details(index_details)?;
+    let codec = KeyCodec::from_details(&details)?;
+    // Entries are row addresses, which the target translates as addresses. A
+    // target in the row-ID domain would be translated wrongly.
+    if details.target_index_version < BTREE_ROW_ADDR_DOMAIN_VERSION {
+        return Err(corrupt_details(format!(
+            "list-element index target B-tree version {} stores row IDs, but version {} or \
+             later (row addresses) is required",
+            details.target_index_version, BTREE_ROW_ADDR_DOMAIN_VERSION
+        )));
+    }
+    let target_details = target_details(&details)?;
+    let cache = cache.with_key_prefix(TARGET_CACHE_PREFIX);
+    let target = match remapper {
+        TargetRemapper::Legacy(remapper) => {
+            BTreeIndexPlugin
+                .load_index(
+                    index_store,
+                    target_details,
+                    details.target_index_version,
+                    remapper,
+                    &cache,
+                )
+                .await?
+        }
+        TargetRemapper::Batch(remapper) => {
+            BTreeIndexPlugin
+                .load_index_with_remapping(
+                    index_store,
+                    target_details,
+                    details.target_index_version,
+                    remapper,
+                    &cache,
+                )
+                .await?
+        }
+    };
+    Ok(Arc::new(ListElementIndex::over_target(target, codec)))
+}
+
 #[async_trait]
 impl ScalarIndexPlugin for ListElementIndexPlugin {
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
@@ -1277,28 +1355,40 @@ impl ScalarIndexPlugin for ListElementIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let details = decode_details(index_details)?;
-        let codec = KeyCodec::from_details(&details)?;
-        let target = BTreeIndexPlugin
-            .load_index(
-                index_store,
-                target_details(&details)?,
-                details.target_index_version,
-                frag_reuse_index,
-                &cache.with_key_prefix("element_target"),
-            )
-            .await?;
-        let zone_size = target
-            .derive_index_params()
-            .ok()
-            .and_then(|p| p.params)
-            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
-            .and_then(|p| p.get("zone_size").and_then(|z| z.as_u64()));
-        Ok(Arc::new(ListElementIndex {
-            target,
-            codec,
-            zone_size,
-        }))
+        load_over_target(
+            index_store,
+            index_details,
+            TargetRemapper::Legacy(frag_reuse_index),
+            cache,
+        )
+        .await
+    }
+
+    /// The entries are row addresses in the target B-tree, which translates
+    /// them in batches.
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        BTreeIndexPlugin.supports_batch_row_id_remapping()
+    }
+
+    /// Loads the target through the B-tree's own batch path. The snapshot and
+    /// rebind hooks keep their defaults, as the B-tree's do: the live index is
+    /// cached in a namespace the caller scopes to the segment's translation,
+    /// and a cache miss loads it again.
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        load_over_target(
+            index_store,
+            index_details,
+            TargetRemapper::Batch(remapping),
+            cache,
+        )
+        .await
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -1353,6 +1443,7 @@ mod tests {
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::noop_progress;
     use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::CompactedToFragmentOne;
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow_array::{Float32Array, ListArray, StringArray};
     use futures::stream;
@@ -1455,6 +1546,24 @@ mod tests {
     }
 
     async fn trained_on(rows: Vec<Option<Vec<Option<Det>>>>) -> (Arc<dyn ScalarIndex>, TempObjDir) {
+        let (store, created, tmp) = train(rows).await;
+        let index = ListElementIndexPlugin
+            .load_index(
+                store,
+                &created.index_details,
+                created.index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        (index, tmp)
+    }
+
+    /// Row i has row address i.
+    async fn train(
+        rows: Vec<Option<Vec<Option<Det>>>>,
+    ) -> (Arc<dyn IndexStore>, CreatedIndex, TempObjDir) {
         let tmp = TempObjDir::default();
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -1488,17 +1597,7 @@ mod tests {
             .train_index(data, store.as_ref(), request, None, noop_progress())
             .await
             .unwrap();
-        let index = plugin
-            .load_index(
-                store,
-                &created.index_details,
-                created.index_version,
-                None,
-                &LanceCache::no_cache(),
-            )
-            .await
-            .unwrap();
-        (index, tmp)
+        (store, created, tmp)
     }
 
     fn parse(filter: &str) -> Option<ListElementQuery> {
@@ -1831,5 +1930,107 @@ mod tests {
         assert!(exact);
         assert!(t.is_empty(), "{t:?}");
         assert_eq!(n, vec![0, 1, 2]);
+    }
+
+    /// Loaded under a batch translation, the index answers with translated
+    /// addresses, NULL rows included, and reads its keys by the names in the
+    /// details it is given, which Lance binds to the current schema.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_load_with_batch_remapping() {
+        let plugin = ListElementIndexPlugin;
+        assert!(plugin.supports_batch_row_id_remapping());
+        let (store, created, _tmp) = train(rows()).await;
+        let query = parse(&q("label = 'car' AND confidence > 0.9")).unwrap();
+
+        let untranslated = plugin
+            .load_index_with_remapping(
+                store.clone(),
+                &created.index_details,
+                created.index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search(untranslated.as_ref(), &query, true).await,
+            (vec![1, 4, 10], vec![3, 5, 6, 9, 12], true)
+        );
+
+        let renamed = ListElementIndexDetails {
+            key_field_ids: vec![2, 3],
+            keys: vec!["class".to_string(), "score".to_string()],
+            ..decode_details(&created.index_details).unwrap()
+        };
+        let translated = plugin
+            .load_index_with_remapping(
+                store,
+                &prost_types::Any::from_msg(&renamed).unwrap(),
+                created.index_version,
+                Some(Arc::new(CompactedToFragmentOne {
+                    deleted: HashSet::from([4]),
+                })),
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search(translated.as_ref(), &query, true).await,
+            (
+                [1, 10].map(CompactedToFragmentOne::moved).to_vec(),
+                [3, 5, 6, 9, 12].map(CompactedToFragmentOne::moved).to_vec(),
+                true
+            )
+        );
+        let translated = translated
+            .as_any()
+            .downcast_ref::<ListElementIndex>()
+            .unwrap();
+        assert_eq!(translated.key_names(), ["class", "score"]);
+        assert_eq!(
+            translated.derive_index_params().unwrap().params.as_deref(),
+            Some(r#"{"keys":["class","score"],"zone_size":4}"#)
+        );
+    }
+
+    /// A target B-tree that stores row IDs would be translated as addresses,
+    /// so both load paths refuse it.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_load_rejects_row_id_domain_target() {
+        let plugin = ListElementIndexPlugin;
+        let (store, created, _tmp) = train(rows()).await;
+        let old_target = ListElementIndexDetails {
+            target_index_version: 0,
+            ..decode_details(&created.index_details).unwrap()
+        };
+        let old_target = prost_types::Any::from_msg(&old_target).unwrap();
+
+        let legacy = plugin
+            .load_index(
+                store.clone(),
+                &old_target,
+                created.index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await;
+        let batch = plugin
+            .load_index_with_remapping(
+                store,
+                &old_target,
+                created.index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await;
+        for result in [legacy, batch] {
+            let Err(err) = result else {
+                panic!("a version-0 target must be rejected");
+            };
+            assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+            assert!(err.to_string().contains("row addresses"), "{err}");
+        }
     }
 }
