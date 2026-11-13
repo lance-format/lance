@@ -608,8 +608,13 @@ impl RTreeIndex {
     ///
     /// With `new_data = None`, only the stored entries are merged.
     /// Source filters and remapping apply only to stored entries. New data must contain
-    /// geometry and row addresses, as for [`ScalarIndex::update`]. If the sources store
-    /// row IDs, the new row addresses must equal their row IDs.
+    /// geometry and row addresses, as for [`ScalarIndex::update`], in the sources' row
+    /// identifier domain: if the sources store row IDs, the new row addresses must equal
+    /// their row IDs.
+    ///
+    /// Sources may be laid out with different `page_size`s. Page size controls only the
+    /// output layout, so the merged segment is repacked with the first source's
+    /// `page_size`, which must be at least 2.
     ///
     /// Every source must store the same kind of row identifier (see
     /// [`ScalarIndex::results_are_row_addresses`]); the merged index keeps it.
