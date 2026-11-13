@@ -2003,7 +2003,7 @@ mod tests {
 
     #[rstest]
     #[case::ascii("quick")]
-    #[case::unicode("équick")]
+    #[case::unicode("éabcdefghijklmnopqrstuvwxyz")]
     fn excessive_fuzziness_is_an_input_error(#[case] token: &str) {
         let params = FtsSearchParams::new().with_fuzziness(Some(10));
         let Err(error) = FuzzyAutomaton::new(token, &DocType::Text, &params) else {
