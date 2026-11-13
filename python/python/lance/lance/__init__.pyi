@@ -462,6 +462,22 @@ class _Dataset:
         index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
+    def _with_read_params(
+        self, read_params: Optional[Dict[str, Any]] = None
+    ) -> _Dataset: ...
+    def _reconfigure(
+        self,
+        block_size: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
+        session: Optional[_Session] = None,
+        namespace_client: Optional[Any] = None,
+        table_id: Optional[List[str]] = None,
+        namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> _Dataset: ...
     @property
     def schema(self) -> pa.Schema: ...
     @property

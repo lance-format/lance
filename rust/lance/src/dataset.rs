@@ -475,6 +475,30 @@ impl Default for ReadParams {
     }
 }
 
+/// Runtime-only configuration applied to an already-open [`Dataset`] handle.
+///
+/// Every field is optional so a caller can change one part of the handle without
+/// rebuilding the manifest, object stores, or inherited base bindings.
+#[derive(Default)]
+pub struct DatasetRuntimeConfig {
+    /// New index cache capacity. Ignored when `session` is also set.
+    pub index_cache_size_bytes: Option<usize>,
+    /// New metadata cache capacity. Ignored when `session` is also set.
+    pub metadata_cache_size_bytes: Option<usize>,
+    /// New primary object-store block-size hint.
+    pub block_size: Option<usize>,
+    /// Replacement session. Wins over the cache sizes above.
+    pub session: Option<Arc<Session>>,
+    /// Replacement commit handler.
+    pub commit_handler: Option<Arc<dyn CommitHandler>>,
+    /// Replacement storage-options accessor for the primary store. The primary
+    /// store is rebuilt through the session registry so subsequent primary I/O
+    /// consults this accessor.
+    pub storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    /// Explicit per-base bindings to merge. Caller entries win over inherited ones.
+    pub base_store_params: HashMap<String, ObjectStoreParams>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProjectionRequest {
     Schema(Arc<Schema>),
@@ -2448,8 +2472,12 @@ impl Dataset {
     /// Clone this dataset with a different object store binding.
     ///
     /// The returned dataset shares metadata, session state, and caches with the
-    /// original dataset, but all subsequent operations on the returned dataset
-    /// use the supplied object store.
+    /// original dataset, but its primary object store — and the dataset-level
+    /// default params used for base paths that have no explicit binding — are
+    /// replaced by the supplied ones. Explicit per-base bindings still win: a base
+    /// path bound through [`DatasetBuilder::with_base_store_params`], or inherited
+    /// from the dataset a shallow clone was taken from, keeps reading through its
+    /// own store.
     pub fn with_object_store(
         &self,
         object_store: Arc<ObjectStore>,
@@ -2462,6 +2490,102 @@ impl Dataset {
             cloned.store_params = Some(Box::new(store_params));
         }
         cloned
+    }
+
+    /// Apply runtime configuration to this dataset handle.
+    ///
+    /// The returned handle keeps the loaded manifest and every store binding that
+    /// `config` does not replace. An explicit session wins over cache sizes, and
+    /// cache sizes create a new session on the same store registry so custom
+    /// object-store providers keep resolving. When `block_size` is set, the
+    /// primary store keeps its existing backend and only changes its read hint.
+    /// Replacing `storage_options_accessor` rebuilds the primary store through
+    /// the session's registry, because the accessor is consumed when the store is
+    /// constructed and must reach the backend that serves primary I/O.
+    pub async fn reconfigure(&self, config: DatasetRuntimeConfig) -> Result<Self> {
+        let mut ds = self.clone();
+
+        let session = match config.session {
+            Some(session) => Some(session),
+            None if config.index_cache_size_bytes.is_some()
+                || config.metadata_cache_size_bytes.is_some() =>
+            {
+                Some(Arc::new(Session::new(
+                    config
+                        .index_cache_size_bytes
+                        .unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
+                    config
+                        .metadata_cache_size_bytes
+                        .unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
+                    ds.session.store_registry(),
+                )))
+            }
+            None => None,
+        };
+        if let Some(session) = session {
+            ds.index_cache = Arc::new(session.index_cache.for_dataset(&ds.uri));
+            ds.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&ds.uri));
+            ds.session = session;
+        }
+
+        let mut store_params = ds.store_params.as_deref().cloned();
+        let accessor_replaced = config.storage_options_accessor.is_some();
+        if let Some(accessor) = config.storage_options_accessor {
+            let params = store_params.get_or_insert_default();
+            params.storage_options_accessor = Some(accessor);
+        }
+        if let Some(block_size) = config.block_size {
+            let params = store_params.get_or_insert_default();
+            params.block_size = Some(block_size);
+        }
+
+        if accessor_replaced {
+            // A store consumes its accessor at construction time, so replacing it
+            // in `store_params` alone leaves the opened backend on the previous
+            // (possibly expiring) credentials. Rebuild through the handle's
+            // session registry so the new accessor, and every other params-bound
+            // setting, reach the backend that serves primary metadata, refs, and
+            // commits. Explicit base bindings stay untouched; `with_object_store`
+            // drops the derived fallback cache so bases are re-resolved from their
+            // own bindings, or from the new default params when they have none,
+            // instead of keeping the replaced stores.
+            let params = store_params.clone().unwrap_or_default();
+            let (object_store, _) =
+                ObjectStore::from_uri_and_params(ds.session.store_registry(), &ds.uri, &params)
+                    .await?;
+            ds = ds.with_object_store(object_store, Some(params));
+        } else if let Some(block_size) = config.block_size {
+            let params = store_params.unwrap_or_default();
+            ds = ds.with_object_store(
+                Arc::new(ds.object_store.with_block_size(block_size)),
+                Some(params),
+            );
+        } else if store_params.is_some() {
+            ds.store_params = store_params.map(Box::new);
+        }
+
+        let commit_handler_replaced = config.commit_handler.is_some();
+        if let Some(commit_handler) = config.commit_handler {
+            ds.commit_handler = commit_handler;
+        }
+        if accessor_replaced || config.block_size.is_some() || commit_handler_replaced {
+            // Refs binds the primary store and commit handler when it is built.
+            ds.refs = Refs::new(
+                ds.object_store.clone(),
+                ds.commit_handler.clone(),
+                ds.branch_location(),
+            );
+        }
+
+        if !config.base_store_params.is_empty() {
+            let mut base_store_params =
+                ds.base_store_params.as_deref().cloned().unwrap_or_default();
+            base_store_params.extend(config.base_store_params);
+            ds.base_store_params = Some(Arc::new(base_store_params));
+            ds.base_object_stores = Default::default();
+        }
+
+        Ok(ds)
     }
 
     /// Clone this dataset with extra object store wrappers applied to all read stores.
@@ -3003,6 +3127,18 @@ impl Dataset {
     /// ```
     pub fn file_reader_options(&self) -> Option<&FileReaderOptions> {
         self.file_reader_options.as_deref()
+    }
+
+    /// Return a copy of this dataset with updated dataset-level file-reader
+    /// defaults.
+    ///
+    /// The returned handle shares the manifest, object stores, session, and
+    /// caches with this dataset. Only the defaults used by subsequent scans
+    /// change; see [`Self::file_reader_options`].
+    pub fn with_file_reader_options(&self, file_reader_options: Option<FileReaderOptions>) -> Self {
+        let mut cloned = self.clone();
+        cloned.file_reader_options = file_reader_options.map(Arc::new);
+        cloned
     }
 
     pub(crate) async fn object_store_for_data_file(
@@ -3865,12 +4001,35 @@ impl Dataset {
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
     /// 'store_params': the object store params to use for the new dataset.
+    ///
+    /// The returned handle retains the source's store parameters for shared files.
+    /// When reopening a clone across stores, supply the source parameters with
+    /// [`DatasetBuilder::with_base_store_params`].
     pub async fn shallow_clone(
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        let store_params = match store_params {
+            Some(params) => params,
+            None => {
+                let mut params = self.store_params.as_deref().cloned().unwrap_or_default();
+                // Inherit the custom store, but not its source dataset location.
+                #[allow(deprecated)]
+                if let Some((_, location)) = params.object_store.as_mut() {
+                    *location = lance_io::object_store::uri_to_url(target_path)?;
+                }
+                params
+            }
+        };
+        let (target_store, _) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            target_path,
+            &store_params,
+        )
+        .await?;
+
         // Prevent cloning into an existing target dataset (parity with
         // `deep_clone`) before anything is written there: a tagged clone
         // stages its relocated FRI details in the target's `_indices/`
@@ -3878,12 +4037,13 @@ impl Dataset {
         // dataset. The check goes through the same store and commit handler
         // the commit below writes through. Only a definitive "no dataset
         // here" permits the clone; see `ensure_clone_target_absent`.
+        // CommitBuilder extracts its path from the URI when given an explicit store.
         let target_base =
             ObjectStore::extract_path_from_uri(self.session.store_registry(), target_path)?;
         Self::ensure_clone_target_absent(
             self.commit_handler.as_ref(),
             &target_base,
-            &self.object_store,
+            &target_store,
             target_path,
         )
         .await?;
@@ -3894,19 +4054,37 @@ impl Dataset {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: source_location.uri,
+            ref_path: source_location.uri.clone(),
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(
-                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-            )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+            .with_store_params(store_params)
+            .with_object_store(target_store)
+            .with_source_store(self.object_store.clone())
+            .with_session(self.session.clone())
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        builder.execute(transaction).await
+        let mut cloned = builder.execute(transaction).await?;
+        // Destination credentials must not replace the bindings for shared
+        // source files, including bases inherited through earlier shallow clones.
+        cloned.base_store_params = Some(Arc::new(
+            cloned
+                .manifest
+                .base_paths
+                .values()
+                .map(|base| {
+                    let params = if base.path == source_location.uri {
+                        self.store_params_for_base(None)
+                    } else {
+                        self.store_params_for_base(Some(base))
+                    };
+                    (base.path.clone(), params)
+                })
+                .collect(),
+        ));
+        Ok(cloned)
     }
 
     /// Deep clone the target version into a new dataset at target_path.
