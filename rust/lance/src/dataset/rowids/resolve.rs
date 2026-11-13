@@ -4,17 +4,21 @@
 //! Resolve requested IDs while preserving complete-index lookup semantics.
 
 use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::InternalCacheKey;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::{Fragment, RowIdMeta};
-use lance_table::rowids::{RowIdIndex, segment::U64Segment};
+use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex, segment::U64Segment};
+use roaring::RoaringBitmap;
 
-use crate::session::index_caches::{PreparedRowIdFragmentKey, RowIdFragmentSpanKey};
+use crate::session::index_caches::{
+    PreparedRowIdFragmentKey, RowIdFragmentAliasKey, RowIdFragmentDeletionKey, RowIdFragmentSpanKey,
+};
 use crate::{Dataset, Error, Result};
 
 use super::cache::{deletion_identity, load_deletions, load_source, sequence_identity};
@@ -42,13 +46,94 @@ impl DeepSizeOf for FragmentSpan {
 pub struct PreparedFragment {
     index: Option<Arc<RowIdIndex>>,
     span: Option<RangeInclusive<u64>>,
-    /// Present only when this lookup was prepared with snapshot deletions.
+    /// Deletions already applied to the lookup, not necessarily the current snapshot.
     deletion: Option<InternalCacheKey>,
+    source_rows: u64,
+    is_range_only: bool,
+    /// Physical offsets retained by a pruned lookup. This proves whether a later
+    /// snapshot can reuse it without retaining the original row-ID sequence.
+    retained: Option<RoaringBitmap>,
+}
+
+/// A validated view does not retain or charge a second copy of its mapping.
+#[derive(Debug)]
+pub struct FragmentAlias(Weak<PreparedFragment>);
+
+impl DeepSizeOf for FragmentAlias {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
 }
 
 impl DeepSizeOf for PreparedFragment {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.index.deep_size_of_children(context)
+            + self
+                .retained
+                .as_ref()
+                .map_or(0, RoaringBitmap::serialized_size)
+    }
+}
+
+impl PreparedFragment {
+    fn should_rebuild(&self, deleted_rows: usize) -> bool {
+        let retained = self
+            .retained
+            .as_ref()
+            .map_or(self.source_rows, RoaringBitmap::len);
+        let live = self.source_rows.saturating_sub(deleted_rows as u64);
+        // Reclaim at least half the remaining entries before paying another
+        // source read/build. Range lookups are already compact without pruning.
+        !self.is_range_only && live < retained && live <= retained / 2
+    }
+
+    fn usable_without_validation(
+        &self,
+        fragment: &Fragment,
+        deletion: Option<InternalCacheKey>,
+    ) -> bool {
+        if self.deletion == deletion {
+            return true;
+        }
+        self.deletion.is_none()
+            && (self.is_range_only
+                || fragment
+                    .deletion_file
+                    .as_ref()
+                    .and_then(|file| file.num_deleted_rows)
+                    .is_some_and(|count| !self.should_rebuild(count)))
+    }
+
+    fn covers_snapshot(&self, deleted: &DeletionVector) -> bool {
+        let Some(retained) = &self.retained else {
+            return true;
+        };
+        let removed = self.source_rows - retained.len();
+        if removed == 0 {
+            return true;
+        }
+        let outside_retained = match deleted {
+            DeletionVector::NoDeletions => 0,
+            DeletionVector::Set(set) => set
+                .iter()
+                .filter(|offset| {
+                    u64::from(**offset) < self.source_rows && !retained.contains(**offset)
+                })
+                .count() as u64,
+            DeletionVector::Bitmap(bitmap) => {
+                // Retained offsets are in the source domain; ignore any invalid
+                // out-of-domain deletions rather than using them as reuse proof.
+                let Some(last) = self
+                    .source_rows
+                    .checked_sub(1)
+                    .and_then(|n| u32::try_from(n).ok())
+                else {
+                    return false;
+                };
+                bitmap.range_cardinality(..=last) - bitmap.intersection_len(retained)
+            }
+        };
+        outside_retained == removed
     }
 }
 
@@ -102,7 +187,7 @@ pub async fn resolve_row_ids(
             deletion: deletion_identity(dataset, fragment, true)?,
         };
         let mut range = 0..unique_ids.len();
-        if let Some(cached) = cached_fragment(dataset, &key).await {
+        if let Some(cached) = cached_fragment(dataset, fragment, &key).await {
             range = candidate_range(&cached.span, &unique_ids);
             if range.is_empty() {
                 excluded_fragments += 1;
@@ -237,27 +322,80 @@ async fn prepare_shared(
         .for_fragment(&dataset.uri, &source_key)?;
     let mut slot = build.lock().await;
     if let Some(active) = slot.as_ref()
-        && (active.deletion.is_none() || active.deletion == key.deletion)
+        && active.usable_without_validation(fragment, key.deletion)
         && (active.index.is_some() || candidate_range(&active.span, row_ids).is_empty())
     {
         return Ok(active.clone());
     }
-    if let Some(cached) = cached_fragment(dataset, key).await {
+    if let Some(cached) = cached_fragment(dataset, fragment, key).await {
         *slot = Some(cached.clone());
         return Ok(cached);
     }
-    let active = Arc::new(prepare_fragment(dataset, fragment, key, row_ids).await?);
+    let previous = match slot.as_ref() {
+        Some(active) if active.index.is_some() => Some(active.clone()),
+        _ => match dataset
+            .index_cache
+            .get_with_key(&RowIdFragmentAliasKey(source_key))
+            .await
+            .and_then(|alias| alias.0.upgrade())
+        {
+            Some(previous) => Some(previous),
+            None => dataset.index_cache.get_with_key(&source_key).await,
+        },
+    };
+    let mut deletions = None;
+    let mut reusable = None;
+    if let Some(previous) = previous
+        && !fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|file| file.num_deleted_rows)
+            .is_some_and(|count| previous.should_rebuild(count))
+    {
+        let deleted = match key.deletion {
+            Some(identity) => load_deletions(dataset, fragment, identity).await?,
+            None => Arc::new(DeletionVector::default()),
+        };
+        if previous.index.is_some()
+            && previous.covers_snapshot(&deleted)
+            && !previous.should_rebuild(deleted.len())
+        {
+            reusable = Some(previous);
+        }
+        deletions = Some(deleted);
+    }
+    let active = match reusable {
+        Some(prepared) => prepared,
+        None => Arc::new(prepare_fragment(dataset, fragment, key, row_ids, deletions).await?),
+    };
     if active.index.is_some() {
+        // One charged entry owns each distinct mapping. Latest-source and
+        // validated-snapshot aliases are weak, so sharing never multiplies its
+        // cache weight or keeps an evicted mapping alive.
+        let prepared_key = PreparedRowIdFragmentKey {
+            source: key.source,
+            deletion: active.deletion,
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&prepared_key, active.clone())
+            .await;
         dataset
             .index_cache
             .insert_with_key(
-                &PreparedRowIdFragmentKey {
-                    source: key.source,
-                    deletion: active.deletion,
-                },
-                active.clone(),
+                &RowIdFragmentAliasKey(source_key),
+                Arc::new(FragmentAlias(Arc::downgrade(&active))),
             )
             .await;
+        if key.deletion != active.deletion {
+            dataset
+                .index_cache
+                .insert_with_key(
+                    &RowIdFragmentAliasKey(*key),
+                    Arc::new(FragmentAlias(Arc::downgrade(&active))),
+                )
+                .await;
+        }
     }
     dataset
         .session()
@@ -269,19 +407,42 @@ async fn prepare_shared(
 
 async fn cached_fragment(
     dataset: &Dataset,
+    fragment: &Fragment,
     key: &PreparedRowIdFragmentKey,
 ) -> Option<Arc<PreparedFragment>> {
     let source_key = PreparedRowIdFragmentKey {
         source: key.source,
         deletion: None,
     };
-    if let Some(prepared) = dataset.index_cache.get_with_key(&source_key).await {
+    if let Some(prepared) = dataset.index_cache.get_with_key(key).await {
         return Some(prepared);
     }
-    if key.deletion.is_some() {
-        return dataset.index_cache.get_with_key(key).await;
+    if key.deletion.is_some()
+        && let Some(prepared) = dataset
+            .index_cache
+            .get_with_key(&RowIdFragmentAliasKey(*key))
+            .await
+            .and_then(|alias| alias.0.upgrade())
+    {
+        return Some(prepared);
     }
-    None
+    if let Some(prepared) = dataset
+        .index_cache
+        .get_with_key(&RowIdFragmentAliasKey(source_key))
+        .await
+        .and_then(|alias| alias.0.upgrade())
+    {
+        // A known pruned source must go through coverage/rebuild validation,
+        // rather than falling back to an older unpruned cache entry.
+        return prepared
+            .usable_without_validation(fragment, key.deletion)
+            .then_some(prepared);
+    }
+    dataset
+        .index_cache
+        .get_with_key(&source_key)
+        .await
+        .filter(|prepared| prepared.usable_without_validation(fragment, key.deletion))
 }
 
 async fn lookup_fragment(
@@ -294,7 +455,7 @@ async fn lookup_fragment(
     let Some(index) = &prepared.index else {
         return Ok(Vec::new());
     };
-    if prepared.deletion.is_none()
+    if prepared.deletion != deletion
         && let Some(deletion) = deletion
     {
         let deleted = load_deletions(dataset, fragment, deletion).await?;
@@ -311,9 +472,15 @@ async fn prepare_fragment(
     fragment: &Fragment,
     key: &PreparedRowIdFragmentKey,
     row_ids: &[u64],
+    mut deleted: Option<Arc<DeletionVector>>,
 ) -> Result<PreparedFragment> {
     let sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
     let span = sequence.row_id_range();
+    let source_rows = sequence.len();
+    let is_range_only = sequence
+        .segments()
+        .iter()
+        .all(|segment| matches!(segment, U64Segment::Range(_)));
     dataset
         .metadata_cache
         .insert_with_key(
@@ -326,49 +493,105 @@ async fn prepare_fragment(
             index: None,
             span,
             deletion: None,
+            source_rows,
+            is_range_only,
+            retained: None,
         });
     }
     let is_small_inline = matches!(&fragment.row_id_meta,
         Some(RowIdMeta::Inline(bytes)) if bytes.len() <= INLINE_PREPARE_BYTES);
-    let build = |source| async move {
-        let prepare = move || RowIdIndex::new(&[source]);
-        if is_small_inline {
-            prepare()
-        } else {
-            spawn_cpu(prepare).await
+    let build = |deletion_vector| {
+        let source = FragmentRowIdIndex {
+            fragment_id: fragment.id as u32,
+            row_id_sequence: sequence.clone(),
+            deletion_vector,
+        };
+        async move {
+            let prepare = move || RowIdIndex::new(&[source]);
+            if is_small_inline {
+                prepare()
+            } else {
+                spawn_cpu(prepare).await
+            }
         }
     };
-    // A cold deleted Array can have a much smaller live map than its raw source.
-    // Preserve that footprint instead of admitting tombstoned rows and repeatedly
-    // evicting the useful lookup. Already-resident source maps were reused above.
-    // Range-only sources remain compact without enumerating deleted rows.
-    let snapshot_deletion = key.deletion.filter(|_| {
-        sequence
-            .segments()
-            .iter()
-            .any(|segment| !matches!(segment, U64Segment::Range(_)))
+    if !is_range_only && deleted.is_none() && key.deletion.is_some() {
+        deleted = Some(
+            load_source(dataset, fragment, sequence.clone(), true)
+                .await?
+                .deletion_vector,
+        );
+    }
+    let mut deletion = key.deletion.filter(|_| {
+        !is_range_only
+            && deleted
+                .as_ref()
+                .is_some_and(|deleted| deleted.len() as u64 >= source_rows.div_ceil(2))
     });
-    let source = load_source(
-        dataset,
-        fragment,
-        sequence.clone(),
-        snapshot_deletion.is_some(),
-    )
-    .await?;
-    let (index, deletion) = match build(source).await {
-        Ok(index) => (index, snapshot_deletion),
+    let mut pruned = match (deletion, &deleted) {
+        (Some(_), Some(deleted)) => deleted.clone(),
+        _ => Arc::new(DeletionVector::default()),
+    };
+    let index = match build(pruned.clone()).await {
+        Ok(index) => index,
         // A merged map cannot represent repeated raw IDs. Preserve the previous
         // snapshot-aware construction for such sources, using the loaded sequence.
-        Err(_) if snapshot_deletion.is_none() && key.deletion.is_some() => {
-            let source = load_source(dataset, fragment, sequence, true).await?;
-            (build(source).await?, key.deletion)
+        Err(_) if deletion.is_none() && key.deletion.is_some() => {
+            pruned = match &deleted {
+                Some(deleted) => deleted.clone(),
+                None => {
+                    load_source(dataset, fragment, sequence.clone(), true)
+                        .await?
+                        .deletion_vector
+                }
+            };
+            deletion = key.deletion;
+            build(pruned.clone()).await?
         }
         Err(error) => return Err(error),
+    };
+    // A folded deletion vector is no longer needed by a merged lookup. Cache
+    // visibility only when queries still need it, avoiding a second large mask
+    // alongside a small, already-pruned map under cache pressure.
+    if deletion.is_none()
+        && let (Some(identity), Some(deleted)) = (key.deletion, deleted)
+    {
+        dataset
+            .index_cache
+            .insert_with_key(&RowIdFragmentDeletionKey { deletion: identity }, deleted)
+            .await;
+    }
+    let retained = if deletion.is_some() {
+        let mut retained = RoaringBitmap::new();
+        if let Some(last) = source_rows.checked_sub(1) {
+            let last = u32::try_from(last).map_err(|_| {
+                Error::corrupt_file_named(
+                    &fragment.id.to_string(),
+                    "row-ID source exceeds the physical offset domain".to_owned(),
+                )
+            })?;
+            retained.insert_range(..=last);
+        }
+        match pruned.as_ref() {
+            DeletionVector::Bitmap(bitmap) => retained -= bitmap,
+            DeletionVector::Set(set) => {
+                for &offset in set {
+                    retained.remove(offset);
+                }
+            }
+            DeletionVector::NoDeletions => {}
+        }
+        Some(retained)
+    } else {
+        None
     };
     Ok(PreparedFragment {
         index: Some(Arc::new(index)),
         span,
         deletion,
+        source_rows,
+        is_range_only,
+        retained,
     })
 }
 
@@ -484,8 +707,7 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn cold_deleted_fragment_fits_the_live_mapping_budget() {
+    async fn large_shuffled_dataset() -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .into_ram_dataset_with_params(
@@ -528,6 +750,126 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
+        dataset
+    }
+
+    #[tokio::test]
+    async fn warm_deleted_fragment_rebuilds_and_reuses_the_smaller_lookup() {
+        let mut dataset = cold_dataset(large_shuffled_dataset().await, 1 << 20, 0);
+        let old = dataset.clone();
+        let fragment_id = dataset.manifest.fragments[0].id as u32;
+        let key = PreparedRowIdFragmentKey {
+            source: sequence_identity(&dataset, &dataset.manifest.fragments[0]).unwrap(),
+            deletion: None,
+        };
+        let ids = [0, 80, 2053, 4096, 0];
+        assert_eq!(
+            resolve_row_ids(&dataset, &ids, true)
+                .await
+                .unwrap()
+                .unwrap(),
+            [Some(0), Some(16), Some(1), None, Some(0)]
+                .map(|offset| offset.map(|offset| RowAddress::new_from_parts(fragment_id, offset)))
+        );
+        let initial = dataset.index_cache.get_with_key(&key).await.unwrap();
+        let initial_bytes = initial.index.as_ref().unwrap().deep_size_of();
+        dataset.delete("i % 16 != 0").await.unwrap();
+        assert_eq!(
+            resolve_row_ids(&dataset, &ids, true)
+                .await
+                .unwrap()
+                .unwrap(),
+            [Some(0), Some(16), None, None, Some(0)]
+                .map(|offset| offset.map(|offset| RowAddress::new_from_parts(fragment_id, offset)))
+        );
+        let pruned_key = PreparedRowIdFragmentKey {
+            deletion: deletion_identity(&dataset, &dataset.manifest.fragments[0], true).unwrap(),
+            ..key
+        };
+        let compacted = dataset.index_cache.get_with_key(&pruned_key).await.unwrap();
+        assert!(
+            compacted.index.as_ref().unwrap().deep_size_of() * 4 < initial_bytes,
+            "a resident lookup must release most deleted mappings"
+        );
+        let first_deleted = dataset.clone();
+        dataset.delete("i = 16").await.unwrap();
+        let fragment = &dataset.manifest.fragments[0];
+        load_deletions(
+            &dataset,
+            fragment,
+            deletion_identity(&dataset, fragment, true)
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let charged_before = dataset.index_cache.size_bytes().await;
+        let before = dataset.object_store.io_stats_snapshot();
+        assert_eq!(
+            resolve_row_ids(&dataset, &ids, true)
+                .await
+                .unwrap()
+                .unwrap(),
+            [Some(0), None, None, None, Some(0)]
+                .map(|offset| offset.map(|offset| RowAddress::new_from_parts(fragment_id, offset)))
+        );
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_bytes,
+            before.read_bytes,
+            "one more deletion must not reread the source after a major rebuild"
+        );
+        let next = cached_fragment(
+            &dataset,
+            fragment,
+            &PreparedRowIdFragmentKey {
+                deletion: deletion_identity(&dataset, fragment, true).unwrap(),
+                ..key
+            },
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            compacted.index.as_ref().unwrap(),
+            next.index.as_ref().unwrap()
+        ));
+        let alias_charge = dataset.index_cache.size_bytes().await - charged_before;
+        assert!(
+            alias_charge < 256,
+            "snapshot aliases must not charge the shared mapping twice"
+        );
+        dataset.delete("i % 32 != 0").await.unwrap();
+        let fragment = &dataset.manifest.fragments[0];
+        let final_key = PreparedRowIdFragmentKey {
+            deletion: deletion_identity(&dataset, fragment, true).unwrap(),
+            ..key
+        };
+        resolve_row_ids(&dataset, &[0, 160], true).await.unwrap();
+        let final_map = dataset.index_cache.get_with_key(&final_key).await.unwrap();
+        assert!(!Arc::ptr_eq(&compacted, &final_map));
+        assert_eq!(final_map.retained.as_ref().unwrap().len(), 128);
+        assert_eq!(
+            resolve_row_ids(&first_deleted, &[80], true)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![Some(RowAddress::new_from_parts(fragment_id, 16))]
+        );
+        assert_eq!(
+            resolve_row_ids(&old, &[2053], true).await.unwrap().unwrap(),
+            vec![Some(RowAddress::new_from_parts(fragment_id, 1))]
+        );
+        let reclaimed = Arc::downgrade(&final_map);
+        drop(final_map);
+        dataset.index_cache.clear().await;
+        assert!(
+            reclaimed.upgrade().is_none(),
+            "weak aliases must not retain evicted mappings"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_deleted_fragment_fits_the_live_mapping_budget() {
+        let mut dataset = large_shuffled_dataset().await;
         dataset.delete("i % 16 != 0").await.unwrap();
         let fragment = dataset.manifest.fragments[0].id as u32;
         let dataset = cold_dataset(dataset, 4096, 0);
@@ -562,6 +904,67 @@ mod tests {
             "a cold deleted fragment must retain its live lookup in the small cache"
         );
         assert!(dataset.index_cache.size_bytes().await <= 4096);
+    }
+
+    #[rstest]
+    #[case::inline(false)]
+    #[case::spilled(true)]
+    #[tokio::test]
+    async fn pruned_lookup_does_not_hide_rows_after_restore(#[case] spilled: bool) {
+        let mut dataset = cold_dataset(shuffled_dataset(spilled, true).await, 1 << 20, 0);
+        let mut restored = dataset.clone();
+        resolve_row_ids(&dataset, &[0, 7, 17, 27, 37], true)
+            .await
+            .unwrap();
+        dataset.delete("i % 10 != 0").await.unwrap();
+        assert_eq!(
+            resolve_row_ids(&dataset, &[0, 7, 17, 27, 37], true)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(0, 0)),
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+        restored.restore().await.unwrap();
+        restored.delete("i % 10 != 1").await.unwrap();
+        let ids = [7, 37, 27, 17, 7, 0, u64::MAX];
+        let expected = [Some(0), Some(1), Some(2), Some(3), Some(0), None, None]
+            .map(|fragment| fragment.map(|fragment| RowAddress::new_from_parts(fragment, 1)));
+        for _ in 0..2 {
+            let (before, after) = tokio::join!(
+                resolve_row_ids(&dataset, &ids, true),
+                resolve_row_ids(&restored, &ids, true)
+            );
+            assert_eq!(after.unwrap().unwrap(), expected);
+            assert_eq!(
+                before.unwrap().unwrap(),
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(RowAddress::new_from_parts(0, 0)),
+                    None
+                ]
+            );
+        }
+        let batch = restored
+            .take_rows(
+                &ids,
+                ProjectionRequest::from_columns(["i"], restored.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+            &[1, 11, 21, 31, 1]
+        );
     }
 
     #[rstest]
@@ -1029,6 +1432,9 @@ mod tests {
             index: Some(index.clone()),
             span: span.clone(),
             deletion: None,
+            source_rows: 10,
+            is_range_only: false,
+            retained: None,
         };
         let weight = super::super::cache::entry_bytes(&sizing);
         drop(sizing);
@@ -1055,6 +1461,9 @@ mod tests {
             index: Some(index),
             span,
             deletion: key.deletion,
+            source_rows: 10,
+            is_range_only: false,
+            retained: None,
         };
         dataset
             .index_cache

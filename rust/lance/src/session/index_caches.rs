@@ -165,8 +165,7 @@ impl CacheKey for RowIdFragmentSpanKey {
     }
 }
 
-/// A fragment lookup, normally independent of snapshot deletions.
-/// A deletion identity is present only for a source that needs snapshot preparation.
+/// A distinct fragment mapping, keyed by the deletions actually applied to it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreparedRowIdFragmentKey {
     pub source: InternalCacheKey,
@@ -185,7 +184,7 @@ impl CacheKey for PreparedRowIdFragmentKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.prepared-row-id-fragment", 2)
+        CacheKeySchema::new("lance.dataset.prepared-row-id-fragment", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -196,6 +195,30 @@ impl CacheKey for PreparedRowIdFragmentKey {
         } else {
             builder.write_none();
         }
+    }
+}
+
+/// Weak latest-source or validated-snapshot view of a charged fragment mapping.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowIdFragmentAliasKey(pub PreparedRowIdFragmentKey);
+
+impl CacheKey for RowIdFragmentAliasKey {
+    type ValueType = crate::dataset::rowids::resolve::FragmentAlias;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment_alias")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdFragmentAlias"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-fragment-alias", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.0.write_key(builder);
     }
 }
 
