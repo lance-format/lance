@@ -322,6 +322,16 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}"
+      # Keep the full merge-tree integration pass above, then pin the focused
+      # regressions to the task head even if main advanced during validation.
+      - name: Check out exact PR head for focused FTS regressions
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "${PR_HEAD}"
+          git checkout --detach "${PR_HEAD}"
+          test "$(git rev-parse HEAD)" = "${PR_HEAD}"
       - name: Run FTS queries and pipeline drain with one compute worker
         env:
           LANCE_CPU_THREADS: "1"
