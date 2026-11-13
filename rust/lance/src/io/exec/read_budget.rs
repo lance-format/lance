@@ -6,17 +6,12 @@
 //! A budgeted scan splits each fragment's ranges into chunks and reserves a
 //! chunk's pages and decoded size before requesting the pages. Each output
 //! batch takes its share of that reservation until the scan emits it; the
-//! rest ends once the chunk is decoded. Chunks must be admitted in the order the
-//! scan consumes them; see [`lance_io::read_budget`].
+//! rest is released once the chunk is decoded. Chunks are admitted in the
+//! order the scan consumes them.
 //!
-//! A chunk's decoded size is first estimated from page metadata, which knows
-//! what dictionary pages decode to but not what compressed ones do. Until a
-//! scan has decoded a batch, it assumes `UNMEASURED_DECODED_PER_RAW`: its
-//! chunks read that much less from disk and reserve the same memory as later
-//! ones, so a scan reads ahead at once without risking the limit on data that
-//! decodes larger than it is on disk. From its first decoded batch on, a scan
-//! reserves what its batches decoded to per byte read: raised at once by a
-//! larger batch, lowered slowly by smaller ones.
+//! Page metadata gives the decoded size of fixed-width and dictionary pages.
+//! For the other bytes, a scan assumes `UNMEASURED_DECODED_PER_RAW` until it
+//! has decoded a batch, then uses what its batches decoded to.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,20 +27,18 @@ use lance_io::read_budget::{Admission, BudgetReader, Reservation};
 use crate::dataset::fragment::FragmentReader;
 
 /// How far one smaller batch moves a scan's learned decoded size toward its
-/// own. A larger batch replaces it at once: under-reserving is what overruns
-/// the limit, over-reserving only reads less ahead.
+/// own. A larger batch replaces it at once, since under-reserving can overrun
+/// the limit.
 const DECODED_FALL_WEIGHT: f64 = 0.25;
 
-/// Decoded bytes per byte on disk a scan assumes until it has decoded a batch,
-/// unless the metadata knows more: compressed pages decode to a few times their
-/// size on disk. Chunks are sized by it, so a first chunk reads less but
-/// reserves no more than a later one.
+/// Decoded bytes per byte on disk a scan assumes for pages whose decoded size
+/// the metadata does not give, until it has decoded a batch. Compressed pages
+/// decode to a few times their size on disk.
 const UNMEASURED_DECODED_PER_RAW: f64 = 4.0;
 
 /// Ranges of one fragment that a budgeted scan admits and reads together.
 pub(super) struct ReadChunk {
     pub ranges: Vec<Range<u64>>,
-    /// What the ranges load
     pub estimate: ReadEstimate,
 }
 
@@ -118,8 +111,7 @@ pub(super) async fn plan_chunks(
 }
 
 /// What the bytes whose decoded size the metadata does not give decode to,
-/// per byte read: learned from each chunk's first batch and shared by all of
-/// a scan's chunks.
+/// per byte read, learned from a scan's decoded batches.
 struct DecodedSize {
     /// NaN until a batch has been decoded.
     decoded_per_raw: AtomicU64,
@@ -148,9 +140,9 @@ impl DecodedSize {
     }
 
     /// What to reserve for `estimate`'s decoded data. Until a batch is
-    /// decoded, the assumed ratio raises it at most to a chunk of
-    /// `chunk_bytes` in all: a unit larger than a chunk, such as a take's
-    /// whole batch, would otherwise reserve several times its size.
+    /// decoded, the assumed ratio may raise it only up to `chunk_bytes` in
+    /// all, so a unit larger than a chunk, such as a take's whole batch, does
+    /// not reserve several times its size.
     fn decoded(&self, estimate: ReadEstimate, chunk_bytes: u64) -> u64 {
         if self.learned().is_some() {
             return self.expected(estimate).round() as u64;
@@ -189,8 +181,6 @@ fn known_decoded(estimate: ReadEstimate) -> f64 {
 /// One scan's use of the read memory budget.
 pub struct ScanBudget {
     reader: BudgetReader,
-    /// Reserve the whole read as one unit instead of chunk by chunk, for
-    /// consumers that collect all of it before using any.
     whole_read: bool,
     decoded: Arc<DecodedSize>,
     /// Where the scan's reads add the time they waited for the budget.
@@ -217,9 +207,8 @@ impl ScanBudget {
         }
     }
 
-    /// The same scan's budget for another stream of its reads, such as a
-    /// partition, which is consumed independently and so needs its own reader.
-    /// What the scan learns about decoded sizes is shared.
+    /// The scan's budget for another independently consumed stream, such as a
+    /// partition. It shares what the scan learns about decoded sizes.
     pub fn sibling(&self) -> Self {
         Self {
             reader: self.reader.sibling(),
@@ -259,9 +248,7 @@ impl ScanBudget {
     }
 }
 
-/// A scan's chunks: their pages and decoded data, which a chunk reserves
-/// together, are about one chunk of the budget. Follows the decoded size the
-/// scan learns.
+/// The memory, pages plus decoded data, that a scan's chunks aim for.
 #[derive(Clone)]
 pub struct ChunkSize {
     pub chunk_bytes: u64,
@@ -319,11 +306,8 @@ pub struct ChunkBudget {
 }
 
 impl ChunkBudget {
-    /// Charges an output batch of the chunk until the batch is dropped, moving
-    /// it out of the chunk's reservation so it is not counted twice. The
-    /// chunk keeps its pages' share while it holds them, and a batch larger
-    /// than what is left is charged the rest. It is already in memory, so
-    /// this never waits.
+    /// Charges an output batch of the chunk until the batch is dropped, taken
+    /// from the chunk's decoded share so it is not counted twice. Never waits.
     pub fn charge_output(&self, bytes: u64) -> Reservation {
         self.reservation.split_off(bytes, self.estimate.bytes)
     }
@@ -334,10 +318,10 @@ impl ChunkBudget {
         self.reader.sibling()
     }
 
-    /// Sizes the reservation from the chunk's first decoded batch, which shows
-    /// how much the chunk's data grows when decoded. Every batch teaches the
-    /// scan's decoded size.
+    /// Resizes the reservation from the chunk's first decoded batch, and
+    /// teaches the scan's decoded size from every batch.
     pub fn observe_decoded(&self, batch: &RecordBatch) {
+        // Files without page metadata (v1) estimate nothing to correct.
         if batch.num_rows() == 0 || self.estimate.bytes == 0 {
             return;
         }
@@ -374,15 +358,18 @@ mod tests {
         }
     }
 
-    /// Before a batch is decoded, chunks reserve what the metadata knows plus
-    /// the assumed ratio for the rest, and are admitted without waiting on
-    /// each other; after, what batches decoded to per unknown byte read.
-    /// Output moves out of its chunk's reservation and is charged until
-    /// dropped.
-    #[tokio::test]
-    async fn test_chunk_budget_learns_decoded_size() {
+    fn scan_budget() -> (Arc<ReadMemoryBudget>, ScanBudget) {
         let budget = Arc::new(ReadMemoryBudget::new(1 << 30));
         let scan = ScanBudget::new(budget.reader(QueryId::unique()), Time::new());
+        (budget, scan)
+    }
+
+    /// Before a batch is decoded, chunks reserve what the metadata knows plus
+    /// the assumed ratio for the rest; after, what batches decoded to per
+    /// unknown byte read.
+    #[tokio::test]
+    async fn test_chunk_budget_learns_decoded_size() {
+        let (budget, scan) = scan_budget();
         let unmeasured = 1000 + 100 + (500.0 * UNMEASURED_DECODED_PER_RAW) as u64;
         let chunk = scan
             .admission()
@@ -408,50 +395,43 @@ mod tests {
         // byte.
         let per_unknown = (decoded as f64 - 100.0) / 500.0;
         assert_eq!(scan.decoded.learned(), Some(per_unknown));
-        let next = scan
+        let _next = scan
             .admission()
             .reserve(100, estimate(1000, 100, 500))
             .await;
         assert_eq!(budget.reserved_bytes(), 2 * (1000 + decoded));
-        // Output moves out of its chunk's reservation, not on top of it.
-        let output = chunk.charge_output(500);
-        assert_eq!(budget.reserved_bytes(), 2 * (1000 + decoded));
-        drop(chunk);
-        assert_eq!(budget.reserved_bytes(), 1000 + decoded + 500);
-        drop((output, next));
-        assert_eq!(budget.reserved_bytes(), 0);
     }
 
-    /// Output larger than the chunk's decoded share never takes the share of
-    /// its pages, which the chunk still holds.
+    /// Output is taken from its chunk's decoded share and charged until
+    /// dropped; past that share it is charged on top, since the chunk still
+    /// holds its pages.
+    #[rstest::rstest]
+    #[case::within_the_decoded_share(400, 1500)]
+    #[case::past_the_decoded_share(2000, 3000)]
     #[tokio::test]
-    async fn test_output_keeps_the_pages_share() {
-        let budget = Arc::new(ReadMemoryBudget::new(1 << 30));
-        let scan = ScanBudget::new(budget.reader(QueryId::unique()), Time::new());
+    async fn test_charge_output(#[case] output: u64, #[case] reserved: u64) {
+        let (budget, scan) = scan_budget();
         let chunk = scan.admission().reserve(100, estimate(1000, 500, 0)).await;
-        assert_eq!(budget.reserved_bytes(), 1500);
-        // 500 moves out of the chunk and 1500 more is charged.
-        let output = chunk.charge_output(2000);
-        assert_eq!(budget.reserved_bytes(), 3000);
+        let output = chunk.charge_output(output);
+        assert_eq!(budget.reserved_bytes(), reserved);
         drop(chunk);
-        assert_eq!(budget.reserved_bytes(), 2000);
+        assert_eq!(budget.reserved_bytes(), output.bytes());
         drop(output);
         assert_eq!(budget.reserved_bytes(), 0);
     }
 
     /// A larger decoded size replaces the learned one at once; a smaller one
     /// moves it only part of the way.
-    #[tokio::test]
-    async fn test_decoded_size_rises_at_once_and_falls_slowly() {
-        let budget = Arc::new(ReadMemoryBudget::new(1 << 30));
-        let scan = ScanBudget::new(budget.reader(QueryId::unique()), Time::new());
-        let learned = |scan: &ScanBudget| scan.decoded.per_raw();
-        scan.decoded.learn(4.0);
-        assert_eq!(learned(&scan), 4.0);
-        scan.decoded.learn(8.0);
-        assert_eq!(learned(&scan), 8.0);
-        scan.decoded.learn(0.0);
-        assert_eq!(learned(&scan), 8.0 * (1.0 - DECODED_FALL_WEIGHT));
+    #[test]
+    fn test_decoded_size_rises_at_once_and_falls_slowly() {
+        let decoded = DecodedSize::new();
+        assert_eq!(decoded.per_raw(), UNMEASURED_DECODED_PER_RAW);
+        decoded.learn(4.0);
+        assert_eq!(decoded.per_raw(), 4.0);
+        decoded.learn(8.0);
+        assert_eq!(decoded.per_raw(), 8.0);
+        decoded.learn(0.0);
+        assert_eq!(decoded.per_raw(), 8.0 * (1.0 - DECODED_FALL_WEIGHT));
     }
 
     #[test]

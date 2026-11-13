@@ -39,13 +39,16 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, READ_BUDGET_WAIT_TIME_METRIC};
 use lance_file::reader::ReadEstimate;
-use lance_io::read_budget::{QueryId, Reservation};
+use lance_io::read_budget::QueryId;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::bitmap_to_ranges;
 use roaring::RoaringBitmap;
 use tracing::error;
 
 use crate::dataset::Dataset;
+use crate::dataset::blob::{
+    BlobMaterializationContext, materialize_blob_v2_binary_batch_with_admission,
+};
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
 use crate::datatypes::Schema;
@@ -105,7 +108,7 @@ struct TakeStream {
     readers_cache: Arc<Mutex<HashMap<u32, Arc<FragmentReader>>>>,
     /// The scan scheduler to use for reading fragments
     scan_scheduler: Arc<ScanScheduler>,
-    /// Bounds the memory of batches being taken, if the session has a budget
+    /// Bounds the memory of batches being taken, if the session has a budget.
     scan_budget: Option<ScanBudget>,
     /// The metrics for the stream
     metrics: TakeStreamMetrics,
@@ -114,7 +117,7 @@ struct TakeStream {
 /// The output of taking one input batch, charged until it is emitted.
 struct TakenBatches {
     batches: Vec<RecordBatch>,
-    output_charge: Option<Reservation>,
+    reservations: Vec<Arc<dyn Send + Sync>>,
 }
 
 impl TakeStream {
@@ -422,7 +425,7 @@ impl TakeStream {
         if batches.is_empty() {
             return Ok(TakenBatches {
                 batches: vec![RecordBatch::new_empty(self.output_schema.clone())],
-                output_charge: None,
+                reservations: Vec::new(),
             });
         }
 
@@ -460,16 +463,38 @@ impl TakeStream {
                 batch.num_rows()
             )));
         }
+        // The taken data keeps its share until emitted; the rest is released
+        // when this returns. Blob payloads are admitted before they are read.
+        let mut reservations: Vec<Arc<dyn Send + Sync>> = Vec::new();
+        if let Some(chunk_budget) = &chunk_budget {
+            let bytes = taken
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum::<usize>();
+            reservations.push(Arc::new(chunk_budget.charge_output(bytes as u64)));
+        }
         let mut output = Vec::with_capacity(taken.len());
         let mut offset = 0;
         for mut new_data in taken {
             if self.materialize_blob_v2_binary {
-                new_data = crate::dataset::blob::materialize_blob_v2_binary_batch(
-                    &self.dataset,
-                    self.fields_to_take.as_ref(),
-                    new_data,
-                )
-                .await?;
+                let context = BlobMaterializationContext::new(None, None);
+                // Each part's payloads wait on their own reader, so a part never
+                // waits for the payloads of an earlier one it still holds.
+                let payloads = chunk_budget
+                    .as_ref()
+                    .map(|chunk_budget| chunk_budget.payload_reader().admission());
+                let (materialized, payload_reservations) =
+                    materialize_blob_v2_binary_batch_with_admission(
+                        &self.dataset,
+                        self.fields_to_take.as_ref(),
+                        new_data,
+                        &context,
+                        context.admission(payloads),
+                    )
+                    .await?
+                    .into_parts();
+                new_data = materialized;
+                reservations.extend(payload_reservations);
             }
 
             let input = batch.slice(offset, new_data.num_rows());
@@ -484,18 +509,9 @@ impl TakeStream {
                 output.push(merged);
             }
         }
-        // The output takes its share of the batch's reservation until it is
-        // emitted; the rest ends here.
-        let output_charge = chunk_budget.map(|chunk_budget| {
-            let bytes = output
-                .iter()
-                .map(RecordBatch::get_array_memory_size)
-                .sum::<usize>();
-            chunk_budget.charge_output(bytes as u64)
-        });
         Ok(TakenBatches {
             batches: output,
-            output_charge,
+            reservations,
         })
     }
 
@@ -524,9 +540,9 @@ impl TakeStream {
             .try_buffered(get_num_compute_intensive_cpus())
             .map_ok(|taken| {
                 // Released once the last of the batch's results is emitted.
-                let output_charge = taken.output_charge;
+                let reservations = taken.reservations;
                 futures::stream::iter(taken.batches).map(move |batch| {
-                    let _ = &output_charge;
+                    let _ = &reservations;
                     Ok(batch)
                 })
             })

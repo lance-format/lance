@@ -96,20 +96,18 @@ type FragmentChunkStream = BoxStream<'static, Result<FragmentChunk>>;
 struct SharedChunks {
     chunks: Arc<ChunkQueue>,
     scan_budget: ScanBudget,
-    /// Chunks a partition reads ahead of its consumer: the scan's read-ahead
-    /// split among its partitions, so the scan reads as far ahead as it does in
-    /// one partition.
+    /// Chunks each partition reads ahead: the scan's read-ahead split among
+    /// its partitions.
     readahead: usize,
 }
 
-/// The chunks of a budgeted read, shared by its partitions. A task forwards
-/// them into a bounded channel ahead of the partitions, so no partition holds
-/// a lock while it waits for a chunk: one whose consumer stops polling can't
-/// hold up the others.
+/// The chunks of a budgeted read, shared by its partitions through a bounded
+/// channel, so a partition whose consumer stops polling holds no lock the
+/// others need.
 struct ChunkQueue {
     receiver: async_channel::Receiver<Result<FragmentChunk>>,
-    /// The chunks and where to send them, until the first partition starts
-    /// the task: the read is planned outside a runtime.
+    /// The chunks and their sender, until the first partition starts the
+    /// producer task; the read is planned outside a runtime.
     unstarted: std::sync::Mutex<
         Option<(
             FragmentChunkStream,
@@ -550,7 +548,7 @@ pub enum FilteredReadThreadingMode {
 struct OpenedFragmentRead {
     dataset: Arc<Dataset>,
     reader: FragmentReader,
-    /// The planned ranges, sorted
+    /// The planned ranges, sorted.
     ranges: Vec<Range<u64>>,
     batch_size: u32,
     keep_batch_size: bool,
@@ -563,9 +561,9 @@ struct OpenedFragmentRead {
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     fragment_counted: Arc<AtomicBool>,
     range_tracker: Arc<Mutex<RangeMetricsTracker>>,
-    /// Stop reading the fragment after this many rows
+    /// Stop reading the fragment after this many rows.
     soft_limit: Option<u64>,
-    /// Rows read so far, across all chunks
+    /// Rows read so far, across all chunks.
     rows_read: Arc<AtomicUsize>,
 }
 
@@ -678,9 +676,7 @@ impl OpenedFragmentRead {
                 let chunk_budget = chunk_budget_for_output.clone();
                 Ok(batch_fut
                     .and_then(move |batch| {
-                        // The batch takes its share of the chunk's reservation
-                        // until the scan emits it; materialized blob batches
-                        // were charged before their payloads were read.
+                        // Blob batches were charged before materialization.
                         let batch = match chunk_budget.filter(|_| !materialize_blob_v2_binary) {
                             Some(chunk_budget) => {
                                 let bytes = batch.batch().get_array_memory_size() as u64;
@@ -724,8 +720,7 @@ struct FilteredReadStream {
     /// This stream can be shared by multiple partitions
     task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchesFut>>>>,
     /// Under a read memory budget with multiple partitions, the partitions
-    /// share the chunks instead, and each admits the chunks it takes with its
-    /// own budget reader (`task_stream` is then empty)
+    /// take chunks from here instead and `task_stream` is empty.
     budgeted_chunks: Option<SharedChunks>,
     /// The scan scheduler for the scan
     scan_scheduler: Arc<ScanScheduler>,
@@ -1878,7 +1873,7 @@ impl FilteredReadStream {
     }
 
     /// Opens the fragments and splits each one's ranges into chunks of about
-    /// `chunk_size` on disk, to be admitted by a read memory budget.
+    /// `chunk_size` of memory.
     #[allow(clippy::too_many_arguments)]
     fn budgeted_chunk_stream(
         dataset: Arc<Dataset>,
@@ -1920,8 +1915,8 @@ impl FilteredReadStream {
             .boxed()
     }
 
-    /// Reads a chunk once the budget admits it, in its own task like an
-    /// unbudgeted fragment read, so chunks are set up in parallel.
+    /// Reads a chunk once the budget admits it, in its own task so chunks are
+    /// set up in parallel.
     fn read_budgeted_chunk(
         admission: ChunkAdmission,
         chunk: Result<FragmentChunk>,
@@ -1937,9 +1932,8 @@ impl FilteredReadStream {
         SpawnedTask::spawn(read.in_current_span()).map(|thread_result| thread_result.unwrap())
     }
 
-    /// Reads the chunks with up to `readahead` of them admitted ahead.
-    /// Admissions are taken in the order the scan consumes the chunks, which
-    /// the budget needs to stay deadlock-free.
+    /// Reads the chunks with up to `readahead` of them admitted ahead, taking
+    /// admissions in the order the scan consumes the chunks.
     fn budgeted_task_stream(
         chunks: FragmentChunkStream,
         readahead: usize,
@@ -1952,10 +1946,8 @@ impl FilteredReadStream {
             .boxed()
     }
 
-    /// One partition's tasks from the chunks its partitions share. A partition
-    /// admits the chunks it takes with its own reader, since partitions are
-    /// consumed independently, and reads up to `readahead` of them ahead of
-    /// its consumer while the budget has room.
+    /// One partition's tasks from the shared chunks, admitted with its own
+    /// reader since partitions are consumed independently.
     fn partition_task_stream(
         shared: &SharedChunks,
     ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
@@ -3417,6 +3409,10 @@ impl FilteredReadExec {
         let index_input = self.input.row_set_plan().cloned();
         let plan_cell = self.plan.clone();
         let materialization_context = self.materialization_context.clone();
+        let single_partition = matches!(
+            options.threading_mode,
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(_)
+        );
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
@@ -3475,6 +3471,12 @@ impl FilteredReadExec {
             } else {
                 None
             };
+            // With one partition there is nothing to share: the stream owns the
+            // read, so dropping it releases what the read holds even while the
+            // plan is kept.
+            if single_partition {
+                *running_stream = None;
+            }
             drop(running_stream);
 
             let stream = match (consolidate, batch_size_bytes) {
@@ -3626,8 +3628,7 @@ struct RowStreamRead {
     loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     baseline_metrics: BaselineMetrics,
-    /// Under a read memory budget, each batch reads with a sibling of this,
-    /// so the batches share what the read learns about decoded sizes
+    /// Under a read memory budget, the reader whose siblings read each batch.
     scan_budget: Option<ScanBudget>,
 }
 
@@ -3671,11 +3672,10 @@ impl RowStreamRead {
         }
     }
 
-    /// Under a read memory budget, the rows to take per batch so that one
-    /// batch's read is about one chunk of the budget. A batch reads all of its
-    /// rows at once, so a larger one would have to wait for the overdraft.
-    /// Estimated from rows spread over the first fragment, since the rows a
-    /// stream takes are scattered; any failure keeps `batch_rows`.
+    /// Under a read memory budget, the rows per batch that keep one batch's
+    /// read to about one chunk, estimated from single rows spread over the
+    /// first fragment since a stream's rows are scattered. Falls back to
+    /// `batch_rows` if the estimate fails.
     async fn budgeted_batch_rows(&self, batch_rows: usize) -> usize {
         let Some(scan_budget) = &self.scan_budget else {
             return batch_rows;

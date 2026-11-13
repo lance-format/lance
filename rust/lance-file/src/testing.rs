@@ -79,25 +79,33 @@ pub fn test_cache() -> Arc<LanceCache> {
     Arc::new(LanceCache::with_capacity(128 * 1024 * 1024))
 }
 
-pub async fn read_lance_file(
+pub async fn open_lance_file(
     fs: &FsFixture,
     decoder_middleware: Arc<DecoderPlugins>,
-    filter: FilterExpression,
-) -> Vec<RecordBatch> {
+    options: FileReaderOptions,
+) -> FileReader {
     let file_scheduler = fs
         .scheduler
         .open_file(&fs.tmp_path, &CachedFileSize::unknown())
         .await
         .unwrap();
-    let file_reader = FileReader::try_open(
+    FileReader::try_open(
         file_scheduler,
         None,
         decoder_middleware,
         &test_cache(),
-        FileReaderOptions::default(),
+        options,
     )
     .await
-    .unwrap();
+    .unwrap()
+}
+
+pub async fn read_lance_file(
+    fs: &FsFixture,
+    decoder_middleware: Arc<DecoderPlugins>,
+    filter: FilterExpression,
+) -> Vec<RecordBatch> {
+    let file_reader = open_lance_file(fs, decoder_middleware, FileReaderOptions::default()).await;
 
     let schema = file_reader.schema();
     assert_eq!(schema.metadata.get("foo").unwrap(), "bar");

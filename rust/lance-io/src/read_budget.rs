@@ -5,28 +5,23 @@
 //!
 //! A reader reserves the bytes a unit of work loads before requesting it and
 //! releases them once the unit is decoded. A reader's units are admitted in
-//! order, each once it fits under the limit; this is what bounds read-ahead.
-//! Read-ahead leaves the last eighth of the limit to readers' first units and
-//! to small readers, so small reads are not queued behind large ones. A reader
-//! that holds nothing is admitted even when its unit does not fit, by taking
-//! the overdraft, which lets one query at a time exceed the limit by what it
-//! needs to make progress. What a unit admitted through the overdraft decodes
-//! to keeps the overdraft until the consumer takes it. All readers of that
-//! query may use the overdraft, because a downstream reader of a query cannot
-//! wait for its own upstream to drain.
+//! order, each once it fits under the limit. Read-ahead may use only 7/8 of the
+//! limit; the rest is for readers' first units and for small readers.
 //!
-//! A reader that holds nothing and waits is stuck: its consumer waits on it.
-//! While a reader whose unit fits under the limit is stuck, freed memory goes
-//! to stuck readers rather than to read-ahead, oldest first among those it can
-//! admit. The query holding the overdraft is never held back, since stuck
-//! readers may be waiting for it to release the overdraft.
+//! A reader that holds nothing is admitted even when its unit does not fit, by
+//! taking the overdraft. Only one query holds the overdraft at a time, and all
+//! of its readers share it, since a downstream reader cannot wait for its own
+//! upstream to drain. Output decoded from an overdrawn unit keeps the overdraft
+//! until it is released.
 //!
-//! A reader only waits for memory that drains as consumers take what they
-//! read: its own reservations, other readers' reservations, or the overdraft,
-//! which its query releases as its consumer takes the overdrawn unit. A query
-//! whose consumer stops taking while it holds the overdraft therefore holds up
-//! other queries' readers that hold nothing and whose units do not fit, and
-//! while those wait, other readers' read-ahead.
+//! A reader that holds nothing and waits is stuck, because its consumer waits
+//! on it. Freed memory goes to stuck readers before read-ahead, oldest first.
+//! The overdraft holder is never held back, since stuck readers may be waiting
+//! for its overdraft.
+//!
+//! Every wait ends once consumers take what was read. A query whose consumer
+//! stops while it holds the overdraft therefore holds up other queries'
+//! readers whose first unit does not fit.
 
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
@@ -103,7 +98,8 @@ pub struct ReadBudgetStats {
     /// The most bytes reserved at once since the budget was created or since
     /// [`ReadMemoryBudget::reset_peak`].
     pub peak_reserved_bytes: u64,
-    /// Total time admissions waited for memory, across all readers.
+    /// Time admissions waited for memory, summed over readers, so it can
+    /// exceed the elapsed time.
     pub waited: std::time::Duration,
 }
 
@@ -205,9 +201,8 @@ impl ReadMemoryBudget {
     }
 
     /// Splits reads into chunks of about `1 / chunks_per_limit` of the limit
-    /// (at least 1 MiB) instead of 1/16. Fewer, larger chunks suit rows that
-    /// are large next to the limit; more, smaller ones let more readers read
-    /// ahead at once and keep the overdraft small.
+    /// (default 16, at least 1 MiB each). Fewer chunks suit rows that are large
+    /// next to the limit; more let more readers read ahead at once.
     pub fn with_chunks_per_limit(self, chunks_per_limit: u64) -> Self {
         Self {
             chunks_per_limit: chunks_per_limit.max(1),
@@ -301,20 +296,23 @@ impl BudgetReader {
     /// exists before it could be admitted, such as a decoded batch waiting to
     /// be emitted. It counts against the limit like any reservation.
     pub fn charge(&self, bytes: u64) -> Reservation {
-        self.charge_as(bytes, false)
-    }
-
-    fn charge_as(&self, bytes: u64, overdraft: bool) -> Reservation {
         let mut state = self.0.budget.state.lock().unwrap();
-        self.charge_locked(&mut state, bytes, overdraft)
+        let mut queue = self.0.queue.lock().unwrap();
+        self.reserve_locked(&mut state, &mut queue, bytes, false)
     }
 
-    fn charge_locked(&self, state: &mut BudgetState, bytes: u64, overdraft: bool) -> Reservation {
+    fn reserve_locked(
+        &self,
+        state: &mut BudgetState,
+        queue: &mut ReaderQueue,
+        bytes: u64,
+        overdraft: bool,
+    ) -> Reservation {
         state.add(bytes);
+        queue.held += bytes;
         if overdraft {
             state.cover_overdraft(&self.0.query);
         }
-        self.0.queue.lock().unwrap().held += bytes;
         Reservation {
             reader: self.clone(),
             bytes: AtomicU64::new(bytes),
@@ -365,20 +363,16 @@ impl Admission {
                 let grant = if self.ticket != queue.serving_ticket {
                     None
                 } else if queue.held == 0 {
-                    // The reader can only make progress with this unit: admit
-                    // it under the limit, or else through the overdraft if it
-                    // is free or already held by this query. Older stuck
-                    // readers that can be admitted go first.
+                    // The reader's first unit: under the limit or through the
+                    // overdraft, after any older stuck reader that can go.
                     let older_first = state
                         .next_stuck(budget.limit)
                         .is_some_and(|id| self.stuck != Some(id));
                     (!older_first && state.admits_first_unit(budget.limit, &reader.query, bytes))
                         .then_some(total > budget.limit)
                 } else {
-                    // Read-ahead stops short of the last part of the limit,
-                    // which only a reader's first unit or a small reader may
-                    // use, so a small read is not queued behind other readers'
-                    // read-ahead.
+                    // Read-ahead leaves the last share of the limit to first
+                    // units and small readers.
                     let small_share = budget.limit / SMALL_READ_SHARE;
                     let limit = if queue.held + bytes <= small_share {
                         budget.limit
@@ -389,15 +383,13 @@ impl Admission {
                         .then_some(false)
                 };
                 if let Some(overdraft) = grant {
-                    state.add(bytes);
-                    queue.held += bytes;
+                    let reservation = self
+                        .reader
+                        .reserve_locked(&mut state, &mut queue, bytes, overdraft);
                     if let Some(since) = waiting_since {
                         budget
                             .waited_nanos
                             .fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
-                    if overdraft {
-                        state.cover_overdraft(&reader.query);
                     }
                     queue.advance_past(self.ticket);
                     self.queued = false;
@@ -408,11 +400,7 @@ impl Admission {
                     drop(state);
                     // The reader's next admission is now first in its line.
                     budget.notify.notify_waiters();
-                    return Reservation {
-                        reader: self.reader.clone(),
-                        bytes: AtomicU64::new(bytes),
-                        overdraft,
-                    };
+                    return reservation;
                 }
                 let stuck = self.ticket == queue.serving_ticket && queue.held == 0;
                 match self.stuck {
@@ -490,19 +478,18 @@ impl Reservation {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// Moves `bytes` of this reservation to a new one, such as a batch decoded
-    /// from this reservation's unit that outlives it, keeping at least `keep`
-    /// here for memory this one still covers, and reserves without waiting
-    /// whatever part it cannot move. Memory that came through the overdraft
-    /// keeps it until released.
+    /// A reservation of `bytes`, such as an output batch decoded from this
+    /// unit, taken from this one as far as it holds more than `keep` and
+    /// charged without waiting for the rest. It keeps this one's overdraft.
     pub fn split_off(&self, bytes: u64, keep: u64) -> Self {
         let reader = &self.reader;
         let mut state = reader.0.budget.state.lock().unwrap();
+        let mut queue = reader.0.queue.lock().unwrap();
         let moved = self.bytes().saturating_sub(keep).min(bytes);
         self.bytes.fetch_sub(moved, Ordering::Relaxed);
         state.reserved -= moved;
-        reader.0.queue.lock().unwrap().held -= moved;
-        reader.charge_locked(&mut state, bytes, self.overdraft)
+        queue.held -= moved;
+        reader.reserve_locked(&mut state, &mut queue, bytes, self.overdraft)
     }
 
     /// Changes the reservation to `bytes` without waiting, once the actual
@@ -754,6 +741,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_split_off() {
+        let budget = budget(1000);
+        let unit = budget.reader(QueryId::unique()).charge(500);
+        // Moved out of the unit, not added to it.
+        let output = unit.split_off(50, 0);
+        assert_eq!((unit.bytes(), budget.reserved_bytes()), (450, 500));
+        // The unit keeps 100; the other 150 is charged.
+        let more = unit.split_off(500, 100);
+        assert_eq!((unit.bytes(), budget.reserved_bytes()), (100, 650));
+        drop((unit, output, more));
+        assert_eq!(budget.reserved_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn test_one_overdraft_at_a_time() {
         let budget = budget(100);
         let first = budget
@@ -761,14 +762,9 @@ mod tests {
             .admission()
             .reserve(500)
             .await;
-        // What the overdrawn unit decodes to keeps the overdraft, and moves
-        // out of the unit's reservation rather than adding to it.
+        // Output split off an overdrawn unit keeps the overdraft.
         let output = first.split_off(50, 0);
-        assert_eq!(budget.reserved_bytes(), 500);
-        // Past what the unit can give up, the rest is reserved.
-        let more = first.split_off(500, 100);
-        assert_eq!(budget.reserved_bytes(), 650);
-        drop((first, more));
+        drop(first);
         // Another query's reader that holds nothing must wait for the overdraft.
         let waiting = assert_waits(budget.reader(QueryId::unique()).admission(), 200).await;
         drop(output);
@@ -840,9 +836,8 @@ mod tests {
         assert_eq!(budget.reserved_bytes(), 250);
     }
 
-    /// Many queries with chained readers and units
-    /// of every size, including units larger than the whole budget, must all
-    /// finish.
+    /// Many queries with chained readers and units of every size, including
+    /// units larger than the whole budget, all finish.
     #[rstest::rstest]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_readers_never_deadlock(#[values(42, 7, 2026)] seed: u64) {

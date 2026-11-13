@@ -161,8 +161,8 @@ fn budgeted_fragment_batches(
         .try_flatten()
         .map(
             move |chunk: Result<(Arc<FragmentReader>, bool, ReadChunk)>| {
-                // Taken here, in order; the rest runs in its own task so chunks are
-                // set up in parallel.
+                // Admissions are taken here, in order; the rest runs in its own
+                // task so chunks are set up in parallel.
                 let admission = scan_budget.admission();
                 let read = async move {
                     let (reader, has_scan_range, chunk) = chunk?;

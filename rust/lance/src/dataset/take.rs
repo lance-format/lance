@@ -210,10 +210,8 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
-    // The take builds its whole result at once: its pages and their decoded
-    // copy, held until the result is returned. It is charged rather than
-    // admitted, because a caller may take while it holds a paused scan whose
-    // memory only it can release.
+    // Charged without waiting: the caller may hold a paused scan whose memory
+    // only it can release.
     let _reservation = match builder.dataset.session.read_budget() {
         Some(budget) => {
             let estimate =

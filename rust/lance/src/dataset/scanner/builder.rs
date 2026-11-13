@@ -778,14 +778,12 @@ impl Scanner {
         self
     }
 
-    /// Keep [`Self::batch_size`] under the session's read memory limit.
+    /// Keep [`Self::batch_size`] under the session's read memory limit, which
+    /// otherwise reads rows too wide for one chunk in smaller batches.
     ///
-    /// By default a budgeted scan reads rows too wide for one chunk of the
-    /// limit in smaller batches. A scan whose batches are written out should
-    /// keep its batch size instead: a writer encodes each batch's values
-    /// together, and too few values per batch can lose an encoding, such as a
-    /// dictionary, that a larger batch would use. A batch larger than the
-    /// limit's share is then read alone, past the limit.
+    /// Set it when the batches are written out: too few values per batch can
+    /// lose an encoding, such as a dictionary. A batch larger than one chunk
+    /// is then read through the overdraft.
     pub fn keep_batch_size(&mut self, keep_batch_size: bool) -> &mut Self {
         self.keep_batch_size = keep_batch_size;
         self

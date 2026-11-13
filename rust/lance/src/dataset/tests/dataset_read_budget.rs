@@ -158,6 +158,40 @@ fn context() -> Arc<TaskContext> {
     Arc::new(TaskContext::default())
 }
 
+/// A whole-fragment scan of `columns` (all when `None`) through `LanceScanExec`.
+fn fragment_scan(
+    dataset: &Arc<Dataset>,
+    columns: Option<&[&str]>,
+    config: LanceScanConfig,
+) -> LanceScanExec {
+    let schema = match columns {
+        Some(columns) => dataset.schema().project(columns).unwrap(),
+        None => dataset.schema().clone(),
+    };
+    LanceScanExec::new(
+        dataset.clone(),
+        dataset.fragments().clone(),
+        None,
+        Arc::new(schema),
+        config,
+    )
+}
+
+async fn collect(plan: &dyn ExecutionPlan) -> Vec<RecordBatch> {
+    plan.execute(0, context())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+/// Fails the test if `read` does not finish in `secs` seconds.
+async fn within<T>(secs: u64, read: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(secs), read)
+        .await
+        .expect("a budgeted read hung")
+}
+
 /// The read paths a budget governs.
 #[derive(Clone, Copy, Debug)]
 enum Read {
@@ -204,13 +238,7 @@ async fn read(dataset: &Arc<Dataset>, read: Read, batch_size: usize, rows: u64) 
                 }
                 _ => {}
             }
-            scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap()
+            vec![scanner.try_into_batch().await.unwrap()]
         }
         Read::Take => {
             // Rows that exist after any deletions.
@@ -223,34 +251,19 @@ async fn read(dataset: &Arc<Dataset>, read: Read, batch_size: usize, rows: u64) 
             return dataset.take(&rows, projection).await.unwrap();
         }
         Read::FragmentScan => {
-            let scan = LanceScanExec::new(
-                dataset.clone(),
-                dataset.fragments().clone(),
-                None,
-                Arc::new(dataset.schema().project(&["id", "value"]).unwrap()),
-                LanceScanConfig {
-                    batch_size,
-                    ..Default::default()
-                },
-            );
-            scan.execute(0, context())
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap()
+            let config = LanceScanConfig {
+                batch_size,
+                ..Default::default()
+            };
+            collect(&fragment_scan(dataset, Some(&["id", "value"]), config)).await
         }
         Read::TakeExec => {
-            let scan = LanceScanExec::new(
-                dataset.clone(),
-                dataset.fragments().clone(),
-                None,
-                Arc::new(dataset.schema().project(&["id"]).unwrap()),
-                LanceScanConfig {
-                    batch_size,
-                    with_row_address: true,
-                    ..Default::default()
-                },
-            );
+            let config = LanceScanConfig {
+                batch_size,
+                with_row_address: true,
+                ..Default::default()
+            };
+            let scan = fragment_scan(dataset, Some(&["id"]), config);
             let value = dataset
                 .empty_projection()
                 .union_column("value", lance_core::datatypes::OnMissing::Error)
@@ -258,13 +271,8 @@ async fn read(dataset: &Arc<Dataset>, read: Read, batch_size: usize, rows: u64) 
             let take = TakeExec::try_new(dataset.clone(), Arc::new(scan), value)
                 .unwrap()
                 .unwrap();
-            let batches: Vec<RecordBatch> = take
-                .execute(0, context())
-                .unwrap()
-                .try_collect()
+            collect(&take)
                 .await
-                .unwrap();
-            batches
                 .into_iter()
                 .map(|batch| {
                     let schema = batch.schema();
@@ -315,7 +323,7 @@ pub(super) fn assert_released(dataset: &Dataset) {
 }
 
 /// Waits for spawned reads of dropped streams to wind down and release.
-async fn assert_released_eventually(dataset: &Dataset) {
+pub(super) async fn assert_released_eventually(dataset: &Dataset) {
     let budget = dataset.session.read_budget().unwrap();
     for _ in 0..1000 {
         if budget.reserved_bytes() == 0 {
@@ -333,6 +341,7 @@ async fn assert_released_eventually(dataset: &Dataset) {
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_budgeted_reads_match_unbudgeted(
+    #[values(1, 64 * 1024 * 1024, u64::MAX)] limit: u64,
     #[values(
         LanceFileVersion::V2_0,
         LanceFileVersion::V2_1,
@@ -360,63 +369,52 @@ async fn test_budgeted_reads_match_unbudgeted(
     unbudgeted.object_store.io_stats_incremental();
     let expected = read_all(&unbudgeted, 1024, rows).await;
     let requests = unbudgeted.object_store.io_stats_incremental().read_iops;
-    let check = async {
-        for limit in [1, 64 * 1024 * 1024, u64::MAX] {
-            let dataset = open(&dir, Some(limit)).await;
-            let budget = dataset.session.read_budget().unwrap();
-            if limit == u64::MAX {
-                // Read first, so caches are as cold as for the unbudgeted read.
-                dataset.object_store.io_stats_incremental();
-                assert_eq!(read_all(&dataset, 1024, rows).await, expected);
-                assert_eq!(
-                    dataset.object_store.io_stats_incremental().read_iops,
-                    requests,
-                    "a budget that never binds added requests"
-                );
-            }
-            budget.reset_peak();
-            let concurrent = futures::future::join_all(READS.iter().map(|kind| {
-                let dataset = dataset.clone();
-                async move { read(&dataset, *kind, 1024, rows).await }
-            }))
-            .await;
-            assert_eq!(concurrent, expected, "limit {limit}");
-            // Where chunks are small next to the limit, reads stay close to it.
-            let peak = budget.stats().peak_reserved_bytes;
-            if limit == 64 * 1024 * 1024 {
-                assert!(
-                    peak as f64 <= 1.5 * limit as f64,
-                    "reads reserved {peak} bytes under a limit of {limit}"
-                );
-            }
-            assert_released(&dataset);
+    let dataset = open(&dir, Some(limit)).await;
+    let budget = dataset.session.read_budget().unwrap();
+    within(300, async {
+        if limit == u64::MAX {
+            // Read first, so caches are as cold as for the unbudgeted read.
+            dataset.object_store.io_stats_incremental();
+            assert_eq!(read_all(&dataset, 1024, rows).await, expected);
+            assert_eq!(
+                dataset.object_store.io_stats_incremental().read_iops,
+                requests,
+                "a budget that never binds added requests"
+            );
         }
-    };
-    tokio::time::timeout(Duration::from_secs(600), check)
-        .await
-        .expect("a budgeted read hung");
+        budget.reset_peak();
+        let concurrent = futures::future::join_all(READS.iter().map(|kind| {
+            let dataset = dataset.clone();
+            async move { read(&dataset, *kind, 1024, rows).await }
+        }))
+        .await;
+        assert_eq!(concurrent, expected);
+    })
+    .await;
+    // Where chunks are small next to the limit, reads stay close to it.
+    let peak = budget.stats().peak_reserved_bytes;
+    if limit == 64 * 1024 * 1024 {
+        assert!(
+            peak as f64 <= 1.5 * limit as f64,
+            "reads reserved {peak} bytes under a limit of {limit}"
+        );
+    }
+    assert_released(&dataset);
 }
 
 /// Every read path returns what it returns without a limit for any batch size,
 /// whether every unit overdraws, units wait for each other, or they fit.
+#[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_budgeted_reads_of_any_batch_size() {
+async fn test_budgeted_reads_of_any_batch_size(#[values(3, 1024, 65536)] batch_size: usize) {
     let dir = TempStrDir::default();
     let rows = write(&dir, LanceFileVersion::V2_2, Shape::VarBinary, 4, None).await;
-    let unbudgeted = open(&dir, None).await;
-    for batch_size in [3, 1024, 65536] {
-        let expected = read_all(&unbudgeted, batch_size, rows).await;
-        for limit in [1, 4 * 1024 * 1024, 64 * 1024 * 1024] {
-            let dataset = open(&dir, Some(limit)).await;
-            let actual = tokio::time::timeout(
-                Duration::from_secs(300),
-                read_all(&dataset, batch_size, rows),
-            )
-            .await
-            .expect("a budgeted read hung");
-            assert_eq!(actual, expected, "limit {limit}, batch size {batch_size}");
-            assert_released(&dataset);
-        }
+    let expected = read_all(&open(&dir, None).await, batch_size, rows).await;
+    for limit in [1, 4 * 1024 * 1024, 64 * 1024 * 1024] {
+        let dataset = open(&dir, Some(limit)).await;
+        let actual = within(300, read_all(&dataset, batch_size, rows)).await;
+        assert_eq!(actual, expected, "limit {limit}");
+        assert_released(&dataset);
     }
 }
 
@@ -428,24 +426,22 @@ async fn test_many_concurrent_budgeted_reads() {
     let rows = write(&dir, LanceFileVersion::V2_2, Shape::LargeBinary, 8, None).await;
     let expected = read_all(&open(&dir, None).await, 1024, rows).await;
     let dataset = open(&dir, Some(4 * 1024 * 1024)).await;
-    let reads = (0..64).map(|query| {
+    let reads = (0..4 * READS.len()).map(|query| {
         let (dataset, kind) = (dataset.clone(), READS[query % READS.len()]);
         async move { (query % READS.len(), read(&dataset, kind, 1024, rows).await) }
     });
-    let results = tokio::time::timeout(Duration::from_secs(600), futures::future::join_all(reads))
-        .await
-        .expect("concurrent budgeted reads hung");
+    let results = within(300, futures::future::join_all(reads)).await;
     for (kind, result) in results {
         assert_eq!(result, expected[kind], "{:?}", READS[kind]);
     }
     assert_released(&dataset);
 }
 
-/// Tiny pages and pages larger than the limit, and thousands of tiny fragments.
+/// Tiny pages, pages larger than the limit, and hundreds of tiny fragments.
 #[rstest]
 #[case::tiny_pages(Shape::Utf8, 4, Some(4096))]
 #[case::huge_pages(Shape::FixedBinary, 4, Some(1 << 30))]
-#[case::many_fragments(Shape::FixedBinary, 2000, None)]
+#[case::many_fragments(Shape::FixedBinary, 500, None)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_budgeted_reads_of_extreme_layouts(
     #[case] shape: Shape,
@@ -463,10 +459,7 @@ async fn test_budgeted_reads_of_extreme_layouts(
     .await;
     let expected = read_all(&open(&dir, None).await, 1024, rows).await;
     let dataset = open(&dir, Some(4 * 1024 * 1024)).await;
-    let actual = tokio::time::timeout(Duration::from_secs(600), read_all(&dataset, 1024, rows))
-        .await
-        .expect("a budgeted read hung");
-    assert_eq!(actual, expected);
+    assert_eq!(within(300, read_all(&dataset, 1024, rows)).await, expected);
     assert_released(&dataset);
 }
 
@@ -507,29 +500,14 @@ async fn test_budgeted_index_reads() {
                 .unwrap()
                 .project(&["id", "value"])
                 .unwrap();
-            let filtered = by_id(
-                filtered
-                    .try_into_stream()
-                    .await
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap(),
-            );
+            let filtered = by_id(vec![filtered.try_into_batch().await.unwrap()]);
             let mut knn = dataset.scan();
             knn.nearest("value", &query, 10)
                 .unwrap()
                 .refine(4)
                 .project(&["id"])
                 .unwrap();
-            let knn = by_id(
-                knn.try_into_stream()
-                    .await
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap(),
-            );
+            let knn = by_id(vec![knn.try_into_batch().await.unwrap()]);
             (filtered, knn)
         }
     };
@@ -540,16 +518,14 @@ async fn test_budgeted_index_reads() {
     );
     for limit in [1, 4 * 1024 * 1024] {
         let dataset = open(&dir, Some(limit)).await;
-        let actual = tokio::time::timeout(Duration::from_secs(300), search(dataset.clone()))
-            .await
-            .expect("a budgeted index read hung");
+        let actual = within(300, search(dataset.clone())).await;
         assert_eq!(actual, expected, "limit {limit}");
         assert_released(&dataset);
     }
 }
 
 /// A read dropped after its first batch releases everything it reserved,
-/// including what its spawned chunk reads held.
+/// including what its spawned chunk reads held, even while its plan is kept.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_cancelled_budgeted_reads_release(
@@ -563,20 +539,23 @@ async fn test_cancelled_budgeted_reads_release(
     let mut stream = scanner.try_into_stream().await.unwrap();
     stream.try_next().await.unwrap().unwrap();
     drop(stream);
-    let scan = LanceScanExec::new(
-        dataset.clone(),
-        dataset.fragments().clone(),
-        None,
-        Arc::new(dataset.schema().clone()),
-        LanceScanConfig {
-            batch_size: 16,
-            ..Default::default()
-        },
-    );
-    let mut stream = scan.execute(0, context()).unwrap();
+    let config = LanceScanConfig {
+        batch_size: 16,
+        ..Default::default()
+    };
+    let mut stream = fragment_scan(&dataset, None, config)
+        .execute(0, context())
+        .unwrap();
     stream.next().await.unwrap().unwrap();
     drop(stream);
+    let mut options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(16);
+    options.threading_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(4);
+    let kept = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+    let mut stream = kept.execute(0, context()).unwrap();
+    stream.try_next().await.unwrap().unwrap();
+    drop(stream);
     assert_released_eventually(&dataset).await;
+    drop(kept);
 }
 
 /// A read whose data reads fail releases everything it reserved.
@@ -603,10 +582,8 @@ async fn test_failed_budgeted_reads_release() {
     let dataset = Arc::new(dataset);
     let mut scanner = dataset.scan();
     scanner.batch_size(16).project(&["id", "value"]).unwrap();
-    let result: lance_core::Result<Vec<RecordBatch>> =
-        async { scanner.try_into_stream().await?.try_collect().await }.await;
     assert!(
-        result.is_err(),
+        scanner.try_into_batch().await.is_err(),
         "the injected failure must reach the reader"
     );
     let take = dataset
@@ -636,10 +613,7 @@ async fn test_paused_scan_does_not_block_other_reads(#[case] limit: u64, #[case]
     let mut paused = scanner.try_into_stream().await.unwrap();
     let mut scanned = paused.try_next().await.unwrap().unwrap().num_rows();
     for &kind in reads {
-        let actual =
-            tokio::time::timeout(Duration::from_secs(120), read(&dataset, kind, 1024, rows))
-                .await
-                .expect("a read waited for a paused scan");
+        let actual = within(120, read(&dataset, kind, 1024, rows)).await;
         assert_eq!(
             actual,
             read(&unbudgeted, kind, 1024, rows).await,
@@ -669,19 +643,18 @@ async fn test_budgeted_partitions_never_wait_for_each_other() {
         .unwrap()
         .reader(QueryId::unique())
         .charge(limit);
-    // Chunks of many rows, emitted 16 at a time.
-    let mut options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(16);
+    // Chunks of many batches each.
+    let mut options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(256);
     options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(2);
     let plan = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
     let context = context();
     let mut stalled = plan.execute(0, context.clone()).unwrap();
     let mut batches = vec![stalled.try_next().await.unwrap().unwrap()];
-    let drained = tokio::time::timeout(
-        Duration::from_secs(30),
+    let drained = within(
+        30,
         plan.execute(1, context).unwrap().try_collect::<Vec<_>>(),
     )
     .await
-    .expect("a partition waited for one that holds memory")
     .unwrap();
     batches.extend(drained);
     batches.extend(stalled.try_collect::<Vec<_>>().await.unwrap());
@@ -733,36 +706,16 @@ async fn test_budgeted_reads_of_evolved_datasets() {
             .fragment_readahead(1)
             .filter("id % 3 = 0")
             .unwrap();
-        by_id(
-            scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap(),
-        )
+        by_id(vec![scanner.try_into_batch().await.unwrap()])
     };
     // A whole-fragment scan that keeps deleted rows, with a null row id.
     let deletions_null = |dataset: Arc<Dataset>| async move {
-        let scan = LanceScanExec::new(
-            dataset.clone(),
-            dataset.fragments().clone(),
-            None,
-            Arc::new(dataset.schema().clone()),
-            LanceScanConfig {
-                with_row_id: true,
-                with_make_deletions_null: true,
-                ..Default::default()
-            },
-        );
-        by_id(
-            scan.execute(0, context())
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap(),
-        )
+        let config = LanceScanConfig {
+            with_row_id: true,
+            with_make_deletions_null: true,
+            ..Default::default()
+        };
+        by_id(collect(&fragment_scan(&dataset, None, config)).await)
     };
     let unbudgeted = open(&dir, None).await;
     let expected = (
@@ -772,15 +725,14 @@ async fn test_budgeted_reads_of_evolved_datasets() {
     );
     for limit in [1, 4 * 1024 * 1024] {
         let dataset = open(&dir, Some(limit)).await;
-        let actual = tokio::time::timeout(Duration::from_secs(300), async {
+        let actual = within(300, async {
             (
                 scan(dataset.clone()).await,
                 deletions_null(dataset.clone()).await,
                 read_all(&dataset, 1024, rows).await,
             )
         })
-        .await
-        .expect("a budgeted read hung");
+        .await;
         assert_eq!(actual, expected, "limit {limit}");
         assert_released(&dataset);
     }

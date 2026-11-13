@@ -903,18 +903,8 @@ fn v2_blob_array(rows: usize, base: usize) -> ArrayRef {
     builder.finish().unwrap()
 }
 
-/// Blob payloads are loaded after their chunk is admitted; a read memory budget
-/// must still return every payload, whether chunks fit, wait or overdraw.
-#[rstest::rstest]
-#[case::every_chunk_overdraws(1)]
-#[case::chunks_wait(4 * 1024 * 1024)]
-#[case::chunks_fit(64 * 1024 * 1024)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
-    use super::dataset_read_budget::{assert_released, open};
-    use lance_core::datatypes::BlobHandling;
-
-    let dir = TempStrDir::default();
+/// Writes 800 rows of `id` and 8 KiB blob v2 payloads, 200 rows per fragment.
+async fn write_blob_v2_dataset(dir: &str) {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         blob_field("blobs", true),
@@ -928,7 +918,7 @@ async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
         .collect();
     Dataset::write(
         RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
-        &dir,
+        dir,
         Some(WriteParams {
             max_rows_per_file: 200,
             data_storage_version: Some(LanceFileVersion::Stable),
@@ -937,7 +927,22 @@ async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
     )
     .await
     .unwrap();
-    // (id, payload length, first payload byte) for every returned row
+}
+
+/// Blob payloads are loaded after their chunk is admitted; a read memory budget
+/// must still return every payload, whether chunks fit, wait or overdraw.
+#[rstest::rstest]
+#[case::every_chunk_overdraws(1)]
+#[case::chunks_wait(4 * 1024 * 1024)]
+#[case::chunks_fit(64 * 1024 * 1024)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
+    use super::dataset_read_budget::{assert_released, open};
+    use lance_core::datatypes::BlobHandling;
+
+    let dir = TempStrDir::default();
+    write_blob_v2_dataset(&dir).await;
+    /// `(id, payload length, first payload byte)` of every returned row.
     async fn read_payloads(dataset: &Dataset, filter: Option<&str>) -> Vec<(i32, usize, u8)> {
         let mut scan = dataset.scan();
         scan.project(&["id", "blobs"])
@@ -947,22 +952,15 @@ async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
         if let Some(filter) = filter {
             scan.filter(filter).unwrap();
         }
-        let batches: Vec<RecordBatch> = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-        let mut rows = Vec::new();
-        for batch in &batches {
-            let ids = batch["id"].as_primitive::<Int32Type>();
-            let blobs = batch["blobs"].as_binary::<i64>();
-            for (id, blob) in ids.values().iter().zip(blobs.iter()) {
-                let blob = blob.unwrap();
-                rows.push((*id, blob.len(), blob[0]));
-            }
-        }
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let blobs = batch["blobs"].as_binary::<i64>();
+        let mut rows: Vec<_> = ids
+            .values()
+            .iter()
+            .zip(blobs.iter())
+            .map(|(id, blob)| (*id, blob.unwrap().len(), blob.unwrap()[0]))
+            .collect();
         rows.sort_unstable();
         rows
     }
@@ -983,6 +981,74 @@ async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
         assert!(concurrent.iter().all(|rows| *rows == expected));
     }
     assert_released(&budgeted);
+}
+
+/// A take's blob payloads wait for room before they are read, and a take
+/// cancelled while it waits releases what it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_read_budget_take_blob_payloads_wait() {
+    use super::dataset_read_budget::{assert_released, assert_released_eventually, open};
+    use crate::io::exec::{LanceScanConfig, LanceScanExec, TakeExec};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::ExecutionPlan;
+    use lance_core::datatypes::{BlobHandling, OnMissing};
+    use lance_io::read_budget::QueryId;
+
+    const LIMIT: u64 = 1024 * 1024;
+    let dir = TempStrDir::default();
+    write_blob_v2_dataset(&dir).await;
+    let dataset = open(&dir, Some(LIMIT)).await;
+    // Row addresses in batches of 32, then their payloads through `TakeExec`.
+    let take = |dataset: Arc<Dataset>| async move {
+        let ids = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().project(&["id"]).unwrap()),
+            LanceScanConfig {
+                batch_size: 32,
+                with_row_address: true,
+                ..Default::default()
+            },
+        );
+        let blobs = dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::AllBinary)
+            .union_column("blobs", OnMissing::Error)
+            .unwrap();
+        TakeExec::try_new(dataset.clone(), Arc::new(ids), blobs)
+            .unwrap()
+            .unwrap()
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+    };
+    // Another query holds the overdraft and leaves room for the row addresses
+    // and descriptors, but not for a batch's payloads (32 × 8 KiB).
+    let budget = dataset.session.read_budget().unwrap();
+    let other = budget
+        .reader(QueryId::unique())
+        .admission()
+        .reserve(LIMIT + 1)
+        .await;
+    other.resize(LIMIT - 128 * 1024);
+    let waiting = tokio::spawn(take(dataset.clone()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "payloads were read without room");
+    waiting.abort();
+    let _ = waiting.await;
+    drop(other);
+    assert_released_eventually(&dataset).await;
+
+    let rows: usize = take(dataset.clone())
+        .await
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 800);
+    assert_released(&dataset);
 }
 
 #[tokio::test]

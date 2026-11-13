@@ -1971,13 +1971,12 @@ impl FileMetadataProvider {
 pub struct ReadEstimate {
     /// Bytes on disk.
     pub bytes: u64,
-    /// Bytes the rows take once decoded, where the metadata says: fixed-width
-    /// values take their width, and a dictionary page decodes to its
-    /// dictionary's average item for every value. Other pages count as their
-    /// bytes on disk, which a reader corrects once it decodes some.
+    /// Bytes the rows take once decoded. Fixed-width values take their width,
+    /// and dictionary pages their average item per value; other pages count
+    /// their bytes on disk.
     pub decoded_bytes: u64,
     /// The part of `bytes` whose decoded size the metadata does not give, such
-    /// as compressed strings; `decoded_bytes` counts it at its size on disk.
+    /// as compressed strings, counted at its size on disk in `decoded_bytes`.
     pub unknown_bytes: u64,
 }
 
@@ -2018,38 +2017,36 @@ impl DecodeEngine {
             )
             .await?;
         let projection = &prepared.decoder_projection;
-        // Lists read for their structure only skip their values' pages. Only
-        // the leaf-column layout (2.1+) has one column per leaf and reads
-        // structure only.
-        let mut structure_only = Vec::new();
-        let list_structure = &self.options.decoder_config.list_structure;
-        if !list_structure.is_empty() {
-            structure_only_columns(
-                &projection.schema.fields,
-                list_structure,
-                false,
-                &mut structure_only,
-            );
-        }
-        if structure_only.len() != projection.column_indices.len() {
-            structure_only.clear();
-        }
-        let mut row_widths = Vec::new();
-        fixed_row_widths(&projection.schema.fields, Some(1.0), &mut row_widths);
-        if row_widths.len() != projection.column_indices.len() {
-            row_widths.clear();
+        let mut leaves = Vec::new();
+        leaf_columns(
+            &projection.schema.fields,
+            &self.options.decoder_config.list_structure,
+            LeafColumn {
+                structure_only: false,
+                row_width: Some(1.0),
+            },
+            &mut leaves,
+        );
+        // 2.0 files with nested fields do not have one column per leaf, so
+        // their columns get no per-leaf facts.
+        if leaves.len() != projection.column_indices.len() {
+            leaves.clear();
         }
         // With full metadata the prepared columns are every column of the file;
         // the projection's column indices are the ones read.
-        let columns = projection
-            .column_indices
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| !structure_only.get(*position).copied().unwrap_or(false))
-            .filter_map(|(position, index)| {
-                let row_width = row_widths.get(position).copied().flatten();
-                Some((prepared.column_infos.get(*index as usize)?, row_width))
-            });
+        let columns =
+            projection
+                .column_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(position, index)| {
+                    let leaf = leaves.get(position);
+                    if leaf.is_some_and(|leaf| leaf.structure_only) {
+                        return None;
+                    }
+                    let row_width = leaf.and_then(|leaf| leaf.row_width);
+                    Some((prepared.column_infos.get(*index as usize)?, row_width))
+                });
         Ok(estimate_read_in_ranges(
             columns,
             ranges,
@@ -2699,46 +2696,46 @@ impl ProjectedFileReader {
     }
 }
 
-/// Marks each leaf column of `fields`, in column order, that is read for list
-/// structure only, the way the decoder passes a list's mode to its children.
-fn structure_only_columns(
-    fields: &[lance_core::datatypes::Field],
-    list_structure: &BTreeMap<i32, ListReadMode>,
-    inherited: bool,
-    columns: &mut Vec<bool>,
-) {
-    for field in fields {
-        let structure_only = inherited || list_structure.contains_key(&field.id);
-        if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
-            columns.push(structure_only);
-        } else {
-            structure_only_columns(&field.children, list_structure, structure_only, columns);
-        }
-    }
+/// What the estimate needs to know about one leaf column.
+#[derive(Clone, Copy)]
+struct LeafColumn {
+    /// Read for list structure only, so its values' pages are skipped.
+    structure_only: bool,
+    /// Decoded bytes per row, where the type fixes it.
+    row_width: Option<f64>,
 }
 
-/// The decoded bytes per row of each leaf column of `fields`, in column order,
-/// where the type fixes it: fixed-width values, times the sizes of any
-/// fixed-size lists around them. `None` where values vary in size.
-fn fixed_row_widths(
+/// Each leaf column of `fields`, in column order. `parent` carries what the
+/// enclosing fields pass down: a list's read mode, and the values per row of
+/// fixed-size lists (as `row_width`).
+fn leaf_columns(
     fields: &[lance_core::datatypes::Field],
-    values_per_row: Option<f64>,
-    columns: &mut Vec<Option<f64>>,
+    list_structure: &BTreeMap<i32, ListReadMode>,
+    parent: LeafColumn,
+    columns: &mut Vec<LeafColumn>,
 ) {
     for field in fields {
         let data_type = field.data_type();
+        let structure_only = parent.structure_only || list_structure.contains_key(&field.id);
         if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
             let width = (field.children.is_empty() && !field.is_blob())
                 .then(|| fixed_width(&data_type))
                 .flatten();
-            columns.push(values_per_row.zip(width).map(|(n, width)| n * width));
+            columns.push(LeafColumn {
+                structure_only,
+                row_width: parent.row_width.zip(width).map(|(n, width)| n * width),
+            });
         } else {
             let values_per_row = match data_type {
-                DataType::FixedSizeList(_, size) => values_per_row.map(|n| n * size as f64),
-                DataType::Struct(_) => values_per_row,
+                DataType::FixedSizeList(_, size) => parent.row_width.map(|n| n * size as f64),
+                DataType::Struct(_) => parent.row_width,
                 _ => None,
             };
-            fixed_row_widths(&field.children, values_per_row, columns);
+            let parent = LeafColumn {
+                structure_only,
+                row_width: values_per_row,
+            };
+            leaf_columns(&field.children, list_structure, parent, columns);
         }
     }
 }
@@ -3113,7 +3110,7 @@ mod tests {
     use crate::reader::{
         EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
     };
-    use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
+    use crate::testing::{FsFixture, WrittenFile, open_lance_file, test_cache, write_lance_file};
     use crate::version::{ConcreteFileVersion, LanceFileVersion};
     use crate::versions;
     use crate::writer::{FileWriterOptions, PAGE_BUFFER_ALIGNMENT};
@@ -4043,20 +4040,12 @@ mod tests {
             FileWriterOptions::default(),
         )
         .await;
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let file_reader = FileReader::try_open(
-            file_scheduler,
-            None,
+        let file_reader = open_lance_file(
+            &fs,
             Arc::<DecoderPlugins>::default(),
-            &test_cache(),
             FileReaderOptions::default(),
         )
-        .await
-        .unwrap();
+        .await;
         let estimate = file_reader
             .estimate_read(&[0..ROWS as u64], None)
             .await
@@ -4100,20 +4089,12 @@ mod tests {
             .col("text", array::rand_utf8(16.into(), false))
             .into_reader_rows(RowCount::from(ROWS), BatchCount::from(1));
         write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let file_reader = FileReader::try_open(
-            file_scheduler,
-            None,
+        let file_reader = open_lance_file(
+            &fs,
             Arc::<DecoderPlugins>::default(),
-            &test_cache(),
             FileReaderOptions::default(),
         )
-        .await
-        .unwrap();
+        .await;
         for rows in [0..ROWS, 100..1100] {
             let estimate = file_reader
                 .estimate_read(std::slice::from_ref(&rows), None)
@@ -4170,20 +4151,12 @@ mod tests {
         }
         let data = data.into_reader_rows(RowCount::from(ROWS / 16), BatchCount::from(16));
         let written_file = write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let file_reader = FileReader::try_open(
-            file_scheduler,
-            None,
+        let file_reader = open_lance_file(
+            &fs,
             Arc::<DecoderPlugins>::default(),
-            &test_cache(),
             FileReaderOptions::default(),
         )
-        .await
-        .unwrap();
+        .await;
         let field_id_mapping = written_file
             .field_id_mapping
             .iter()
@@ -4273,18 +4246,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let structure_reader = FileReader::try_open(
-            fs.scheduler
-                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-                .await
-                .unwrap(),
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            options,
-        )
-        .await
-        .unwrap();
+        let structure_reader =
+            open_lance_file(&fs, Arc::<DecoderPlugins>::default(), options).await;
         let structure = structure_reader
             .estimate_read(&[0..ROWS], Some(projection("images")))
             .await
