@@ -3539,7 +3539,11 @@ impl FilterExpression {
     }
 }
 
-/// A predicate on a single column, evaluated against page values to skip pages.
+/// Lets the caller skip pages that can't contain matching rows.
+///
+/// For some pages the decoder knows every value without decoding the rows, e.g. from the page's
+/// dictionary. It passes those values to [`Self::any_may_match`] and leaves the page out of the
+/// returned rows if that returns `false`.
 ///
 /// See [`CoreFieldDecoderStrategy::rows_that_may_match`].
 pub trait ValuePredicate: Send + Sync {
