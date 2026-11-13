@@ -716,26 +716,25 @@ impl BitmapIndex {
         };
         let cache_key = BitmapKey::try_new(row_offset)?;
 
-        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
-            if let Some(metrics) = metrics {
-                metrics.record_index_cache_hit();
-            }
-            return Ok(cached);
-        }
-
-        // Record that we're loading a partition from disk
+        // Concurrent misses on one value share a single load, and the caller
+        // gets the cached bitmap rather than a second copy of it.
+        let (bitmap, hit) = self
+            .index_cache
+            .get_or_insert_with_key_hit(cache_key, || async move {
+                if let Some(metrics) = metrics {
+                    metrics.record_part_load();
+                }
+                self.read_bitmap_at(row_offset).await
+            })
+            .await?;
         if let Some(metrics) = metrics {
-            metrics.record_index_cache_miss();
-            metrics.record_part_load();
+            if hit {
+                metrics.record_index_cache_hit();
+            } else {
+                metrics.record_index_cache_miss();
+            }
         }
-
-        let bitmap = self.read_bitmap_at(row_offset).await?;
-
-        self.index_cache
-            .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
-            .await;
-
-        Ok(Arc::new(bitmap))
+        Ok(bitmap)
     }
 
     /// Read one row set straight from the lookup file, remapped through the
@@ -3326,6 +3325,53 @@ mod tests {
         index.search(&query, &metrics).await.unwrap();
         assert_eq!(metrics.index_cache_hits(), 0);
         assert_eq!(metrics.index_cache_misses(), 1);
+    }
+
+    /// Concurrent searches for one uncached value share a single load.
+    #[tokio::test]
+    async fn test_bitmap_concurrent_misses_load_once() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["red", "blue", "red"])),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let batch = sort_batch_by_value(&batch);
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
+            .await
+            .unwrap();
+
+        let metrics = LocalMetricsCollector::default();
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("red".to_string())));
+        futures::future::try_join_all((0..8).map(|_| index.search(&query, &metrics)))
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics
+                .parts_loaded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.index_cache_misses(), 1);
+        assert_eq!(metrics.index_cache_hits(), 7);
     }
 
     // Regression test for the O(N log N) warm-cache rebuild introduced in
