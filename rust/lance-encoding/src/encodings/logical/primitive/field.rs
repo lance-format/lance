@@ -895,6 +895,11 @@ impl StructuralPrimitiveFieldScheduler {
 }
 
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
+    fn release_before(&mut self, row: u64) -> Result<()> {
+        self.page_schedulers.retain(|page| page.row_range.end > row);
+        Ok(())
+    }
+
     fn initialize<'a>(
         &'a mut self,
         requested_ranges: Option<&'a [Range<u64>]>,
@@ -1011,18 +1016,25 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
 ///
 /// Only `FixedSizeList` types have nested children that contribute additional
 /// bitmaps; all other fixed-width leaf types return 0.
-fn fsl_child_bitmap_bytes(data_type: &arrow_schema::DataType, rows: u64) -> u64 {
+fn fsl_child_bitmap_bytes(data_type: &arrow_schema::DataType, rows: u64) -> Result<u64> {
     match data_type {
         arrow_schema::DataType::FixedSizeList(child_field, dimension) => {
-            let child_rows = rows * *dimension as u64;
+            let child_rows = u64::try_from(*dimension)
+                .ok()
+                .and_then(|dimension| rows.checked_mul(dimension))
+                .ok_or_else(|| Error::not_supported("Fixed-size child row count overflow"))?;
             let own = if child_field.is_nullable() {
-                child_rows.div_ceil(8)
+                child_rows
+                    .div_ceil(512)
+                    .checked_mul(64)
+                    .ok_or_else(|| Error::not_supported("Fixed-size child bitmap size overflow"))?
             } else {
                 0
             };
-            own + fsl_child_bitmap_bytes(child_field.data_type(), child_rows)
+            own.checked_add(fsl_child_bitmap_bytes(child_field.data_type(), child_rows)?)
+                .ok_or_else(|| Error::not_supported("Fixed-size child bitmap sum overflow"))
         }
-        _ => 0,
+        _ => Ok(0),
     }
 }
 
@@ -1078,6 +1090,45 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
+    fn decoded_layout(&self, num_rows: u64) -> Result<crate::decoder::DecodedLayout> {
+        let mut remaining = num_rows;
+        let mut layout = crate::decoder::DecodedLayout::default();
+        for (page_index, page) in self.page_decoders.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let drained = if page_index == 0 {
+                self.rows_drained_in_current
+            } else {
+                0
+            };
+            let take = remaining.min(page.num_rows().saturating_sub(drained));
+            layout = layout.checked_add(page.decoded_layout(take, self.data_type())?)?;
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(Error::not_supported(
+                "repetition layout planning requires scheduled pages",
+            ));
+        }
+        // A leaf validity bitmap is indexed by values, not by top-level rows.
+        // Include Arrow's bitmap alignment and the bitmaps of fixed-size children.
+        let count = layout.values.max(layout.levels);
+        let bitmaps = fsl_child_bitmap_bytes(self.data_type(), count)?
+            .checked_add(if self.field.is_nullable() {
+                count.div_ceil(8)
+            } else {
+                0
+            })
+            .and_then(|bytes| bytes.checked_add(63))
+            .ok_or_else(|| Error::not_supported("Repeated validity byte count overflow"))?;
+        layout.bytes = layout
+            .bytes
+            .checked_add(bitmaps)
+            .ok_or_else(|| Error::not_supported("Repeated decoded byte count overflow"))?;
+        Ok(layout)
+    }
+
     fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
         let dictionary_rows = self
             .page_decoders
@@ -1152,9 +1203,13 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
                 let rows = (c as u64).min(rows_remaining);
                 out[i] = rows * byte_width as u64;
                 if is_nullable {
-                    out[i] += rows.div_ceil(8);
+                    out[i] += rows.div_ceil(512) * 64;
                 }
-                out[i] += fsl_child_bitmap_bytes(data_type, rows);
+                out[i] = out[i]
+                    .checked_add(fsl_child_bitmap_bytes(data_type, rows)?)
+                    .ok_or_else(|| {
+                        Error::not_supported("Fixed-size decoded byte count overflow")
+                    })?;
             }
             return Ok(out);
         }
@@ -1164,9 +1219,9 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             let mut out = [0u64; 8];
             for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
                 let rows = (c as u64).min(rows_remaining);
-                out[i] = rows.div_ceil(8);
+                out[i] = rows.div_ceil(512) * 64;
                 if is_nullable {
-                    out[i] += rows.div_ceil(8);
+                    out[i] += rows.div_ceil(512) * 64;
                 }
             }
             return Ok(out);
@@ -1183,7 +1238,8 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             let rows = (c as u64).min(rows_remaining);
             out[i] = self.decoded_bytes_for_rows(rows)?;
             if is_nullable {
-                out[i] += rows.div_ceil(8);
+                // BooleanBufferBuilder retains whole 64-byte allocation blocks.
+                out[i] += rows.div_ceil(512) * 64;
             }
         }
         Ok(out)
@@ -1368,26 +1424,34 @@ mod tests {
 
     #[test]
     fn test_plan_decoded_bytes_fixed_size_list_of_f32() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use arrow_buffer::NullBuffer;
+
         use crate::decoder::CANDIDATE_BATCH_SIZES;
 
         const DIMENSION: i32 = 8;
         // Items are non-nullable, which is the typical case for vector embeddings.
         let item_field = Arc::new(ArrowField::new("item", DataType::Float32, false));
-        let fsl_type = DataType::FixedSizeList(item_field, DIMENSION);
+        let fsl_type = DataType::FixedSizeList(item_field.clone(), DIMENSION);
         let field = Arc::new(ArrowField::new("vector", fsl_type, true));
         let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
 
         let rows_remaining = 100u64;
         let bytes = decoder.plan_decoded_bytes(rows_remaining).unwrap();
 
-        // Each FSL row is DIMENSION f32 values = DIMENSION * 4 bytes, plus
-        // 1 bit of validity bitmap (the field is nullable).
-        let bytes_per_row = DIMENSION as u64 * 4;
+        // Compare retained Arrow buffers, including bitmap allocation alignment,
+        // rather than repeating the planner's byte-count formula.
         for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
-            let rows = (candidate as u64).min(rows_remaining);
+            let rows = (candidate as u64).min(rows_remaining) as usize;
+            let array = FixedSizeListArray::new(
+                item_field.clone(),
+                DIMENSION,
+                Arc::new(Float32Array::from(vec![0.0; rows * DIMENSION as usize])),
+                Some(NullBuffer::from_iter((0..rows).map(|row| row % 3 != 0))),
+            );
             assert_eq!(
                 bytes[i],
-                rows * bytes_per_row + rows.div_ceil(8),
+                array.get_buffer_memory_size() as u64,
                 "candidate batch size {candidate}"
             );
         }
@@ -1813,6 +1877,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(built_pages(&scheduler), [0, 1, 2, 63]);
+
+        scheduler.release_before(250).unwrap();
+        assert_eq!(built_pages(&scheduler), [2, 63]);
+        scheduler
+            .initialize(Some(&[250..350]), &filter, &context)
+            .await
+            .unwrap();
+        assert_eq!(built_pages(&scheduler), [2, 3, 63]);
+        scheduler.release_before(400).unwrap();
+        assert_eq!(built_pages(&scheduler), [63]);
 
         // The eager path builds every page and releases the page source.
         scheduler.initialize(None, &filter, &context).await.unwrap();

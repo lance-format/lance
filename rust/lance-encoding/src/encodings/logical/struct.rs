@@ -187,6 +187,13 @@ impl StructuralStructScheduler {
 }
 
 impl StructuralFieldScheduler for StructuralStructScheduler {
+    fn release_before(&mut self, row: u64) -> Result<()> {
+        for child in &mut self.children {
+            child.release_before(row)?;
+        }
+        Ok(())
+    }
+
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[Range<u64>],

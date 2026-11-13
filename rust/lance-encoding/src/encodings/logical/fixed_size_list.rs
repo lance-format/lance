@@ -147,6 +147,13 @@ impl StructuralFixedSizeListScheduler {
 }
 
 impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
+    fn release_before(&mut self, row: u64) -> Result<()> {
+        let child_row = row
+            .checked_mul(self.dimension)
+            .ok_or_else(|| Error::invalid_input("fixed-size list release row exceeds u64"))?;
+        self.child.release_before(child_row)
+    }
+
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[Range<u64>],

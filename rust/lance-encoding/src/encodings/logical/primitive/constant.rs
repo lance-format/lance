@@ -3,12 +3,13 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, new_empty_array, new_null_array};
+use arrow_array::{Array, ArrayRef, cast::AsArray, new_empty_array, new_null_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use lance_arrow::DataTypeExt;
 
 use lance_core::{
     Error, Result,
@@ -322,7 +323,7 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConstantPageDecoder {
     ranges: VecDeque<Range<u64>>,
     scalar: ArrayRef,
@@ -401,6 +402,94 @@ impl ConstantPageDecoder {
 }
 
 impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPageDecoder {
+    fn decoded_layout(
+        &self,
+        num_rows: u64,
+        _data_type: &DataType,
+    ) -> Result<crate::decoder::DecodedLayout> {
+        // Reuse the decoder's row-to-level walk without advancing its position.
+        // Null/empty parents occupy levels but do not produce leaf values.
+        let mut cursor = self.clone();
+        let mut remaining = num_rows;
+        let mut values = 0u64;
+        let mut levels = 0u64;
+        for range in &self.ranges {
+            let take = remaining.min(range.end - range.start);
+            if take == 0 {
+                break;
+            }
+            cursor.skip_to_row(range.start)?;
+            let start = cursor.cursor_level;
+            cursor.skip_to_row(range.start + take)?;
+            let end = cursor.cursor_level;
+            let visible = match &self.def {
+                Some(def) => def
+                    .get(start..end)
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named(
+                            "constant",
+                            "Definition range exceeds loaded levels",
+                        )
+                    })?
+                    .iter()
+                    .filter(|level| **level <= self.max_visible_def)
+                    .count() as u64,
+                None => (end - start) as u64,
+            };
+            values = values
+                .checked_add(visible)
+                .ok_or_else(|| Error::not_supported("Constant visible value count overflow"))?;
+            levels = levels
+                .checked_add((end - start) as u64)
+                .ok_or_else(|| Error::not_supported("Constant level count overflow"))?;
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(Error::invalid_input(
+                "Constant layout request exceeds scheduled rows",
+            ));
+        }
+        let row_bytes = match self.scalar.data_type() {
+            DataType::Binary | DataType::LargeBinary | DataType::Utf8 | DataType::LargeUtf8
+                if self.scalar.is_null(0) =>
+            {
+                0
+            }
+            DataType::Binary => self.scalar.as_binary::<i32>().value(0).len() as u64,
+            DataType::LargeBinary => self.scalar.as_binary::<i64>().value(0).len() as u64,
+            DataType::Utf8 => self.scalar.as_string::<i32>().value(0).len() as u64,
+            DataType::LargeUtf8 => self.scalar.as_string::<i64>().value(0).len() as u64,
+            DataType::Boolean => 1,
+            DataType::Null => 0,
+            data_type => data_type
+                .byte_width_opt()
+                .map(|width| width as u64)
+                .ok_or_else(|| {
+                    Error::not_supported(format!("Constant byte planning for {data_type:?}"))
+                })?,
+        };
+        // Arrow take expands the scalar. Allow builder growth, offsets and
+        // alignment, as well as the retained scalar used by the decode task.
+        let bytes = row_bytes
+            .checked_mul(values)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add(values.checked_add(1)?.checked_mul(32)?))
+            .and_then(|bytes| bytes.checked_add(128))
+            .and_then(|bytes| bytes.checked_add(self.scalar.get_buffer_memory_size() as u64))
+            .ok_or_else(|| Error::not_supported("Constant decoded byte count overflow"))?;
+        Ok(crate::decoder::DecodedLayout {
+            bytes,
+            values,
+            levels,
+        })
+    }
+
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        Ok(self
+            .decoded_layout(num_rows, self.scalar.data_type())?
+            .bytes)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn crate::decoder::DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
 

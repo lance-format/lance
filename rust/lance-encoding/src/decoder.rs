@@ -260,8 +260,11 @@ use crate::format::pb::{self, column_encoding};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
+mod budget_scan;
 mod late_reads;
 
+use budget_scan::BudgetScanScheduler;
+pub use budget_scan::PlannedBatch;
 pub(crate) use late_reads::LateReadGuard;
 use late_reads::{Charge, LateWindow};
 
@@ -2105,6 +2108,9 @@ const PAGE_LOAD_CONCURRENCY: usize = 16;
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
+    // Budget scans submit only the range being planned or drained. Ordinary
+    // streams keep their existing independently scheduled source.
+    budget_scheduler: Option<BudgetScanScheduler>,
     root_decoder: StructuralStructDecoder,
     rows_remaining: u64,
     rows_per_batch: u32,
@@ -2160,6 +2166,7 @@ impl StructuralBatchDecodeStream {
             batch_size_bytes.is_some() && has_variable_width(root_decoder.data_type());
         Self {
             context: DecoderContext::new(scheduled),
+            budget_scheduler: None,
             root_decoder,
             rows_remaining: num_rows,
             rows_per_batch,
@@ -2182,7 +2189,43 @@ impl StructuralBatchDecodeStream {
         }
         let mut pages = Vec::new();
         let mut scheduling_error = None;
-        while self.rows_scheduled < scheduled_need {
+        if self.rows_scheduled < scheduled_need
+            && let Some(scheduler) = &mut self.budget_scheduler
+        {
+            let start = self.rows_scheduled;
+            scheduler.prepare(start..scheduled_need).await?;
+            let mut end = start;
+            scheduler.scheduler.do_schedule_ranges_structural(
+                &[start..scheduled_need],
+                &FilterExpression::no_filter(),
+                scheduler.io.clone(),
+                |message| match message {
+                    Ok(message) => {
+                        end = start + message.scheduled_so_far;
+                        pages.extend(
+                            message
+                                .decoders
+                                .into_iter()
+                                .map(MessageType::into_structural),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        scheduling_error = Some(error);
+                        false
+                    }
+                },
+            );
+            self.rows_scheduled = end;
+            self.scheduler_exhausted = end < scheduled_need;
+            if end != scheduled_need && scheduling_error.is_none() {
+                scheduling_error = Some(Error::corrupt_file_named(
+                    "budget_scan",
+                    format!("scheduled rows end at {end}, expected {scheduled_need}"),
+                ));
+            }
+        }
+        while self.budget_scheduler.is_none() && self.rows_scheduled < scheduled_need {
             let next_message = self.context.source.recv().await;
             match next_message {
                 Some(Ok(scan_line)) => {
@@ -2352,6 +2395,83 @@ impl StructuralBatchDecodeStream {
             ))
         });
         stream.boxed()
+    }
+
+    /// Returns decoded byte counts or conservative bounds for the 8
+    /// [`CANDIDATE_BATCH_SIZES`], clamped to the requested lookahead and EOF.
+    ///
+    /// Waits for enough pages to be scheduled so that the largest candidate's
+    /// pages are available. Use [`Self::plan_next_batch`] to stop probing once an
+    /// output byte target is reached instead of always loading the largest candidate.
+    pub async fn plan_decoded_bytes(&mut self, rows_remaining: u64) -> Result<[u64; 8]> {
+        let rows_remaining = rows_remaining.min(self.rows_remaining);
+        let candidate_max = CANDIDATE_BATCH_SIZES[CANDIDATE_BATCH_SIZES.len() - 1] as u64;
+        let lookahead = candidate_max.min(rows_remaining);
+        if lookahead > 0 {
+            let want_scheduled = self.rows_drained + lookahead;
+            self.wait_for_scheduled(want_scheduled).await?;
+        }
+        self.root_decoder.plan_decoded_bytes(rows_remaining)
+    }
+
+    /// Drain up to `num_rows` rows from the persistent decoder, returning a
+    /// [`ReadBatchTask`].
+    ///
+    /// Used by the byte-budget scan path where the caller controls batch sizes
+    /// externally (via [`plan_decoded_bytes`]). Existing offset and dictionary
+    /// limits may further reduce the task. A zero request is invalid before EOF.
+    pub async fn drain_task(&mut self, num_rows: u32) -> Result<Option<ReadBatchTask>> {
+        if self.rows_remaining == 0 {
+            return Ok(None);
+        }
+        if num_rows == 0 {
+            return Err(Error::invalid_input(
+                "drain_task requires a positive row count",
+            ));
+        }
+
+        let mut to_take = (num_rows as u64).min(self.rows_remaining);
+
+        let desired_scheduled = self.rows_drained + to_take;
+        let scheduled_need = desired_scheduled.saturating_sub(self.rows_scheduled);
+        if scheduled_need > 0 {
+            let actually = self.wait_for_scheduled(desired_scheduled).await?;
+            if actually < desired_scheduled {
+                to_take -= desired_scheduled - actually;
+            }
+        }
+
+        if to_take == 0 {
+            return Ok(None);
+        }
+
+        let limit = StructuralFieldDecoder::max_rows_to_drain(
+            &self.root_decoder,
+            to_take,
+            I32_OFFSET_BYTE_BUDGET,
+        )?;
+        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
+        let next_task = self.root_decoder.drain_batch_task(to_take)?;
+        let num_rows = next_task.num_rows;
+        let emitted_batch_size_warning = self.emitted_batch_size_warning.clone();
+        let spawn = self.spawn_batch_decode_tasks;
+        self.rows_drained += to_take;
+
+        let task = async move {
+            let (batch, _data_size) = if spawn {
+                tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
+                    .await
+                    .map_err(|err| Error::wrapped(err.into()))??
+            } else {
+                next_task.into_batch(emitted_batch_size_warning)?
+            };
+            Ok(batch)
+        };
+
+        Ok(Some(ReadBatchTask {
+            task: task.boxed(),
+            num_rows: num_rows as u32,
+        }))
     }
 }
 
@@ -3500,6 +3620,13 @@ impl FilterExpression {
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
+    /// Release initialization state for pages wholly before `row` when a
+    /// forward-only scan no longer needs to schedule their data. Existing page
+    /// decoders retain their own input references until consumption completes.
+    fn release_before(&mut self, _row: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Loads the per-page metadata this column needs before scheduling.
     ///
     /// When `requested_ranges` is present, only pages overlapping those
@@ -3623,7 +3750,43 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
     fn decode(self: Box<Self>) -> Result<DecodedPage>;
 }
 
+/// Decoded payload and structural counts for a selected top-level row range.
+///
+/// Values and level entries may outnumber rows when a field is repeated. Level
+/// entries include invisible null/empty-list markers and bound the capacity of
+/// the offset and validity buffers reconstructed by parent list decoders.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodedLayout {
+    /// Conservative payload byte count, before parent structural buffers.
+    pub bytes: u64,
+    /// Number of visible leaf values, including null values.
+    pub values: u64,
+    /// Number of selected repetition/definition entries.
+    pub levels: u64,
+}
+
+impl DecodedLayout {
+    pub(crate) fn checked_add(self, other: Self) -> Result<Self> {
+        let checked = || {
+            Some(Self {
+                bytes: self.bytes.checked_add(other.bytes)?,
+                values: self.values.checked_add(other.values)?,
+                levels: self.levels.checked_add(other.levels)?,
+            })
+        };
+        checked().ok_or_else(|| Error::not_supported("Decoded layout exceeds u64"))
+    }
+}
+
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
+    /// Plans a repeated field without confusing top-level rows with leaf values.
+    /// Unsupported representations must not supply a heuristic byte bound.
+    fn decoded_layout(&self, _num_rows: u64, _data_type: &DataType) -> Result<DecodedLayout> {
+        Err(Error::not_supported(format!(
+            "Repeated layout planning is unavailable for {}",
+            std::any::type_name::<Self>()
+        )))
+    }
     /// Number of stored dictionary values, if this decoder preserves dictionary encoding.
     fn dictionary_len(&self) -> Option<u64> {
         None
@@ -3678,6 +3841,12 @@ pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {
 }
 
 pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
+    /// Plans decoded buffers and repeated-value counts from the current position.
+    fn decoded_layout(&self, _num_rows: u64) -> Result<DecodedLayout> {
+        Err(Error::not_supported(
+            "Repeated layout planning is unavailable for this field decoder",
+        ))
+    }
     /// See [`LogicalPageDecoder::max_rows_to_drain`].
     fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
         Ok(DrainLimit {
@@ -3777,6 +3946,68 @@ pub async fn decode_batch(
         false,
     )?;
     decode_stream.next().await.unwrap().task.await
+}
+
+/// Creates a persistent structural decode stream for byte-budget-controlled scanning.
+///
+/// Unlike [`schedule_and_decode`] which boxes the stream and exposes a fixed batch size,
+/// this returns the raw [`StructuralBatchDecodeStream`] so the caller can query
+/// [`StructuralBatchDecodeStream::plan_decoded_bytes`] and drain rows via
+/// [`StructuralBatchDecodeStream::drain_task`] with externally chosen batch sizes.
+///
+/// Only supports v2.1+ structural files. For v2.0 files, use schema-based estimates
+/// with fresh decode tasks instead.
+pub async fn open_structural_budget_scan(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    num_rows: u64,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+) -> Result<StructuralBatchDecodeStream> {
+    let (_, rx) = mpsc::unbounded_channel();
+
+    let arrow_schema = ArrowSchema::from(target_schema.as_ref());
+    let structural_decoder = StructuralStructDecoder::new(
+        arrow_schema.fields,
+        config.decoder_config.validate_on_decode,
+        /*is_root=*/ true,
+        /*nullable=*/ false,
+    )?;
+
+    let mut stream = StructuralBatchDecodeStream::new(
+        rx,
+        u32::MAX, // rows_per_batch unused in drain_task path
+        num_rows,
+        structural_decoder,
+        /*spawn_batch_decode_tasks=*/ true,
+        /*batch_size_bytes=*/ None,
+    );
+
+    if num_rows == 0 {
+        return Ok(stream);
+    }
+
+    let decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
+        target_schema.as_ref(),
+        &column_indices,
+        &column_infos,
+        &vec![],
+        num_rows,
+        config.decoder_plugins,
+        config.io.clone(),
+        config.cache,
+        Some(&[]),
+        &FilterExpression::no_filter(),
+        &config.decoder_config,
+    )
+    .await?;
+
+    stream.budget_scheduler = Some(BudgetScanScheduler {
+        scheduler: decode_scheduler,
+        io: config.io,
+    });
+
+    Ok(stream)
 }
 
 #[cfg(test)]

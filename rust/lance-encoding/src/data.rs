@@ -231,11 +231,13 @@ impl FixedWidthDataBlock {
 struct VariableWidthDataBlockBuilder<T: OffsetSizeTrait> {
     offsets: Vec<T>,
     bytes: Vec<u8>,
+    is_exact_capacity: bool,
 }
 
 impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
-    fn new(estimated_size_bytes: u64) -> Self {
+    fn new(estimated_size_bytes: u64, is_exact_capacity: bool) -> Self {
         Self {
+            is_exact_capacity,
             offsets: vec![T::from_usize(0).unwrap()],
             bytes: Vec::with_capacity(estimated_size_bytes as usize),
         }
@@ -278,6 +280,11 @@ impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthD
         }
         let previous_len = self.bytes.len();
 
+        if self.is_exact_capacity {
+            self.bytes.reserve_exact(selected_data_len);
+            self.offsets
+                .reserve_exact((selection.end - selection.start) as usize);
+        }
         self.bytes
             .extend_from_slice(&block.data[start_offset.as_usize()..end_offset.as_usize()]);
 
@@ -308,12 +315,14 @@ impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthD
 #[derive(Debug)]
 struct BitmapDataBlockBuilder {
     values: BooleanBufferBuilder,
+    is_exact_capacity: bool,
 }
 
 impl BitmapDataBlockBuilder {
-    fn new(estimated_size_bytes: u64) -> Self {
+    fn new(estimated_size_bytes: u64, is_exact_capacity: bool) -> Self {
         Self {
             values: BooleanBufferBuilder::new(estimated_size_bytes as usize * 8),
+            is_exact_capacity,
         }
     }
 }
@@ -325,6 +334,9 @@ impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
 
     fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
         let bitmap_blk = data_block.as_fixed_width_ref().unwrap();
+        if self.is_exact_capacity {
+            reserve_bitmap_exact(&mut self.values, (selection.end - selection.start) as usize)?;
+        }
         self.values.append_packed_range(
             selection.start as usize..selection.end as usize,
             &bitmap_blk.data,
@@ -350,13 +362,15 @@ struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
     values: Vec<u8>,
+    is_exact_capacity: bool,
 }
 
 impl FixedWidthDataBlockBuilder {
-    fn new(bits_per_value: u64, estimated_size_bytes: u64) -> Self {
+    fn new(bits_per_value: u64, estimated_size_bytes: u64, is_exact_capacity: bool) -> Self {
         assert!(bits_per_value.is_multiple_of(8));
         Self {
             bits_per_value,
+            is_exact_capacity,
             bytes_per_value: bits_per_value / 8,
             values: Vec::with_capacity(estimated_size_bytes as usize),
         }
@@ -373,14 +387,24 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
         let end = selection.end as usize * self.bytes_per_value as usize;
+        if self.is_exact_capacity {
+            self.values.reserve_exact(end - start);
+        }
         self.values.extend_from_slice(&block.data[start..end]);
         Ok(())
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
+        // An unallocated Vec<u8> has a byte-aligned dangling pointer. Arrow
+        // validates alignment even for an empty primitive child array.
+        let data = if self.values.is_empty() {
+            LanceBuffer::from(arrow_buffer::Buffer::from(&[] as &[u8]))
+        } else {
+            LanceBuffer::from(self.values)
+        };
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::from(self.values),
+            data,
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
@@ -578,13 +602,19 @@ impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
 struct NullableDataBlockBuilder {
     inner: Box<dyn DataBlockBuilderImpl>,
     validity: BooleanBufferBuilder,
+    is_exact_capacity: bool,
 }
 
 impl NullableDataBlockBuilder {
-    fn new(inner: Box<dyn DataBlockBuilderImpl>, estimated_size_bytes: usize) -> Self {
+    fn new(
+        inner: Box<dyn DataBlockBuilderImpl>,
+        estimated_size_bytes: usize,
+        is_exact_capacity: bool,
+    ) -> Self {
         Self {
             inner,
             validity: BooleanBufferBuilder::new(estimated_size_bytes * 8),
+            is_exact_capacity,
         }
     }
 }
@@ -605,6 +635,9 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
             selection.start as usize,
             (selection.end - selection.start) as usize,
         );
+        if self.is_exact_capacity {
+            reserve_bitmap_exact(&mut self.validity, bool_buf.len())?;
+        }
         self.validity.append_buffer(&bool_buf);
         Ok(())
     }
@@ -617,6 +650,22 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
             block_info: BlockInfo::new(),
         })
     }
+}
+
+/// Arrow's incremental bitmap growth can double a non-power-of-two reservation.
+/// Rebuild only when growing so retained capacity stays at the selected bit count
+/// rounded to Arrow's allocation alignment, including during subsequent appends.
+fn reserve_bitmap_exact(builder: &mut BooleanBufferBuilder, additional: usize) -> Result<()> {
+    let required = builder
+        .len()
+        .checked_add(additional)
+        .ok_or_else(|| Error::not_supported("Appended bitmap length overflow"))?;
+    if required > builder.capacity() {
+        let mut replacement = BooleanBufferBuilder::new(required);
+        replacement.append_buffer(&builder.finish());
+        *builder = replacement;
+    }
+    Ok(())
 }
 
 /// A data block with no regular structure.  There is no available spot to attach
@@ -1532,15 +1581,23 @@ impl DataBlock {
         }
     }
 
-    fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
+    fn make_builder(
+        &self,
+        estimated_size_bytes: u64,
+        is_exact_capacity: bool,
+    ) -> Box<dyn DataBlockBuilderImpl> {
         match self {
             Self::FixedWidth(inner) => {
                 if inner.bits_per_value == 1 {
-                    Box::new(BitmapDataBlockBuilder::new(estimated_size_bytes))
+                    Box::new(BitmapDataBlockBuilder::new(
+                        estimated_size_bytes,
+                        is_exact_capacity,
+                    ))
                 } else {
                     Box::new(FixedWidthDataBlockBuilder::new(
                         inner.bits_per_value,
                         estimated_size_bytes,
+                        is_exact_capacity,
                     ))
                 }
             }
@@ -1548,17 +1605,21 @@ impl DataBlock {
                 if inner.bits_per_offset == 32 {
                     Box::new(VariableWidthDataBlockBuilder::<i32>::new(
                         estimated_size_bytes,
+                        is_exact_capacity,
                     ))
                 } else if inner.bits_per_offset == 64 {
                     Box::new(VariableWidthDataBlockBuilder::<i64>::new(
                         estimated_size_bytes,
+                        is_exact_capacity,
                     ))
                 } else {
                     todo!()
                 }
             }
             Self::FixedSizeList(inner) => {
-                let inner_builder = inner.child.make_builder(estimated_size_bytes);
+                let inner_builder = inner
+                    .child
+                    .make_builder(estimated_size_bytes, is_exact_capacity);
                 Box::new(FixedSizeListBlockBuilder::new(
                     inner_builder,
                     inner.dimension,
@@ -1568,12 +1629,14 @@ impl DataBlock {
                 // There's no easy way to know what percentage of the data is in the valiidty buffer
                 // but 1/16th seems like a reasonable guess.
                 let estimated_validity_size_bytes = estimated_size_bytes / 16;
-                let inner_builder = nullable
-                    .data
-                    .make_builder(estimated_size_bytes - estimated_validity_size_bytes);
+                let inner_builder = nullable.data.make_builder(
+                    estimated_size_bytes - estimated_validity_size_bytes,
+                    is_exact_capacity,
+                );
                 Box::new(NullableDataBlockBuilder::new(
                     inner_builder,
                     estimated_validity_size_bytes as usize,
+                    is_exact_capacity,
                 ))
             }
             Self::Struct(struct_data_block) => {
@@ -1586,7 +1649,7 @@ impl DataBlock {
                 let child_builders = struct_data_block
                     .children
                     .iter()
-                    .map(|child| child.make_builder(per_child_estimate))
+                    .map(|child| child.make_builder(per_child_estimate, is_exact_capacity))
                     .collect();
                 Box::new(StructDataBlockBuilder::new(child_builders))
             }
@@ -1680,7 +1743,12 @@ fn stitch_offsets<T: ArrowNativeType + std::ops::Add<Output = T> + std::ops::Sub
     if offsets.is_empty() {
         return (LanceBuffer::empty(), Vec::default());
     }
-    let len = offsets.iter().map(|b| b.len()).sum::<usize>();
+    // Each input contributes its values, but only the result needs a leading
+    // offset. Vec capacity is measured in elements, not input buffer bytes.
+    let len = 1 + offsets
+        .iter()
+        .map(|b| (b.len() / std::mem::size_of::<T>()).saturating_sub(1))
+        .sum::<usize>();
     // Note: we are making a copy here, even if there is only one input, because we want to
     // normalize that input if it doesn't start with zero.  This could be micro-optimized out
     // if needed.
@@ -2449,6 +2517,7 @@ trait DataBlockBuilderImpl: std::fmt::Debug {
 #[derive(Debug)]
 pub struct DataBlockBuilder {
     estimated_size_bytes: u64,
+    is_exact_capacity: bool,
     builder: Option<Box<dyn DataBlockBuilderImpl>>,
 }
 
@@ -2456,13 +2525,25 @@ impl DataBlockBuilder {
     pub fn with_capacity_estimate(estimated_size_bytes: u64) -> Self {
         Self {
             estimated_size_bytes,
+            is_exact_capacity: false,
+            builder: None,
+        }
+    }
+
+    /// Reserve value buffers only for appended selections, rather than guessing from
+    /// encoded byte sizes. Bitmap buffers reserve only the required aligned bytes.
+    pub(crate) fn with_exact_capacity() -> Self {
+        Self {
+            estimated_size_bytes: 0,
+            is_exact_capacity: true,
             builder: None,
         }
     }
 
     fn get_builder(&mut self, block: &DataBlock) -> &mut dyn DataBlockBuilderImpl {
         if self.builder.is_none() {
-            self.builder = Some(block.make_builder(self.estimated_size_bytes));
+            self.builder =
+                Some(block.make_builder(self.estimated_size_bytes, self.is_exact_capacity));
         }
         self.builder.as_mut().unwrap().as_mut()
     }
@@ -2505,16 +2586,18 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array,
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, DictionaryArray, FixedSizeListArray,
+        Int8Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray, UInt8Array,
+        UInt16Array,
         cast::AsArray,
-        make_array, new_null_array,
+        make_array, new_empty_array, new_null_array,
         types::{Int8Type, Int32Type, UInt8Type, UInt16Type},
     };
-    use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+    use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer};
     use arrow_data::ArrayData;
 
     use arrow_schema::{DataType, Field, Fields};
+    use lance_arrow::DataTypeExt;
     use lance_core::Error;
     use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
@@ -2528,6 +2611,93 @@ mod tests {
     };
 
     use arrow_array::Array;
+
+    #[rstest]
+    #[case::boolean(0)]
+    #[case::nullable_scalar(1)]
+    #[case::nullable_fsl(2)]
+    #[case::deep_nullable_fsl(3)]
+    fn test_exact_builder_retained_capacity_across_appends(#[case] kind: u8) {
+        // The first selection reserves a non-power-of-two bitmap capacity.
+        // Appending the second crosses that capacity, exposing geometric growth.
+        let rows = 2048;
+        let depth = match kind {
+            2 => 1,
+            3 => 3,
+            _ => 0,
+        };
+        let mut source: ArrayRef = if kind == 0 {
+            Arc::new(BooleanArray::from_iter(
+                (0..rows).map(|i| (i % 5 != 0).then_some(i % 3 == 0)),
+            ))
+        } else {
+            Arc::new(UInt16Array::from_iter(
+                (0..rows * (1 << depth)).map(|i| (i % 5 != 0).then_some(i as u16)),
+            ))
+        };
+        for level in 0..depth {
+            let len = source.len() / 2;
+            source = Arc::new(FixedSizeListArray::new(
+                Arc::new(Field::new("item", source.data_type().clone(), true)),
+                2,
+                source,
+                Some(NullBuffer::from_iter(
+                    (0..len).map(|i| i % (level + 3) != 0),
+                )),
+            ));
+        }
+        let data_type = source.data_type().clone();
+        let block = DataBlock::from_arrays(&[source.clone()], rows as u64);
+        let mut builder = DataBlockBuilder::with_exact_capacity();
+        let mut slices = Vec::new();
+        for selection in [3..1028, 1100..1612] {
+            slices.push(source.slice(selection.start, selection.end - selection.start));
+            builder
+                .append(&block, selection.start as u64..selection.end as u64)
+                .unwrap();
+        }
+        let expected = arrow_select::concat::concat(
+            &slices
+                .iter()
+                .map(|array| array.as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let actual = make_array(builder.finish().into_arrow(data_type, true).unwrap());
+        assert_eq!(actual.to_data(), expected.to_data());
+        fn check_capacity(actual: &ArrayData, expected: &ArrayData) {
+            // Arrow concat may shrink FSL null buffers to unaligned byte lengths.
+            // Our contract permits one aligned allocation per selected bitmap,
+            // but no spare capacity in the Vec-backed value buffers.
+            for (actual_buffer, expected_buffer) in actual.buffers().iter().zip(expected.buffers())
+            {
+                let bound = if matches!(expected.data_type(), DataType::Boolean) {
+                    BooleanBufferBuilder::new(expected.len()).capacity() / 8
+                } else {
+                    expected_buffer.len()
+                };
+                assert!(
+                    actual_buffer.capacity() <= bound,
+                    "value capacity {} exceeds {bound}",
+                    actual_buffer.capacity()
+                );
+            }
+            if let Some(nulls) = actual.nulls() {
+                let bound = BooleanBufferBuilder::new(expected.len()).capacity() / 8;
+                assert!(
+                    nulls.buffer().capacity() <= bound,
+                    "bitmap capacity {} exceeds {bound}",
+                    nulls.buffer().capacity()
+                );
+            }
+            for (actual_child, expected_child) in
+                actual.child_data().iter().zip(expected.child_data())
+            {
+                check_capacity(actual_child, expected_child);
+            }
+        }
+        check_capacity(&actual.to_data(), &expected.to_data());
+    }
 
     #[test]
     fn test_sliced_to_data_block() {
@@ -2591,6 +2761,37 @@ mod tests {
         let data = block.as_variable_width().unwrap();
         assert_eq!(data.offsets, LanceBuffer::reinterpret_vec(vec![0, 1, 3, 6]));
         assert_eq!(data.data, LanceBuffer::copy_slice(b"abcdef"));
+    }
+
+    #[rstest]
+    #[case::binary(DataType::Binary, 4)]
+    #[case::large_binary(DataType::LargeBinary, 8)]
+    fn test_binary_conversion_bounds_offset_allocation(
+        #[case] data_type: DataType,
+        #[case] offset_width: usize,
+        #[values(false, true)] concatenate: bool,
+    ) {
+        let input = BinaryArray::from(vec![b"prefix".as_slice(), b"a", b"", b"bc", b"suffix"]);
+        let input = arrow_cast::cast(&input, &data_type).unwrap();
+        let selected = input.slice(1, 3);
+        let arrays = if concatenate {
+            vec![
+                selected.slice(0, 1),
+                input.slice(0, 0),
+                selected.slice(1, 2),
+            ]
+        } else {
+            vec![selected.clone()]
+        };
+        let block = DataBlock::from_arrays(&arrays, 3);
+        let offsets = &block.as_variable_width_ref().unwrap().offsets;
+        // Four offsets describe these three values, including the empty value.
+        assert_eq!(offsets.len(), 4 * offset_width);
+        assert_eq!(offsets.clone().into_buffer().capacity(), 4 * offset_width);
+        assert_eq!(
+            block.into_arrow(data_type, true).unwrap(),
+            selected.to_data()
+        );
     }
 
     #[test]
@@ -3329,6 +3530,26 @@ mod tests {
                 .into_arrow(DataType::Int32, validate)
                 .expect_err("a short values buffer must be rejected");
         }
+    }
+
+    #[rstest]
+    #[case::float32(DataType::Float32)]
+    #[case::float64(DataType::Float64)]
+    #[case::decimal128(DataType::Decimal128(10, 0))]
+    fn exact_builder_preserves_typed_empty_values(#[case] data_type: DataType) {
+        let expected = new_empty_array(&data_type);
+        let width = data_type.byte_width_opt().unwrap();
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0; width]),
+            bits_per_value: width as u64 * 8,
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        });
+        let mut builder = DataBlockBuilder::with_exact_capacity();
+        builder.append(&block, 1..1).unwrap();
+        let actual = make_array(builder.finish().into_arrow(data_type, true).unwrap());
+        assert_eq!(actual.to_data(), expected.to_data());
+        assert_eq!(actual.get_buffer_memory_size(), 0);
     }
 
     #[rstest]

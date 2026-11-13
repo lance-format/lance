@@ -108,6 +108,10 @@ impl StructuralListScheduler {
 }
 
 impl StructuralFieldScheduler for StructuralListScheduler {
+    fn release_before(&mut self, row: u64) -> Result<()> {
+        self.child.release_before(row)
+    }
+
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[Range<u64>],
@@ -165,6 +169,33 @@ impl StructuralListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralListDecoder {
+    fn decoded_layout(&self, num_rows: u64) -> Result<crate::decoder::DecodedLayout> {
+        let mut layout = self.child.decoded_layout(num_rows)?;
+        let offset_width = match self.data_type {
+            DataType::List(_) => 4,
+            DataType::LargeList(_) => 8,
+            _ => {
+                return Err(lance_core::Error::internal(
+                    "List decoder has a non-list type",
+                ));
+            }
+        };
+        // The unraveler reserves list offsets from the selected level count,
+        // which includes empty/null list markers and can exceed parent rows.
+        let overhead = layout
+            .levels
+            .checked_add(1)
+            .and_then(|levels| levels.checked_mul(offset_width))
+            .and_then(|bytes| bytes.checked_add(layout.levels.div_ceil(8)))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(|| lance_core::Error::not_supported("List layout byte count overflow"))?;
+        layout.bytes = layout
+            .bytes
+            .checked_add(overhead)
+            .ok_or_else(|| lance_core::Error::not_supported("List decoded byte count overflow"))?;
+        Ok(layout)
+    }
+
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         let child_limit = self.child.max_rows_to_drain(num_rows, byte_budget)?;
         let child_plan_rows = child_limit
@@ -205,11 +236,12 @@ impl StructuralFieldDecoder for StructuralListDecoder {
         &self.data_type
     }
 
-    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
-        Err(lance_core::Error::not_supported(
-            "plan_decoded_bytes is not yet supported for fields with repetition (list/repeated types)"
-                .to_string(),
-        ))
+    fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        let mut sizes = [0; 8];
+        for (size, rows) in sizes.iter_mut().zip(crate::decoder::CANDIDATE_BATCH_SIZES) {
+            *size = self.decoded_layout(rows_remaining.min(rows as u64))?.bytes;
+        }
+        Ok(sizes)
     }
 }
 

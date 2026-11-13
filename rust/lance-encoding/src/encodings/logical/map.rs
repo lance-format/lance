@@ -100,6 +100,10 @@ impl StructuralMapScheduler {
 }
 
 impl StructuralFieldScheduler for StructuralMapScheduler {
+    fn release_before(&mut self, row: u64) -> Result<()> {
+        self.child.release_before(row)
+    }
+
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[Range<u64>],

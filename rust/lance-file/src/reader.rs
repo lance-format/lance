@@ -53,6 +53,20 @@ use crate::{
 
 pub(crate) mod structural;
 
+/// The 8 candidate row counts evaluated during byte-budget planning.
+/// Re-exported from lance-encoding for consumers that only depend on lance-file.
+pub use lance_encoding::decoder::CANDIDATE_BATCH_SIZES;
+
+/// Exact decoded byte counts for each [`CANDIDATE_BATCH_SIZES`] entry,
+/// produced by [`ProjectedFileReader::plan_next_decode`].
+///
+/// Index `i` corresponds to `CANDIDATE_BATCH_SIZES[i]` rows, clamped to
+/// `rows_remaining` passed to `plan_next_decode`.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchSizeEstimate {
+    pub exact_bytes: [u64; 8],
+}
+
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read
 pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
@@ -2150,6 +2164,105 @@ impl ProjectedFileReader {
     /// Reads a global buffer by index.
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         self.core.read_global_buffer(index).await
+    }
+
+    /// Returns schema-based decoded byte counts for the next rows in this file,
+    /// for each of [`CANDIDATE_BATCH_SIZES`] candidate row counts.
+    ///
+    /// `row_offset` is the absolute row index within the file (0-based).
+    /// `rows_remaining` is how many rows are left to read from `row_offset`.
+    ///
+    /// The estimates are computed directly from the field schemas: fixed-width
+    /// types are exact; variable-width types use a heuristic constant. This is
+    /// the same estimation logic as the encoding layer's feedback-based path but
+    /// applied per-file so the fragment reader can sum across all files and pick
+    /// a batch size that respects the budget for the whole fragment.
+    pub fn plan_next_decode(&self, rows_remaining: u64) -> Result<BatchSizeEstimate> {
+        use lance_encoding::decoder::estimate_bytes_per_row;
+
+        let schema = self.schema();
+        let bpr = schema
+            .fields
+            .iter()
+            .map(|f| estimate_bytes_per_row(&f.data_type()))
+            .sum::<f64>()
+            .max(1.0) as u64;
+
+        let mut exact_bytes = [0u64; 8];
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(rows_remaining);
+            exact_bytes[i] = rows * bpr;
+        }
+        Ok(BatchSizeEstimate { exact_bytes })
+    }
+
+    /// Creates a single decode task for `num_rows` rows starting at `row_offset`.
+    ///
+    /// This is a thin wrapper around the existing task-stream infrastructure: it
+    /// issues a range read for exactly `num_rows` rows and collects the first
+    /// (and only) task from the resulting stream.
+    pub async fn read_range_task(&self, row_offset: u64, num_rows: u32) -> Result<ReadBatchTask> {
+        let end = row_offset
+            .checked_add(num_rows as u64)
+            .ok_or_else(|| Error::invalid_input("row_offset + num_rows overflows u64"))?;
+        let mut stream = self
+            .read_tasks(
+                ReadBatchParams::Range(row_offset as usize..end as usize),
+                num_rows,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await?;
+        stream.next().await.ok_or_else(|| {
+            Error::internal(format!(
+                "read_range_task produced no tasks for offset={row_offset} num_rows={num_rows}"
+            ))
+        })
+    }
+
+    /// Opens a persistent structural decode stream for byte-budget scanning.
+    ///
+    /// Returns a [`StructuralBatchDecodeStream`] that covers all rows in the file.
+    /// The caller drives pacing via [`StructuralBatchDecodeStream::plan_decoded_bytes`]
+    /// and [`StructuralBatchDecodeStream::drain_task`].
+    ///
+    /// Only valid for v2.1+ structural files. For v2.0 files, use schema-based estimates
+    /// with fresh per-batch decoders instead.
+    pub async fn open_budget_scan(
+        &self,
+    ) -> Result<lance_encoding::decoder::StructuralBatchDecodeStream> {
+        use lance_encoding::decoder::{SchedulerDecoderConfig, open_structural_budget_scan};
+
+        let projection = self.base_projection().clone();
+        let (prepared, _read_len) = self
+            .core
+            .read_projection
+            .prepare(
+                &self.core.metadata_provider,
+                &projection,
+                &self.core.scheduler,
+                &self.core.cache,
+            )
+            .await?;
+
+        let num_rows = self.num_rows();
+        let config = SchedulerDecoderConfig {
+            batch_size: u32::MAX,
+            cache: self.core.cache.clone(),
+            decoder_plugins: self.core.decoder_plugins.clone(),
+            io: self.core.scheduler.clone(),
+            decoder_config: self.core.options.decoder_config.clone(),
+            batch_size_bytes: None,
+        };
+
+        open_structural_budget_scan(
+            prepared.column_infos,
+            num_rows,
+            prepared.decoder_projection.column_indices,
+            prepared.decoder_projection.schema,
+            config,
+        )
+        .await
     }
 }
 
@@ -6207,5 +6320,354 @@ mod tests {
             9
         );
         assert_eq!(validate(empty_struct, true, &[0], vec![9]).unwrap(), 9);
+    }
+
+    async fn open_projected_reader(fs: &FsFixture) -> ProjectedFileReader {
+        // First open as FileReader to get metadata, then re-open as ProjectedFileReader.
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let file_version = file_reader.metadata().version();
+        let base_proj =
+            versions::reader_projection_from_whole_schema(file_reader.schema(), file_version);
+        let metadata = file_reader.metadata().clone();
+
+        let file_scheduler2 = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let io = Arc::new(crate::LanceEncodingsIo::new(file_scheduler2));
+        ProjectedFileReader::try_open_with_file_metadata(
+            io,
+            fs.tmp_path.clone(),
+            Some(base_proj),
+            Arc::<DecoderPlugins>::default(),
+            metadata,
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// plan_next_decode returns exact bytes for fixed-width Int64 column.
+    ///
+    /// Expected: `exact_bytes[i] == CANDIDATE_BATCH_SIZES[i].min(rows) * 8`.
+    #[tokio::test]
+    async fn test_plan_next_decode_fixed_width_exact() {
+        use crate::reader::CANDIDATE_BATCH_SIZES;
+
+        let fs = FsFixture::default();
+        let num_rows = 500u32;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from_iter_values(
+                0..num_rows as i64,
+            ))],
+        )
+        .unwrap();
+        write_lance_file(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let reader = open_projected_reader(&fs).await;
+        let estimate = reader.plan_next_decode(num_rows as u64).unwrap();
+
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(num_rows as u64);
+            assert_eq!(
+                estimate.exact_bytes[i],
+                rows * 8,
+                "candidate index {i}: expected {} * 8 = {} bytes, got {}",
+                rows,
+                rows * 8,
+                estimate.exact_bytes[i]
+            );
+        }
+    }
+
+    /// plan_next_decode sums bytes across multiple fixed-width columns.
+    #[tokio::test]
+    async fn test_plan_next_decode_multi_column_sums() {
+        use crate::reader::CANDIDATE_BATCH_SIZES;
+
+        let fs = FsFixture::default();
+        let num_rows = 500u32;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(
+                    0..num_rows as i64,
+                )),
+                Arc::new(arrow_array::Int32Array::from_iter_values(
+                    0..num_rows as i32,
+                )),
+            ],
+        )
+        .unwrap();
+        write_lance_file(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let reader = open_projected_reader(&fs).await;
+        let estimate = reader.plan_next_decode(num_rows as u64).unwrap();
+
+        // Int64 = 8 bytes/row, Int32 = 4 bytes/row => 12 bytes/row total
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(num_rows as u64);
+            assert_eq!(
+                estimate.exact_bytes[i],
+                rows * 12,
+                "candidate index {i}: expected {} * 12 = {} bytes, got {}",
+                rows,
+                rows * 12,
+                estimate.exact_bytes[i]
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::flat("flat", 12)]
+    #[case::nested("nested", 12)]
+    #[case::nested_many("nested_many", 12)]
+    #[case::nested_repeated("nested_repeated", 300)]
+    #[case::nested_vectors("nested_vectors", 12)]
+    #[case::nested_deep_vectors("nested_deep_vectors", 12)]
+    #[case::repeated_flat("repeated_flat", 300)]
+    #[case::repeated_text("repeated_text", 300)]
+    #[case::unique_text("unique_text", 300)]
+    #[case::skewed_flat("skewed_flat", 300)]
+    #[case::nested_vectors_multiple_chunks("nested_vectors", 1537)]
+    #[case::nested_deep_vectors_multiple_chunks("nested_deep_vectors", 1537)]
+    #[case::unique_text_multiple_chunks("unique_text", 4099)]
+    #[tokio::test]
+    async fn test_budget_scan_preserves_nested_results(
+        #[case] kind: &str,
+        #[case] num_rows: usize,
+        #[values(ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_2)]
+        version: ConcreteFileVersion,
+    ) {
+        use arrow_array::builder::{
+            FixedSizeListBuilder, Float32Builder, LargeBinaryBuilder, ListBuilder, StringBuilder,
+        };
+
+        let mut values = LargeBinaryBuilder::new();
+        let mut lists = ListBuilder::new(LargeBinaryBuilder::new());
+        let mut strings = StringBuilder::new();
+        let is_text = kind.ends_with("text");
+        let repeated = kind.starts_with("repeated") || kind == "nested_repeated";
+        for index in 0..num_rows {
+            let short =
+                is_text || kind == "nested_repeated" || (kind == "skewed_flat" && index < 200);
+            let payload = if short {
+                if repeated {
+                    "same-text".to_string()
+                } else {
+                    format!("item-{index:04}")
+                }
+            } else {
+                char::from(if repeated {
+                    b'a'
+                } else {
+                    b'a' + (index % 26) as u8
+                })
+                .to_string()
+                .repeat(4096)
+            };
+            if index == 1 {
+                values.append_null();
+                strings.append_null();
+                lists.append(false);
+            } else if index == 2 {
+                values.append_value([]);
+                strings.append_value("");
+                lists.append(true);
+            } else {
+                values.append_value(payload.as_bytes());
+                strings.append_value(&payload);
+                let items = match kind {
+                    "nested_many" => 400,
+                    "nested_repeated" => 32,
+                    _ => 1,
+                };
+                for item in 0..items {
+                    if kind == "nested_many" {
+                        if item % 11 == 0 {
+                            lists.values().append_null();
+                        } else {
+                            lists.values().append_value([]);
+                        }
+                    } else {
+                        lists.values().append_value(payload.as_bytes());
+                    }
+                }
+                if index == 3 {
+                    lists.values().append_null();
+                }
+                lists.append(true);
+            }
+        }
+        let column: arrow_array::ArrayRef = if kind == "nested_deep_vectors" {
+            let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(
+                FixedSizeListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2), 2),
+                2,
+            ));
+            for index in 0..num_rows {
+                if index > 2 {
+                    for child in 0..(index % 7 + 1) {
+                        for inner in 0..2 {
+                            for leaf in 0..2 {
+                                vectors
+                                    .values()
+                                    .values()
+                                    .values()
+                                    .values()
+                                    .append_value(index as f32);
+                                vectors.values().values().values().values().append_null();
+                                vectors.values().values().values().append(leaf != 1);
+                            }
+                            vectors.values().values().append(inner != 1);
+                        }
+                        vectors.values().append(child != 1);
+                    }
+                }
+                vectors.append(index != 1);
+            }
+            Arc::new(vectors.finish())
+        } else if kind == "nested_vectors" {
+            let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2));
+            for index in 0..num_rows {
+                if index > 2 {
+                    for child in 0..(index % 7 + 1) {
+                        vectors.values().values().append_value(index as f32);
+                        vectors.values().values().append_value(child as f32);
+                        vectors.values().append(child != 1);
+                    }
+                }
+                vectors.append(index != 1);
+            }
+            Arc::new(vectors.finish())
+        } else if kind.starts_with("nested") {
+            Arc::new(lists.finish())
+        } else if is_text {
+            Arc::new(strings.finish())
+        } else {
+            Arc::new(values.finish())
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            column.data_type().clone(),
+            true,
+        )]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let fs = FsFixture::default();
+        write_lance_file(
+            RecordBatchIterator::new([Ok(expected.clone())], schema.clone()),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let reader = open_projected_reader(&fs).await;
+        let mut scan = reader.open_budget_scan().await.unwrap();
+        let error = scan
+            .drain_task(0)
+            .await
+            .err()
+            .expect("zero rows must not masquerade as EOF");
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("positive row count"));
+        let budget = 16 * 1024;
+        let mut remaining = expected.num_rows() as u64;
+        let mut output = Vec::new();
+        while remaining > 0 {
+            let plan = scan.plan_next_batch(budget).await.unwrap().unwrap();
+            let (rows, estimate) = (plan.num_rows, plan.decoded_bytes);
+            let batch = scan
+                .drain_task(rows)
+                .await
+                .unwrap()
+                .unwrap()
+                .task
+                .await
+                .unwrap();
+            assert_eq!(batch.num_rows(), rows as usize);
+            let retained: usize = batch
+                .columns()
+                .iter()
+                .map(|column| column.get_buffer_memory_size())
+                .sum();
+            fn buffer_layout(array: &arrow_data::ArrayData) -> String {
+                format!(
+                    "{:?}: len={}, buffers={:?}, nulls={:?}, children={:?}",
+                    array.data_type(),
+                    array.len(),
+                    array
+                        .buffers()
+                        .iter()
+                        .map(|buf| (buf.len(), buf.capacity()))
+                        .collect::<Vec<_>>(),
+                    array
+                        .nulls()
+                        .map(|nulls| (nulls.len(), nulls.buffer().capacity())),
+                    array
+                        .child_data()
+                        .iter()
+                        .map(buffer_layout)
+                        .collect::<Vec<_>>()
+                )
+            }
+            assert!(
+                retained as u64 <= estimate,
+                "retained {retained} bytes exceeds planned {estimate}; rows={rows}, remaining={remaining}; {}",
+                buffer_layout(&batch.column(0).to_data())
+            );
+            assert!(
+                retained <= budget as usize,
+                "retained {retained} bytes exceeds {budget}"
+            );
+            remaining -= batch.num_rows() as u64;
+            output.push(batch);
+        }
+        assert!(scan.drain_task(1).await.unwrap().is_none());
+        if is_text {
+            assert!(output.iter().any(|batch| batch.num_rows() >= 4));
+        }
+        if num_rows > 1024 {
+            assert!(output.len() > 1, "fixture must exercise partial drains");
+        }
+        assert_eq!(
+            arrow_select::concat::concat_batches(&schema, &output).unwrap(),
+            expected
+        );
     }
 }

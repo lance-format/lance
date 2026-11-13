@@ -1129,6 +1129,40 @@ impl VariableFullZipDecoder {
 }
 
 impl StructuralPageDecoder for VariableFullZipDecoder {
+    fn decoded_layout(
+        &self,
+        num_rows: u64,
+        _data_type: &arrow_schema::DataType,
+    ) -> Result<crate::decoder::DecodedLayout> {
+        let bytes = self.decoded_bytes(num_rows)?;
+        if num_rows == 0 {
+            return Ok(crate::decoder::DecodedLayout::default());
+        }
+        let start = self.current_idx;
+        let end = usize::try_from(num_rows)
+            .ok()
+            .and_then(|rows| start.checked_add(rows));
+        let counts = end
+            .and_then(|end| {
+                Some((
+                    self.visible_item_counts
+                        .get(end)?
+                        .checked_sub(*self.visible_item_counts.get(start)?)?,
+                    self.repdef_starts
+                        .get(end)?
+                        .checked_sub(*self.repdef_starts.get(start)?)? as u64,
+                ))
+            })
+            .ok_or_else(|| {
+                Error::corrupt_file_named("full-zip", "Invalid repeated layout range")
+            })?;
+        Ok(crate::decoder::DecodedLayout {
+            bytes,
+            values: counts.0,
+            levels: counts.1.max(counts.0).max(num_rows),
+        })
+    }
+
     fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
         if num_rows == 0 {
             return Ok(0);
