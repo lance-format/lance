@@ -16,7 +16,7 @@ use roaring::RoaringBitmap;
 
 use super::{FileFragment, data_file_projection};
 
-/// Bound the transient encoded bytes retained by each warming read to 1 MiB.
+/// Bound each encoded read request to 1 MiB; store layers may coalesce or prefetch.
 const PREWARM_READ_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]
@@ -54,7 +54,7 @@ impl DataPrewarmPlan {
 
     /// Fetch encoded bytes through the query's object-store stack.
     ///
-    /// `concurrency` bounds simultaneous reads; each read retains at most 1 MiB.
+    /// `concurrency` bounds simultaneous reads; each read requests at most 1 MiB.
     /// Completion means reads succeeded, not that cache eviction is prevented.
     pub async fn execute(&self, concurrency: usize) -> Result<()> {
         if concurrency == 0 {
