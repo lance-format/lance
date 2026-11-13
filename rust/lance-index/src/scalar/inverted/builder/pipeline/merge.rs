@@ -12,6 +12,7 @@ use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use fst::Streamer;
+use futures::future::join_all;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
 
@@ -274,6 +275,25 @@ impl PostingCursor {
 struct TermInput {
     token: String,
     batches: Vec<(RecordBatch, u32)>,
+}
+
+async fn read_term(
+    postings: &mut [PostingCursor],
+    sources: &[(usize, usize)],
+    bases: &[u32],
+) -> Result<Vec<(RecordBatch, u32)>> {
+    let reads = postings
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(source, cursor)| {
+            sources
+                .iter()
+                .find_map(|&(index, row)| (index == source).then_some(row))
+                .map(|row| async move { cursor.at(row).await.map(|batch| (batch, bases[source])) })
+        });
+    // Every cursor already owns a separate read reservation. Start independent
+    // reads together, but drain all accepted work even when one read fails.
+    join_all(reads).await.into_iter().collect()
 }
 
 fn encode_terms(
@@ -608,7 +628,7 @@ impl FinalMerge {
             .checked_mul(4)
             .and_then(|bytes| bytes.checked_add(16))
             .ok_or_else(|| Error::index("FTS document row bound overflow"))?;
-        let doc_batch_rows = (self.budget / 32 / doc_row_bytes).min(4096) as usize;
+        let doc_batch_rows = (self.budget / 32 / doc_row_bytes).min(65_536) as usize;
         if doc_batch_rows == 0 {
             return Ok(None);
         }
@@ -629,22 +649,21 @@ impl FinalMerge {
             if reader.num_rows() != run.docs {
                 return Err(Error::index("FTS run document count differs from manifest"));
             }
-            for start in (0..run.docs).step_by(doc_batch_rows) {
-                check_running(&self.stop)?;
-                let batch = reader
-                    .read_range(
-                        start..(start + doc_batch_rows).min(run.docs),
-                        Some(&[NUM_TOKEN_COL]),
-                    )
-                    .await?;
-                lengths.extend_from_slice(
-                    batch
-                        .column_by_name(NUM_TOKEN_COL)
-                        .ok_or_else(|| Error::index(format!("missing FTS column {NUM_TOKEN_COL}")))?
-                        .as_primitive::<arrow_array::types::UInt32Type>()
-                        .values(),
-                );
-            }
+            // Metadata admission charges sixteen bytes per document. The final
+            // lengths slab and one projected UInt32 input each use four, so a
+            // single sequential read fits the existing reservation without
+            // hundreds of small remote requests. Identities/coordinates below
+            // remain byte-windowed because their rank is caller-driven.
+            let batch = reader
+                .read_range(0..run.docs, Some(&[NUM_TOKEN_COL]))
+                .await?;
+            lengths.extend_from_slice(
+                batch
+                    .column_by_name(NUM_TOKEN_COL)
+                    .ok_or_else(|| Error::index(format!("missing FTS column {NUM_TOKEN_COL}")))?
+                    .as_primitive::<arrow_array::types::UInt32Type>()
+                    .values(),
+            );
             doc_readers.push(reader);
             let reader = self
                 .store
@@ -707,10 +726,7 @@ impl FinalMerge {
                 writer.write_record_batch(batch.1).await?;
                 work = 0;
             }
-            let mut batches = Vec::with_capacity(sources.len());
-            for (source, row) in sources {
-                batches.push((postings[source].at(row).await?, bases[source]));
-            }
+            let batches = read_term(&mut postings, &sources, &bases).await?;
             inputs.push(TermInput { token, batches });
             work += term_work;
             if inputs.len() == METADATA_ROWS {

@@ -238,6 +238,7 @@ async fn metadata_over_budget_keeps_valid_first_level_outputs() -> Result<()> {
 enum Fault {
     None,
     Read,
+    ConcurrentRead,
     Open,
     LaterOpen,
     Write,
@@ -249,12 +250,17 @@ enum Fault {
 struct Probe {
     fault: Fault,
     reads: std::sync::atomic::AtomicUsize,
+    doc_reads: std::sync::atomic::AtomicUsize,
     writes: std::sync::atomic::AtomicUsize,
     manifest_live: std::sync::atomic::AtomicUsize,
     manifest_peak: std::sync::atomic::AtomicUsize,
     posting_bytes_peak: std::sync::atomic::AtomicUsize,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    other_started: tokio::sync::Notify,
+    other_release: tokio::sync::Notify,
+    read_failed: tokio::sync::Notify,
+    other_finished: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -270,12 +276,17 @@ impl ProbeStore {
             probe: Arc::new(Probe {
                 fault,
                 reads: Default::default(),
+                doc_reads: Default::default(),
                 writes: Default::default(),
                 manifest_live: Default::default(),
                 manifest_peak: Default::default(),
                 posting_bytes_peak: Default::default(),
                 started: Default::default(),
                 release: Default::default(),
+                other_started: Default::default(),
+                other_release: Default::default(),
+                read_failed: Default::default(),
+                other_finished: Default::default(),
             }),
         }
     }
@@ -334,7 +345,8 @@ impl IndexStore for ProbeStore {
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let reader = self.inner.open_index_file(name).await?;
         let is_manifest = name.ends_with(".merge.lance");
-        if is_manifest || name.ends_with("invert.lance") {
+        let is_documents = name.ends_with("docs.lance");
+        if is_manifest || is_documents || name.ends_with("invert.lance") {
             if is_manifest {
                 let live = self.probe.manifest_live.fetch_add(1, Ordering::Relaxed) + 1;
                 self.probe.manifest_peak.fetch_max(live, Ordering::Relaxed);
@@ -343,6 +355,7 @@ impl IndexStore for ProbeStore {
                 inner: reader,
                 probe: self.probe.clone(),
                 is_manifest,
+                is_documents,
             }))
         } else {
             Ok(reader)
@@ -366,6 +379,7 @@ struct ProbeReader {
     inner: Arc<dyn IndexReader>,
     probe: Arc<Probe>,
     is_manifest: bool,
+    is_documents: bool,
 }
 
 impl Drop for ProbeReader {
@@ -391,20 +405,40 @@ impl IndexReader for ProbeReader {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
         assert!(
-            self.is_manifest || range.len() <= 4096,
+            self.is_manifest || self.is_documents || range.len() <= 4096,
             "external merge must bound rows even for empty payloads"
         );
-        if !self.is_manifest {
-            self.probe.reads.fetch_add(1, Ordering::Relaxed);
+        let is_posting = !self.is_manifest && !self.is_documents;
+        let ticket = if is_posting {
+            self.probe.reads.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        if self.is_documents {
+            self.probe.doc_reads.fetch_add(1, Ordering::Relaxed);
         }
-        if !self.is_manifest && self.probe.fault == Fault::Read {
+        if is_posting && self.probe.fault == Fault::Read {
             return Err(Error::execution("injected final read"));
         }
+        if is_posting && self.probe.fault == Fault::ConcurrentRead {
+            if ticket == 0 {
+                self.probe.release.notified().await;
+                self.probe.read_failed.notify_one();
+                return Err(Error::execution("injected concurrent final read"));
+            }
+            if ticket == 1 {
+                self.probe.other_started.notify_one();
+                self.probe.other_release.notified().await;
+            }
+        }
         let batch = self.inner.read_range(range, projection).await?;
-        if !self.is_manifest {
+        if is_posting {
             self.probe
                 .posting_bytes_peak
                 .fetch_max(batch.get_array_memory_size(), Ordering::Relaxed);
+            if self.probe.fault == Fault::ConcurrentRead && ticket == 1 {
+                self.probe.other_finished.store(true, Ordering::Relaxed);
+            }
         }
         Ok(batch)
     }
@@ -500,6 +534,87 @@ async fn small_postings_fill_the_admitted_read_window() -> Result<()> {
         "small posting rows must amortize remote reads across the admitted byte window"
     );
     assert!(store.probe.posting_bytes_peak.load(Ordering::Relaxed) <= (64 << 20) / (8 * 4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_reads_use_admitted_metadata_and_byte_windows() -> Result<()> {
+    let inner = store();
+    let mut input = WorkerOutput::default();
+    for id in 0..4 {
+        let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+            id,
+            false,
+            TokenSetFormat::Fst,
+            InvertedListFormatVersion::V3,
+            256,
+        );
+        builder.tokens.get_or_add("word");
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            builder.posting_tail_codec,
+            builder.block_size,
+        );
+        for doc in 0..20_000u32 {
+            builder
+                .docs
+                .append_with_doc_index(id * 100_000 + u64::from(doc), 1, &[])
+                .unwrap();
+            posting.add(doc, PositionRecorder::Count(1));
+        }
+        builder.posting_lists.push(posting);
+        let (id, files) = write_run(
+            builder,
+            inner.as_ref(),
+            PartitionWriteTarget::Final,
+            &Stop::default(),
+        )
+        .await?;
+        input.partitions.push(id);
+        input.files.extend(files);
+    }
+    let store = ProbeStore::new(inner, Fault::None);
+    let mut ctx = merger(Arc::new(store.clone()), false);
+    ctx.budget = 128 << 20;
+    let output = ctx.finish(input).await?;
+    assert_eq!(output.partitions.len(), 1);
+    assert!(
+        store.probe.doc_reads.load(Ordering::Relaxed) <= 8,
+        "admitted lengths and small document files must not require many remote round trips"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_posting_read_failure_drains_other_reads() -> Result<()> {
+    let inner = store();
+    let input = inputs(inner.as_ref(), true, true).await?;
+    let store = ProbeStore::new(inner, Fault::ConcurrentRead);
+    let ctx = merger(Arc::new(store.clone()), true);
+    let mut task = tokio::spawn(async move { ctx.finish(input).await });
+    let overlaps = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        store.probe.other_started.notified(),
+    )
+    .await
+    .is_ok();
+    store.probe.release.notify_waiters();
+    if overlaps {
+        store.probe.read_failed.notified().await;
+        let early = tokio::time::timeout(std::time::Duration::from_millis(20), &mut task).await;
+        store.probe.other_release.notify_waiters();
+        assert!(
+            early.is_err(),
+            "an accepted read must drain before the first error returns"
+        );
+    } else {
+        store.probe.other_release.notify_waiters();
+    }
+    let error = task.await.unwrap().err().expect("injected read failure");
+    assert!(matches!(error, Error::Execution { .. }));
+    assert!(error.to_string().contains("injected concurrent final read"));
+    assert!(overlaps, "independent admitted input reads must overlap");
+    assert!(store.probe.other_finished.load(Ordering::Relaxed));
     Ok(())
 }
 
