@@ -165,7 +165,8 @@ impl CacheKey for RowIdFragmentSpanKey {
     }
 }
 
-/// An immutable fragment's prepared row-ID lookup, including effective deletions.
+/// A fragment lookup, normally independent of snapshot deletions.
+/// A deletion identity is present only for a source that needs snapshot preparation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreparedRowIdFragmentKey {
     pub source: InternalCacheKey,
@@ -184,7 +185,7 @@ impl CacheKey for PreparedRowIdFragmentKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.prepared-row-id-fragment", 1)
+        CacheKeySchema::new("lance.dataset.prepared-row-id-fragment", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -195,6 +196,32 @@ impl CacheKey for PreparedRowIdFragmentKey {
         } else {
             builder.write_none();
         }
+    }
+}
+
+/// Snapshot deletion visibility, charged separately from shared row-ID lookups.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowIdFragmentDeletionKey {
+    pub deletion: InternalCacheKey,
+}
+
+impl CacheKey for RowIdFragmentDeletionKey {
+    type ValueType = lance_core::utils::deletion::DeletionVector;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment_deletion")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdFragmentDeletion"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-fragment-deletion", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.deletion.as_bytes());
     }
 }
 

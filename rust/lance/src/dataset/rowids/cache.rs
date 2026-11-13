@@ -14,6 +14,7 @@ use lance_table::io::deletion::read_deletion_file;
 use lance_table::rowids::{FragmentRowIdIndex, RowIdSequence};
 
 use crate::session::caches::{DeletionFileKey, RowIdSequenceKey};
+use crate::session::index_caches::RowIdFragmentDeletionKey;
 use crate::{Dataset, Error, Result};
 
 /// Locks live only while a caller builds or waits. The registry holds no indices
@@ -150,6 +151,29 @@ pub(super) async fn load_source(
         row_id_sequence: sequence,
         deletion_vector,
     })
+}
+
+pub(super) async fn load_deletions(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    deletion: InternalCacheKey,
+) -> Result<Arc<DeletionVector>> {
+    let file = fragment
+        .deletion_file
+        .as_ref()
+        .ok_or_else(|| Error::internal("row id deletion identity has no deletion file"))?;
+    dataset
+        .index_cache
+        .get_or_insert_with_key(RowIdFragmentDeletionKey { deletion }, || async {
+            read_deletion_file(
+                fragment.id,
+                file,
+                &dataset.dataset_dir_for_deletion(file)?,
+                dataset.object_store_for_deletion(file).await?.as_ref(),
+            )
+            .await
+        })
+        .await
 }
 
 fn write_base_identity(
