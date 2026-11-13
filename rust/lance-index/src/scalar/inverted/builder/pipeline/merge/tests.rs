@@ -184,8 +184,18 @@ async fn serialized_target_retains_valid_larger_inputs() -> Result<()> {
 async fn merges_persisted_runs_preserving_documents(
     #[case] positions: bool,
     #[case] coordinates: bool,
+    #[values(
+        lance_file::version::ConcreteFileVersion::V2_0,
+        lance_file::version::ConcreteFileVersion::V2_2
+    )]
+    file_version: lance_file::version::ConcreteFileVersion,
 ) -> Result<()> {
-    let store = store();
+    let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::with_format_version(
+        Arc::new(ObjectStore::memory()),
+        Path::from("index"),
+        Arc::new(LanceCache::no_cache()),
+        file_version,
+    ));
     let output = merger(store.clone(), positions)
         .finish(inputs(store.as_ref(), positions, coordinates).await?)
         .await?;
@@ -270,6 +280,104 @@ async fn merges_persisted_runs_preserving_documents(
             .await
             .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_position_streams_roundtrip_through_current_file_chunks() -> Result<()> {
+    let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::with_format_version(
+        Arc::new(ObjectStore::memory()),
+        Path::from("index"),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let positions = (0..32_768_u32)
+        .scan(0_u32, |position, i| {
+            *position += i % 17 + 1;
+            Some(*position)
+        })
+        .collect::<Vec<_>>();
+    let mut input = WorkerOutput::default();
+    for id in 0..2_u64 {
+        let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+            id,
+            true,
+            TokenSetFormat::Fst,
+            InvertedListFormatVersion::V3,
+            256,
+        );
+        builder.tokens.get_or_add("large");
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            true,
+            builder.posting_tail_codec,
+            builder.block_size,
+        );
+        for doc in 0..4_u32 {
+            builder
+                .docs
+                .append(id * 100 + u64::from(doc), positions.last().unwrap() + 1);
+            posting.add(doc, PositionRecorder::Position(positions.clone().into()));
+        }
+        builder.posting_lists.push(posting);
+        let (id, files) = write_run(
+            builder,
+            store.as_ref(),
+            PartitionWriteTarget::Final,
+            &Stop::default(),
+        )
+        .await?;
+        input.partitions.push(id);
+        input.files.extend(files);
+    }
+    let mut context = merger(store.clone(), true);
+    context.budget = 256 << 20;
+    let output = context.finish(input).await?;
+    assert_eq!(output.partitions.len(), 1);
+    let id = output.partitions[0];
+    let reader = store
+        .open_index_file(&PartitionWriteTarget::Final.posting_path(id))
+        .await?;
+    let batch = reader.read_range(0..1, None).await?;
+    let schema: Schema = reader.schema().into();
+    assert_eq!(
+        schema
+            .field_with_name(COMPRESSED_POSITION_COL)?
+            .metadata()
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .map(String::as_str),
+        Some(STRUCTURAL_ENCODING_MINIBLOCK)
+    );
+    let ordinary_schema =
+        inverted_list_schema_for_version_with_block_size(true, InvertedListFormatVersion::V3, 256);
+    assert!(
+        !ordinary_schema
+            .field_with_name(COMPRESSED_POSITION_COL)?
+            .metadata()
+            .contains_key(STRUCTURAL_ENCODING_META_KEY)
+    );
+    let batch = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec())?;
+    assert!(
+        batch[COMPRESSED_POSITION_COL]
+            .as_binary::<i64>()
+            .value(0)
+            .len()
+            > 32 * 1024
+    );
+    let max_score = batch[MAX_SCORE_COL]
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .value(0);
+    let length = batch[LENGTH_COL]
+        .as_primitive::<arrow_array::types::UInt32Type>()
+        .value(0);
+    let posting = PostingList::from_batch(&batch, Some(max_score), Some(length))?;
+    let mut docs = Vec::new();
+    for (doc, frequency, actual) in posting.iter() {
+        assert_eq!(frequency, positions.len() as u32);
+        assert_eq!(actual.unwrap().collect::<Vec<_>>(), positions);
+        docs.push(doc);
+    }
+    docs.sort_unstable();
+    assert_eq!(docs, (0..8_u64).collect::<Vec<_>>());
     Ok(())
 }
 

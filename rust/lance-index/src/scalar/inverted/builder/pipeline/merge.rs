@@ -10,11 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fst::Streamer;
 use futures::future::join_all;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
+use lance_encoding::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
 
 use super::super::{
     DocSet, IndexFile, IndexStore, InnerBuilder, InvertedIndexBuilder, InvertedListFormatVersion,
@@ -24,6 +25,7 @@ use super::super::{
 };
 use super::Stop;
 use crate::scalar::IndexReader;
+use crate::scalar::inverted::index::COMPRESSED_POSITION_COL;
 
 const RETAINED: &str = "retained_bytes";
 const SCRATCH: &str = "scratch_bytes";
@@ -33,6 +35,65 @@ const METADATA_ROWS: usize = 128;
 // goals. Amortize remote latency for small terms while the byte quota below
 // remains the primary bound; cap rows too for zero-sized posting payloads.
 const POSTING_READ_ROWS: usize = 4096;
+// Existing u32 mini-block metadata addresses at most 2 GiB per chunk.
+// Keep header/alignment headroom; larger valid terms retain automatic encoding.
+const MAX_POSITION_CHUNK_WORK: u64 = (1 << 31) - (1 << 20);
+
+fn posting_schema(
+    with_position: bool,
+    format: InvertedListFormatVersion,
+    block_size: usize,
+    chunk_positions: bool,
+) -> SchemaRef {
+    let schema =
+        inverted_list_schema_for_version_with_block_size(with_position, format, block_size);
+    if !with_position || !chunk_positions {
+        return schema;
+    }
+    // FullZip unzips the containing page before selecting one term. Larger
+    // final partitions amplify that temporary memory. Existing mini-block
+    // encoding lets the reader schedule only the selected term's chunks.
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.name() == COMPRESSED_POSITION_COL {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(
+                    STRUCTURAL_ENCODING_META_KEY.into(),
+                    STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                );
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+fn without_position_chunk_hint(schema: Schema) -> Schema {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.name() == COMPRESSED_POSITION_COL
+                && field
+                    .metadata()
+                    .get(STRUCTURAL_ENCODING_META_KEY)
+                    .map(String::as_str)
+                    == Some(STRUCTURAL_ENCODING_MINIBLOCK)
+            {
+                let mut metadata = field.metadata().clone();
+                metadata.remove(STRUCTURAL_ENCODING_META_KEY);
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
 
 #[derive(Clone, Copy, Default)]
 struct Bounds {
@@ -600,6 +661,7 @@ impl FinalMerge {
         }
         let mut terms = Terms::new(&tokens)?;
         let mut count = 0u64;
+        let mut chunk_positions = true;
         // Validate every hot term before creating output or reading posting
         // payloads. An oversized term narrows fan-in, never forces an unbounded
         // decode or converts the whole group back into an in-memory builder.
@@ -617,6 +679,7 @@ impl FinalMerge {
             if work > work_limit || count >= u32::MAX as u64 {
                 return Ok(None);
             }
+            chunk_positions &= work <= MAX_POSITION_CHUNK_WORK;
             count += 1;
             if count.is_multiple_of(METADATA_ROWS as u64) {
                 check_running(&self.stop)?;
@@ -638,10 +701,11 @@ impl FinalMerge {
         let mut lengths = Vec::with_capacity(doc_count);
         let mut doc_readers = Vec::with_capacity(runs.len());
         let mut postings = Vec::with_capacity(runs.len());
-        let schema = inverted_list_schema_for_version_with_block_size(
+        let schema = posting_schema(
             self.with_position,
             InvertedListFormatVersion::V3,
             self.block_size,
+            chunk_positions,
         );
         for (index, run) in runs.iter().enumerate() {
             check_running(&self.stop)?;
@@ -673,7 +737,13 @@ impl FinalMerge {
                 .open_index_file(&self.target.posting_path(run.id))
                 .await?;
             let input_schema: Schema = reader.schema().into();
-            if input_schema != *schema {
+            if without_position_chunk_hint(input_schema)
+                != *inverted_list_schema_for_version_with_block_size(
+                    self.with_position,
+                    InvertedListFormatVersion::V3,
+                    self.block_size,
+                )
+            {
                 return Err(Error::index("FTS run posting schemas differ"));
             }
             if reader.num_rows() != run.terms {
@@ -860,7 +930,7 @@ pub(super) async fn write_run(
     stop: &Stop,
 ) -> Result<(u64, Vec<IndexFile>)> {
     check_running(stop)?;
-    let (mut builder, manifest) = spawn_cpu(move || {
+    let (mut builder, manifest, chunk_positions) = spawn_cpu(move || {
         order_run(&mut builder);
         let retained = builder
             .posting_lists
@@ -872,6 +942,11 @@ pub(super) async fn write_run(
             .iter()
             .map(|posting| posting.merge_scratch_bytes())
             .collect::<Result<Vec<_>>>()?;
+        let chunk_positions = retained.iter().zip(&scratch).all(|(&retained, &scratch)| {
+            Bounds { retained, scratch }
+                .work_bytes()
+                .is_ok_and(|work| work <= MAX_POSITION_CHUNK_WORK)
+        });
         let schema = Schema::new_with_metadata(
             vec![
                 Field::new(RETAINED, DataType::UInt64, false),
@@ -896,7 +971,7 @@ pub(super) async fn write_run(
                 Arc::new(UInt64Array::from(scratch)),
             ],
         )?;
-        Result::Ok((builder, manifest))
+        Result::Ok((builder, manifest, chunk_positions))
     })
     .await?;
     check_running(stop)?;
@@ -907,7 +982,13 @@ pub(super) async fn write_run(
     writer.write_record_batch(manifest).await?;
     writer.finish().await?;
     check_running(stop)?;
-    let files = builder.write_to(store, target).await?;
+    let schema = posting_schema(
+        builder.with_position,
+        builder.format_version,
+        builder.block_size,
+        chunk_positions,
+    );
+    let files = builder.write_to_with_schema(store, target, schema).await?;
     Ok((id, files))
 }
 

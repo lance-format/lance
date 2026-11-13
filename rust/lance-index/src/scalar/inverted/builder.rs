@@ -1447,9 +1447,23 @@ impl InnerBuilder {
         store: &dyn IndexStore,
         target: PartitionWriteTarget,
     ) -> Result<Vec<IndexFile>> {
+        let schema = inverted_list_schema_for_version_with_block_size(
+            self.with_position,
+            self.format_version,
+            self.block_size,
+        );
+        self.write_to_with_schema(store, target, schema).await
+    }
+
+    async fn write_to_with_schema(
+        &mut self,
+        store: &dyn IndexStore,
+        target: PartitionWriteTarget,
+        schema: SchemaRef,
+    ) -> Result<Vec<IndexFile>> {
         let docs = Arc::new(std::mem::take(&mut self.docs));
         let files = vec![
-            self.write_posting_lists(store, docs.clone(), &target.posting_path(self.id))
+            self.write_posting_lists(store, docs.clone(), &target.posting_path(self.id), schema)
                 .await?,
             self.write_tokens(store, &target.token_path(self.id))
                 .await?,
@@ -1465,18 +1479,10 @@ impl InnerBuilder {
         store: &dyn IndexStore,
         docs: Arc<DocSet>,
         path: &str,
+        schema: SchemaRef,
     ) -> Result<IndexFile> {
         let id = self.id;
-        let mut writer = store
-            .new_index_file(
-                path,
-                inverted_list_schema_for_version_with_block_size(
-                    self.with_position,
-                    self.format_version,
-                    self.block_size,
-                ),
-            )
-            .await?;
+        let mut writer = store.new_index_file(path, schema.clone()).await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
 
         log::info!(
@@ -1487,11 +1493,6 @@ impl InnerBuilder {
         );
         let with_position = self.with_position;
         let format_version = self.format_version;
-        let schema = inverted_list_schema_for_version_with_block_size(
-            self.with_position,
-            self.format_version,
-            self.block_size,
-        );
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
         let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
@@ -4111,8 +4112,13 @@ mod tests {
 
         let store = CountingStore::new();
         let docs = Arc::new(std::mem::take(&mut builder.docs));
+        let schema = inverted_list_schema_for_version_with_block_size(
+            builder.with_position,
+            builder.format_version,
+            builder.block_size,
+        );
         builder
-            .write_posting_lists(&store, docs, &posting_file_path(0))
+            .write_posting_lists(&store, docs, &posting_file_path(0), schema)
             .await?;
 
         assert_eq!(store.write_count(), 1);
