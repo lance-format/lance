@@ -327,6 +327,68 @@ async fn tagged_table_installs_a_new_user_index() {
     assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
 }
 
+/// The second segment replays the first commit from its transaction file,
+/// which stores the keys-only entry in the suffix layout.
+#[rstest::rstest]
+#[case::same_declaration("w", true)]
+#[case::different_carried_field("i", false)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_replays_staged_keys_only_segments_across_another_session(
+    #[case] carried_by_second: &str,
+    #[case] lands: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    let [v, w, carried] =
+        ["v", "w", carried_by_second].map(|name| dataset.schema().field_id(name).unwrap());
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+    let mut staged = Vec::new();
+    for (fragment, carried) in [(10, w), (11, carried)] {
+        let segment = dataset
+            .create_index_builder(&["v"], IndexType::BTree, &params)
+            .fragments(vec![fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        staged.push(IndexMetadata {
+            fields: vec![v],
+            covering_fields: vec![carried],
+            ..segment
+        });
+    }
+    let second = staged.pop().unwrap();
+    dataset
+        .commit_existing_index_segments("v_idx", "v", staged)
+        .await
+        .unwrap();
+
+    let committed = fresh_session(dir.as_str())
+        .await
+        .commit_existing_index_segments("v_idx", "v", vec![second])
+        .await;
+
+    if !lands {
+        let error = committed.unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be carried across"),
+            "unexpected error: {error}"
+        );
+        return;
+    }
+    committed.unwrap();
+    let stored = crate::index::loading::load_all_indices(&fresh_session(dir.as_str()).await)
+        .await
+        .unwrap();
+    let segments: Vec<_> = stored.iter().filter(|idx| idx.name == "v_idx").collect();
+    assert_eq!(segments.len(), 2);
+    assert!(
+        segments
+            .iter()
+            .all(|segment| segment.keyed_field() == Some(v) && segment.covering_fields == [w])
+    );
+}
+
 /// A user index built before a stable partition and committed after it is
 /// rebased across the rewrite by the conflict resolver: it lands with its
 /// provenance (the retired sources) and translates, so it answers for the

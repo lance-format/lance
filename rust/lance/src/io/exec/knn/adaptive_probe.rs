@@ -239,7 +239,7 @@ fn effort_scales(k: usize, metric: DistanceType) -> Option<(f64, f64)> {
 
 /// Interpolate between positive partition budgets, preserving both anchor bounds
 /// when floating-point rounding puts the result just outside the interval.
-fn interpolate_budget(effort: f64, start: (f64, usize), end: (f64, usize)) -> usize {
+pub(super) fn interpolate_budget(effort: f64, start: (f64, usize), end: (f64, usize)) -> usize {
     let fraction = (effort - start.0) / (end.0 - start.0);
     let budget = start.1 as f64 * (end.1 as f64 / start.1 as f64).powf(fraction);
     (budget.ceil() as usize).clamp(start.1, end.1)
