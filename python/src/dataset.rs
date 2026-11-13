@@ -40,7 +40,7 @@ use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
-    MaterializationStyle, MultivectorAlgorithm, RowAddrMask,
+    MaterializationStyle, RowAddrMask,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
@@ -1207,15 +1207,6 @@ impl Dataset {
                     None
                 };
 
-            let multivector_algorithm = match nearest.get_item("multivector_algorithm")? {
-                Some(algorithm) if !algorithm.is_none() => Some(
-                    algorithm
-                        .extract::<String>()?
-                        .parse::<MultivectorAlgorithm>()
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                ),
-                _ => None,
-            };
             let warp_imputation_rank: Option<usize> =
                 match nearest.get_item("warp_imputation_rank")? {
                     Some(rank) if !rank.is_none() => Some(rank.extract()?),
@@ -1243,9 +1234,6 @@ impl Dataset {
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
                     s = s.search_effort(search_effort)?;
-                    if let Some(algorithm) = multivector_algorithm {
-                        s = s.multivector_algorithm(algorithm);
-                    }
                     if let Some(rank) = warp_imputation_rank {
                         s = s.warp_imputation_rank(rank);
                     }

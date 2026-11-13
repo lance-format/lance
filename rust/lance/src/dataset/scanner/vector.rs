@@ -63,9 +63,7 @@ use crate::io::exec::{
 };
 use crate::{Error, Result};
 
-use super::{
-    DEFAULT_XTR_OVERFETCH, FilterPlan, MultivectorAlgorithm, PlannedFilteredScan, Scanner,
-};
+use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
 /// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;
@@ -450,38 +448,18 @@ impl Scanner {
                             "quantized refinement is not supported for multivector columns",
                         ));
                     }
-                    let algorithm = match self.multivector_algorithm {
-                        Some(algorithm) => algorithm,
-                        None if warp_supports_segments(
-                            &self.dataset,
-                            &q.column,
+                    // XTR remains for the indices WARP cannot search.
+                    if warp_supports_segments(&self.dataset, &q.column, &index_segments).await? {
+                        self.multivec_warp_ann(
+                            &q,
                             &index_segments,
+                            filter_plan,
+                            overlay_block.clone(),
                         )
-                        .await? =>
-                        {
-                            MultivectorAlgorithm::Warp
-                        }
-                        None => MultivectorAlgorithm::Xtr,
-                    };
-                    match algorithm {
-                        MultivectorAlgorithm::Xtr => {
-                            self.multivec_ann(
-                                &q,
-                                &index_segments,
-                                filter_plan,
-                                overlay_block.clone(),
-                            )
+                        .await?
+                    } else {
+                        self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
                             .await?
-                        }
-                        MultivectorAlgorithm::Warp => {
-                            self.multivec_warp_ann(
-                                &q,
-                                &index_segments,
-                                filter_plan,
-                                overlay_block.clone(),
-                            )
-                            .await?
-                        }
                     }
                 }
                 _ => unreachable!(),
@@ -1456,9 +1434,8 @@ impl Scanner {
             minimum_nprobes: q.minimum_nprobes,
             maximum_nprobes: q.maximum_nprobes,
             search_effort: q.search_effort,
-            imputation_rank: self
-                .warp_imputation_rank
-                .unwrap_or(q.k * *DEFAULT_XTR_OVERFETCH as usize),
+            imputation_rank: self.warp_imputation_rank,
+            k: q.k,
             approx_mode: q.approx_mode,
         };
         let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;

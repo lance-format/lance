@@ -36,8 +36,8 @@ use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsC
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::warp::{
-    Stride, centroid_similarities, merge_strides, merge_top_k, missing_similarity,
-    probe_partitions, split_row_ids, top_k_documents,
+    Stride, centroid_similarities, default_imputation_rank, merge_strides, merge_top_k,
+    missing_similarity, probe_partitions, split_row_ids, top_k_documents,
 };
 use lance_index::vector::{ApproxMode, PreparedPartitionRows, Query, VectorIndex};
 use lance_linalg::distance::{DistanceType, dot_f32};
@@ -100,8 +100,12 @@ pub struct WarpParams {
     /// The search effort in [0, 1], as in [`Query::search_effort`].
     pub search_effort: f64,
     /// The rank `t'` whose estimated similarity is imputed for unobserved
-    /// documents.
-    pub imputation_rank: usize,
+    /// documents; unset uses [`default_imputation_rank`] over the searched
+    /// segments.
+    pub imputation_rank: Option<usize>,
+    /// The number of documents requested, which sets the default `t'` of
+    /// indices with many partitions.
+    pub k: usize,
     /// How the partitions' quantized tokens are scored, as in
     /// [`Query::approx_mode`].
     pub approx_mode: ApproxMode,
@@ -118,7 +122,8 @@ impl WarpParams {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             search_effort: 0.5,
-            imputation_rank,
+            imputation_rank: Some(imputation_rank),
+            k: 10,
             approx_mode: ApproxMode::default(),
         }
     }
@@ -185,11 +190,6 @@ pub async fn warp_select(
         return Err(Error::invalid_input(format!(
             "search_effort must be finite and in [0, 1], got {search_effort}"
         )));
-    }
-    if imputation_rank == 0 {
-        return Err(Error::invalid_input(
-            "WARP imputation_rank must be at least 1, got 0",
-        ));
     }
     if dim == 0 || !query_tokens.len().is_multiple_of(dim) || query_tokens.is_empty() {
         return Err(Error::invalid_input(format!(
@@ -270,6 +270,10 @@ pub async fn warp_select(
             (0..index.total_partitions()).map(|partition| index.partition_size(partition) as u32)
         })
         .collect::<Arc<[u32]>>();
+    let imputation_rank = imputation_rank.unwrap_or_else(|| {
+        let num_tokens = partition_sizes.iter().map(|&size| size as u64).sum();
+        default_imputation_rank(num_tokens, partition_sizes.len(), params.k)
+    });
     let nprobes = indices
         .iter()
         .map(|index| params.segment_nprobe(index.total_partitions()))
@@ -683,7 +687,7 @@ fn cosine_similarity_conversion(index: &dyn VectorIndex, uuid: Uuid) -> Result<f
     if index.as_any().is::<IVFIndex>() {
         return Err(Error::not_supported(format!(
             "WARP search does not support the legacy IVF_PQ index format of segment {uuid}; \
-             rebuild the index or use MultivectorAlgorithm::Xtr"
+             rebuild the index"
         )));
     }
     if index.metric_type() != DistanceType::Cosine {
@@ -696,7 +700,7 @@ fn cosine_similarity_conversion(index: &dyn VectorIndex, uuid: Uuid) -> Result<f
     if !matches!(sub_index, SubIndexType::Flat) {
         return Err(Error::not_supported(format!(
             "WARP search does not support the {sub_index} sub-index of segment {uuid}, \
-             which may skip tokens of a partition; use MultivectorAlgorithm::Xtr"
+             which may skip tokens of a partition"
         )));
     }
     match quantization {
@@ -796,6 +800,8 @@ impl DisplayAs for WarpExec {
             imputation_rank,
             ..
         } = self.params;
+        let imputation_rank =
+            imputation_rank.map_or_else(|| "default".to_string(), |rank| rank.to_string());
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
@@ -1132,17 +1138,33 @@ mod tests {
                 .0;
             assert_eq!(selection.missing_similarities[token], expected);
         }
+
+        // The default t' scales with the tokens of every segment; this corpus
+        // of 2,000 tokens is below its first step, so 0 is imputed.
+        let selection = warp_select(
+            &dataset,
+            "vector",
+            &segments,
+            &query,
+            DIM,
+            WarpParams {
+                imputation_rank: None,
+                ..WarpParams::new(2, 1)
+            },
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selection.missing_similarities, vec![0.0; num_query_tokens]);
     }
 
     #[rstest]
-    #[case::zero_nprobe(0, 10, 8, 16)]
-    #[case::zero_imputation_rank(2, 0, 8, 16)]
-    #[case::ragged_query(2, 10, 8, 15)]
-    #[case::no_segments(2, 10, 8, 16)]
+    #[case::zero_nprobe(0, 8, 16)]
+    #[case::ragged_query(2, 8, 15)]
+    #[case::no_segments(2, 8, 16)]
     #[tokio::test]
     async fn test_warp_select_rejects_invalid_input(
         #[case] nprobe: usize,
-        #[case] imputation_rank: usize,
         #[case] dim: usize,
         #[case] query_len: usize,
     ) {
@@ -1157,7 +1179,7 @@ mod tests {
             &[],
             &query,
             dim,
-            WarpParams::new(nprobe, imputation_rank),
+            WarpParams::new(nprobe, 10),
             &NoOpMetricsCollector,
         )
         .await
@@ -1748,7 +1770,6 @@ mod tests {
         #[case] upper: Option<f32>,
         #[case] refine: Option<u32>,
     ) {
-        use crate::dataset::scanner::MultivectorAlgorithm;
         let mut rng = StdRng::seed_from_u64(42);
         let (dataset, _) = two_segment_dataset(
             &VectorIndexParams::ivf_flat(4, DistanceType::Cosine),
@@ -1765,32 +1786,27 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        for algorithm in [MultivectorAlgorithm::Xtr, MultivectorAlgorithm::Warp] {
-            let mut scanner = dataset.scan();
-            scanner
-                .nearest("vector", &query, 10)
-                .unwrap()
-                .nprobes(4)
-                .multivector_algorithm(algorithm)
-                .distance_range(lower, upper);
-            if let Some(factor) = refine {
-                scanner.refine(factor);
-            }
-            let result = scanner.try_into_batch().await.unwrap();
-            let distances = result[DIST_COL].as_primitive::<Float32Type>();
-            assert_eq!(
-                result.num_rows(),
-                expected.num_rows(),
-                "{algorithm:?}: result count"
-            );
-            assert!(
-                distances
-                    .values()
-                    .iter()
-                    .all(|&d| lower.is_none_or(|l| d >= l) && upper.is_none_or(|u| d < u)),
-                "{algorithm:?} returned out-of-range distances: {:?}",
-                distances.values()
-            );
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .nprobes(4)
+            .distance_range(lower, upper);
+        if let Some(factor) = refine {
+            scanner.refine(factor);
         }
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("Warp:"), "{plan}");
+        let result = scanner.try_into_batch().await.unwrap();
+        let distances = result[DIST_COL].as_primitive::<Float32Type>();
+        assert_eq!(result.num_rows(), expected.num_rows());
+        assert!(
+            distances
+                .values()
+                .iter()
+                .all(|&d| lower.is_none_or(|l| d >= l) && upper.is_none_or(|u| d < u)),
+            "out-of-range distances: {:?}",
+            distances.values()
+        );
     }
 }

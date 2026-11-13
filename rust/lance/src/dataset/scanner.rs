@@ -140,49 +140,6 @@ pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
     .unwrap_or(DEFAULT_XTR_OVERFETCH_VALUE)
 });
 
-/// The algorithm used to answer an indexed multivector (late-interaction) query.
-///
-/// Only affects multivector columns searched through a vector index; exact
-/// (flat) multivector search is unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MultivectorAlgorithm {
-    /// Search each query token independently, then sum per-document maxima,
-    /// imputing a token's missing score with its lowest retrieved score.
-    ///
-    /// See XTR: <https://arxiv.org/abs/2304.01982>.
-    Xtr,
-    /// Select IVF partitions per query token from centroid scores, estimate
-    /// missing scores from those centroids, score every token of the selected
-    /// partitions, and merge the scores per document.
-    ///
-    /// Supports IVF indices with a FLAT sub-index (IVF_FLAT, IVF_PQ, IVF_SQ,
-    /// IVF_RQ), but neither HNSW sub-indices nor the legacy IVF_PQ format.
-    ///
-    /// See WARP: <https://arxiv.org/abs/2501.17788>.
-    Warp,
-}
-
-impl std::str::FromStr for MultivectorAlgorithm {
-    type Err = Error;
-
-    /// Parse `"xtr"` or `"warp"`, ignoring case.
-    ///
-    /// ```
-    /// # use lance::dataset::scanner::MultivectorAlgorithm;
-    /// assert_eq!("WARP".parse::<MultivectorAlgorithm>().unwrap(), MultivectorAlgorithm::Warp);
-    /// assert!("plaid".parse::<MultivectorAlgorithm>().is_err());
-    /// ```
-    fn from_str(algorithm: &str) -> Result<Self> {
-        match algorithm.to_lowercase().as_str() {
-            "xtr" => Ok(Self::Xtr),
-            "warp" => Ok(Self::Warp),
-            _ => Err(Error::invalid_input(format!(
-                "unknown multivector algorithm {algorithm:?}; expected \"xtr\" or \"warp\""
-            ))),
-        }
-    }
-}
-
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads
@@ -614,9 +571,7 @@ pub struct Scanner {
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
-    /// `None` uses WARP when every index segment supports it, and XTR otherwise.
-    multivector_algorithm: Option<MultivectorAlgorithm>,
-    /// WARP's `t'`; `None` uses the token count XTR retrieves per query token.
+    /// WARP's `t'`; `None` scales it with the indexed corpus.
     warp_imputation_rank: Option<usize>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries

@@ -490,7 +490,6 @@ def _build_vector_search_query(
     refine_column: Optional[str] = None,
     refine_q: Optional[QueryVectorLike] = None,
     refine_metric: Optional[str] = None,
-    multivector_algorithm: Optional[Literal["xtr", "warp"]] = None,
     warp_imputation_rank: Optional[int] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -573,38 +572,28 @@ def _build_vector_search_query(
         and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
         coarse TopM still precedes refinement. Query filters are unsupported;
         scalar filters retain their usual prefilter/postfilter behavior.
-    multivector_algorithm: {"xtr", "warp"}, optional
-        Algorithm for indexed multivector (late-interaction) search. Leave it
-        unset: the default is ``"warp"`` whenever every index segment supports
-        it (IVF_FLAT, IVF_PQ, IVF_SQ and IVF_RQ, but not HNSW sub-indices or the
-        legacy IVF_PQ format) and ``"xtr"`` otherwise. Prefer WARP
-        (`WARP <https://arxiv.org/abs/2501.17788>`_): it delivers much higher
-        recall than XTR at similar or lower latency. On BEIR SciFact at the
-        defaults, its recall@10 against exact search is 0.79-0.86 versus XTR's
-        0.53-0.56, and XTR stays below 0.56 at any ``nprobes``. Choose ``"xtr"``
-        only to reproduce earlier results.
-
-        XTR retrieves each query token's nearest tokens independently and scores
-        a document only from the tokens it retrieved. WARP probes partitions per
-        query token, 32 by default, scores every token in them, and estimates
-        the scores of the rest from the centroids. ``nprobes``,
-        ``minimum_nprobes``, ``maximum_nprobes`` and ``search_effort`` set the
-        partitions as for IVF search, except that a ``maximum_nprobes`` set alone
-        is the count WARP probes, since it never expands its search. More
-        partitions trade latency for recall.
     warp_imputation_rank: int, optional
-        WARP only; most callers should leave it unset. When none of a document's
-        tokens is in the partitions a query token probed, WARP cannot compute
-        that token's similarity to the document, so it imputes the similarity of
-        roughly the ``warp_imputation_rank``-th most similar token in the whole
-        index, estimated from the centroids and partition sizes. Defaults to
-        ``k * 10``, or ``k * LANCE_XTR_OVERFETCH`` when that environment
-        variable is set. It is not a latency knob: it reads no extra data. Larger
-        values impute lower similarities, so documents that only some query
-        tokens observe rank lower. Its effect on recall is small: on SciFact
-        (1.9 million tokens), recall@10 varied by at most 0.02 between 10 and
-        100000, and was best between 1000 and 10000. Prefer ``nprobes`` or
-        ``search_effort`` to raise recall.
+        Most callers should leave it unset. Indexed multivector
+        (late-interaction) search uses `WARP <https://arxiv.org/abs/2501.17788>`_
+        when every index segment supports it (IVF_FLAT, IVF_PQ, IVF_SQ and IVF_RQ,
+        but not HNSW sub-indices or the legacy IVF_PQ format) and XTR otherwise,
+        which ignores this setting. WARP probes partitions per query token, 32 by
+        default, scores every token in them, and estimates the scores of the rest
+        from the centroids. ``nprobes``, ``minimum_nprobes``, ``maximum_nprobes``
+        and ``search_effort`` set the partitions as for IVF search, except that a
+        ``maximum_nprobes`` set alone is the count WARP probes, since it never
+        expands its search. More partitions trade latency for recall.
+
+        When none of a document's tokens is in the partitions a query token
+        probed, WARP cannot compute that token's similarity to the document, so it
+        imputes the similarity of roughly the ``warp_imputation_rank``-th most
+        similar token in the whole index, estimated from the centroids and
+        partition sizes; 0 imputes 0. The default follows the WARP reference
+        implementation: ``floor(sqrt(8 * N) / 1000) * 1000`` for ``N`` indexed
+        tokens in up to 65,536 partitions (so 0 below 125,000 tokens), and 50,000,
+        or 100,000 when ``k`` exceeds 100, beyond that. It is not a latency knob:
+        it reads no extra data. Larger values impute lower similarities, so
+        documents that only some query tokens observe rank lower.
 
     Returns
     -------
@@ -704,7 +693,6 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "search_effort": search_effort,
         "distance_range": distance_range,
-        "multivector_algorithm": multivector_algorithm,
         "warp_imputation_rank": warp_imputation_rank,
         "refine_column": refine_column,
         "refine_q": refine_q,
@@ -1082,7 +1070,6 @@ class ScannerBuilder:
         refine_column: Optional[str] = None,
         refine_q: Optional[QueryVectorLike] = None,
         refine_metric: Optional[str] = None,
-        multivector_algorithm: Optional[Literal["xtr", "warp"]] = None,
         warp_imputation_rank: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
@@ -1153,38 +1140,28 @@ class ScannerBuilder:
             and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
             coarse TopM still precedes refinement. Query filters are unsupported;
             scalar filters retain their usual prefilter/postfilter behavior.
-        multivector_algorithm: {"xtr", "warp"}, optional
-            Algorithm for indexed multivector (late-interaction) search. Leave it
-            unset: the default is ``"warp"`` whenever every index segment supports
-            it (IVF_FLAT, IVF_PQ, IVF_SQ and IVF_RQ, but not HNSW sub-indices or the
-            legacy IVF_PQ format) and ``"xtr"`` otherwise. Prefer WARP
-            (`WARP <https://arxiv.org/abs/2501.17788>`_): it delivers much higher
-            recall than XTR at similar or lower latency. On BEIR SciFact at the
-            defaults, its recall@10 against exact search is 0.79-0.86 versus XTR's
-            0.53-0.56, and XTR stays below 0.56 at any ``nprobes``. Choose ``"xtr"``
-            only to reproduce earlier results.
-
-            XTR retrieves each query token's nearest tokens independently and scores
-            a document only from the tokens it retrieved. WARP probes partitions per
-            query token, 32 by default, scores every token in them, and estimates
-            the scores of the rest from the centroids. ``nprobes``,
-            ``minimum_nprobes``, ``maximum_nprobes`` and ``search_effort`` set the
-            partitions as for IVF search, except that a ``maximum_nprobes`` set alone
-            is the count WARP probes, since it never expands its search. More
-            partitions trade latency for recall.
         warp_imputation_rank: int, optional
-            WARP only; most callers should leave it unset. When none of a document's
-            tokens is in the partitions a query token probed, WARP cannot compute
-            that token's similarity to the document, so it imputes the similarity of
-            roughly the ``warp_imputation_rank``-th most similar token in the whole
-            index, estimated from the centroids and partition sizes. Defaults to
-            ``k * 10``, or ``k * LANCE_XTR_OVERFETCH`` when that environment
-            variable is set. It is not a latency knob: it reads no extra data. Larger
-            values impute lower similarities, so documents that only some query
-            tokens observe rank lower. Its effect on recall is small: on SciFact
-            (1.9 million tokens), recall@10 varied by at most 0.02 between 10 and
-            100000, and was best between 1000 and 10000. Prefer ``nprobes`` or
-            ``search_effort`` to raise recall.
+            Most callers should leave it unset. Indexed multivector
+            (late-interaction) search uses `WARP <https://arxiv.org/abs/2501.17788>`_
+            when every index segment supports it (IVF_FLAT, IVF_PQ, IVF_SQ and IVF_RQ,
+            but not HNSW sub-indices or the legacy IVF_PQ format) and XTR otherwise,
+            which ignores this setting. WARP probes partitions per query token, 32 by
+            default, scores every token in them, and estimates the scores of the rest
+            from the centroids. ``nprobes``, ``minimum_nprobes``, ``maximum_nprobes``
+            and ``search_effort`` set the partitions as for IVF search, except that a
+            ``maximum_nprobes`` set alone is the count WARP probes, since it never
+            expands its search. More partitions trade latency for recall.
+
+            When none of a document's tokens is in the partitions a query token
+            probed, WARP cannot compute that token's similarity to the document, so it
+            imputes the similarity of roughly the ``warp_imputation_rank``-th most
+            similar token in the whole index, estimated from the centroids and
+            partition sizes; 0 imputes 0. The default follows the WARP reference
+            implementation: ``floor(sqrt(8 * N) / 1000) * 1000`` for ``N`` indexed
+            tokens in up to 65,536 partitions (so 0 below 125,000 tokens), and 50,000,
+            or 100,000 when ``k`` exceeds 100, beyond that. It is not a latency knob:
+            it reads no extra data. Larger values impute lower similarities, so
+            documents that only some query tokens observe rank lower.
 
         Examples
         --------
@@ -1217,7 +1194,6 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
-            multivector_algorithm=multivector_algorithm,
             warp_imputation_rank=warp_imputation_rank,
             refine_column=refine_column,
             refine_q=refine_q,

@@ -50,7 +50,7 @@ use super::aggregate::AggregateExpr;
 use super::vector::VectorRefinement;
 use super::{
     BATCH_SIZE_FALLBACK, ColumnOrdering, ExprFilter, LanceFilter, MaterializationStyle,
-    MultivectorAlgorithm, QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
+    QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
 };
 
 impl Scanner {
@@ -81,7 +81,6 @@ impl Scanner {
             nearest_refine: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
-            multivector_algorithm: None,
             warp_imputation_rank: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
@@ -1277,50 +1276,23 @@ impl Scanner {
         self
     }
 
-    /// Choose the algorithm for indexed multivector search.
+    /// Set WARP's imputation rank `t'`; most callers should leave it unset.
     ///
-    /// Leave it unset: WARP is used when every index segment supports it and
-    /// XTR otherwise. Prefer WARP, which delivers much higher recall than XTR
-    /// at similar or lower latency. On BEIR SciFact at the defaults, its
-    /// recall@10 against exact search is 0.79-0.86 versus XTR's 0.53-0.56, and
-    /// XTR stays below 0.56 at any [`Self::nprobes`]. Choose XTR only to
-    /// reproduce earlier results. Choosing WARP for an index it does not
-    /// support fails the query; see [`MultivectorAlgorithm::Warp`].
-    ///
-    /// ```
-    /// # use arrow_array::Float32Array;
-    /// # use lance::dataset::scanner::MultivectorAlgorithm;
-    /// # use lance::{Dataset, Result};
-    /// # async fn search(dataset: &Dataset) -> Result<()> {
-    /// // Two query tokens of dimension 128, flattened.
-    /// let query = Float32Array::from(vec![0.0_f32; 256]);
-    /// let mut scanner = dataset.scan();
-    /// scanner.nearest("multivector", &query, 10)?;
-    /// scanner.multivector_algorithm(MultivectorAlgorithm::Xtr);
-    /// let results = scanner.try_into_batch().await?;
-    /// # let _ = results;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn multivector_algorithm(&mut self, algorithm: MultivectorAlgorithm) -> &mut Self {
-        self.multivector_algorithm = Some(algorithm);
-        self
-    }
-
-    /// Set WARP's imputation rank `t'` (must be at least 1); most callers
-    /// should leave it unset.
+    /// Indexed multivector search uses WARP (<https://arxiv.org/abs/2501.17788>)
+    /// when every index segment is IVF with a FLAT sub-index (IVF_FLAT, IVF_PQ,
+    /// IVF_SQ or IVF_RQ, but not the legacy IVF_PQ format), and XTR otherwise,
+    /// which ignores this setting.
     ///
     /// When none of a document's tokens is in the partitions a query token
     /// probed, WARP cannot compute that token's similarity to the document,
     /// so it imputes the similarity of roughly the `t'`-th most similar token
     /// in the whole index, estimated from the centroids and partition sizes.
-    /// Defaults to `k * LANCE_XTR_OVERFETCH`, i.e. `k * 10` unless that
-    /// environment variable is set. It is not a latency knob: it reads no
-    /// extra data. Larger values impute lower similarities, so documents that
-    /// only some query tokens observe rank lower. Its effect on recall is
-    /// small: on SciFact (1.9 million tokens), recall@10 varied by at most
-    /// 0.02 between 10 and 100000, and was best between 1000 and 10000.
-    /// Prefer more partitions to raise recall.
+    /// A `t'` of 0 imputes 0. The default follows the WARP reference
+    /// implementation; see
+    /// [`lance_index::vector::warp::default_imputation_rank`]. It is not a
+    /// latency knob: it reads no extra data. Larger values impute lower
+    /// similarities, so documents that only some query tokens observe rank
+    /// lower. Prefer more partitions to raise recall.
     ///
     /// WARP probes a fixed number of partitions per query token and segment,
     /// [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`] by default. As for
@@ -1331,14 +1303,13 @@ impl Scanner {
     ///
     /// ```
     /// # use arrow_array::Float32Array;
-    /// # use lance::dataset::scanner::MultivectorAlgorithm;
     /// # use lance::{Dataset, Result};
     /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// // Two query tokens of dimension 128, flattened.
     /// let query = Float32Array::from(vec![0.0_f32; 256]);
     /// let mut scanner = dataset.scan();
-    /// scanner.nearest("multivector", &query, 10)?;
     /// scanner
-    ///     .multivector_algorithm(MultivectorAlgorithm::Warp)
+    ///     .nearest("multivector", &query, 10)?
     ///     .nprobes(32)
     ///     .warp_imputation_rank(1000);
     /// # Ok(())

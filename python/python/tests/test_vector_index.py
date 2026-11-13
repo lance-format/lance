@@ -2078,7 +2078,7 @@ def test_create_ivf_rq_mostly_null():
     assert result.num_rows == 10
 
 
-def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch):
+def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     rng = np.random.default_rng(42)
     query = rng.random((5, 128))
     results = indexed_multivec_dataset.scanner(
@@ -2122,22 +2122,6 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
             == doubled_results["_distance"][i].as_py()
         )
 
-    # XTR's per-token routing uses Auto's configuration, including with
-    # refinement. WARP probes a fixed number of partitions instead.
-    with monkeypatch.context() as overrides:
-        overrides.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
-        for refine_factor in (None, 2):
-            with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
-                indexed_multivec_dataset.to_table(
-                    nearest={
-                        "column": "vector",
-                        "q": query,
-                        "k": 100,
-                        "refine_factor": refine_factor,
-                        "multivector_algorithm": "xtr",
-                    }
-                )
-
     # query with a vector that dim not match
     query = rng.random(256)
     with pytest.raises(ValueError, match="does not match index column size"):
@@ -2153,25 +2137,16 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
         )
 
 
-@pytest.mark.parametrize("multivector_algorithm", ["xtr", "warp"])
-def test_multivec_algorithm(
-    indexed_multivec_dataset: lance.LanceDataset, multivector_algorithm: str
-):
+def test_multivec_warp(indexed_multivec_dataset: lance.LanceDataset):
     rng = np.random.default_rng(42)
     query = rng.random((5, 128))
-    nearest = {
-        "column": "vector",
-        "q": query,
-        "k": 100,
-        "nprobes": 1,
-        "multivector_algorithm": multivector_algorithm,
-        "warp_imputation_rank": 500,
-    }
+    nearest = {"column": "vector", "q": query, "k": 100, "nprobes": 1}
     plan = indexed_multivec_dataset.scanner(nearest=nearest).explain_plan()
-    if multivector_algorithm == "warp":
-        assert "Warp: k=100, nprobes=1, imputation_rank=500" in plan
-    else:
-        assert "Warp:" not in plan
+    assert "Warp: k=100, nprobes=1, imputation_rank=default" in plan
+
+    nearest["warp_imputation_rank"] = 500
+    plan = indexed_multivec_dataset.scanner(nearest=nearest).explain_plan()
+    assert "Warp: k=100, nprobes=1, imputation_rank=500" in plan
 
     results = indexed_multivec_dataset.to_table(columns=["id"], nearest=nearest)
     assert results.num_rows == 100
@@ -2184,17 +2159,25 @@ def test_multivec_algorithm(
     assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
 
 
-def test_multivec_algorithm_rejects_unknown(
-    indexed_multivec_dataset: lance.LanceDataset,
-):
-    nearest = {
-        "column": "vector",
-        "q": np.random.default_rng(42).random((5, 128)),
-        "k": 10,
-        "multivector_algorithm": "plaid",
-    }
-    with pytest.raises(ValueError, match="unknown multivector algorithm"):
-        indexed_multivec_dataset.to_table(nearest=nearest)
+def test_multivec_falls_back_to_xtr(tmp_path: Path, monkeypatch):
+    rng = np.random.default_rng(42)
+    vector_type = pa.list_(pa.list_(pa.float32(), 8))
+    vectors = [rng.random((3, 8)).tolist() for _ in range(300)]
+    table = pa.table({"id": range(300), "vector": pa.array(vectors, type=vector_type)})
+    dataset = lance.write_dataset(table, tmp_path / "hnsw_multivec.lance")
+    dataset.create_index(
+        "vector", index_type="IVF_HNSW_SQ", metric="cosine", num_partitions=2
+    )
+    nearest = {"column": "vector", "q": rng.random((2, 8)), "k": 10}
+    assert "Warp:" not in dataset.scanner(nearest=nearest).explain_plan()
+    assert dataset.to_table(nearest=nearest).num_rows == 10
+
+    # XTR's per-token routing uses Auto's configuration, including with
+    # refinement.
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    for refine_factor in (None, 2):
+        with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+            dataset.to_table(nearest={**nearest, "refine_factor": refine_factor})
 
 
 def test_multivec_search_paths(tmp_path: Path):
@@ -3750,7 +3733,6 @@ def test_nearest_preserves_existing_positional_arguments(dataset):
         "refine_column",
         "refine_q",
         "refine_metric",
-        "multivector_algorithm",
         "warp_imputation_rank",
     ]
 

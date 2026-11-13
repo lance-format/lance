@@ -5129,9 +5129,7 @@ async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
 /// exactly and every document is observed by every query token, so it returns
 /// the exact multivector top k; a prefilter restricts it like ANN search.
 #[tokio::test]
-async fn test_multivector_algorithm_dispatch() {
-    use crate::dataset::scanner::MultivectorAlgorithm;
-
+async fn test_multivector_search_uses_warp() {
     let test_dir = TempStrDir::default();
     let (mut dataset, vectors) =
         generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
@@ -5144,24 +5142,17 @@ async fn test_multivector_algorithm_dispatch() {
 
     let k = 10;
     let query = vectors.value(0);
-    let search = |algorithm, filter: Option<&str>| {
+    let search = |filter: Option<&str>| {
         let mut scanner = dataset.scan();
         scanner
             .nearest("vector", &query, k)
             .unwrap()
-            .nprobes(num_partitions)
-            .multivector_algorithm(algorithm);
+            .nprobes(num_partitions);
         if let Some(filter) = filter {
             scanner.prefilter(true).filter(filter).unwrap();
         }
         scanner
     };
-
-    let xtr = search(MultivectorAlgorithm::Xtr, None)
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(xtr.num_rows(), k);
 
     // Python's `nprobes` reaches the scanner as minimum and maximum nprobes.
     let mut scanner = dataset.scan();
@@ -5169,18 +5160,14 @@ async fn test_multivector_algorithm_dispatch() {
         .nearest("vector", &query, k)
         .unwrap()
         .minimum_nprobes(1)
-        .maximum_nprobes(num_partitions)
-        .multivector_algorithm(MultivectorAlgorithm::Warp);
+        .maximum_nprobes(num_partitions);
     let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
         plan.contains(&format!("Warp: k={k}, nprobes={num_partitions}")),
         "{plan}"
     );
 
-    let warp = search(MultivectorAlgorithm::Warp, None)
-        .try_into_batch()
-        .await
-        .unwrap();
+    let warp = search(None).try_into_batch().await.unwrap();
     let ground_truth = multivec_ground_truth(&vectors, query.as_ref(), k, DistanceType::Cosine);
     let ids = warp["id"].as_primitive::<UInt64Type>().values();
     let distances = warp[DIST_COL].as_primitive::<Float32Type>().values();
@@ -5195,10 +5182,7 @@ async fn test_multivector_algorithm_dispatch() {
         );
     }
 
-    let filtered = search(MultivectorAlgorithm::Warp, Some("id >= 100"))
-        .try_into_batch()
-        .await
-        .unwrap();
+    let filtered = search(Some("id >= 100")).try_into_batch().await.unwrap();
     assert_eq!(filtered.num_rows(), k);
     assert!(
         filtered["id"]
@@ -5209,12 +5193,9 @@ async fn test_multivector_algorithm_dispatch() {
     );
 }
 
-/// Unset, the multivector algorithm falls back to XTR for an index WARP does
-/// not support; choosing WARP for it explicitly fails.
+/// Multivector search falls back to XTR for an index WARP does not support.
 #[tokio::test]
-async fn test_multivector_algorithm_falls_back_to_xtr() {
-    use crate::dataset::scanner::MultivectorAlgorithm;
-
+async fn test_multivector_search_falls_back_to_xtr() {
     let test_dir = TempStrDir::default();
     let (mut dataset, vectors) =
         generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
@@ -5231,15 +5212,9 @@ async fn test_multivector_algorithm_falls_back_to_xtr() {
     let query = vectors.value(0);
     let mut scanner = dataset.scan();
     scanner.nearest("vector", &query, 10).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(!plan.contains("Warp:"), "{plan}");
     assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 10);
-
-    scanner.multivector_algorithm(MultivectorAlgorithm::Warp);
-    let err = scanner.try_into_batch().await.unwrap_err();
-    assert!(
-        matches!(err, lance_core::Error::NotSupported { .. }),
-        "unexpected error: {err}"
-    );
-    assert!(err.to_string().contains("HNSW sub-index"), "{err}");
 }
 
 #[tokio::test]

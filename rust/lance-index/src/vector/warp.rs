@@ -27,6 +27,36 @@ use lance_linalg::distance::dot_f32;
 /// The paper reports recall saturating between 16 and 32.
 pub const DEFAULT_WARP_NPROBE: usize = 32;
 
+/// Up to this many partitions, the default `t'` grows with the corpus.
+const MAX_CORPUS_SCALED_PARTITIONS: usize = 1 << 16;
+
+/// The default `t'` for an index of `num_tokens` token embeddings in
+/// `num_partitions` partitions, searched for the top `k` documents.
+///
+/// This follows the [reference implementation]: up to 65,536 partitions, `t'`
+/// is `floor(sqrt(8 * num_tokens) / 1000) * 1000`, as the paper recommends
+/// scaling it with the square root of the corpus size. Beyond that it is
+/// 100,000 when `k` exceeds 100 and 50,000 otherwise. Below 125,000 tokens it
+/// is 0, so [`missing_similarity`] imputes a similarity of 0.
+///
+/// [reference implementation]: https://github.com/jlscheerer/xtr-warp/blob/cca97613e6f969ac89f259946b976f8c5a6f1399/warp/engine/search/index_storage.py#L103-L109
+///
+/// ```
+/// # use lance_index::vector::warp::default_imputation_rank;
+/// assert_eq!(default_imputation_rank(2_000_000, 4096, 10), 4000);
+/// assert_eq!(default_imputation_rank(100_000, 256, 10), 0);
+/// assert_eq!(default_imputation_rank(2_000_000, 1 << 17, 1000), 100_000);
+/// ```
+pub fn default_imputation_rank(num_tokens: u64, num_partitions: usize, k: usize) -> usize {
+    if num_partitions <= MAX_CORPUS_SCALED_PARTITIONS {
+        ((8.0 * num_tokens as f64).sqrt() / 1000.0) as usize * 1000
+    } else if k > 100 {
+        100_000
+    } else {
+        50_000
+    }
+}
+
 /// The walk sorts centroids lazily in chunks that double from this size, since
 /// it usually stops after a small prefix of the K centroids.
 const INITIAL_WALK_CHUNK: usize = 64;
@@ -105,7 +135,7 @@ pub fn probe_partitions(similarities: &[f32], nprobe: usize) -> Vec<u32> {
 /// accumulated population first reaches `imputation_rank` (`t'`), i.e. an
 /// estimate of the similarity of the `t'`-th most similar token. If the whole
 /// index holds fewer than `t'` tokens, it is the least similar partition's
-/// similarity.
+/// similarity. A `t'` of 0 imputes 0, as the reference implementation does.
 ///
 /// `similarities[k]` and `partition_sizes[k]` describe the same partition. To
 /// estimate over several index segments, concatenate their partitions.
@@ -134,9 +164,7 @@ pub fn missing_similarity(
         ));
     }
     if imputation_rank == 0 {
-        return Err(Error::invalid_input(
-            "WARP imputation_rank must be at least 1, got 0",
-        ));
+        return Ok(0.0);
     }
 
     let cmp = by_similarity_desc(similarities);
@@ -498,6 +526,7 @@ mod tests {
     #[case::inside_third(8, 0.5)]
     #[case::last(18, 0.1)]
     #[case::exceeds_total(1000, 0.1)]
+    #[case::zero(0, 0.0)]
     fn test_missing_similarity_walks_partition_chunks(
         #[case] imputation_rank: usize,
         #[case] expected: f32,
@@ -506,6 +535,25 @@ mod tests {
         let sizes = [10, 2, 4, 3];
         assert_eq!(
             missing_similarity(&similarities, &sizes, imputation_rank).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::below_first_step(124_999, 256, 10, 0)]
+    #[case::first_step(125_000, 256, 10, 1000)]
+    #[case::truncates(2_000_000, 4096, 10, 4000)]
+    #[case::last_scaled_partition_count(2_000_000, 1 << 16, 10, 4000)]
+    #[case::fixed_small_k(2_000_000, (1 << 16) + 1, 100, 50_000)]
+    #[case::fixed_large_k(2_000_000, (1 << 16) + 1, 101, 100_000)]
+    fn test_default_imputation_rank(
+        #[case] num_tokens: u64,
+        #[case] num_partitions: usize,
+        #[case] k: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(
+            default_imputation_rank(num_tokens, num_partitions, k),
             expected
         );
     }
@@ -551,7 +599,6 @@ mod tests {
     #[rstest]
     #[case::length_mismatch(vec![0.1, 0.2], vec![1], 1)]
     #[case::empty(vec![], vec![], 1)]
-    #[case::zero_rank(vec![0.1], vec![1], 0)]
     fn test_missing_similarity_rejects_invalid_input(
         #[case] similarities: Vec<f32>,
         #[case] sizes: Vec<u32>,
