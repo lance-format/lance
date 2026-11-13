@@ -4,8 +4,9 @@
 use std::sync::Arc;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
-use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
+use lance_geo::rtree::RTreeIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::progress::noop_progress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
 use lance_table::format::IndexMetadata;
@@ -38,7 +39,7 @@ pub(in crate::index) async fn merge_segments(
     let segment_refs = segments.iter().collect::<Vec<_>>();
     // Without stable row ids the two domains coincide, so once a row-id-domain
     // segment is refused on a stable-row-id dataset the filters can always be
-    // address-domain. `merge_rtree_indices` keeps the sources' own domain.
+    // address-domain. `RTreeIndex::merge_segments` keeps the sources' own domain.
     super::shared_segment_domain(dataset, "RTree", &segment_refs)?;
     let (fragment_bitmap, old_data_filters) =
         crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
@@ -106,5 +107,12 @@ pub(in crate::index) async fn open_and_merge_segments(
         source_indices.push(Arc::new(rtree_index.clone()));
     }
 
-    merge_rtree_indices(&source_indices, new_data, new_store, old_data_filters).await
+    RTreeIndex::merge_segments(
+        &source_indices,
+        new_data,
+        new_store,
+        old_data_filters,
+        noop_progress(),
+    )
+    .await
 }
