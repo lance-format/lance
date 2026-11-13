@@ -25,7 +25,8 @@ use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
-use lance_datafusion::exec::execute_plan;
+use lance_core::utils::tracing::TRACE_EXECUTION;
+use lance_datafusion::exec::{ExecutionSummaryCounts, execute_plan};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
@@ -43,7 +44,7 @@ use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
+use crate::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
 use crate::dataset::{ColumnAlteration, NewColumnTransform};
 use crate::{Dataset, Error};
@@ -52,6 +53,7 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 use rstest::rstest;
+use tracing_mock::{expect, subscriber};
 
 #[rstest]
 #[case::struct_null_check(false, "c IS NOT NULL", vec![0, 1, 2])]
@@ -113,6 +115,72 @@ async fn test_partial_projection_with_filter_on_same_column(
     let result = scan.try_into_batch().await.unwrap();
     assert_eq!(result.schema().as_ref(), &expected_schema, "{filter}");
     assert_eq!(result, expected, "{filter}");
+}
+
+/// A scan reports the most bytes its plan held reserved in DataFusion's memory
+/// pool, to its stats callback and in its `lance::execution` event: a sort
+/// reserves memory there, a plain scan reserves nothing.
+#[rstest]
+#[case::sorted(true)]
+#[case::unsorted(false)]
+#[tokio::test]
+async fn test_scan_reports_peak_reserved_bytes(#[case] sorted: bool) {
+    let batch = record_batch!(("k", Int32, [3, 1, 2, 0])).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let scan = || {
+        let mut scan = dataset.scan();
+        if sorted {
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first("k".to_string())]))
+                .unwrap();
+        }
+        scan
+    };
+
+    let summary = Arc::new(std::sync::Mutex::new(None));
+    let mut reported_scan = scan();
+    reported_scan.scan_stats_callback(Arc::new({
+        let summary = Arc::clone(&summary);
+        move |counts: &ExecutionSummaryCounts| *summary.lock().unwrap() = Some(counts.clone())
+    }));
+    let result = reported_scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 4);
+    let peak = summary
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .peak_reserved_bytes();
+    assert_eq!(peak.map(|bytes| bytes > 0), Some(sorted), "{peak:?}");
+
+    let peak_field = expect::field("peak_reserved_bytes");
+    let peak_field = if sorted {
+        peak_field
+    } else {
+        peak_field.with_value(&0usize)
+    };
+    let (subscriber, handle) = subscriber::mock()
+        .with_filter(|metadata| metadata.target() == TRACE_EXECUTION)
+        .event(expect::event().with_fields(peak_field))
+        .run_with_handle();
+    // While exactly one dispatcher is registered, tracing caches a callsite's
+    // interest from the default dispatcher of the thread that fires it first,
+    // so a scan finishing in a parallel test could disable the event for this
+    // mock. A second live dispatcher makes tracing consult every registered one.
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    let guard = tracing::subscriber::set_default(subscriber);
+    scan().try_into_batch().await.unwrap();
+    drop(guard);
+    handle.assert_finished();
 }
 
 /// A null struct must not read back as a valid struct with null children.

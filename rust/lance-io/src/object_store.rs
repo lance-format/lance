@@ -992,6 +992,16 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// Return this store with a different block-size hint.
+    ///
+    /// The backing object store and I/O tracker are shared. Only the block size
+    /// used to plan reads changes.
+    pub fn with_block_size(&self, block_size: usize) -> Self {
+        let mut cloned = self.clone();
+        cloned.block_size = block_size;
+        cloned
+    }
+
     /// The amount of parallelism to use for I/O operations.
     ///
     /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.

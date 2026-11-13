@@ -11,6 +11,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::{Dataset, io::ObjectStore};
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
@@ -19,7 +20,7 @@ use lance_index::scalar::{
     IndexStore, SargableQuery, ScalarIndex, SearchResult,
     btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
     lance_format::LanceIndexStore,
-    registry::ScalarIndexPlugin,
+    registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME},
 };
 use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 use lance_select::RowSetOps;
@@ -32,15 +33,15 @@ struct BenchmarkFixture {
     baseline_dataset: Arc<Dataset>,
 }
 
-fn test_data() -> impl RecordBatchReader {
+fn test_data(value_column: &str, row_column: &str) -> impl RecordBatchReader {
     gen_batch()
-        .col("values", array::step::<UInt32Type>())
-        .col("row_ids", array::step::<UInt64Type>())
+        .col(value_column, array::step::<UInt32Type>())
+        .col(row_column, array::step::<UInt64Type>())
         .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
 }
 
 fn test_data_stream() -> SendableRecordBatchStream {
-    reader_to_stream(Box::new(test_data()))
+    reader_to_stream(Box::new(test_data(VALUE_COLUMN_NAME, ROW_ADDR)))
 }
 
 impl BenchmarkFixture {
@@ -59,7 +60,11 @@ impl BenchmarkFixture {
 
     async fn write_baseline_data(tempdir: &TempStrDir) -> Arc<Dataset> {
         let test_path = tempdir.as_str();
-        Arc::new(Dataset::write(test_data(), test_path, None).await.unwrap())
+        Arc::new(
+            Dataset::write(test_data("values", "row_ids"), test_path, None)
+                .await
+                .unwrap(),
+        )
     }
 
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
