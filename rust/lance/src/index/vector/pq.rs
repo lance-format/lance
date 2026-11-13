@@ -864,7 +864,6 @@ mod tests {
         assert_eq!(pq.num_bits, 8);
         assert_eq!(pq.dimension, DIM);
 
-        #[allow(clippy::redundant_clone)]
         let codebook = pq.codebook.clone();
         assert_eq!(codebook.len(), 256);
         codebook

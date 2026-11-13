@@ -1,0 +1,64 @@
+name: Rust (no lockfile)
+
+# Builds against the newest dependency versions (no Cargo.lock) to catch
+# upstream releases that break us. That doesn't need to run on every PR, so it
+# runs nightly and on PRs that change workspace dependency declarations.
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      # Only the root workspace is built; python/ and java/ are excluded from it.
+      - Cargo.toml
+      - rust/**/Cargo.toml
+      - .github/workflows/rust-no-lock.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-no-lock:
+    if: github.event_name != 'schedule' || github.repository == 'lance-format/lance'
+    runs-on: ubuntu-24.04
+    # ~13 min on the 32-core runner; the 4-core runner is several times slower.
+    timeout-minutes: 120
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      # Remove Cargo.lock to force a fresh resolution
+      - name: Remove Cargo.lock
+        run: rm -f Cargo.lock
+      # Only the nightly run on main saves the cache, so PRs reuse it without
+      # filling the repo's cache quota with large all-features builds.
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: no-lock
+          save-if: ${{ github.event_name == 'schedule' }}
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Build all
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
+          cargo build --profile ci --benches --features ${ALL_FEATURES} --tests

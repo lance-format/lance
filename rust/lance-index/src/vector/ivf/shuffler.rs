@@ -277,7 +277,7 @@ pub async fn shuffle_dataset(
                     .cloned()
                     .unwrap_or(Arc::new(HashMap::new()));
 
-                tokio::task::spawn(async move {
+                lance_core::utils::tokio::spawn(async move {
                     let mut batch = b?;
 
                     if !partition_map.is_empty() {
@@ -763,7 +763,7 @@ impl IvfShuffler {
             .zip(stream::repeat(num_batches))
             .map(|(i, num_batches)| {
                 let this = self.clone();
-                tokio::spawn(async move {
+                lance_core::utils::tokio::spawn(async move {
                     // first, calculate which files and ranges needs to be processed
                     let start = i;
                     let end = std::cmp::min(i + batches_per_partition, total_batches);

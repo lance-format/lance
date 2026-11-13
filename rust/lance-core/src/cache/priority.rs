@@ -88,6 +88,23 @@ impl<T: Clone> PriorityEntries<T> {
         }
         dropped
     }
+    /// Evict lowest-priority, then oldest, entries until the tier fits within
+    /// `capacity` bytes.
+    ///
+    /// Entries are returned rather than dropped so a caller holding this
+    /// structure behind a lock can release them after unlocking.
+    pub fn set_capacity(&mut self, capacity: usize) -> Vec<T> {
+        let mut dropped = Vec::new();
+        while self.bytes > capacity as u128 {
+            let Some(key) = self.order.first_key_value().map(|(_, key)| *key) else {
+                break;
+            };
+            if let Some(value) = self.remove(&key) {
+                dropped.push(value);
+            }
+        }
+        dropped
+    }
     pub fn clear(&mut self) -> Vec<T> {
         self.order.clear();
         self.bytes = 0;
@@ -155,6 +172,27 @@ mod tests {
         assert_eq!(cache.insert(low, 2, 40, 1, 100), vec![2]);
         assert!(!cache.contains(&low));
         assert!(cache.contains(&sign));
+    }
+
+    #[test]
+    fn set_capacity_evicts_oldest_entries_within_new_budget() {
+        let keys = [1u8, 2, 3].map(|id| InternalCacheKey::from_bytes([id; 16]));
+        let mut cache = PriorityEntries::default();
+        for (id, key) in keys.iter().enumerate() {
+            cache.insert(*key, id, 40, 1, 160);
+        }
+        assert_eq!(cache.bytes(), 120);
+
+        // Shrinking keeps the newest entries that fit and reports the rest.
+        assert_eq!(cache.set_capacity(80), vec![0]);
+        assert_eq!(cache.bytes(), 80);
+        assert!(!cache.contains(&keys[0]));
+        assert!(cache.contains(&keys[1]) && cache.contains(&keys[2]));
+
+        // Growing, or shrinking within the current usage, evicts nothing.
+        assert!(cache.set_capacity(1 << 20).is_empty());
+        assert!(cache.set_capacity(80).is_empty());
+        assert_eq!(cache.bytes(), 80);
     }
 
     #[test]

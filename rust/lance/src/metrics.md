@@ -46,6 +46,25 @@ cloud stores (S3, GCS, Azure); Opendal-backed stores bypass the HTTP client
 where the counters are installed, so they report the other object store metrics
 but not throttle/retryable counts.
 
+## Scan metrics
+
+The scan node mirrors its `decode_time` and `task_wait_time` plan timers as
+cumulative counters so an exporter can read the elapsed time while a scan is
+still running. The counters hold nanoseconds, and intervals are recorded when
+they complete or are dropped. Consequently, `rate() / 1e9` estimates the
+average number of measured decode or task-wait intervals in progress per
+second; in-flight intervals contribute only after they are recorded.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lance_scan_decode_time_nanoseconds_total` | counter | `base` (+ `dataset` in dataset mode) | Wall time spent decoding scan tasks, summed over concurrent tasks. |
+| `lance_scan_task_wait_time_nanoseconds_total` | counter | `base` (+ `dataset` in dataset mode) | Time scan partitions spent waiting for scheduled I/O. |
+
+The labels follow `LANCE_OBJECT_STORE_METRICS_LABEL`; `dataset` is also present
+in dataset mode. Both counters use the primary dataset store's labels even when
+fragments are read through additional bases, so they cannot be joined
+one-for-one with secondary-base I/O metrics.
+
 ## Cache metrics
 
 Cache activity metrics use bounded labels. `cache` is `index`, `metadata`, or
@@ -123,17 +142,19 @@ low; compare the entry-size histogram with the configured capacity.
 
 ## Memory metrics
 
-These report the memory of the Lance process. They are off by default: set `LANCE_MEMORY_OBSERVE` to `1`, `true`, `on` or `yes` to turn them on. Unset, empty, `0`, `false`, `off` or `no` keeps them off, and any other value makes the observed operations fail with an invalid-input error. Lance reads the variable once, the first time it needs it, so set it before the process starts. Readings come from `/proc/self/status` and the process's cgroup, so they are available on Linux only; elsewhere, and in builds without the `metrics` feature, setting the variable logs a warning and reports nothing.
+These report the memory of the Lance process. They are off by default: set `LANCE_MEMORY_OBSERVE` to `1`, `true`, `on` or `yes` to turn them on. Unset, empty, `0`, `false`, `off` or `no` keeps them off, and any other value makes the observed operations fail with an invalid-input error and reports no memory metric. Lance reads the variable once, the first time it needs it, so set it before the process starts. The process and cgroup gauges and the peaks come from `/proc/self/status` and the process's cgroup, so they are available on Linux only; elsewhere, setting the variable logs a warning and reports only `lance_memory_component_bytes`. Builds without the `metrics` feature report no memory gauge or histogram. The same switch turns on trace events on the `lance::memory` target, which need neither a recorder nor the `metrics` feature; the Memory Events section of the performance guide describes them.
 
-The gauges are read when the recorder collects. The Python and Java OpenTelemetry bridges refresh them before every snapshot. A Rust application using another recorder can use `lance::memory::histogram_bounds()` while configuring it, call `lance::memory::describe_metrics()` after installing it, and call `lance::memory::refresh_metrics()` from its collection loop. A gauge whose source is unavailable, such as the limit of a cgroup that has none, is not reported, and a gauge keeps its last value if its source disappears later.
+The gauges are read when the recorder collects. The Python and Java OpenTelemetry bridges refresh them before every snapshot. A Rust application using another recorder can use `lance::memory::histogram_bounds()` while configuring it, call `lance::memory::describe_metrics()` after installing it, and call `lance::memory::refresh_metrics()` from its collection loop. A process or cgroup gauge whose source is unavailable, such as the limit of a cgroup that has none, is not reported, and keeps its last value if its source disappears later.
 
 The peak histograms cover index builds started through `create_index` (or `CreateIndexBuilder`) and the inverted index branch of `merge_index_metadata`. While a build runs, a background thread samples the resident set size (RSS) every 100 ms, and every stage of the build, as well as the build as a whole, reports the largest value seen. The readings taken when a stage starts and ends count for every stage open at the time, so a build's peak is never below the peaks of its stages. A spike between two readings is only caught when it raises the peak RSS the kernel keeps for the process (`VmHWM`), so the values are lower bounds. Index builds that run as part of `optimize_indices` or of a MemWAL flush are not reported yet.
 
-An operation peak is recorded only when the build completes successfully. A build that fails or is cancelled before that records no operation peak, and a stage that never completes records no stage peak. Stages that completed earlier in the same build keep their samples.
+An operation peak is recorded only when the build completes successfully, which for a build that `create_index` commits is after its commit, so its peak covers the commit. A build that fails or is cancelled before that records no operation peak, and a stage that never completes records no stage peak. Stages that completed earlier in the same build keep their samples.
 
 Peaks describe the whole process, so work running at the same time, including other index builds, counts towards them. For most scalar indices the `load_data` stage only prepares the scan: reading, sorting and training happen after it and show up in the operation peak. `operation` is `create_index` or `merge_index_metadata`, and `index_type` is the lowercase type name (`btree`, `inverted`, `ivf_pq`, ...). The `index_type` and `stage` labels each keep at most 64 distinct values per process; later values are reported as `other`.
 
-The process gauges are best-effort readings of the live process. They cannot be exported after the process exits or is killed, so they do not provide a postmortem for a hard out-of-memory kill.
+The process gauges are best-effort readings of the live process. They cannot be exported after the process exits or is killed, so they do not provide a postmortem for a hard out-of-memory kill. The memory events are emitted as each build starts and completes, so a build that was killed shows as a start without a completion.
+
+`lance_memory_component_bytes` reports how many bytes three parts of Lance hold right now, from their own accounting, on every platform. `io_scheduler` is what the I/O schedulers admitted for reading and their callers have not received yet, reads still in flight included. Each scheduler bounds its share by its own I/O buffer size, which is the `io_buffer_size` of the scan for a scan and 32 MiB per I/O thread for most other reads, such as takes and index loads. Reads admitted by priority can go past that bound, and reads that bypass backpressure, as well as schedulers without an I/O buffer size, are not counted. `datafusion_pool` is the reservations in the DataFusion memory pools that Lance builds from its execution options, with or without spilling, as scans and index builds use. Plans that run in a default DataFusion session are not counted yet: the joins of `merge_insert`, MemWAL scans and point lookups, `Dataset::sql`, sessions from the DataFusion namespace `SessionBuilder`, and sessions an application builds itself. `mem_wal` is what the MemWAL shard writers hold, as `ShardWriter::memory().retained_bytes()` reports it: the memtables not flushed yet or kept for `frozen_memtable_grace`, with their indexes, or the pending batches of a WAL-only writer. A writer registers with the gauge after `ShardWriter::open` replays the WAL, so the memory that replay uses is not sampled, while the memtables it rebuilds stay resident and count as soon as `open` returns. The value is read when the recorder collects, so an instance created and dropped between two collections is not seen. A component is not reported until Lance first creates one in the process, and reads 0 while none is alive. The sum of the three is what these parts account for, not a breakdown of the RSS: each part estimates its own buffers, and the I/O schedulers count reads before their bytes arrive. The session caches report their size separately, as `lance_cache_size_bytes` (see Cache metrics).
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -143,3 +164,4 @@ The process gauges are best-effort readings of the live process. They cannot be 
 | `lance_memory_cgroup_limit_bytes` | gauge | none | Tightest memory limit over the process's cgroup and its ancestors, in bytes. |
 | `lance_memory_stage_peak_bytes` | histogram | `operation`, `index_type`, `stage` | Peak RSS during each stage of an index build, in bytes. |
 | `lance_memory_operation_peak_bytes` | histogram | `operation`, `index_type` | Peak RSS during each index build, in bytes. |
+| `lance_memory_component_bytes` | gauge | `component` | Bytes that a part of Lance holds right now: `io_scheduler`, `datafusion_pool` or `mem_wal`. |

@@ -20,7 +20,6 @@ use datafusion_physical_plan::{
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
-use tokio::task::spawn;
 
 pub mod background_iterator;
 
@@ -43,7 +42,7 @@ pub trait StreamingWriteSource: Send {
         Self: Sized,
     {
         let mut stream = self.into_stream();
-        let (stream, arrow_schema, schema) = spawn(async move {
+        let (stream, arrow_schema, schema) = lance_core::utils::tokio::spawn(async move {
             let arrow_schema = stream.schema();
             let mut schema: Schema = Schema::try_from(arrow_schema.as_ref())?;
             let first_batch = stream.try_next().await?;
