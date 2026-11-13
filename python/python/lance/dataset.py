@@ -2610,19 +2610,49 @@ class LanceDataset(pa.dataset.Dataset):
             data_storage_version,
         )
 
-    def versions(self) -> List[Version]:
+    def versions(
+        self,
+        *,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        descending: bool = False,
+    ) -> List[Version]:
         """
-        Return all versions in this dataset.
+        Return a page of versions in this dataset.
+
+        Versions are ordered ascending by version, or descending when
+        ``descending`` is ``True``. ``offset`` is the number of versions to skip
+        and ``limit`` is the maximum number to return, so the defaults return the
+        whole history. ``limit=None`` means no limit, ``limit=0`` returns an empty
+        list without listing or reading any manifest, and an ``offset`` past the
+        end of the history returns an empty list. Detached versions are never part
+        of the history.
 
         Each entry is a :class:`Version` with ``version``, ``timestamp``,
         ``metadata``, and ``manifest_size``. ``manifest_size`` is the size in
         bytes of that version's manifest file, or ``None`` if the commit
         handler could not report it.
+
+        Only the manifests in the returned page are read. A descending page on a
+        lexically ordered store with V2 manifest paths stops listing once the page
+        is filled; ascending pages, V1 manifest paths, and stores without lexically
+        ordered listings enumerate every manifest location before selecting the
+        page.
         """
-        versions = self._ds.versions()
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        versions = self._ds.versions(offset, limit, descending)
         for v in versions:
             _convert_version_timestamp(v)
         return versions
+
+    def count_versions(self) -> int:
+        """
+        Return the number of versions in this dataset.
+        """
+        return self._ds.count_versions()
 
     def get_version(self) -> Version:
         """

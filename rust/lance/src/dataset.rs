@@ -3266,27 +3266,83 @@ impl Dataset {
         self.session.deep_size_of() as u64
     }
 
-    /// Get all versions.
+    /// Get all versions, in ascending order.
+    ///
+    /// Every manifest in the history is read. Use [`Self::versions_with_options`] to
+    /// read only a page, or [`Self::count_versions`] to avoid reading manifests at all.
     pub async fn versions(&self) -> Result<Vec<Version>> {
-        let mut versions: Vec<Version> = self
-            .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
-            .map_ok(|location| async move {
+        self.versions_with_options(0, None, false).await
+    }
+
+    /// Get one page of versions in the current version history.
+    ///
+    /// Versions are ordered ascending by version, or descending when `descending`
+    /// is true. `offset` is the number of versions to skip and `limit` is the
+    /// maximum number to return, so `versions_with_options(0, None, false)` is the
+    /// whole history. `None` means no limit, `Some(0)` returns an empty page without
+    /// listing or reading any manifest, and an `offset` past the end of the history
+    /// returns an empty page. Detached versions are never part of the history.
+    ///
+    /// Only the manifests in the returned page are read, concurrently within the
+    /// store's effective IO window.
+    ///
+    /// With `descending` on a store whose listing is lexically ordered and whose
+    /// manifests are V2 paths, listing stops after `offset + limit` manifest entries
+    /// have been observed, so a page near the newest version does not enumerate the
+    /// history. Every other case (ascending pages, V1 manifest paths, or a listing
+    /// that is not lexically ordered) enumerates every manifest location before
+    /// selecting the page. These are listing-entry bounds: a store may still
+    /// materialize more keys, or issue more requests, than the entries it yields.
+    pub async fn versions_with_options(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> Result<Vec<Version>> {
+        let limit = limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let locations: Vec<ManifestLocation> = if descending {
+            let mut stream =
+                self.commit_handler
+                    .list_manifest_locations(&self.base, &self.object_store, true);
+            let mut skipped = 0;
+            let mut page = Vec::new();
+            while page.len() < limit {
+                let Some(location) = stream.try_next().await? else {
+                    break;
+                };
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    page.push(location);
+                }
+            }
+            page
+        } else {
+            let mut all: Vec<ManifestLocation> = self
+                .commit_handler
+                .list_manifest_locations(&self.base, &self.object_store, false)
+                .try_collect()
+                .await?;
+            all.sort_unstable_by_key(|location| location.version);
+            all.into_iter().skip(offset).take(limit).collect()
+        };
+
+        stream::iter(locations)
+            .map(|location| async move {
                 let manifest_size = location.size;
                 let manifest =
                     read_manifest(&self.object_store, &location.path, manifest_size).await?;
                 let mut version = Version::from(&manifest);
                 version.manifest_size = manifest_size;
-                Ok(version)
+                Ok::<_, Error>(version)
             })
-            .try_buffer_unordered(self.object_store.io_parallelism())
+            .buffered(self.object_store.io_parallelism())
             .try_collect()
-            .await?;
-
-        // TODO: this API should support pagination
-        versions.sort_by_key(|v| v.version);
-
-        Ok(versions)
+            .await
     }
 
     /// Get the number of versions in the current version history.
