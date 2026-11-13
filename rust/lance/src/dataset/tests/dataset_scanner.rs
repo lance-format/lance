@@ -162,9 +162,6 @@ async fn test_scan_reports_peak_reserved_bytes(#[case] sorted: bool) {
         .peak_reserved_bytes();
     assert_eq!(peak.map(|bytes| bytes > 0), Some(sorted), "{peak:?}");
 
-    // The scan above has registered the event's callsite. Registered while this
-    // mock is the only subscriber, it could keep the interest of another test's
-    // thread that has no subscriber.
     let peak_field = expect::field("peak_reserved_bytes");
     let peak_field = if sorted {
         peak_field
@@ -175,6 +172,11 @@ async fn test_scan_reports_peak_reserved_bytes(#[case] sorted: bool) {
         .with_filter(|metadata| metadata.target() == TRACE_EXECUTION)
         .event(expect::event().with_fields(peak_field))
         .run_with_handle();
+    // While exactly one dispatcher is registered, tracing caches a callsite's
+    // interest from the default dispatcher of the thread that fires it first,
+    // so a scan finishing in a parallel test could disable the event for this
+    // mock. A second live dispatcher makes tracing consult every registered one.
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
     let guard = tracing::subscriber::set_default(subscriber);
     scan().try_into_batch().await.unwrap();
     drop(guard);
