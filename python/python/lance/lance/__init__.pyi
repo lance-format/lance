@@ -311,6 +311,8 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        *,
+        session: Optional[_Session] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -349,6 +351,7 @@ class LanceFileReader:
         namespace_client: Optional[LanceNamespace],
         table_id: Optional[List[str]],
         columns: Optional[List[str]] = None,
+        session: Optional[_Session] = None,
     ): ...
     def read_all(
         self, batch_size: int, batch_readahead: int
@@ -426,6 +429,8 @@ class _Session:
         Either option may be more expensive.
         """
         ...
+    def set_index_cache_capacity(self, capacity_bytes: int) -> None: ...
+    def set_metadata_cache_capacity(self, capacity_bytes: int) -> None: ...
 
 def read_blob_files(
     blob_files: List[Optional[LanceBlobFile]],
@@ -472,6 +477,22 @@ class _Dataset:
         index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
+    def _with_read_params(
+        self, read_params: Optional[Dict[str, Any]] = None
+    ) -> _Dataset: ...
+    def _reconfigure(
+        self,
+        block_size: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
+        session: Optional[_Session] = None,
+        namespace_client: Optional[Any] = None,
+        table_id: Optional[List[str]] = None,
+        namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> _Dataset: ...
     @property
     def schema(self) -> pa.Schema: ...
     @property
@@ -600,7 +621,13 @@ class _Dataset:
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def column_layout_stats(self) -> List[Dict[str, Any]]: ...
-    def versions(self) -> List[Version]: ...
+    def versions(
+        self,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        descending: bool = False,
+    ) -> List[Version]: ...
+    def count_versions(self) -> int: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
     def current_version(self) -> Version: ...

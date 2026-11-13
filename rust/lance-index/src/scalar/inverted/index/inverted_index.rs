@@ -216,13 +216,32 @@ impl InvertedIndex {
             }
         }
 
-        let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
-        builder = builder
-            .with_token_set_format(first.token_set_format)
-            .with_format_version(first.format_version());
-        let files = builder
-            .update_from_segments(new_data, dest_store, segments, old_data_filters)
-            .await?;
+        let can_update = match (segments, old_data_filters, first.partitions.as_slice()) {
+            ([_], [filter], [partition]) if first.deleted_fragments.is_empty() => {
+                match partition.docs.modern() {
+                    Some(docs) => docs.can_copy_unchanged(filter.as_ref()).await?,
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        let files = if can_update {
+            // A single unchanged partition has nothing to merge yet. Copy it
+            // and consolidate with the new tail once, instead of decoding and
+            // writing the old postings before decoding them again at finalize.
+            first
+                .to_builder()
+                .with_progress(progress)
+                .update(new_data, dest_store, None)
+                .await?
+        } else {
+            InvertedIndexBuilder::new(first.params.clone())
+                .with_progress(progress)
+                .with_token_set_format(first.token_set_format)
+                .with_format_version(first.format_version())
+                .update_from_segments(new_data, dest_store, segments, old_data_filters)
+                .await?
+        };
 
         let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
 

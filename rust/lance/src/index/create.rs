@@ -39,7 +39,7 @@ use lance_index::{
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use std::{collections::HashMap, future::IntoFuture, sync::Arc};
-use tracing::{instrument, warn};
+use tracing::{Instrument, instrument, warn};
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
@@ -210,10 +210,17 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
-        self.execute_uncommitted_impl().await
+        let (index_metadata, observed) = self.execute_uncommitted_impl().await?;
+        observed.finish();
+        Ok(index_metadata)
     }
 
-    fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+    /// Builds the index and returns it with the memory observation of the
+    /// build still open, so that a caller that commits the index can finish
+    /// the observation once the commit has succeeded.
+    fn execute_uncommitted_impl(
+        &mut self,
+    ) -> BoxFuture<'_, Result<(IndexMetadata, ObservedBuild)>> {
         async move {
         if self.columns.len() != 1 {
             return Err(Error::index(
@@ -736,8 +743,7 @@ impl<'a> CreateIndexBuilder<'a> {
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
-        observed.finish();
-        Ok(index_metadata)
+        Ok((index_metadata, observed))
         }
         .boxed()
     }
@@ -753,7 +759,10 @@ impl<'a> CreateIndexBuilder<'a> {
             return self.execute_multi_segment_fmindex(num_segments).await;
         }
 
-        let new_idx = self.execute_uncommitted().await?;
+        let (new_idx, observed) = self
+            .execute_uncommitted_impl()
+            .instrument(tracing::info_span!("execute_uncommitted"))
+            .await?;
         let index_uuid = new_idx.uuid;
         let removed_indices = if self.replace {
             load_all_indices(self.dataset)
@@ -781,7 +790,8 @@ impl<'a> CreateIndexBuilder<'a> {
 
         // Rebasing may withdraw all query coverage while keeping the committed
         // segment's definition for rebuilding. Include that stored metadata.
-        self.dataset
+        let committed = self
+            .dataset
             .load_index_with_purpose(&index_uuid, OpenPurpose::Maintenance)
             .await?
             .ok_or_else(|| {
@@ -789,7 +799,9 @@ impl<'a> CreateIndexBuilder<'a> {
                     "Index with UUID {} not found after commit",
                     index_uuid
                 ))
-            })
+            })?;
+        observed.finish();
+        Ok(committed)
     }
     /// Extract `num_segments` from FM-Index params if this is an FM-Index build.
     fn fmindex_num_segments(&self) -> Option<u32> {
@@ -988,7 +1000,6 @@ impl<'a> CreateIndexBuilder<'a> {
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);
         }
-        observed.finish();
 
         // Convert to IndexSegments and build proper transaction metadata
         let segments = segment_metadatas
@@ -1023,18 +1034,21 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
-        if let Some(index) = indices.into_iter().next() {
-            return Ok(index);
-        }
-        // A rebase can withdraw all query coverage and leave empty
-        // definitions, which tagged query listings omit.
-        let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
-        indices.into_iter().next().ok_or_else(|| {
-            Error::internal(format!(
-                "FM-Index segments for '{}' not found after commit",
-                index_name
-            ))
-        })
+        let committed = if let Some(index) = indices.into_iter().next() {
+            index
+        } else {
+            // A rebase can withdraw all query coverage and leave empty
+            // definitions, which tagged query listings omit.
+            let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
+            indices.into_iter().next().ok_or_else(|| {
+                Error::internal(format!(
+                    "FM-Index segments for '{}' not found after commit",
+                    index_name
+                ))
+            })?
+        };
+        observed.finish();
+        Ok(committed)
     }
 }
 

@@ -20,7 +20,7 @@ use crate::{
 };
 use arrow::{
     array::AsArray,
-    datatypes::{UInt8Type, UInt32Type, UInt64Type},
+    datatypes::{Int32Type, UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_array::RecordBatch;
 use arrow_array::{
@@ -45,8 +45,20 @@ use lance_core::{
     utils::blob::blob_path,
 };
 use lance_datagen::{BatchCount, RowCount, array};
-use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
-use lance_io::{object_store::ObjectStoreParams, stream::RecordBatchStream};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::{
+    reader::{FileReader, FileReaderOptions},
+    version::{ConcreteFileVersion, LanceFileVersion},
+    versions,
+    writer::FileWriterOptions,
+};
+use lance_io::{
+    ReadBatchParams,
+    object_store::{ObjectStore, ObjectStoreParams},
+    scheduler::{ScanScheduler, SchedulerConfig},
+    stream::RecordBatchStream,
+    utils::CachedFileSize,
+};
 use lance_table::feature_flags::{FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY};
 use lance_table::format::BasePath;
 use rstest::rstest;
@@ -106,6 +118,254 @@ async fn test_released_blob_descriptor_nulls(
             .collect::<Vec<_>>(),
         remaining,
     );
+}
+
+fn descriptor_sizes(descriptor: &StructArray) -> Vec<Option<u64>> {
+    descriptor
+        .column_by_name("size")
+        .unwrap()
+        .as_primitive::<UInt64Type>()
+        .iter()
+        .collect()
+}
+
+fn descriptor_positions(descriptor: &StructArray) -> Vec<Option<u64>> {
+    descriptor
+        .column_by_name("position")
+        .unwrap()
+        .as_primitive::<UInt64Type>()
+        .iter()
+        .collect()
+}
+
+fn descriptor_kinds(descriptor: &StructArray) -> Vec<Option<u8>> {
+    descriptor
+        .column_by_name("kind")
+        .unwrap()
+        .as_primitive::<UInt8Type>()
+        .iter()
+        .collect()
+}
+
+fn descriptor_blob_ids(descriptor: &StructArray) -> Vec<Option<u32>> {
+    descriptor
+        .column_by_name("blob_id")
+        .unwrap()
+        .as_primitive::<UInt32Type>()
+        .iter()
+        .collect()
+}
+
+fn assert_descriptor(
+    descriptor: &StructArray,
+    sizes: &[Option<u64>],
+    positions: &[Option<u64>],
+    null_row: usize,
+) {
+    assert_eq!(descriptor_sizes(descriptor), sizes);
+    assert_eq!(descriptor_positions(descriptor), positions);
+    assert_eq!(
+        descriptor_kinds(descriptor),
+        sizes.iter().map(|size| size.map(|_| 0)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        descriptor_blob_ids(descriptor),
+        sizes.iter().map(|size| size.map(|_| 0)).collect::<Vec<_>>()
+    );
+    assert_eq!(descriptor.null_count(), 1);
+    assert!(descriptor.is_null(null_row));
+}
+
+/// Lance 14.0.2's raw file writer stores each Blob v2 descriptor group as
+/// anonymous top-level footer fields, including for a nested Blob. The raw
+/// reader must attach every group back to its own parent before projection.
+#[tokio::test]
+async fn test_raw_reader_reads_released_blob_v2_footer() {
+    let dir = crate::utils::test::copy_test_data_to_tmp("v14.0.2/blob_v2_raw_reader").unwrap();
+    let path =
+        object_store::path::Path::from_filesystem_path(dir.std_path().join("blob_v2_raw.lance"))
+            .unwrap();
+    let scheduler = Arc::new(ScanScheduler::new(
+        Arc::new(ObjectStore::local()),
+        SchedulerConfig::default_for_testing(),
+    ));
+    let file_scheduler = scheduler
+        .open_file(&path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let reader = FileReader::try_open(
+        file_scheduler,
+        None,
+        Arc::<DecoderPlugins>::default(),
+        &lance_file::testing::test_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reader.version(), ConcreteFileVersion::V2_2);
+
+    let schema = reader.schema();
+    assert_eq!(
+        schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "blob_a", "blob_b", "info"]
+    );
+    assert_eq!(schema.field("id").unwrap().id, 0);
+    let blob_a = schema.field("blob_a").unwrap();
+    let blob_b = schema.field("blob_b").unwrap();
+    let info = schema.field("info").unwrap();
+    assert_eq!(
+        (blob_a.id, blob_a.parent_id, blob_a.nullable),
+        (1, -1, true)
+    );
+    assert_eq!(
+        (blob_b.id, blob_b.parent_id, blob_b.nullable),
+        (8, -1, true)
+    );
+    assert_eq!((info.id, info.parent_id, info.nullable), (15, -1, true));
+    assert_eq!(info.children.len(), 1);
+    let payload = &info.children[0];
+    assert_eq!(payload.name, "payload");
+    assert_eq!(
+        (payload.id, payload.parent_id, payload.nullable),
+        (16, 15, true)
+    );
+
+    for blob in [blob_a, blob_b, payload] {
+        assert!(blob.is_blob_v2());
+        assert_eq!(
+            blob.metadata.get(BLOB_META_KEY).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            blob.metadata
+                .get("lance-encoding:packed")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            blob.children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kind", "position", "size", "blob_id", "blob_uri"]
+        );
+        for child in &blob.children {
+            assert_eq!((child.id, child.parent_id), (-1, -1));
+            assert!(child.children.is_empty());
+        }
+    }
+
+    let batches = reader
+        .read_stream(
+            ReadBatchParams::RangeFull,
+            1024,
+            16,
+            FilterExpression::no_filter(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let batch = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(batch.num_columns(), 4);
+    assert_eq!(
+        batch["id"]
+            .as_primitive::<Int32Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(10), Some(20), Some(30)]
+    );
+
+    let blob_a = batch["blob_a"].as_struct();
+    let blob_b = batch["blob_b"].as_struct();
+    let info = batch["info"].as_struct();
+    assert_eq!(info.null_count(), 0);
+    let payload = info.column_by_name("payload").unwrap().as_struct();
+    assert_descriptor(
+        blob_a,
+        &[Some(5), None, Some(0)],
+        &[Some(0), None, Some(64)],
+        1,
+    );
+    assert_descriptor(
+        blob_b,
+        &[Some(3), Some(5), None],
+        &[Some(64), Some(128), None],
+        2,
+    );
+    assert_descriptor(
+        payload,
+        &[Some(8), None, Some(8)],
+        &[Some(192), None, Some(256)],
+        1,
+    );
+
+    let projection = versions::reader_projection_from_column_names(
+        ConcreteFileVersion::V2_2,
+        schema,
+        &["blob_b", "info.payload"],
+    )
+    .unwrap();
+    let projected = reader
+        .read_stream_projected(
+            ReadBatchParams::RangeFull,
+            1024,
+            16,
+            projection,
+            FilterExpression::no_filter(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let projected =
+        arrow_select::concat::concat_batches(&projected[0].schema(), &projected).unwrap();
+    assert_eq!(projected.num_columns(), 2);
+    assert_eq!(projected["blob_b"].to_data(), batch["blob_b"].to_data());
+    assert_eq!(
+        projected["info"]
+            .as_struct()
+            .column_by_name("payload")
+            .unwrap()
+            .to_data(),
+        batch["info"]
+            .as_struct()
+            .column_by_name("payload")
+            .unwrap()
+            .to_data()
+    );
+
+    let projection = versions::reader_projection_from_column_names(
+        ConcreteFileVersion::V2_2,
+        schema,
+        &["id", "blob_a"],
+    )
+    .unwrap();
+    let projected = reader
+        .read_stream_projected(
+            ReadBatchParams::RangeFull,
+            1024,
+            16,
+            projection,
+            FilterExpression::no_filter(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let projected =
+        arrow_select::concat::concat_batches(&projected[0].schema(), &projected).unwrap();
+    assert_eq!(projected.num_columns(), 2);
+    assert_eq!(projected["id"].to_data(), batch["id"].to_data());
+    assert_eq!(projected["blob_a"].to_data(), batch["blob_a"].to_data());
 }
 
 #[rstest]

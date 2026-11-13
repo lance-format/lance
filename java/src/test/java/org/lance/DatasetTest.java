@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.compaction.CompactionOptions;
 import org.lance.file.FileWriteOptions;
+import org.lance.fragment.DeletionFile;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -414,6 +415,42 @@ public class DatasetTest {
             assertEquals(8, summaries.get(2).getTotalRows());
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testListVersionsWithOptions(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("list_versions_with_options").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 5).close();
+      testDataset.write(2, 5).close();
+      testDataset.write(3, 5).close();
+      try (Dataset dataset = testDataset.write(4, 5)) {
+        List<Version> all = dataset.listVersions();
+        assertEquals(5, all.size());
+        assertEquals(5, dataset.getVersionCount());
+
+        List<Version> newest = dataset.listVersions(0, Optional.of(2L), true);
+        assertEquals(Arrays.asList(all.get(4), all.get(3)), newest);
+
+        List<Version> secondPage = dataset.listVersions(2, Optional.of(2L), true);
+        assertEquals(Arrays.asList(all.get(2), all.get(1)), secondPage);
+
+        List<Version> ascending = dataset.listVersions(3, Optional.empty(), false);
+        assertEquals(Arrays.asList(all.get(3), all.get(4)), ascending);
+
+        assertEquals(all, dataset.listVersions(0, Optional.empty(), false));
+        assertTrue(dataset.listVersions(5, Optional.of(2L), false).isEmpty());
+        assertTrue(dataset.listVersions(0, Optional.of(0L), false).isEmpty());
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.listVersions(-1, Optional.empty(), false));
+        assertThrows(
+            IllegalArgumentException.class, () -> dataset.listVersions(0, Optional.of(-1L), false));
       }
     }
   }
@@ -1684,7 +1721,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testGetRowAddresses(@TempDir Path tempDir) {
+  void testGetRowAddresses(@TempDir Path tempDir) throws IOException {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
@@ -1719,6 +1756,39 @@ public class DatasetTest {
         // Without stable row ids a row id is its address, so ids pass through unchanged.
         List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
         assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String datasetPath = tempDir.resolve("deletion-io").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset
+          .createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())
+          .close();
+      testDataset.write(1, 5).close();
+
+      Path deletionFile;
+      try (Dataset ds = testDataset.write(2, 5)) {
+        ds.delete("id = 2");
+        Fragment fragment = ds.getFragments().get(0);
+        DeletionFile deletion = fragment.metadata().getDeletionFile();
+        assertNotNull(deletion);
+        String relativePath = deletion.getRelativePath(fragment.getId());
+        assertNotNull(relativePath);
+        deletionFile = Path.of(datasetPath).resolve(relativePath);
+      }
+
+      assertTrue(Files.deleteIfExists(deletionFile), "deletion file should exist");
+
+      try (Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        // A cold empty lookup must return before loading row-id metadata or deletion files.
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+        IOException error =
+            assertThrows(
+                IOException.class, () -> ds.getRowAddresses(Collections.singletonList(0L)));
+        assertTrue(error.getMessage().contains("_deletions"), error.getMessage());
       }
     }
   }

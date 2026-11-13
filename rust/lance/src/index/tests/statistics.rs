@@ -546,7 +546,7 @@ async fn test_describe_indices_empty_vector_bitmap_has_known_zero_coverage() {
     );
 }
 
-/// `fields` lists the carried columns too, but a logical description must
+/// `fields` can list the carried columns too, but a logical description must
 /// advertise only what the index can be searched on. Every binding reads this
 /// list as "the index's columns" -- Python's `_default_vector_index_for_column`
 /// matches on membership -- so a carried column here hands back the keyed
@@ -1820,4 +1820,47 @@ async fn test_index_statistics_from_segments_requires_migration() {
     )
     .unwrap();
     assert_eq!(actual, expected);
+}
+
+#[rstest]
+#[case::same_declaration(false, "b", true)]
+#[case::different_carried_field(false, "c", false)]
+#[case::same_fields_different_carried_field(true, "c", false)]
+#[tokio::test]
+async fn test_index_description_reads_segments_in_either_layout(
+    #[case] first_keys_only: bool,
+    #[case] carried_by_second: &str,
+    #[case] describes: bool,
+) {
+    let dataset = write_btree_table("memory://", &["a"], None).await;
+    let [a, b, carried] =
+        ["a", "b", carried_by_second].map(|name| dataset.schema().field_id(name).unwrap());
+    let plain = dataset.load_indices().await.unwrap()[0].clone();
+    let first = IndexMetadata {
+        fields: if first_keys_only { vec![a] } else { vec![a, b] },
+        covering_fields: vec![b],
+        ..plain.clone()
+    };
+    let keys_only = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        fields: vec![a],
+        covering_fields: vec![carried],
+        ..plain
+    };
+
+    let description = IndexDescriptionImpl::try_new(vec![first, keys_only], &dataset).await;
+
+    if !describes {
+        let Err(error) = description else {
+            panic!("segments that carry different fields must not describe one index");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("should declare identical keyed and carried fields"),
+            "unexpected error: {error}"
+        );
+        return;
+    }
+    assert_eq!(description.unwrap().field_ids(), [a as u32]);
 }

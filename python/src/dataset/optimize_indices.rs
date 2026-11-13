@@ -41,6 +41,9 @@ pub(crate) fn optimize_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<O
     if let Some(max_rows_per_segment) = kwargs.get_item("max_rows_per_segment")? {
         options.max_rows_per_segment = max_rows_per_segment.extract()?;
     }
+    if let Some(max_rows_to_consolidate) = kwargs.get_item("max_rows_to_consolidate")? {
+        options.max_rows_to_consolidate = max_rows_to_consolidate.extract()?;
+    }
     Ok(options)
 }
 
@@ -279,8 +282,21 @@ impl PyOptimizeIndices {
     /// Commit the merge ``results`` in one transaction, ``None`` entries
     /// ignored; whatever they do not cover stays unindexed for the next
     /// optimize. ``dataset`` is updated to the new version.
+    ///
+    /// ``options`` are the keyword options of
+    /// :py:meth:`lance.dataset.DatasetOptimizer.optimize_indices` the plan was
+    /// made with, for the ones that decide how the results are checked: a
+    /// consolidation (``max_rows_to_consolidate``) is checked against the
+    /// segments the dataset has now, so pass those options here as well.
+    /// Omitted, the commit uses the defaults, as it always has.
     #[staticmethod]
-    fn commit(dataset: Bound<PyAny>, results: Vec<Option<PyIndexSegmentResult>>) -> PyResult<()> {
+    #[pyo3(signature = (dataset, results, options = None))]
+    fn commit(
+        dataset: Bound<PyAny>,
+        results: Vec<Option<PyIndexSegmentResult>>,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let options = optimize_options(options)?;
         let dataset_ref = unwrap_dataset(dataset)?;
         // Taken before the commit, so a handle another thread is using is
         // refused with nothing committed, not after the commit went through.
@@ -292,7 +308,7 @@ impl PyOptimizeIndices {
             .map(|result| result.0)
             .collect();
         rt().block_on(None, async {
-            commit_optimize_indices(&mut new_ds, results, &OptimizeOptions::default()).await
+            commit_optimize_indices(&mut new_ds, results, &options).await
         })?
         .infer_error()?;
         dataset_mut.ds = Arc::new(new_ds);
