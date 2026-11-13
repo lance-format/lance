@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use arrow_array::{UInt64Array, record_batch};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt64Array, record_batch};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::collect;
 use rstest::rstest;
@@ -84,5 +84,93 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
                 "unexpected score {score}"
             );
         }
+    }
+}
+
+#[rstest]
+#[case::custom_list_retains_language_stop_word(
+    InvertedIndexParams::default().stem(false).custom_stop_words(Some(vec!["lance".into()])),
+    vec!["the lance data", "the orange", "lance purple"],
+    "the", vec![10, 11], Some(1.6_f32.ln() * 2.2 / 2.38),
+)]
+#[case::custom_list_removes_custom_word(
+    InvertedIndexParams::default().stem(false).custom_stop_words(Some(vec!["lance".into()])),
+    vec!["the lance data", "the orange", "lance purple"],
+    "lance", vec![], None,
+)]
+#[case::json_document_tokenizer(
+    InvertedIndexParams::default().stem(false).remove_stop_words(false).lance_tokenizer("json".into()),
+    vec![r#"{"body":"apple orange"}"#, r#"{"other":"apple"}"#, r#"{"body":"pear"}"#],
+    "body,str,apple", vec![10], Some((8_f32 / 3.0).ln() * 2.2 / 2.65),
+)]
+#[tokio::test]
+async fn explicit_empty_segments_retain_complete_persisted_tokenizer(
+    #[case] params: InvertedIndexParams,
+    #[case] documents: Vec<&str>,
+    #[case] terms: &str,
+    #[case] expected_ids: Vec<u64>,
+    #[case] expected_score: Option<f32>,
+) {
+    let text = Arc::new(StringArray::from(documents)) as arrow_array::ArrayRef;
+    let batch = RecordBatch::try_from_iter([("text", text.clone())]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    dataset.session().index_cache.clear().await;
+    let cache_entries = dataset.index_cache_entry_count().await;
+    let dataset = Arc::new(dataset);
+    let corpus = RecordBatch::try_from_iter([
+        ("text", text),
+        (
+            "_rowid",
+            Arc::new(UInt64Array::from(vec![10, 11, 12])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let input =
+        MemorySourceConfig::try_new_exec(&[vec![corpus.clone()]], corpus.schema(), None).unwrap();
+    let query = MatchQuery::new(terms.into())
+        .with_column(Some("text".into()))
+        .with_document_granularity(DocumentGranularity::Row);
+    let exec = Arc::new(
+        FlatMatchQueryExec::new_with_segments(
+            dataset.clone(),
+            query,
+            FtsSearchParams::default(),
+            input,
+            vec![],
+        )
+        .unwrap(),
+    );
+    for _ in 0..2 {
+        let batches = collect(exec.clone(), Default::default()).await.unwrap();
+        let result = arrow::compute::concat_batches(&exec.schema(), &batches).unwrap();
+        let mut actual_ids = result["_rowid"]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .to_vec();
+        actual_ids.sort_unstable();
+        assert_eq!(actual_ids, expected_ids);
+        if let Some(expected) = expected_score {
+            for actual in result["_score"]
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .values()
+            {
+                assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+            }
+        }
+        assert_eq!(
+            dataset.index_cache_entry_count().await,
+            cache_entries,
+            "tokenizer metadata must not open index partitions"
+        );
     }
 }

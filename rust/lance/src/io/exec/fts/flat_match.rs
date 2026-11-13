@@ -28,7 +28,7 @@ use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
 use crate::index::scalar::inverted::{
-    ResolvedFtsField, load_segment_details, load_segments, resolve_fts_field,
+    ResolvedFtsField, load_segment_details, load_segment_params, load_segments, resolve_fts_field,
 };
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
@@ -41,8 +41,8 @@ use lance_index::scalar::inverted::query::{
     uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
-    DocumentGranularity, FlatBm25SearchOptions, InvertedIndexParams, MemBM25Scorer,
-    build_global_bm25_scorer, flat_bm25_search_stream_with_options_and_scorer, fts_schema,
+    DocumentGranularity, FlatBm25SearchOptions, MemBM25Scorer, build_global_bm25_scorer,
+    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use tracing::instrument;
 
@@ -1054,15 +1054,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         // open every committed segment. Read tokenizer metadata
                         // from the pinned snapshot without constructing an index
                         // or borrowing any of its document/term statistics.
-                        let mut tokenizer = match load_segments(&ds, &column, document_granularity)
-                            .await?
-                        {
-                            Some(metadata) => {
-                                let details = load_segment_details(&ds, &column, &metadata).await?;
-                                InvertedIndexParams::try_from(&details)?.build()?
-                            }
-                            None => default_text_tokenizer(),
-                        };
+                        let mut tokenizer =
+                            match load_segments(&ds, &column, document_granularity).await? {
+                                Some(metadata) => {
+                                    let segment = metadata.first().ok_or_else(|| {
+                                        Error::internal("FTS tokenizer metadata has no segment")
+                                    })?;
+                                    load_segment_params(&ds, segment).await?.build()?
+                                }
+                                None => default_text_tokenizer(),
+                            };
                         let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         (
