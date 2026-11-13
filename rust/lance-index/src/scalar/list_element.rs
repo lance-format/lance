@@ -1328,6 +1328,19 @@ impl ScalarIndexPlugin for ListElementIndexPlugin {
         LIST_ELEMENT_INDEX_VERSION
     }
 
+    fn additional_field_ids(&self, index_details: &prost_types::Any) -> Result<Vec<i32>> {
+        let details = decode_details(index_details)?;
+        if details.keys.is_empty() || details.key_field_ids.len() != details.keys.len() {
+            return Err(corrupt_details(format!(
+                "list-element index has {} key field IDs for {} keys; \
+                 every key must have a recorded field ID",
+                details.key_field_ids.len(),
+                details.keys.len(),
+            )));
+        }
+        Ok(details.key_field_ids)
+    }
+
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
     }
@@ -1814,6 +1827,77 @@ mod tests {
             plugin
                 .new_query_parser("idx".to_string(), &details(vec![2]))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn test_additional_field_ids_follow_selected_keys_through_rename() {
+        let mut details = ListElementIndexDetails {
+            key_field_ids: vec![4, 2],
+            keys: vec!["confidence".to_string(), "label".to_string()],
+            key_types: vec!["float".to_string(), "string".to_string()],
+            key_encoding: ListElementKeyEncoding::ArrowRowV1.into(),
+            target_details: None,
+            target_index_version: 0,
+        };
+        let plugin = ListElementIndexPlugin;
+        assert_eq!(
+            plugin
+                .additional_field_ids(&prost_types::Any::from_msg(&details).unwrap())
+                .unwrap(),
+            [4, 2],
+        );
+        // The unindexed area field is absent, and names do not identify dependencies.
+        details.keys = vec!["score".to_string(), "class".to_string()];
+        assert_eq!(
+            plugin
+                .additional_field_ids(&prost_types::Any::from_msg(&details).unwrap())
+                .unwrap(),
+            [4, 2],
+        );
+    }
+
+    #[rstest]
+    #[case::missing_ids(vec![])]
+    #[case::missing_second_id(vec![2])]
+    #[case::extra_id(vec![2, 3, 4])]
+    fn test_additional_field_ids_reject_incomplete_declaration(#[case] ids: Vec<i32>) {
+        let details = prost_types::Any::from_msg(&ListElementIndexDetails {
+            key_field_ids: ids,
+            keys: vec!["label".to_string(), "confidence".to_string()],
+            key_types: vec!["string".to_string(), "float".to_string()],
+            key_encoding: ListElementKeyEncoding::ArrowRowV1.into(),
+            target_details: None,
+            target_index_version: 0,
+        })
+        .unwrap();
+        let error = ListElementIndexPlugin
+            .additional_field_ids(&details)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("every key must have a recorded field ID"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_additional_field_ids_reject_undecodable_details() {
+        let details = prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.ListElementIndexDetails".to_string(),
+            value: vec![0xff],
+        };
+        let error = ListElementIndexPlugin
+            .additional_field_ids(&details)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot decode list-element index details"),
+            "{error}"
         );
     }
 
