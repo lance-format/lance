@@ -50,13 +50,15 @@ use lance_core::{
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     DECODE_TIME_METRIC, ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC,
-    RANGES_SCANNED_METRIC, ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+    RANGES_SCANNED_METRIC, READ_BUDGET_WAIT_TIME_METRIC, ROWS_SCANNED_METRIC,
+    TASK_WAIT_TIME_METRIC,
 };
-use lance_file::reader::FileReaderOptions;
+use lance_file::reader::{FileReaderOptions, ReadEstimate};
 use lance_index::scalar::expression::FilterPlan;
 use lance_io::object_store::{
     METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
 };
+use lance_io::read_budget::QueryId;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
@@ -71,7 +73,7 @@ use tracing::{Instrument, instrument};
 
 use crate::Dataset;
 use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
-use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig};
+use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::fragment_slice::validate_physical_rows;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
@@ -81,11 +83,68 @@ use crate::dataset::scanner::{
 use crate::dataset::versions;
 
 use super::column_width::{self, MeasuredWidths};
+use super::read_budget::{self, ChunkAdmission, ChunkBudget, ChunkSize, ReadChunk, ScanBudget};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
 type MaterializedReadBatchesFut =
     futures::future::BoxFuture<'static, Result<Vec<MaterializedBlobBatch>>>;
+type FragmentChunk = (Arc<OpenedFragmentRead>, ReadChunk);
+type FragmentChunkStream = BoxStream<'static, Result<FragmentChunk>>;
+
+/// The chunks of a budgeted read that its partitions take from.
+struct SharedChunks {
+    chunks: Arc<ChunkQueue>,
+    scan_budget: ScanBudget,
+    /// Chunks a partition reads ahead of its consumer: the scan's read-ahead
+    /// split among its partitions, so the scan reads as far ahead as it does in
+    /// one partition.
+    readahead: usize,
+}
+
+/// The chunks of a budgeted read, shared by its partitions. A task forwards
+/// them into a bounded channel ahead of the partitions, so no partition holds
+/// a lock while it waits for a chunk: one whose consumer stops polling can't
+/// hold up the others.
+struct ChunkQueue {
+    receiver: async_channel::Receiver<Result<FragmentChunk>>,
+    /// The chunks and where to send them, until the first partition starts
+    /// the task: the read is planned outside a runtime.
+    unstarted: std::sync::Mutex<
+        Option<(
+            FragmentChunkStream,
+            async_channel::Sender<Result<FragmentChunk>>,
+        )>,
+    >,
+    producer: std::sync::OnceLock<SpawnedTask<()>>,
+}
+
+impl ChunkQueue {
+    fn new(chunks: FragmentChunkStream, capacity: usize) -> Arc<Self> {
+        let (sender, receiver) = async_channel::bounded(capacity.max(1));
+        Arc::new(Self {
+            receiver,
+            unstarted: std::sync::Mutex::new(Some((chunks, sender))),
+            producer: Default::default(),
+        })
+    }
+
+    /// The next chunk, or `None` once the read has none left. Shaped for
+    /// [`futures::stream::unfold`].
+    async fn pop(self: Arc<Self>) -> Option<(Result<FragmentChunk>, Arc<Self>)> {
+        if let Some((mut chunks, sender)) = self.unstarted.lock().unwrap().take() {
+            let _ = self.producer.set(SpawnedTask::spawn(async move {
+                while let Some(chunk) = chunks.next().await {
+                    if sender.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        let chunk = self.receiver.recv().await.ok()?;
+        Some((chunk, self))
+    }
+}
 
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
     let schema = projection.to_schema();
@@ -232,6 +291,7 @@ struct ScopedFragmentRead {
     read_projection: Arc<Projection>,
     with_deleted_rows: bool,
     batch_size: u32,
+    keep_batch_size: bool,
     file_reader_options: Option<FileReaderOptions>,
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
@@ -485,6 +545,152 @@ pub enum FilteredReadThreadingMode {
     MultiplePartitions(usize),
 }
 
+/// A fragment opened for reading. A scan reads its planned ranges either all at
+/// once or, under a read memory budget, a chunk at a time.
+struct OpenedFragmentRead {
+    dataset: Arc<Dataset>,
+    reader: FragmentReader,
+    /// The planned ranges, sorted
+    ranges: Vec<Range<u64>>,
+    batch_size: u32,
+    keep_batch_size: bool,
+    batch_size_bytes: Option<u64>,
+    physical_filter: Option<Arc<dyn PhysicalExpr>>,
+    output_schema: SchemaRef,
+    output_read_schema: Arc<LanceSchema>,
+    materialize_blob_v2_binary: bool,
+    materialization_context: Arc<BlobMaterializationContext>,
+    global_metrics: Arc<FilteredReadGlobalMetrics>,
+    fragment_counted: Arc<AtomicBool>,
+    range_tracker: Arc<Mutex<RangeMetricsTracker>>,
+    /// Stop reading the fragment after this many rows
+    soft_limit: Option<u64>,
+    /// Rows read so far, across all chunks
+    rows_read: Arc<AtomicUsize>,
+}
+
+impl OpenedFragmentRead {
+    fn reached_soft_limit(&self) -> bool {
+        self.soft_limit
+            .is_some_and(|limit| self.rows_read.load(Ordering::Relaxed) >= limit as usize)
+    }
+
+    async fn plan_chunks(&self, chunk_bytes: u64) -> Result<Vec<ReadChunk>> {
+        read_budget::plan_chunks(
+            &self.reader,
+            &self.ranges,
+            self.batch_size,
+            self.keep_batch_size,
+            chunk_bytes,
+        )
+        .await
+    }
+
+    async fn read_ranges(
+        &self,
+        ranges: Vec<Range<u64>>,
+        chunk_budget: Option<Arc<ChunkBudget>>,
+    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>> {
+        let dataset = self.dataset.clone();
+        let global_metrics = self.global_metrics.clone();
+        let fragment_counted = self.fragment_counted.clone();
+        let range_tracker = self.range_tracker.clone();
+        let materialize_blob_v2_binary = self.materialize_blob_v2_binary;
+        let output_read_schema = self.output_read_schema.clone();
+        let materialization_context = self.materialization_context.clone();
+        let physical_filter = self.physical_filter.clone();
+        let output_schema = self.output_schema.clone();
+        let batch_size_bytes = self.batch_size_bytes;
+        let chunk_budget_for_output = chunk_budget.clone();
+        let fragment_stream = self
+            .reader
+            .read_ranges(ranges.into(), self.batch_size)
+            .await?
+            .map(move |batch_fut: ReadBatchFut| {
+                let global_metrics = global_metrics.clone();
+                let fragment_counted = fragment_counted.clone();
+                let range_tracker = range_tracker.clone();
+                let decoded_budget = chunk_budget.clone();
+                let batch_fut = batch_fut
+                    .inspect_ok(move |batch| {
+                        if let Some(chunk_budget) = &decoded_budget {
+                            chunk_budget.observe_decoded(batch);
+                        }
+                        let num_rows = batch.num_rows();
+                        global_metrics.rows_scanned.add(num_rows);
+                        if !fragment_counted.swap(true, Ordering::Relaxed) {
+                            global_metrics.fragments_scanned.add(1);
+                        }
+                        // Note: this is an approximation. Batches may come in out-of-order,
+                        // in which case this might be inaccurate.
+                        if let Ok(mut range_tracker) = range_tracker.lock() {
+                            let additional_ranges =
+                                range_tracker.incremental_ranges_scanned(num_rows);
+                            global_metrics.ranges_scanned.add(additional_ranges);
+                        }
+                    })
+                    .boxed();
+                if materialize_blob_v2_binary {
+                    let dataset = dataset.clone();
+                    let output_read_schema = output_read_schema.clone();
+                    let materialization_context = materialization_context.clone();
+                    let admission = materialization_context.admission();
+                    batch_fut
+                        .and_then(move |batch| async move {
+                            crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
+                                &dataset,
+                                output_read_schema.as_ref(),
+                                batch,
+                                &materialization_context,
+                                admission,
+                            )
+                            .await
+                        })
+                        .boxed()
+                } else {
+                    batch_fut.map_ok(MaterializedBlobBatch::unreserved).boxed()
+                }
+            })
+            .zip(futures::stream::repeat((
+                physical_filter.clone(),
+                output_schema.clone(),
+            )))
+            .map(|(batch_fut, args)| {
+                FilteredReadStream::wrap_with_filter(batch_fut, args.0, args.1)
+            })
+            .map(move |batch_fut_result| {
+                let batch_fut = batch_fut_result?;
+                let chunk_budget = chunk_budget_for_output.clone();
+                Ok(batch_fut
+                    .and_then(move |batch| {
+                        // The batch takes its share of the chunk's reservation
+                        // until the scan emits it.
+                        let batch = match chunk_budget {
+                            Some(chunk_budget) => {
+                                let bytes = batch.batch().get_array_memory_size() as u64;
+                                batch.with_reservation(Arc::new(chunk_budget.charge_output(bytes)))
+                            }
+                            None => batch,
+                        };
+                        futures::future::ready(if let Some(budget) = batch_size_bytes {
+                            batch.split_by_bytes((budget * 2) as usize)
+                        } else {
+                            Ok(vec![batch])
+                        })
+                    })
+                    .boxed())
+            });
+
+        let result = if let Some(limit) = self.soft_limit {
+            FilteredReadStream::apply_soft_limit(fragment_stream, limit, self.rows_read.clone())
+                .boxed()
+        } else {
+            fragment_stream.boxed()
+        };
+        Ok(result)
+    }
+}
+
 /// The stream of filtered rows that satisfies the FilteredReadExec node
 ///
 /// This represents a scan of a Lance dataset.  Upon creation of the stream we will
@@ -501,6 +707,10 @@ struct FilteredReadStream {
     ///
     /// This stream can be shared by multiple partitions
     task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchesFut>>>>,
+    /// Under a read memory budget with multiple partitions, the partitions
+    /// share the chunks instead, and each admits the chunks it takes with its
+    /// own budget reader (`task_stream` is then empty)
+    budgeted_chunks: Option<SharedChunks>,
     /// The scan scheduler for the scan
     scan_scheduler: Arc<ScanScheduler>,
     /// The global metrics for the scan
@@ -653,6 +863,7 @@ impl FilteredReadStream {
         priority_offset: Option<u32>,
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
+        scan_budget: Option<ScanBudget>,
     ) -> Result<Self> {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
@@ -704,32 +915,73 @@ impl FilteredReadStream {
             }
         }
 
-        let global_metrics_clone = global_metrics.clone();
-
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map({
-                let scan_range_after_filter = scan_range_after_filter.clone();
-                move |scoped_fragment| {
-                    let metrics = global_metrics_clone.clone();
-                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    let dataset = dataset.clone();
-                    let materialization_context = materialization_context.clone();
-                    SpawnedTask::spawn(
-                        Self::read_fragment(
-                            dataset,
-                            scoped_fragment,
-                            metrics,
-                            limit,
-                            materialization_context,
-                            materialize_blob_v2_binary,
-                        )
-                        .in_current_span(),
-                    )
-                    .map(|thread_result| thread_result.unwrap())
+        let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+        let mut budgeted_chunks = None;
+        let task_stream = match scan_budget {
+            Some(scan_budget) if scan_budget.is_whole_read() => Self::budgeted_whole_read_stream(
+                dataset,
+                scoped_fragments,
+                global_metrics.clone(),
+                limit,
+                materialization_context,
+                materialize_blob_v2_binary,
+                fragment_readahead,
+                scan_budget,
+            ),
+            Some(scan_budget) => {
+                let chunks = Self::budgeted_chunk_stream(
+                    dataset,
+                    scoped_fragments,
+                    global_metrics.clone(),
+                    limit,
+                    materialization_context,
+                    materialize_blob_v2_binary,
+                    fragment_readahead,
+                    scan_budget.chunk_size(),
+                );
+                match threading_mode {
+                    FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => {
+                        Self::budgeted_task_stream(chunks, fragment_readahead, scan_budget)
+                    }
+                    FilteredReadThreadingMode::MultiplePartitions(partitions) => {
+                        budgeted_chunks = Some(SharedChunks {
+                            chunks: ChunkQueue::new(chunks, fragment_readahead),
+                            scan_budget,
+                            readahead: fragment_readahead.div_ceil(partitions.max(1)),
+                        });
+                        futures::stream::empty().boxed()
+                    }
                 }
-            })
-            .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+            }
+            None => {
+                let global_metrics_clone = global_metrics.clone();
+
+                let fragment_streams = futures::stream::iter(scoped_fragments)
+                    .map({
+                        let scan_range_after_filter = scan_range_after_filter.clone();
+                        move |scoped_fragment| {
+                            let metrics = global_metrics_clone.clone();
+                            let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                            let dataset = dataset.clone();
+                            let materialization_context = materialization_context.clone();
+                            SpawnedTask::spawn(
+                                Self::read_fragment(
+                                    dataset,
+                                    scoped_fragment,
+                                    metrics,
+                                    limit,
+                                    materialization_context,
+                                    materialize_blob_v2_binary,
+                                )
+                                .in_current_span(),
+                            )
+                            .map(|thread_result| thread_result.unwrap())
+                        }
+                    })
+                    .buffered(fragment_readahead);
+                fragment_streams.try_flatten().boxed()
+            }
+        };
 
         // A batch never spans fragments, so a plan touching many fragments
         // with few rows each emits one tiny batch per fragment. Fragments
@@ -750,6 +1002,7 @@ impl FilteredReadStream {
         Ok(Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
+            budgeted_chunks,
             scan_scheduler,
             metrics: global_metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
@@ -1148,6 +1401,7 @@ impl FilteredReadStream {
                     read_projection,
                     with_deleted_rows: options.with_deleted_rows,
                     batch_size: default_batch_size,
+                    keep_batch_size: options.keep_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
                     physical_filter,
                     priority: priority as u32,
@@ -1544,7 +1798,10 @@ impl FilteredReadStream {
             FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
                 assert!(partition < num_partitions);
                 let output_schema = self.output_schema.clone();
-                let task_stream = self.task_stream.clone();
+                let task_stream = match &self.budgeted_chunks {
+                    Some(shared) => Arc::new(AsyncMutex::new(Self::partition_task_stream(shared))),
+                    None => self.task_stream.clone(),
+                };
                 let global_metrics_clone = global_metrics.clone();
                 let scan_scheduler_clone = scan_scheduler.clone();
                 let batch_stream = futures::stream::try_unfold(task_stream, {
@@ -1604,16 +1861,177 @@ impl FilteredReadStream {
         }
     }
 
+    /// Opens the fragments and splits each one's ranges into chunks of about
+    /// `chunk_size` on disk, to be admitted by a read memory budget.
+    #[allow(clippy::too_many_arguments)]
+    fn budgeted_chunk_stream(
+        dataset: Arc<Dataset>,
+        scoped_fragments: Vec<ScopedFragmentRead>,
+        global_metrics: Arc<FilteredReadGlobalMetrics>,
+        fragment_soft_limit: Option<u64>,
+        materialization_context: Arc<BlobMaterializationContext>,
+        materialize_blob_v2_binary: bool,
+        readahead: usize,
+        chunk_size: ChunkSize,
+    ) -> FragmentChunkStream {
+        futures::stream::iter(scoped_fragments)
+            .map(move |scoped_fragment| {
+                let chunk_size = chunk_size.clone();
+                let open = Self::open_fragment(
+                    dataset.clone(),
+                    scoped_fragment,
+                    global_metrics.clone(),
+                    fragment_soft_limit,
+                    materialization_context.clone(),
+                    materialize_blob_v2_binary,
+                );
+                SpawnedTask::spawn(
+                    async move {
+                        let fragment = open.await?;
+                        let chunks = fragment.plan_chunks(chunk_size.bytes()).await?;
+                        Ok::<_, Error>(futures::stream::iter(
+                            chunks
+                                .into_iter()
+                                .map(move |chunk| Ok((fragment.clone(), chunk))),
+                        ))
+                    }
+                    .in_current_span(),
+                )
+                .map(|thread_result| thread_result.unwrap())
+            })
+            .buffered(readahead)
+            .try_flatten()
+            .boxed()
+    }
+
+    /// Reads a chunk once the budget admits it, in its own task like an
+    /// unbudgeted fragment read, so chunks are set up in parallel.
+    fn read_budgeted_chunk(
+        admission: ChunkAdmission,
+        chunk: Result<FragmentChunk>,
+    ) -> impl Future<Output = Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>>> {
+        let read = async move {
+            let (fragment, chunk) = chunk?;
+            if fragment.reached_soft_limit() {
+                return Ok::<_, Error>(futures::stream::empty().boxed());
+            }
+            let chunk_budget = admission.reserve(chunk.rows(), chunk.estimate).await;
+            fragment.read_ranges(chunk.ranges, Some(chunk_budget)).await
+        };
+        SpawnedTask::spawn(read.in_current_span()).map(|thread_result| thread_result.unwrap())
+    }
+
+    /// Reads the chunks with up to `readahead` of them admitted ahead.
+    /// Admissions are taken in the order the scan consumes the chunks, which
+    /// the budget needs to stay deadlock-free.
+    fn budgeted_task_stream(
+        chunks: FragmentChunkStream,
+        readahead: usize,
+        scan_budget: ScanBudget,
+    ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
+        chunks
+            .map(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
+            .buffered(readahead)
+            .try_flatten()
+            .boxed()
+    }
+
+    /// One partition's tasks from the chunks its partitions share. A partition
+    /// admits the chunks it takes with its own reader, since partitions are
+    /// consumed independently, and reads up to `readahead` of them ahead of
+    /// its consumer while the budget has room.
+    fn partition_task_stream(
+        shared: &SharedChunks,
+    ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
+        let scan_budget = shared.scan_budget.sibling();
+        futures::stream::unfold(shared.chunks.clone(), ChunkQueue::pop)
+            .map(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
+            .buffered(shared.readahead.max(1))
+            .try_flatten()
+            .boxed()
+    }
+
+    /// Reads the fragments under one reservation for the whole read, taken
+    /// before any of their pages are requested.
+    #[allow(clippy::too_many_arguments)]
+    fn budgeted_whole_read_stream(
+        dataset: Arc<Dataset>,
+        scoped_fragments: Vec<ScopedFragmentRead>,
+        global_metrics: Arc<FilteredReadGlobalMetrics>,
+        fragment_soft_limit: Option<u64>,
+        materialization_context: Arc<BlobMaterializationContext>,
+        materialize_blob_v2_binary: bool,
+        readahead: usize,
+        scan_budget: ScanBudget,
+    ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
+        let admission = scan_budget.admission();
+        futures::stream::once(async move {
+            let fragments: Vec<Arc<OpenedFragmentRead>> = futures::stream::iter(scoped_fragments)
+                .map(|scoped_fragment| {
+                    Self::open_fragment(
+                        dataset.clone(),
+                        scoped_fragment,
+                        global_metrics.clone(),
+                        fragment_soft_limit,
+                        materialization_context.clone(),
+                        materialize_blob_v2_binary,
+                    )
+                })
+                .buffered(readahead)
+                .try_collect()
+                .await?;
+            let (mut rows, mut estimate) = (0, ReadEstimate::default());
+            for fragment in &fragments {
+                rows += fragment.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+                estimate = estimate
+                    + fragment
+                        .reader
+                        .estimate_read(fragment.ranges.clone().into())
+                        .await?;
+            }
+            let chunk_budget = admission.reserve(rows, estimate).await;
+            let reads = futures::future::try_join_all(fragments.iter().map(|fragment| {
+                fragment.read_ranges(fragment.ranges.clone(), Some(chunk_budget.clone()))
+            }))
+            .await?;
+            Ok::<_, Error>(futures::stream::iter(reads).flatten())
+        })
+        .try_flatten()
+        .boxed()
+    }
+
     // Reads a single fragment into a stream of batch tasks
     #[instrument(name = "read_fragment", level = "debug", skip_all)]
     async fn read_fragment(
+        dataset: Arc<Dataset>,
+        fragment_read_task: ScopedFragmentRead,
+        global_metrics: Arc<FilteredReadGlobalMetrics>,
+        fragment_soft_limit: Option<u64>,
+        materialization_context: Arc<BlobMaterializationContext>,
+        materialize_blob_v2_binary: bool,
+    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>> {
+        let fragment = Self::open_fragment(
+            dataset,
+            fragment_read_task,
+            global_metrics,
+            fragment_soft_limit,
+            materialization_context,
+            materialize_blob_v2_binary,
+        )
+        .await?;
+        let ranges = fragment.ranges.clone();
+        fragment.read_ranges(ranges, None).await
+    }
+
+    #[instrument(name = "open_fragment", level = "debug", skip_all)]
+    async fn open_fragment(
         dataset: Arc<Dataset>,
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
-    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>> {
+    ) -> Result<Arc<OpenedFragmentRead>> {
         let batch_size_bytes = fragment_read_task
             .file_reader_options
             .as_ref()
@@ -1642,100 +2060,42 @@ impl FilteredReadStream {
         if has_blob_v2_binary {
             frag_read_config = frag_read_config.with_row_address(true);
         }
-        let mut fragment_reader = fragment_read_task
+        let mut reader = fragment_read_task
             .fragment
             .open(&read_schema, frag_read_config)
             .await?;
 
         if fragment_read_task.with_deleted_rows {
-            fragment_reader.with_make_deletions_null();
+            reader.with_make_deletions_null();
         }
 
         // The reader expects sorted ranges and it may be possible to get non-sorted ranges if
         // the row ids are not contiguous
         fragment_read_task.ranges.sort_by_key(|r| r.start);
 
-        let physical_filter = fragment_read_task.physical_filter;
-
-        // We are going to count the fragment as scanned on the first batch we
-        // read. This might miss empty fragments, but we assume that wouldn't be
-        // used in the scan anyways.
-        let fragment_counted = Arc::new(AtomicBool::new(false));
-        let range_tracker = Arc::new(Mutex::new(RangeMetricsTracker::new(
-            fragment_read_task.ranges.clone(),
-        )));
-
-        let fragment_stream = fragment_reader
-            .read_ranges(
-                fragment_read_task.ranges.into(),
-                fragment_read_task.batch_size,
-            )
-            .await?
-            .map(move |batch_fut: ReadBatchFut| {
-                let global_metrics = global_metrics.clone();
-                let fragment_counted = fragment_counted.clone();
-                let range_tracker = range_tracker.clone();
-                let batch_fut = batch_fut
-                    .inspect_ok(move |batch| {
-                        let num_rows = batch.num_rows();
-                        global_metrics.rows_scanned.add(num_rows);
-                        if !fragment_counted.swap(true, Ordering::Relaxed) {
-                            global_metrics.fragments_scanned.add(1);
-                        }
-                        // Note: this is an approximation. Batches may come in out-of-order,
-                        // in which case this might be inaccurate.
-                        if let Ok(mut range_tracker) = range_tracker.lock() {
-                            let additional_ranges =
-                                range_tracker.incremental_ranges_scanned(num_rows);
-                            global_metrics.ranges_scanned.add(additional_ranges);
-                        }
-                    })
-                    .boxed();
-                if materialize_blob_v2_binary {
-                    let dataset = dataset.clone();
-                    let output_read_schema = output_read_schema.clone();
-                    let materialization_context = materialization_context.clone();
-                    let admission = materialization_context.admission();
-                    batch_fut
-                        .and_then(move |batch| async move {
-                            crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
-                                &dataset,
-                                output_read_schema.as_ref(),
-                                batch,
-                                &materialization_context,
-                                admission,
-                            )
-                            .await
-                        })
-                        .boxed()
-                } else {
-                    batch_fut.map_ok(MaterializedBlobBatch::unreserved).boxed()
-                }
-            })
-            .zip(futures::stream::repeat((
-                physical_filter.clone(),
-                output_schema.clone(),
-            )))
-            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1))
-            .map(move |batch_fut_result| {
-                let batch_fut = batch_fut_result?;
-                Ok(batch_fut
-                    .and_then(move |batch| {
-                        futures::future::ready(if let Some(budget) = batch_size_bytes {
-                            batch.split_by_bytes((budget * 2) as usize)
-                        } else {
-                            Ok(vec![batch])
-                        })
-                    })
-                    .boxed())
-            });
-
-        let result = if let Some(limit) = fragment_soft_limit {
-            Self::apply_soft_limit(fragment_stream, limit).boxed()
-        } else {
-            fragment_stream.boxed()
-        };
-        Ok(result)
+        Ok(Arc::new(OpenedFragmentRead {
+            dataset,
+            reader,
+            range_tracker: Arc::new(Mutex::new(RangeMetricsTracker::new(
+                fragment_read_task.ranges.clone(),
+            ))),
+            ranges: fragment_read_task.ranges,
+            batch_size: fragment_read_task.batch_size,
+            keep_batch_size: fragment_read_task.keep_batch_size,
+            batch_size_bytes,
+            physical_filter: fragment_read_task.physical_filter,
+            output_schema,
+            output_read_schema,
+            materialize_blob_v2_binary,
+            materialization_context,
+            global_metrics,
+            // We are going to count the fragment as scanned on the first batch we
+            // read. This might miss empty fragments, but we assume that wouldn't be
+            // used in the scan anyways.
+            fragment_counted: Arc::new(AtomicBool::new(false)),
+            soft_limit: fragment_soft_limit,
+            rows_read: Arc::new(AtomicUsize::new(0)),
+        }))
     }
 
     fn wrap_with_filter(
@@ -1766,12 +2126,11 @@ impl FilteredReadStream {
     fn apply_soft_limit<S>(
         stream: S,
         limit: u64,
+        rows_read: Arc<AtomicUsize>,
     ) -> impl Stream<Item = Result<MaterializedReadBatchesFut>>
     where
         S: Stream<Item = Result<MaterializedReadBatchesFut>>,
     {
-        let rows_read = Arc::new(AtomicUsize::new(0));
-
         stream
             .take_while({
                 let rows_read = rows_read.clone();
@@ -2002,6 +2361,9 @@ pub struct FilteredReadOptions {
     pub materialization_readahead_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
+    /// Keep `batch_size` under a read memory limit; see
+    /// [`crate::dataset::scanner::Scanner::keep_batch_size`].
+    pub keep_batch_size: bool,
     /// Row IDs whose index entries may be stale because an overlay committed after the
     /// index was built touches an indexed field. They are blocked from the index result so the
     /// index never emits them; the scanner re-evaluates just these rows against their current
@@ -2042,6 +2404,7 @@ impl FilteredReadOptions {
             io_buffer_size_bytes: None,
             materialization_readahead_bytes: None,
             only_indexed_fragments: false,
+            keep_batch_size: false,
             overlay_block: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
@@ -3054,6 +3417,12 @@ impl FilteredReadExec {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
+                let scan_budget = dataset.session.read_budget().map(|budget| {
+                    ScanBudget::new(
+                        budget.reader(QueryId::of(&context)),
+                        metrics.new_time(READ_BUDGET_WAIT_TIME_METRIC, partition),
+                    )
+                });
                 let new_running_stream = FilteredReadStream::try_new(
                     dataset,
                     options,
@@ -3064,6 +3433,7 @@ impl FilteredReadExec {
                     None,
                     materialization_context,
                     true,
+                    scan_budget,
                 )
                 .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
@@ -3158,6 +3528,7 @@ impl FilteredReadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = QueryId::of(&context);
         let input_stream = source.plan.execute(partition, context)?;
         let dataset = self.dataset.clone();
         let source = source.clone();
@@ -3180,6 +3551,7 @@ impl FilteredReadExec {
                 &metrics,
                 partition,
                 materialization_context,
+                query,
             ));
             Ok::<_, DataFusionError>(row_stream_read.apply(input_stream))
         })
@@ -3238,9 +3610,16 @@ struct RowStreamRead {
     loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     baseline_metrics: BaselineMetrics,
+    /// Under a read memory budget, each batch reads with a sibling of this,
+    /// so the batches share what the read learns about decoded sizes
+    scan_budget: Option<ScanBudget>,
 }
 
+/// Rows sampled to estimate what a row-stream read loads per row.
+const SAMPLED_ROWS: u64 = 64;
+
 impl RowStreamRead {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dataset: Arc<Dataset>,
         source: Arc<RowStreamSource>,
@@ -3249,10 +3628,12 @@ impl RowStreamRead {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
         materialization_context: Arc<BlobMaterializationContext>,
+        query: QueryId,
     ) -> Self {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
         let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
+        let dataset_budget = dataset.session.read_budget().cloned();
         Self {
             dataset,
             source,
@@ -3264,7 +3645,59 @@ impl RowStreamRead {
             loaded_fragments: OnceCell::new(),
             global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
+            // `collect_all` gathers each batch's whole read before returning it.
+            scan_budget: dataset_budget.map(|budget| {
+                ScanBudget::whole_read(
+                    budget.reader(query),
+                    metrics.new_time(READ_BUDGET_WAIT_TIME_METRIC, partition),
+                )
+            }),
         }
+    }
+
+    /// Under a read memory budget, the rows to take per batch so that one
+    /// batch's read is about one chunk of the budget. A batch reads all of its
+    /// rows at once, so a larger one would have to wait for the overdraft.
+    /// Estimated from rows spread over the first fragment, since the rows a
+    /// stream takes are scattered; any failure keeps `batch_rows`.
+    async fn budgeted_batch_rows(&self, batch_rows: usize) -> usize {
+        let Some(scan_budget) = &self.scan_budget else {
+            return batch_rows;
+        };
+        if batch_rows == 0 || self.source.read_options.keep_batch_size {
+            return batch_rows;
+        }
+        let Ok(fragments) = self.load_fragments().await else {
+            return batch_rows;
+        };
+        let Some(fragment) = fragments
+            .fragments
+            .iter()
+            .find(|fragment| fragment.num_physical_rows > 0)
+        else {
+            return batch_rows;
+        };
+        let schema = crate::dataset::blob::blob_v2_descriptor_schema(
+            &self.source.read_options.projection.to_bare_schema(),
+        );
+        let Ok(reader) = fragment
+            .fragment
+            .open(&schema, FragReadConfig::default())
+            .await
+        else {
+            return batch_rows;
+        };
+        let step = (fragment.num_physical_rows / SAMPLED_ROWS).max(1);
+        let sample: Vec<Range<u64>> = (0..fragment.num_physical_rows)
+            .step_by(step as usize)
+            .map(|row| row..row + 1)
+            .collect();
+        let rows = sample.len() as u64;
+        let Ok(ReadEstimate { bytes, .. }) = reader.estimate_read(sample.into()).await else {
+            return batch_rows;
+        };
+        let bytes_per_row = (bytes / rows).max(1);
+        (scan_budget.chunk_size().bytes() / bytes_per_row).clamp(1, batch_rows as u64) as usize
     }
 
     async fn load_fragments(&self) -> Result<&StreamFragments> {
@@ -3485,6 +3918,7 @@ impl RowStreamRead {
             Some(priority_offset),
             self.materialization_context.clone(),
             false,
+            self.scan_budget.as_ref().map(ScanBudget::sibling),
         )?;
         let decode_parallelism = match self.source.read_options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
@@ -3540,14 +3974,18 @@ impl RowStreamRead {
             .as_ref()
             .and_then(|o| o.batch_size_bytes);
         let result = if let Some(output_schema) = &self.source.materialization_output_schema {
-            crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
-                &self.dataset,
-                output_schema,
-                attached.into_batch(),
-                &self.materialization_context,
-                admission,
+            let (batch, reservations) = attached.into_parts();
+            reservations.into_iter().fold(
+                crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
+                    &self.dataset,
+                    output_schema,
+                    batch,
+                    &self.materialization_context,
+                    admission,
+                )
+                .await?,
+                MaterializedBlobBatch::with_reservation,
             )
-            .await?
         } else {
             drop(admission);
             attached
@@ -3571,7 +4009,12 @@ impl RowStreamRead {
             .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
         let on_result = self.clone();
         let on_done = self.clone();
-        coalesce_batches(input, batch_target_rows)
+        let this = self.clone();
+        let batches = futures::stream::once(async move {
+            coalesce_batches(input, this.budgeted_batch_rows(batch_target_rows).await)
+        })
+        .flatten();
+        batches
             .enumerate()
             .map(move |(batch_index, batch)| {
                 let batch = batch?;

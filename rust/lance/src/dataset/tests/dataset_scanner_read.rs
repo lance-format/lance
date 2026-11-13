@@ -903,6 +903,83 @@ fn v2_blob_array(rows: usize, base: usize) -> ArrayRef {
     builder.finish().unwrap()
 }
 
+/// Blob payloads are loaded after their chunk is admitted; a read memory budget
+/// must still return every payload, whether chunks fit, wait or overdraw.
+#[rstest::rstest]
+#[case::every_chunk_overdraws(1)]
+#[case::chunks_wait(4 * 1024 * 1024)]
+#[case::chunks_fit(64 * 1024 * 1024)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
+    use super::dataset_read_budget::{assert_released, open};
+    use lance_core::datatypes::BlobHandling;
+
+    let dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        blob_field("blobs", true),
+    ]));
+    let batches: Vec<RecordBatch> = (0..4)
+        .map(|b| {
+            let base = b * 200;
+            let ids = Arc::new(Int32Array::from_iter_values(base as i32..base as i32 + 200));
+            RecordBatch::try_new(schema.clone(), vec![ids, v2_blob_array(200, base)]).unwrap()
+        })
+        .collect();
+    Dataset::write(
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 200,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // (id, payload length, first payload byte) for every returned row
+    async fn read_payloads(dataset: &Dataset, filter: Option<&str>) -> Vec<(i32, usize, u8)> {
+        let mut scan = dataset.scan();
+        scan.project(&["id", "blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .batch_size(32);
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+        }
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch["id"].as_primitive::<Int32Type>();
+            let blobs = batch["blobs"].as_binary::<i64>();
+            for (id, blob) in ids.values().iter().zip(blobs.iter()) {
+                let blob = blob.unwrap();
+                rows.push((*id, blob.len(), blob[0]));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    let unbudgeted = open(&dir, None).await;
+    let budgeted = open(&dir, Some(limit)).await;
+    for filter in [None, Some("id % 5 = 0")] {
+        let expected = read_payloads(&unbudgeted, filter).await;
+        assert!(expected.iter().all(|(_, len, _)| *len == 8 * 1024));
+        assert_eq!(read_payloads(&budgeted, filter).await, expected);
+        let concurrent =
+            futures::future::join_all((0..8).map(|_| read_payloads(&budgeted, filter))).await;
+        assert!(concurrent.iter().all(|rows| *rows == expected));
+    }
+    assert_released(&budgeted);
+}
+
 #[tokio::test]
 async fn test_batch_size_bytes_blob_v2_late_materialization() {
     use lance_core::datatypes::BlobHandling;

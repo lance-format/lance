@@ -95,6 +95,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
+            keep_batch_size: false,
             file_reader_options,
             aggregate: None,
             legacy_with_row_addr: false,
@@ -774,6 +775,19 @@ impl Scanner {
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
+        self
+    }
+
+    /// Keep [`Self::batch_size`] under the session's read memory limit.
+    ///
+    /// By default a budgeted scan reads rows too wide for one chunk of the
+    /// limit in smaller batches. A scan whose batches are written out should
+    /// keep its batch size instead: a writer encodes each batch's values
+    /// together, and too few values per batch can lose an encoding, such as a
+    /// dictionary, that a larger batch would use. A batch larger than the
+    /// limit's share is then read alone, past the limit.
+    pub fn keep_batch_size(&mut self, keep_batch_size: bool) -> &mut Self {
+        self.keep_batch_size = keep_batch_size;
         self
     }
 

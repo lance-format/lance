@@ -196,7 +196,7 @@ pub struct MaterializedBlobBatch {
     /// Reservations are reference-counted so that splitting a batch into
     /// multiple chunks keeps the original memory reservation alive until the
     /// last chunk is dropped.
-    _reservations: Vec<Arc<BlobMaterializationReservation>>,
+    _reservations: Vec<Arc<dyn Send + Sync>>,
 }
 
 impl MaterializedBlobBatch {
@@ -208,14 +208,17 @@ impl MaterializedBlobBatch {
     }
 
     #[cfg(test)]
-    fn with_reservations(
-        batch: RecordBatch,
-        reservations: Vec<Arc<BlobMaterializationReservation>>,
-    ) -> Self {
+    fn with_reservations(batch: RecordBatch, reservations: Vec<Arc<dyn Send + Sync>>) -> Self {
         Self {
             batch,
             _reservations: reservations,
         }
+    }
+
+    /// Keeps `reservation` until every chunk of this batch is dropped.
+    pub(crate) fn with_reservation(mut self, reservation: Arc<dyn Send + Sync>) -> Self {
+        self._reservations.push(reservation);
+        self
     }
 
     pub(crate) fn batch(&self) -> &RecordBatch {
@@ -265,6 +268,11 @@ impl MaterializedBlobBatch {
 
     pub(crate) fn into_batch(self) -> RecordBatch {
         self.batch
+    }
+
+    /// The batch and the reservations that keep its memory accounted for.
+    pub(crate) fn into_parts(self) -> (RecordBatch, Vec<Arc<dyn Send + Sync>>) {
+        (self.batch, self._reservations)
     }
 }
 
@@ -488,7 +496,10 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
                 )),
                 columns,
             )?,
-            _reservations: reservation.into_iter().map(Arc::new).collect(),
+            _reservations: reservation
+                .into_iter()
+                .map(|reservation| Arc::new(reservation) as Arc<dyn Send + Sync>)
+                .collect(),
         })
     }
     .boxed()

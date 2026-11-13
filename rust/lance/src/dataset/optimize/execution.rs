@@ -289,6 +289,9 @@ async fn prepare_reader(
     if let Some(bs) = batch_size {
         scanner.batch_size(bs);
     }
+    // The rewrite encodes each batch it reads, so a read memory limit must not
+    // shrink them below what keeps the source's encodings.
+    scanner.keep_batch_size(true);
     if let Some(io_buffer_size) = io_buffer_size {
         scanner.io_buffer_size(io_buffer_size);
     }
