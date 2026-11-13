@@ -1179,6 +1179,7 @@ impl InvertedIndex {
                     let results = super::scheduling::score_ready_partitions(
                         loads,
                         chunk_size,
+                        |(_, _, _, _, postings)| postings.retained_bytes(),
                         move |loaded| {
                             let mut results = Vec::with_capacity(loaded.len());
                             for (partition_ordinal, part, lengths, visibility, postings) in loaded {

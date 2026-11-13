@@ -1701,6 +1701,38 @@ pub(super) struct FetchedPostings {
 }
 
 impl FetchedPostings {
+    /// Approximate the cache-backed payload held until this partition is scored.
+    /// Group slices can retain whole Arrow allocations. Shared position streams
+    /// already track the capacity accepted by their ownership checks.
+    pub(super) fn retained_bytes(&self) -> usize {
+        let mut context = lance_core::deepsize::Context::default();
+        self.postings
+            .iter()
+            .fold(0usize, |total, (_, _, _, posting)| {
+                let bytes = match posting {
+                    PostingList::Plain(posting) => posting.deep_size_of_children(&mut context),
+                    PostingList::Compressed(posting) => {
+                        let positions = match &posting.positions {
+                            Some(CompressedPositionStorage::LegacyPerDoc(positions)) => {
+                                super::cache::retained_cache_bytes(positions, &mut context)
+                            }
+                            Some(CompressedPositionStorage::SharedStream(positions)) => {
+                                positions.size()
+                            }
+                            None => 0,
+                        };
+                        let impacts = posting.impacts.as_ref().map_or(0, |impacts| {
+                            super::cache::retained_cache_bytes(impacts.entries(), &mut context)
+                        });
+                        super::cache::retained_cache_bytes(&posting.blocks, &mut context)
+                            .saturating_add(positions)
+                            .saturating_add(impacts)
+                    }
+                };
+                total.saturating_add(bytes)
+            })
+    }
+
     /// Build the iterators; `tokens` must be the tokens these postings were
     /// fetched for.
     pub(super) fn into_loaded(
