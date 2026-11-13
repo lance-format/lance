@@ -52,7 +52,8 @@ public class LanceMetricsTest {
           "lance_memory_rss_bytes",
           "lance_memory_rss_peak_bytes",
           "lance_memory_cgroup_bytes",
-          "lance_memory_cgroup_limit_bytes");
+          "lance_memory_cgroup_limit_bytes",
+          "lance_memory_component_bytes");
   private static final String MEMORY_STAGE_PEAK = "lance_memory_stage_peak_bytes";
   private static final String MEMORY_OPERATION_PEAK = "lance_memory_operation_peak_bytes";
 

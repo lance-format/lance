@@ -3,6 +3,9 @@
 
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
+use crate::index::frag_reuse_v0_cache::{
+    V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
+};
 use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
@@ -24,7 +27,7 @@ use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -40,7 +43,11 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
-    V0(Arc<dyn RowIdRemapper>),
+    V0 {
+        remapper: Arc<dyn RowIdRemapper>,
+        /// See [`v0_segment_cache_id`].
+        cache_id: Option<Uuid>,
+    },
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
@@ -55,7 +62,10 @@ pub(crate) enum ResolvedRemapping {
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V0 { cache_id, .. } => f
+                .debug_struct("V0")
+                .field("cache_id", cache_id)
+                .finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
             Self::V1Translate { remapper, .. } => {
                 f.debug_tuple("V1Translate").field(remapper).finish()
@@ -97,15 +107,15 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the history, by its
-/// [`v0_cache_identity`], identify cached content. Under a tagged history the
+/// handed to the plugin's load path), so only then does the history, by
+/// [`v0_segment_cache_id`], identify cached content. Under a tagged history the
 /// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
 /// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
     match resolved {
-        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        Some((_, ResolvedRemapping::V0 { cache_id, .. })) => cache_id.as_ref(),
         _ => None,
     }
 }
@@ -205,6 +215,10 @@ pub(crate) enum MissingCoverageReason {
     /// The stored metadata cannot be interpreted (no or undecodable index
     /// details). Maintenance fails.
     Corrupt,
+    /// The segment's format marker could not be read, so whether this build
+    /// can translate it is unknown. Not a verdict on the segment: maintenance
+    /// skips it and a later call reclassifies it once the read succeeds.
+    Unverifiable,
 }
 
 impl std::fmt::Display for MissingCoverageReason {
@@ -216,6 +230,7 @@ impl std::fmt::Display for MissingCoverageReason {
             }
             Self::Unsupported => "this build cannot translate it",
             Self::Corrupt => "its metadata cannot be interpreted",
+            Self::Unverifiable => "its format marker could not be read",
         })
     }
 }
@@ -283,104 +298,140 @@ impl CacheKey for FriQueryPlanKey<'_> {
 
 /// Build or fetch the snapshot's FRI query plan.
 ///
-/// Cached in the tagged (manifest-path scoped) namespace; concurrent opens
-/// coalesce on one build. Everything only needed to BUILD the plan (notably
-/// `load_indices` and its tagged coverage post-processing) runs inside the
-/// loader, so warm opens never recompute coverage.
+/// Cached in the tagged (manifest-path scoped) namespace, so warm opens never
+/// recompute coverage. A plan built from an unverifiable listing, or holding an
+/// `Unverifiable` segment, is returned uncached, so concurrent cold builds of
+/// such a snapshot each run the derivation -- the cost of re-probing instead of
+/// freezing a transient fault for the snapshot. A healthy snapshot's cold
+/// builds run the derivation concurrently too; the raw ledger, mapping and
+/// format-marker readers they go through stay cached.
 async fn fri_query_plan(
     dataset: &Dataset,
     fri: &IndexMetadata,
     stored: &[IndexMetadata],
     mapping: &Arc<super::frag_reuse_reader::FragmentReuseIndex>,
 ) -> lance_core::Result<Arc<FriQueryPlan>> {
-    dataset
+    let cache = dataset
         .index_cache
-        .with_key_prefix(dataset.manifest_location.path.as_ref())
-        .get_or_insert_with_key(
-            FriQueryPlanKey {
-                fri_uuid: &fri.uuid,
-            },
-            || async {
-                // The filtered listing carries the rewritten query coverage;
-                // `stored` keeps provenance from before that rewrite. Callers
-                // hold metadata returned by load_indices and cannot supply
-                // this distinction.
-                let indices = dataset.load_indices().await?;
-                let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    stored.iter().map(|entry| (entry.uuid, entry)).collect();
-                // Group the filtered listing by logical index name; the
-                // backtrack derives each member's sibling exclusions from the
-                // stored provenance of the whole group in one pass, so
-                // "direct coverage wins" is owned by one algorithm.
-                let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    HashMap::with_capacity(indices.len());
-                let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
-                for entry in indices.iter() {
-                    filtered_by_uuid.insert(entry.uuid, entry);
-                    if entry.name != FRAG_REUSE_INDEX_NAME {
-                        groups
-                            .entry(entry.name.as_str())
-                            .or_default()
-                            .push(entry.uuid);
+        .with_key_prefix(dataset.manifest_location.path.as_ref());
+    let key = FriQueryPlanKey {
+        fri_uuid: &fri.uuid,
+    };
+    if let Some(cached) = cache.get_with_key(&key).await {
+        return Ok(cached);
+    }
+    // The listing's own `unverifiable` set, not a guess from the plan's
+    // contents: a segment the reader dropped for an unreadable marker is
+    // simply absent here, and `missing_coverage_reason` below may then probe
+    // it successfully and return a DEFINITIVE reason. Caching a plan built
+    // from those two inconsistent views would freeze "no coverage" for the
+    // whole snapshot.
+    let mut unverifiable = BTreeSet::new();
+    let plan = {
+        let build = async {
+            // The filtered listing carries the rewritten query coverage;
+            // `stored` keeps provenance from before that rewrite. Callers
+            // hold metadata returned by load_indices and cannot supply
+            // this distinction.
+            let listing = dataset.derived_index_listing().await?;
+            unverifiable = listing.unverifiable;
+            let indices = listing.indices;
+            let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                stored.iter().map(|entry| (entry.uuid, entry)).collect();
+            // Group the filtered listing by logical index name; the
+            // backtrack derives each member's sibling exclusions from the
+            // stored provenance of the whole group in one pass, so
+            // "direct coverage wins" is owned by one algorithm.
+            let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                HashMap::with_capacity(indices.len());
+            let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
+            for entry in indices.iter() {
+                filtered_by_uuid.insert(entry.uuid, entry);
+                if entry.name != FRAG_REUSE_INDEX_NAME {
+                    groups
+                        .entry(entry.name.as_str())
+                        .or_default()
+                        .push(entry.uuid);
+                }
+            }
+            let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
+            for members in groups.into_values() {
+                let provenance: Vec<RoaringBitmap> = members
+                    .iter()
+                    .map(|uuid| {
+                        stored_by_uuid
+                            .get(uuid)
+                            .and_then(|source| source.fragment_bitmap.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
+                    parts_by_uuid.insert(*uuid, parts);
+                }
+            }
+            let mut segments = HashMap::with_capacity(stored.len());
+            for source in stored.iter() {
+                let plan = if source
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+                {
+                    // An empty bitmap needs no translation, but its pages
+                    // may still hold the withdrawn rows: never identity.
+                    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
+                } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
+                    SegmentRemappingPlan::Identity
+                } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
+                    && let Some(bitmap) = &entry.fragment_bitmap
+                {
+                    let coverage = bitmap & dataset.fragment_bitmap.as_ref();
+                    // Other selected segments own their direct coverage.
+                    // Drop paths entering those fragments before later
+                    // mappings can merge them with this segment's
+                    // contribution.
+                    let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
+                    let fingerprint =
+                        mapping.translation_fingerprint(&coverage, &parts.excluded, &parts.path);
+                    SegmentRemappingPlan::Translate {
+                        coverage,
+                        excluded_fragments: parts.excluded,
+                        fingerprint,
                     }
-                }
-                let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
-                for members in groups.into_values() {
-                    let provenance: Vec<RoaringBitmap> = members
-                        .iter()
-                        .map(|uuid| {
-                            stored_by_uuid
-                                .get(uuid)
-                                .and_then(|source| source.fragment_bitmap.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
-                        parts_by_uuid.insert(*uuid, parts);
-                    }
-                }
-                let mut segments = HashMap::with_capacity(stored.len());
-                for source in stored.iter() {
-                    let plan = if source
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|bitmap| bitmap.is_empty())
-                    {
-                        // An empty bitmap needs no translation, but its pages
-                        // may still hold the withdrawn rows: never identity.
-                        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
-                    } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
-                        SegmentRemappingPlan::Identity
-                    } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
-                        && let Some(bitmap) = &entry.fragment_bitmap
-                    {
-                        let coverage = bitmap & dataset.fragment_bitmap.as_ref();
-                        // Other selected segments own their direct coverage.
-                        // Drop paths entering those fragments before later
-                        // mappings can merge them with this segment's
-                        // contribution.
-                        let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
-                        let fingerprint = mapping.translation_fingerprint(
-                            &coverage,
-                            &parts.excluded,
-                            &parts.path,
-                        );
-                        SegmentRemappingPlan::Translate {
-                            coverage,
-                            excluded_fragments: parts.excluded,
-                            fingerprint,
-                        }
-                    } else {
-                        SegmentRemappingPlan::MissingCoverage(
-                            missing_coverage_reason(dataset, mapping, source).await?,
-                        )
-                    };
-                    segments.insert(source.uuid, plan);
-                }
-                Ok(FriQueryPlan { segments })
-            },
-        )
-        .await
+                } else if unverifiable.contains(&source.name) {
+                    // This segment's own logical group lost a segment to an
+                    // unreadable marker, so its absence here says nothing
+                    // about its coverage. Re-probing could answer a definitive
+                    // reason built on a group listing that is already known to
+                    // be incomplete; report the uncertainty instead (the plan
+                    // is uncached below). Another group's uncertainty leaves
+                    // this segment's reason to the probe.
+                    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
+                } else {
+                    SegmentRemappingPlan::MissingCoverage(
+                        missing_coverage_reason(dataset, mapping, source).await?,
+                    )
+                };
+                segments.insert(source.uuid, plan);
+            }
+            Ok::<_, Error>(FriQueryPlan { segments })
+        };
+        Arc::new(build.await?)
+    };
+    // A reason of `Unverifiable`, or a listing that lost a segment to an
+    // unreadable marker, holds for this call alone: caching the plan would
+    // keep the segment unverifiable for the whole snapshot. Return it
+    // uncached so the next call re-probes.
+    if unverifiable.is_empty()
+        && !plan.segments.values().any(|plan| {
+            matches!(
+                plan,
+                SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
+            )
+        })
+    {
+        cache.insert_with_key(&key, plan.clone()).await;
+    }
+    Ok(plan)
 }
 
 /// Resolve the current fragment coverage for committed query segments.
@@ -504,11 +555,25 @@ async fn missing_coverage_reason(
     if source.index_details.is_none() {
         return Ok(MissingCoverageReason::Corrupt);
     }
+    // A probe that cannot reach the format marker says nothing about the
+    // segment's format, and the snapshot plan this reason goes into is built
+    // for every segment: failing here would fail every query on the table.
+    // Report it as unverifiable for THIS plan, so a later snapshot
+    // reclassifies once the store answers again.
     Ok(
-        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await? {
-            Some(true) => MissingCoverageReason::NoDerivedCoverage,
-            Some(false) => MissingCoverageReason::Unsupported,
-            None => MissingCoverageReason::Corrupt,
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await {
+            Ok(Some(true)) => MissingCoverageReason::NoDerivedCoverage,
+            Ok(Some(false)) => MissingCoverageReason::Unsupported,
+            Ok(None) => MissingCoverageReason::Corrupt,
+            Err(error) => {
+                log::warn!(
+                    "index {} (segment {}): could not read its format marker ({error}); \
+                     reporting its coverage as unverifiable for this snapshot",
+                    source.name,
+                    source.uuid,
+                );
+                MissingCoverageReason::Unverifiable
+            }
         },
     )
 }
@@ -616,12 +681,24 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            (
-                v0_cache_identity(dataset, fri),
-                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
-            )
-        }));
+        let Some(legacy) = dataset.open_frag_reuse_index(metrics).await? else {
+            return Ok(None);
+        };
+        let history = v0_cache_identity(dataset, fri);
+        let digests = dataset
+            .index_cache
+            .get_or_insert_with_key(V0HistoryDigestsKey { history: &history }, || async {
+                Ok(V0HistoryDigests::new(&legacy.details))
+            })
+            .await?;
+        let cache_id = v0_segment_cache_id(history, &legacy.details, &digests, index);
+        return Ok(Some((
+            history,
+            ResolvedRemapping::V0 {
+                remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
+                cache_id,
+            },
+        )));
     }
     if fri.index_version != 1 {
         return Err(Error::not_supported(format!(
@@ -672,6 +749,13 @@ pub(super) async fn open_row_id_remapping_with_plan(
             Err(Error::not_supported(format!(
                 "segment {} cannot be translated by this build under the tagged fragment reuse \
                  history; leave it for a rebuild or a newer version of Lance",
+                index.uuid
+            )))
+        }
+        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable) => {
+            Err(Error::not_supported(format!(
+                "segment {}'s format marker could not be read, so whether this build can \
+                 translate it is unknown; retry once the store answers",
                 index.uuid
             )))
         }
@@ -2016,6 +2100,135 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     Ok((entry, base_entry_version))
 }
 
+/// The committed segments whose coverage of `rewritten` a deferred rewrite
+/// must withdraw instead of leaving behind: those that cover one of the
+/// rewritten fragments, directly or through their retired provenance, and
+/// whose type cannot translate stored addresses through the history in
+/// batches.
+///
+/// The classification is the reader's own
+/// (`segment_supports_batch_remapping`), so a segment the reader would
+/// translate keeps its provenance:
+/// - `Some(true)`: deferrable, not listed;
+/// - `Some(false)`: listed, its coverage of the rewritten sources withdrawn;
+/// - `None`: not listed. Details that cannot be interpreted are refused
+///   elsewhere (the reader derives no coverage for such a segment and the
+///   write gates refuse the shapes that would rely on one), and guessing a
+///   withdrawal from unreadable metadata would delete coverage this build
+///   cannot prove is unsound.
+///
+/// Returned in the stored listing's order so the result does not depend on
+/// map iteration.
+pub(crate) async fn undeferrable_rewrite_segments(
+    dataset: &Dataset,
+    rewritten: &RoaringBitmap,
+) -> lance_core::Result<Vec<Uuid>> {
+    if rewritten.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stored = super::loading::load_all_indices(dataset).await?;
+    // A segment may cover `rewritten` only through a retired fragment an
+    // earlier rewrite already moved into it, so the selector needs the same
+    // history and liveness the withdrawal helper walks.
+    let lineage = match stored
+        .iter()
+        .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
+    {
+        Some(entry) => {
+            let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
+            Some(
+                lance_table::system_index::frag_reuse::lineage::TaggedLineage::new(
+                    entry,
+                    Some(Arc::new(ledger)),
+                ),
+            )
+        }
+        None => None,
+    };
+    let live: RoaringBitmap = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect();
+    undeferrable_segments_covering(dataset, stored.iter(), rewritten, lineage.as_ref(), &live).await
+}
+
+/// [`undeferrable_rewrite_segments`] over a supplied segment list: the
+/// segments of `segments` whose coverage of `fragments` cannot be translated
+/// through the history. Used for segments the manifest does not list yet, a
+/// `CreateIndex` rebased over a committed rewrite.
+///
+/// A segment is a candidate when it covers one of `fragments` directly, or
+/// when it covers a retired fragment (outside `live`) whose rows the history
+/// moved into one of `fragments`: that coverage addresses the rewritten
+/// fragment just as much, through one more hop. The reach of a retired
+/// source mirrors the withdrawal helper's conservative rule, so selection
+/// and withdrawal agree on the same fragments: an unwalkable history
+/// (`None` lineage, or `destinations_of` returning `None`) makes every
+/// retired source a candidate rather than silently keeping coverage the
+/// withdrawal would drop.
+///
+/// Only candidates pay the capability probe.
+pub(crate) async fn undeferrable_segments_covering<'a>(
+    dataset: &Dataset,
+    segments: impl Iterator<Item = &'a IndexMetadata>,
+    fragments: &RoaringBitmap,
+    lineage: Option<&lance_table::system_index::frag_reuse::lineage::TaggedLineage>,
+    live: &RoaringBitmap,
+) -> lance_core::Result<Vec<Uuid>> {
+    let mut undeferrable = Vec::new();
+    let mut reaches: HashMap<u32, bool> = HashMap::new();
+    for index in segments {
+        if lance_table::system_index::is_system_index(index) {
+            continue;
+        }
+        // Unknown coverage is not a candidate, as in every earlier revision
+        // of this selector: the established reader rules already refuse such
+        // a segment (no derived coverage, scan fallback), so there is nothing
+        // a withdrawal could protect, and the selector never guesses which
+        // fragments an absent bitmap would have named.
+        let Some(bitmap) = index.fragment_bitmap.as_ref() else {
+            continue;
+        };
+        let covers_directly = !bitmap.is_disjoint(fragments);
+        let covers_through_history = !covers_directly
+            && (bitmap - live).iter().any(|source| {
+                // Same-name segments routinely share retired sources, and the
+                // walk is transitive; memoize it for this call.
+                *reaches.entry(source).or_insert_with(|| {
+                    match lineage.and_then(|lineage| lineage.destinations_of(source)) {
+                        Some(destinations) => destinations
+                            .iter()
+                            .any(|destination| fragments.contains(*destination)),
+                        None => true,
+                    }
+                })
+            });
+        if !covers_directly && !covers_through_history {
+            continue;
+        }
+        // TODO: Support deferred remapping for all index types.
+        // Only a CONFIRMED undeferrable verdict withdraws coverage. A probe
+        // that cannot reach the segment's format marker is not a verdict: the
+        // commit proceeds without selecting the segment, so no withdrawal is
+        // persisted from a transient fault and nothing is cached. The reader
+        // refuses such a segment's coverage meanwhile, and a later commit
+        // withdraws once the probe answers.
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, index).await {
+            Ok(Some(false)) => undeferrable.push(index.uuid),
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "index {} (segment {}): could not read its format marker ({error}); \
+                 not withdrawing its coverage in this commit",
+                index.name,
+                index.uuid,
+            ),
+        }
+    }
+    Ok(undeferrable)
+}
+
 /// Package assembled tagged FRI content bytes into a fresh manifest entry,
 /// spilling to an external details file above the inline threshold. The
 /// content must already be validated (a decodable ledger); this only encodes.
@@ -2555,10 +2768,19 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse_reader::tests as reader_tests;
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::{derive_vector_index_type, vector_index_details_default};
+    use crate::session::Session;
+    use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int32Type;
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Int32Array, RecordBatch};
+    use lance_datagen::Dimension;
+    use lance_index::INDEX_AUXILIARY_FILE_NAME;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     use lance_table::format::Fragment;
     use lance_table::format::pb::fragment_reuse_index_details::{
@@ -3821,12 +4043,11 @@ mod tests {
         assert_eq!(dataset.latest_version_id().await.unwrap(), version);
     }
 
-    /// Round 5 item 4: deferred compaction of fragments no index covers and
-    /// no lineage reaches commits a plain rewrite on a tagged table -- no
-    /// new transition, the entry untouched -- instead of growing the history
-    /// with records no reader ever has to translate.
+    /// Deferred compaction of fragments no index covers and no lineage reaches
+    /// still appends a transition on a tagged table (an index build in flight
+    /// may cover them), and trim releases it since no committed index needs it.
     #[tokio::test]
-    async fn uncovered_deferred_compaction_commits_plain_rewrite() {
+    async fn uncovered_deferred_compaction_appends_a_trimmable_transition() {
         let mut dataset = reader_tests::fixture().await;
         reserve_fragments(&mut dataset, 20).await;
         let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
@@ -3901,20 +4122,34 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
 
-        // The entry is byte-for-byte the one from before the compaction.
         let stored = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap();
         let entry = stored_fri(&stored);
-        assert_eq!(entry.uuid, entry_before.uuid);
+        assert_ne!(entry.uuid, entry_before.uuid);
         let ledger = decode_entry(&dataset, &entry).await;
-        assert_eq!(ledger.transitions().len(), 1);
+        assert_eq!(ledger.transitions().len(), 2);
         assert_eq!(sorted_values(&dataset).await, before);
         assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
         assert_eq!(
             filtered_values(&dataset, "i >= 100").await,
             (100..104).collect::<Vec<_>>()
         );
+
+        // Trim releases the uncovered transition and keeps the covered one.
+        let ledger_before = decode_entry(&dataset, &entry_before).await;
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
+        let trimmed = decode_entry(&dataset, &stored_fri(&stored)).await;
+        assert_eq!(
+            format!("{:?}", trimmed.transitions()),
+            format!("{:?}", ledger_before.transitions())
+        );
+        assert_eq!(sorted_values(&dataset).await, before);
     }
 
     /// Round 5 item 7: detached commits skip the rebase pipeline, so nothing
@@ -4227,6 +4462,100 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 9);
         assert_eq!(filtered_values(&dataset, "i = 8").await, vec![8]);
         assert_eq!(filtered_values(&dataset, "i >= 9").await, Vec::<i32>::new());
+    }
+
+    /// A legacy vector index whose details cannot be inferred yet must not pin
+    /// the uninferred entry in the tagged listing: once its files are readable
+    /// again, `load_indices` serves the inferred details.
+    #[tokio::test]
+    async fn tagged_listing_is_not_cached_before_inference_succeeds() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(8)),
+            )
+            .into_dataset(
+                test_dir.as_str(),
+                crate::utils::test::FragmentCount::from(2),
+                crate::utils::test::FragmentRowCount::from(64),
+            )
+            .await
+            .unwrap();
+        reserve_fragments(&mut dataset, 20).await;
+        let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        let mut dataset = shallow_clone::commit_stable_partition(dataset, &source_ids, 10).await;
+        dataset
+            .create_index(
+                &["vec"],
+                lance_index::IndexType::Vector,
+                Some("vec_idx".into()),
+                &VectorIndexParams::with_ivf_sq_params(
+                    MetricType::Cosine,
+                    IvfBuildParams::new(2),
+                    SQBuildParams::default(),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let vec_idx = |listing: &[IndexMetadata]| {
+            listing
+                .iter()
+                .find(|idx| idx.name == "vec_idx")
+                .cloned()
+                .unwrap()
+        };
+        let mut legacy = dataset.load_indices().await.unwrap().as_ref().clone();
+        // Inference reads the quantizer from the auxiliary file; hiding it fails
+        // inference without failing the listing.
+        let aux_file = std::path::Path::new(test_dir.as_str())
+            .join("_indices")
+            .join(vec_idx(&legacy).uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let hidden = aux_file.with_extension("hidden");
+        std::fs::rename(&aux_file, &hidden).unwrap();
+
+        // Store the index without vector details, as one built before they were
+        // recorded is. Inference fails, so the commit cannot migrate it.
+        for idx in legacy.iter_mut().filter(|idx| idx.name == "vec_idx") {
+            idx.index_details = Some(Arc::new(vector_index_details_default()));
+        }
+        let raw_key = IndexMetadataKey {
+            version: dataset.manifest.version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&raw_key, Arc::new(legacy))
+            .await;
+        dataset.delete("false").await.unwrap();
+
+        let dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let listing = dataset.load_indices().await.unwrap();
+        assert!(
+            vec_idx(&listing).index_details.unwrap().value.is_empty(),
+            "inference must fail while the auxiliary file is unreadable"
+        );
+
+        std::fs::rename(&hidden, &aux_file).unwrap();
+        let listing = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            derive_vector_index_type(&vec_idx(&listing).index_details.unwrap()),
+            "IVF_SQ",
+            "the tagged listing pinned the uninferred details"
+        );
+        assert!(Arc::ptr_eq(
+            &listing,
+            &dataset.load_indices().await.unwrap()
+        ));
     }
 
     /// Shallow-cloning tagged histories. All fixtures are on-disk: base-path

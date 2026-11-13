@@ -52,6 +52,7 @@ use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, assert_scan_slice_matches, find_filtered_read,
 };
@@ -2245,6 +2246,9 @@ async fn test_ann_with_deletion(
             dataset.index_cache_entry_count().await,
             2, // 2 for index metadata at version 1 and 2.
         );
+        // Load the row-id lookup explicitly so cache counts are independent of
+        // which scan path resolves stable row ids.
+        get_row_id_index(&dataset).await.unwrap();
         let results = scan
             .try_into_stream()
             .await
@@ -2255,9 +2259,9 @@ async fn test_ann_with_deletion(
 
         assert_eq!(
             dataset.index_cache_entry_count().await,
-            // the index, its partitions and the segment ownership mask, plus
-            // the index metadata of every version
-            6 + dataset.versions().await.unwrap().len()
+            // The vector index, its partitions and the segment ownership mask,
+            // plus versioned index metadata and the stable-row-id lookup.
+            6 + dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
         );
         assert_eq!(results.len(), 1);
         let batch = &results[0];

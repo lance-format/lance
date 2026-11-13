@@ -411,7 +411,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         branch: str
             Name of the branch to create. ``"main"`` is reserved for the
-            default branch and cannot be used as a new branch name.
+            default branch and cannot be used as a new branch name. A literal
+            ``"."`` path segment is rejected. New names are limited to a
+            portable budget of 211 bytes measured after the name is storage
+            path encoded twice; longer names that already exist remain
+            available for lookup, checkout, metadata updates, and deletion.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
@@ -631,6 +635,8 @@ class LanceDataset(pa.dataset.Dataset):
             used for batch nearest-neighbor search. When ``use_index`` is true and a
             vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
+            For multivector columns, ``"warp_imputation_rank"`` tunes WARP search;
+            see :meth:`ScannerBuilder.nearest`.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
@@ -955,6 +961,46 @@ class LanceDataset(pa.dataset.Dataset):
         whether the current version has any fragments.
         """
         return self._ds.has_stable_row_ids
+
+    def get_row_addresses(
+        self, row_ids: Union[List[int], pa.Array, pa.ChunkedArray]
+    ) -> pa.UInt64Array:
+        """
+        Resolve row IDs to their current row addresses, in input order.
+
+        A row address is ``(fragment_id << 32) | offset``. With stable row IDs,
+        null, unknown and deleted IDs come back as null. Without stable row IDs,
+        row IDs are row addresses, so each non-null ID is returned unchanged.
+
+        Parameters
+        ----------
+        row_ids : list of int, pyarrow.Array or pyarrow.ChunkedArray
+            Row IDs from ``_rowid``. Integer arrays are cast to uint64, so
+            negative values raise an error.
+
+        Returns
+        -------
+        pyarrow.UInt64Array
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> ds = lance.write_dataset(
+        ...     table, "memory://get_row_addresses", enable_stable_row_ids=True
+        ... )
+        >>> _ = ds.delete("x = 2")
+        >>> ds.get_row_addresses([0, 1, 2, 100]).to_pylist()
+        [0, None, 2, None]
+        """
+        if isinstance(row_ids, pa.ChunkedArray):
+            row_ids = row_ids.combine_chunks()
+        if isinstance(row_ids, pa.Array):
+            row_ids = row_ids.cast(pa.uint64())
+        else:
+            row_ids = pa.array(row_ids, type=pa.uint64())
+        return pa.array(self._ds.row_ids_to_row_addrs(row_ids))
 
     @property
     def max_field_id(self) -> int:

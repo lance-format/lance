@@ -1312,7 +1312,7 @@ impl InnerBuilder {
         // accumulates enough data to flush an encoded column, the flush also needs
         // that pool. The parked producer and the starved consumer would then wait
         // on each other forever.
-        let producer = tokio::spawn(async move {
+        let producer = lance_core::utils::tokio::spawn(async move {
             let mut batch_builder = PostingListBatchBuilder::new(
                 schema_for_batches,
                 with_position,
