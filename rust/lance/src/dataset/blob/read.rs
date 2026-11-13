@@ -593,7 +593,9 @@ impl ReadBlobFilesBuilder {
     /// Returns an error before any payload I/O when a range's `offset + length`
     /// overflows `u64` (checked for every request), when a range extends past
     /// its handle's blob size (not checked for `None` requests, which have no
-    /// size), or when a handle has been closed.
+    /// size), or when a handle was already closed when the stream was created.
+    /// Closing a handle after that point does not cancel reads that were
+    /// already planned.
     pub async fn try_into_stream(self) -> Result<ReadBlobFilesStream> {
         if self.options.io_buffer_size_bytes == Some(0) {
             return Err(Error::invalid_input(

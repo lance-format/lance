@@ -599,12 +599,14 @@ handles = ds.take_blobs("blob", indices=[0, 1, 2])
 
 payloads = [data for _request_index, data in lance.read_blob_files(handles)]
 headers = lance.read_blob_file_ranges(
-    [(handle, 0, 16) for handle in handles if handle is not None]
+    [(handle, 0, 16) for handle in handles]
 )
 ```
 
 Each result is a `(request_index, data)` pair. A `None` handle, which
-`take_blobs` returns for a null blob, returns `None`. Handles are not tied to a
+`take_blobs` returns for a null blob, returns `None`; keep null handles in the
+request list so `request_index` still matches the original handle positions.
+Handles are not tied to a
 dataset receiver. Handles retain the object locations and byte ranges resolved
 when they were opened, including when passed alongside handles from other
 datasets or snapshots. Later dataset commits do not re-resolve those descriptors;

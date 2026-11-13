@@ -425,8 +425,10 @@ def read_blob_files(
     Handles retain their resolved source and range across later dataset commits.
     Referenced payload files must remain retained. External objects follow their
     storage provider's consistency semantics. Reading does not move a handle's
-    cursor; a closed handle raises ``ValueError``. Empty and all-``None`` inputs
-    issue no storage requests.
+    cursor. A handle that is already closed when the read stream is created
+    raises ``ValueError``; closing it afterwards does not cancel reads that
+    were already planned. Empty and all-``None`` inputs issue no storage
+    requests.
 
     Parameters
     ----------
