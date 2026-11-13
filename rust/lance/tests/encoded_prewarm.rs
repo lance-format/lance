@@ -8,17 +8,23 @@ use lance_file::writer::FileWriterOptions;
 use roaring::RoaringBitmap;
 
 #[rstest::rstest]
-#[case::single_fragment(65536)]
-#[case::multiple_fragments(32768)]
+#[case::flat(65536, "payload")]
+#[case::vector(65536, "vector")]
+#[case::multiple_fragments(32768, "vector")]
 #[tokio::test]
 async fn encoded_prewarm_real_file_narrows_projection_and_physical_pages(
     #[case] max_rows_per_file: usize,
+    #[case] column: &str,
 ) {
     let batch = gen_batch()
         .col("id", array::step::<arrow_array::types::Int64Type>())
         .col("payload", array::step::<arrow_array::types::Int64Type>())
+        .col(
+            "vector",
+            array::rand_vec::<arrow_array::types::Float32Type>(64.into()),
+        )
         .into_reader_rows(RowCount::from(1024), BatchCount::from(64));
-    let dataset = Dataset::write(
+    let mut dataset = Dataset::write(
         batch,
         "memory://",
         Some(WriteParams {
@@ -33,16 +39,21 @@ async fn encoded_prewarm_real_file_narrows_projection_and_physical_pages(
     )
     .await
     .unwrap();
+    dataset.delete("id % 2 = 0").await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 65536 / max_rows_per_file);
-    let projection = dataset.schema().project(&["payload"]).unwrap();
+    let projection = dataset.schema().project(&[column]).unwrap();
     for fragment in &fragments {
+        let physical_rows = fragment.metadata().physical_rows.unwrap();
+        let selected_row = (physical_rows - 1) as u32;
+        assert!(u64::from(selected_row) > fragment.count_rows(None).await.unwrap() as u64);
         let all = fragment.plan_data_prewarm(&projection, None).await.unwrap();
         let selected = fragment
-            .plan_data_prewarm(&projection, Some(&RoaringBitmap::from_iter([0])))
+            .plan_data_prewarm(&projection, Some(&RoaringBitmap::from_iter([selected_row])))
             .await
             .unwrap();
         assert!(all.num_pages() > 1);
+        assert!(selected.num_pages() > 0);
         assert!(selected.num_pages() < all.num_pages());
         assert!(selected.num_bytes() < all.num_bytes());
         assert!(selected.fallback_reasons().next().is_none());

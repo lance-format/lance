@@ -21,8 +21,9 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
+        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
+        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
+        schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
 };
@@ -554,20 +555,22 @@ pub(crate) fn normalize_dense_page_rows(encoded_rows: u64, row_scale: u64) -> Re
     Ok(encoded_rows / row_scale)
 }
 
+pub(crate) fn normalized_page_num_rows(page: &PageInfo, dense_row_scale: u64) -> Result<u64> {
+    // Sparse planar pages carry their row scale in the page layout. Stable
+    // structural pages and dense planar pages use the projection's scale.
+    Ok(match &page.encoding {
+        PageEncoding::Structural(_) => normalize_dense_page_rows(page.num_rows, dense_row_scale)?,
+        PageEncoding::Planar(layout) => match layout.sparse() {
+            Some(sparse) => sparse.row_count_and_scale(page.num_rows)?.0,
+            None => normalize_dense_page_rows(page.num_rows, dense_row_scale)?,
+        },
+        _ => page.num_rows,
+    })
+}
+
 pub(crate) fn normalized_column_num_rows(info: &ColumnInfo, dense_row_scale: u64) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
-        // Sparse planar pages carry their row scale in the page layout. Stable
-        // structural pages and dense planar pages use the projection's scale.
-        let page_rows = match &page.encoding {
-            PageEncoding::Structural(_) => {
-                normalize_dense_page_rows(page.num_rows, dense_row_scale)?
-            }
-            PageEncoding::Planar(layout) => match layout.sparse() {
-                Some(sparse) => sparse.row_count_and_scale(page.num_rows)?.0,
-                None => normalize_dense_page_rows(page.num_rows, dense_row_scale)?,
-            },
-            _ => page.num_rows,
-        };
+        let page_rows = normalized_page_num_rows(page, dense_row_scale)?;
         rows.checked_add(page_rows)
             .ok_or_else(|| Error::invalid_input_source("Column row count overflows u64".into()))
     })

@@ -145,10 +145,7 @@ impl FileFragment {
             let directory = self.dataset.data_file_dir(file)?;
             file.validate(&directory)?;
             let path = directory.join(file.path.as_str());
-            let scheduler = scheduler
-                .open_file(&path, &file.file_size_bytes)
-                .await?
-                .with_metadata_read_size(lance_file::reader::FOOTER_LEN)?;
+            let scheduler = scheduler.open_file(&path, &file.file_size_bytes).await?;
             let metadata = FileReader::read_all_metadata(&scheduler).await?;
             let field_columns = file
                 .fields

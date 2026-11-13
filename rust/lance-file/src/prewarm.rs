@@ -5,10 +5,14 @@
 
 use std::ops::Range;
 
-use lance_core::{Error, Result};
+use arrow_schema::DataType;
+use lance_core::{Error, Result, datatypes::Field};
 use roaring::RoaringBitmap;
 
-use crate::reader::{CachedFileMetadata, FileReader, ReaderProjection};
+use crate::reader::{
+    CachedFileMetadata, FileReader, ReaderProjection, normalized_page_num_rows, structural,
+};
+use crate::version::ConcreteFileVersion;
 
 /// Encoded buffers needed by a projected physical row selection.
 #[derive(Debug, Default)]
@@ -28,11 +32,66 @@ impl EncodedPagePlan {
     }
 }
 
+fn column_row_scales(
+    projection: &ReaderProjection,
+    version: ConcreteFileVersion,
+) -> Result<Vec<Option<u64>>> {
+    if version == ConcreteFileVersion::V2_0 {
+        let is_flat = projection
+            .schema
+            .fields
+            .iter()
+            .all(|field| field.children.is_empty());
+        return Ok(vec![is_flat.then_some(1); projection.column_indices.len()]);
+    }
+    fn visit(field: &Field, scale: Option<u64>, result: &mut Vec<Option<u64>>) -> Result<()> {
+        let (has_column, has_children) = structural::field_column_shape(field);
+        if has_column {
+            result.push(scale);
+        }
+        if has_children {
+            let child_scale = match field.data_type() {
+                DataType::Struct(_) => scale,
+                DataType::FixedSizeList(_, dimension) => match scale {
+                    Some(scale) => Some(
+                        u64::try_from(dimension)
+                            .ok()
+                            .and_then(|dimension| scale.checked_mul(dimension))
+                            .filter(|scale| *scale > 0)
+                            .ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "invalid fixed-size-list prewarm row scale for {}",
+                                    field.name
+                                ))
+                            })?,
+                    ),
+                    None => None,
+                },
+                _ => None,
+            };
+            for child in &field.children {
+                visit(child, child_scale, result)?;
+            }
+        }
+        Ok(())
+    }
+    let mut scales = Vec::with_capacity(projection.column_indices.len());
+    for field in &projection.schema.fields {
+        visit(field, Some(1), &mut scales)?;
+    }
+    if scales.len() != projection.column_indices.len() {
+        return Err(Error::not_supported(
+            "prewarm projection does not have a known physical column layout",
+        ));
+    }
+    Ok(scales)
+}
+
 /// Map physical rows to projected encoded pages using file metadata only.
 ///
-/// `None` selects all rows; an empty bitmap selects nothing. Flat columns with
-/// one encoded row per top-level row are narrowed to overlapping pages. Nested
-/// layouts conservatively retain every projected page because repetition and
+/// `None` selects all rows; an empty bitmap selects nothing. Flat columns,
+/// structs, and fixed-size lists are narrowed to overlapping pages. Variable-length
+/// nested layouts retain every projected page because repetition and
 /// offset metadata can be needed to map their row coordinates. Shared column
 /// and file buffers are retained in either case. Blob payloads must be planned
 /// separately: this function rejects blob projections rather than claiming that
@@ -51,36 +110,31 @@ pub fn plan_encoded_pages(
     rows: Option<&RoaringBitmap>,
 ) -> Result<EncodedPagePlan> {
     FileReader::validate_projection(projection, metadata)?;
+    let mut plan = EncodedPagePlan::default();
+    if rows.is_some_and(RoaringBitmap::is_empty) || metadata.num_rows == 0 {
+        return Ok(plan);
+    }
     if projection.schema.fields_pre_order().any(|f| f.is_blob()) {
         return Err(Error::not_supported(
             "encoded page prewarm cannot locate out-of-line blob payloads from footer metadata",
         ));
     }
-    let mut plan = EncodedPagePlan::default();
-    if rows.is_some_and(RoaringBitmap::is_empty) || metadata.num_rows == 0 {
-        return Ok(plan);
-    }
-    if rows
+    if let Some(max_row) = rows
         .and_then(RoaringBitmap::max)
-        .is_some_and(|r| u64::from(r) >= metadata.num_rows)
+        .filter(|r| u64::from(*r) >= metadata.num_rows)
     {
-        return Err(Error::invalid_input(
-            "prewarm physical row selection exceeds file row count",
-        ));
+        return Err(Error::invalid_input(format!(
+            "prewarm physical row selection {max_row} exceeds file row count {}",
+            metadata.num_rows
+        )));
     }
-    let flat = projection
-        .schema
-        .fields
-        .iter()
-        .all(|f| f.children.is_empty());
-    if !flat {
-        plan.fallback_reason =
-            Some("nested projection requires whole-column encoded buffers".into());
-    }
+    let scales = column_row_scales(projection, metadata.version)?;
     let mut push_buffer = |offset: u64, size: u64| -> Result<()> {
-        let end = offset
-            .checked_add(size)
-            .ok_or_else(|| Error::invalid_input("prewarm buffer range overflows u64"))?;
+        let end = offset.checked_add(size).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "prewarm buffer offset {offset} + size {size} overflows u64"
+            ))
+        })?;
         if end > metadata.file_size_bytes {
             return Err(Error::invalid_input(format!(
                 "prewarm buffer {offset}..{end} exceeds file size {}",
@@ -92,35 +146,49 @@ pub fn plan_encoded_pages(
         }
         Ok(())
     };
-    for &column in &projection.column_indices {
+    for (&column, scale) in projection.column_indices.iter().zip(scales) {
         let info = metadata.column_infos.get(column as usize).ok_or_else(|| {
             Error::invalid_input(format!(
                 "prewarm column {column} is absent from file metadata"
             ))
         })?;
-        // A row-count mismatch can mean nested/fixed-size-list coordinates. It
-        // must broaden the selection, never silently exclude encoded pages.
-        let page_rows = info
-            .page_infos
-            .iter()
-            .try_fold(0u64, |n, p| n.checked_add(p.num_rows))
-            .ok_or_else(|| Error::invalid_input("prewarm page row count overflows u64"))?;
-        let aligned = flat && page_rows == metadata.num_rows;
-        if !aligned && plan.fallback_reason.is_none() {
-            plan.fallback_reason =
-                Some("encoded page rows do not map directly to top-level rows".into());
+        let normalized = scale
+            .map(|scale| {
+                info.page_infos
+                    .iter()
+                    .map(|page| normalized_page_num_rows(page, scale))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let is_aligned = normalized.as_ref().is_some_and(|rows| {
+            rows.iter().try_fold(0u64, |n, rows| n.checked_add(*rows)) == Some(metadata.num_rows)
+        });
+        if !is_aligned && plan.fallback_reason.is_none() {
+            plan.fallback_reason = Some(
+                if scale.is_none() {
+                    "nested projection requires whole-column encoded buffers"
+                } else {
+                    "encoded page rows do not map directly to top-level rows"
+                }
+                .into(),
+            );
         }
+        let normalized = normalized.unwrap_or_default();
         let mut start = 0;
-        for page in info.page_infos.iter() {
-            let end = start + page.num_rows;
-            let selected = !aligned
+        for (ordinal, page) in info.page_infos.iter().enumerate() {
+            let end = if is_aligned {
+                start + normalized[ordinal]
+            } else {
+                start
+            };
+            let is_selected = !is_aligned
                 || rows.is_none_or(|rows| {
                     let first = rows.rank(start.saturating_sub(1).min(u64::from(u32::MAX)) as u32);
                     let before = if start == 0 { 0 } else { first };
                     let through = rows.rank(end.saturating_sub(1).min(u64::from(u32::MAX)) as u32);
                     through > before
                 });
-            if selected {
+            if is_selected {
                 plan.selected_pages += 1;
                 for &(offset, size) in page.buffer_offsets_and_sizes.iter() {
                     push_buffer(offset, size)?;
@@ -298,5 +366,55 @@ mod tests {
         let error = plan_encoded_pages(&metadata, &projection, None).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("blob payloads"));
+        assert!(
+            plan_encoded_pages(&metadata, &projection, Some(&RoaringBitmap::new()))
+                .unwrap()
+                .byte_ranges
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn encoded_prewarm_maps_nested_fixed_size_lists_to_top_level_rows() {
+        let (mut metadata, mut projection) = fixture();
+        projection.schema = Arc::new(
+            Schema::try_from(&ArrowSchema::new(vec![Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(vec![Field::new("value", DataType::Int64, true)].into()),
+                        true,
+                    )),
+                    4,
+                ),
+                true,
+            )]))
+            .unwrap(),
+        );
+        let column = metadata.column_infos[0].clone();
+        let pages = column
+            .page_infos
+            .iter()
+            .map(|page| PageInfo {
+                num_rows: page.num_rows * 4,
+                priority: page.priority,
+                encoding: page.encoding.clone(),
+                buffer_offsets_and_sizes: page.buffer_offsets_and_sizes.clone(),
+            })
+            .collect::<Vec<_>>();
+        metadata.column_infos[0] = Arc::new(ColumnInfo {
+            page_infos: pages.into(),
+            ..column.as_ref().clone()
+        });
+        let plan = plan_encoded_pages(
+            &metadata,
+            &projection,
+            Some(&RoaringBitmap::from_iter([4, 7])),
+        )
+        .unwrap();
+        assert_eq!(plan.byte_ranges, vec![100..200, 400..420, 2000..2020]);
+        assert_eq!(plan.selected_pages, 1);
+        assert!(plan.fallback_reason.is_none());
     }
 }

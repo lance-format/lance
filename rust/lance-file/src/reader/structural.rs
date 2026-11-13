@@ -171,7 +171,7 @@ pub fn validate_global_buffers(buffers: &[BufferDescriptor]) -> Result<()> {
     Ok(())
 }
 
-fn field_column_shape(field: &Field) -> (bool, bool) {
+pub fn field_column_shape(field: &Field) -> (bool, bool) {
     if field.is_blob() || field.is_packed_struct() {
         return (true, false);
     }
