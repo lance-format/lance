@@ -82,6 +82,8 @@ pub struct LanceIndexStore {
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
+    /// None preserves the normal file-writer default; Some caps its configured column cache.
+    write_buffer_size: Option<u64>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -129,6 +131,7 @@ impl LanceIndexStore {
             file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
+            write_buffer_size: None,
         }
     }
 
@@ -569,11 +572,24 @@ impl IndexStore for LanceIndexStore {
             self.format_version,
             writer,
             schema,
-            current_writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions {
+                data_cache_bytes: self.write_buffer_size,
+                ..Default::default()
+            },
         )?;
         Ok(Box::new(LanceIndexWriter {
             path: name.to_string(),
             inner: writer,
+        }))
+    }
+
+    fn with_write_buffer_size(&self, bytes: u64) -> Result<Arc<dyn IndexStore>> {
+        if bytes == 0 {
+            return Err(Error::invalid_input("writer buffer must be positive"));
+        }
+        Ok(Arc::new(Self {
+            write_buffer_size: Some(bytes),
+            ..self.clone()
         }))
     }
 
@@ -781,6 +797,34 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    #[tokio::test]
+    async fn bounded_writer_scope_preserves_store_and_read_format() -> Result<()> {
+        let tempdir = TempDir::default();
+        let (_, store) = concrete_test_store(&tempdir);
+        let error = store.with_write_buffer_size(0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("positive"));
+        let bounded = store.with_write_buffer_size(4096)?;
+        assert_eq!(store.write_buffer_size, None);
+        assert_eq!(
+            bounded
+                .as_any()
+                .downcast_ref::<LanceIndexStore>()
+                .unwrap()
+                .write_buffer_size,
+            Some(4096)
+        );
+        let batch = arrow_array::record_batch!(("value", Int32, [1, 2, 3]))?;
+        let mut writer = bounded
+            .new_index_file("bounded.lance", batch.schema())
+            .await?;
+        writer.write_record_batch(batch.clone()).await?;
+        writer.finish().await?;
+        let reader = store.open_index_file("bounded.lance").await?;
+        assert_eq!(reader.read_range(0..3, None).await?, batch);
+        Ok(())
     }
 
     #[tokio::test]

@@ -31,6 +31,8 @@ use lance_core::{Error, Result};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
+mod merge;
+
 use super::{
     IndexStore, IndexWorker, IndexWorkerConfig, InnerBuilder, InvertedIndexBuilder,
     InvertedListFormatVersion, PartitionWriteTarget, SendableRecordBatchStream, TailPartition,
@@ -111,6 +113,13 @@ pub(super) async fn build(
     let (runs, run_receiver) = RunSender::new(config);
     let stop = runs.stop.clone();
     let cancel_on_drop = CancelOnDrop(stop.clone());
+    let final_merge = merge::FinalMerge::new(
+        builder,
+        store.clone(),
+        target,
+        config.total_memory_bytes,
+        stop.clone(),
+    );
 
     // Cancellation of the public future signals this supervisor rather than
     // aborting it. It must retain and join workers that own CPU work or writes:
@@ -185,7 +194,8 @@ pub(super) async fn build(
         });
 
         let (output, tails) = finish_workers(tasks, &stop).await?;
-        finish_tails(output, tails, store, target, config, &stop).await
+        let output = finish_tails(output, tails, store, target, config, &stop).await?;
+        final_merge.finish(output).await
     });
     let output = supervisor.await?;
     drop(cancel_on_drop);
@@ -553,15 +563,14 @@ async fn consume_worker(
                 }
                 match outcome {
                     MergeOutcome::Merged(merged) => merged,
-                    MergeOutcome::Full {
-                        mut previous,
-                        incoming,
-                    } => {
+                    MergeOutcome::Full { previous, incoming } => {
                         undersized_partitions +=
                             usize::from(previous.memory_size() < config.output_target_bytes);
                         let writing = Instant::now();
-                        files.extend(previous.write_to(store.as_ref(), target).await?);
-                        partitions.push(previous.id());
+                        let (id, written) =
+                            merge::write_run(*previous, store.as_ref(), target, &stop).await?;
+                        files.extend(written);
+                        partitions.push(id);
                         write_seconds += writing.elapsed().as_secs_f64();
                         incoming
                     }
@@ -572,12 +581,13 @@ async fn consume_worker(
         if let Some(builder) = &accumulated {
             max_output_bytes = max_output_bytes.max(builder.memory_size());
         }
-        if let Some(mut builder) =
+        if let Some(builder) =
             accumulated.take_if(|builder| builder.memory_size() >= config.output_target_bytes)
         {
             let writing = Instant::now();
-            files.extend(builder.write_to(store.as_ref(), target).await?);
-            partitions.push(builder.id());
+            let (id, written) = merge::write_run(builder, store.as_ref(), target, &stop).await?;
+            files.extend(written);
+            partitions.push(id);
             write_seconds += writing.elapsed().as_secs_f64();
         }
     }
@@ -644,36 +654,31 @@ async fn finish_tails(
                 }
                 match outcome {
                     MergeOutcome::Merged(builder) => builder,
-                    MergeOutcome::Full {
-                        mut previous,
-                        incoming,
-                    } => {
-                        output
-                            .files
-                            .extend(previous.write_to(store.as_ref(), target).await?);
-                        output.partitions.push(previous.id());
+                    MergeOutcome::Full { previous, incoming } => {
+                        let (id, files) =
+                            merge::write_run(*previous, store.as_ref(), target, stop).await?;
+                        output.files.extend(files);
+                        output.partitions.push(id);
                         incoming
                     }
                 }
             }
             None => incoming,
         });
-        if let Some(mut builder) =
+        if let Some(builder) =
             accumulated.take_if(|builder| builder.memory_size() >= config.output_target_bytes)
         {
-            output
-                .files
-                .extend(builder.write_to(store.as_ref(), target).await?);
-            output.partitions.push(builder.id());
+            let (id, files) = merge::write_run(builder, store.as_ref(), target, stop).await?;
+            output.files.extend(files);
+            output.partitions.push(id);
         }
     }
     if !stop.is_cancelled()
-        && let Some(mut builder) = accumulated
+        && let Some(builder) = accumulated
     {
-        output
-            .files
-            .extend(builder.write_to(store.as_ref(), target).await?);
-        output.partitions.push(builder.id());
+        let (id, files) = merge::write_run(builder, store.as_ref(), target, stop).await?;
+        output.files.extend(files);
+        output.partitions.push(id);
     }
     log::info!(
         "FTS_PIPELINE_TAILS_COMPLETE tails={} partitions={}",

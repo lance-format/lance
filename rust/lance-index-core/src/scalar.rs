@@ -383,6 +383,25 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// that silently gets no bound cannot tell.
     fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore>;
 
+    /// Return a scope whose index writers use at most `bytes` of configured
+    /// column buffering per file. A single Arrow row and encoding scratch may
+    /// exceed that buffer, so callers must separately bound their batches.
+    /// Unsupported stores return an error rather than silently ignoring a cap.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::Result;
+    /// use lance_index_core::scalar::IndexStore;
+    /// fn bounded_writers(store: &dyn IndexStore) -> Result<Arc<dyn IndexStore>> {
+    ///     store.with_write_buffer_size(8 << 20)
+    /// }
+    /// ```
+    fn with_write_buffer_size(&self, bytes: u64) -> Result<Arc<dyn IndexStore>> {
+        Err(Error::not_supported(format!(
+            "index store does not support a writer buffer of {bytes} bytes"
+        )))
+    }
+
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
