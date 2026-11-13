@@ -11,8 +11,8 @@ use lance_table::feature_flags::{
     FLAG_DISABLE_TRANSACTION_FILE, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX,
     FLAG_FRAGMENT_TREE, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_INLINE_DELETIONS,
     FLAG_MANAGED_BLOBS, FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS,
-    FLAG_OBJECT_METADATA, FLAG_ROW_ADDR_INDICES, FLAG_SPILLED_ROW_LINEAGE, FLAG_STABLE_ROW_IDS,
-    FLAG_TABLE_CONFIG, FLAG_UNKNOWN, FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+    FLAG_OBJECT_METADATA, FLAG_RETENTION_LEASES, FLAG_ROW_ADDR_INDICES, FLAG_SPILLED_ROW_LINEAGE,
+    FLAG_STABLE_ROW_IDS, FLAG_TABLE_CONFIG, FLAG_UNKNOWN, FLAG_UNSTABLE_DATA_OVERLAY_FILES,
     FLAG_USE_V2_FORMAT_DEPRECATED, FLAG_ZONE_WRITE_SEEDS,
 };
 use lance_table::format::overlay::OverlayCoverage;
@@ -314,6 +314,23 @@ impl fmt::Display for LanceToolManifest {
             "clustering_definitions",
             &self.manifest.clustering.len().to_string(),
         )?;
+        write_kv(
+            f,
+            2,
+            "retention_leases",
+            &self.manifest.retention_leases().len().to_string(),
+        )?;
+        for lease in self.manifest.retention_leases() {
+            writeln!(
+                f,
+                "    - id: {}, version: {}, created_at: {}, expires_at: {}, label: {}",
+                lease.id(),
+                lease.version(),
+                lease.created_at().to_rfc3339(),
+                lease.expires_at().to_rfc3339(),
+                lease.label().unwrap_or("none"),
+            )?;
+        }
         write_kv(f, 2, "next_row_id", &self.manifest.next_row_id.to_string())?;
         write_kv(
             f,
@@ -1138,6 +1155,52 @@ fn write_transaction_operation(
                 .sum::<usize>();
             write_kv(f, indent, "actions", &action_count.to_string())
         }
+        pb::transaction::Operation::AcquireLease(acquire) => {
+            write_kv(f, indent, "operation", "acquire_lease")?;
+            write_kv(
+                f,
+                indent,
+                "lease_id",
+                &format_pb_uuid(acquire.lease_id.as_ref()),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "created_at",
+                &format_pb_timestamp(acquire.created_at.as_ref().map(|t| (t.seconds, t.nanos))),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "expires_at",
+                &format_pb_timestamp(acquire.expires_at.as_ref().map(|t| (t.seconds, t.nanos))),
+            )?;
+            write_kv(f, indent, "label", &format_optional(acquire.label.as_ref()))
+        }
+        pb::transaction::Operation::RenewLease(renew) => {
+            write_kv(f, indent, "operation", "renew_lease")?;
+            write_kv(
+                f,
+                indent,
+                "lease_id",
+                &format_pb_uuid(renew.lease_id.as_ref()),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "expires_at",
+                &format_pb_timestamp(renew.expires_at.as_ref().map(|t| (t.seconds, t.nanos))),
+            )
+        }
+        pb::transaction::Operation::ReleaseLease(release) => {
+            write_kv(f, indent, "operation", "release_lease")?;
+            write_kv(
+                f,
+                indent,
+                "lease_id",
+                &format_pb_uuid(release.lease_id.as_ref()),
+            )
+        }
     }
 }
 
@@ -1225,6 +1288,27 @@ fn write_indented_block(f: &mut Formatter<'_>, indent: usize, block: &str) -> fm
 
 fn write_kv(f: &mut Formatter<'_>, indent: usize, key: &str, value: &str) -> fmt::Result {
     writeln!(f, "{:indent$}{}: {}", "", key, value, indent = indent)
+}
+
+fn format_pb_uuid(value: Option<&pb::Uuid>) -> String {
+    match value {
+        None => "absent".to_string(),
+        Some(value) => uuid::Uuid::from_slice(&value.uuid)
+            .map(|uuid| uuid.to_string())
+            .unwrap_or_else(|_| format!("invalid ({} bytes)", value.uuid.len())),
+    }
+}
+
+/// Formats a protobuf `Timestamp` given as `(seconds, nanos)`.
+fn format_pb_timestamp(value: Option<(i64, i32)>) -> String {
+    let Some((seconds, nanos)) = value else {
+        return "absent".to_string();
+    };
+    u32::try_from(nanos)
+        .ok()
+        .and_then(|nanos| DateTime::<Utc>::from_timestamp(seconds, nanos))
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| format!("invalid (seconds={seconds}, nanos={nanos})"))
 }
 
 fn format_optional(value: Option<&String>) -> String {
@@ -1347,6 +1431,7 @@ fn format_feature_flags(flags: u64) -> String {
         (FLAG_OBJECT_METADATA, "object_metadata"),
         (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
         (FLAG_INLINE_DELETIONS, "inline_deletions"),
+        (FLAG_RETENTION_LEASES, "retention_leases"),
     ];
     let mut names = known_flags
         .iter()
@@ -1623,6 +1708,7 @@ mod tests {
             (FLAG_OBJECT_METADATA, "object_metadata"),
             (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
             (FLAG_INLINE_DELETIONS, "inline_deletions"),
+            (FLAG_RETENTION_LEASES, "retention_leases"),
         ];
         let rendered = format_feature_flags(FLAG_UNKNOWN - 1);
         for (_, name) in known_flags {

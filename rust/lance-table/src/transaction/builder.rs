@@ -3,6 +3,7 @@
 
 //! The transaction itself: an operation plus the version it was based on.
 
+use crate::format::RetentionLease;
 use crate::transaction::Operation;
 use lance_core::deepsize::DeepSizeOf;
 use std::collections::HashMap;
@@ -27,27 +28,42 @@ pub struct Transaction {
 /// Add TransactionBuilder for flexibly setting option without using `mut`
 pub struct TransactionBuilder {
     read_version: u64,
-    // uuid is optional for builder since it can autogenerate
-    uuid: Option<String>,
+    uuid: String,
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl TransactionBuilder {
+    /// A transaction with a freshly generated UUID.
     pub fn new(read_version: u64, operation: Operation) -> Self {
         Self {
             read_version,
-            uuid: None,
+            uuid: Uuid::new_v4().hyphenated().to_string(),
             operation,
             tag: None,
             transaction_properties: None,
         }
     }
 
-    pub fn uuid(mut self, uuid: String) -> Self {
-        self.uuid = Some(uuid);
-        self
+    /// The transaction that publishes the holder's result for `lease`.
+    ///
+    /// It reads the leased version and takes the lease ID as its UUID, so
+    /// committing it releases the lease atomically with `operation`.
+    ///
+    /// ```
+    /// # use lance_table::format::RetentionLease;
+    /// # use lance_table::transaction::{Operation, TransactionBuilder};
+    /// # fn publish(lease: &RetentionLease, operation: Operation) {
+    /// let transaction = TransactionBuilder::for_lease(lease, operation).build();
+    /// assert_eq!(transaction.read_version, lease.version());
+    /// # }
+    /// ```
+    pub fn for_lease(lease: &RetentionLease, operation: Operation) -> Self {
+        Self {
+            uuid: lease.id().hyphenated().to_string(),
+            ..Self::new(lease.version(), operation)
+        }
     }
 
     pub fn tag(mut self, tag: Option<String>) -> Self {
@@ -64,12 +80,9 @@ impl TransactionBuilder {
     }
 
     pub fn build(self) -> Transaction {
-        let uuid = self
-            .uuid
-            .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
         Transaction {
             read_version: self.read_version,
-            uuid,
+            uuid: self.uuid,
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,

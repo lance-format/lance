@@ -14,8 +14,9 @@ use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
     FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
-    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
+    ensure_can_write_manifest, frag_reuse_with_stable_row_ids_enabled,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
+    validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -49,6 +50,7 @@ use crate::system_index::mem_wal::{
 };
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::prepare::{FragReuseUpdate, PreparedIndices};
+use crate::transaction::retention_leases::{LeaseChange, derive_retention_leases};
 use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
 use crate::transaction::validate::merge_fragment_physically_rewritten;
@@ -86,6 +88,32 @@ use uuid::Uuid;
 /// rewrites their row ids (compaction, for example), so coordinate reader
 /// upgrades before enabling it.
 pub const RANGE_SEGMENTS_CONFIG_KEY: &str = "lance.row_ids.range_segments";
+
+/// What a commit attempt publishes; see [`Transaction::build_manifest_prepared`].
+#[derive(Debug)]
+pub enum ManifestBuild {
+    /// Write this manifest with this index list.
+    Write(Box<Manifest>, Vec<IndexMetadata>),
+    /// A retention lease request that changes nothing against the manifest it
+    /// was built on: no version is written, and that manifest stays current.
+    Unchanged,
+}
+
+/// Refuse an `AcquireLease` this build could not honor: on a stable-row-ID
+/// table it must be able to record the fragment reuse transitions a lease
+/// requires.
+fn ensure_lease_acquisition_supported(
+    manifest: &Manifest,
+    frag_reuse_with_stable_row_ids_enabled: bool,
+) -> Result<()> {
+    if manifest.uses_stable_row_ids() && !frag_reuse_with_stable_row_ids_enabled {
+        return Err(Error::not_supported(
+            "Retention leases are not supported on tables with stable row IDs by this build \
+             of Lance: it cannot record fragment reuse transitions for them",
+        ));
+    }
+    Ok(())
+}
 
 fn range_segments_enabled(manifest: &Manifest) -> bool {
     manifest
@@ -226,6 +254,10 @@ impl Transaction {
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
+        // A restore removes all leases. The target's own list is historical,
+        // so it neither carries over nor gates the restore (see
+        // `derive_retention_leases` for the other sites that clear the list).
+        manifest.set_retention_leases(Vec::new());
         // This read bypasses Dataset's feature gates. Refuse unsupported target
         // manifests before apply_feature_flags can clear their unknown bits and
         // republish the referenced files as legacy-compatible.
@@ -686,6 +718,9 @@ impl Transaction {
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
+    /// A retention lease request that would change nothing is an error here;
+    /// the commit path uses [`Self::build_manifest_prepared`], which reports it
+    /// as [`ManifestBuild::Unchanged`].
     pub fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
@@ -730,13 +765,19 @@ impl Transaction {
             None,
             FragReuseUpdate::None,
         )?;
-        self.build_manifest_prepared(
+        match self.build_manifest_prepared(
             current_manifest,
             prepared,
             transaction_file_path,
             config,
             read_version_state,
-        )
+        )? {
+            ManifestBuild::Write(manifest, indices) => Ok((*manifest, indices)),
+            ManifestBuild::Unchanged => Err(Error::invalid_input(format!(
+                "{} changes nothing, so there is no manifest to build",
+                self.operation.name()
+            ))),
+        }
     }
 
     /// Build the next manifest from a prepared index list
@@ -744,6 +785,9 @@ impl Transaction {
     /// prepared list and publishes only the final list; the original list
     /// is what MemWAL coverage is compared against. The prepared result must
     /// have been derived against `current_manifest`.
+    ///
+    /// The retention lease list is derived from `current_manifest`'s at
+    /// `config.now`; a lease request that changes nothing builds no manifest.
     pub fn build_manifest_prepared(
         &self,
         current_manifest: Option<&Manifest>,
@@ -751,7 +795,7 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
-    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+    ) -> Result<ManifestBuild> {
         // The production commit loop calls this path directly, so the only
         // operation that applies a definitions list has to be enforced here
         // rather than in the convenience wrapper: anything else would ignore
@@ -926,6 +970,21 @@ impl Transaction {
                 });
 
         let new_version = current_manifest.map_or(1, |m| m.version + 1);
+
+        if let (Operation::AcquireLease { .. }, Some(manifest)) =
+            (&self.operation, current_manifest)
+        {
+            ensure_lease_acquisition_supported(manifest, frag_reuse_with_stable_row_ids_enabled())?;
+        }
+        let retention_leases = match derive_retention_leases(
+            current_manifest.map_or(&[], |m| m.retention_leases.as_slice()),
+            self,
+            new_version,
+            config.now,
+        )? {
+            LeaseChange::Write(leases) => leases,
+            LeaseChange::Unchanged => return Ok(ManifestBuild::Unchanged),
+        };
 
         match &self.operation {
             Operation::Clone { .. } => {
@@ -1453,7 +1512,11 @@ impl Transaction {
                     }
                 }
             }
-            Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
+            Operation::ReserveFragments { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
             Operation::Merge { fragments, .. } => {
@@ -2055,6 +2118,7 @@ impl Transaction {
         }
 
         manifest.tag.clone_from(&self.tag);
+        manifest.set_retention_leases(retention_leases);
 
         if config.auto_set_feature_flags {
             // Internal operations (e.g. CreateIndex) build with the default config,
@@ -2369,7 +2433,7 @@ impl Transaction {
         validate_clustering_of(&manifest, &changed_clustering_references)?;
 
         validate_non_reusable_field_id_flags(&manifest)?;
-        Ok((manifest, final_indices))
+        Ok(ManifestBuild::Write(Box::new(manifest), final_indices))
     }
 
     /// Definitions key on field ids, so allocating one commits the table to
@@ -2495,7 +2559,10 @@ impl Transaction {
             | Operation::ReserveFragments { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
-            | Operation::UpdateMemWalState { .. } => Some(vec![]),
+            | Operation::UpdateMemWalState { .. }
+            | Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => Some(vec![]),
             Operation::Overwrite { .. }
             | Operation::Merge { .. }
             | Operation::Project { .. }
@@ -2535,8 +2602,11 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::feature_flags::FLAG_OBJECT_METADATA;
+    use crate::feature_flags::FLAG_RETENTION_LEASES;
+    use crate::format::RetentionLease;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
+    use crate::format::retention_lease::tests::{at as lease_at, lease as test_lease};
     use crate::format::{
         DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
         ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
@@ -2548,7 +2618,9 @@ mod tests {
         make_stable_row_id_manifest, overlay_with_field, sample_index_metadata, sample_manifest,
         tagged_entry,
     };
-    use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
+    use crate::transaction::{
+        DataOverlayGroup, TransactionBuilder, UpdateMode, validate_operation,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -2559,6 +2631,13 @@ mod tests {
     use std::num::NonZero;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    fn written(build: ManifestBuild) -> (Manifest, Vec<IndexMetadata>) {
+        match build {
+            ManifestBuild::Write(manifest, indices) => (*manifest, indices),
+            ManifestBuild::Unchanged => panic!("expected a manifest to write"),
+        }
+    }
 
     /// Fragment 0 is the live destination of a rewrite that retired
     /// fragment 5; the entry carries that one transition inline.
@@ -3506,9 +3585,11 @@ mod tests {
                 })),
             )
             .unwrap();
-        let (new_manifest, final_indices) = transaction
-            .build_manifest_prepared(Some(&manifest), prepared, "txn", &config, None)
-            .unwrap();
+        let (new_manifest, final_indices) = written(
+            transaction
+                .build_manifest_prepared(Some(&manifest), prepared, "txn", &config, None)
+                .unwrap(),
+        );
         // The assembled entry replaced the previous one by name.
         let entries: Vec<_> = final_indices
             .iter()
@@ -3549,7 +3630,9 @@ mod tests {
             None,
             FragReuseUpdate::Trim,
         )?;
-        transaction.build_manifest_prepared(Some(manifest), prepared, "txn", &config, None)
+        transaction
+            .build_manifest_prepared(Some(manifest), prepared, "txn", &config, None)
+            .map(written)
     }
 
     /// A CreateIndex replacing a tagged entry without the maintenance path's
@@ -3765,9 +3848,11 @@ mod tests {
             prepared_unrelated.fragment_bitmap,
             unrelated.fragment_bitmap
         );
-        let (_, indices) = transaction
-            .build_manifest_prepared(Some(&manifest), prepared.clone(), "txn", &config, None)
-            .unwrap();
+        let (_, indices) = written(
+            transaction
+                .build_manifest_prepared(Some(&manifest), prepared.clone(), "txn", &config, None)
+                .unwrap(),
+        );
         assert_eq!(indices, prepared.prepared());
     }
 
@@ -8073,5 +8158,145 @@ mod tests {
         )
         .await;
         assert_eq!(next.fragments[1].files.len(), 1);
+    }
+
+    fn build_with_leases(
+        previous: &[RetentionLease],
+        transaction: &Transaction,
+        now: i64,
+        auto_set_feature_flags: bool,
+    ) -> (Manifest, ManifestBuild) {
+        let mut manifest = sample_manifest();
+        manifest.set_retention_leases(previous.to_vec());
+        let config = ManifestBuildConfig {
+            now: lease_at(now),
+            auto_set_feature_flags,
+            ..default_build_config()
+        };
+        let prepared = transaction
+            .prepare_indices(
+                Some(&manifest),
+                vec![],
+                &config,
+                None,
+                FragReuseUpdate::None,
+            )
+            .unwrap();
+        let build = transaction
+            .build_manifest_prepared(Some(&manifest), prepared, "txn", &config, None)
+            .unwrap();
+        (manifest, build)
+    }
+
+    fn lease_transaction(operation: Operation) -> Transaction {
+        Transaction::new_from_version(1, operation)
+    }
+
+    #[rstest]
+    fn lease_acquisition_changes_only_the_lease_list(
+        #[values(false, true)] auto_set_feature_flags: bool,
+    ) {
+        let acquire = lease_transaction(Operation::AcquireLease {
+            lease_id: Uuid::from_u128(7),
+            created_at: lease_at(90),
+            expires_at: lease_at(300),
+            label: None,
+        });
+        let (previous, build) = build_with_leases(&[], &acquire, 100, auto_set_feature_flags);
+        let (manifest, indices) = written(build);
+
+        assert!(indices.is_empty());
+        let [lease] = manifest.retention_leases.as_slice() else {
+            panic!("expected one lease, got {:?}", manifest.retention_leases);
+        };
+        assert_eq!(lease.id(), Uuid::from_u128(7));
+        assert_eq!(lease.version(), previous.version + 1);
+        assert_eq!(
+            manifest.writer_feature_flags,
+            previous.writer_feature_flags | FLAG_RETENTION_LEASES
+        );
+        assert_eq!(manifest.reader_feature_flags, previous.reader_feature_flags);
+        assert_eq!(manifest.fragments, previous.fragments);
+        assert_eq!(manifest.schema, previous.schema);
+        assert_eq!(manifest.config, previous.config);
+        assert_eq!(manifest.next_row_id, previous.next_row_id);
+    }
+
+    #[rstest]
+    #[case::reacquire(Operation::AcquireLease {
+        lease_id: Uuid::from_u128(1),
+        created_at: lease_at(90),
+        expires_at: lease_at(300),
+        label: None,
+    })]
+    #[case::renew_not_later(Operation::RenewLease {
+        lease_id: Uuid::from_u128(1),
+        expires_at: lease_at(150),
+    })]
+    #[case::release_absent(Operation::ReleaseLease {
+        lease_id: Uuid::from_u128(2),
+    })]
+    fn lease_request_that_changes_nothing_builds_no_manifest(#[case] operation: Operation) {
+        let (_, build) = build_with_leases(
+            &[test_lease(1, 1, 200)],
+            &lease_transaction(operation),
+            100,
+            true,
+        );
+        assert!(matches!(build, ManifestBuild::Unchanged), "{build:?}");
+    }
+
+    /// Expiry is judged by the injected time, and the flag follows the list
+    /// even when feature flags are not recomputed.
+    #[rstest]
+    fn ordinary_commit_removes_expired_and_published_leases(
+        #[values(false, true)] auto_set_feature_flags: bool,
+    ) {
+        let published = test_lease(1, 1, 500);
+        let append = TransactionBuilder::for_lease(
+            &published,
+            Operation::Append {
+                fragments: vec![Fragment::new(0)],
+            },
+        )
+        .build();
+        let previous = [published, test_lease(2, 1, 200), test_lease(3, 1, 300)];
+
+        let (_, build) = build_with_leases(&previous, &append, 200, auto_set_feature_flags);
+        let (manifest, _) = written(build);
+        assert_eq!(manifest.retention_leases, vec![test_lease(3, 1, 300)]);
+        assert_ne!(manifest.writer_feature_flags & FLAG_RETENTION_LEASES, 0);
+
+        let (_, build) = build_with_leases(&previous, &append, 300, auto_set_feature_flags);
+        let (manifest, _) = written(build);
+        assert!(manifest.retention_leases.is_empty());
+        assert_eq!(manifest.writer_feature_flags & FLAG_RETENTION_LEASES, 0);
+    }
+
+    #[rstest]
+    #[case::supported(false, true, None)]
+    #[case::address_row_ids_without_frag_reuse_support(false, false, None)]
+    #[case::stable_row_ids_supported(true, true, None)]
+    #[case::stable_row_ids_unsupported(true, false, Some("stable row IDs"))]
+    fn lease_acquisition_requires_support(
+        #[case] stable_row_ids: bool,
+        #[case] frag_reuse_with_stable_row_ids_enabled: bool,
+        #[case] message: Option<&str>,
+    ) {
+        let manifest = if stable_row_ids {
+            make_stable_row_id_manifest(vec![])
+        } else {
+            sample_manifest()
+        };
+        let result =
+            ensure_lease_acquisition_supported(&manifest, frag_reuse_with_stable_row_ids_enabled);
+        match message {
+            None => result.unwrap(),
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
     }
 }

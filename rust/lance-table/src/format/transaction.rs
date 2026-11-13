@@ -62,7 +62,10 @@ pub fn operation_may_change_schema(transaction: &pb::Transaction) -> bool {
             | Operation::Update(_)
             | Operation::UpdateMemWalState(_)
             | Operation::UpdateBases(_)
-            | Operation::DataOverlay(_),
+            | Operation::DataOverlay(_)
+            | Operation::AcquireLease(_)
+            | Operation::RenewLease(_)
+            | Operation::ReleaseLease(_),
         ) => false,
         _ => true,
     }

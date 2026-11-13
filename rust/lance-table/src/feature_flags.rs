@@ -136,8 +136,14 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// Writer-only retention requirements for retention leases in the current manifest.
+/// Set exactly when `Manifest::retention_leases` is nonempty. Writers must
+/// honor the leases: keep leased versions through cleanup and record the
+/// fragment reuse transitions leases require. Ordinary reads do not require
+/// support for the lease metadata.
+pub const FLAG_RETENTION_LEASES: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 20;
+pub const FLAG_UNKNOWN: u64 = 1 << 21;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -158,6 +164,7 @@ const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_RETENTION_LEASES < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -330,6 +337,10 @@ pub fn apply_feature_flags(
 
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
+    }
+
+    if !manifest.retention_leases.is_empty() {
+        manifest.writer_feature_flags |= FLAG_RETENTION_LEASES;
     }
 
     if non_reusable_field_ids {
@@ -576,7 +587,7 @@ pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
             .into(),
         ));
     }
-    Ok(())
+    validate_retention_leases(manifest)
 }
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
@@ -637,6 +648,32 @@ pub fn validate_non_reusable_field_id_flags(manifest: &Manifest) -> Result<()> {
         return Err(Error::corrupt_file_named(
             "manifest",
             "Manifest has a non-reusable-field-ID reader feature flag, but non-reusable field IDs only require writer support",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a lease list that writers must not carry forward: an invalid or
+/// duplicate record, or a list whose writer flag disagrees with it. Readers
+/// ignore the list, so this is checked only before writes.
+pub fn validate_retention_leases(manifest: &Manifest) -> Result<()> {
+    if let Some(error) = manifest.retention_lease_error() {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            format!("Manifest retention lease list has an invalid record: {error}"),
+        ));
+    }
+    crate::format::validate_retention_lease_ids(&manifest.retention_leases)?;
+    let listed = !manifest.retention_leases.is_empty();
+    let flagged = manifest.writer_feature_flags & FLAG_RETENTION_LEASES != 0;
+    if listed != flagged {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            format!(
+                "Manifest lists {} retention leases but the retention lease writer feature flag is {}",
+                manifest.retention_leases.len(),
+                if flagged { "set" } else { "unset" }
+            ),
         ));
     }
     Ok(())
@@ -803,6 +840,44 @@ mod tests {
         // the module-level `const _` assertion keeps it at or above that boundary.
     }
 
+    #[rstest::rstest]
+    fn test_retention_lease_flag_is_supported(
+        #[values(false, true)] overlay_enabled: bool,
+        #[values(false, true)] frag_reuse_with_stable_row_ids_enabled: bool,
+    ) {
+        assert_eq!(FLAG_RETENTION_LEASES, 1 << 20);
+        let supported =
+            supported_flags_when(overlay_enabled, frag_reuse_with_stable_row_ids_enabled);
+        assert_eq!(supported & FLAG_RETENTION_LEASES, FLAG_RETENTION_LEASES);
+        assert!(can_read_dataset(FLAG_RETENTION_LEASES));
+        assert!(can_write_dataset(FLAG_RETENTION_LEASES));
+    }
+
+    #[test]
+    fn test_retention_lease_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_RETENTION_LEASES;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(
+            error.to_string().contains("writer feature flag is set"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_retention_lease_flag_follows_lease_list() {
+        let mut manifest = empty_manifest();
+        manifest.retention_leases = vec![crate::format::retention_lease::tests::lease(1, 1, 10)];
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_RETENTION_LEASES, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_RETENTION_LEASES, 0);
+
+        manifest.retention_leases.clear();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & FLAG_RETENTION_LEASES, 0);
+    }
+
     #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
@@ -811,7 +886,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 20);
+        assert_eq!(FLAG_UNKNOWN, 1 << 21);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 

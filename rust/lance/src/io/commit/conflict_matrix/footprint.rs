@@ -85,6 +85,10 @@ impl Cell {
 /// A cell reading `R/L/L` is fully footprint-sensitive. `R/R/L` distinguishes
 /// fragments but not fields. `R/R/R` rejects on opcode alone.
 ///
+/// The rewrite records its move in the fragment reuse index (see
+/// [`super::cases`]), so it lands under an index build, and two rewrites
+/// conflict whatever fragments they touch, since both replace that index.
+///
 /// Regenerate with the `discover_footprints` test below.
 const FOOTPRINT_MATRIX: &str = "\
                        | dl      df      ur      uc      ov      dr      ci      rw
@@ -94,8 +98,8 @@ update_rewrite_rows    | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L  
 update_rewrite_columns | R/-/L   R/-/L   R/-/L   R/R/L   R/L/L   R/R/L   L/-/L   R/-/L
 data_overlay           | L/-/L   R/-/L   R/-/L   L/L/L   L/L/L   L/L/L   L/-/L   R/-/L
 data_replacement       | L/-/L   X/-/L   R/-/L   R/L/L   L/L/L   R/L/L   L/-/L   R/-/L
-create_index           | L/-/L   L/-/L   L/-/L   L/L/L   L/L/L   L/L/L   R/-/R   R/-/L
-rewrite                | R/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   R/-/L   R/-/L
+create_index           | L/-/L   L/-/L   L/-/L   L/L/L   L/L/L   L/L/L   R/-/R   L/-/L
+rewrite                | R/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/R
 ";
 
 /// The level [`FOOTPRINT_MATRIX`] was observed under.

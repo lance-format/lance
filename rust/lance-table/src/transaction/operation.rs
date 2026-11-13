@@ -14,6 +14,7 @@ use crate::format::overlay::DataOverlayFile;
 use crate::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::UpdateMap;
+use chrono::{DateTime, Utc};
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
@@ -260,6 +261,38 @@ pub enum Operation {
         new_bases: Vec<BasePath>,
     },
 
+    /// Add a retention lease on the version this commit creates. Idempotent by
+    /// `lease_id`: if the ID is already listed, the stored lease is returned and
+    /// no version is created.
+    AcquireLease {
+        /// The UUID of the transaction the holder intends to publish. Must
+        /// differ from this transaction's own UUID.
+        lease_id: Uuid,
+        /// Fixed before the first attempt and preserved across retries.
+        created_at: DateTime<Utc>,
+        /// An absolute time, not a TTL. Must be later than `created_at` and in
+        /// the future at each attempt.
+        expires_at: DateTime<Utc>,
+        /// Human-readable context, such as the job holding the lease. It has
+        /// no retention meaning.
+        label: Option<String>,
+    },
+
+    /// Extend `expires_at` of a listed, unexpired lease. A requested time not
+    /// later than the current one is a no-op.
+    RenewLease {
+        /// The ID of the lease to renew.
+        lease_id: Uuid,
+        /// The new absolute expiry, not a TTL.
+        expires_at: DateTime<Utc>,
+    },
+
+    /// Remove a lease. An absent lease is a no-op.
+    ReleaseLease {
+        /// The ID of the lease to release.
+        lease_id: Uuid,
+    },
+
     /// An operation written by a newer version of Lance that this version does
     /// not recognize. It can be read but never re-encoded or committed, and it
     /// is assumed to conflict with everything.
@@ -316,6 +349,9 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            Self::AcquireLease { .. } => write!(f, "AcquireLease"),
+            Self::RenewLease { .. } => write!(f, "RenewLease"),
+            Self::ReleaseLease { .. } => write!(f, "ReleaseLease"),
         }
     }
 }
@@ -448,6 +484,9 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            Self::AcquireLease { .. } => "AcquireLease",
+            Self::RenewLease { .. } => "RenewLease",
+            Self::ReleaseLease { .. } => "ReleaseLease",
         }
     }
 

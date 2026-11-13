@@ -75,6 +75,9 @@ impl_deep_size_primitive!(
     ()
 );
 
+// Fixed-size values with no heap allocation.
+impl_deep_size_primitive!(uuid::Uuid, chrono::DateTime<chrono::Utc>);
+
 impl DeepSizeOf for str {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         0

@@ -25,6 +25,7 @@ pub fn default_build_config() -> ManifestBuildConfig {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos(),
+        now: Utc::now(),
         use_stable_row_ids: false,
         use_legacy_format: None,
         storage_format: None,

@@ -194,13 +194,41 @@ Each rewrite that defers index remapping records its mapping: a reuse version
 in FRI index version 0, or transitions in index version 1. A rewrite publishes
 its mapping atomically, replacing the FRI entry in the same commit. A
 transition must reference only fragments committed no later than itself.
-Fragments not covered by any index are served by scanning, so correctness
-never depends on a mapping being present.
 
-Once all dependent indices have caught up, the corresponding history can be
-trimmed. Cleanup must retain intermediate transitions still needed to translate
-old addresses. External mapping files can be deleted only when no retained
-dataset version references them.
+## Trimming
+
+An FRI history may be trimmed to reduce its size. Trimming must not remove any entry if:
+
+* It is referenced by an index
+* It is referenced by a [retention lease](../../table/retention_leases.md)
+* It describes an intermediate transition that is required by another required
+  entry to translate correctly.
+
+For example, consider:
+
+```
+leased version: 12 (fragments: {3, 4, 5})
+indexed fragments: {1, 3}
+
+Transitions:
+
+  {1, 2} -> {5}  keep: an index references fragment 1
+  {4}    -> {6}  keep: the leased version contains fragment 4
+  {6}    -> {7}  keep: translating fragment 4 to 7 passes through 6
+  {8}    -> {9}  trim: no index or retention lease references fragment 8
+```
+
+Fragment 3 was never rewritten, so neither its index nor the lease needs a
+transition for it. Fragment 8 was written after version 12 and compacted
+before any index covered it, so its transition can be trimmed.
+
+Only the sources of a transition decide whether it is required. If a new index
+is built on fragment 9, the `{8} -> {9}` transition can still be trimmed: the
+index already covers the destination, and nothing that needs translating
+references fragment 8.
+
+External mapping files can be deleted only when no retained dataset version
+references them.
 
 ## Stable Row IDs
 

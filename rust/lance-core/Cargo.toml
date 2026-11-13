@@ -20,6 +20,7 @@ async-trait.workspace = true
 lance-arrow.workspace = true
 blake3.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
 lance-derive.workspace = true
@@ -43,6 +44,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true
 url.workspace = true
+uuid.workspace = true
 log.workspace = true
 
 [dev-dependencies]

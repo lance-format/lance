@@ -34,6 +34,40 @@ message UUID {
   bytes uuid = 1;
 }
 
+/* A retention lease that belongs to the branch whose current manifest lists it.
+ * Historical copies do not impose retention requirements. All fields except
+ * label are required by the lease contract; protobuf presence permits
+ * detecting an invalid partial record. IDs contain exactly 16 UUID bytes and
+ * are compared by those bytes.
+ */
+message RetentionLease {
+  /* The UUID of the transaction the holder intends to publish, as 16 bytes.
+   * Committing an ordinary transaction with this UUID releases the
+   * lease. Absent or any length other than 16 bytes is invalid.
+   */
+  UUID id = 1;
+  /* The leased version: the version created by the successful acquisition commit.
+   * Absent or zero is invalid. Renewal never changes it. Listed leases retain
+   * complete versions from the oldest leased version through the
+   * current branch head, including their transactions, as specified in
+   * Retention Leases.
+   */
+  optional uint64 version = 2;
+  /* Creation time chosen before the first acquisition attempt, in UTC.
+   * Absent is invalid. Retries preserve it; it need not equal commit time.
+   */
+  google.protobuf.Timestamp created_at = 3;
+  /* Absolute UTC expiry time. Absent or not later than created_at is invalid.
+   * Passing it makes the lease eligible for removal by the next commit;
+   * it does not remove the stored record. Renewals may only increase it.
+   */
+  google.protobuf.Timestamp expires_at = 4;
+  /* Optional human-readable context. Absent or empty means no label.
+   * It has no retention or authorization meaning and is immutable for this lease.
+   */
+  optional string label = 5;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -182,6 +216,8 @@ message Manifest {
    * * 1 << 16: paired with the reader bit for version 1 zone-level statistics
    *   seeds. Writers must preserve the seed contract and the required bits
    *   during data writes, index maintenance, cleanup, clone, and restore.
+   * * 1 << 20: retention leases. Writer-only; set exactly when retention_leases
+   *   is nonempty, and maintenance must honor the list.
    */
   uint64 writer_feature_flags = 10;
 
@@ -315,6 +351,16 @@ message Manifest {
    * u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
    */
   uint32 max_clustering_id = 26;
+
+  /* The authoritative lease list when this is the current manifest.
+   * Absent/empty means no listed leases. Order is insignificant; IDs must be
+   * unique. Writer bit 20 is set exactly when this list is nonempty. Commits
+   * remove expired leases.
+   * Restore and overwrite remove all leases; new clones and branches start
+   * with an empty list. Detached manifests neither carry nor change
+   * leases. No reader capability is required solely for leases.
+   */
+  repeated RetentionLease retention_leases = 27;
 
 } // Manifest
 

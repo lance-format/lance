@@ -343,8 +343,9 @@ pub async fn explain_expire_versions(
 /// [`cleanup_old_versions`](super::cleanup::cleanup_old_versions) afterwards to reclaim
 /// them.
 ///
-/// Never removes the newest version, a tagged version on the current branch, or a version
-/// a branch is rooted at.
+/// Never removes the newest version, a tagged version on the current branch, a version
+/// a branch is rooted at, or a version from the oldest one a listed retention lease
+/// holds onwards.
 pub async fn expire_versions(
     dataset: &Dataset,
     policy: ExpireVersionsPolicy,
@@ -659,6 +660,42 @@ mod tests {
             reopened.checkout_version(2).await.is_ok(),
             "a tagged version must still be checkout-able"
         );
+    }
+
+    #[tokio::test]
+    async fn expire_keeps_every_version_from_the_oldest_lease() {
+        let uri = TempStrDir::default();
+        let dataset = dataset_with_versions(&uri, 2).await;
+        // The handle stays at version 2, so the lease is read from the latest manifest.
+        let (lease, _) = dataset
+            .acquire_retention_lease(crate::dataset::LeaseOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(lease.version(), 3);
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await.unwrap();
+        latest.delete("i = 0").await.unwrap();
+        latest.delete("i = 1").await.unwrap();
+        assert_eq!(latest.manifest.version, 5);
+
+        let stats = expire_versions(
+            &dataset,
+            ExpireVersionsPolicyBuilder::default()
+                .before_version(latest.manifest.version)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.versions_removed, 2);
+        let surviving = dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .map_ok(|l| l.version)
+            .try_collect::<HashSet<_>>()
+            .await
+            .unwrap();
+        assert_eq!(surviving, HashSet::from([3, 4, 5]));
     }
 
     #[tokio::test]

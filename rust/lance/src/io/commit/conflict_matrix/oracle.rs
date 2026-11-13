@@ -143,7 +143,9 @@ async fn serial_execution(
 /// some columns is how a content oracle silently stops checking anything.
 ///
 /// The schema is part of the fingerprint too, so a pair that disagrees about
-/// which columns survive fails here rather than comparing the wrong things.
+/// which columns survive fails here rather than comparing the wrong things. So
+/// is the retention lease list, which a rebase must derive as serial execution
+/// does.
 async fn content(dataset: &Dataset) -> Vec<String> {
     let batch = dataset
         .scan()
@@ -181,5 +183,22 @@ async fn content(dataset: &Dataset) -> Vec<String> {
     // The schema line sorts with the rest; it is prefixed so it cannot collide
     // with a data row.
     rows[1..].sort();
+
+    // Lease IDs are random per run, so a lease is compared by everything else.
+    let mut leases = dataset
+        .retention_leases()
+        .iter()
+        .map(|lease| {
+            format!(
+                "lease: version {} created {} expires {} label {:?}",
+                lease.version(),
+                lease.created_at(),
+                lease.expires_at(),
+                lease.label(),
+            )
+        })
+        .collect::<Vec<_>>();
+    leases.sort();
+    rows.extend(leases);
     rows
 }

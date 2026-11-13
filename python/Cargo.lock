@@ -4204,6 +4204,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "chrono",
  "datafusion-common",
  "datafusion-sql",
  "futures",
@@ -4229,6 +4230,7 @@ dependencies = [
  "tracing",
  "twox-hash",
  "url",
+ "uuid",
 ]
 
 [[package]]
