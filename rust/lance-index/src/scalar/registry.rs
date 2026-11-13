@@ -212,6 +212,31 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
+    /// Field IDs this index depends on in addition to its query input columns.
+    ///
+    /// Lance persists these IDs alongside the input columns in the index's
+    /// metadata so ordinary schema changes can invalidate the index without
+    /// loading its plugin. They are dependencies, not additional query inputs:
+    /// for example, an index queried on a list column can depend on selected
+    /// fields inside its element struct.
+    ///
+    /// IDs must be recorded in `index_details` before this method is called.
+    /// Return them in a deterministic order, without duplicates or input-column
+    /// IDs. This method must not access index files. The default declares no
+    /// additional dependencies and preserves existing plugins' input fields.
+    ///
+    /// ```
+    /// # use lance_index::{pbold, scalar::{btree::BTreeIndexPlugin, registry::ScalarIndexPlugin}};
+    /// # fn main() -> lance_core::Result<()> {
+    /// let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())?;
+    /// assert!(BTreeIndexPlugin.additional_field_ids(&details)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn additional_field_ids(&self, _index_details: &prost_types::Any) -> Result<Vec<i32>> {
+        Ok(Vec::new())
+    }
+
     /// Whether Lance may maintain this index through `optimize_indices`.
     ///
     /// Return `false` when an external service owns refreshing and merging the
@@ -819,6 +844,21 @@ mod tests {
         InvertedIndex, InvertedIndexParams, METADATA_FILE, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
     };
     use crate::scalar::lance_format::LanceIndexStore;
+
+    #[test]
+    fn test_plugin_defaults_to_no_additional_field_ids() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let details =
+            prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap();
+        assert!(
+            registry
+                .get_plugin_by_details(&details)
+                .unwrap()
+                .additional_field_ids(&details)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Pause the cold caller after publication, allowing a warm caller to rotate
     /// the same entry before the cold caller receives its result.
