@@ -22,6 +22,7 @@ use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
     },
+    io::deletion::relative_deletion_file_path,
     rowids::RowIdSequence,
 };
 use object_store::path::Path;
@@ -121,6 +122,9 @@ impl CacheKey for TransactionKey {
     }
 }
 
+/// The deletion vector of one deletion file, keyed by its location.
+///
+/// An explicit path does not include the fragment id. A derived path does.
 #[derive(Debug)]
 pub struct DeletionFileKey<'a> {
     pub fragment_id: u64,
@@ -130,26 +134,25 @@ pub struct DeletionFileKey<'a> {
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "deletion/{}/{}/{}/{}",
-            self.fragment_id,
-            self.deletion_file.read_version,
-            self.deletion_file.id,
-            self.deletion_file.file_type.suffix()
-        ))
+        let location = relative_deletion_file_path(self.fragment_id, self.deletion_file);
+        match self.deletion_file.base_id {
+            Some(base_id) => Cow::Owned(format!("deletion/{base_id}/{location}")),
+            None => Cow::Owned(format!("deletion/{location}")),
+        }
     }
     fn type_name() -> &'static str {
         "DeletionVector"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.fragment_id);
-        builder.write_u64(self.deletion_file.read_version);
-        builder.write_u64(self.deletion_file.id);
+        builder.write_str(&relative_deletion_file_path(
+            self.fragment_id,
+            self.deletion_file,
+        ));
         builder.write_variant(match &self.deletion_file.file_type {
             DeletionFileType::Array => 0,
             DeletionFileType::Bitmap => 1,
@@ -329,6 +332,7 @@ impl DSMetadataCache {
 mod tests {
     use std::sync::Arc;
 
+    use lance_table::format::DeletionFilePath;
     use lance_table::rowids::write_row_ids;
 
     use super::*;
@@ -342,6 +346,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: None,
         };
         cache
@@ -363,6 +368,63 @@ mod tests {
                 .get_with_key(&DeletionFileKey {
                     fragment_id: 2,
                     deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deletion_file_cache_key_location() {
+        let cache = LanceCache::with_capacity(4096);
+        let explicit = || DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some(DeletionFilePath::new_random()),
+            inline: None,
+        };
+        let first = explicit();
+        let deletion_vector = Arc::new(DeletionVector::Bitmap([1].into_iter().collect()));
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &first,
+                },
+                deletion_vector.clone(),
+            )
+            .await;
+
+        let renumbered = cache
+            .get_with_key(&DeletionFileKey {
+                fragment_id: 43,
+                deletion_file: &first,
+            })
+            .await
+            .expect("an explicit path does not depend on the fragment id");
+        assert!(Arc::ptr_eq(&renumbered, &deletion_vector));
+
+        let legacy = DeletionFile {
+            path: None,
+            ..first.clone()
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &legacy,
+                })
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &explicit(),
                 })
                 .await
                 .is_none()

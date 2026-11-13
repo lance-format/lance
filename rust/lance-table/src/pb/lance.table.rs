@@ -350,12 +350,10 @@ impl ::prost::Name for FieldCoverage {
 }
 /// Deletion File
 ///
-/// The path of the deletion file is constructed as:
+/// Stored inline in the manifest when `inline` is set, at `{root}/{path}` when
+/// `path` is set, or derived from the owning fragment ID as:
 ///    {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
-/// where {extension} depends on DeletionFileType.
-///
-/// When `inline` is set there is no such file: the deletion vector lives in the
-/// manifest itself.
+/// where {root} is the dataset root named by `base_id` (or this dataset when absent).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeletionFile {
     /// Type of deletion file.
@@ -371,6 +369,16 @@ pub struct DeletionFile {
     /// The number of rows that are marked as deleted.
     #[prost(uint64, tag = "4")]
     pub num_deleted_rows: u64,
+    /// EXPERIMENTAL. Explicit path relative to {root}, formatted as
+    /// `_deletions/{uuid}.{extension}` (lowercase hyphenated UUID, extension
+    /// matching `file_type`). Cannot be set together with `inline`.
+    ///
+    /// Writers must use a new UUID for each file and never overwrite an existing
+    /// file. Readers must reject invalid paths without falling back to legacy
+    /// naming. Requires sticky feature flag `2^20` (`FLAG_UNSTABLE_DELETION_FILE_PATHS`)
+    /// in both reader and writer feature flags.
+    #[prost(string, optional, tag = "5")]
+    pub path: ::core::option::Option<::prost::alloc::string::String>,
     /// The deletion vector itself, stored in the manifest instead of in a file.
     /// Always the BITMAP encoding (a serialized Roaring bitmap of deleted row
     /// offsets), whatever `file_type` says. A reader that reads one request per
