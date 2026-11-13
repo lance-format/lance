@@ -3,7 +3,6 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 
@@ -15,20 +14,23 @@ use crate::{
     data::{BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
+    encodings::physical::fsst::{
+        ParsedFsstDecompressor, get_fsst_decompressor, parse_fsst_symbol_table,
+    },
     format::ProtobufUtils,
 };
 
 #[derive(Debug)]
 pub struct FsstPageScheduler {
     inner_scheduler: Box<dyn PageScheduler>,
-    symbol_table: LanceBuffer,
+    decompressor: Arc<ParsedFsstDecompressor>,
 }
 
 impl FsstPageScheduler {
     pub fn new(inner_scheduler: Box<dyn PageScheduler>, symbol_table: LanceBuffer) -> Self {
         Self {
             inner_scheduler,
-            symbol_table,
+            decompressor: Arc::new(parse_fsst_symbol_table(symbol_table.as_ref())),
         }
     }
 }
@@ -43,13 +45,13 @@ impl PageScheduler for FsstPageScheduler {
         let inner_decoder = self
             .inner_scheduler
             .schedule_ranges(ranges, scheduler, top_level_row);
-        let symbol_table = self.symbol_table.clone();
+        let decompressor = self.decompressor.clone();
 
         async move {
             let inner_decoder = inner_decoder.await?;
             Ok(Box::new(FsstPageDecoder {
                 inner_decoder,
-                symbol_table,
+                decompressor,
             }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
@@ -58,7 +60,7 @@ impl PageScheduler for FsstPageScheduler {
 
 struct FsstPageDecoder {
     inner_decoder: Box<dyn PrimitivePageDecoder>,
-    symbol_table: LanceBuffer,
+    decompressor: Arc<ParsedFsstDecompressor>,
 }
 
 impl PrimitivePageDecoder for FsstPageDecoder {
@@ -72,6 +74,7 @@ impl PrimitivePageDecoder for FsstPageDecoder {
     }
 
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+        let decompressor = get_fsst_decompressor(&self.decompressor)?;
         let compressed_data = self.inner_decoder.decode(rows_to_skip, num_rows)?;
         let (string_data, nulls) = match compressed_data {
             DataBlock::Nullable(nullable) => {
@@ -82,39 +85,19 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             _ => panic!("Received non-variable width data from inner decoder"),
         }?;
 
-        let offsets = ScalarBuffer::<i32>::from(string_data.offsets.into_buffer());
-        let bytes = string_data.data.into_buffer();
+        let offsets = string_data.offsets.borrow_to_typed_slice::<i32>();
+        let bytes = string_data.data.as_ref();
 
-        let mut decompressed_offsets = vec![0_i32; offsets.len()];
-        let mut decompressed_bytes = vec![0_u8; bytes.len() * 8];
-        // Safety: Exposes uninitialized memory but we're about to clobber it
-        unsafe {
-            decompressed_bytes.set_len(decompressed_bytes.capacity());
-        }
-        fsst::fsst::decompress(
-            &self.symbol_table,
-            &bytes,
-            &offsets,
-            &mut decompressed_bytes,
-            &mut decompressed_offsets,
-        )
-        .map_err(crate::encodings::physical::fsst::map_fsst_error)?;
-
-        // TODO: Change PrimitivePageDecoder to use Vec instead of BytesMut
-        // since there is no way to get BytesMut from Vec but these copies should be avoidable
-        // This is not the first time this has happened
-        let mut offsets_as_bytes_mut = Vec::with_capacity(decompressed_offsets.len());
-        let decompressed_offsets = ScalarBuffer::<i32>::from(decompressed_offsets);
-        offsets_as_bytes_mut.extend_from_slice(decompressed_offsets.inner().as_slice());
-
-        let mut bytes_as_bytes_mut = Vec::with_capacity(decompressed_bytes.len());
-        bytes_as_bytes_mut.extend_from_slice(&decompressed_bytes);
+        let (mut decompressed_bytes, decompressed_offsets) = decompressor
+            .decompress_into(bytes, offsets.as_ref())
+            .map_err(crate::encodings::physical::fsst::map_fsst_error)?;
+        decompressed_bytes.shrink_to_fit();
 
         let new_string_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: 32,
-            data: LanceBuffer::from(bytes_as_bytes_mut),
+            data: LanceBuffer::from(decompressed_bytes),
             num_values: num_rows,
-            offsets: LanceBuffer::from(offsets_as_bytes_mut),
+            offsets: LanceBuffer::reinterpret_vec(decompressed_offsets),
             block_info: BlockInfo::new(),
         });
 
@@ -159,20 +142,11 @@ impl ArrayEncoder for FsstArrayEncoder {
         assert_eq!(data.bits_per_offset, 32);
         let num_values = data.num_values;
         let offsets = data.offsets.borrow_to_typed_slice::<i32>();
-        let offsets_slice = offsets.as_ref();
-        let bytes_data = data.data.into_buffer();
+        let bytes_data = data.data.as_ref();
 
-        let mut dest_offsets = vec![0_i32; offsets_slice.len() * 2];
-        let mut dest_values = vec![0_u8; bytes_data.len() * 2];
         let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
-
-        fsst::fsst::compress(
-            &mut symbol_table,
-            bytes_data.as_slice(),
-            offsets_slice,
-            &mut dest_values,
-            &mut dest_offsets,
-        )?;
+        let (dest_values, dest_offsets) =
+            fsst::fsst::compress_into(&mut symbol_table, bytes_data, offsets.as_ref())?;
 
         let dest_offset = LanceBuffer::reinterpret_vec(dest_offsets);
         let dest_values = LanceBuffer::from(dest_values);

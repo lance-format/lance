@@ -279,6 +279,22 @@ impl CombinedFieldsBM25Scorer {
         self.avg_doc_length
     }
 
+    /// Blended document frequencies keyed by tokenized query terms.
+    /// Together with [`Self::doc_count`] and [`Self::avg_doc_length`], these
+    /// reconstruct the scorer without serializing computed IDF values:
+    ///
+    /// ```
+    /// # use lance_index::scalar::inverted::CombinedFieldsBM25Scorer;
+    /// # fn rebuild(scorer: &CombinedFieldsBM25Scorer) -> CombinedFieldsBM25Scorer {
+    /// CombinedFieldsBM25Scorer::new(
+    ///     scorer.doc_count(), scorer.avg_doc_length(), scorer.doc_freq().clone(),
+    /// )
+    /// # }
+    /// ```
+    pub fn doc_freq(&self) -> &HashMap<String, usize> {
+        &self.doc_freq
+    }
+
     /// Blended IDF for `term` over the virtual field. Returns `0.0` for a term
     /// absent from every target column (`docFreq' == 0`), and for the inconsistent
     /// statistics (`docFreq' > docCount'`) that drive `idf` negative or, once

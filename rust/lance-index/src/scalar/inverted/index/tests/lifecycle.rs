@@ -230,7 +230,8 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
     let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(updated.format_version(), format_version);
     assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
-    assert_eq!(updated.partitions.len(), 2);
+    // Consolidating the two tiny partitions must preserve their V2 format.
+    assert_eq!(updated.partitions.len(), 1);
     for partition in &updated.partitions {
         assert_eq!(
             partition.inverted_list.posting_tail_codec(),

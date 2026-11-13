@@ -18,8 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
+use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
+use crate::feature_flags::{COVERING_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -120,6 +121,10 @@ pub struct Manifest {
     /// first. Allocation takes `max_clustering_id + 1` and the value never
     /// decreases, including after definition removal or restore.
     pub max_clustering_id: u32,
+
+    /// Encoded bytes of `fragments`, reused when this manifest, or one derived
+    /// from it, is written. Ignored by equality.
+    encoded_fragments: EncodedFragmentCache,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -223,6 +228,7 @@ impl Manifest {
             base_paths,
             clustering: Vec::new(),
             max_clustering_id: 0,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
     }
 
@@ -257,6 +263,7 @@ impl Manifest {
             base_paths: previous.base_paths.clone(),
             clustering: previous.clustering.clone(),
             max_clustering_id: previous.max_clustering_id,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
     }
 
@@ -309,16 +316,18 @@ impl Manifest {
             // wholesale -- `covering_fields` included -- a build that predates
             // covering could then open it and read carried columns as keyed ones.
             // Kept unconditionally rather than derived from the cloned indexes:
-            // over-fencing a clone is harmless, under-fencing one is not.
+            // over-fencing a clone is harmless, under-fencing one is not. The
+            // independent-layout bit goes with it, so the cloned entries are
+            // written back under the contract they were read with.
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them. So are stable row ids:
             // they are otherwise derived from the fragments, so a clone of a table
             // whose rows were all deleted would lose them and stop assigning ids
             // from `next_row_id`.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
+                & (COVERING_FLAGS | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
+                & (COVERING_FLAGS | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
@@ -338,7 +347,45 @@ impl Manifest {
             // the definitions they reference and the allocation high-water mark.
             clustering: self.clustering.clone(),
             max_clustering_id: self.max_clustering_id,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
+    }
+
+    /// Encoded `pb::DataFragment` bytes of `fragments`, by position, if the
+    /// cached encodings describe the current fragment list. A `None` entry is
+    /// a fragment that has to be encoded when the manifest is written.
+    pub(crate) fn encoded_fragments(&self) -> Option<&[Option<Bytes>]> {
+        self.encoded_fragments.get(&self.fragments)
+    }
+
+    /// Record `encoded[i]` as the encoded bytes of `fragments[i]`; the entries
+    /// are slices of one buffer of `retained_bytes` bytes.
+    pub(crate) fn set_encoded_fragments(
+        &mut self,
+        encoded: Vec<Option<Bytes>>,
+        retained_bytes: usize,
+    ) {
+        self.encoded_fragments =
+            EncodedFragmentCache::new(&self.fragments, encoded, retained_bytes);
+    }
+
+    /// Reuse `previous`'s encoded bytes for every fragment of this manifest
+    /// that was taken unchanged from `previous`.
+    ///
+    /// `changed_ids` must hold the id of every fragment this manifest added,
+    /// replaced or modified relative to `previous`. Callers derive it from the
+    /// transaction's own bookkeeping; fragments are never compared by content.
+    pub(crate) fn reuse_encoded_fragments(&mut self, previous: &Self, changed_ids: &[u64]) {
+        let Some(previous_encoded) = previous.encoded_fragments() else {
+            return;
+        };
+        let encoded = carry_encoded_fragments(
+            &previous.fragments,
+            previous_encoded,
+            &self.fragments,
+            changed_ids,
+        );
+        self.set_encoded_fragments(encoded, previous.encoded_fragments.retained_bytes());
     }
 
     /// Return the `timestamp_nanos` value as a Utc DateTime
@@ -616,7 +663,7 @@ impl Manifest {
     /// - total_files_size: Total size of all data files in bytes
     /// - total_fragments: Total number of fragments in the dataset
     /// - total_data_files: Total number of data files across all fragments
-    /// - total_deletion_files: Total number of deletion files
+    /// - total_deletion_files: Total number of external deletion files
     /// - total_data_file_rows: Total number of rows in data files
     /// - total_deletion_file_rows: Total number of deleted rows in deletion files
     /// - total_rows: Total number of rows in the dataset
@@ -638,8 +685,11 @@ impl Manifest {
                             summary.total_files_size += size_bytes.get();
                         }
                     }
-                    // Check and count if the current fragment has a deletion file
-                    if f.deletion_file.is_some() {
+                    // Inline vectors are part of the manifest, not deletion files.
+                    if f.deletion_file
+                        .as_ref()
+                        .is_some_and(|file| !file.is_inline())
+                    {
                         summary.total_deletion_files += 1;
                     }
                     // Sum the number of deleted rows from the deletion file (if available)
@@ -1143,6 +1193,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .transaction_section
                 .or(p.transaction_section_deprecated)
                 .map(|i| i as usize),
+            encoded_fragments: EncodedFragmentCache::default(),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -1165,73 +1216,82 @@ impl TryFrom<pb::Manifest> for Manifest {
 
 impl From<&Manifest> for pb::Manifest {
     fn from(m: &Manifest) -> Self {
-        let timestamp_nanos = if m.timestamp_nanos == 0 {
-            None
-        } else {
-            let nanos = m.timestamp_nanos % 1e9 as u128;
-            let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
-            Some(Timestamp {
-                seconds,
-                nanos: nanos as i32,
-            })
-        };
-        let fields_with_meta: FieldsWithMeta = (&m.schema).into();
         Self {
-            fields: fields_with_meta.fields.0,
-            schema_metadata: m
-                .schema
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
-                .collect(),
-            version: m.version,
-            branch: m.branch.clone(),
-            clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
-            max_clustering_id: m.max_clustering_id,
-            writer_version: m
-                .writer_version
-                .as_ref()
-                .map(|wv| pb::manifest::WriterVersion {
-                    library: wv.library.clone(),
-                    version: wv.version.clone(),
-                    prerelease: wv.prerelease.clone(),
-                    build_metadata: wv.build_metadata.clone(),
-                }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            fragment_tree: None,
-            table_metadata: m.table_metadata.clone(),
-            version_aux_data: m.version_aux_data as u64,
-            index_section: m.index_section.map(|i| i as u64),
-            timestamp: timestamp_nanos,
-            tag: m.tag.clone().unwrap_or_default(),
-            reader_feature_flags: m.reader_feature_flags,
-            writer_feature_flags: m.writer_feature_flags,
-            max_fragment_id: m.max_fragment_id,
-            max_allocated_field_id: m.max_allocated_field_id,
-            transaction_file: m.transaction_file.clone().unwrap_or_default(),
-            next_row_id: m.next_row_id,
-            data_format: Some(pb::manifest::DataStorageFormat {
-                file_format: m.data_storage_format.file_format.clone(),
-                version: m
-                    .data_storage_format
-                    .version
-                    .to_manifest_string()
-                    .to_string(),
-            }),
-            config: m.config.clone(),
-            base_paths: m
-                .base_paths
-                .values()
-                .map(|base_path| pb::BasePath {
-                    id: base_path.id,
-                    name: base_path.name.clone(),
-                    is_dataset_root: base_path.is_dataset_root,
-                    path: base_path.path.clone(),
-                })
-                .collect(),
-            transaction_section: m.transaction_section.map(|i| i as u64),
-            transaction_section_deprecated: None,
+            ..pb_manifest_without_fragments(m)
         }
+    }
+}
+
+/// The protobuf form of `m` with `fragments` left empty, for writers that
+/// encode the fragments themselves.
+pub fn pb_manifest_without_fragments(m: &Manifest) -> pb::Manifest {
+    let timestamp_nanos = if m.timestamp_nanos == 0 {
+        None
+    } else {
+        let nanos = m.timestamp_nanos % 1e9 as u128;
+        let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
+        Some(Timestamp {
+            seconds,
+            nanos: nanos as i32,
+        })
+    };
+    let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+    pb::Manifest {
+        fields: fields_with_meta.fields.0,
+        schema_metadata: m
+            .schema
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect(),
+        version: m.version,
+        branch: m.branch.clone(),
+        clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
+        max_clustering_id: m.max_clustering_id,
+        writer_version: m
+            .writer_version
+            .as_ref()
+            .map(|wv| pb::manifest::WriterVersion {
+                library: wv.library.clone(),
+                version: wv.version.clone(),
+                prerelease: wv.prerelease.clone(),
+                build_metadata: wv.build_metadata.clone(),
+            }),
+        fragments: vec![],
+        fragment_tree: None,
+        table_metadata: m.table_metadata.clone(),
+        version_aux_data: m.version_aux_data as u64,
+        index_section: m.index_section.map(|i| i as u64),
+        timestamp: timestamp_nanos,
+        tag: m.tag.clone().unwrap_or_default(),
+        reader_feature_flags: m.reader_feature_flags,
+        writer_feature_flags: m.writer_feature_flags,
+        max_fragment_id: m.max_fragment_id,
+        max_allocated_field_id: m.max_allocated_field_id,
+        transaction_file: m.transaction_file.clone().unwrap_or_default(),
+        next_row_id: m.next_row_id,
+        data_format: Some(pb::manifest::DataStorageFormat {
+            file_format: m.data_storage_format.file_format.clone(),
+            version: m
+                .data_storage_format
+                .version
+                .to_manifest_string()
+                .to_string(),
+        }),
+        config: m.config.clone(),
+        base_paths: m
+            .base_paths
+            .values()
+            .map(|base_path| pb::BasePath {
+                id: base_path.id,
+                name: base_path.name.clone(),
+                is_dataset_root: base_path.is_dataset_root,
+                path: base_path.path.clone(),
+            })
+            .collect(),
+        transaction_section: m.transaction_section.map(|i| i as u64),
+        transaction_section_deprecated: None,
     }
 }
 
@@ -1295,7 +1355,10 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::feature_flags::{
+        CoveringContract, FLAG_COVERED_INDEX_METADATA, FLAG_NON_REUSABLE_FIELD_IDS,
+        FLAG_USE_V2_FORMAT_DEPRECATED,
+    };
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;
@@ -2067,6 +2130,42 @@ mod tests {
         assert_ne!(cloned.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
     }
 
+    /// The clone copies the index section as read, so it must keep the
+    /// contract that section was read with.
+    #[rstest::rstest]
+    #[case::suffix(FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(COVERING_FLAGS)]
+    fn shallow_clone_keeps_the_covering_contract(#[case] flags: u64) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = flags;
+        manifest.writer_feature_flags = flags;
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        assert_eq!(cloned.reader_feature_flags & COVERING_FLAGS, flags);
+        assert_eq!(cloned.writer_feature_flags & COVERING_FLAGS, flags);
+        assert_eq!(
+            CoveringContract::of(&cloned),
+            CoveringContract::of(&manifest)
+        );
+    }
+
     #[test]
     fn test_config() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
@@ -2215,11 +2314,12 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let manifest_with_deletion = Manifest::new(
-            schema,
-            Arc::new(vec![fragment_with_deletion]),
+            schema.clone(),
+            Arc::new(vec![fragment_with_deletion.clone()]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
@@ -2232,6 +2332,23 @@ mod tests {
         assert_eq!(deletion_summary.total_deletion_file_rows, 10);
         assert_eq!(deletion_summary.total_data_file_rows, 50);
         assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        fragment_with_deletion
+            .deletion_file
+            .as_mut()
+            .unwrap()
+            .inline = Some(vec![0].into());
+        let manifest_with_inline_deletion = Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_deletion]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let inline_summary = manifest_with_inline_deletion.summary();
+        assert_eq!(inline_summary.total_rows, 40);
+        assert_eq!(inline_summary.total_deletion_file_rows, 10);
+        assert_eq!(inline_summary.total_data_file_rows, 50);
+        assert_eq!(inline_summary.total_deletion_files, 0);
 
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();

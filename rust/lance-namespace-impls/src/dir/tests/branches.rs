@@ -2034,11 +2034,10 @@ async fn test_create_branch_rejects_negative_from_version() {
 async fn test_create_branch_nonexistent_from_version() {
     let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
 
-    // Version 999 does not exist (the table has 2 versions). create_branch's clone phase
-    // raises DatasetNotFound, which we map to a documented InvalidInput (400).
+    // A missing source must return the documented InvalidInput (400) without reserving the name.
     let err = namespace
         .create_table_branch(CreateTableBranchRequest {
-            id: Some(table_id),
+            id: Some(table_id.clone()),
             name: "dev".to_string(),
             from_version: Some(999),
             ..Default::default()
@@ -2056,6 +2055,16 @@ async fn test_create_branch_nonexistent_from_version() {
         "error should name the missing source, got: {}",
         err
     );
+
+    namespace
+        .create_table_branch(CreateTableBranchRequest {
+            id: Some(table_id),
+            name: "dev".to_string(),
+            from_version: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

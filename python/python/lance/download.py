@@ -55,7 +55,7 @@ def download_jieba():
     try:
         requests = import_requests()
         resp = requests.get(
-            "https://github.com/messense/jieba-rs/raw/refs/heads/main/src/data/dict.txt"
+            "https://github.com/messense/jieba-rs/raw/refs/heads/main/jieba/src/data/dict.txt"
         )
         content = resp.content
         with open(os.path.join(dirname, "dict.txt"), "wb") as out:
@@ -64,7 +64,7 @@ def download_jieba():
         traceback.print_exc()
         print(
             "Download jieba language model failed. Please download dict.txt from "
-            "https://github.com/messense/jieba-rs/tree/main/src/data "
+            "https://github.com/messense/jieba-rs/tree/main/jieba/src/data "
             f"and put it in {dirname}"
         )
 

@@ -22,20 +22,22 @@ use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
+};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::FutureExt;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::stream::FuturesUnordered;
-use futures::{Stream, StreamExt};
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -65,9 +67,9 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    IndexFileKey, OriginLatencyClass, QueryResidual, QueryScratch, QueryScratchCapacity,
-    QueryScratchPool, RabitRawQueryContext, ResidentAttach, ResidentColumns,
-    ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
+    DistCalculator, DistanceCalculatorOptions, IndexFileKey, OriginLatencyClass, QueryResidual,
+    QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach,
+    ResidentColumns, ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
     origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
     resident_store_fits, shares_resident_store,
 };
@@ -75,7 +77,8 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, PartitionSearchControl, PreparedPartitionSearchHandle, Query,
+        ApproxMode, DISTANCE_TYPE_KEY, PartitionRowDistances, PartitionSearchControl,
+        PartitionSearchResult, PreparedPartitionRows, PreparedPartitionSearchHandle, Query,
         VECTOR_RESULT_SCHEMA, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
         storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
@@ -88,21 +91,26 @@ use lance_io::{
     ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
 };
 use lance_linalg::distance::DistanceType;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use std::time::Instant;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
+mod partition_search;
+#[cfg(test)]
+use partition_search::balanced_query_ranges;
 pub mod rabit_scan;
 
-use rabit_scan::{RabitCacheLayout, RabitScan, RabitScanContext, RabitScanFactory};
+use partition_search::{
+    BatchPartition, NativeRabitScan, PartitionSearchRequest, PartitionSearchSource,
+    PreparedPartition,
+};
+use rabit_scan::{RabitCacheLayout, RabitIndex, RabitScan, RabitScanFactory};
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
@@ -125,7 +133,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// both to avoid using wrong row offsets during reconstruction.
     pub(crate) aux_ivf: IvfModel,
     pub(crate) distance_type: DistanceType,
-    pub(crate) sub_index_metadata: Vec<String>,
+    pub(crate) sub_index_metadata: Arc<[String]>,
     /// Parsed quantizer metadata — stored directly to avoid JSON re-parsing on
     /// every warm-path reconstruction.
     pub(crate) metadata: <Q::Storage as QuantizerStorage>::Metadata,
@@ -490,6 +498,233 @@ async fn read_partition_window_batches(
     split_window_batches(schema, &partition_lengths, batches)
 }
 
+fn global_heap_to_batch(
+    heap: BinaryHeap<OrderedNode<u64>>,
+    metrics: &dyn MetricsCollector,
+) -> Result<RecordBatch> {
+    let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
+    let (row_ids, dists): (Vec<_>, Vec<_>) = heap.into_iter().map(|r| (r.id, r.dist.0)).unzip();
+    Ok(RecordBatch::try_new(
+        VECTOR_RESULT_SCHEMA.clone(),
+        vec![
+            Arc::new(Float32Array::from(dists)),
+            Arc::new(UInt64Array::from(row_ids)),
+        ],
+    )?)
+}
+
+/// The files a prewarm window reads: the index file and the storage file,
+/// each with the IVF model that locates its partitions.
+#[derive(Clone, Copy)]
+struct PrewarmFiles<'a> {
+    index_reader: &'a FileReader,
+    read_projection: Option<&'a ReaderProjection>,
+    index_ivf: &'a IvfModel,
+    storage_reader: &'a FileReader,
+    storage_ivf: &'a IvfModel,
+}
+
+/// The partition-entry cache a prewarm window fills. Building an entry is the
+/// only `S × Q`-specific step of prewarm, so the window scheduling around it is
+/// compiled once.
+trait PrewarmCache: Sync {
+    fn is_cached(&self, partition_id: usize) -> BoxFuture<'_, bool>;
+
+    /// Cache the entry built from the batches `load` yields unless one is
+    /// cached already, in which case `load` is not polled. Returns whether
+    /// an entry was already cached.
+    fn insert_with<'a>(
+        &'a self,
+        partition_id: usize,
+        load: BoxFuture<'a, Result<PartitionPrewarmBatches>>,
+    ) -> BoxFuture<'a, Result<bool>>;
+}
+
+struct PrewarmEntryCache<'a, S: IvfSubIndex + 'static, Q: Quantization + 'static> {
+    index: &'a IVFIndex<S, Q>,
+    index_cache: WeakLanceCache,
+}
+
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PrewarmCache
+    for PrewarmEntryCache<'_, S, Q>
+{
+    fn is_cached(&self, partition_id: usize) -> BoxFuture<'_, bool> {
+        async move {
+            self.index_cache
+                .get_with_key(&IVFPartitionKey::<S, Q>::new(partition_id))
+                .await
+                .is_some()
+        }
+        .boxed()
+    }
+
+    fn insert_with<'a>(
+        &'a self,
+        partition_id: usize,
+        load: BoxFuture<'a, Result<PartitionPrewarmBatches>>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        async move {
+            let (_, was_cached) = self
+                .index_cache
+                .get_or_insert_with_key_hit(IVFPartitionKey::<S, Q>::new(partition_id), || async {
+                    let entry = self
+                        .index
+                        .materialize_prewarm_partition(partition_id, load.await?)
+                        .await?;
+                    debug_assert!(
+                        !entry.shares_resident_store(),
+                        "prewarmed partition {partition_id} holds memory of a resident store"
+                    );
+                    Ok(entry)
+                })
+                .await?;
+            Ok(was_cached)
+        }
+        .boxed()
+    }
+}
+
+async fn prewarm_partition_window(
+    cache: &dyn PrewarmCache,
+    files: PrewarmFiles<'_>,
+    partitions: Range<usize>,
+) -> Result<()> {
+    let index_schema = Arc::new(match files.read_projection {
+        Some(projection) => projection.schema.as_ref().into(),
+        None => files.index_reader.schema().as_ref().into(),
+    });
+    let storage_schema = Arc::new(files.storage_reader.schema().as_ref().into());
+    let mut partition_id = partitions.start;
+    while partition_id < partitions.end {
+        if cache.is_cached(partition_id).await {
+            partition_id += 1;
+            continue;
+        }
+
+        // Stop at a cached hole. This prevents a warm partition from being
+        // included in a larger contiguous read merely because later
+        // partitions are cold.
+        let mut run_end = partition_id + 1;
+        while run_end < partitions.end {
+            if cache.is_cached(run_end).await {
+                break;
+            }
+            run_end += 1;
+        }
+        let run = partition_id..run_end;
+        let load_run = async {
+            let (index_batches, storage_batches) = tokio::try_join!(
+                read_partition_window_batches(
+                    files.index_reader,
+                    files.read_projection,
+                    &index_schema,
+                    files.index_ivf,
+                    run.clone(),
+                    None,
+                ),
+                read_partition_window_batches(
+                    files.storage_reader,
+                    None,
+                    &storage_schema,
+                    files.storage_ivf,
+                    run.clone(),
+                    None,
+                )
+            )?;
+            if index_batches.len() != run.len() || storage_batches.len() != run.len() {
+                return Err(Error::internal(format!(
+                    "IVF prewarm run {:?} produced {} index and {} storage partitions",
+                    run,
+                    index_batches.len(),
+                    storage_batches.len()
+                )));
+            }
+
+            let mut payloads = index_batches
+                .into_iter()
+                .zip(storage_batches)
+                .map(|(index, storage)| PartitionPrewarmBatches { index, storage });
+            let leader_batches = payloads.next().ok_or_else(|| {
+                Error::internal(format!(
+                    "IVF prewarm run {:?} did not produce its leader partition",
+                    run
+                ))
+            })?;
+            let mut follower_loads = payloads
+                .enumerate()
+                .map(|(offset, batches)| {
+                    cache.insert_with(run.start + offset + 1, async move { Ok(batches) }.boxed())
+                })
+                .collect::<FuturesUnordered<_>>();
+            let mut first_error = None;
+            while let Some(result) = follower_loads.next().await {
+                if let Err(error) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(leader_batches)
+        };
+        let was_cached = cache.insert_with(partition_id, load_run.boxed()).await?;
+        partition_id = if was_cached {
+            // A query or another prewarm owned this key. It may not have
+            // populated the remainder of our planned window, so resume at
+            // the next partition instead of skipping the full run.
+            partition_id + 1
+        } else {
+            run_end
+        };
+    }
+    Ok(())
+}
+
+/// [`Index::prewarm`] of an index that is not native: its partitions,
+/// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
+/// parallelism.
+async fn prewarm_partitions<'a>(
+    prewarm_window: &'a (dyn Fn(Range<usize>) -> BoxFuture<'a, Result<()>> + Sync),
+    uuid: &Uuid,
+    io_parallelism: usize,
+    index_layout: PrewarmFileLayout<'_>,
+    storage_layout: PrewarmFileLayout<'_>,
+) -> Result<()> {
+    let cpu_parallelism = get_num_compute_intensive_cpus();
+    let target_bytes = prewarm_window_size_bytes()?;
+    let parallelism = prewarm_parallelism(io_parallelism, cpu_parallelism);
+    let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
+    let windows =
+        plan_partition_windows(index_layout, storage_layout, target_bytes, max_partitions)?;
+    let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
+    info!(
+        uuid = %uuid,
+        windows = windows.len(),
+        planned_bytes,
+        window_bytes = target_bytes,
+        parallelism,
+        io_parallelism,
+        "prewarming IVF partitions in byte windows"
+    );
+    let started = std::time::Instant::now();
+    stream::iter(windows)
+        .map(Ok)
+        .try_for_each_concurrent(Some(parallelism), |window| {
+            prewarm_window(window.partitions)
+        })
+        .await?;
+    let elapsed = started.elapsed();
+    info!(
+        uuid = %uuid,
+        elapsed_ms = elapsed.as_millis() as u64,
+        planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
+        "prewarmed IVF partitions"
+    );
+    Ok(())
+}
+
 /// Number of prewarm windows kept in flight. Raising this beyond the CPU pool
 /// size measured no throughput gain (see `DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES`);
 /// the window size is the lever.
@@ -498,13 +733,18 @@ fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
 }
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
-    query: Query,
+    /// Shared across every probed partition; only [`Self::dist_q_c`] differs.
+    query: Arc<Query>,
+    /// Distance from the query to this partition's centroid.
+    dist_q_c: f32,
     pre_filter: Arc<dyn PreFilter>,
     partition_id: usize,
     partition_centroid: Option<ArrayRef>,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     raw_query_context: Option<Arc<RabitRawQueryContext>>,
     part_entry: Arc<PartitionEntry<S, Q>>,
+    use_query_residual: bool,
+    use_residual_scratch: bool,
     /// Released together with `part_entry`, so the tracker's live count is the
     /// number of partitions whose storage is pinned by in-flight searches.
     _in_flight: PreparedPartitionGuard,
@@ -567,6 +807,85 @@ pub(crate) fn empty_rabit_search_cache_cell() -> RabitSearchCacheCell {
 
 fn rabit_search_cache_cell(cache: Option<Arc<RabitSearchCache>>) -> RabitSearchCacheCell {
     Arc::new(Mutex::new(Some(cache)))
+}
+
+/// A partition loaded for [`VectorIndex::prepare_partition_rows`], held in
+/// [`PreparedPartitionRows::handle`].
+struct PartitionRowsScan<S: IvfSubIndex, Q: Quantization> {
+    partition_id: usize,
+    part_entry: Arc<PartitionEntry<S, Q>>,
+    pre_filter: Arc<dyn PreFilter>,
+    partition_centroid: Option<ArrayRef>,
+    /// Each query, preprocessed for the partition, with its original key. The
+    /// key's RQ raw-query context is built when scoring, on the CPU pool.
+    queries: Vec<(Query, ArrayRef)>,
+    /// Counts the scan among the partitions pinned by in-flight searches.
+    _in_flight: PreparedPartitionGuard,
+}
+
+/// A partition's vectors grouped by row, for scoring every row.
+struct PartitionRows {
+    /// Rows with a selected vector, strictly ascending.
+    row_ids: Arc<[u64]>,
+    /// Offsets of the selected vectors, grouped by row in `row_ids` order.
+    offsets: Vec<u32>,
+    /// `group_ends[r]` is the end in `offsets` of row `row_ids[r]`'s vectors.
+    group_ends: Vec<u32>,
+}
+
+impl PartitionRows {
+    fn new<'a>(row_ids: impl Iterator<Item = &'a u64>, mask: Option<&RowAddrMask>) -> Self {
+        let mut vectors = row_ids
+            .enumerate()
+            .filter(|(_, row_id)| mask.is_none_or(|mask| mask.selected(**row_id)))
+            .map(|(offset, &row_id)| (row_id, offset as u32))
+            .collect::<Vec<_>>();
+        // Partitions usually hold their rows in ascending order already.
+        if !vectors.is_sorted() {
+            vectors.sort_unstable();
+        }
+        let mut row_ids = Vec::with_capacity(vectors.len());
+        let mut offsets = Vec::with_capacity(vectors.len());
+        let mut group_ends = Vec::with_capacity(vectors.len());
+        for (row_id, offset) in vectors {
+            if row_ids.last() != Some(&row_id) {
+                if !offsets.is_empty() {
+                    group_ends.push(offsets.len() as u32);
+                }
+                row_ids.push(row_id);
+            }
+            offsets.push(offset);
+        }
+        if !offsets.is_empty() {
+            group_ends.push(offsets.len() as u32);
+        }
+        Self {
+            row_ids: row_ids.into(),
+            offsets,
+            group_ends,
+        }
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// The smallest `distance(offset)` over each row's vectors, in `row_ids` order.
+    fn min_per_row(&self, distance: impl Fn(u32) -> f32) -> Vec<f32> {
+        let mut start = 0;
+        self.group_ends
+            .iter()
+            .map(|&end| {
+                let end = end as usize;
+                let closest = self.offsets[start..end]
+                    .iter()
+                    .map(|&offset| distance(offset))
+                    .fold(f32::INFINITY, f32::min);
+                start = end;
+                closest
+            })
+            .collect()
+    }
 }
 
 fn rotated_partition_centroid_slice(
@@ -739,7 +1058,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 ivf,
                 aux_ivf,
                 distance_type,
-                sub_index_metadata: header.sub_index_metadata,
+                sub_index_metadata: header.sub_index_metadata.into(),
                 metadata,
                 sub_index_type,
                 quantization_type,
@@ -810,7 +1129,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             index_file_path: self.index_file_path.clone(),
             uuid: self.uuid.to_string(),
             distance_type: self.distance_type.to_string(),
-            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_metadata: self.sub_index_metadata.to_vec(),
             sub_index_type: self.sub_index_type.to_string(),
             quantization_type: self.quantization_type.to_string(),
             quantizer_metadata_json,
@@ -954,6 +1273,11 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
     pub(super) fn new(index: S, storage: Q::Storage) -> Self {
+        let storage = if S::name() == HNSW::name() {
+            storage.for_graph_search()
+        } else {
+            storage
+        };
         Self {
             index,
             storage,
@@ -1081,10 +1405,10 @@ pub(crate) struct IvfOpenContext {
     /// sets one; `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides
     /// it. See [`IVFIndex::resident_columns_at_open`].
     pub(crate) resident_columns: ResidentColumnsSetting,
-    /// The index's namespace of the index cache without a fragment reuse
-    /// segment, where an IVF_RQ index with resident small columns charges
-    /// their store (see [`ResidentColumns::in_index_cache`]), so
-    /// that a new fragment reuse index keeps the store. `None` keeps the
+    /// The cache pool for immutable index files, without dataset or fragment
+    /// reuse translation. Physical file keys scope raw entries and charge
+    /// resident stores (see [`ResidentColumns::in_index_cache`]), so snapshots
+    /// and shallow clones can share them. `None` keeps the
     /// store charged nowhere, shared with the file's other live indexes.
     pub(crate) file_cache: Option<LanceCache>,
     /// A strong reference acquired before opening the index can evict the
@@ -1148,12 +1472,14 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// every column. Built once here because it is fallible and only depends on
     /// the file schema.
     read_projection: Option<ReaderProjection>,
-    sub_index_metadata: Vec<String>,
+    sub_index_metadata: Arc<[String]>,
     storage: IvfQuantizationStorage<Q>,
 
     distance_type: DistanceType,
 
     index_cache: WeakLanceCache,
+    /// Immutable planes and code-only entries, independent of FRI translation.
+    raw_cache: WeakLanceCache,
 
     io_parallelism: usize,
     /// Cumulative I/O performed while opening this index (file footers, IVF
@@ -1266,7 +1592,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> Result<Option<Arc<RabitSearchCache>>> {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // HNSW walks its graph without the flat raw-query scan state.
+        if Q::quantization_type() != QuantizationType::Rabit || S::name() == HNSW::name() {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = storage.quantizer()? else {
@@ -1305,7 +1632,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         &self,
         query: &ArrayRef,
     ) -> Result<Option<Arc<RabitRawQueryContext>>> {
-        if Q::quantization_type() != QuantizationType::Rabit || self.use_query_residual {
+        if Q::quantization_type() != QuantizationType::Rabit
+            || self.use_query_residual
+            || S::name() == HNSW::name()
+        {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = self.storage.quantizer()? else {
@@ -1320,202 +1650,66 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_partition(
         &self,
         partition_id: usize,
-        query: &Query,
+        query: Arc<Query>,
+        dist_q_c: f32,
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
+        wait_for_prefilter: bool,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
-        let (part_entry, ()) =
-            tokio::try_join!(self.load_query_partition(partition_id, metrics), async {
+        let prefilter_ready = async {
+            if wait_for_prefilter {
                 let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
                 pre_filter.wait_for_ready().await
-            },)?;
+            } else {
+                Ok(())
+            }
+        };
+        let (part_entry, ()) = tokio::try_join!(
+            self.load_query_partition(partition_id, metrics),
+            prefilter_ready
+        )?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
-        Ok(PreparedPartitionSearch {
-            query: query.clone(),
-            pre_filter,
+        Ok(self.prepared_search(
             partition_id,
-            partition_centroid: self.ivf.centroid(partition_id),
-            rq_search_cache: self.rq_search_cache.clone(),
+            query,
+            dist_q_c,
+            pre_filter,
             raw_query_context,
             part_entry,
-            _in_flight: self.prepared_partitions.track(),
-            _marker: PhantomData,
-        })
+        ))
     }
 
-    async fn prepare_partition_without_prefilter_wait(
+    fn prepared_search(
         &self,
         partition_id: usize,
-        query: &Query,
+        query: Arc<Query>,
+        dist_q_c: f32,
         pre_filter: Arc<dyn PreFilter>,
-        metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
-    ) -> Result<PreparedPartitionSearch<S, Q>> {
-        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
-        let part_entry = self.load_query_partition(partition_id, metrics).await?;
-        let pre_filter =
-            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
-                .await?;
-        Ok(PreparedPartitionSearch {
-            query: query.clone(),
+        part_entry: Arc<PartitionEntry<S, Q>>,
+    ) -> PreparedPartitionSearch<S, Q> {
+        PreparedPartitionSearch {
+            query,
+            dist_q_c,
             pre_filter,
             partition_id,
             partition_centroid: self.ivf.centroid(partition_id),
             rq_search_cache: self.rq_search_cache.clone(),
             raw_query_context,
             part_entry,
+            use_query_residual: self.use_query_residual,
+            use_residual_scratch: self.use_residual_scratch,
             _in_flight: self.prepared_partitions.track(),
             _marker: PhantomData,
-        })
-    }
-
-    fn run_prepared_partition_search(
-        use_query_residual: bool,
-        use_residual_scratch: bool,
-        prepared: PreparedPartitionSearch<S, Q>,
-        metrics: &dyn MetricsCollector,
-        scratch: &mut QueryScratch,
-    ) -> Result<RecordBatch> {
-        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
-        if prepared.pre_filter.selects_nothing() {
-            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
         }
-        let PreparedPartitionSearch {
-            query,
-            pre_filter,
-            partition_id,
-            partition_centroid,
-            rq_search_cache,
-            raw_query_context,
-            part_entry,
-            _in_flight: _,
-            _marker: _,
-        } = prepared;
-        let rotated_partition_centroid =
-            rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
-        let residual = Self::query_context_for_scratch(
-            use_query_residual,
-            use_residual_scratch,
-            partition_id,
-            partition_centroid.as_ref(),
-            rotated_partition_centroid,
-            raw_query_context.as_deref(),
-        )?;
-        let query = Self::preprocess_partition_query_owned(
-            use_query_residual,
-            use_residual_scratch,
-            partition_id,
-            partition_centroid.as_ref(),
-            query,
-        )?;
-        let param = (&query).into();
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k * refine_factor;
-        let batch = part_entry.index.search_with_scratch(
-            query.key,
-            k,
-            param,
-            &part_entry.storage,
-            pre_filter,
-            metrics,
-            residual,
-            scratch,
-        )?;
-        Ok(batch)
-    }
-
-    /// Pull prepared partitions off `prepared` until their pinned storage reaches
-    /// `chunk_bytes` or the chunk holds [`GLOBAL_TOPK_CHUNK_MAX_PARTITIONS`],
-    /// always taking at least one. `None` once the stream is exhausted; a failed
-    /// prepare ends the chunk (and the search) immediately.
-    async fn next_scoring_chunk<St>(
-        prepared: &mut St,
-        chunk_bytes: usize,
-    ) -> Option<Result<Vec<PreparedPartitionSearch<S, Q>>>>
-    where
-        St: Stream<Item = Result<PreparedPartitionSearch<S, Q>>> + Unpin,
-    {
-        let mut chunk = Vec::new();
-        let mut bytes = 0;
-        while bytes < chunk_bytes && chunk.len() < GLOBAL_TOPK_CHUNK_MAX_PARTITIONS {
-            match prepared.next().await {
-                Some(Ok(prepared)) => {
-                    bytes += prepared.part_entry.size_bytes();
-                    chunk.push(prepared);
-                }
-                Some(Err(err)) => return Some(Err(err)),
-                None => break,
-            }
-        }
-        if chunk.is_empty() {
-            None
-        } else {
-            Some(Ok(chunk))
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn accumulate_prepared_partition_search(
-        use_query_residual: bool,
-        use_residual_scratch: bool,
-        prepared: PreparedPartitionSearch<S, Q>,
-        heap: &mut BinaryHeap<OrderedNode<u64>>,
-        scratch: &mut QueryScratch,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<()> {
-        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
-        if prepared.pre_filter.selects_nothing() {
-            return Ok(());
-        }
-        let PreparedPartitionSearch {
-            query,
-            pre_filter,
-            partition_id,
-            partition_centroid,
-            rq_search_cache,
-            raw_query_context,
-            part_entry,
-            _in_flight: _,
-            _marker: _,
-        } = prepared;
-        let rotated_partition_centroid =
-            rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
-        let residual = Self::query_context_for_scratch(
-            use_query_residual,
-            use_residual_scratch,
-            partition_id,
-            partition_centroid.as_ref(),
-            rotated_partition_centroid,
-            raw_query_context.as_deref(),
-        )?;
-        let query = Self::preprocess_partition_query_owned(
-            use_query_residual,
-            use_residual_scratch,
-            partition_id,
-            partition_centroid.as_ref(),
-            query,
-        )?;
-        let param = (&query).into();
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k * refine_factor;
-        part_entry.index.accumulate_topk_with_scratch(
-            query.key,
-            k,
-            param,
-            &part_entry.storage,
-            pre_filter,
-            heap,
-            residual,
-            scratch,
-            metrics,
-        )
     }
 
     fn query_context_for_scratch<'a>(
@@ -1543,21 +1737,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
-    fn global_heap_to_batch(
-        heap: BinaryHeap<OrderedNode<u64>>,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<RecordBatch> {
-        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
-        let (row_ids, dists): (Vec<_>, Vec<_>) = heap.into_iter().map(|r| (r.id, r.dist.0)).unzip();
-        Ok(RecordBatch::try_new(
-            VECTOR_RESULT_SCHEMA.clone(),
-            vec![
-                Arc::new(Float32Array::from(dists)),
-                Arc::new(UInt64Array::from(row_ids)),
-            ],
-        )?)
-    }
-
     fn preprocess_partition_query(
         use_query_residual: bool,
         use_residual_scratch: bool,
@@ -1565,13 +1744,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_centroid: Option<&ArrayRef>,
         query: &Query,
     ) -> Result<Query> {
-        Self::preprocess_partition_query_owned(
+        let mut query = query.clone();
+        query.key = Self::preprocess_partition_query_key(
             use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid,
-            query.clone(),
-        )
+            query.key,
+        )?;
+        Ok(query)
     }
 
     fn preprocess_partition_query_owned(
@@ -1581,24 +1762,74 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_centroid: Option<&ArrayRef>,
         mut query: Query,
     ) -> Result<Query> {
+        query.key = Self::preprocess_partition_query_key(
+            use_query_residual,
+            use_residual_scratch,
+            partition_id,
+            partition_centroid,
+            query.key,
+        )?;
+        Ok(query)
+    }
+
+    /// Residualize the query key for one partition when residual scratch is off.
+    /// With residual scratch the key is left as-is and the residual is applied
+    /// inside the distance calculator, so this is a no-op Arc clone of `key`.
+    fn preprocess_partition_query_key(
+        use_query_residual: bool,
+        use_residual_scratch: bool,
+        partition_id: usize,
+        partition_centroid: Option<&ArrayRef>,
+        key: ArrayRef,
+    ) -> Result<ArrayRef> {
         if use_query_residual {
             let partition_centroid = partition_centroid.ok_or_else(|| {
                 Error::index(format!("partition centroid {partition_id} does not exist"))
             })?;
             if use_residual_scratch {
-                return Ok(query);
+                return Ok(key);
             }
-            let residual_key = sub(&query.key, partition_centroid)?;
-            query.key = residual_key;
+            return Ok(sub(&key, partition_centroid)?);
         }
-        Ok(query)
+        Ok(key)
+    }
+
+    fn query_centroid_distance(&self, partition_id: usize, query: &Query) -> Result<f32> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::index(format!(
+                "partition {partition_id} is out of range for an IVF index with {} partitions",
+                self.ivf.num_partitions()
+            )));
+        }
+        let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
+            Error::index(format!("partition centroid {partition_id} does not exist"))
+        })?;
+        let centroid = FixedSizeListArray::try_new_from_values(
+            centroid.clone(),
+            i32::try_from(centroid.len()).map_err(|_| {
+                Error::index(format!(
+                    "partition centroid {partition_id} has unsupported dimension {}",
+                    centroid.len()
+                ))
+            })?,
+        )?;
+        let distance_type = if self.distance_type == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            self.distance_type
+        };
+        let distances = distance_type.batch(query.key.as_ref(), &centroid)?;
+        Ok(distances.value(0))
     }
 
     fn query_scratch_capacity(
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> QueryScratchCapacity {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // Only the flat RaBitQ scan reads the per-row scratch; HNSW walks without it.
+        if Q::quantization_type() != QuantizationType::Rabit
+            || S::name() != <FlatIndex as IvfSubIndex>::name()
+        {
             return QueryScratchCapacity::default();
         }
 
@@ -1649,6 +1880,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .join(uuid_str.as_str())
             .join(INDEX_AUXILIARY_FILE_NAME);
         let index_file = aux_file_key(&object_store, &index_dir, &uuid);
+        let raw_cache = WeakLanceCache::from(
+            &context
+                .file_cache
+                .as_ref()
+                .unwrap_or(&index_cache)
+                .with_key_prefix(&object_store.store_prefix)
+                .with_key_prefix(aux_path.as_ref()),
+        );
+        let row_address_cache = WeakLanceCache::from(
+            &index_cache
+                .with_key_prefix(&object_store.store_prefix)
+                .with_key_prefix(aux_path.as_ref()),
+        );
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
@@ -1708,7 +1952,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
         .await?;
         let storage = match frag_reuse_index {
-            Some(ResolvedRemapping::V0(remapper)) => {
+            Some(ResolvedRemapping::V0 { remapper, .. }) => {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, Some(remapper))
                     .await?
             }
@@ -1728,7 +1972,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             context.file_cache.as_ref(),
             context.resident_columns,
         )?;
-        let rabit_scan = if storage.supports_rabit_planes() {
+        // A graph walks whole partitions, so it stays off the plane scan.
+        let rabit_scan = if S::name() != HNSW::name() && storage.supports_rabit_planes() {
             context
                 .rabit_scan_factory
                 .as_ref()
@@ -1740,6 +1985,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
+            .with_row_address_cache(row_address_cache)
             .with_origin_latency(origin_latency)
             .with_resident_columns(resident_store)
             .with_resident_columns_enabled(resident_columns)
@@ -1785,9 +2031,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             reader: index_reader,
             read_projection,
             storage,
-            sub_index_metadata,
+            sub_index_metadata: sub_index_metadata.into(),
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            raw_cache,
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
@@ -1807,9 +2054,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: IvfModel,
         reader: FileReader,
         storage: IvfQuantizationStorage<Q>,
-        sub_index_metadata: Vec<String>,
+        sub_index_metadata: Arc<[String]>,
         distance_type: DistanceType,
         index_cache: LanceCache,
+        raw_cache: WeakLanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
         origin_latency: OriginLatencyClass,
@@ -1834,6 +2082,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            raw_cache,
             io_parallelism,
             // Reconstruction from cached state re-opens readers on its own path;
             // the open-time I/O is not attributed here (it is a one-time cost,
@@ -1901,7 +2150,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_cache: Option<&LanceCache>,
         session: ResidentColumnsSetting,
     ) -> Result<bool> {
-        if !storage.supports_rabit_planes() {
+        if S::name() == HNSW::name() || !storage.supports_rabit_planes() {
             return Ok(false);
         }
         resident_lifetime_setting()?;
@@ -2150,7 +2399,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .storage
             .load_partition_cached(
                 partition_id,
-                &self.index_cache,
+                &self.raw_cache,
                 write_cache,
                 attach,
                 io_stats.clone(),
@@ -2224,7 +2473,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let index = self.load_sub_index(partition_id, io_stats.clone()).await?;
         let storage = self
             .storage
-            .load_rabit_partition_planes(partition_id, &self.index_cache, io_stats)
+            .load_rabit_partition_planes(partition_id, &self.raw_cache, io_stats)
             .await?;
         Ok(PartitionEntry::new(index, storage))
     }
@@ -2345,122 +2594,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if self.caches_partition_codes() {
             return self.prewarm_partition_codes_window(partitions).await;
         }
-        let index_schema = Arc::new(match &self.read_projection {
-            Some(projection) => projection.schema.as_ref().into(),
-            None => self.reader.schema().as_ref().into(),
-        });
-        let storage_schema = Arc::new(self.storage.reader().schema().as_ref().into());
-        let mut partition_id = partitions.start;
-        while partition_id < partitions.end {
-            let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
-            if self.index_cache.get_with_key(&leader_key).await.is_some() {
-                partition_id += 1;
-                continue;
-            }
-
-            // Stop at a cached hole. This prevents a warm partition from being
-            // included in a larger contiguous read merely because later
-            // partitions are cold.
-            let mut run_end = partition_id + 1;
-            while run_end < partitions.end {
-                let key = IVFPartitionKey::<S, Q>::new(run_end);
-                if self.index_cache.get_with_key(&key).await.is_some() {
-                    break;
-                }
-                run_end += 1;
-            }
-            let run = partition_id..run_end;
-            let (_, was_cached) = self
-                .index_cache
-                .get_or_insert_with_key_hit(leader_key, || async {
-                    let (index_batches, storage_batches) = tokio::try_join!(
-                        read_partition_window_batches(
-                            &self.reader,
-                            self.read_projection.as_ref(),
-                            &index_schema,
-                            &self.ivf,
-                            run.clone(),
-                            None,
-                        ),
-                        read_partition_window_batches(
-                            self.storage.reader(),
-                            None,
-                            &storage_schema,
-                            self.storage.ivf(),
-                            run.clone(),
-                            None,
-                        )
-                    )?;
-                    if index_batches.len() != run.len() || storage_batches.len() != run.len() {
-                        return Err(Error::internal(format!(
-                            "IVF prewarm run {:?} produced {} index and {} storage partitions",
-                            run,
-                            index_batches.len(),
-                            storage_batches.len()
-                        )));
-                    }
-
-                    let mut payloads = index_batches
-                        .into_iter()
-                        .zip(storage_batches)
-                        .map(|(index, storage)| PartitionPrewarmBatches { index, storage });
-                    let leader_batches = payloads.next().ok_or_else(|| {
-                        Error::internal(format!(
-                            "IVF prewarm run {:?} did not produce its leader partition",
-                            run
-                        ))
-                    })?;
-                    let mut follower_loads = FuturesUnordered::new();
-                    for (offset, batches) in payloads.enumerate() {
-                        let follower_id = run.start + offset + 1;
-                        follower_loads.push(async move {
-                            let key = IVFPartitionKey::<S, Q>::new(follower_id);
-                            self.index_cache
-                                .get_or_insert_with_key(key, || async move {
-                                    let entry = self
-                                        .materialize_prewarm_partition(follower_id, batches)
-                                        .await?;
-                                    debug_assert!(
-                                        !entry.shares_resident_store(),
-                                        "prewarmed partition {follower_id} holds memory of a resident store"
-                                    );
-                                    Ok(entry)
-                                })
-                                .await
-                                .map(|_| ())
-                        });
-                    }
-                    let mut first_error = None;
-                    while let Some(result) = follower_loads.next().await {
-                        if let Err(error) = result
-                            && first_error.is_none()
-                        {
-                            first_error = Some(error);
-                        }
-                    }
-                    if let Some(error) = first_error {
-                        return Err(error);
-                    }
-                    let entry = self
-                        .materialize_prewarm_partition(partition_id, leader_batches)
-                        .await?;
-                    debug_assert!(
-                        !entry.shares_resident_store(),
-                        "prewarmed partition {partition_id} holds memory of a resident store"
-                    );
-                    Ok(entry)
-                })
-                .await?;
-            partition_id = if was_cached {
-                // A query or another prewarm owned this key. It may not have
-                // populated the remainder of our planned window, so resume at
-                // the next partition instead of skipping the full run.
-                partition_id + 1
-            } else {
-                run_end
-            };
-        }
-        Ok(())
+        let cache = PrewarmEntryCache {
+            index: self,
+            index_cache: self.index_cache.with_load_origin(CacheLoadOrigin::Warm),
+        };
+        let files = PrewarmFiles {
+            index_reader: &self.reader,
+            read_projection: self.read_projection.as_ref(),
+            index_ivf: &self.ivf,
+            storage_reader: self.storage.reader(),
+            storage_ivf: self.storage.ivf(),
+        };
+        prewarm_partition_window(&cache, files, partitions).await
     }
 
     /// [`Self::prewarm_partition_window`] of an index that caches its
@@ -2469,13 +2614,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// holds nothing to warm, and the index loaded the resident store when
     /// it opened.
     async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
+        let raw_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
         let projection = self.storage.partition_codes_projection()?;
         let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
-            let cached = |partition| async move {
-                let key = PartitionCodesKey { partition };
-                self.index_cache.get_with_key(&key).await.is_some()
+            let cached = |partition| {
+                let raw_cache = &raw_cache;
+                async move {
+                    let key = PartitionCodesKey { partition };
+                    raw_cache.get_with_key(&key).await.is_some()
+                }
             };
             if cached(partition_id).await {
                 partition_id += 1;
@@ -2508,7 +2657,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     !shares_resident_store(&codes.0),
                     "prewarmed codes of partition {partition} hold memory of a resident store"
                 );
-                self.index_cache
+                raw_cache
                     .get_or_insert_with_key(
                         PartitionCodesKey { partition },
                         || async move { Ok(codes) },
@@ -2524,11 +2673,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
     /// parallelism.
     async fn prewarm_partitions(&self) -> Result<()> {
-        let cpu_parallelism = get_num_compute_intensive_cpus();
-        let target_bytes = prewarm_window_size_bytes()?;
-        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
-        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
-        let windows = plan_partition_windows(
+        prewarm_partitions(
+            &|partitions| self.prewarm_partition_window(partitions).boxed(),
+            &self.uuid,
+            self.io_parallelism,
             PrewarmFileLayout {
                 ivf: &self.ivf,
                 encoded_bytes: self.reader.metadata().num_data_bytes,
@@ -2539,34 +2687,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 encoded_bytes: self.storage.reader().metadata().num_data_bytes,
                 num_rows: self.storage.reader().num_rows(),
             },
-            target_bytes,
-            max_partitions,
-        )?;
-        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
-        info!(
-            uuid = %self.uuid,
-            windows = windows.len(),
-            planned_bytes,
-            window_bytes = target_bytes,
-            parallelism,
-            io_parallelism = self.io_parallelism,
-            "prewarming IVF partitions in byte windows"
-        );
-        let started = std::time::Instant::now();
-        stream::iter(windows)
-            .map(Ok)
-            .try_for_each_concurrent(Some(parallelism), |window| async move {
-                self.prewarm_partition_window(window.partitions).await
-            })
-            .await?;
-        let elapsed = started.elapsed();
-        info!(
-            uuid = %self.uuid,
-            elapsed_ms = elapsed.as_millis() as u64,
-            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
-            "prewarmed IVF partitions"
-        );
-        Ok(())
+        )
+        .await
     }
 
     pub async fn load_partition_storage(
@@ -2631,7 +2753,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             self.uuid
         );
         if self.uses_rabit_plane_cache() {
-            self.storage.prewarm_planes(&self.index_cache).await?;
+            let index_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
+            self.storage.prewarm_planes(&index_cache).await?;
         } else {
             self.prewarm_partitions().await?;
         }
@@ -2649,13 +2772,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
-            (sub_index_type, quantization_type) => {
-                unimplemented!(
-                    "unsupported index type: {}, {}",
-                    sub_index_type,
-                    quantization_type
-                )
-            }
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
         }
     }
 
@@ -2842,6 +2959,168 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(batch)
     }
 
+    async fn prepare_partition_rows(
+        &self,
+        partition_id: usize,
+        queries: &[Query],
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionRows> {
+        let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+        let part_entry = self.load_query_partition(partition_id, metrics).await?;
+        {
+            let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+            pre_filter.wait_for_ready().await?;
+        }
+        let pre_filter =
+            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
+                .await?;
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let queries = queries
+            .iter()
+            .map(|query| {
+                let prepared = Self::preprocess_partition_query(
+                    self.use_query_residual,
+                    self.use_residual_scratch,
+                    partition_id,
+                    partition_centroid.as_ref(),
+                    query,
+                )?;
+                Ok((prepared, query.key.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PreparedPartitionRows {
+            size_bytes: part_entry.size_bytes(),
+            handle: Box::new(PartitionRowsScan::<S, Q> {
+                partition_id,
+                part_entry,
+                pre_filter,
+                partition_centroid,
+                queries,
+                _in_flight: self.prepared_partitions.track(),
+            }),
+        })
+    }
+
+    fn score_prepared_partition_rows(
+        &self,
+        prepared: PreparedPartitionRows,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PartitionRowDistances> {
+        let PartitionRowsScan {
+            partition_id,
+            part_entry,
+            pre_filter,
+            partition_centroid,
+            queries,
+            _in_flight,
+        } = *prepared
+            .handle
+            .downcast::<PartitionRowsScan<S, Q>>()
+            .map_err(|_| Error::internal("failed to downcast prepared partition rows"))?;
+        if queries.is_empty() || pre_filter.selects_nothing() {
+            return Ok(PartitionRowDistances {
+                row_ids: Arc::from([]),
+                distances: vec![Vec::new(); queries.len()],
+            });
+        }
+        let _search_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        let storage = &part_entry.storage;
+        let mask = (!pre_filter.is_empty()).then(|| pre_filter.mask());
+        let rows = PartitionRows::new(storage.row_ids(), mask.as_deref());
+        metrics.record_comparisons(rows.num_vectors() * queries.len());
+        let rotated_partition_centroid =
+            rotated_partition_centroid_slice(self.rq_search_cache.as_deref(), partition_id);
+        let distances = self.scratch_pool.with_scratch(|scratch| {
+            queries
+                .into_iter()
+                .map(|(query, original_key)| {
+                    let raw_query_context = self.prepare_rq_raw_query_context(&original_key)?;
+                    let residual = Self::query_context_for_scratch(
+                        self.use_query_residual,
+                        self.use_residual_scratch,
+                        partition_id,
+                        partition_centroid.as_ref(),
+                        rotated_partition_centroid,
+                        raw_query_context.as_deref(),
+                    )?;
+                    let dist_calc = storage.dist_calculator_with_scratch(
+                        query.key,
+                        query.dist_q_c,
+                        residual,
+                        &mut scratch.query_f32,
+                        DistanceCalculatorOptions {
+                            approx_mode: query.approx_mode,
+                        },
+                    );
+                    // Score as a FLAT sub-index search does: every row in one
+                    // batch when nothing is filtered, else row by row.
+                    Ok(if mask.is_some() {
+                        rows.min_per_row(|offset| dist_calc.distance(offset))
+                    } else {
+                        dist_calc.distance_all_with_scratch(
+                            storage.len(),
+                            &mut scratch.distances,
+                            &mut scratch.u16,
+                            &mut scratch.u8,
+                            &mut scratch.u32,
+                        );
+                        rows.min_per_row(|offset| scratch.distances[offset as usize])
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        Ok(PartitionRowDistances {
+            row_ids: rows.row_ids,
+            distances,
+        })
+    }
+
+    async fn search_in_partition_with_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        let Some(index) = (self as &dyn Any).downcast_ref::<RabitIndex>() else {
+            return Err(Error::not_supported(format!(
+                "candidate-producing search is not supported for IVF_{}_{}",
+                S::name(),
+                Q::quantization_type()
+            )));
+        };
+        index
+            .search_rabit_partition_with_candidates(
+                partition_id,
+                query,
+                pre_filter,
+                metrics,
+                candidate_limit,
+            )
+            .await
+    }
+
+    async fn score_partition_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        offsets_in_partition: &[u32],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let Some(index) = (self as &dyn Any).downcast_ref::<RabitIndex>() else {
+            return Err(Error::not_supported(format!(
+                "selected-candidate scoring is not supported for IVF_{}_{}",
+                S::name(),
+                Q::quantization_type()
+            )));
+        };
+        index
+            .score_rabit_partition_candidates(partition_id, query, offsets_in_partition, metrics)
+            .await
+    }
+
     async fn prepare_partition_search(
         &self,
         partition_id: usize,
@@ -2851,8 +3130,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     ) -> Result<PreparedPartitionSearchHandle> {
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
         Ok(Box::new(
-            self.prepare_partition(partition_id, query, pre_filter, metrics, raw_query_context)
-                .await?,
+            self.prepare_partition(
+                partition_id,
+                Arc::new(query.clone()),
+                query.dist_q_c,
+                pre_filter,
+                metrics,
+                raw_query_context,
+                true,
+            )
+            .await?,
         ))
     }
 
@@ -2864,15 +3151,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepared = prepared
             .downcast::<PreparedPartitionSearch<S, Q>>()
             .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
-        self.scratch_pool.with_scratch(|scratch| {
-            Self::run_prepared_partition_search(
-                self.use_query_residual,
-                self.use_residual_scratch,
-                *prepared,
-                metrics,
-                scratch,
-            )
-        })
+        self.scratch_pool
+            .with_scratch(|scratch| prepared.search(metrics, scratch))
     }
 
     fn supports_prepared_partition_search(&self) -> bool {
@@ -2899,336 +3179,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         control: Option<Arc<dyn PartitionSearchControl>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
-        if partitions.len() != q_c_dists.len() {
-            return Err(Error::invalid_input(format!(
-                "partition count {} does not match centroid distance count {}",
-                partitions.len(),
-                q_c_dists.len()
-            )));
-        }
-        if start_idx > end_idx || end_idx > partitions.len() {
-            return Err(Error::invalid_input(format!(
-                "invalid partition search range [{start_idx}, {end_idx}) for {} partitions",
-                partitions.len()
-            )));
-        }
-
-        let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
-        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
-
-        if control.is_none() && S::supports_global_topk_heap() {
-            if let Some(strategy) = &self.rabit_scan {
-                let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
-                if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
-                    let context = Arc::new(RabitScanContext::new(
-                        index,
-                        raw_query_context.clone(),
-                        query.clone(),
-                        partitions.clone(),
-                        q_c_dists.clone(),
-                        start_idx..end_idx,
-                        pre_filter.clone(),
-                        metrics.clone(),
-                    ));
-                    if let Some(batch) = strategy.search(context).await? {
-                        return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                            VECTOR_RESULT_SCHEMA.clone(),
-                            stream::once(async move { Ok(batch) }),
-                        )));
-                    }
-                }
-            }
-            let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
-            {
-                let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
-                pre_filter.wait_for_ready().await?;
-            }
-            let prepare_index = self.clone();
-            let prepare_metrics = metrics.clone();
-            let prepare_raw_query_context = raw_query_context.clone();
-            // Stream prepared partitions through scoring in chunks rather than
-            // collecting all of them first. A prepared partition pins its whole
-            // quantized storage, so collecting `nprobes` of them before scoring
-            // makes peak memory scale with `nprobes` (a 4096-probe query over a
-            // large RQ index pinned hundreds of GiB per index segment). Chunking
-            // bounds resident partitions to the prepare window plus two chunks:
-            // one being assembled by `next_scoring_chunk` while another is scored.
-            // `buffered` preserves the probe order, so the heap accumulates
-            // partitions in the same order as before (which decides which of
-            // several rows tied at the k-th distance the capped heap keeps).
-            let mut prepared = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
-                    let index = prepare_index.clone();
-                    let pre_filter = pre_filter.clone();
-                    let metrics = prepare_metrics.clone();
-                    let raw_query_context = prepare_raw_query_context.clone();
-                    async move {
-                        index
-                            .prepare_partition_without_prefilter_wait(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                                raw_query_context,
-                            )
-                            .await
-                    }
-                })
-                .buffered(prepare_parallelism)
-                .fuse();
-            let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
-
-            let use_query_residual = self.use_query_residual;
-            let use_residual_scratch = self.use_residual_scratch;
-            let mut heap = BinaryHeap::with_capacity(heap_capacity);
-            // Score each chunk on the CPU pool while the next chunk prepares (the
-            // same overlap `search_partitions_batch` uses): `spawn_cpu` starts the
-            // scoring immediately and the async task, never a CPU-pool thread, does
-            // the waiting (#7642). The heap is threaded through each dispatch so
-            // scoring stays sequential, and a scored chunk is dropped before the
-            // next one is scored.
-            let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
-            while let Some(chunk) = pending {
-                let chunk = chunk?;
-                let search_metrics = metrics.clone();
-                let scratch_pool = self.scratch_pool.clone();
-                let queued = Instant::now();
-                let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
-                    search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                    scratch_pool.with_scratch(|scratch| -> Result<()> {
-                        for prepared in chunk {
-                            Self::accumulate_prepared_partition_search(
-                                use_query_residual,
-                                use_residual_scratch,
-                                prepared,
-                                &mut heap,
-                                scratch,
-                                search_metrics.as_ref(),
-                            )?;
-                        }
-                        Ok(())
-                    })?;
-                    Ok(heap)
-                });
-                let (scored, next) =
-                    futures::join!(score, Self::next_scoring_chunk(&mut prepared, chunk_bytes));
-                heap = scored?;
-                pending = next;
-            }
-
-            // Turning the heap into the result batch is a sort of `k * refine_factor`
-            // entries. Below a few thousand that is well under the ~100µs where a
-            // `spawn_cpu` dispatch pays for itself, so do it inline and keep the
-            // common small-k query at one dispatch (as before the chunked scoring).
-            let batch = if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
-                Self::global_heap_to_batch(heap, metrics.as_ref())?
-            } else {
-                let result_metrics = metrics.clone();
-                let queued = Instant::now();
-                spawn_cpu(move || {
-                    result_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                    Self::global_heap_to_batch(heap, result_metrics.as_ref())
-                })
-                .await?
-            };
-
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                VECTOR_RESULT_SCHEMA.clone(),
-                stream::once(async move { Ok(batch) }),
-            )));
-        }
-
-        // The prepared channel holds a full search batch so that partitions prepared
-        // while the previous batch is being searched are ready for the next greedy
-        // drain, instead of serializing producer and consumer through a single slot.
-        let (prepared_tx, mut prepared_rx) =
-            mpsc::channel::<Result<PreparedPartitionSearch<S, Q>>>(*STREAMING_SEARCH_BATCH_SIZE);
-        let (batch_tx, batch_rx) = mpsc::channel::<DataFusionResult<RecordBatch>>(1);
-
-        let prepare_index = self.clone();
-        let prepare_metrics = metrics.clone();
-        let prepare_raw_query_context = raw_query_context.clone();
-        tokio::spawn(async move {
-            let prepare_stream = stream::iter(start_idx..end_idx)
-                .map(move |idx| {
-                    let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
-                    let index = prepare_index.clone();
-                    let pre_filter = pre_filter.clone();
-                    let metrics = prepare_metrics.clone();
-                    let raw_query_context = prepare_raw_query_context.clone();
-                    async move {
-                        index
-                            .prepare_partition(
-                                part_id as usize,
-                                &query,
-                                pre_filter,
-                                metrics.as_ref(),
-                                raw_query_context,
-                            )
-                            .await
-                    }
-                })
-                .buffered(prepare_parallelism);
-
-            futures::pin_mut!(prepare_stream);
-            while let Some(prepared) = prepare_stream.next().await {
-                let has_error = prepared.is_err();
-                if prepared_tx.send(prepared).await.is_err() || has_error {
-                    break;
-                }
-            }
+        let native_rabit_scan = self.rabit_scan.clone().map(|strategy| NativeRabitScan {
+            index: self.clone(),
+            strategy,
         });
-
-        let use_query_residual = self.use_query_residual;
-        let use_residual_scratch = self.use_residual_scratch;
-        let search_metrics = metrics.clone();
-        let search_control = control.clone();
-        let scratch_pool = self.scratch_pool.clone();
-        // Search prepared partitions in batches. Each batch is searched in a single
-        // `spawn_cpu` dispatch (amortizing the per-dispatch overhead the single-worker
-        // design in #6475 avoided), but the channel `recv`/`send` stay in async code so
-        // no CPU-pool thread ever parks on a channel — parking one can deadlock the pool
-        // on small hosts (#7642). `should_stop` is checked per partition, so early-stop
-        // granularity is unchanged.
-        //
-        // Batches are formed greedily: wait for one prepared partition, then drain
-        // whatever else is already prepared, up to the batch size. Waiting for a full
-        // batch instead would delay the first search (and the early-stop feedback it
-        // produces) behind up to a whole batch of prepare I/O, which is significant
-        // when prepare parallelism is low.
-        tokio::spawn(async move {
-            loop {
-                // Stop pulling as soon as the search is done — or the receiver of our
-                // results is gone — so the producer stops preparing partitions we
-                // would never search.
-                if search_control
-                    .as_ref()
-                    .is_some_and(|control| control.should_stop())
-                    || batch_tx.is_closed()
-                {
-                    return;
-                }
-
-                let mut prepared_batch = Vec::with_capacity(*STREAMING_SEARCH_BATCH_SIZE);
-                let mut prepare_error = None;
-                let mut producer_done = false;
-                match prepared_rx.recv().await {
-                    Some(Ok(prepared)) => prepared_batch.push(prepared),
-                    Some(Err(err)) => prepare_error = Some(DataFusionError::from(err)),
-                    None => producer_done = true,
-                }
-                while prepare_error.is_none()
-                    && !producer_done
-                    && prepared_batch.len() < *STREAMING_SEARCH_BATCH_SIZE
-                {
-                    match prepared_rx.try_recv() {
-                        Ok(Ok(prepared)) => prepared_batch.push(prepared),
-                        Ok(Err(err)) => {
-                            prepare_error = Some(DataFusionError::from(err));
-                        }
-                        // Nothing else is prepared yet; search what we have rather
-                        // than waiting for more.
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            producer_done = true;
-                        }
-                    }
-                }
-
-                if !prepared_batch.is_empty() {
-                    let scratch_pool = scratch_pool.clone();
-                    let search_metrics = search_metrics.clone();
-                    let search_control = search_control.clone();
-                    // `is_closed` is synchronously callable, so a sender clone lets the
-                    // CPU loop notice a dropped receiver between partitions instead of
-                    // searching out the whole batch for a cancelled query. (A `select!`
-                    // on `closed()` would not help here: `spawn_cpu` closures are not
-                    // cancellable, so abandoning the await leaves the work running.)
-                    let cancel_probe = batch_tx.clone();
-                    let queued = Instant::now();
-                    let search_output = spawn_cpu(move || {
-                        search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                        let mut outputs: Vec<DataFusionResult<RecordBatch>> =
-                            Vec::with_capacity(prepared_batch.len());
-                        // `stopped` means the whole search should end (an error, an
-                        // early-stop signal, or cancellation), not just this batch.
-                        let mut stopped = false;
-                        scratch_pool.with_scratch(|scratch| {
-                            for prepared in prepared_batch {
-                                if search_control
-                                    .as_ref()
-                                    .is_some_and(|control| control.should_stop())
-                                    || cancel_probe.is_closed()
-                                {
-                                    stopped = true;
-                                    break;
-                                }
-                                match Self::run_prepared_partition_search(
-                                    use_query_residual,
-                                    use_residual_scratch,
-                                    prepared,
-                                    search_metrics.as_ref(),
-                                    scratch,
-                                )
-                                .map_err(DataFusionError::from)
-                                {
-                                    Ok(batch) => {
-                                        if let Some(control) = search_control.as_ref() {
-                                            control.record_batch(&batch);
-                                        }
-                                        outputs.push(Ok(batch));
-                                    }
-                                    Err(err) => {
-                                        outputs.push(Err(err));
-                                        stopped = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        Ok::<_, DataFusionError>((outputs, stopped))
-                    })
-                    .await;
-
-                    let (outputs, stopped) = match search_output {
-                        Ok(output) => output,
-                        // Defensive: the closure always returns Ok (search errors are
-                        // captured per partition in `outputs`), so this arm should be
-                        // unreachable. Forward and stop rather than drop silently.
-                        Err(err) => {
-                            let _ = batch_tx.send(Err(err)).await;
-                            return;
-                        }
-                    };
-                    for output in outputs {
-                        if batch_tx.send(output).await.is_err() {
-                            return;
-                        }
-                    }
-                    if stopped {
-                        return;
-                    }
-                }
-
-                if let Some(err) = prepare_error {
-                    let _ = batch_tx.send(Err(err)).await;
-                    return;
-                }
-                if producer_done {
-                    return;
-                }
-            }
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            VECTOR_RESULT_SCHEMA.clone(),
-            ReceiverStream::new(batch_rx),
-        )))
+        partition_search::search_partitions(
+            self,
+            S::supports_global_topk_heap(),
+            native_rabit_scan,
+            PartitionSearchRequest {
+                query,
+                partitions,
+                q_c_dists,
+                start_idx,
+                end_idx,
+                pre_filter,
+                control,
+                metrics,
+            },
+        )
+        .await
     }
 
     fn supports_batch_partition_search(&self) -> bool {
@@ -3248,182 +3218,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 "batch partition search requires a global top-k heap sub-index",
             ));
         }
-        let query_count = partitions_per_query.len();
-        if q_c_dists_per_query.len() != query_count {
-            return Err(Error::invalid_input(format!(
-                "batch partition search: {query_count} query partition lists but {} distance lists",
-                q_c_dists_per_query.len()
-            )));
-        }
-        if query_count == 0 {
-            return Ok(Vec::new());
-        }
-        if !query.key.len().is_multiple_of(query_count) {
-            return Err(Error::invalid_input(format!(
-                "batch partition search: query key length {} is not divisible by query count {query_count}",
-                query.key.len()
-            )));
-        }
-        let dim = query.key.len() / query_count;
-
-        // Per-query immutable search state: the query vector slice and the
-        // optional Rabit raw-query context both depend only on the query vector,
-        // so compute them once up front rather than per probed partition.
-        let mut base_queries = Vec::with_capacity(query_count);
-        let mut raw_query_contexts = Vec::with_capacity(query_count);
-        for query_index in 0..query_count {
-            if partitions_per_query[query_index].len() != q_c_dists_per_query[query_index].len() {
-                return Err(Error::invalid_input(format!(
-                    "batch partition search: query {query_index} has {} partitions but {} distances",
-                    partitions_per_query[query_index].len(),
-                    q_c_dists_per_query[query_index].len()
-                )));
-            }
-            let mut single_query = query.clone();
-            single_query.key = query.key.slice(query_index * dim, dim);
-            raw_query_contexts.push(self.prepare_rq_raw_query_context(&single_query.key)?);
-            base_queries.push(single_query);
-        }
-        // Shared across every chunk's scoring dispatch below, so wrap once in an
-        // `Arc` instead of cloning the whole `Vec` per chunk.
-        let base_queries = Arc::new(base_queries);
-        let raw_query_contexts = Arc::new(raw_query_contexts);
-
-        // Invert the per-query partition lists so each distinct partition is
-        // loaded once and scored against every query that probes it.
-        let mut assignments: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
-        for (query_index, (parts, dists)) in partitions_per_query
-            .iter()
-            .zip(q_c_dists_per_query.iter())
-            .enumerate()
-        {
-            for (part_id, dist_q_c) in parts.values().iter().zip(dists.values().iter()) {
-                assignments
-                    .entry(*part_id)
-                    .or_default()
-                    .push((query_index, *dist_q_c));
-            }
-        }
-
-        {
-            let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
-            pre_filter.wait_for_ready().await?;
-        }
-
-        // Score partitions in a deterministic order. `assignments` is a HashMap,
-        // so its iteration order (and hence the order partitions accumulate into
-        // each per-query heap) is otherwise arbitrary. When several rows tie at
-        // the k-th distance, which one the capped heap keeps depends on insertion
-        // order, so a stable partition order is what makes the selected top-k
-        // deterministic across runs. (Any of the tied rows is an equally valid
-        // k-th neighbor, so this does not affect recall.)
-        let mut assignment_list: Vec<(u32, Vec<(usize, f32)>)> = assignments.into_iter().collect();
-        assignment_list.sort_by_key(|(part_id, _)| *part_id);
-
-        // Load each distinct partition's storage exactly once (the shared I/O
-        // that batch search exists to save), but *stream* the loaded partitions
-        // through scoring in chunks rather than materializing them all. A wide
-        // batch probes up to `min(query_count * nprobes, num_partitions)` distinct
-        // partitions, so collecting every loaded partition before scoring would
-        // make peak memory scale with the batch width — up to the whole index.
-        // Streaming bounds resident partition storage to the load window plus one
-        // chunk. `buffered` preserves the sorted load order above, so scoring order
-        // (and thus the k-th-distance tie-break) stays deterministic.
-        let load_parallelism = get_num_compute_intensive_cpus().max(1);
-        let load_index = self.clone();
-        let load_metrics = metrics.clone();
-        let load_pre_filter = pre_filter;
-        let mut loaded_chunks = stream::iter(assignment_list)
-            .map(move |(part_id, probing_queries)| {
-                let index = load_index.clone();
-                let metrics = load_metrics.clone();
-                let pre_filter = load_pre_filter.clone();
-                async move {
-                    let part_id = part_id as usize;
-                    let part_entry = index
-                        .load_query_partition(part_id, metrics.as_ref())
-                        .await?;
-                    let pre_filter = Self::prefilter_for_partition(
-                        &index.index_cache,
-                        part_id,
-                        &part_entry,
-                        pre_filter,
-                    )
-                    .await?;
-                    Result::Ok((part_id, part_entry, probing_queries, pre_filter))
-                }
-            })
-            .buffered(load_parallelism)
-            .chunks(*STREAMING_SEARCH_BATCH_SIZE);
-
-        let use_query_residual = self.use_query_residual;
-        let use_residual_scratch = self.use_residual_scratch;
-        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
-            .map(|_| BinaryHeap::with_capacity(heap_capacity))
-            .collect();
-
-        // Score each chunk on the CPU pool while the next chunk loads. `spawn_cpu`
-        // dispatches the scoring immediately and only touches CPU-bound state, so
-        // `join!`-ing it with the next `loaded_chunks` pull keeps partition I/O in
-        // flight during scoring: the async task, never a CPU-pool thread, does the
-        // waiting (#7642), and the load stream is not paused (the pairing `spawn_cpu`'s
-        // docs recommend with `buffered`). Scoring stays sequential across chunks —
-        // each mutates the same per-query heaps — so a step costs about
-        // max(load, score) rather than their sum, and a scored chunk's storage is
-        // dropped before the next is scored, keeping peak memory bounded.
-        let mut pending = loaded_chunks.next().await;
-        while let Some(chunk) = pending {
-            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
-            let index = self.clone();
-            let base_queries = base_queries.clone();
-            let raw_query_contexts = raw_query_contexts.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let search_metrics = metrics.clone();
-            let queued = Instant::now();
-            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
-                search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                scratch_pool.with_scratch(|scratch| -> Result<()> {
-                    for (part_id, part_entry, probing_queries, pre_filter) in &chunk {
-                        let partition_centroid = index.ivf.centroid(*part_id);
-                        for (query_index, dist_q_c) in probing_queries {
-                            let mut single_query = base_queries[*query_index].clone();
-                            single_query.dist_q_c = *dist_q_c;
-                            let prepared = PreparedPartitionSearch::<S, Q> {
-                                query: single_query,
-                                pre_filter: pre_filter.clone(),
-                                partition_id: *part_id,
-                                partition_centroid: partition_centroid.clone(),
-                                rq_search_cache: index.rq_search_cache.clone(),
-                                raw_query_context: raw_query_contexts[*query_index].clone(),
-                                part_entry: part_entry.clone(),
-                                _in_flight: index.prepared_partitions.track(),
-                                _marker: PhantomData,
-                            };
-                            Self::accumulate_prepared_partition_search(
-                                use_query_residual,
-                                use_residual_scratch,
-                                prepared,
-                                &mut heaps[*query_index],
-                                scratch,
-                                search_metrics.as_ref(),
-                            )?;
-                        }
-                    }
-                    Ok(())
-                })?;
-                Ok(heaps)
-            });
-            // Load the next chunk while this one is scored on the CPU pool.
-            let (scored, next) = futures::join!(score, loaded_chunks.next());
-            heaps = scored?;
-            pending = next;
-        }
-
-        heaps
-            .into_iter()
-            .map(|heap| Self::global_heap_to_batch(heap, metrics.as_ref()))
-            .collect::<Result<Vec<_>>>()
+        partition_search::search_partitions_batch(
+            self,
+            query,
+            partitions_per_query,
+            q_c_dists_per_query,
+            pre_filter,
+            metrics,
+        )
+        .await
     }
 
     fn is_loadable(&self) -> bool {
@@ -3473,6 +3276,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .collect::<Vec<_>>();
         let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches));
         Ok(Box::pin(stream))
+    }
+
+    async fn partition_storage_batches(&self, partition_id: usize) -> Result<Vec<RecordBatch>> {
+        let storage = self.load_partition_storage(partition_id, None).await?;
+        Ok(storage.to_batches()?.collect())
     }
 
     fn supports_pairwise_vectors(&self) -> bool {
@@ -3562,6 +3370,371 @@ pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
 
+/// Candidate search exists only for IVF_RQ with a flat sub-index, so it is
+/// compiled for that type alone instead of for every `S × Q` pair.
+impl RabitIndex {
+    async fn search_rabit_partition_with_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        let partition_id_u32 = u32::try_from(partition_id).map_err(|_| {
+            Error::invalid_input(format!(
+                "partition id {partition_id} exceeds the candidate identity limit"
+            ))
+        })?;
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        pre_filter.wait_for_ready().await?;
+
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let rq_search_cache = self.rq_search_cache.clone();
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
+        let query = Self::preprocess_partition_query(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
+        )?;
+        let scratch_pool = self.scratch_pool.clone();
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let (result, local_metrics) = spawn_cpu(move || {
+            let param = (&query).into();
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<FlatIndex, RabitQuantizer>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let rotated_partition_centroid =
+                rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+            let residual = Self::query_context_for_scratch(
+                use_query_residual,
+                use_residual_scratch,
+                partition_id,
+                partition_centroid.as_ref(),
+                rotated_partition_centroid,
+                raw_query_context.as_deref(),
+            )?;
+            let result = scratch_pool.with_scratch(|scratch| {
+                part.index.search_with_candidates_with_scratch(
+                    query.key,
+                    candidate_limit,
+                    param,
+                    &part.storage,
+                    pre_filter,
+                    &local_metrics,
+                    partition_id_u32,
+                    residual,
+                    scratch,
+                )
+            })?;
+            Result::Ok((result, local_metrics))
+        })
+        .await?;
+
+        local_metrics.dump_into(metrics);
+        Ok(result)
+    }
+
+    async fn score_rabit_partition_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        offsets_in_partition: &[u32],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let mut query = query.clone();
+        query.dist_q_c = self.query_centroid_distance(partition_id, &query)?;
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let rq_search_cache = self.rq_search_cache.clone();
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
+        let query = Self::preprocess_partition_query_owned(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
+        )?;
+        let offsets_in_partition = offsets_in_partition.to_vec();
+        let scratch_pool = self.scratch_pool.clone();
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let (batch, local_metrics) = spawn_cpu(move || {
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<FlatIndex, RabitQuantizer>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let partition_len = part.storage.len();
+            for &offset in &offsets_in_partition {
+                if offset as usize >= partition_len {
+                    return Err(Error::index(format!(
+                        "partition offset {offset} is out of range for partition {partition_id} with {partition_len} rows"
+                    )));
+                }
+            }
+
+            let rotated_partition_centroid =
+                rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+            let residual = Self::query_context_for_scratch(
+                use_query_residual,
+                use_residual_scratch,
+                partition_id,
+                partition_centroid.as_ref(),
+                rotated_partition_centroid,
+                raw_query_context.as_deref(),
+            )?;
+            let batch = scratch_pool.with_scratch(|scratch| {
+                let dist_calc = part.storage.dist_calculator_with_scratch(
+                    query.key,
+                    query.dist_q_c,
+                    residual,
+                    &mut scratch.query_f32,
+                    DistanceCalculatorOptions {
+                        approx_mode: ApproxMode::Accurate,
+                    },
+                );
+                let mut row_ids = Vec::with_capacity(offsets_in_partition.len());
+                let mut distances = Vec::with_capacity(offsets_in_partition.len());
+                for &offset in &offsets_in_partition {
+                    row_ids.push(part.storage.row_id(offset));
+                    distances.push(dist_calc.distance(offset));
+                }
+                Result::Ok(RecordBatch::try_new(
+                    VECTOR_RESULT_SCHEMA.clone(),
+                    vec![
+                        Arc::new(Float32Array::from(distances)),
+                        Arc::new(UInt64Array::from(row_ids)),
+                    ],
+                )?)
+            })?;
+            local_metrics.record_comparisons(offsets_in_partition.len());
+            Result::Ok((batch, local_metrics))
+        })
+        .await?;
+
+        local_metrics.dump_into(metrics);
+        Ok(batch)
+    }
+}
+
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PreparedPartitionSearch<S, Q> {
+    /// Runs `score` with this partition's residualized query key, candidate
+    /// count and query params, or returns `None` when the prefilter selects
+    /// nothing.
+    fn score<R>(
+        self,
+        metrics: &dyn MetricsCollector,
+        score: impl FnOnce(
+            &PartitionEntry<S, Q>,
+            ArrayRef,
+            usize,
+            S::QueryParams,
+            Arc<dyn PreFilter>,
+            Option<QueryResidual<'_>>,
+        ) -> Result<R>,
+    ) -> Result<Option<R>> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        if self.pre_filter.selects_nothing() {
+            return Ok(None);
+        }
+        let rotated_partition_centroid =
+            rotated_partition_centroid_slice(self.rq_search_cache.as_deref(), self.partition_id);
+        let residual = IVFIndex::<S, Q>::query_context_for_scratch(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            self.partition_id,
+            self.partition_centroid.as_ref(),
+            rotated_partition_centroid,
+            self.raw_query_context.as_deref(),
+        )?;
+        let query_key = IVFIndex::<S, Q>::preprocess_partition_query_key(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            self.partition_id,
+            self.partition_centroid.as_ref(),
+            self.query.key.clone(),
+        )?;
+        let param = S::query_params(self.query.as_ref(), &query_key, self.dist_q_c);
+        let k = self.query.k * self.query.refine_factor.unwrap_or(1) as usize;
+        score(
+            &self.part_entry,
+            query_key,
+            k,
+            param,
+            self.pre_filter.clone(),
+            residual,
+        )
+        .map(Some)
+    }
+
+    /// Unboxed [`PreparedPartition::accumulate_topk`], for callers that
+    /// score many partitions per query and would otherwise box each one.
+    fn accumulate_into(
+        self,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        scratch: &mut QueryScratch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        self.score(metrics, |entry, key, k, param, pre_filter, residual| {
+            entry.index.accumulate_topk_with_scratch(
+                key,
+                k,
+                param,
+                &entry.storage,
+                pre_filter,
+                heap,
+                residual,
+                scratch,
+                metrics,
+            )
+        })?;
+        Ok(())
+    }
+}
+
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PreparedPartition
+    for PreparedPartitionSearch<S, Q>
+{
+    fn size_bytes(&self) -> usize {
+        self.part_entry.size_bytes()
+    }
+
+    fn search(
+        self: Box<Self>,
+        metrics: &dyn MetricsCollector,
+        scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
+        let batch = self.score(metrics, |entry, key, k, param, pre_filter, residual| {
+            entry.index.search_with_scratch(
+                key,
+                k,
+                param,
+                &entry.storage,
+                pre_filter,
+                metrics,
+                residual,
+                scratch,
+            )
+        })?;
+        Ok(batch.unwrap_or_else(|| RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone())))
+    }
+
+    fn accumulate_topk(
+        self: Box<Self>,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        scratch: &mut QueryScratch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        (*self).accumulate_into(heap, scratch, metrics)
+    }
+}
+
+/// A partition loaded once and scored against every query of a batch.
+struct LoadedBatchPartition<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
+    index: Arc<IVFIndex<S, Q>>,
+    partition_id: usize,
+    part_entry: Arc<PartitionEntry<S, Q>>,
+    pre_filter: Arc<dyn PreFilter>,
+}
+
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> BatchPartition
+    for LoadedBatchPartition<S, Q>
+{
+    fn accumulate_topk(
+        &self,
+        query: &Arc<Query>,
+        dist_q_c: f32,
+        raw_query_context: Option<&Arc<RabitRawQueryContext>>,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        scratch: &mut QueryScratch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let prepared = self.index.prepared_search(
+            self.partition_id,
+            query.clone(),
+            dist_q_c,
+            self.pre_filter.clone(),
+            raw_query_context.cloned(),
+            self.part_entry.clone(),
+        );
+        prepared.accumulate_into(heap, scratch, metrics)
+    }
+}
+
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearchSource for IVFIndex<S, Q> {
+    fn prepare_scored_partition(
+        self: Arc<Self>,
+        partition_id: usize,
+        query: Arc<Query>,
+        dist_q_c: f32,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        raw_query_context: Option<Arc<RabitRawQueryContext>>,
+        wait_for_prefilter: bool,
+    ) -> BoxFuture<'static, Result<Box<dyn PreparedPartition>>> {
+        async move {
+            let prepared = self
+                .prepare_partition(
+                    partition_id,
+                    query,
+                    dist_q_c,
+                    pre_filter,
+                    metrics.as_ref(),
+                    raw_query_context,
+                    wait_for_prefilter,
+                )
+                .await?;
+            Ok(Box::new(prepared) as Box<dyn PreparedPartition>)
+        }
+        .boxed()
+    }
+
+    fn load_batch_partition(
+        self: Arc<Self>,
+        partition_id: usize,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> BoxFuture<'static, Result<Box<dyn BatchPartition>>> {
+        async move {
+            let part_entry = self
+                .load_query_partition(partition_id, metrics.as_ref())
+                .await?;
+            let pre_filter = Self::prefilter_for_partition(
+                &self.index_cache,
+                partition_id,
+                &part_entry,
+                pre_filter,
+            )
+            .await?;
+            Ok(Box::new(LoadedBatchPartition {
+                index: self,
+                partition_id,
+                part_entry,
+                pre_filter,
+            }) as Box<dyn BatchPartition>)
+        }
+        .boxed()
+    }
+
+    fn raw_query_context(&self, query: &ArrayRef) -> Result<Option<Arc<RabitRawQueryContext>>> {
+        self.prepare_rq_raw_query_context(query)
+    }
+
+    fn scratch_pool(&self) -> Arc<QueryScratchPool> {
+        self.scratch_pool.clone()
+    }
+}
+
 async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     state: &IvfIndexState<Q>,
     object_store: Arc<ObjectStore>,
@@ -3583,6 +3756,20 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let index_file = IndexFileKey::new(&state.uuid, &object_store.store_prefix, aux_path.as_ref());
+    let raw_cache = WeakLanceCache::from(
+        &context
+            .file_cache
+            .as_ref()
+            .unwrap_or(&index_cache)
+            .with_key_prefix(&object_store.store_prefix)
+            .with_key_prefix(aux_path.as_ref()),
+    );
+
+    let row_address_cache = WeakLanceCache::from(
+        &index_cache
+            .with_key_prefix(&object_store.store_prefix)
+            .with_key_prefix(aux_path.as_ref()),
+    );
 
     // Readers carry a scheduler bound to an object store, so they cannot be
     // shared across dataset opens. Reuse only portable file metadata and bind
@@ -3614,7 +3801,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         )
     };
     let storage = match frag_reuse_index {
-        Some(ResolvedRemapping::V0(remapper)) => make_storage(Some(remapper)),
+        Some(ResolvedRemapping::V0 { remapper, .. }) => make_storage(Some(remapper)),
         Some(ResolvedRemapping::V1Translate { remapper, .. }) => {
             make_storage(None).with_row_id_remapping(remapper)
         }
@@ -3629,7 +3816,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.resident_columns,
     )?;
     let io_stats = context.io_stats.clone();
-    let rabit_scan = if storage.supports_rabit_planes() {
+    let rabit_scan = if S::name() != HNSW::name() && storage.supports_rabit_planes() {
         context
             .rabit_scan_factory
             .as_ref()
@@ -3641,6 +3828,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
+        .with_row_address_cache(row_address_cache)
         .with_resident_columns(resident_columns)
         .with_resident_columns_enabled(resident)
         .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?);
@@ -3662,6 +3850,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.sub_index_metadata.clone(),
         state.distance_type,
         index_cache,
+        raw_cache,
         io_parallelism,
         rq_search_cache,
         origin_latency,
@@ -3671,4 +3860,4 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

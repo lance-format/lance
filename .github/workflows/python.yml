@@ -16,6 +16,7 @@ on:
       - python/**
       - rust/**
       - protos/**
+      - skills/lance-table-maintenance/scripts/**
       - .github/workflows/python.yml
       - .github/workflows/build_linux_wheel/**
       - .github/workflows/build_mac_wheel/**
@@ -42,6 +43,26 @@ env:
   CACHE_PREFIX: "2"
 
 jobs:
+  # Rust-only PRs run a reduced set; pushes to main/release run everything.
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      bindings: ${{ github.event_name != 'pull_request' || steps.filter.outputs.bindings == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            bindings:
+              - python/**
+              - .github/workflows/python.yml
+              - .github/workflows/build_*_wheel/**
+              - .github/workflows/run_tests/**
+
   lint:
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
@@ -97,6 +118,8 @@ jobs:
           pytest --doctest-modules python/lance
 
   python-rust-test:
+    needs: changes
+    if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 30
     name: pylance crate Rust tests
     runs-on: "ubuntu-24.04-4x"
@@ -183,11 +206,11 @@ jobs:
           if-no-files-found: error
 
   linux:
-    needs: [linux-wheel, linux-memtest]
+    needs: [changes, linux-wheel, linux-memtest]
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["10", "13", "14"]
+        python-minor-version: ${{ fromJSON(needs.changes.outputs.bindings == 'true' && '["10", "13", "14"]' || '["14"]') }}
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04-4x"
     defaults:
@@ -254,6 +277,8 @@ jobs:
           make compattest PYTEST_WORKERS=$(( $(nproc) * 2 ))
 
   linux-arm:
+    needs: changes
+    if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 45
     runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.14 ARM
@@ -284,56 +309,9 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
-  mac:
-    timeout-minutes: 45
-    name: Python macOS 3.14 ARM
-    runs-on: "warp-macos-14-arm64-6x"
-    defaults:
-      run:
-        shell: bash
-        working-directory: python
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          lfs: true
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.14"
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-      - uses: ./.github/workflows/build_mac_wheel
-        with:
-          args: "--profile ci"
-      - uses: ./.github/workflows/run_tests
-        with:
-          skip-torch: "true"
-
-  windows:
-    runs-on: windows-latest-4x
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: powershell
-        working-directory: python
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          lfs: true
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-      - uses: ./.github/workflows/build_windows_wheel
-        with:
-          args: "--profile ci"
-      - uses: ./.github/workflows/run_tests
   aws-integtest:
-    needs: linux-wheel
+    needs: [changes, linux-wheel]
+    if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
     defaults:

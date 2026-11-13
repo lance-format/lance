@@ -7,21 +7,25 @@ use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    utils::{filter_finite_training_data, maybe_sample_training_data, sample_unseen_training_data},
+    utils::{
+        filter_finite_training_data, infer_vector_dim, maybe_sample_training_data,
+        sample_unseen_training_data,
+    },
 };
 use super::{
     builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
+use crate::dataset::transaction::Operation;
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
     index::{
-        INDEX_FILE_NAME, pb,
         prefilter::PreFilter,
         vector::ivf::io::{write_pq_partition_payload, write_pq_partitions},
     },
@@ -41,7 +45,7 @@ use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::TryFutureExt;
+use futures::{FutureExt, TryFutureExt};
 use futures::{
     Stream, TryStreamExt,
     stream::{self, StreamExt},
@@ -71,6 +75,9 @@ use lance_index::prefilter::NoFilter;
 use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::storage::{
+    RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
+};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
 use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 use lance_index::vector::hnsw::HnswMetadata;
@@ -81,14 +88,15 @@ use lance_index::vector::kmeans::{KMeans, KMeansParams};
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
 };
-use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::quantizer::{QuantizationType, QuantizerMetadata as _};
+use lance_index::vector::storage::{STORAGE_METADATA_KEY, VectorStore};
 use lance_index::vector::v3::shuffler::create_owned_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
-    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
-    MAX_PARTITION_SIZE_FACTOR, MIN_PARTITION_SIZE_PERCENT,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata,
+    IndexType, MAX_PARTITION_SIZE_FACTOR, MIN_PARTITION_SIZE_PERCENT,
     optimize::OptimizeOptions,
+    pb,
     vector::{
         Query, VectorIndex,
         hnsw::{HNSW, HNSWIndex, builder::HnswBuildParams},
@@ -105,7 +113,7 @@ use lance_index::{
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::CachedFileSize;
+use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_io::{
     ReadBatchParams,
     local::to_local_path,
@@ -128,7 +136,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::Range,
     pin::Pin,
@@ -556,6 +564,255 @@ pub(crate) fn validate_vector_query_compatibility(
     }
 
     Ok(())
+}
+
+/// What a search ranks a vector segment by: its metric and its index type.
+/// Merging the distances of segments that differ in either ranks part of the
+/// data by the wrong one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VectorQueryContract {
+    metric: DistanceType,
+    /// `IndexType::Vector` for an index extension, which names no type this
+    /// build knows; it matches only another such segment.
+    index_type: IndexType,
+}
+
+impl VectorQueryContract {
+    /// The contract of an opened segment, from the two accessors every
+    /// vector index implements, legacy ones included.
+    pub(crate) fn of_index(index: &dyn VectorIndex) -> Self {
+        Self {
+            metric: index.metric_type(),
+            index_type: index.index_type(),
+        }
+    }
+
+    /// The contract an index file of the current format records in its
+    /// schema: the type the opener dispatches on, and the metric the opened
+    /// index ranks by.
+    fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
+        let index_type = IndexType::try_from(metadata.index_type.as_str())?;
+        // The opener opens these files only as one of the IVF types.
+        if !index_type.is_vector() || index_type == IndexType::Vector {
+            return Err(Error::index(format!(
+                "Unsupported index type: {}",
+                metadata.index_type
+            )));
+        }
+        Ok(Self {
+            metric: DistanceType::try_from(metadata.distance_type.as_str())?,
+            index_type,
+        })
+    }
+}
+
+impl std::fmt::Display for VectorQueryContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.index_type {
+            // Its `Display` says IVF_PQ.
+            IndexType::Vector => write!(f, "metric {:?}, an index extension's type", self.metric),
+            index_type => write!(f, "metric {:?}, type {index_type}", self.metric),
+        }
+    }
+}
+
+/// Refuses a `CreateIndex` that would leave the segments of one index name
+/// keyed on different columns, or its vector segments under different query
+/// contracts. The index APIs compare the contracts of opened segments with
+/// [`validate_vector_query_compatibility`]; a raw transaction reaches the
+/// commit without them, so each commit attempt compares every segment the new
+/// manifest keeps under each name the transaction adds to, retained ones
+/// included, whatever their details say: a search merges all of them once it
+/// picks the name, and one this build would leave out as too new, a newer
+/// build merges. The caller of a raw transaction sets every field of the
+/// segment metadata, so each contract is read from the segment's own index
+/// file, and a file that cannot be read refuses the commit.
+///
+/// A search opens every segment of the name it picks as a vector segment, so
+/// when some segments of a name have an index file, all of them need one: a
+/// scalar segment on the same column, or a vector segment whose file is gone,
+/// would fail every search. A name none of whose segments has one, such as a
+/// zone map on a vector-typed column, is not a vector index.
+pub(crate) async fn validate_committed_vector_segments(
+    dataset: &Dataset,
+    operation: &Operation,
+    proposed_indices: &[TableIndexMetadata],
+) -> Result<()> {
+    let Operation::CreateIndex { new_indices, .. } = operation else {
+        return Ok(());
+    };
+    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = new_indices
+        .iter()
+        .map(|index| (index.name.as_str(), Vec::new()))
+        .collect();
+    for segment in proposed_indices {
+        if let Some(segments) = segments_by_name.get_mut(segment.name.as_str()) {
+            segments.push(segment);
+        }
+    }
+
+    for (name, segments) in segments_by_name {
+        // A search picks a name by a segment keyed on the queried vector
+        // column, then merges the other segments of that name with it.
+        let keyed_on_a_vector_column = segments.iter().any(|segment| {
+            segment
+                .fields
+                .first()
+                .and_then(|&field_id| dataset.schema().field_by_id(field_id))
+                .is_some_and(|field| infer_vector_dim(&field.data_type()).is_ok())
+        });
+        if segments.len() < 2 || !keyed_on_a_vector_column {
+            continue;
+        }
+        let first = segments[0];
+        if let Some(other) = segments
+            .iter()
+            .find(|segment| segment.keyed_fields() != first.keyed_fields())
+        {
+            let columns = |segment: &TableIndexMetadata| {
+                segment
+                    .keyed_fields()
+                    .iter()
+                    .map(|&field_id| {
+                        dataset
+                            .schema()
+                            .field_path(field_id)
+                            .unwrap_or_else(|_| format!("field {field_id}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segments {} (on {}) and {} (on {}) would both remain in index \
+                 '{name}'; a search reads every segment of an index as keyed on the queried \
+                 column, so all of them must be keyed on the same columns",
+                first.uuid,
+                columns(first),
+                other.uuid,
+                columns(other),
+            )));
+        }
+        // Boxed and collected first: reading a segment is a large future, and
+        // mapping these references inside the stream makes rustc report the
+        // commit future's `Send` as "not general enough".
+        let contracts = segments
+            .into_iter()
+            .map(|segment| {
+                async move {
+                    let contract =
+                        vector_segment_contract(dataset, segment)
+                            .await
+                            .map_err(|error| {
+                                Error::io(format!(
+                                    "CreateIndex: cannot read vector segment {} to check that \
+                                     index '{}' keeps one metric and index type: {error}",
+                                    segment.uuid, segment.name
+                                ))
+                            })?;
+                    Ok::<_, Error>((segment, contract))
+                }
+                .boxed()
+            })
+            .collect::<Vec<_>>();
+        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
+        let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
+        let mut without_index_file = None;
+        while let Some((segment, contract)) = contracts.try_next().await? {
+            match contract {
+                None => {
+                    without_index_file.get_or_insert(segment);
+                }
+                Some(contract) => match &reference {
+                    None => reference = Some((segment, contract)),
+                    Some((first, expected)) if *expected != contract => {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: vector segments {} ({expected}) and {} ({contract}) \
+                             would both remain in index '{name}'; a search ranks every segment \
+                             of an index by one metric and index type, so replace all of its \
+                             segments in one commit",
+                            first.uuid, segment.uuid,
+                        )));
+                    }
+                    Some(_) => {}
+                },
+            }
+            if let (Some((first, expected)), Some(other)) = (&reference, without_index_file) {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: vector segment {} ({expected}) and segment {}, which has no \
+                     vector index file, would both remain in index '{name}'; a search opens \
+                     every segment of an index as a vector segment",
+                    first.uuid, other.uuid,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A vector segment's contract, read from its own index file. A file of the
+/// current format records it in its schema, read the way the opener reads it
+/// before loading any centroid; a file of an older format, or an index
+/// extension's, is opened on the identity plan, since a staged segment is in
+/// no listing a query plan covers, and a plan translates row addresses, never
+/// a metric or a type.
+///
+/// `None` when the segment has no index file: the files it records name
+/// none, or it records no files and the store has none.
+async fn vector_segment_contract(
+    dataset: &Dataset,
+    segment: &TableIndexMetadata,
+) -> Result<Option<VectorQueryContract>> {
+    // Not asked of the store: a missing key costs a request and its retries
+    // per segment, and a store may answer it with a denial instead.
+    if segment
+        .files
+        .as_ref()
+        .is_some_and(|files| !files.iter().any(|file| file.path == INDEX_FILE_NAME))
+    {
+        return Ok(None);
+    }
+    let object_store = dataset.object_store_for_index(segment).await?;
+    let index_file = dataset
+        .indice_files_dir(segment)?
+        .join(segment.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let file_sizes = segment.file_size_map();
+    let version = async {
+        let reader = open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+        read_version(&read_last_block(reader.as_ref()).await?)
+    };
+    let version = match version.await {
+        Ok(version) => version,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if matches!(version, (0, 3) | (2, _)) {
+        let metadata = dataset
+            .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
+            .await?;
+        return VectorQueryContract::from_file_metadata(&metadata).map(Some);
+    }
+    let field_id = segment
+        .fields
+        .first()
+        .ok_or_else(|| Error::invalid_input("the segment names no indexed column".to_string()))?;
+    let column = dataset.schema().field_path(*field_id)?;
+    let index = dataset
+        .open_vector_index_from_metadata_with_plan(
+            &column,
+            segment,
+            Some(&SegmentRemappingPlan::Identity),
+            OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
+    Ok(Some(VectorQueryContract::of_index(index.as_ref())))
 }
 
 fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
@@ -1061,6 +1318,27 @@ pub(crate) async fn optimize_vector_indices_v2(
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                derive_hnsw_params(reference_index.as_ref()),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_index_sources(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
+        }
+        // IVF_HNSW_RQ
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
@@ -2847,7 +3125,7 @@ async fn merge_segments_inner(
         })?;
         fragment_bitmap |= source_fragment_bitmap.clone();
     }
-    let mut index_details = crate::index::vector_index_details_default();
+    let mut index_details = crate::index::vector::details::vector_index_details_default();
     for segment in &segments {
         if let Some(details) = segment.index_details.as_deref() {
             let details = details.clone();
@@ -3290,6 +3568,11 @@ async fn write_hnsw_root_index_from_auxiliary(
     };
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
     let mut partition_index_metadata = Vec::with_capacity(aux_ivf.num_partitions());
+    // Read once: a dense rotation is a large global buffer.
+    let rq_metadata = match index_metadata.index_type.as_str() {
+        "IVF_HNSW_RQ" => Some(read_rq_storage_metadata(aux_reader).await?),
+        _ => None,
+    };
 
     progress
         .stage_start(
@@ -3317,6 +3600,7 @@ async fn write_hnsw_root_index_from_auxiliary(
             aux_reader,
             distance_type,
             hnsw_params,
+            rq_metadata.as_ref().zip(aux_ivf.centroid(partition_id)),
         )
         .await?;
         let index_batch = hnsw.to_batch()?;
@@ -3364,6 +3648,7 @@ async fn build_hnsw_from_storage_batch(
     aux_reader: &V2Reader,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
+    rq: Option<(&RabitQuantizationMetadata, ArrayRef)>,
 ) -> Result<HNSW> {
     match index_type {
         "IVF_HNSW_FLAT" => {
@@ -3398,6 +3683,14 @@ async fn build_hnsw_from_storage_batch(
                 read_storage_metadata::<ScalarQuantizationMetadata>(aux_reader, SQ_METADATA_KEY)?;
             let storage =
                 ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+            HNSW::index_vectors(&storage, hnsw_params.clone())
+        }
+        "IVF_HNSW_RQ" => {
+            let (metadata, centroid) = rq
+                .ok_or_else(|| Error::index("IVF_HNSW_RQ graph rebuild needs the IVF centroids"))?;
+            let storage =
+                RabitQuantizationStorage::try_from_batch(batch, metadata, distance_type, None)?
+                    .with_centroid(centroid.as_ref())?;
             HNSW::index_vectors(&storage, hnsw_params.clone())
         }
         other => Err(Error::index(format!(
@@ -3436,6 +3729,19 @@ async fn read_pq_storage_metadata(reader: &V2Reader) -> Result<ProductQuantizati
             .await?;
         let codebook_tensor: lance_index::pb::Tensor = Message::decode(tensor_bytes)?;
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+    }
+    Ok(metadata)
+}
+
+/// An `IVF_HNSW_RQ` auxiliary file's RQ metadata, with the dense rotation loaded.
+async fn read_rq_storage_metadata(reader: &V2Reader) -> Result<RabitQuantizationMetadata> {
+    let mut metadata =
+        read_storage_metadata::<RabitQuantizationMetadata>(reader, RABIT_METADATA_KEY)?;
+    // A dense rotation lives in a global buffer, not in the JSON.
+    if metadata.rotate_mat.is_none()
+        && let Some(position) = metadata.buffer_index()
+    {
+        metadata.parse_buffer(reader.read_global_buffer(position).await?)?;
     }
     Ok(metadata)
 }
@@ -3485,7 +3791,7 @@ where
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -5431,7 +5737,7 @@ async fn finish_streaming_ivf_training<T>(
     training_result: Result<T>,
     progress_tx: mpsc::UnboundedSender<u64>,
     on_progress: KMeansProgressCallback,
-    progress_worker: tokio::task::JoinHandle<Result<()>>,
+    progress_worker: lance_core::utils::tokio::JoinHandle<Result<()>>,
     trainer_name: &str,
 ) -> Result<T> {
     drop(progress_tx);
@@ -5564,7 +5870,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -5789,7 +6095,7 @@ async fn train_streaming_ivf_model(
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -6012,8 +6318,10 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
-    use crate::index::vector_index_details_default;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+    use crate::index::vector::details::vector_index_details_default;
+    use crate::index::{
+        DatasetIndexExt, loading::DatasetIndexInternalExt, vector::VectorIndexParams,
+    };
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
@@ -7050,7 +7358,7 @@ mod tests {
     #[case::ivf_pq_dot(CreateIndexCase {
         metric_type: MetricType::Dot,
         num_partitions: 2,
-        dimension: 2000,
+        dimension: 16,
         index_type: TestIndexType::IvfPq { pq: TestPqParams::small() },
     })]
     #[case::ivf_flat(CreateIndexCase { num_partitions: 1, metric_type: MetricType::Dot, dimension: 16, index_type: TestIndexType::IvfFlat })]
@@ -8487,17 +8795,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1)]
-    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1)]
-    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0)]
-    #[case::float32_streaming(DataType::Float32, false, Some(1), 1)]
-    #[case::float16_in_memory(DataType::Float16, false, None, 0)]
+    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1, "rq")]
+    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1, "rq")]
+    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0, "rq")]
+    #[case::float32_streaming(DataType::Float32, false, Some(1), 1, "rq")]
+    #[case::float16_in_memory(DataType::Float16, false, None, 0, "rq")]
+    // Flat and SQ fail partition assignment, PQ fails residuals, without
+    // Float16 centroids from streaming coreset training.
+    #[case::float16_streaming_flat(DataType::Float16, false, Some(1), 1, "flat")]
+    #[case::float16_streaming_pq(DataType::Float16, false, Some(1), 1, "pq")]
+    #[case::float16_streaming_sq(DataType::Float16, false, Some(1), 1, "sq")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_ivf_rq_build_and_search_float_types(
+    async fn test_ivf_build_and_search_float_types(
         #[case] value_type: DataType,
         #[case] is_nullable: bool,
         #[case] streaming_sample_rate: Option<usize>,
         #[case] refine_passes: usize,
+        #[case] index: &str,
     ) {
         const NUM_ROWS: usize = 600;
         const NUM_PARTITIONS: usize = 257;
@@ -8542,11 +8856,25 @@ mod tests {
         ivf_params.streaming_sample_rate = streaming_sample_rate;
         ivf_params.streaming_refine_passes = refine_passes;
         ivf_params.max_iters = 1;
-        let params = VectorIndexParams::with_ivf_rq_params(
-            MetricType::Cosine,
-            ivf_params,
-            RQBuildParams::new(1),
-        );
+        let params = match index {
+            "rq" => VectorIndexParams::with_ivf_rq_params(
+                MetricType::Cosine,
+                ivf_params,
+                RQBuildParams::new(1),
+            ),
+            "flat" => VectorIndexParams::with_ivf_flat_params(MetricType::Cosine, ivf_params),
+            "pq" => VectorIndexParams::with_ivf_pq_params(
+                MetricType::Cosine,
+                ivf_params,
+                PQBuildParams::new(4, 8),
+            ),
+            "sq" => VectorIndexParams::with_ivf_sq_params(
+                MetricType::Cosine,
+                ivf_params,
+                SQBuildParams::default(),
+            ),
+            _ => unreachable!(),
+        };
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
@@ -10393,6 +10721,84 @@ mod tests {
         dataset.prewarm_index("my_idx").await.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    /// Count this process's descriptors for index files under `prefix`.
+    ///
+    /// Deleted files still match: their `/proc` link keeps the old path with a
+    /// ` (deleted)` suffix.
+    #[cfg(target_os = "linux")]
+    fn count_open_index_fds(prefix: &str) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                let target = target.to_string_lossy();
+                target.starts_with(prefix) && target.contains("_indices")
+            })
+            .count()
+    }
+
+    /// A cached legacy index must not keep a descriptor open for the file it
+    /// was loaded from. Creating indexes in a loop mints a new UUID each time;
+    /// before the fix the session index cache pinned one descriptor per UUID,
+    /// which is what let descriptor counts grow with every optimize/rewrite.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_legacy_index_cache_does_not_pin_file_descriptors() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = DIM as i32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        )]));
+        let vectors = generate_random_array(512 * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        )
+        .version(IndexFileVersion::Legacy)
+        .clone();
+        let query = Float32Array::from_iter_values(repeat_n(0.0, DIM));
+
+        for round in 0..4 {
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("my_idx".to_owned()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // Querying opens the index, which caches it for the session.
+            dataset
+                .scan()
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .project(&["_rowid"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let open_fds = count_open_index_fds(test_dir.as_str());
+            assert_eq!(
+                open_fds, 0,
+                "round {round}: cached legacy index pinned {open_fds} descriptors"
+            );
+        }
     }
 
     #[tokio::test]

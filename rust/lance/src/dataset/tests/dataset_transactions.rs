@@ -8,17 +8,25 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR, UpdateBuilder,
-    write_manifest_file,
+    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
+    UpdateBuilder, write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
-use lance_table::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_ROW_ADDR_INDICES};
-use lance_table::format::IndexMetadata;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_ROW_ADDR_INDICES,
+};
+use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+    ManifestNamingScheme, ManifestWriter,
+};
+use object_store::path::Path;
 use roaring::RoaringBitmap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -40,8 +48,10 @@ use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datagen::{BatchCount, RowCount, array};
 
 use crate::datafusion::LanceTableProvider;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_datafusion::udf::register_functions;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -1423,6 +1433,232 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
 }
 
+async fn restore_fence_dataset() -> (TempStrDir, Dataset) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let first = record_batch!(("id", Int32, [1])).unwrap();
+    let second = record_batch!(("id", Int32, [2])).unwrap();
+    let dir = TempStrDir::default();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(first)], schema.clone()),
+        &dir,
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(second)], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.version().version, 2);
+    (dir, dataset)
+}
+
+#[tokio::test]
+async fn test_restore_from_requires_the_expected_latest_version() {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+
+    target.restore_from(2).await.unwrap();
+
+    assert_eq!(target.version().version, 3);
+    let restored = reopen(&dir).await;
+    assert_eq!(restored.version().version, 3);
+    assert_eq!(restored.count_rows(None).await.unwrap(), 1);
+    let batch = restored.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["id"].as_primitive::<Int32Type>().values(), &[1]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcurrentCommit {
+    UpdateConfig,
+    Merge,
+}
+
+#[rstest::rstest]
+#[case::update_config(ConcurrentCommit::UpdateConfig)]
+#[case::merge(ConcurrentCommit::Merge)]
+#[tokio::test]
+async fn test_restore_from_rejects_a_concurrent_commit(#[case] commit: ConcurrentCommit) {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+    let mut writer = reopen(&dir).await;
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            writer
+                .update_schema_metadata([("restore_fence", "advanced")])
+                .await
+                .unwrap();
+        }
+        ConcurrentCommit::Merge => {
+            writer
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "added".to_string(),
+                        "id + 10".to_string(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let error = target.restore_from(2).await.unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 2, .. }),
+        "restore must return a retryable conflict: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("latest version advanced"),
+        "{error}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 2);
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            assert_eq!(
+                latest
+                    .schema()
+                    .metadata
+                    .get("restore_fence")
+                    .map(String::as_str),
+                Some("advanced")
+            );
+        }
+        ConcurrentCommit::Merge => {
+            assert!(latest.schema().field("added").is_some());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GateNextCommitHandler {
+    inner: Arc<dyn CommitHandler>,
+    gate_next: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+impl GateNextCommitHandler {
+    fn arm(&self) {
+        self.gate_next.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for GateNextCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.inner.is_version_not_found_definitive()
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        self.inner.propagate_commit_error_after_success()
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<ManifestTransaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        if self.gate_next.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await
+    }
+}
+
+/// Once the restore has checked its predecessor, a commit that wins the next
+/// version must make the restore conflict instead of rebasing to a later
+/// version.
+#[tokio::test]
+async fn test_restore_from_does_not_rebase_after_predecessor_validation() {
+    let (dir, _) = restore_fence_dataset().await;
+    let handler = Arc::new(GateNextCommitHandler {
+        inner: Arc::new(ConditionalPutCommitHandler),
+        gate_next: AtomicBool::new(false),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    handler.arm();
+
+    let restore_handler: Arc<dyn CommitHandler> = handler.clone();
+    let mut target = DatasetBuilder::from_uri(&dir)
+        .with_read_params(ReadParams {
+            commit_handler: Some(restore_handler),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap()
+        .checkout_version(1)
+        .await
+        .unwrap();
+
+    let restore = tokio::spawn(async move { target.restore_from(2).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handler.entered.notified(),
+    )
+    .await
+    .expect("restore must reach publication");
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    Dataset::write(
+        RecordBatchIterator::new([Ok(record_batch!(("id", Int32, [3])).unwrap())], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    handler.release.notify_one();
+    let error = restore.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 3, .. }),
+        "restore must not rebase after validation: {error:?}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 3);
+}
+
 /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
 /// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
 /// untouched fragments keep both version sequences.
@@ -1742,6 +1978,188 @@ async fn test_alter_columns_rename_and_cast(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::cast(false)]
+#[case::drop_and_readd(true)]
+#[tokio::test]
+async fn test_append_conflicts_with_concurrent_schema_change(
+    #[case] drop_and_readd: bool,
+    #[values(false, true)] streaming_write: bool,
+) {
+    let batch = record_batch!(
+        ("id", Int64, [1, 2, 3, 4]),
+        ("x", Int64, [Some(5), None, Some(7), Some(9)])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            session: Some(Arc::new(Session::default())),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let session = dataset.session();
+    let mut changed = dataset.clone();
+    let change_schema = async move {
+        if drop_and_readd {
+            changed.drop_columns(&["x"]).await.unwrap();
+            changed
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("x", DataType::Int64, true),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            changed
+                .alter_columns(&[ColumnAlteration::new("x".into()).cast_to(DataType::Int32)])
+                .await
+                .unwrap();
+        }
+    };
+    let append_batch = record_batch!(("id", Int64, [5, 6]), ("x", Int64, [Some(3), None])).unwrap();
+    let error = if streaming_write {
+        // The writer peeks the first batch before opening the URI. Change the
+        // schema on the second poll, after the append has resolved its schema.
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            append_batch.schema(),
+            futures::stream::iter([Ok(append_batch.clone())]).chain(futures::stream::once(
+                async move {
+                    change_schema.await;
+                    Ok(append_batch)
+                },
+            )),
+        ));
+        InsertBuilder::new(dataset.uri())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                session: Some(session),
+                ..Default::default()
+            })
+            .execute_stream(stream)
+            .await
+            .unwrap_err()
+    } else {
+        change_schema.await;
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(append_batch.clone())], append_batch.schema()),
+                None,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+    let message = error.to_string();
+    assert!(
+        message.contains("Append") && message.contains("Please retry"),
+        "{message}"
+    );
+
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        dataset.version().version,
+        if drop_and_readd { 3 } else { 2 }
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+    let retry = if drop_and_readd {
+        record_batch!(("id", Int64, [5]), ("x", Int64, [3])).unwrap()
+    } else {
+        record_batch!(("id", Int64, [5]), ("x", Int32, [3])).unwrap()
+    };
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(retry.clone())], retry.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = dataset
+        .scan()
+        .filter("id = 5")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(rows["x"].null_count(), 0);
+    if drop_and_readd {
+        assert_eq!(rows["x"].as_primitive::<Int64Type>().value(0), 3);
+    } else {
+        assert_eq!(rows["x"].as_primitive::<Int32Type>().value(0), 3);
+    }
+}
+
+#[rstest::rstest]
+#[case::rename("rename")]
+#[case::nullable_add("add")]
+#[case::drop("drop")]
+#[tokio::test]
+async fn test_append_allows_compatible_concurrent_schema_change(#[case] change: &str) {
+    let batch = record_batch!(("id", Int64, [1, 2]), ("x", Int64, [Some(5), None])).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut changed = dataset.clone();
+    if change == "drop" {
+        changed.drop_columns(&["x"]).await.unwrap();
+    } else if change == "rename" {
+        changed
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("y".into())])
+            .await
+            .unwrap();
+    } else {
+        changed
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "y",
+                    DataType::Int64,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(rows.num_rows(), 4);
+    assert_eq!(rows["id"].as_ref(), &Int64Array::from(vec![1, 2, 1, 2]));
+    if change == "drop" {
+        assert!(rows.schema().field_with_name("x").is_err());
+    } else {
+        assert_eq!(
+            rows[if change == "rename" { "y" } else { "x" }].as_ref(),
+            &Int64Array::from(vec![Some(5), None, Some(5), None])
+        );
+    }
+    if change == "add" {
+        assert_eq!(rows["y"].null_count(), 4);
+    }
+}
+
 // Which clause rejects the lossy round-trip depends on the hole's
 // position: a hole before the last field remaps a shared id, while a
 // hole at the end reuses the dropped id for the new field.
@@ -2011,10 +2429,14 @@ async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
     assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
 }
 
-/// A covering declaration that is not a suffix of `fields` must be refused
-/// at commit, not silently accepted and later misread as a keyed column.
+#[rstest::rstest]
+#[case::independent(vec![0], None)]
+#[case::repeated_carried_field(vec![1, 1], Some("more than once"))]
 #[tokio::test]
-async fn test_create_index_rejects_non_suffix_covering_fields() {
+async fn test_create_index_commits_independent_covering_fields(
+    #[case] covering_fields: Vec<i32>,
+    #[case] refusal: Option<&str>,
+) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
 
@@ -2033,13 +2455,11 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
 
-    // fields = [0, 1] with covering = [0]: field 0 is the leading entry,
-    // not the trailing one, so this claims the keyed column is covered.
-    let bad_index = IndexMetadata {
+    let index = IndexMetadata {
         uuid: Uuid::new_v4(),
-        name: "bad_idx".to_string(),
+        name: "covered_idx".to_string(),
         fields: vec![0, 1],
-        covering_fields: vec![0],
+        covering_fields: covering_fields.clone(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
         index_details: None,
@@ -2054,24 +2474,35 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::CreateIndex {
-            new_indices: vec![bad_index],
+            new_indices: vec![index],
             removed_indices: vec![],
         },
         None,
     );
 
-    let err = dataset
+    let committed = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-        .expect_err("a non-suffix covering declaration must not commit");
-    assert!(
-        matches!(err, Error::InvalidInput { .. }),
-        "expected InvalidInput, got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("must come last"),
-        "unexpected message: {err}"
-    );
+        .await;
+    if let Some(refusal) = refusal {
+        let err = committed.expect_err("a repeated carried field must not commit");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(refusal),
+            "unexpected message: {err}"
+        );
+        return;
+    }
+    committed.unwrap();
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(dataset.manifest.reader_feature_flags & covering, covering);
+    assert_eq!(dataset.manifest.writer_feature_flags & covering, covering);
+    let reopened = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    let stored = reopened.load_indices().await.unwrap();
+    assert_eq!(stored[0].keyed_fields(), [0, 1]);
+    assert_eq!(stored[0].covering_fields, covering_fields);
 }
 
 /// A shallow clone copies the index metadata wholesale, `covering_fields`

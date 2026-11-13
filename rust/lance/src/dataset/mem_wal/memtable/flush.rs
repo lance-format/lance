@@ -500,7 +500,8 @@ impl MemTableFlusher {
         // them, however large: reads and the merge into base find columns by id.
         let mut builder = InsertBuilder::new(uri.as_str())
             .with_params(&write_params)
-            .with_inherited_field_ids();
+            .with_inherited_field_ids()
+            .with_dictionary_split_disabled();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }
@@ -537,6 +538,7 @@ impl MemTableFlusher {
                 dataset.version().version,
                 &dv,
                 dataset.object_store.as_ref(),
+                dataset.inline_deletions_max_bytes()?,
             )
             .await?;
             let fragments = Arc::make_mut(&mut manifest.fragments);
@@ -735,10 +737,13 @@ impl MemTableFlusher {
                 }
                 FlushOutcome::Wrote(index_meta) => {
                     // Queries find a generation's index by name and field.
-                    if index_meta.name != spec.name || index_meta.fields != spec.field_ids {
+                    if index_meta.name != spec.name || index_meta.keyed_fields() != spec.field_ids {
                         return Err(Error::internal(format!(
                             "index '{}' on fields {:?} recorded its file as '{}' on fields {:?}",
-                            spec.name, spec.field_ids, index_meta.name, index_meta.fields
+                            spec.name,
+                            spec.field_ids,
+                            index_meta.name,
+                            index_meta.keyed_fields()
                         )));
                     }
                     created.push(*index_meta);
@@ -935,8 +940,9 @@ async fn build_scalar_index(
     }
     let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
     let params = spec.plugin.flush_params(spec)?;
-    let mut builder =
-        CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
+    let mut builder = CreateIndexBuilder::new(dataset, &columns, index_type, &params)
+        .name(spec.name.clone())
+        .without_memory_observation();
     if let Some(stream) = training_data {
         // Memtable positions are the flushed file's row ids, so no remap.
         builder = builder.preprocessed_stream(stream, spec.plugin.training_criteria());
@@ -948,7 +954,9 @@ async fn build_scalar_index(
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{
+        DictionaryArray, Int8Array, Int32Array, RecordBatch, StringArray, types::Int8Type,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
     use rstest::rstest;
@@ -1529,6 +1537,88 @@ mod tests {
         assert_eq!(rows.get(&1), Some(&"a2".to_string()));
         assert_eq!(rows.get(&2), Some(&"b".to_string()));
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
+    }
+
+    /// A rejected insert must leave the generation flushable as one fragment.
+    #[rstest]
+    #[case::indexed("indexed")]
+    #[case::batch_only("batch_only")]
+    #[case::batches_only("batches_only")]
+    #[tokio::test]
+    async fn test_dictionary_capacity_rejected_before_insert(#[case] mode: &str) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            "",
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            create_pk_schema().field(0).clone(),
+            Field::new(
+                "name",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]));
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let batch = |start| {
+            let values =
+                StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+            let names = DictionaryArray::<Int8Type>::try_new(
+                (0..100).collect::<Int8Array>(),
+                Arc::new(values),
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(start..start + 100)),
+                    Arc::new(names),
+                ],
+            )
+            .unwrap()
+        };
+        memtable.insert(batch(0)).await.unwrap();
+        let pk_bytes = memtable.pk_bytes();
+        let error = match mode {
+            "indexed" => memtable.insert(batch(100)).await.map(|_| ()),
+            "batch_only" => memtable.insert_batch_only(batch(100)).await.map(|_| ()),
+            "batches_only" => memtable
+                .insert_batches_only(vec![batch(100)])
+                .await
+                .map(|_| ()),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("200 distinct encoded values"));
+        assert!(error.to_string().contains("capacity of 128"));
+        assert_eq!(memtable.row_count(), 100);
+        assert_eq!(memtable.batch_count(), 1);
+        assert_eq!(memtable.pk_bytes(), pk_bytes);
+
+        let flusher = MemTableFlusher::new(
+            store,
+            base_path,
+            base_uri.clone(),
+            "",
+            shard_id,
+            manifest_store,
+        );
+        let result = flusher.flush(&memtable, epoch, 1, 1).await.unwrap();
+        let uri = format!("{base_uri}/_mem_wal/{shard_id}/{}", result.sstable.path);
+        let dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let scanned = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(scanned.num_rows(), 100);
+        let expected = batch(0);
+        assert_eq!(&scanned["id"], &expected["id"]);
+        assert_eq!(&scanned["name"], &expected["name"]);
     }
 
     /// Flushing a memtable with a primary-key index writes a standalone sidecar
@@ -2614,7 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn a_scalar_build_uses_the_plugin_flush_params(#[case] deviation: Deviation) {
         use crate::dataset::mem_wal::index::test_plugin::wrapped_with_flush_params;
-        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::btree::BTreeParameters;
         use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};

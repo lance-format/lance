@@ -19,6 +19,7 @@ use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
     execution::{TaskContext, context::SessionContext},
+    logical_expr::LogicalPlan,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         analyze::AnalyzeExec, coalesce_partitions::CoalescePartitionsExec, metrics::MetricType,
@@ -32,9 +33,11 @@ use tracing::Span;
 
 pub use lance_datafusion_exec::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
-    OneShotExec, StrictBatchSizeExec, collect_execution_metrics,
+    OneShotExec, RecordBatchExec, StrictBatchSizeExec, collect_execution_metrics,
 };
-use lance_datafusion_exec::exec::{execute_plan_with_context, new_runtime_env, new_session_config};
+use lance_datafusion_exec::exec::{
+    execute_plan_with_context, new_runtime_env, new_session_config, track_execution_memory,
+};
 
 use crate::udf::register_functions;
 
@@ -217,7 +220,7 @@ fn get_task_context(
     // Build from the session state in place. `SessionContext::state` would clone
     // the whole state (every function map, rule list and option) only to drop
     // it, which is a measurable share of CPU for short queries.
-    let task_ctx = TaskContext::from(session_ctx);
+    let task_ctx = track_execution_memory(TaskContext::from(session_ctx), options);
     let Some(batch_size) = options.validated_batch_size()? else {
         return Ok(Arc::new(task_ctx));
     };
@@ -269,9 +272,8 @@ pub async fn analyze_plan(
 /// When `task_context` is `Some`, the plan executes under it instead of the
 /// context derived from `options`. Callers whose nodes read session-config
 /// extensions at execution time (e.g. distributed routing identity) must pass
-/// the context carrying those extensions; otherwise the nodes error during
-/// `execute` and `AnalyzeExec` reports an empty, unexecuted plan tree instead
-/// of surfacing the error.
+/// the context carrying those extensions. Errors from executing the plan or
+/// reading its output are propagated to the caller.
 pub async fn analyze_plan_with_context(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -281,10 +283,9 @@ pub async fn analyze_plan_with_context(
     // partition, and we want these to be connected to the parent span
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
-    let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
     let analyze = Arc::new(
-        AnalyzeExec::builder(true, true, plan, schema)
+        AnalyzeExec::builder(true, true, plan, LogicalPlan::explain_schema())
             .with_metric_types(vec![MetricType::Summary])
             .build(),
     );
@@ -300,7 +301,9 @@ pub async fn analyze_plan_with_context(
         .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
-    while (stream.next().await).is_some() {}
+    while let Some(batch) = stream.next().await {
+        batch?;
+    }
 
     let result = format_plan(analyze);
     Ok(result)
@@ -562,7 +565,7 @@ pub async fn provider_to_stream(
 mod tests {
     use super::*;
     use arrow_array::record_batch;
-    use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::memory_pool::{MemoryConsumer, PeakRecordingPool};
     use datafusion_common::DataFusionError;
 
     use datafusion::execution::memory_pool::MemoryLimit;
@@ -704,21 +707,29 @@ mod tests {
         let default_options = LanceExecutionOptions::default();
         let session_ctx = get_session_context(&default_options);
         let task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
+        let other_task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
         // Lance operators key per-execution state on the task context's identity.
-        assert!(!Arc::ptr_eq(
-            &task_ctx,
-            &get_task_context(&session_ctx, &default_options).unwrap()
-        ));
+        assert!(!Arc::ptr_eq(&task_ctx, &other_task_ctx));
         assert_eq!(task_ctx.session_id(), session_ctx.session_id());
         assert_eq!(
             task_ctx.session_config().batch_size(),
             session_ctx.copied_config().batch_size()
         );
-        assert!(Arc::ptr_eq(
-            &task_ctx.runtime_env(),
-            &session_ctx.runtime_env()
-        ));
         assert!(task_ctx.scalar_functions().contains_key("contains_tokens"));
+        // Each execution records the peak of its own reservations, although all
+        // of them go to the session's pool.
+        let peak = |task_ctx: &TaskContext| {
+            PeakRecordingPool::from_pool(task_ctx.memory_pool().as_ref())
+                .unwrap()
+                .peak_reserved()
+        };
+        let reservation = MemoryConsumer::new("execution").register(task_ctx.memory_pool());
+        reservation.grow(1000);
+        let other_reservation =
+            MemoryConsumer::new("other execution").register(other_task_ctx.memory_pool());
+        other_reservation.grow(10);
+        assert_eq!(peak(&task_ctx), 1000);
+        assert_eq!(peak(&other_task_ctx), 10);
 
         let spill_options = LanceExecutionOptions {
             use_spilling: true,
@@ -737,16 +748,17 @@ mod tests {
                 .contains_key("contains_tokens")
         );
         // The batch size override applies to this execution only, and the
-        // execution still shares the session's memory pool.
+        // execution still reserves from the session's memory pool.
         assert_ne!(spill_session_ctx.copied_config().batch_size(), 17);
-        assert!(Arc::ptr_eq(
-            &spill_task_ctx.runtime_env(),
-            &spill_session_ctx.runtime_env()
-        ));
         assert!(matches!(
             spill_task_ctx.memory_pool().memory_limit(),
             MemoryLimit::Finite(limit) if limit == 64 * 1024 * 1024
         ));
+        let spill_reservation =
+            MemoryConsumer::new("spilling execution").register(spill_task_ctx.memory_pool());
+        spill_reservation.grow(1000);
+        assert_eq!(spill_session_ctx.runtime_env().memory_pool.reserved(), 1000);
+        assert_eq!(peak(&spill_task_ctx), 1000);
     }
 
     #[tokio::test]
@@ -863,8 +875,7 @@ mod tests {
 
     // Regression: analyze must run under a caller-provided TaskContext so nodes
     // that read a session-config extension at execute time see it. Without the
-    // context the node errors and AnalyzeExec would otherwise report an empty,
-    // unexecuted plan tree.
+    // context the node's execution error must be propagated.
     #[tokio::test]
     async fn test_analyze_plan_uses_provided_task_context() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -872,16 +883,16 @@ mod tests {
         let executed = Arc::new(AtomicBool::new(false));
         let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new(executed.clone()));
 
-        // Default context lacks the extension: the node errors during execute
-        // (never reaching the `executed` flag), but AnalyzeExec absorbs that
-        // per-partition failure and reports an empty, unexecuted plan tree
-        // rather than propagating the error. This is the regression symptom.
-        let report = analyze_plan(plan.clone(), LanceExecutionOptions::default())
+        // The default context lacks the extension, so execution must fail.
+        let error = analyze_plan(plan.clone(), LanceExecutionOptions::default())
             .await
-            .expect("AnalyzeExec swallows the node's execute error into an Ok report");
+            .unwrap_err();
+        assert!(matches!(error, Error::Execution { .. }), "{error:?}");
         assert!(
-            report.contains("NeedsExtensionExec, metrics=[]"),
-            "expected an empty, unexecuted NeedsExtensionExec node, got: {report}"
+            error
+                .to_string()
+                .contains("missing required session-config extension"),
+            "{error}"
         );
         assert!(
             !executed.load(Ordering::SeqCst),
