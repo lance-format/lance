@@ -1463,6 +1463,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion::planner::Planner;
     use lance_io::object_store::ObjectStore;
+    use rstest::rstest;
 
     /// label, confidence
     type Det = (Option<&'static str>, Option<f32>);
