@@ -3191,14 +3191,14 @@ mod composite {
             dataset,
             vec![Action::SetDeletionFile(SetDeletionFile {
                 fragment: fragment_id,
-                deletion_file: Some(DeletionFile {
+                deletion_file: DeletionFile {
                     read_version,
                     id: 1,
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(2),
                     base_id: None,
                     inline: None,
-                }),
+                },
                 data_change: true,
                 base: None,
             })],
@@ -3288,14 +3288,14 @@ mod composite {
                 read_version,
                 vec![Action::SetDeletionFile(SetDeletionFile {
                     fragment: fragment_id,
-                    deletion_file: Some(DeletionFile {
+                    deletion_file: DeletionFile {
                         read_version,
                         id,
                         file_type: DeletionFileType::Array,
                         num_deleted_rows: Some(1),
                         base_id: None,
                         inline: None,
-                    }),
+                    },
                     data_change: true,
                     base: None,
                 })],

@@ -2142,7 +2142,14 @@ mod tests {
     #[case::data_only(
         Action::SetDeletionFile(SetDeletionFile {
             fragment: 0,
-            deletion_file: None,
+            deletion_file: crate::format::DeletionFile {
+                read_version: 1,
+                id: 1,
+                file_type: crate::format::DeletionFileType::Array,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                inline: None,
+            },
             data_change: true,
             base: None,
         }),

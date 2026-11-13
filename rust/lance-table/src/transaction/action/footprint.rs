@@ -587,7 +587,7 @@ impl From<&CompositeOperation> for Footprint {
 mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile};
-    use crate::transaction::action::test_support::footprint;
+    use crate::transaction::action::test_support::{any_deletion_file, footprint};
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
         RemoveFragment, SetDeletionFile, TombstoneFieldData,
@@ -738,7 +738,7 @@ mod tests {
     fn set_deletion_file(fragment: u64) -> Action {
         Action::SetDeletionFile(SetDeletionFile {
             fragment,
-            deletion_file: None,
+            deletion_file: any_deletion_file(),
             data_change: true,
             base: None,
         })

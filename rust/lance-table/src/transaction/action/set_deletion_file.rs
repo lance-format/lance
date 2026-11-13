@@ -4,6 +4,7 @@
 //! Set (replace) a fragment's deletion file.
 
 use super::apply::ApplyState;
+use super::proto::required;
 use super::{Coordinate, Footprint, Ref};
 use crate::format::{DeletionFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
@@ -13,6 +14,12 @@ use lance_core::{Error, Result};
 ///
 /// This is reference-stable rather than a delta: the fragment id is committed
 /// and physical row offsets never move, so the post-image is unambiguous.
+///
+/// A fragment's deletions only grow. Indices built while rows were deleted
+/// never saw them, so bringing rows back would leave those indices silently
+/// missing them. A deletion file therefore cannot be cleared, and a
+/// replacement known to delete fewer rows than the one it replaces is
+/// rejected.
 ///
 /// TODO: derive the newly-deleted rows by diffing against the read version, so
 /// rebase and conflict detection can merge two deletes on one fragment. Until
@@ -28,8 +35,8 @@ pub struct SetDeletionFile {
     /// so the writer has to know the committed fragment id before it can write
     /// the file at all, and a minted id does not exist until apply.
     pub fragment: u64,
-    /// The new deletion file, or `None` to clear the fragment's deletions.
-    pub deletion_file: Option<DeletionFile>,
+    /// The new deletion file.
+    pub deletion_file: DeletionFile,
     /// See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
     /// The base path the deletion file lives under: committed, or one minted
@@ -39,34 +46,34 @@ pub struct SetDeletionFile {
 
 impl SetDeletionFile {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let deletion_file = match (&self.deletion_file, self.base) {
-            (None, Some(base)) => {
-                return Err(Error::invalid_input(format!(
-                    "SetDeletionFile for fragment {} clears its deletion file but names base \
-                     {base:?}; a base only says where a deletion file lives",
-                    self.fragment
-                )));
-            }
-            (None, None) => None,
-            (Some(file), base) => {
-                if let Some(base_id) = file.base_id {
-                    return Err(Error::invalid_input(format!(
-                        "SetDeletionFile for fragment {} carries deletion_file.base_id \
-                         {base_id}; deletion_file.base_id must be unset, since the action's \
-                         base names where the file lives",
-                        self.fragment
-                    )));
-                }
-                Some(DeletionFile {
-                    base_id: base.map(|base| state.resolve_base(base)).transpose()?,
-                    ..file.clone()
-                })
-            }
+        if let Some(base_id) = self.deletion_file.base_id {
+            return Err(Error::invalid_input(format!(
+                "SetDeletionFile for fragment {} carries deletion_file.base_id {base_id}; \
+                 deletion_file.base_id must be unset, since the action's base names where the \
+                 file lives",
+                self.fragment
+            )));
+        }
+        let deletion_file = DeletionFile {
+            base_id: self.base.map(|base| state.resolve_base(base)).transpose()?,
+            ..self.deletion_file.clone()
         };
         let fragment_id = state.resolve_fragment(Ref::Committed(self.fragment))?;
-        state
-            .fragment_mut(fragment_id, "SetDeletionFile")?
-            .deletion_file = deletion_file;
+        let fragment = state.fragment_mut(fragment_id, "SetDeletionFile")?;
+        let deleted_before = fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|previous| previous.num_deleted_rows);
+        if let (Some(before), Some(after)) = (deleted_before, deletion_file.num_deleted_rows)
+            && after < before
+        {
+            return Err(Error::invalid_input(format!(
+                "SetDeletionFile for fragment {fragment_id} deletes {after} rows, fewer than \
+                 the {before} its current deletion file deletes; deleted rows cannot be \
+                 restored"
+            )));
+        }
+        fragment.deletion_file = Some(deletion_file);
         Ok(())
     }
 
@@ -85,7 +92,7 @@ impl From<&SetDeletionFile> for pb_actions::SetDeletionFile {
     fn from(value: &SetDeletionFile) -> Self {
         Self {
             fragment: value.fragment,
-            deletion_file: value.deletion_file.as_ref().map(pb::DeletionFile::from),
+            deletion_file: Some(pb::DeletionFile::from(&value.deletion_file)),
             data_unchanged: !value.data_change,
             base: value.base.map(Into::into),
         }
@@ -98,10 +105,10 @@ impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
     fn try_from(message: pb_actions::SetDeletionFile) -> Result<Self> {
         Ok(Self {
             fragment: message.fragment,
-            deletion_file: message
-                .deletion_file
-                .map(DeletionFile::try_from)
-                .transpose()?,
+            deletion_file: DeletionFile::try_from(required(
+                message.deletion_file,
+                "SetDeletionFile.deletion_file",
+            )?)?,
             data_change: !message.data_unchanged,
             base: message.base.map(Ref::try_from).transpose()?,
         })
@@ -118,41 +125,86 @@ mod tests {
     use crate::transaction::action::{Action, Ref};
     use rstest::rstest;
 
-    #[test]
-    fn test_set_deletion_file_sets_and_clears() {
-        let manifest = backed_manifest();
-        let deletion_file = DeletionFile {
-            read_version: manifest.version,
-            id: 3,
-            file_type: DeletionFileType::Array,
-            num_deleted_rows: Some(2),
-            base_id: None,
-            inline: None,
-        };
-        let next = apply(
-            &manifest,
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
-                deletion_file: Some(deletion_file.clone()),
-                data_change: true,
-                base: None,
-            })],
-        )
-        .unwrap();
-        assert_eq!(next.fragments[0].deletion_file, Some(deletion_file));
+    fn set_deletion_file(file: DeletionFile) -> Action {
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: file,
+            data_change: true,
+            base: None,
+        })
+    }
 
-        // An absent deletion file is a request to clear it, not a no-op.
-        let cleared = apply(
-            &next,
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
-                deletion_file: None,
-                data_change: true,
-                base: None,
-            })],
+    fn deleting(num_deleted_rows: Option<usize>) -> DeletionFile {
+        DeletionFile {
+            num_deleted_rows,
+            ..deletion_file(None)
+        }
+    }
+
+    #[test]
+    fn test_set_deletion_file_sets_the_file() {
+        let next = apply(
+            &backed_manifest(),
+            vec![set_deletion_file(deleting(Some(2)))],
         )
         .unwrap();
-        assert_eq!(cleared.fragments[0].deletion_file, None);
+
+        assert_eq!(next.fragments[0].deletion_file, Some(deleting(Some(2))));
+    }
+
+    /// The protobuf field is a message, so absence is representable on the
+    /// wire; it does not mean "clear".
+    #[test]
+    fn test_set_deletion_file_requires_a_file_on_the_wire() {
+        let message = pb_actions::SetDeletionFile {
+            fragment: 0,
+            deletion_file: None,
+            data_unchanged: false,
+            base: None,
+        };
+
+        let error = SetDeletionFile::try_from(message).unwrap_err();
+
+        assert!(
+            error.to_string().contains("SetDeletionFile.deletion_file"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Fewer deleted rows would bring rows back that indices never saw. A
+    /// count either side does not record cannot be compared, and is let
+    /// through.
+    #[rstest]
+    #[case::more(Some(2), Some(3), true)]
+    #[case::same(Some(2), Some(2), true)]
+    #[case::fewer(Some(2), Some(1), false)]
+    #[case::unknown_before(None, Some(1), true)]
+    #[case::unknown_after(Some(2), None, true)]
+    fn test_set_deletion_file_rejects_restoring_deleted_rows(
+        #[case] before: Option<usize>,
+        #[case] after: Option<usize>,
+        #[case] accepted: bool,
+    ) {
+        let manifest = apply(
+            &backed_manifest(),
+            vec![set_deletion_file(deleting(before))],
+        )
+        .unwrap();
+
+        let result = apply(&manifest, vec![set_deletion_file(deleting(after))]);
+
+        if accepted {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("deleted rows cannot be restored"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -161,7 +213,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::SetDeletionFile(SetDeletionFile {
                 fragment: 7,
-                deletion_file: None,
+                deletion_file: deletion_file(None),
                 data_change: true,
                 base: None,
             })],
@@ -185,35 +237,29 @@ mod tests {
     /// The same contract as [`AddDataFile`](super::super::AddDataFile)'s: `base`
     /// says where the file lives and apply stamps the embedded `base_id`.
     #[rstest]
-    #[case::own_directory(Some(deletion_file(None)), None, false, Ok(None))]
-    #[case::committed_base(Some(deletion_file(None)), Some(Ref::Committed(1)), false, Ok(Some(1)))]
-    #[case::base_minted_earlier(Some(deletion_file(None)), Some(Ref::Local(0)), true, Ok(Some(2)))]
+    #[case::own_directory(deletion_file(None), None, false, Ok(None))]
+    #[case::committed_base(deletion_file(None), Some(Ref::Committed(1)), false, Ok(Some(1)))]
+    #[case::base_minted_earlier(deletion_file(None), Some(Ref::Local(0)), true, Ok(Some(2)))]
     #[case::embedded_base_id(
-        Some(deletion_file(Some(1))),
+        deletion_file(Some(1)),
         None,
         false,
         Err("deletion_file.base_id must be unset")
     )]
     #[case::committed_base_the_dataset_lacks(
-        Some(deletion_file(None)),
+        deletion_file(None),
         Some(Ref::Committed(0)),
         false,
         Err("base id 0 in an action names no base path of the dataset")
     )]
     #[case::base_not_minted(
-        Some(deletion_file(None)),
+        deletion_file(None),
         Some(Ref::Local(0)),
         false,
         Err("local base token 0, which no earlier action in this operation minted")
     )]
-    #[case::base_for_a_cleared_deletion_file(
-        None,
-        Some(Ref::Committed(1)),
-        false,
-        Err("names base")
-    )]
     fn test_set_deletion_file_stamps_its_base(
-        #[case] file: Option<DeletionFile>,
+        #[case] file: DeletionFile,
         #[case] base: Option<Ref>,
         #[case] mint_base_first: bool,
         #[case] expected: std::result::Result<Option<u32>, &str>,

@@ -4,7 +4,9 @@
 //! Fixtures shared by the per-action test modules.
 
 use super::{Action, CompositeOperation, Footprint, UserStep};
-use crate::format::{BasePath, DataFile, Fragment, IndexMetadata, Manifest};
+use crate::format::{
+    BasePath, DataFile, DeletionFile, DeletionFileType, Fragment, IndexMetadata, Manifest,
+};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, ReadVersionState, Transaction};
 use arrow_schema::{DataType, Field as ArrowField};
@@ -126,5 +128,17 @@ pub(super) fn one_column_file(path: &str) -> DataFile {
     DataFile {
         column_indices: Arc::from([0]),
         ..DataFile::new_unstarted(path, ConcreteFileVersion::V2_0)
+    }
+}
+
+/// A deletion file for tests that only need the action to carry one.
+pub(super) fn any_deletion_file() -> DeletionFile {
+    DeletionFile {
+        read_version: 1,
+        id: 1,
+        file_type: DeletionFileType::Array,
+        num_deleted_rows: Some(1),
+        base_id: None,
+        inline: None,
     }
 }

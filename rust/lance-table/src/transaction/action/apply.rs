@@ -25,7 +25,8 @@
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{
-    apply_index_object_metadata_flag, inherit_sticky_feature_flags, validate_auto_cleanup_config,
+    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, inherit_sticky_feature_flags,
+    managed_blobs_enabled, validate_auto_cleanup_config,
 };
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
@@ -35,7 +36,7 @@ use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
-use crate::transaction::manifest_build::check_blob_nesting;
+use crate::transaction::manifest_build::{apply_range_segments, check_blob_nesting};
 use crate::transaction::validate::schema_fragments_valid;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
@@ -289,6 +290,14 @@ impl<'a> ApplyState<'a> {
             ..
         } = self;
 
+        // Actions build the schema one field at a time, so nothing guarantees
+        // what building it from Arrow would. Checked before anything reads a
+        // field's data type, which panics on a list with no child. A table
+        // whose schema already failed stays committable.
+        if check_schema(&current_manifest.schema).is_ok() {
+            check_schema(&schema)?;
+        }
+
         if reset {
             indices.clear();
         }
@@ -346,6 +355,12 @@ impl<'a> ApplyState<'a> {
             != auto_cleanup_settings(&manifest.config)
         {
             validate_auto_cleanup_config(&manifest)?;
+        }
+        // Both read the final schema and config, so they come after those land.
+        apply_range_segments(&mut manifest, Some(current_manifest))?;
+        if managed_blobs_enabled(&manifest.schema)? {
+            manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
+            manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
 
         // The assembly derives the marks from what the manifest still holds,
@@ -1068,6 +1083,37 @@ fn prune_rebound_fields_from_indices(
     Ok(())
 }
 
+/// [`Schema::validate`], preceded by the shape [`Field::data_type`] assumes: a
+/// list or map has exactly one child, a struct at least one (dropping a
+/// struct's last child drops the struct on the legacy path), and any other
+/// type none.
+fn check_schema(schema: &Schema) -> Result<()> {
+    for field in schema.fields_pre_order() {
+        let logical_type = &field.logical_type;
+        let (fits, expected) = if logical_type.is_list()
+            || logical_type.is_large_list()
+            || logical_type.is_fixed_size_list_struct()
+            || logical_type.is_map()
+        {
+            (field.children.len() == 1, "exactly one child")
+        } else if logical_type.is_struct() {
+            (!field.children.is_empty(), "at least one child")
+        } else {
+            (field.children.is_empty(), "no children")
+        };
+        if !fits {
+            return Err(Error::invalid_input(format!(
+                "field '{}' (id {}) of type {} has {} children, but its type takes {expected}",
+                field.name,
+                field.id,
+                logical_type,
+                field.children.len()
+            )));
+        }
+    }
+    schema.validate()
+}
+
 fn auto_cleanup_settings(config: &HashMap<String, String>) -> BTreeMap<&str, &str> {
     config
         .iter()
@@ -1117,6 +1163,7 @@ mod tests {
     use super::*;
     use crate::feature_flags::{
         FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA,
+        MANAGED_BLOBS_META_KEY,
     };
     use crate::format::DataFile;
     use crate::rowids::write_row_ids;
@@ -1125,8 +1172,8 @@ mod tests {
         new_mem_wal_index_meta,
     };
     use crate::transaction::action::test_support::{
-        added_field, apply, apply_after_reading, apply_with_indices, backed_manifest,
-        manifest_with_base, mint_base, one_column_file,
+        added_field, any_deletion_file, apply, apply_after_reading, apply_with_indices,
+        backed_manifest, manifest_with_base, mint_base, one_column_file,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
@@ -1526,7 +1573,7 @@ mod tests {
             remove_fragment_zero(),
             Action::SetDeletionFile(SetDeletionFile {
                 fragment: 0,
-                deletion_file: None,
+                deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
             }),
@@ -1896,7 +1943,7 @@ mod tests {
             mint_fragment(0),
             Action::SetDeletionFile(SetDeletionFile {
                 fragment: 5,
-                deletion_file: None,
+                deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
             }),
@@ -1937,7 +1984,7 @@ mod tests {
     #[case::deletion_file(
         Action::SetDeletionFile(SetDeletionFile {
             fragment: 1,
-            deletion_file: None,
+            deletion_file: any_deletion_file(),
             data_change: true,
             base: None,
         }),
@@ -2126,5 +2173,170 @@ mod tests {
         .unwrap();
 
         assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    fn add_top_level(def: lance_core::datatypes::Field) -> Action {
+        Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def,
+        })
+    }
+
+    fn arrow_def(name: &str, data_type: DataType) -> lance_core::datatypes::Field {
+        lance_core::datatypes::Field::try_from(ArrowField::new(name, data_type, true)).unwrap()
+    }
+
+    /// `backed_manifest` with a nullable `s: struct<x: int32>` beside `id`.
+    fn struct_manifest() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+        ]))
+        .unwrap();
+        manifest
+    }
+
+    /// Actions build the schema a field at a time, so apply checks what
+    /// building it from Arrow would have guaranteed.
+    #[rstest]
+    #[case::dotted_top_level_name(
+        vec![add_top_level(added_field("a.b"))],
+        "cannot contain `.`"
+    )]
+    #[case::renamed_to_a_dotted_name(
+        vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: Some("x.y".into()),
+            nullable: None,
+        })],
+        "cannot contain `.`"
+    )]
+    #[case::zero_dimension_fixed_size_list(
+        vec![add_top_level(arrow_def(
+            "v",
+            DataType::FixedSizeList(Arc::new(ArrowField::new("item", DataType::Int32, true)), 0),
+        ))],
+        "dimension 0"
+    )]
+    #[case::child_under_a_primitive(
+        vec![Action::AddField(AddField {
+            local: 0,
+            parent: Some(FieldRef::Committed(0)),
+            def: added_field("child"),
+        })],
+        "takes no children"
+    )]
+    #[case::list_without_its_item(
+        vec![add_top_level(arrow_def(
+            "l",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        ))],
+        "takes exactly one child"
+    )]
+    #[case::struct_left_empty(
+        vec![Action::DropField(DropField { field: FieldRef::Committed(2) })],
+        "takes at least one child"
+    )]
+    fn test_apply_rejects_a_malformed_schema(#[case] actions: Vec<Action>, #[case] expected: &str) {
+        let error = apply(&struct_manifest(), actions).unwrap_err();
+
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_schema_malformed_before_the_commit_does_not_block_it() {
+        let mut manifest = backed_manifest();
+        manifest.schema.field_by_id_mut(0).unwrap().name = "a.b".into();
+
+        apply(
+            &manifest,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                schema_metadata: Some(UpdateMap {
+                    update_entries: vec![("note", Some("unrelated")).into()],
+                    replace: false,
+                }),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+    }
+
+    fn set_schema_metadata(key: &str, value: &str) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            schema_metadata: Some(UpdateMap {
+                update_entries: vec![(key, Some(value)).into()],
+                replace: false,
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Readers that predate managed blobs must be fenced off once the schema
+    /// opts in, as the legacy path does on every commit.
+    #[test]
+    fn test_opting_into_managed_blobs_sets_the_feature_flag() {
+        let manifest = apply(
+            &backed_manifest(),
+            vec![set_schema_metadata(MANAGED_BLOBS_META_KEY, "true")],
+        )
+        .unwrap();
+
+        assert_ne!(manifest.reader_feature_flags & FLAG_MANAGED_BLOBS, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_MANAGED_BLOBS, 0);
+
+        let error = apply(
+            &backed_manifest(),
+            vec![set_schema_metadata(MANAGED_BLOBS_META_KEY, "maybe")],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("maybe"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Turning range segments on re-encodes every fragment once, breaking
+    /// `Range` runs a reader would otherwise fold into one interval across a
+    /// wide gap.
+    #[test]
+    fn test_enabling_range_segments_reencodes_row_ids() {
+        let mut row_ids = crate::rowids::RowIdSequence::from(0u64..100);
+        row_ids.extend(crate::rowids::RowIdSequence::from(1_000_000u64..1_000_100));
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+        fragment.physical_rows = Some(200);
+        let manifest = make_stable_row_id_manifest(vec![fragment]);
+
+        let next = apply(
+            &manifest,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![
+                        (crate::transaction::RANGE_SEGMENTS_CONFIG_KEY, Some("true")).into(),
+                    ],
+                    replace: false,
+                }),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        let Some(RowIdMeta::Inline(data)) = &next.fragments[0].row_id_meta else {
+            panic!("expected inline row ids");
+        };
+        assert!(!read_row_ids(data).unwrap().range_runs_span_a_gap());
     }
 }

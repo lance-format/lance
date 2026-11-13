@@ -218,14 +218,14 @@ mod tests {
             }),
             Action::SetDeletionFile(SetDeletionFile {
                 fragment: 6,
-                deletion_file: Some(DeletionFile {
+                deletion_file: DeletionFile {
                     read_version: 3,
                     id: 9,
                     file_type: DeletionFileType::Bitmap,
                     num_deleted_rows: Some(4),
                     base_id: None,
                     inline: None,
-                }),
+                },
                 data_change: true,
                 base: Some(Ref::Committed(2)),
             }),

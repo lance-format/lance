@@ -148,7 +148,7 @@ fn changes_auto_cleanup_config(operation: &Operation) -> bool {
 /// (their inline bytes are the very same allocation), so a commit pays only
 /// for the fragments it changed; enabling the key re-encodes every fragment
 /// once.
-fn apply_range_segments(
+pub(super) fn apply_range_segments(
     manifest: &mut Manifest,
     current_manifest: Option<&Manifest>,
 ) -> Result<()> {
