@@ -47,6 +47,10 @@ pub(in crate::index) async fn open_and_merge_segments(
             &NoOpMetricsCollector,
         )
         .await?;
+        let scalar_index = scalar_index
+            .as_any()
+            .downcast_ref::<lance_index::scalar::json::JsonIndex>()
+            .map_or(&scalar_index, |json| json.target_index());
         let bitmap_index = scalar_index
             .as_any()
             .downcast_ref::<BitmapIndex>()

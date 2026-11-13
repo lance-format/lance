@@ -33,7 +33,8 @@ pub(super) fn empty_value_row_id_stream(
         ))
     })?;
     let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
+        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true)
+            .with_metadata(field.metadata.clone()),
         ArrowField::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
     ]));
     Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -77,6 +78,10 @@ pub(crate) async fn open_and_merge_segments(
             &NoOpMetricsCollector,
         )
         .await?;
+        let scalar_index = scalar_index
+            .as_any()
+            .downcast_ref::<lance_index::scalar::json::JsonIndex>()
+            .map_or(&scalar_index, |json| json.target_index());
         let btree = scalar_index
             .as_any()
             .downcast_ref::<BTreeIndex>()

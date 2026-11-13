@@ -21,7 +21,7 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, NGram, Inverted) is split: tasks build one uncommitted segment each
+//! Bitmap, NGram, Inverted, and JSON over BTree/Bitmap/NGram) is split: tasks build one uncommitted segment each
 //! over a group of fragments, encoded against the model of a reference
 //! segment; merges combine the task results that carry their `group` with the
 //! committed segments they list into one segment. A task that is the only
@@ -2041,5 +2041,162 @@ mod tests {
         let segments = segments(&dataset, SCALAR_INDEX).await;
         assert_eq!(segments.len(), 1);
         assert_eq!(coverage(&segments), RoaringBitmap::from_iter([2u32, 3]));
+    }
+    #[rstest::rstest]
+    #[case::btree("btree")]
+    #[case::bitmap("bitmap")]
+    #[case::ngram("ngram")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_distributed_optimize(
+        #[case] target: &str,
+        #[values(2, 4)] task_rows: u64,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let values = if target == "ngram" {
+            vec![
+                Some(r#"{"x":"hit"}"#),
+                Some(r#"{"x":null}"#),
+                Some(r#"{"x":"hit"}"#),
+                Some(r#"{"x":"miss"}"#),
+                Some("{}"),
+                None,
+                Some(r#"{"x":"miss"}"#),
+                Some(r#"{"x":"hit"}"#),
+            ]
+        } else {
+            vec![
+                Some(r#"{"x":1}"#),
+                Some(r#"{"x":null}"#),
+                Some(r#"{"x":1}"#),
+                Some(r#"{"x":3}"#),
+                Some("{}"),
+                None,
+                Some(r#"{"x":2}"#),
+                Some(r#"{"x":1}"#),
+            ]
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("doc", DataType::Utf8, true).with_metadata(std::collections::HashMap::from(
+                [(
+                    lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                    lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+                )],
+            )),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])),
+                Arc::new(arrow_array::StringArray::from(values)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+            "target_index_type": target, "path": "x",
+        }));
+        let mut old = Vec::new();
+        for fragment in 0..2 {
+            old.push(
+                dataset
+                    .create_index_builder(&["doc"], IndexType::Scalar, &params)
+                    .name("doc_idx".into())
+                    .fragments(vec![fragment])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("doc_idx", "doc", old)
+            .await
+            .unwrap();
+        dataset.delete("id = 0").await.unwrap();
+        let options = OptimizeOptions::merge(2).max_rows_per_task(Some(task_rows));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), (4 / task_rows) as usize);
+        assert_eq!(plan.merges.len(), 1);
+        if task_rows == 4 {
+            assert_eq!(plan.tasks[0].old_segments.len(), 2);
+        } else {
+            assert_eq!(plan.merges[0].old_segments.len(), 2);
+        }
+        let indexed_files = dataset.fragments()[..2]
+            .iter()
+            .flat_map(|fragment| fragment.files.iter().map(|file| &file.path))
+            .collect::<Vec<_>>();
+        dataset.object_store.io_stats_incremental();
+        let results = execute_plan(&dataset, &plan).await;
+        let reads = dataset.object_store.io_stats_incremental();
+        assert!(
+            reads.requests.iter().all(|request| {
+                !indexed_files
+                    .iter()
+                    .any(|file| request.path.as_ref().ends_with(file.as_str()))
+            }),
+            "merge must not rescan the already-indexed JSON files"
+        );
+        commit_optimize_indices(&mut dataset, results, &options)
+            .await
+            .unwrap();
+        let merged = segments(&dataset, "doc_idx").await;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(coverage(&merged), *dataset.fragment_bitmap);
+        let predicate = if target == "ngram" {
+            "contains(json_get_string(doc, 'x'), 'hit')"
+        } else {
+            "json_get_int(doc, 'x') = 1"
+        };
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert!(
+            scan.explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ScalarIndex")
+        );
+        let indexed = scan.try_into_batch().await.unwrap();
+        let baseline = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .use_scalar_index(false)
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed, baseline);
+        assert_eq!(indexed.num_rows(), 2);
+        if target != "ngram" {
+            let nulls = dataset
+                .scan()
+                .filter("json_get_int(doc, 'x') IS NULL")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(nulls.num_rows(), 3);
+        }
+        // A second pass has no new data and no segment consolidation to do.
+        assert!(
+            plan_optimize_indices(&dataset, &options)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
     }
 }

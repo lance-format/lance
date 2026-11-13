@@ -1070,14 +1070,19 @@ async fn merge_scalar_indices<'a>(
     rebuild_frags |= &effective_old_frags;
     let new_uuid = Uuid::new_v4();
 
-    // Scalar Index that expos an N:1 segment-merge primitive reachable without
-    // rescanning the dataset
-    let has_segment_merge_primitive = matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram
-    );
+    // An N:1 merge primitive can reuse old index data without a dataset scan.
+    let json_merge_target = reference_idx
+        .index_details
+        .as_deref()
+        .and_then(super::scalar::json::merge_target_type);
+    let has_segment_merge_primitive = json_merge_target.is_some()
+        || matches!(
+            index_type,
+            IndexType::BTree | IndexType::Bitmap | IndexType::NGram
+        );
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let ngram_requires_rebuild = index_type == IndexType::NGram
+    let ngram_requires_rebuild = (index_type == IndexType::NGram
+        || json_merge_target == Some(IndexType::NGram))
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
@@ -1217,6 +1222,26 @@ async fn merge_scalar_indices<'a>(
             };
 
             match index_type {
+                IndexType::Scalar if json_merge_target.is_some() => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        migrated_to_row_addrs(reference_idx),
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    super::scalar::json::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
                 IndexType::BTree => {
                     let (_, old_data_filters) = build_per_segment_filters(
                         dataset.as_ref(),
@@ -5153,12 +5178,6 @@ mod tests {
 
     /// A JSON-wrapped BITMAP must keep working without stable row ids, where a
     /// row id and a row address are the same value.
-    ///
-    /// Creation only: unlike BTree (see the matching test below), Bitmap does
-    /// not report a `training_data_type`, so `JsonIndex::update` -- and so
-    /// `optimize_indices` -- is not supported for a JSON-wrapped Bitmap target
-    /// at all, regardless of stable row ids. Pre-existing and unrelated to the
-    /// row-address-domain migration.
     #[tokio::test]
     async fn test_json_wrapped_bitmap_create_without_stable_row_ids() {
         let test_dir = TempStrDir::default();

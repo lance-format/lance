@@ -10,8 +10,7 @@ use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::NGramIndex;
 use lance_index::scalar::{
-    BuiltinIndexType, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper,
-    ScalarIndexParams, index_files_to_table,
+    CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, index_files_to_table,
 };
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
@@ -109,12 +108,21 @@ pub(in crate::index) async fn merge_segments(
             .remap_fragment_bitmap(&mut fragment_bitmap)?;
         fragment_bitmap &= dataset.fragment_bitmap.as_ref();
         let field_path = dataset.schema().field_path(field_id)?;
+        let reference = super::open_scalar_index_with_plan(
+            dataset,
+            &field_path,
+            &segments[0],
+            staged.and_then(|plans| plans.get(&segments[0].uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         (
             super::build_scalar_index(
                 dataset,
                 &field_path,
                 new_uuid,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &reference.derive_index_params()?,
                 true,
                 Some(fragment_bitmap.iter().collect()),
                 None,
@@ -132,7 +140,24 @@ pub(in crate::index) async fn merge_segments(
             crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
                 .await?;
         let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-        (
+        let created = if segments[0]
+            .index_details
+            .as_deref()
+            .and_then(super::json::merge_target_type)
+            .is_some()
+        {
+            let field_path = dataset.schema().field_path(field_id)?;
+            super::json::open_and_merge_segments(
+                dataset,
+                &field_path,
+                &segment_refs,
+                None,
+                &new_store,
+                &old_data_filters,
+                staged,
+            )
+            .await?
+        } else {
             open_and_merge_segments(
                 dataset,
                 &segment_refs,
@@ -141,10 +166,9 @@ pub(in crate::index) async fn merge_segments(
                 &old_data_filters,
                 staged,
             )
-            .await?,
-            source_dataset_version,
-            fragment_bitmap,
-        )
+            .await?
+        };
+        (created, source_dataset_version, fragment_bitmap)
     };
 
     Ok(IndexMetadata {
