@@ -14,7 +14,7 @@ use crate::dataset::{
 };
 
 use crate::index::DatasetIndexExt;
-use crate::utils::test::geo;
+use crate::utils::test::{copy_test_data_to_tmp, geo};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::UInt32Array;
@@ -1161,5 +1161,201 @@ async fn test_rtree_distributed_optimize(
                 "predicate: {predicate}, use_index: {use_index}"
             );
         }
+    }
+}
+
+/// Little-endian WKB for a 2D point, the layout geoarrow infers for a plain
+/// binary column.
+fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(21);
+    bytes.push(1);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes
+}
+
+/// The fixture's rows, with NULLs where `id % 5 == 3`.
+fn rtree_fixture_append_batch(
+    schema: arrow_schema::SchemaRef,
+    first_id: i32,
+    count: i32,
+) -> RecordBatch {
+    let ids: Vec<i32> = (first_id..first_id + count).collect();
+    let geometries: Vec<Option<Vec<u8>>> = ids
+        .iter()
+        .map(|id| (*id % 5 != 3).then(|| wkb_point(*id as f64, *id as f64)))
+        .collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int32Array::from(ids)),
+            Arc::new(arrow_array::BinaryArray::from_iter(
+                geometries.iter().map(|geometry| geometry.as_deref()),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// Bounded optimize must migrate a released RTree cohort as a whole.
+///
+/// Lance 14.0.2, a stable release from before RTree moved to the row-address
+/// domain, wrote format version 0, whose segments store logical row IDs. A
+/// split plan rebuilds only the segments it absorbs, so with the default
+/// `num_indices_to_merge` the older v0 segment would survive beside the
+/// address-domain result and the commit is rejected for mixing domains.
+/// The single-process migration folds every v0 segment into one rebuild;
+/// bounded optimize has to fall back to it, and must split normally once the
+/// index is migrated.
+#[tokio::test]
+async fn test_rtree_bounded_optimize_migrates_whole_legacy_cohort() {
+    let dir =
+        copy_test_data_to_tmp("v14.0.2/rtree_row_id_domain/rtree_row_id_domain.lance").unwrap();
+    let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+    assert!(dataset.manifest.uses_stable_row_ids());
+    let legacy = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(legacy.len(), 2);
+    assert!(
+        legacy
+            .iter()
+            .all(|segment| segment.index_version == 0 && !segment.results_are_row_addrs()),
+        "the fixture must be a released row-ID-domain cohort: {legacy:?}"
+    );
+
+    let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+    assert_eq!(
+        schema.fields().len(),
+        2,
+        "fixture schema changed: {schema:?}"
+    );
+    let appended = rtree_fixture_append_batch(schema.clone(), 16, 8);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema.clone()),
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    // Default `num_indices_to_merge` selects the trailing segment only; the
+    // single-process plan absorbs the whole legacy cohort into one rebuild.
+    let options = OptimizeOptions::default().max_rows_per_task(Some(4));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tasks.len(),
+        1,
+        "legacy cohort must rebuild in one task"
+    );
+    assert_eq!(plan.tasks[0].old_segments.len(), 2, "all v0 segments join");
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.push(task.execute(&dataset).await.unwrap().unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
+    }
+    crate::index::optimize::commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+    dataset.validate().await.unwrap();
+
+    let committed = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert!(committed[0].results_are_row_addrs());
+    assert_eq!(
+        committed[0].index_version,
+        lance_geo::rtree::RTREE_ROW_ADDR_DOMAIN_VERSION as i32
+    );
+    assert_eq!(committed[0].fragment_bitmap.as_ref().unwrap().len(), 3);
+
+    assert_rtree_scan_rows(&dataset, "geometry IS NULL", vec![3, 8, 13, 18, 23]).await;
+    assert_rtree_scan_rows(
+        &dataset,
+        "ST_Intersects(geometry, ST_GeomFromText('POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0))'))",
+        vec![0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20],
+    )
+    .await;
+    assert_rtree_scan_rows(
+        &dataset,
+        "ST_Intersects(geometry, ST_GeomFromText('POINT (20 20)'))",
+        vec![20],
+    )
+    .await;
+
+    // The migrated index is address-domain, so a later bounded optimize splits
+    // again instead of rebuilding everything in one task.
+    let appended = rtree_fixture_append_batch(schema.clone(), 24, 8);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 5);
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tasks.len(),
+        2,
+        "address-domain cohort splits: {plan:?}"
+    );
+    assert_eq!(plan.merges.len(), 1);
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.push(task.execute(&dataset).await.unwrap().unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
+    }
+    crate::index::optimize::commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+    dataset.validate().await.unwrap();
+    let committed = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert_eq!(committed[0].fragment_bitmap.as_ref().unwrap().len(), 5);
+    assert_rtree_scan_rows(&dataset, "geometry IS NULL", vec![3, 8, 13, 18, 23, 28]).await;
+    assert_rtree_scan_rows(
+        &dataset,
+        "ST_Intersects(geometry, ST_GeomFromText('POINT (30 30)'))",
+        vec![30],
+    )
+    .await;
+}
+
+/// Run `predicate` with and without the scalar index and compare both to the
+/// fixture rows, asserting the indexed plan really used the index.
+async fn assert_rtree_scan_rows(dataset: &Dataset, predicate: &str, expected: Vec<i32>) {
+    for use_index in [true, false] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .filter(predicate)
+            .unwrap()
+            .use_scalar_index(use_index);
+        if use_index {
+            assert_contains!(scan.explain_plan(false).await.unwrap(), "ScalarIndexQuery");
+        }
+        let result = scan.try_into_batch().await.unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(
+            ids, expected,
+            "predicate: {predicate}, use_index: {use_index}"
+        );
     }
 }
