@@ -737,10 +737,13 @@ impl MemTableFlusher {
                 }
                 FlushOutcome::Wrote(index_meta) => {
                     // Queries find a generation's index by name and field.
-                    if index_meta.name != spec.name || index_meta.fields != spec.field_ids {
+                    if index_meta.name != spec.name || index_meta.keyed_fields() != spec.field_ids {
                         return Err(Error::internal(format!(
                             "index '{}' on fields {:?} recorded its file as '{}' on fields {:?}",
-                            spec.name, spec.field_ids, index_meta.name, index_meta.fields
+                            spec.name,
+                            spec.field_ids,
+                            index_meta.name,
+                            index_meta.keyed_fields()
                         )));
                     }
                     created.push(*index_meta);
@@ -937,8 +940,9 @@ async fn build_scalar_index(
     }
     let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
     let params = spec.plugin.flush_params(spec)?;
-    let mut builder =
-        CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
+    let mut builder = CreateIndexBuilder::new(dataset, &columns, index_type, &params)
+        .name(spec.name.clone())
+        .without_memory_observation();
     if let Some(stream) = training_data {
         // Memtable positions are the flushed file's row ids, so no remap.
         builder = builder.preprocessed_stream(stream, spec.plugin.training_criteria());

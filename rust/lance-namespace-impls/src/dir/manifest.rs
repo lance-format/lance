@@ -1020,6 +1020,7 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
         // CommitConflict: version collision retries exhausted -> Throttling (safe to retry)
         LanceError::CommitConflict { .. } => NamespaceError::Throttling {
             message: format!("Too many concurrent writes, please retry later: {:?}", e),
+            retry_after: None,
         }
         .into(),
         // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
@@ -4109,7 +4110,7 @@ impl LanceNamespace for ManifestNamespace {
 
         // Atomically create the .lance-reserved file to mark the table as declared.
         // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
-        // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
+        // publication + MarkerFileError::AlreadyExists → TableAlreadyExists).
         let reserved_file_path = table_path.clone().join(".lance-reserved");
         super::put_marker_file_atomic(
             &self.object_store,

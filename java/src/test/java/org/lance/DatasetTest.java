@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.compaction.CompactionOptions;
 import org.lance.file.FileWriteOptions;
+import org.lance.fragment.DeletionFile;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -266,6 +267,46 @@ public class DatasetTest {
         () -> {
           dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
         });
+  }
+
+  @Test
+  void testOpenMissingDatasetThrowsDatasetNotFound(@TempDir Path tempDir) {
+    String missingPath = tempDir.resolve("missing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DatasetNotFoundException error =
+          assertThrows(DatasetNotFoundException.class, () -> Dataset.open(missingPath, allocator));
+      assertTrue(error.getMessage().contains("missing_dataset"), error.getMessage());
+      // Handlers written for the IllegalArgumentException thrown before still catch it.
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testCreateExistingDatasetThrowsDatasetAlreadyExists(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("existing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      DatasetAlreadyExistsException error =
+          assertThrows(DatasetAlreadyExistsException.class, testDataset::createEmptyDataset);
+      assertTrue(error.getMessage().contains("existing_dataset"), error.getMessage());
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testOpenUnknownSchemeIsNotDatasetNotFound() {
+    // Invalid input is still reported as a plain IllegalArgumentException, so callers can tell it
+    // apart from a missing dataset.
+    try (BufferAllocator allocator = new RootAllocator()) {
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> Dataset.open("nosuchscheme://bucket/table.lance", allocator));
+      assertEquals(IllegalArgumentException.class, error.getClass(), error.getMessage());
+      assertTrue(error.getMessage().contains("nosuchscheme"), error.getMessage());
+    }
   }
 
   @Test
@@ -550,6 +591,14 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         dataset2.tags().delete("tag_on_branch");
         assertEquals(1, dataset2.tags().list().size());
+
+        dataset2.tags().update("tag1", 2);
+        assertEquals(2, dataset2.tags().getVersion("tag1"));
+        Dataset.Tags tags = dataset2.tags();
+        dataset2.close();
+        IllegalArgumentException closed =
+            assertThrows(IllegalArgumentException.class, () -> tags.update("tag1", 1));
+        assertTrue(closed.getMessage().contains("Dataset is closed"));
       }
     }
   }
@@ -1636,6 +1685,79 @@ public class DatasetTest {
   }
 
   @Test
+  void testGetRowAddresses(@TempDir Path tempDir) throws IOException {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
+      dataset =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build());
+      testDataset.write(1, 5).close();
+      try (Dataset ds = testDataset.write(2, 5)) {
+        // Row ids 0-4 live in the first fragment and 5-9 in the second.
+        long second = ds.getFragments().get(1).getId();
+        assertEquals(
+            Arrays.asList(second << 32 | 2, null), ds.getRowAddresses(Arrays.asList(7L, 99L)));
+
+        // Compaction moves every row into one new fragment but keeps its id; deleted rows
+        // (ids 2 and 7 hold id = 2) no longer resolve.
+        ds.compact();
+        ds.delete("id = 2");
+        assertEquals(1, ds.getFragments().size());
+        long compacted = ds.getFragments().get(0).getId();
+        assertEquals(
+            Arrays.asList(compacted << 32 | 8, null, compacted << 32 | 1, compacted << 32 | 8),
+            ds.getRowAddresses(Arrays.asList(8L, 7L, 1L, 8L)));
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("plain").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset ds = testDataset.write(1, 5)) {
+        // Without stable row ids a row id is its address, so ids pass through unchanged.
+        List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
+        assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String datasetPath = tempDir.resolve("deletion-io").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset
+          .createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())
+          .close();
+      testDataset.write(1, 5).close();
+
+      Path deletionFile;
+      try (Dataset ds = testDataset.write(2, 5)) {
+        ds.delete("id = 2");
+        Fragment fragment = ds.getFragments().get(0);
+        DeletionFile deletion = fragment.metadata().getDeletionFile();
+        assertNotNull(deletion);
+        String relativePath = deletion.getRelativePath(fragment.getId());
+        assertNotNull(relativePath);
+        deletionFile = Path.of(datasetPath).resolve(relativePath);
+      }
+
+      assertTrue(Files.deleteIfExists(deletionFile), "deletion file should exist");
+
+      try (Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        // A cold empty lookup must return before loading row-id metadata or deletion files.
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+        IOException error =
+            assertThrows(
+                IOException.class, () -> ds.getRowAddresses(Collections.singletonList(0L)));
+        assertTrue(error.getMessage().contains("_deletions"), error.getMessage());
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -2084,8 +2206,32 @@ public class DatasetTest {
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
 
-                  // Delete branch1 and verify listing
+                  // Delete branch2 and reject checkout and writes through its stale handle.
                   mainV2.branches().delete("branch2");
+                  assertEquals(1, mainV2.branches().list().size());
+                  RuntimeException deletedBranch =
+                      assertThrows(
+                          RuntimeException.class, () -> mainV2.checkout(Ref.ofBranch("branch2")));
+                  assertTrue(
+                      deletedBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      deletedBranch.getMessage());
+                  RuntimeException staleCommit =
+                      assertThrows(
+                          RuntimeException.class,
+                          () ->
+                              branch2V4
+                                  .newTransactionBuilder()
+                                  .operation(appendC)
+                                  .build()
+                                  .commit());
+                  assertTrue(
+                      staleCommit
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      staleCommit.getMessage());
+                  assertEquals(4, branch2V4.version());
                   assertEquals(1, mainV2.branches().list().size());
 
                   // Step 6. use checkout_branch to checkout branch1
@@ -2145,11 +2291,15 @@ public class DatasetTest {
                     assertEquals(8, opened.countRows()); // A(5) + B(3)
                     assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
                   }
-                  IOException missing =
+                  RuntimeException missingBranch =
                       assertThrows(
-                          IOException.class,
+                          RuntimeException.class,
                           () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
-                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  assertTrue(
+                      missingBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch no_such_branch does not exist"),
+                      missingBranch.getMessage());
                   RuntimeException missingTag =
                       assertThrows(
                           RuntimeException.class,

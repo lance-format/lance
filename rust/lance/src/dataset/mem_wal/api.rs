@@ -1101,7 +1101,7 @@ async fn build_index_specs(
         };
 
         let columns = match index_meta
-            .fields
+            .keyed_fields()
             .iter()
             .map(|field_id| column_path(dataset.schema(), index_name, *field_id))
             .collect::<Result<Vec<_>>>()
@@ -1135,7 +1135,7 @@ async fn build_index_specs(
         let field_ids =
             match resolved.field_ids {
                 // The index's own columns keep its own field ids.
-                None if resolved.columns == columns => Ok(index_meta.fields.clone()),
+                None if resolved.columns == columns => Ok(index_meta.keyed_fields().to_vec()),
                 None => resolved
                     .columns
                     .iter()
@@ -1265,21 +1265,31 @@ pub async fn validate_maintained_indexes_with(
 #[cfg(test)]
 mod tests {
     use super::super::index::HnswParams;
-    use super::super::scanner::SsTableCache;
+    use super::super::scanner::{LsmScanner, ShardSnapshot, SsTableCache};
     use super::*;
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
         Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
     use lance_index::IndexType;
     use lance_index::scalar::inverted::DocumentGranularity;
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_table::feature_flags::{
+        FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS,
+    };
+    use lance_table::format::IndexMetadata;
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::session::Session;
 
     fn id_v_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -2751,5 +2761,291 @@ mod tests {
             vec!["id_idx".to_string()]
         );
         writer.close().await.unwrap();
+    }
+
+    /// `id` as the unenforced primary key, which the fresh-tier scan
+    /// deduplicates on.
+    fn primary_key_id() -> Field {
+        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+            "true".to_string(),
+        )]))
+    }
+
+    fn id_v_schema_with_primary_key() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            primary_key_id(),
+            Field::new("v", DataType::Int32, true),
+        ]))
+    }
+
+    async fn id_v_dataset_with_primary_key(uri: &str, ids: &[i32]) -> Dataset {
+        let schema = id_v_schema_with_primary_key();
+        let batch = id_v_batch(&schema, ids);
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            uri,
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Redeclares the index `name` as carrying `carried`, in the suffix layout
+    /// or keys-only.
+    async fn declare_carried_column(
+        dataset: &mut Dataset,
+        name: &str,
+        carried: &str,
+        keys_only: bool,
+    ) {
+        let plain = dataset.load_indices_by_name(name).await.unwrap().remove(0);
+        let carried = dataset.schema().field_id(carried).unwrap();
+        let fields = if keys_only {
+            plain.fields.clone()
+        } else {
+            [plain.fields.as_slice(), &[carried]].concat()
+        };
+        let covered = IndexMetadata {
+            fields,
+            covering_fields: vec![carried],
+            ..plain.clone()
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: vec![plain],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// Writes `batch` through `writer` and flushes it, checks that the flushed
+    /// generation carries `index_name`, and returns the ids that `filter`
+    /// finds across the base table and the fresh tier.
+    async fn flush_and_filter(
+        uri: &str,
+        dataset: &Dataset,
+        writer: ShardWriter,
+        batch: RecordBatch,
+        index_name: &str,
+        filter: &str,
+    ) -> Vec<i32> {
+        writer.put(vec![batch]).await.unwrap();
+        writer.force_freeze_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        let dir_id = writer.config().dir_id.clone();
+        writer.close().await.unwrap();
+        let [sstable] = manifest.sstables.as_slice() else {
+            panic!(
+                "expected one flushed generation, got {:?}",
+                manifest.sstables
+            );
+        };
+        let generation = Dataset::open(&sstable_uri(
+            uri,
+            &dir_id,
+            &manifest.shard_id,
+            &sstable.path,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            generation
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .any(|index| index.name == index_name),
+            "the flushed generation must carry '{index_name}'"
+        );
+        let snapshot = ShardSnapshot::new(manifest.shard_id)
+            .with_current_generation(manifest.current_generation)
+            .with_sstable(sstable.generation, sstable.path.clone());
+        let batches: Vec<RecordBatch> = LsmScanner::new(
+            Arc::new(dataset.clone()),
+            vec![snapshot],
+            vec!["id".to_string()],
+        )
+        .with_mem_wal_dir_id(dir_id)
+        .filter(filter)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| batch["id"].as_primitive::<Int32Type>().values().to_vec())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[rstest]
+    #[case::suffix(false)]
+    #[case::keys_only(true)]
+    #[tokio::test]
+    async fn test_a_covered_btree_is_maintained_in_either_layout(#[case] keys_only: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let mut dataset = id_v_dataset_with_primary_key(&uri, &[1, 2, 3]).await;
+        dataset
+            .create_index(
+                &["v"],
+                IndexType::BTree,
+                Some("v_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        declare_carried_column(&mut dataset, "v_btree", "id", keys_only).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["v_btree".to_string()]
+        );
+        let batch = id_v_batch(&id_v_schema_with_primary_key(), &[10, 11, 12]);
+        let ids = flush_and_filter(&uri, &dataset, writer, batch, "v_btree", "v >= 100").await;
+
+        assert_eq!(ids, vec![10, 11, 12]);
+    }
+
+    #[rstest]
+    #[case::suffix(false)]
+    #[case::keys_only(true)]
+    #[tokio::test]
+    async fn test_a_covered_full_text_index_is_maintained_in_either_layout(
+        #[case] keys_only: bool,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            primary_key_id(),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let rows = |ids: &[i32], words: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from(words.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(rows(&[1, 2], &["alpha", "beta"]))], schema.clone()),
+            &uri,
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        declare_carried_column(&mut dataset, "text_fts", "id", keys_only).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["text_fts".to_string()]
+        );
+        let batch = rows(&[10, 11], &["alpha gamma", "delta"]);
+        let ids = flush_and_filter(&uri, &dataset, writer, batch, "text_fts", "id >= 10").await;
+
+        assert_eq!(ids, vec![10, 11]);
+    }
+
+    /// The writer opens while `v_btree` is in the suffix layout. Another
+    /// session then commits a keys-only index, which sets the independent bit
+    /// and stores `v_btree` keys-only.
+    #[tokio::test]
+    async fn test_a_writer_flushes_after_another_session_stores_its_index_keys_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let mut dataset = id_v_dataset_with_primary_key(&uri, &[1, 2, 3]).await;
+        for (column, name) in [("v", "v_btree"), ("id", "id_btree")] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    Some(name.to_string()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        declare_carried_column(&mut dataset, "v_btree", "id", false).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(["v_btree"])
+            .execute()
+            .await
+            .unwrap();
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+
+        let mut other_session = DatasetBuilder::from_uri(&uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        declare_carried_column(&mut other_session, "id_btree", "v", true).await;
+        let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert_eq!(
+            other_session.manifest.reader_feature_flags & covering,
+            covering
+        );
+        let v = other_session.schema().field_id("v").unwrap();
+        let stored = other_session.load_indices_by_name("v_btree").await.unwrap();
+        assert_eq!(stored[0].fields, vec![v]);
+
+        let batch = id_v_batch(&id_v_schema_with_primary_key(), &[10, 11, 12]);
+        let ids = flush_and_filter(&uri, &dataset, writer, batch, "v_btree", "v >= 100").await;
+
+        assert_eq!(ids, vec![10, 11, 12]);
     }
 }

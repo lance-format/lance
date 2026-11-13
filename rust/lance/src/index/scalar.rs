@@ -10,6 +10,7 @@ pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
+pub(crate) mod list_element;
 pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
@@ -26,6 +27,7 @@ use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use crate::index::DatasetIndexExt;
+use crate::index::create::CreateIndexBuilder;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
@@ -325,11 +327,13 @@ pub(crate) async fn load_fts_training_data(
     // scanner and indexing workers. Keep explicit reader settings, and apply
     // a byte target only to this training scan, not to the caller's dataset.
     let mut dataset = dataset.clone();
-    dataset
-        .file_reader_options
-        .get_or_insert_with(Default::default)
-        .batch_size_bytes
-        .get_or_insert(16 * 1024 * 1024);
+    Arc::make_mut(
+        dataset
+            .file_reader_options
+            .get_or_insert_with(Default::default),
+    )
+    .batch_size_bytes
+    .get_or_insert(16 * 1024 * 1024);
     let scan_column = if resolved.has_lists() {
         resolved.root_column.as_str()
     } else {
@@ -361,8 +365,22 @@ pub(crate) async fn load_fts_training_data(
     }
 }
 
+// The R-tree plugin is added here because `register_scalar_index_plugin` only works before the
+// first default registry is built, and code outside `lance` can build one at any time.
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| {
+        #[cfg(feature = "geo")]
+        {
+            IndexPluginRegistry::with_default_plugins_and(|registry| {
+                registry.add_plugin::<
+                    lance_index::pb::RTreeIndexDetails,
+                    lance_geo::rtree::RTreeIndexPlugin,
+                >();
+            })
+        }
+        #[cfg(not(feature = "geo"))]
+        IndexPluginRegistry::with_default_plugins()
+    });
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
@@ -420,6 +438,68 @@ impl IndexDetails {
     }
 }
 
+/// The format version of `index_type` from before it moved to the row-address
+/// domain, for the index types that did so with a version bump.
+pub(in crate::index) fn row_id_domain_version(index_type: &str) -> Option<u32> {
+    use lance_index::scalar::{bitmap, btree, label_list, ngram};
+    let is = |builtin: BuiltinIndexType| index_type.eq_ignore_ascii_case(builtin.as_str());
+    #[cfg(feature = "geo")]
+    if is(BuiltinIndexType::RTree) {
+        return Some(lance_geo::rtree::RTREE_ROW_ID_DOMAIN_VERSION);
+    }
+    if is(BuiltinIndexType::BTree) {
+        Some(btree::BTREE_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::Bitmap) {
+        Some(bitmap::BITMAP_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::LabelList) {
+        Some(label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::NGram) {
+        Some(ngram::NGRAM_ROW_ID_DOMAIN_VERSION)
+    } else {
+        None
+    }
+}
+
+/// The domain (see [`IndexMetadata::results_are_row_addrs`]) shared by
+/// `segments`, for a merge that reuses their stored data without a rescan and
+/// so writes its result in that same domain.
+///
+/// Refuses segments that disagree, since their stored identifiers would be
+/// combined as-is, and -- on a dataset with stable row ids -- a segment
+/// persisted before its type moved to the row-address domain: its row ids
+/// differ from the row addresses newly scanned data holds. Such a segment
+/// must be rebuilt first (e.g. with `create_index(..., replace: true)`).
+pub(in crate::index) fn shared_segment_domain(
+    dataset: &Dataset,
+    index_type: &str,
+    segments: &[&IndexMetadata],
+) -> Result<bool> {
+    let Some(first) = segments.first() else {
+        return Ok(true);
+    };
+    let results_are_row_addrs = first.results_are_row_addrs();
+    if let Some(other) = segments
+        .iter()
+        .find(|segment| segment.results_are_row_addrs() != results_are_row_addrs)
+    {
+        return Err(Error::invalid_input(format!(
+            "{index_type} segments {} and {} disagree on whether they store row ids or row \
+             addresses and cannot be merged; rebuild the index first (e.g. with \
+             create_index(..., replace: true))",
+            first.uuid, other.uuid,
+        )));
+    }
+    if !results_are_row_addrs && dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(format!(
+            "{index_type} segment {} predates row-address-domain support and cannot be merged \
+             on a dataset with stable row IDs; rebuild it first (e.g. with \
+             create_index(..., replace: true))",
+            first.uuid,
+        )));
+    }
+    Ok(results_are_row_addrs)
+}
+
 /// Build a Scalar Index (returns details to store in the manifest)
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
@@ -433,43 +513,6 @@ pub(super) async fn build_scalar_index(
     preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
-    // A JSON-wrapped BTREE/Bitmap/LabelList index cannot yet carry the
-    // row-address-domain migration through its own metadata: `JsonIndexDetails`
-    // has no field for the target's persisted version (`JsonIndexPlugin::load_index`
-    // stands in with the target plugin's current max version instead), and the
-    // generic domain-safety checks that protect a plain segment during
-    // merge/compaction (`IndexMetadata::results_are_row_addrs`, append.rs's
-    // `legacy_domain_mismatch`) key off the index's own type_url, which a
-    // JSON wrapper's details never match. A wrapped segment that genuinely
-    // stored row addresses on a stable-row-id dataset would be invisible to
-    // all of that machinery, which assumes row-id domain by construction.
-    // Reject it outright until the wrapper preserves the target's own domain
-    // through its own metadata (lance-format/lance#9721); a plain (non-wrapped)
-    // index of any of these types is unaffected, and so is this same
-    // combination without stable row ids, where a row id already is a row
-    // address.
-    if params.index_type.eq_ignore_ascii_case("json")
-        && dataset.manifest.uses_stable_row_ids()
-        && let Some(target) = params
-            .params
-            .as_deref()
-            .and_then(lance_index::scalar::json::json_wrapped_target_type)
-        && let Some(builtin) = [
-            BuiltinIndexType::BTree,
-            BuiltinIndexType::Bitmap,
-            BuiltinIndexType::LabelList,
-        ]
-        .into_iter()
-        .find(|builtin| target.eq_ignore_ascii_case(builtin.as_str()))
-    {
-        let name = builtin.as_str().to_uppercase();
-        return Err(Error::not_supported(format!(
-            "a JSON-wrapped {name} index is not yet supported on a dataset with stable row \
-             ids enabled -- create a plain {name} index on this column instead, or disable \
-             stable row ids for this dataset"
-        )));
-    }
-
     let inverted_params = (params.index_type.eq_ignore_ascii_case("inverted")
         || params.index_type.eq_ignore_ascii_case("fts"))
     .then(|| serde_json::from_str::<InvertedIndexParams>(params.params.as_deref().unwrap_or("{}")))
@@ -607,35 +650,37 @@ pub(super) async fn build_scalar_index(
         )
         .await?;
 
-    // BTree, Bitmap, and LabelList always train on physical row addresses --
-    // the plugins' TrainingCriteria has no per-dataset awareness to vary
-    // that -- but a row address and a row id are the same value on a
+    // A list-element index names its keys; record which fields they are, so
+    // the index follows them through renames.
+    if list_element::is_list_element(&created_index.index_details) {
+        let indexed_field = dataset
+            .schema()
+            .field(column)
+            .ok_or_else(|| Error::invalid_input(format!("No column with name {column}")))?;
+        list_element::record_key_field_ids(indexed_field, &mut created_index)?;
+    }
+
+    // BTree, Bitmap, LabelList, NGram, and RTree always train on physical row
+    // addresses -- the plugins' TrainingCriteria has no per-dataset awareness
+    // to vary that -- but a row address and a row id are the same value on a
     // dataset that does not use stable row ids, so the trained page data is
     // identical either way there. Label it with the pre-migration version in
     // that case: an old build already understands it, so a user who never
     // turns on stable row ids sees no forward-compatibility impact from the
     // address-domain migration (see BTREE_ROW_ID_DOMAIN_VERSION,
-    // BITMAP_ROW_ID_DOMAIN_VERSION, and LABEL_LIST_ROW_ID_DOMAIN_VERSION).
+    // BITMAP_ROW_ID_DOMAIN_VERSION, LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+    // NGRAM_ROW_ID_DOMAIN_VERSION, and RTREE_ROW_ID_DOMAIN_VERSION).
     // Only a stable-row-id dataset -- where the two domains genuinely
     // diverge -- needs the address-domain version these plugins actually
     // trained.
     if !dataset.manifest.uses_stable_row_ids() {
-        if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
-        {
-            created_index.index_version = lance_index::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION;
-        } else if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::Bitmap.as_str())
-        {
-            created_index.index_version = lance_index::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION;
-        } else if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::LabelList.as_str())
-        {
-            created_index.index_version =
-                lance_index::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION;
+        if let Some(version) = row_id_domain_version(&params.index_type) {
+            created_index.index_version = version;
+        } else if params.index_type.eq_ignore_ascii_case("json") {
+            // A JSON index trains its target the same way the target's own
+            // plugin would, so the same relabeling applies to a wrapped BTree,
+            // Bitmap, or LabelList.
+            lance_index::scalar::json::relabel_as_row_id_domain(&mut created_index)?;
         }
     }
 
@@ -889,7 +934,10 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
-    let index_details = fetch_index_details(dataset, column, index).await?;
+    let mut index_details = fetch_index_details(dataset, column, index).await?;
+    if list_element::is_list_element(&index_details) {
+        index_details = list_element::details_for_open(dataset.schema(), index, index_details)?;
+    }
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
     let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
@@ -901,7 +949,7 @@ pub(crate) async fn open_scalar_index_with_plan(
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
     let (frag_reuse_index, batch_remapping) =
         match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
+            Some(ResolvedRemapping::V0 { remapper, .. }) => (Some(remapper.clone()), None),
             // An untouched segment on a tagged dataset loads the original way,
             // with no remapper; every plugin (including legacy-API-only ones)
             // supports this.
@@ -913,12 +961,13 @@ pub(crate) async fn open_scalar_index_with_plan(
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
     // already validated this session, saving the extra `open_index_file` IOP.
-    let load: ScalarIndexLoad = Box::pin({
+    let make_load = || -> ScalarIndexLoad<'_> {
         let index_store = index_store.clone();
         let batch_remapping = batch_remapping.clone();
         let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
-        async move {
+        let index_details = index_details.clone();
+        Box::pin(async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
                 validate_label_list_index_compatibility(
                     dataset,
@@ -959,26 +1008,37 @@ pub(crate) async fn open_scalar_index_with_plan(
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
             metrics.record_index_load();
             Ok(index)
-        }
-    });
+        })
+    };
 
-    if batch_remapping.is_some() {
+    let opened = if let Some(batch_remapping) = batch_remapping.clone() {
         let rebind_store = index_store.clone();
         lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
-            index_store,
+            index_store.clone(),
             &index_cache,
-            load,
+            make_load(),
             move |index| async move {
-                plugin.rebind_with_remapping(index.as_ref(), rebind_store, batch_remapping)
+                plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(batch_remapping))
             },
             |index| plugin.cache_snapshot(index),
         )
-        .await
+        .await?
     } else {
         plugin
-            .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-            .await
+            .get_or_insert_in_cache(
+                index_store.clone(),
+                frag_reuse_index.clone(),
+                &index_cache,
+                make_load(),
+            )
+            .await?
+    };
+    // A list-element index cached before a rename reads its keys by their old
+    // names. Searching does not use them, but updating does, so load it again.
+    if list_element::has_other_key_names(opened.as_ref(), &index_details) {
+        return make_load().await;
     }
+    Ok(opened)
 }
 
 pub(crate) async fn cached_scalar_index_container(
@@ -1207,15 +1267,15 @@ pub async fn initialize_scalar_index(
             inverted_params.get_document_granularity(),
         )?;
 
-        target_dataset
-            .create_index(
-                &[&resolved.canonical_path],
-                index_type,
-                Some(source_index.name.clone()),
-                &inverted_params,
-                false,
-            )
-            .await?;
+        CreateIndexBuilder::new(
+            target_dataset,
+            &[&resolved.canonical_path],
+            index_type,
+            &inverted_params,
+        )
+        .name(source_index.name.clone())
+        .copy_of_existing()
+        .await?;
     } else {
         target_dataset
             .create_index(
@@ -1813,11 +1873,11 @@ mod tests {
             .await
             .unwrap();
         if let Some(byte_target) = byte_target {
-            dataset.file_reader_options = Some(lance_file::reader::FileReaderOptions {
+            dataset.file_reader_options = Some(Arc::new(lance_file::reader::FileReaderOptions {
                 batch_size_bytes: Some(byte_target),
                 read_chunk_size: 1024 * 1024,
                 ..Default::default()
-            });
+            }));
         }
         assert!(largest_original_batch(&dataset).await >= 40);
         let params = InvertedIndexParams::default().num_workers(workers);

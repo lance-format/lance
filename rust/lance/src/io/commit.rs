@@ -34,7 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
-use lance_table::feature_flags::ensure_can_write_manifest;
+use lance_table::feature_flags::{CoveringContract, ensure_can_write_manifest};
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
     WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
@@ -489,10 +489,11 @@ async fn do_commit_new_dataset(
             let reader = source_store.open(&source_manifest_location.path).await?;
             let section: pb::IndexSection =
                 lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            let contract = CoveringContract::of(&source_manifest);
             section
                 .indices
                 .into_iter()
-                .map(IndexMetadata::try_from)
+                .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
@@ -616,7 +617,8 @@ async fn do_commit_new_dataset(
                     None,
                     None,
                     None,
-                )?;
+                )
+                .await?;
                 crate::dataset::blob::clone::copy_blob_columns(
                     Arc::new(source),
                     Arc::new(object_store.clone()),
@@ -1409,6 +1411,22 @@ pub(crate) async fn do_commit_detached_transaction(
             }
         };
 
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                dataset,
+                &transaction.operation,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            }
+            checked
+        })
+        .await?;
+
         manifest.version = random_version;
 
         // recompute_stats is always false so far because detached manifests are newer than
@@ -1452,6 +1470,7 @@ pub(crate) async fn do_commit_detached_transaction(
         }
 
         // Try to commit the manifest
+        dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -1577,7 +1596,8 @@ pub(crate) async fn commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
-    do_commit_detached_transaction(
+    dataset.ensure_branch_exists().await?;
+    let result = do_commit_detached_transaction(
         dataset,
         object_store,
         commit_handler,
@@ -1586,7 +1606,9 @@ pub(crate) async fn commit_detached_transaction(
         commit_config,
         retry_timeout,
     )
-    .await
+    .await;
+    dataset.ensure_branch_exists().await?;
+    result
 }
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
@@ -1650,7 +1672,14 @@ async fn prepare_attempt(
         &dataset.manifest.fragments,
     )
     .is_empty();
-    let ledger = if rewrites_in_place {
+    // A deferred rewrite withdrawing an undeferrable segment's coverage walks
+    // the history too, to find the retired sources that reach the rewritten
+    // fragments.
+    let withdraws_undeferrable = matches!(
+        &frag_reuse,
+        FragReuseUpdate::Rewrite(assembly) if !assembly.undeferrable_segments.is_empty()
+    );
+    let ledger = if rewrites_in_place || withdraws_undeferrable {
         match indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -1695,7 +1724,8 @@ async fn record_successful_commit(
     location: &ManifestLocation,
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
-) {
+) -> Result<()> {
+    dataset.ensure_branch_exists().await?;
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
     };
@@ -1718,6 +1748,11 @@ async fn record_successful_commit(
             store_identity: &dataset.object_store.store_prefix,
             e_tag: location.e_tag.as_deref(),
         };
+        let contract = CoveringContract::of(manifest);
+        let indices = indices
+            .into_iter()
+            .map(|index| index.into_stored_shape(contract))
+            .collect::<Vec<_>>();
         dataset
             .index_cache
             .insert_with_key(&key, Arc::new(indices))
@@ -1734,6 +1769,7 @@ async fn record_successful_commit(
             _ => {}
         };
     }
+    dataset.ensure_branch_exists().await
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
@@ -1750,6 +1786,7 @@ pub(crate) async fn commit_transaction(
     affected_rows: Option<&RowAddrTreeMap>,
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -1862,7 +1899,9 @@ pub(crate) async fn commit_transaction(
             // started at exact same time better.
 
             let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
+                    .await?
+                    .with_read_version_dataset(&read_version_dataset);
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -1987,6 +2026,23 @@ pub(crate) async fn commit_transaction(
             }
         };
 
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                &dataset,
+                &attempt_transaction.operation,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
+            }
+            checked
+        })
+        .await?;
+
         manifest.version = target_version;
 
         let previous_writer_version = &dataset.manifest.writer_version;
@@ -2036,6 +2092,7 @@ pub(crate) async fn commit_transaction(
         }
 
         // Try to commit the manifest
+        original_dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -2052,6 +2109,9 @@ pub(crate) async fn commit_transaction(
             may_change_schema,
         )
         .await;
+        // Deletion can race the manifest PUT. Never acknowledge an orphaned
+        // commit, including when the handler reports an ambiguous result.
+        original_dataset.ensure_branch_exists().await?;
 
         match result {
             Ok(manifest_location) => {
@@ -2063,7 +2123,7 @@ pub(crate) async fn commit_transaction(
                     indices,
                     commit_config.skip_auto_cleanup,
                 )
-                .await;
+                .await?;
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
@@ -2095,7 +2155,7 @@ pub(crate) async fn commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         return Ok((committed_manifest, location));
                     }
                     // Confirmed loss: another writer owns the version (or,
@@ -2168,7 +2228,7 @@ pub(crate) async fn commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         if commit_handler.propagate_commit_error_after_success() {
                             return Err(err);
                         }

@@ -100,6 +100,17 @@ pub trait BasicTrainer: Send + Sync {
     ) -> Result<CreatedIndex>;
 }
 
+/// Whether a plugin's indices serve ordered search through
+/// [`ScalarIndex::as_ordered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndexOrderingCapability {
+    /// The index cannot stream keys in order.
+    Unordered,
+    /// The index streams keys in either direction, with nulls first or last.
+    Bidirectional,
+}
+
 /// A trait for scalar index plugins
 #[async_trait]
 pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
@@ -162,6 +173,37 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// ```
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
+    }
+
+    /// Whether an index with these details serves ordered search through
+    /// [`ScalarIndex::as_ordered`], decided without loading the index.
+    ///
+    /// A loaded index can still return `None` from `as_ordered`, for example
+    /// when it spans several segments, or `NotSupported` from `search_ordered`,
+    /// for example when its files are out of key order, so a planner must keep
+    /// a fallback.
+    ///
+    /// ```
+    /// # use lance_index::pbold;
+    /// # use lance_index::scalar::bitmap::BitmapIndexPlugin;
+    /// # use lance_index::scalar::btree::BTreeIndexPlugin;
+    /// # use lance_index::scalar::registry::{IndexOrderingCapability, ScalarIndexPlugin};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BTreeIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Bidirectional
+    /// );
+    /// let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BitmapIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Unordered
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
+        IndexOrderingCapability::Unordered
     }
 
     /// The version of the index plugin
