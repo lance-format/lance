@@ -7,6 +7,76 @@ use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey};
 use std::future::Future;
 use std::pin::Pin;
 
+#[tokio::test]
+async fn test_positions_reuse_held_stream_after_cache_eviction() {
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::memory().into(),
+        object_store::path::Path::from("positions-reuse"),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .format_version(InvertedListFormatVersion::V3);
+    let format = params.resolved_format_version();
+    let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        true,
+        TokenSetFormat::default(),
+        format,
+        params.posting_block_size(),
+    );
+    builder.tokens.get_or_add("body");
+    let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+        true,
+        format.posting_tail_codec(),
+        params.posting_block_size(),
+    );
+    posting.add(0, PositionRecorder::Position(vec![0, 3, 7].into()));
+    posting.add(1, PositionRecorder::Position(vec![1, 5].into()));
+    builder.posting_lists.push(posting);
+    builder.docs.append(100, 12);
+    builder.docs.append(101, 12);
+    builder.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+    let cache = Arc::new(LanceCache::with_backend(Arc::new(
+        QuickCacheBackend::with_capacity(1 << 20),
+    )));
+    let index = InvertedIndex::load(store, None, cache.as_ref())
+        .await
+        .unwrap();
+    let reader = &index.partitions[0].inverted_list;
+    let first = reader
+        .read_positions(0, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    cache.clear().await;
+    assert!(
+        reader
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .is_none()
+    );
+    let second = reader
+        .read_positions(0, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let (
+        CompressedPositionStorage::SharedStream(first),
+        CompressedPositionStorage::SharedStream(second),
+    ) = (first, second)
+    else {
+        panic!("modern positions must use shared streams");
+    };
+    assert_eq!(first.bytes(), second.bytes());
+    assert_eq!(first.block_offsets(), second.block_offsets());
+    assert_eq!(
+        first.bytes().as_ptr(),
+        second.bytes().as_ptr(),
+        "another query still owns this immutable stream; eviction must not duplicate its payload"
+    );
+}
+
 #[derive(Debug)]
 struct RejectPositionsCacheBackend {
     inner: QuickCacheBackend,
