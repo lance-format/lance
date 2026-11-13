@@ -576,6 +576,11 @@ impl PreFilter for DatasetPreFilter {
             .is_some_and(|mask| mask_selects_nothing(mask))
     }
 
+    /// `filter_row_ids` below is exactly `mask().selected_indices`.
+    fn is_mask_equivalent(&self) -> bool {
+        true
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,

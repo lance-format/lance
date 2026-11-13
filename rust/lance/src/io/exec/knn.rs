@@ -1874,6 +1874,12 @@ impl PreFilter for SegmentPreFilter {
             .clone()
     }
 
+    /// `filter_row_ids` below is exactly `mask().selected_indices`: the
+    /// ownership restriction is already part of the final mask.
+    fn is_mask_equivalent(&self) -> bool {
+        true
+    }
+
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
         self.mask().selected_indices(row_ids)
     }
@@ -5997,6 +6003,28 @@ mod tests {
         );
         empty.wait_for_ready().await.unwrap();
         assert!(empty.selects_nothing());
+    }
+
+    /// Segment position filtering is exactly membership of its final mask
+    /// (filter ∩ ownership), so consumers may test that mask directly.
+    #[tokio::test]
+    async fn segment_prefilter_positions_are_final_mask_membership() {
+        let other_fragment =
+            u64::from(lance_core::utils::address::RowAddress::new_from_parts(1, 0));
+        let mut allowed = RowAddrTreeMap::new();
+        for row in [0_u64, 1, 2, other_fragment] {
+            allowed.insert(row);
+        }
+        let base = prefilter_with_mask(Some(RowAddrMask::from_allowed(allowed))).await;
+        let mut owned = RowAddrTreeMap::new();
+        owned.insert_fragment(0);
+        let segment = SegmentPreFilter::new(base, Arc::new(RowAddrMask::from_allowed(owned)));
+        assert!(segment.is_mask_equivalent());
+        segment.wait_for_ready().await.unwrap();
+        let rows = [2_u64, 7, other_fragment, 0, 2];
+        let positions = segment.filter_row_ids(Box::new(rows.iter()));
+        assert_eq!(positions, segment.mask().selected_indices(rows.iter()));
+        assert_eq!(positions, [0, 3, 4]);
     }
 
     /// After the barrier, a delta whose prefilter selects nothing is

@@ -71,6 +71,29 @@ pub trait PreFilter: Send + Sync {
         false
     }
 
+    /// Whether position filtering is exactly the membership of [`Self::mask`].
+    ///
+    /// Call after [`Self::wait_for_ready`]. This also promises the same input
+    /// ordering and duplicate-row behavior, with no additional filtering rules.
+    /// The default retains [`Self::filter_row_ids`] for custom filters and
+    /// ownership wrappers that have not established this equivalence.
+    ///
+    /// ```
+    /// # use lance_index::prefilter::PreFilter;
+    /// # async fn example(filter: &dyn PreFilter) -> lance_core::Result<()> {
+    /// filter.wait_for_ready().await?;
+    /// if filter.is_mask_equivalent() {
+    ///     let rows = [1_u64, 1, 5];
+    ///     assert_eq!(filter.mask().selected_indices(rows.iter()),
+    ///         filter.filter_row_ids(Box::new(rows.iter())));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_mask_equivalent(&self) -> bool {
+        false
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
