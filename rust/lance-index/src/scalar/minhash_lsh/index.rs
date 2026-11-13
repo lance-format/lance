@@ -6,6 +6,7 @@
 //! prewarming, and the rebuilds that update, remap or merge segments.
 
 use super::*;
+use crate::progress::{IndexBuildProgress, noop_progress};
 use crate::scalar::RowAddrTranslatorRef;
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
 use lance_core::cache::{
@@ -431,6 +432,84 @@ impl MinHashLshIndex {
             Ok(RecordBatch::try_new(filtered.schema(), columns)?)
         })
         .boxed()
+    }
+
+    /// Merge segments into one new segment in `dest_store`, keeping only the rows
+    /// each segment's filter selects. Every segment must have been built with the
+    /// same parameters. If `new_data` is provided, its text and physical row
+    /// addresses are indexed in the same segment.
+    ///
+    /// Like [`ScalarIndex::update`] and [`ScalarIndex::remap`], this always writes
+    /// the current (row-address-domain) format and copies each source's stored
+    /// identifiers as-is. A source persisted before
+    /// [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] stores row ids, which equal row
+    /// addresses only on a dataset without stable row ids; on a dataset with
+    /// stable row ids the caller must rebuild such a segment instead of passing it
+    /// here, or its matches are silently lost.
+    ///
+    /// `progress` reports when the merge starts and when the output is ready.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lance_core::Result;
+    /// use lance_index::progress::noop_progress;
+    /// use lance_index::scalar::{IndexStore, OldIndexDataFilter};
+    /// use lance_index::scalar::minhash_lsh::MinHashLshIndex;
+    ///
+    /// async fn consolidate(
+    ///     sources: &[(&MinHashLshIndex, Option<&OldIndexDataFilter>)],
+    ///     destination: &dyn IndexStore,
+    /// ) -> Result<()> {
+    ///     MinHashLshIndex::merge_segments(sources, None, destination, noop_progress()).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn merge_segments(
+        sources: &[(&Self, Option<&OldIndexDataFilter>)],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let Some((first, _)) = sources.first() else {
+            return Err(Error::invalid_input(
+                "merging MinHash LSH segments requires at least one segment".to_string(),
+            ));
+        };
+        for (index, _) in sources {
+            if index.params != first.params {
+                return Err(Error::invalid_input(format!(
+                    "MinHash LSH segments were built with different parameters and cannot be merged: {:?} vs {:?}; rebuild the index with replace=true instead",
+                    first.params, index.params
+                )));
+            }
+        }
+        let total_docs: u64 = sources.iter().map(|(index, _)| index.num_docs as u64).sum();
+        if total_docs > u32::MAX as u64 + 1 {
+            return Err(Error::invalid_input(format!(
+                "merging these MinHash LSH segments would produce {total_docs} documents but a segment holds at most {}; keep the segments separate",
+                u32::MAX as u64 + 1
+            )));
+        }
+        let signature_sources = sources
+            .iter()
+            .map(|(index, filter)| {
+                index.signature_source(match filter {
+                    Some(filter) => RowIdTransform::Filter(filter),
+                    None => RowIdTransform::Keep,
+                })
+            })
+            .collect();
+        let builder = MinHashLshIndexBuilder::try_new(first.params.clone())?;
+        progress
+            .stage_start("merge_minhash_segments", None, "documents")
+            .await?;
+        let files = builder
+            .rebuild_from(signature_sources, new_data, dest_store)
+            .await?;
+        let created = first.created_index(files)?;
+        progress.stage_complete("merge_minhash_segments").await?;
+        Ok(created)
     }
 
     fn signature_source<'a>(&self, transform: RowIdTransform<'a>) -> SignatureSource<'a> {
@@ -1767,54 +1846,15 @@ impl ScalarIndex for MinHashLshIndex {
     }
 }
 
-/// Merge segments into one new segment in `dest_store`, keeping only the rows
-/// each segment's filter selects. Every segment must have been built with the
-/// same parameters.
+/// Merge existing MinHash LSH segments into one segment in `dest_store`.
 ///
-/// Like [`ScalarIndex::update`] and [`ScalarIndex::remap`], this always writes
-/// the current (row-address-domain) format and copies each source's stored
-/// identifiers as-is. A source persisted before
-/// [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] stores row ids, which equal row
-/// addresses only on a dataset without stable row ids; on a dataset with
-/// stable row ids the caller must rebuild such a segment instead of passing it
-/// here, or its matches are silently lost.
+/// See [`MinHashLshIndex::merge_segments`] for the source requirements.
+#[deprecated(note = "use MinHashLshIndex::merge_segments with new_data = None")]
 pub async fn merge_minhash_indices(
     sources: &[(&MinHashLshIndex, Option<&OldIndexDataFilter>)],
     dest_store: &dyn IndexStore,
 ) -> Result<CreatedIndex> {
-    let Some((first, _)) = sources.first() else {
-        return Err(Error::invalid_input(
-            "merging MinHash LSH segments requires at least one segment".to_string(),
-        ));
-    };
-    for (index, _) in sources {
-        if index.params != first.params {
-            return Err(Error::invalid_input(format!(
-                "MinHash LSH segments were built with different parameters and cannot be merged: {:?} vs {:?}; rebuild the index with replace=true instead",
-                first.params, index.params
-            )));
-        }
-    }
-    let total_docs: u64 = sources.iter().map(|(index, _)| index.num_docs as u64).sum();
-    if total_docs > u32::MAX as u64 + 1 {
-        return Err(Error::invalid_input(format!(
-            "merging these MinHash LSH segments would produce {total_docs} documents but a segment holds at most {}; keep the segments separate",
-            u32::MAX as u64 + 1
-        )));
-    }
-    let signature_sources = sources
-        .iter()
-        .map(|(index, filter)| {
-            index.signature_source(match filter {
-                Some(filter) => RowIdTransform::Filter(filter),
-                None => RowIdTransform::Keep,
-            })
-        })
-        .collect();
-    let files = MinHashLshIndexBuilder::try_new(first.params.clone())?
-        .rebuild_from(signature_sources, None, dest_store)
-        .await?;
-    first.created_index(files)
+    MinHashLshIndex::merge_segments(sources, None, dest_store, noop_progress()).await
 }
 
 #[cfg(test)]

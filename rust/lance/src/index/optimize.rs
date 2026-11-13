@@ -21,8 +21,8 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, NGram, Inverted) is split: tasks build one uncommitted segment each
-//! over a group of fragments, encoded against the model of a reference
+//! Bitmap, NGram, Inverted, MinHash LSH) is split: tasks build one uncommitted
+//! segment each over a group of fragments, encoded against the model of a reference
 //! segment; merges combine the task results that carry their `group` with the
 //! committed segments they list into one segment. A task that is the only
 //! input of its merge folds those old segments in itself, in one pass. For a
@@ -111,8 +111,8 @@ use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
-    segment_has_inverted_details, segment_has_merge_primitive, segment_has_vector_details,
-    unsupported_index_version, validate_segment_metadata,
+    segment_has_inverted_details, segment_has_merge_primitive, segment_has_minhashlsh_details,
+    segment_has_vector_details, unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -686,10 +686,19 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         // absorbed segments from scratch, and the only split that reproduces
         // it is none. Inverted stays unsplit under stable row ids until its
         // merge drops stale postings (issue #8085).
+        let stable_row_ids = dataset.manifest.uses_stable_row_ids();
+        // A legacy MinHash segment on a stable-row-ID table must be rebuilt.
+        // The unsplit task rebuilds its coverage once alongside the new rows.
+        let minhash_requires_domain_rebuild = stable_row_ids
+            && segment_has_minhashlsh_details(last)
+            && segments
+                .iter()
+                .any(|segment| !segment.results_are_row_addrs());
         let split = bounded
             && !consolidate::is_consolidation(options)
             && segment_has_merge_primitive(last)
-            && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids());
+            && !(segment_has_inverted_details(last) && stable_row_ids)
+            && !minhash_requires_domain_rebuild;
         // Split scalar planning needs the tokenizer on the driver before it
         // can dispatch tasks. Tagged histories are refused before that open.
         let requires_local_tokenizer =

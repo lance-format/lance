@@ -49,7 +49,9 @@ mod index;
 mod tests;
 
 pub use builder::MinHashLshIndexBuilder;
-pub use index::{MinHashLshIndex, merge_minhash_indices};
+pub use index::MinHashLshIndex;
+#[allow(deprecated)]
+pub use index::merge_minhash_indices;
 
 use builder::{RowIdTransform, SignatureSource};
 
