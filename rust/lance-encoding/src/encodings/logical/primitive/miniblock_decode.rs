@@ -1016,21 +1016,30 @@ impl DecodePageTask for DecodeMiniBlockTask {
             Ok((item_range, level_range))
         };
 
-        let mut data = if self.instructions.len() == 1
-            && self.structural_projection.is_none()
-            && self.value_decompressor.allocates_output()
-        {
+        let mut data = if self.instructions.len() == 1 && self.structural_projection.is_none() {
             let (instructions, chunk) = &self.instructions[0];
             let (rep, def, value_buffers) = self.decode_chunk_sections(&chunk.data)?;
             let (item_range, level_range) =
                 map_instruction(instructions, chunk, rep.as_ref(), def.as_ref())?;
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, 0);
             Self::extend_levels(level_range, &mut defbuf, &def, 0);
-            self.value_decompressor.decompress_range(
+            let num_values = item_range.end - item_range.start;
+            let decoded = self.value_decompressor.decompress_range(
                 value_buffers,
                 chunk.items_in_chunk,
                 item_range,
-            )?
+            )?;
+            if self.value_decompressor.allocates_output() {
+                decoded
+            } else {
+                // A codec view must not pin its input chunk. Size its compact
+                // copy after decoding the selection: estimating from the whole
+                // chunk over-reserves unrelated values and forces consumers
+                // that enforce retained-byte bounds to copy again.
+                let mut builder = DataBlockBuilder::with_capacity_estimate(decoded.data_size());
+                builder.append(&decoded, 0..num_values)?;
+                builder.finish()
+            }
         } else if let Some(projection) = &self.structural_projection {
             let mut total_items = 0_u64;
             let mut group_start = 0usize;
