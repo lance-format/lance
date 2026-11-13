@@ -2200,11 +2200,15 @@ async fn test_commit_existing_index_segments_removes_empty_segment() {
 /// Every commit rebuilds the index list from what it is handed, so filtering
 /// the version there turns "ignore it" into "delete it", and the build that
 /// could have read the index never gets the chance.
+#[rstest]
+#[case::newer_version(UnreadableIndexKind::NewerVersion)]
+#[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[case::reserved_field(UnreadableIndexKind::ReservedField)]
 #[tokio::test]
-async fn test_unsupported_index_survives_an_unrelated_commit() {
+async fn test_unsupported_index_survives_an_unrelated_commit(#[case] kind: UnreadableIndexKind) {
     let test_dir = tempfile::tempdir().unwrap();
     let test_uri = test_dir.path().to_str().unwrap();
-    dataset_with_an_index_from_a_newer_build(test_uri, "id_idx").await;
+    dataset_with_an_unreadable_index(test_uri, "id_idx", kind).await;
 
     let dataset = Dataset::open(test_uri).await.unwrap();
     assert_eq!(
@@ -2243,6 +2247,117 @@ async fn test_unsupported_index_survives_an_unrelated_commit() {
     );
 }
 
+#[rstest]
+#[case::row_id(lance_table::format::ROW_ID_FIELD_ID)]
+#[case::unknown_reserved_field(-100)]
+#[tokio::test]
+async fn test_reserved_field_index_does_not_break_queries_or_maintenance(#[case] field_id: i32) {
+    let test_uri = "memory://";
+    let reader = || {
+        gen_batch()
+            .col("rid", array::step::<arrow_array::types::UInt64Type>())
+            .col("payload", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(
+        reader(),
+        test_uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    for (column, name) in [("rid", "rowid_idx"), ("payload", READABLE_INDEX)] {
+        dataset
+            .create_index_builder(&[column], IndexType::BTree, &btree_params)
+            .name(name.to_string())
+            .await
+            .unwrap();
+    }
+    let original = manifest_index(&dataset, "rowid_idx").await;
+    let reserved = IndexMetadata {
+        fields: vec![field_id],
+        ..original.clone()
+    };
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![reserved.clone()],
+                    removed_indices: vec![original],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // The reserved-field segment must not interfere with either an unindexed
+    // predicate or the readable companion index.
+    for filter in ["rid < 3", "payload < 3"] {
+        assert_eq!(
+            dataset
+                .scan()
+                .filter(filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows(),
+            3
+        );
+    }
+    assert_eq!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.name.as_str())
+            .collect::<Vec<_>>(),
+        [READABLE_INDEX]
+    );
+
+    dataset
+        .append(reader(), Some(WriteParams::default()))
+        .await
+        .unwrap();
+    assert_eq!(manifest_index(&dataset, "rowid_idx").await, reserved);
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(manifest_index(&dataset, "rowid_idx").await, reserved);
+
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(metrics.fragments_removed > 0);
+    let after = manifest_index(&dataset, "rowid_idx").await;
+    assert_eq!(after.uuid, reserved.uuid);
+    assert_eq!(after.fields, reserved.fields);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 20);
+    assert_eq!(
+        dataset
+            .scan()
+            .filter("payload < 3")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        6
+    );
+}
+
 /// Carrying an unreadable index forward is not the same as keeping it
 /// forever: dropping the column it covers still removes it.
 #[tokio::test]
@@ -2276,6 +2391,7 @@ async fn test_unsupported_index_is_dropped_with_its_column() {
 #[rstest]
 #[case::newer_version(UnreadableIndexKind::NewerVersion)]
 #[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[case::reserved_field(UnreadableIndexKind::ReservedField)]
 #[tokio::test]
 async fn test_unsupported_index_without_a_bitmap_does_not_fail_later_commits(
     #[case] kind: UnreadableIndexKind,
@@ -2787,10 +2903,10 @@ async fn test_compaction_survives_an_unsupported_index() {
     let test_dir = tempfile::tempdir().unwrap();
     let test_uri = test_dir.path().to_str().unwrap();
 
-    // A text column alongside `two_column_reader`'s numeric ones: every
-    // remaining row-id-domain scalar index type (NGram here) requires text,
-    // unlike BTree and Bitmap, which moved to row-address domain and no
-    // longer exercise this test.
+    // A text column alongside `two_column_reader`'s numeric ones: the only
+    // remaining row-id-domain scalar index type (Inverted) requires text;
+    // the others moved to row-address domain and no longer exercise this
+    // test.
     fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
         lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
@@ -2811,11 +2927,11 @@ async fn test_compaction_survives_an_unsupported_index() {
 
     // Row-id-domain: its coverage is recalculated (not dropped) across a
     // rewrite under stable row ids, which is exactly the property this test
-    // checks. BTree and Bitmap moved to row-address domain and no longer
-    // exercise it.
-    let ngram_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+    // checks. The other scalar index types moved to row-address domain and
+    // no longer exercise it.
+    let inverted_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
     dataset
-        .create_index_builder(&["text"], IndexType::NGram, &ngram_params)
+        .create_index_builder(&["text"], IndexType::Inverted, &inverted_params)
         .name("id_idx".to_string())
         .train(false)
         .await
@@ -2871,6 +2987,7 @@ async fn test_compaction_survives_an_unsupported_index() {
 #[rstest]
 #[case::newer_version(UnreadableIndexKind::NewerVersion)]
 #[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[case::reserved_field(UnreadableIndexKind::ReservedField)]
 #[tokio::test]
 async fn test_compaction_defers_fragments_an_unsupported_index_covers(
     #[case] kind: UnreadableIndexKind,

@@ -50,7 +50,6 @@ criterion = { workspace = true }
 lance-testing.workspace = true
 rand_xoshiro = { workspace = true }
 proptest.workspace = true
-serial_test.workspace = true
 
 [features]
 default = ["lz4", "zstd", "bitpacking"]

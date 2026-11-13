@@ -18,7 +18,7 @@ use datafusion_execution::{
     TaskContext,
     config::SessionConfig,
     disk_manager::DiskManagerBuilder,
-    memory_pool::{FairSpillPool, TrackConsumersPool},
+    memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool},
     runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
@@ -36,6 +36,7 @@ use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
+    memory::{Component, register_component},
     utils::{
         futures::FinallyStreamExt,
         tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
@@ -365,7 +366,19 @@ pub fn new_runtime_env(options: &LanceExecutionOptions) -> Arc<RuntimeEnv> {
     }
     // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
     // reservations. This bypasses the configured pool limit, not actual RAM limits.
-    runtime_env_builder.build_arc().unwrap()
+    let runtime_env = runtime_env_builder.build_arc().unwrap();
+    // The pool rather than the environment: every reservation holds its pool,
+    // so the pool and the bytes reserved in it can outlive the environment.
+    register_component(
+        Component::DataFusionPool,
+        &runtime_env.memory_pool,
+        pool_reserved_bytes,
+    );
+    runtime_env
+}
+
+fn pool_reserved_bytes(pool: &(dyn MemoryPool + 'static)) -> u64 {
+    pool.reserved() as u64
 }
 
 /// Returns a new task context to execute one plan with `options`.

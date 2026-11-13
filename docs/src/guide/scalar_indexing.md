@@ -22,6 +22,7 @@ The workflows below cover the Python (`pylance`), Rust (`lance`), and Java (`org
 | `NGRAM` | Substring search in text | `contains(column, 'substring')` | May return candidates that need rechecking; use `INVERTED` for BM25 search |
 | `BLOOMFILTER` | Membership-oriented equality checks | Equality and inequality filters | Inexact and limited predicate support |
 | `FM` | Exact substring search, including one-character patterns | `contains(column, 'substring')` | Specialized index; use scalar indexes for ordinary comparisons |
+| `LISTELEMENT` (experimental) | Fields of the elements of a `list<struct>` column, such as object detections | `any_element(column, 'predicate')`, see [Filtering on elements of a list of structs](read_and_write.md#filtering-on-elements-of-a-list-of-structs) | The predicate must fix the first key |
 
 B-tree is the usual default for scalar columns. Choose bitmap for genuinely low-cardinality columns, and zone maps when data is sorted or nearly sorted. See [Performance Guide](performance.md#indexes) for resource tradeoffs.
 
@@ -351,7 +352,7 @@ Array membership filters can use a label-list index:
     }
     ```
 
-Scalar indexes support common equality, comparison, range, set-membership, and null predicates. Multiple indexed predicates can be combined with `AND` or `OR`. A predicate such as `id = 1 OR unindexed_column = 2` may not be able to use the index on `id`, because the unindexed branch must also be evaluated.
+Scalar indexes support common equality, comparison, range, set-membership, and null predicates. Multiple indexed predicates can be combined with `AND` or `OR`. A predicate such as `id = 1 OR unindexed_column = 2` may not be able to use the index on `id`, because the unindexed branch must also be evaluated. An `OR` whose branches each include an indexed predicate, such as `(id = 1 AND unindexed_column = 2) OR id = 3`, still uses the index: the index finds the candidate rows and the whole filter is applied to them.
 
 Set `use_scalar_index=False` (Python), `.use_scalar_index(false)` (Rust), or `.useScalarIndex(false)` (Java) on a scanner to disable scalar-index acceleration for a specific query.
 
