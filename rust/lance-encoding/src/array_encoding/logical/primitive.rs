@@ -532,7 +532,7 @@ impl PrimitiveFieldEncoder {
         let column_idx = self.column_index;
         let data_type = self.field.data_type();
 
-        Ok(tokio::task::spawn(async move {
+        Ok(lance_core::utils::tokio::spawn(async move {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
             let data = DataBlock::from_arrays(&arrays, num_values);
             let mut buffer_index = 0;

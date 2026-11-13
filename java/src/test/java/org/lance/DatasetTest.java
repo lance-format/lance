@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.compaction.CompactionOptions;
 import org.lance.file.FileWriteOptions;
+import org.lance.fragment.DeletionFile;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -1684,7 +1685,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testGetRowAddresses(@TempDir Path tempDir) {
+  void testGetRowAddresses(@TempDir Path tempDir) throws IOException {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
@@ -1719,6 +1720,39 @@ public class DatasetTest {
         // Without stable row ids a row id is its address, so ids pass through unchanged.
         List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
         assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String datasetPath = tempDir.resolve("deletion-io").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset
+          .createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())
+          .close();
+      testDataset.write(1, 5).close();
+
+      Path deletionFile;
+      try (Dataset ds = testDataset.write(2, 5)) {
+        ds.delete("id = 2");
+        Fragment fragment = ds.getFragments().get(0);
+        DeletionFile deletion = fragment.metadata().getDeletionFile();
+        assertNotNull(deletion);
+        String relativePath = deletion.getRelativePath(fragment.getId());
+        assertNotNull(relativePath);
+        deletionFile = Path.of(datasetPath).resolve(relativePath);
+      }
+
+      assertTrue(Files.deleteIfExists(deletionFile), "deletion file should exist");
+
+      try (Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        // A cold empty lookup must return before loading row-id metadata or deletion files.
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+        IOException error =
+            assertThrows(
+                IOException.class, () -> ds.getRowAddresses(Collections.singletonList(0L)));
+        assertTrue(error.getMessage().contains("_deletions"), error.getMessage());
       }
     }
   }
