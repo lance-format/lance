@@ -2454,22 +2454,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_miniblock_planned_binary_bytes_match_partial_drain() {
+    #[rstest::rstest]
+    fn test_miniblock_planned_binary_bytes_match_partial_drain(
+        #[values(32, 64)] bits_per_offset: u8,
+        #[values(false, true)] large_header: bool,
+    ) {
         use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 
-        fn binary_value_buffer(values: &[&[u8]]) -> Vec<u8> {
-            let header_bytes = (values.len() as u32 + 1) * 4;
+        fn binary_value_buffer(values: &[&[u8]], bits_per_offset: u8) -> Vec<u8> {
+            let header_bytes = (values.len() as u64 + 1) * u64::from(bits_per_offset / 8);
             let mut offsets = vec![header_bytes];
             let mut current = header_bytes;
             for value in values {
-                current += value.len() as u32;
+                current += value.len() as u64;
                 offsets.push(current);
             }
-            let mut buffer = offsets
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>();
+            let mut buffer = if bits_per_offset == 32 {
+                offsets
+                    .into_iter()
+                    .flat_map(|o| (o as u32).to_le_bytes())
+                    .collect::<Vec<_>>()
+            } else {
+                offsets
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+                    .collect::<Vec<_>>()
+            };
             for value in values {
                 buffer.extend_from_slice(value);
             }
@@ -2477,10 +2487,14 @@ mod tests {
             buffer
         }
 
-        fn miniblock_chunk(value_buffer: &[u8]) -> LanceBuffer {
+        fn miniblock_chunk(value_buffer: &[u8], large_header: bool) -> LanceBuffer {
             let mut chunk = Vec::new();
             chunk.extend_from_slice(&0_u16.to_le_bytes());
-            chunk.extend_from_slice(&(value_buffer.len() as u16).to_le_bytes());
+            if large_header {
+                chunk.extend_from_slice(&(value_buffer.len() as u32).to_le_bytes());
+            } else {
+                chunk.extend_from_slice(&(value_buffer.len() as u16).to_le_bytes());
+            }
             let padding =
                 lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
             chunk.resize(chunk.len() + padding, 0);
@@ -2491,13 +2505,23 @@ mod tests {
             LanceBuffer::from(chunk)
         }
 
-        let values: Vec<&[u8]> = vec![b"aa", b"bb", b"ccc", b"d", b"eeeee"];
-        let chunk_data = miniblock_chunk(&binary_value_buffer(&values));
+        let values = [
+            vec![b'a'; 1024],
+            vec![b'b'; 8192],
+            vec![b'c'; 1024],
+            vec![b'd'; 8192],
+            vec![b'e'; 1024],
+        ];
+        let slices = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let chunk_data =
+            miniblock_chunk(&binary_value_buffer(&slices, bits_per_offset), large_header);
         let mut decoder = MiniBlockDecoder {
             structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
-            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            value_decompressor: Arc::new(
+                BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap(),
+            ),
             def_meaning: Arc::from([]),
             loaded_chunks: VecDeque::from([LoadedChunk {
                 data: chunk_data,
@@ -2516,13 +2540,45 @@ mod tests {
             num_rows: values.len() as u64,
             num_buffers: 1,
             dictionary: None,
-            has_large_chunk: false,
+            has_large_chunk: large_header,
         };
 
-        decoder.drain(2).unwrap().decode().unwrap();
+        let first = decoder.drain(2).unwrap().decode().unwrap();
         let planned = decoder.decoded_bytes(3).unwrap();
         let actual = decoder.drain(3).unwrap().decode().unwrap();
         assert_eq!(planned, actual.data.data_size());
+        for (decoded, selected) in [(first, &values[..2]), (actual, &values[2..])] {
+            let data = decoded.data.as_variable_width_ref().unwrap();
+            let offsets = if bits_per_offset == 32 {
+                data.offsets
+                    .borrow_to_typed_view::<u32>()
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect::<Vec<_>>()
+            } else {
+                data.offsets
+                    .borrow_to_typed_view::<u64>()
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(data.num_values as usize, selected.len());
+            for (row, expected) in selected.iter().enumerate() {
+                assert_eq!(
+                    &data.data[offsets[row]..offsets[row + 1]],
+                    expected.as_slice()
+                );
+            }
+            // A partial decode must not reserve output for unrelated chunk
+            // values: that prevents compact consumers from reusing its buffer.
+            let buffer = data.data.clone().into_buffer();
+            assert!(
+                buffer.capacity() <= buffer.len() + 64,
+                "selected {} bytes retained {} bytes",
+                buffer.len(),
+                buffer.capacity()
+            );
+        }
     }
 
     #[test]
