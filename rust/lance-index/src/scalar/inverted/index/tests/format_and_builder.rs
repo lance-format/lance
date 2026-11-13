@@ -67,6 +67,34 @@ fn test_shared_positions_do_not_retain_an_aliased_owned_buffer() {
     assert_eq!(stream.block(0), &[7_u8; 1024]);
 }
 
+#[rstest::rstest]
+#[case::compact(1088, true)]
+#[case::oversized(4096, false)]
+fn test_shared_positions_reuse_uniquely_owned_io_bytes(
+    #[case] capacity: usize,
+    #[case] shares_backing: bool,
+) {
+    let mut data = Vec::with_capacity(capacity);
+    data.extend((0..1088).map(|i| (i % 251) as u8));
+    let expected = data[64..].to_vec();
+    let bytes = bytes::Bytes::from(data).slice(64..1088);
+    let buffer = lance_encoding::buffer::LanceBuffer::from_bytes(bytes, 1).into_buffer();
+    let pointer = buffer.as_ptr();
+    let values = LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(vec![0_i64, 1024].into()),
+        buffer,
+        None,
+    );
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], values);
+    assert_eq!(stream.bytes().as_ptr() == pointer, shares_backing);
+    assert_eq!(stream.bytes(), expected);
+    assert_eq!(
+        stream.size(),
+        (if shares_backing { capacity } else { 1024 }) + std::mem::size_of::<u32>()
+    );
+}
+
 #[test]
 fn test_shared_positions_copy_external_owner_with_hidden_capacity() {
     struct Owner(Arc<Vec<u8>>);
