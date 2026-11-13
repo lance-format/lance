@@ -34,6 +34,7 @@ use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
 use crate::io::exec::utils::{FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter};
 use lance_index::prefilter::FilterLoader;
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::query::{
@@ -41,8 +42,8 @@ use lance_index::scalar::inverted::query::{
     uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
-    DocumentGranularity, FlatBm25SearchOptions, MemBM25Scorer, build_global_bm25_scorer,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
+    DocumentGranularity, FlatBm25SearchOptions, FlatScorerExchange, MemBM25Scorer,
+    build_global_bm25_scorer, flat_bm25_search_stream_with_scorer_exchange, fts_schema,
 };
 use tracing::instrument;
 
@@ -686,12 +687,25 @@ pub struct FlatMatchQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Replaces shared-scorer coordination; the two are mutually exclusive.
+    scorer_exchange: Option<ScorerExchangeHandle>,
+    /// When set, the tokenizer is built from these params and no index is opened.
+    tokenizer_params: Option<InvertedIndexParams>,
     document_granularity: DocumentGranularity,
     document_column: String,
     schema: SchemaRef,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+}
+
+#[derive(Clone)]
+struct ScorerExchangeHandle(FlatScorerExchange);
+
+impl std::fmt::Debug for ScorerExchangeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlatScorerExchange")
+    }
 }
 
 impl DisplayAs for FlatMatchQueryExec {
@@ -704,7 +718,11 @@ impl DisplayAs for FlatMatchQueryExec {
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )?;
-                fmt_tokenized_query(&self.tokenized_query, ", ", f)
+                fmt_tokenized_query(&self.tokenized_query, ", ", f)?;
+                if self.scorer_exchange.is_some() {
+                    write!(f, ", scorer_exchange=true")?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -713,7 +731,11 @@ impl DisplayAs for FlatMatchQueryExec {
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )?;
-                fmt_tokenized_query(&self.tokenized_query, "\n", f)
+                fmt_tokenized_query(&self.tokenized_query, "\n", f)?;
+                if self.scorer_exchange.is_some() {
+                    write!(f, "\nscorer_exchange=true")?;
+                }
+                Ok(())
             }
         }
     }
@@ -765,6 +787,8 @@ impl FlatMatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             preset_segments: None,
+            scorer_exchange: None,
+            tokenizer_params: None,
             document_granularity,
             document_column,
             schema,
@@ -821,6 +845,8 @@ impl FlatMatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             preset_segments: Some(segments),
+            scorer_exchange: None,
+            tokenizer_params: None,
             candidate_filter: PreFilterSource::None,
             document_granularity,
             document_column,
@@ -862,12 +888,76 @@ impl FlatMatchQueryExec {
             base_scorer: self.base_scorer.clone(),
             shared_scorer: Some(scorer),
             preset_segments: self.preset_segments.clone(),
+            scorer_exchange: self.scorer_exchange.clone(),
+            tokenizer_params: self.tokenizer_params.clone(),
             document_granularity: self.document_granularity,
             document_column: self.document_column.clone(),
             schema: self.schema.clone(),
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
         })
+    }
+
+    /// Score with the scorer returned by `exchange` instead of the locally
+    /// accumulated one. See [`FlatScorerExchange`].
+    ///
+    /// Cannot be combined with a shared scorer; execution fails if both are set.
+    pub fn with_scorer_exchange(mut self, exchange: FlatScorerExchange) -> Self {
+        self.scorer_exchange = Some(ScorerExchangeHandle(exchange));
+        self
+    }
+
+    /// A copy of this node with `exchange` set and any shared scorer removed.
+    pub fn rebuilt_with_scorer_exchange(&self, exchange: FlatScorerExchange) -> Self {
+        let mut rebuilt = self.rebuilt();
+        rebuilt.shared_scorer = None;
+        rebuilt.with_scorer_exchange(exchange)
+    }
+
+    pub fn has_scorer_exchange(&self) -> bool {
+        self.scorer_exchange.is_some()
+    }
+
+    /// Tokenize with these params instead of opening the column's FTS index.
+    ///
+    /// They must match the params of the index whose statistics the base
+    /// scorer or scorer exchange provides.
+    pub fn with_tokenizer_params(mut self, params: InvertedIndexParams) -> Self {
+        self.tokenizer_params = Some(params);
+        self
+    }
+
+    /// A copy of this node with the tokenizer params set.
+    pub fn rebuilt_with_tokenizer_params(&self, params: InvertedIndexParams) -> Self {
+        let mut rebuilt = self.rebuilt();
+        // The cached tokens may come from a different tokenizer.
+        rebuilt.tokenized_query = Arc::new(OnceLock::new());
+        rebuilt.with_tokenizer_params(params)
+    }
+
+    pub fn tokenizer_params(&self) -> Option<&InvertedIndexParams> {
+        self.tokenizer_params.as_ref()
+    }
+
+    fn rebuilt(&self) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            unindexed_input: self.unindexed_input.clone(),
+            candidate_filter: self.candidate_filter.clone(),
+            base_scorer: self.base_scorer.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            preset_segments: self.preset_segments.clone(),
+            scorer_exchange: self.scorer_exchange.clone(),
+            tokenizer_params: self.tokenizer_params.clone(),
+            document_granularity: self.document_granularity,
+            document_column: self.document_column.clone(),
+            schema: self.schema.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+        }
     }
 
     /// Restrict emitted rows after collecting statistics from the complete corpus.
@@ -987,6 +1077,8 @@ impl ExecutionPlan for FlatMatchQueryExec {
             base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
             preset_segments: self.preset_segments.clone(),
+            scorer_exchange: self.scorer_exchange.clone(),
+            tokenizer_params: self.tokenizer_params.clone(),
             document_granularity: self.document_granularity,
             document_column: self.document_column.clone(),
             schema: self.schema.clone(),
@@ -1007,6 +1099,19 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let candidate_filter = self.candidate_filter.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
+        let scorer_exchange = self.scorer_exchange.as_ref().map(|handle| handle.0.clone());
+        let shared_scorer_producer = match shared_scorer_producer {
+            Some(producer) if scorer_exchange.is_some() => {
+                let error = DataFusionError::Execution(
+                    "flat FTS scorer exchange cannot be combined with a shared corpus scorer"
+                        .to_string(),
+                );
+                producer.publish_error(&error);
+                return Err(error);
+            }
+            producer => producer,
+        };
+        let tokenizer_params = self.tokenizer_params.clone();
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
@@ -1042,52 +1147,61 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let stream = stream::once(async move {
             let shared_scorer_producer = shared_scorer_producer;
             let result = async {
-                let segments = match preset_segments {
-                    Some(segments) => Some(segments),
-                    None => load_segments(&ds, &column, document_granularity).await?,
-                };
-                let (tokenizer, base_scorer) = match segments {
-                    Some(segments) => {
-                        let _details = load_segment_details(&ds, &column, &segments).await?;
-                        let indices =
-                            open_fts_segments(&ds, &column, &segments, &metrics.index_metrics)
-                                .await?;
-                        metrics.record_parts_searched(
-                            indices.iter().map(|index| index.partition_count()).sum(),
-                        );
-                        let first_index = indices.first().ok_or(DataFusionError::Execution(
-                            format!("FTS index for column {} has no segments", column),
-                        ))?;
-                        let mut tokenizer = first_index.tokenizer();
-                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
-                        record_tokenized_query(&tokenized_query, &query_tokens);
-                        let base_scorer = match preset_base_scorer {
-                            Some(scorer) => (*scorer).clone(),
-                            None => {
-                                let scorer_start = std::time::Instant::now();
-                                let scorer = build_global_bm25_scorer(
-                                    &indices,
-                                    &query_tokens,
-                                    &FtsSearchParams::new(),
-                                    Some(metrics.as_ref()),
-                                )
-                                .boxed()
-                                .await?;
-                                metrics.record_scorer_build(scorer_start.elapsed());
-                                scorer
-                            }
-                        };
-                        (tokenizer, Some(base_scorer))
-                    }
-                    None => {
-                        let mut tokenizer = default_text_tokenizer();
-                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
-                        record_tokenized_query(&tokenized_query, &query_tokens);
-                        (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
+                let (tokenizer, base_scorer) = if let Some(params) = tokenizer_params {
+                    let mut tokenizer = params.build()?;
+                    let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                    record_tokenized_query(&tokenized_query, &query_tokens);
+                    (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
+                } else {
+                    let segments = match preset_segments {
+                        Some(segments) => Some(segments),
+                        None => load_segments(&ds, &column, document_granularity).await?,
+                    };
+                    match segments {
+                        Some(segments) => {
+                            let _details = load_segment_details(&ds, &column, &segments).await?;
+                            let indices =
+                                open_fts_segments(&ds, &column, &segments, &metrics.index_metrics)
+                                    .await?;
+                            metrics.record_parts_searched(
+                                indices.iter().map(|index| index.partition_count()).sum(),
+                            );
+                            let first_index = indices.first().ok_or(DataFusionError::Execution(
+                                format!("FTS index for column {} has no segments", column),
+                            ))?;
+                            let mut tokenizer = first_index.tokenizer();
+                            let query_tokens =
+                                try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                            record_tokenized_query(&tokenized_query, &query_tokens);
+                            let base_scorer = match preset_base_scorer {
+                                Some(scorer) => (*scorer).clone(),
+                                None => {
+                                    let scorer_start = std::time::Instant::now();
+                                    let scorer = build_global_bm25_scorer(
+                                        &indices,
+                                        &query_tokens,
+                                        &FtsSearchParams::new(),
+                                        Some(metrics.as_ref()),
+                                    )
+                                    .boxed()
+                                    .await?;
+                                    metrics.record_scorer_build(scorer_start.elapsed());
+                                    scorer
+                                }
+                            };
+                            (tokenizer, Some(base_scorer))
+                        }
+                        None => {
+                            let mut tokenizer = default_text_tokenizer();
+                            let query_tokens =
+                                try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                            record_tokenized_query(&tokenized_query, &query_tokens);
+                            (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
+                        }
                     }
                 };
 
-                flat_bm25_search_stream_with_options_and_scorer(
+                flat_bm25_search_stream_with_scorer_exchange(
                     unindexed_input,
                     document_column,
                     query.terms,
@@ -1101,6 +1215,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         document_granularity,
                         phrase_slop,
                     },
+                    scorer_exchange,
                 )
                 .await
             }
@@ -1181,6 +1296,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
 #[cfg(test)]
 mod tests {
     mod filter_binding;
+    mod scorer_exchange;
     use super::*;
     use crate::dataset::transaction::{Operation, TransactionBuilder};
     use crate::index::DatasetIndexExt;
