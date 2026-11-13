@@ -510,8 +510,8 @@ impl ProjectionRequest {
     ///
     /// # Panics
     ///
-    /// If a column is not in the schema. Use [`Self::try_from_columns`] for
-    /// column names that come from a user.
+    /// If a column, or a nested path below it, is not in the schema. Use
+    /// [`Self::try_from_columns`] for column names that come from a user.
     pub fn from_columns(
         columns: impl IntoIterator<Item = impl AsRef<str>>,
         dataset_schema: &Schema,
