@@ -54,8 +54,9 @@ use crate::io::exec::{
 };
 use crate::{Error, Result};
 
+use lance_table::format::FilterSchema;
+
 use super::aggregate::AggregateExpr;
-use super::filterable_schema::FilterableSchema;
 use super::source::TakeOperation;
 use super::{
     ColumnOrdering, DatasetRecordBatchStream, FilterPlan, MaterializationStyle, QueryFilter,
@@ -121,7 +122,7 @@ impl Scanner {
     ///
     /// This is the schema of the dataset, any metadata columns like _rowid or _rowaddr
     /// and any extra columns like _distance or _score
-    fn filterable_schema(&self) -> Result<FilterableSchema> {
+    fn filterable_schema(&self) -> Result<FilterSchema> {
         let fts_document_granularity = self
             .full_text_query
             .as_ref()
@@ -132,21 +133,17 @@ impl Scanner {
     fn filterable_schema_with_fts_granularity(
         &self,
         fts_document_granularity: Option<DocumentGranularity>,
-    ) -> Result<FilterableSchema> {
+    ) -> Result<FilterSchema> {
         let extra_columns = self.extra_columns(fts_document_granularity);
-        self.dataset.filterable_schemas.get_or_try_insert(
-            &self.dataset.manifest,
-            &extra_columns,
-            || {
-                Projection::full(self.dataset.clone())
-                    .with_row_id()
-                    .with_row_addr()
-                    .with_row_last_updated_at_version()
-                    .with_row_created_at_version()
-                    .to_schema()
-                    .merge(&ArrowSchema::new(extra_columns.clone()))
-            },
-        )
+        self.dataset.manifest.filter_schema(&extra_columns, || {
+            Projection::full(self.dataset.clone())
+                .with_row_id()
+                .with_row_addr()
+                .with_row_last_updated_at_version()
+                .with_row_created_at_version()
+                .to_schema()
+                .merge(&ArrowSchema::new(extra_columns.clone()))
+        })
     }
 
     /// This takes the current output, and the user's requested projection, and calculates the
@@ -2104,13 +2101,10 @@ mod tests {
         scan.filter("b = 4").unwrap();
         assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
 
-        // An unshared manifest edited in place must not be served a stale schema.
-        dataset.manifest = Arc::new(dataset.manifest.as_ref().clone());
-        let cached = Arc::new(dataset.clone())
-            .scan()
-            .filterable_schema()
-            .unwrap()
-            .schema;
+        // Editing a shared manifest's schema through `Arc::make_mut` edits a
+        // clone, which builds its own filter schema.
+        let shared = Arc::new(dataset.clone());
+        let cached = shared.scan().filterable_schema().unwrap().schema;
         Arc::make_mut(&mut dataset.manifest)
             .schema
             .metadata
@@ -2118,5 +2112,9 @@ mod tests {
         let edited = Arc::new(dataset).scan().filterable_schema().unwrap().schema;
         assert!(!cached.metadata.contains_key("edited"));
         assert_eq!(edited.metadata["edited"], "yes");
+        assert!(Arc::ptr_eq(
+            &cached,
+            &shared.scan().filterable_schema().unwrap().schema
+        ));
     }
 }

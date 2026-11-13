@@ -12,7 +12,6 @@
 
 mod aggregate;
 mod builder;
-pub(crate) mod filterable_schema;
 pub(crate) mod fts;
 mod list_structure;
 mod minhash;

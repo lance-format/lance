@@ -136,7 +136,6 @@ use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
-use self::scanner::filterable_schema::FilterableSchemaCache;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
@@ -292,8 +291,6 @@ pub struct Dataset {
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
-    /// Schemas available to scan filters, shared across clones.
-    pub(crate) filterable_schemas: Arc<FilterableSchemaCache>,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
@@ -1171,7 +1168,6 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
-            filterable_schemas: Default::default(),
         })
     }
 
