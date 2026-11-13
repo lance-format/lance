@@ -31,6 +31,8 @@ impl PostingReader {
                 .get_or_init(|| {
                     Arc::new(PostingFileMetadata {
                         schema: reader.schema().clone(),
+                        #[cfg(feature = "fts-format-research")]
+                        research_path: None,
                         num_rows: reader.num_rows(),
                         file_size: reader.file_size_bytes(),
                     })
@@ -92,6 +94,8 @@ pub struct PostingListReader {
     /// bytes off cold storage when the caller only needs `df` for a few terms.
     pub(super) metadata: PostingMetadata,
 
+    #[cfg(feature = "fts-format-research")]
+    pub(super) research_path: Option<String>,
     pub(super) has_position: bool,
     pub(super) has_impacts: bool,
     pub(super) posting_tail_codec: PostingTailCodec,
@@ -281,6 +285,8 @@ impl PostingListReader {
         };
         Ok(Self {
             reader: self.reader.with_store(store, path),
+            #[cfg(feature = "fts-format-research")]
+            research_path: self.research_path.clone(),
             num_rows: self.num_rows,
             metadata: PostingMetadata::V2 {
                 metadata: metadata.clone(),

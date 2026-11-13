@@ -315,7 +315,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let object_store = Arc::new(ObjectStore::local());
     let metadata_cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
-    let index_cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index_cache = LanceCache::with_capacity(
+        std::env::var("FTS_RESEARCH_INDEX_CACHE_MIB")
+            .unwrap_or_else(|_| "64".to_owned())
+            .parse::<usize>()?
+            * 1024
+            * 1024,
+    );
     fs::create_dir_all(&root)?;
     let container = match std::env::var("FTS_RESEARCH_CONTAINER_VERSION")
         .unwrap_or_else(|_| "2.2".to_owned())

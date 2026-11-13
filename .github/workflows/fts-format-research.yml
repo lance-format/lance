@@ -32,4 +32,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
       - name: Check native research contracts
-        run: cargo test --locked --profile ci -p lance-index --features lance-io/aws --example fts_format_research
+        run: cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research
+      - name: Check mapped region lifetime and invalid directories
+        run: cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --lib research_positions::tests
+      - name: Check sidecar queries against independent raw-text BM25 reference
+        run: |
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=export cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=map cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_MODE=zero-copy cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
