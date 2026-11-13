@@ -10,6 +10,7 @@
 use super::DEFAULT_URING_QUEUE_DEPTH;
 use super::requests::{IoRequest, PendingRequests};
 use io_uring::{IoUring, opcode, types};
+use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -197,6 +198,7 @@ fn run_uring_thread(
     let mut completed_iops = 0usize;
     let mut completed_sectors = 0usize;
     let mut min_in_flight = usize::MAX;
+    let mut retries = VecDeque::new();
 
     loop {
         // Track minimum in-flight count
@@ -224,32 +226,48 @@ fn run_uring_thread(
 
         // Process all available completions first
         let mut needs_submit = false;
-        let completions = process_completions(&mut ring, &mut pending);
-        match completions {
+        match process_completions(&mut ring, &mut pending) {
             Ok(result) => {
                 completed_iops += result.iops;
                 completed_sectors += result.sectors;
-
-                // Resubmit any short-read retries
-                for request in result.retries {
-                    if let Err(e) = push_to_sq(&mut ring, &mut pending, request) {
-                        log::error!("Failed to resubmit short read: {}", e);
-                    } else {
-                        needs_submit = true;
-                    }
-                }
+                retries.extend(result.retries);
             }
-            Err(e) => {
-                log::error!("Error processing io_uring completions: {}", e);
+            Err(error) => {
+                shutdown_with_error(
+                    ring,
+                    pending,
+                    retries,
+                    &request_rx,
+                    &is_alive,
+                    thread_id,
+                    error,
+                );
+                return;
+            }
+        }
+
+        // Requests only enter the SQ while it has room; the rest wait here or in the channel.
+        while !ring.submission().is_full() {
+            let Some(request) = retries.pop_front() else {
+                break;
+            };
+            if let Err(e) = push_to_sq(&mut ring, &mut pending, request) {
+                log::error!("Failed to resubmit short read: {}", e);
+            } else {
+                needs_submit = true;
             }
         }
 
         min_in_flight = min_in_flight.min(pending.len());
 
         // Batch submit requests - keep pulling from channel and pushing to SQ
-        // until we hit batch size or channel is empty
+        // until we hit batch size, the SQ is full, or the channel is empty
         let mut batch_count = 0;
         loop {
+            if ring.submission().is_full() {
+                break;
+            }
+
             // Try to receive new request
             // Use recv_timeout only when pending is empty, otherwise use try_recv
             let recv_result = if pending.is_empty() && batch_count == 0 {
@@ -291,6 +309,7 @@ fn run_uring_thread(
                             shutdown_with_error(
                                 ring,
                                 pending,
+                                retries,
                                 &request_rx,
                                 &is_alive,
                                 thread_id,
@@ -312,7 +331,15 @@ fn run_uring_thread(
         if batch_count > 0 || needs_submit {
             let queued = ring.submission().len();
             if let Err(error) = submit_all(queued, || ring.submit()) {
-                shutdown_with_error(ring, pending, &request_rx, &is_alive, thread_id, error);
+                shutdown_with_error(
+                    ring,
+                    pending,
+                    retries,
+                    &request_rx,
+                    &is_alive,
+                    thread_id,
+                    error,
+                );
                 return;
             }
         }
@@ -350,6 +377,7 @@ fn submit_all(mut queued: usize, mut submit: impl FnMut() -> io::Result<usize>) 
 fn shutdown_with_error(
     ring: IoUring,
     pending: PendingRequests,
+    retries: VecDeque<Arc<IoRequest>>,
     request_rx: &Receiver<QueuedRequest>,
     is_alive: &AtomicBool,
     thread_id: usize,
@@ -365,6 +393,9 @@ fn shutdown_with_error(
     // Closing the ring need not wait for reads already in flight. The failed requests stay in
     // `pending`, whose drop leaks them, so the kernel never writes into a freed buffer.
     for request in pending.values() {
+        request.fail(io::Error::new(error_kind, error_message.clone()));
+    }
+    for request in retries {
         request.fail(io::Error::new(error_kind, error_message.clone()));
     }
     for request in request_rx.try_iter() {
@@ -457,6 +488,20 @@ fn process_completions(
     let mut sectors = 0;
     let mut retries = Vec::new();
 
+    // Completions that found the CQ full wait on the kernel's overflow list until an
+    // io_uring_enter flushes them, and the worker enters the kernel only to submit new reads.
+    if ring.submission().cq_overflow() {
+        match ring.submit() {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::ResourceBusy
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     // Process all available completions
     for cqe in ring.completion() {
         let user_data = cqe.user_data();
@@ -525,21 +570,30 @@ fn process_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueuedRequest, shutdown_with_error, start_uring_thread, submit_all};
+    use super::{
+        QueuedRequest, process_completions, push_to_sq, run_uring_thread, shutdown_with_error,
+        start_uring_thread, submit_all,
+    };
     use crate::uring::requests::{IoRequest, PendingRequests, RequestState};
     use bytes::BytesMut;
     use io_uring::IoUring;
     use std::collections::VecDeque;
-    use std::io;
+    use std::fs::File;
+    use std::io::{self, Write};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn new_request() -> Arc<IoRequest> {
+        read_request(&Arc::new(tempfile::tempfile().unwrap()), 0)
+    }
+
+    fn read_request(file: &Arc<File>, offset: u64) -> Arc<IoRequest> {
         Arc::new(IoRequest {
-            file: Arc::new(tempfile::tempfile().unwrap()),
-            offset: 0,
+            file: Arc::clone(file),
+            offset,
             length: 1,
             thread_id: thread::current().id(),
             state: Mutex::new(RequestState {
@@ -550,6 +604,88 @@ mod tests {
                 bytes_read: 0,
             }),
         })
+    }
+
+    /// A file whose byte at offset `i` is `i % 256`.
+    fn data_file(len: usize) -> Arc<File> {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&(0..len).map(|i| i as u8).collect::<Vec<_>>())
+            .unwrap();
+        Arc::new(file)
+    }
+
+    fn assert_read_byte(request: &IoRequest) {
+        let state = request.state.lock().unwrap();
+        assert!(state.completed);
+        assert!(state.err.is_none(), "{:?}", state.err);
+        assert_eq!(state.buffer.as_ref(), &[request.offset as u8]);
+    }
+
+    #[test]
+    fn test_process_completions_reaps_overflowed_completions() {
+        // Queue depth 1 gives a 2-entry CQ.
+        let Ok(mut ring) = IoUring::new(1) else {
+            return;
+        };
+        let file = data_file(3);
+        let requests: Vec<_> = (0..3).map(|offset| read_request(&file, offset)).collect();
+        let mut pending = PendingRequests::default();
+        for request in &requests {
+            push_to_sq(&mut ring, &mut pending, Arc::clone(request)).unwrap();
+            submit_all(1, || ring.submit()).unwrap();
+        }
+        // Three completions cannot fit in two CQ slots without reaping, so one overflows.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ring.submission().cq_overflow() {
+            assert!(Instant::now() < deadline, "CQ never overflowed");
+            thread::yield_now();
+        }
+
+        for _ in 0..requests.len() {
+            process_completions(&mut ring, &mut pending).unwrap();
+            if pending.is_empty() {
+                break;
+            }
+        }
+
+        assert!(pending.is_empty(), "{} reads never reaped", pending.len());
+        for request in &requests {
+            assert_read_byte(request);
+        }
+    }
+
+    #[test]
+    fn test_worker_queues_requests_beyond_queue_depth() {
+        let Ok(ring) = IoUring::new(1) else {
+            return;
+        };
+        let file = data_file(64);
+        let requests: Vec<_> = (0..64).map(|offset| read_request(&file, offset)).collect();
+        // Queue every request before the worker starts, so its first batch exceeds the SQ.
+        let (request_tx, request_rx) = sync_channel(requests.len());
+        for request in &requests {
+            request_tx
+                .send(QueuedRequest::new(Arc::clone(request)))
+                .unwrap();
+        }
+        let worker = thread::spawn(move || {
+            run_uring_thread(ring, request_rx, Arc::new(AtomicBool::new(true)), 0)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !requests
+            .iter()
+            .all(|request| request.state.lock().unwrap().completed)
+        {
+            assert!(Instant::now() < deadline, "reads did not complete");
+            thread::yield_now();
+        }
+
+        for request in &requests {
+            assert_read_byte(request);
+        }
+        drop(request_tx);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -621,16 +757,23 @@ mod tests {
         let request = new_request();
         let mut pending = PendingRequests::default();
         pending.insert(1, Arc::clone(&request));
+        let retry = new_request();
         let (_request_tx, request_rx) = sync_channel(1);
 
         shutdown_with_error(
             ring,
             pending,
+            VecDeque::from([Arc::clone(&retry)]),
             &request_rx,
             &AtomicBool::new(true),
             0,
             io::Error::other("submit failed"),
         );
+
+        let retry_state = retry.state.lock().unwrap();
+        assert!(retry_state.completed);
+        assert!(retry_state.err.is_some());
+        drop(retry_state);
 
         let state = request.state.lock().unwrap();
         assert!(state.completed);
