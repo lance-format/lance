@@ -135,6 +135,11 @@ pub(super) struct SearchConcurrency {
 }
 
 impl SearchConcurrency {
+    pub(super) fn exceeds_compute_capacity(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+            > lance_core::utils::tokio::get_num_compute_intensive_cpus()
+    }
+
     pub(super) fn enter(&self) -> SearchGuard<'_> {
         self.active.fetch_add(1, Ordering::Relaxed);
         SearchGuard(self)

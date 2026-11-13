@@ -113,10 +113,6 @@ pub struct PostingListReader {
     pub(super) modern_postings_validated: Arc<AtomicBool>,
     pub(super) modern_num_docs: Option<usize>,
 
-    /// Best-effort reuse of modern positions still owned by another query.
-    /// Shared across handles for the same immutable file/cache namespace.
-    pub(super) active_positions: Option<Arc<ActivePositionStreams>>,
-
     pub(super) index_cache: WeakLanceCache,
 }
 
@@ -207,16 +203,7 @@ impl DeepSizeOf for PostingListReader {
                     .saturating_mul(std::mem::size_of::<AtomicBool>())
             })
             .unwrap_or(0);
-        let active_positions_size = self
-            .active_positions
-            .as_ref()
-            .filter(|streams| context.mark_seen(Arc::as_ptr(streams) as usize))
-            .map(|streams| streams.retained_metadata_bytes())
-            .unwrap_or(0);
-        metadata_size
-            + self.grouping.deep_size_of_children(context)
-            + validation_size
-            + active_positions_size
+        metadata_size + self.grouping.deep_size_of_children(context) + validation_size
     }
 }
 
@@ -279,9 +266,6 @@ impl PostingListReader {
             modern_doc_id_validations,
             modern_postings_validated: Arc::new(AtomicBool::new(false)),
             modern_num_docs: None,
-            active_positions: (!is_legacy_layout
-                && matches!(positions_layout, PositionsLayout::SharedStream(_)))
-            .then(|| Arc::new(ActivePositionStreams::default())),
             index_cache: WeakLanceCache::from(index_cache),
         })
     }
@@ -310,7 +294,6 @@ impl PostingListReader {
             modern_doc_id_validations: self.modern_doc_id_validations.clone(),
             modern_postings_validated: self.modern_postings_validated.clone(),
             modern_num_docs: self.modern_num_docs,
-            active_positions: self.active_positions.clone(),
             index_cache: self.index_cache.clone(),
         })
     }

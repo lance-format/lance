@@ -6,135 +6,38 @@ use async_trait::async_trait;
 use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey};
 use std::future::Future;
 use std::pin::Pin;
-
-#[rstest::rstest]
-#[tokio::test]
-async fn test_positions_reuse_held_stream_after_cache_eviction(
-    #[values(false, true)] rebind: bool,
-) {
-    let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::memory().into(),
-        object_store::path::Path::from("positions-reuse"),
-        Arc::new(LanceCache::no_cache()),
-    ));
-    let params = InvertedIndexParams::default()
-        .with_position(true)
-        .format_version(InvertedListFormatVersion::V3);
-    let format = params.resolved_format_version();
-    let mut builder = InnerBuilder::new_with_format_version_and_block_size(
-        0,
-        true,
-        TokenSetFormat::default(),
-        format,
-        params.posting_block_size(),
-    );
-    builder.tokens.get_or_add("body");
-    let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
-        true,
-        format.posting_tail_codec(),
-        params.posting_block_size(),
-    );
-    posting.add(0, PositionRecorder::Position(vec![0, 3, 7].into()));
-    posting.add(1, PositionRecorder::Position(vec![1, 5].into()));
-    builder.posting_lists.push(posting);
-    builder.docs.append(100, 12);
-    builder.docs.append(101, 12);
-    builder.write(store.as_ref()).await.unwrap();
-    write_test_metadata(&store, vec![0], params).await;
-    let cache = Arc::new(LanceCache::with_backend(Arc::new(
-        QuickCacheBackend::with_capacity(1 << 20),
-    )));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
-        .await
-        .unwrap();
-    let reader = &index.partitions[0].inverted_list;
-    let first = reader
-        .read_positions(0, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    cache.clear().await;
-    assert!(
-        reader
-            .index_cache
-            .get_with_key(&PositionKey { token_id: 0 })
-            .await
-            .is_none()
-    );
-    let rebound = rebind.then(|| reader.with_store(store, posting_file_path(0)).unwrap());
-    let reader = rebound.as_ref().unwrap_or(reader);
-    let second = reader
-        .read_positions(0, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    let (
-        CompressedPositionStorage::SharedStream(first),
-        CompressedPositionStorage::SharedStream(second),
-    ) = (first, second)
-    else {
-        panic!("modern positions must use shared streams");
-    };
-    assert_eq!(first.bytes(), second.bytes());
-    assert_eq!(first.block_offsets(), second.block_offsets());
-    assert_eq!(
-        first.bytes().as_ptr(),
-        second.bytes().as_ptr(),
-        "another query still owns this immutable stream; eviction must not duplicate its payload"
-    );
-}
-
-#[test]
-fn test_positions_active_reuse_releases_payload_and_checks_token_identity() {
-    struct Owner(Arc<Vec<u8>>);
-    impl AsRef<[u8]> for Owner {
-        fn as_ref(&self) -> &[u8] {
-            self.0.as_slice()
-        }
-    }
-    let payload = Arc::new(vec![7_u8; 1024]);
-    let weak_payload = Arc::downgrade(&payload);
-    let stream = SharedPositionStream::new(
-        PositionStreamCodec::PackedDelta,
-        vec![0],
-        bytes::Bytes::from_owner(Owner(payload)),
-    );
-    let streams = ActivePositionStreams::default();
-    streams.remember(3, &stream);
-    let held = streams.get(3).unwrap();
-    assert_eq!(held.bytes().as_ptr(), stream.bytes().as_ptr());
-    // The fixed table must not return a colliding token's bytes, or grow as
-    // new tokens replace old entries. A separate immutable file has no entry.
-    assert!(streams.get(3 + 256).is_none());
-    let other = SharedPositionStream::new(
-        PositionStreamCodec::PackedDelta,
-        vec![0],
-        bytes::Bytes::from_static(&[9]),
-    );
-    streams.remember(3 + 256, &other);
-    assert!(streams.get(3).is_none());
-    assert_eq!(streams.get(3 + 256).unwrap().bytes(), &[9]);
-    assert!(ActivePositionStreams::default().get(3).is_none());
-    streams.remember(3, &held);
-    drop(stream);
-    assert!(weak_payload.upgrade().is_some());
-    drop(held);
-    assert!(weak_payload.upgrade().is_none());
-    assert!(streams.get(3).is_none());
-}
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Debug)]
 struct RejectPositionsCacheBackend {
     inner: QuickCacheBackend,
+    active_positions: AtomicUsize,
+    peak_positions: AtomicUsize,
+    position_reads: AtomicUsize,
+    fail_position_read: usize,
 }
 
 impl RejectPositionsCacheBackend {
     fn new(capacity: usize) -> Self {
         Self {
             inner: QuickCacheBackend::with_capacity(capacity),
+            active_positions: AtomicUsize::new(0),
+            peak_positions: AtomicUsize::new(0),
+            position_reads: AtomicUsize::new(0),
+            fail_position_read: 0,
         }
     }
 
     fn rejects(codec: Option<&CacheCodec>) -> bool {
         codec.is_some_and(|codec| codec.type_id() == "lance.fts.Positions")
+    }
+}
+
+struct ActivePositionLoad<'a>(&'a AtomicUsize);
+
+impl Drop for ActivePositionLoad<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -164,6 +67,15 @@ impl CacheBackend for RejectPositionsCacheBackend {
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
         if Self::rejects(codec.as_ref()) {
+            let active = self.active_positions.fetch_add(1, Ordering::SeqCst) + 1;
+            let _active = ActivePositionLoad(&self.active_positions);
+            self.peak_positions.fetch_max(active, Ordering::SeqCst);
+            let read = self.position_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            // Let competing term loads enter before this loader completes.
+            tokio::task::yield_now().await;
+            if self.fail_position_read == read {
+                return Err(Error::index("injected position read failure"));
+            }
             return loader.await.map(|(entry, _)| (entry, false));
         }
         self.inner.get_or_insert(key, loader, codec).await
@@ -187,6 +99,84 @@ impl CacheBackend for RejectPositionsCacheBackend {
 
     fn approx_size_bytes(&self) -> usize {
         self.inner.approx_size_bytes()
+    }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_phrase_positions_drain_one_term_at_a_time_under_pressure(
+    #[values(false, true)] fail_second_read: bool,
+) {
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::memory().into(),
+        object_store::path::Path::from("phrase-pressure"),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .format_version(InvertedListFormatVersion::V3);
+    let format = params.resolved_format_version();
+    let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        true,
+        TokenSetFormat::default(),
+        format,
+        params.posting_block_size(),
+    );
+    for (term, first, second) in [("alpha", 0, 0), ("beta", 1, 2), ("gamma", 2, 3)] {
+        builder.tokens.get_or_add(term);
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            true,
+            format.posting_tail_codec(),
+            params.posting_block_size(),
+        );
+        posting.add(0, PositionRecorder::Position(vec![first].into()));
+        posting.add(1, PositionRecorder::Position(vec![second].into()));
+        builder.posting_lists.push(posting);
+    }
+    builder.docs.append(100, 8);
+    builder.docs.append(101, 8);
+    builder.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+    let mut backend = RejectPositionsCacheBackend::new(1 << 20);
+    backend.fail_position_read = if fail_second_read { 2 } else { 0 };
+    let backend = Arc::new(backend);
+    let cache = LanceCache::with_backend(backend.clone());
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    let pressure = (0..=get_num_compute_intensive_cpus())
+        .map(|_| super::super::scheduling::MODERN_SEARCHES.enter())
+        .collect::<Vec<_>>();
+    let result = index
+        .bm25_search(
+            Arc::new(Tokens::new(
+                vec!["alpha".into(), "beta".into(), "gamma".into()],
+                crate::scalar::inverted::document_tokenizer::DocType::Text,
+            )),
+            Arc::new(
+                FtsSearchParams::new()
+                    .with_limit(Some(10))
+                    .with_phrase_slop(Some(0)),
+            ),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await;
+    drop(pressure);
+    assert_eq!(backend.active_positions.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.peak_positions.load(Ordering::SeqCst), 1);
+    if fail_second_read {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(error.to_string().contains("injected position read failure"));
+        assert_eq!(backend.position_reads.load(Ordering::SeqCst), 2);
+    } else {
+        let (rows, scores) = result.unwrap();
+        assert_eq!(rows, vec![100]);
+        assert_eq!(scores.len(), 1);
+        assert!(scores[0].is_finite() && scores[0] > 0.0);
+        assert_eq!(backend.position_reads.load(Ordering::SeqCst), 3);
     }
 }
 

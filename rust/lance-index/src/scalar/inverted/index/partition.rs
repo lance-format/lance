@@ -1446,6 +1446,16 @@ impl InvertedPartition {
 
         let io_parallelism = self.store.io_parallelism();
         let token_count = token_ids.len();
+        // With many searches already supplying remote I/O, overlapping all
+        // large position decoders within a partition retains their temporary
+        // buffers together. Keep posting reads parallel, then read positions
+        // one term at a time. A single search keeps its original overlap.
+        let stage_positions = self.docs.modern().is_some()
+            && params.phrase_slop == Some(0)
+            && self.inverted_list.has_positions()
+            && !has_expansions
+            && token_count > 1
+            && super::scheduling::MODERN_SEARCHES.exceeds_compute_capacity();
         let reads = token_ids
             .into_iter()
             .map(|(token_id, token_index, position)| {
@@ -1460,14 +1470,18 @@ impl InvertedPartition {
                     let posting = match read_policy {
                         PostingReadPolicy::ReadAhead => {
                             self.inverted_list
-                                .posting_list(token_id, is_phrase_query, metrics)
+                                .posting_list(
+                                    token_id,
+                                    is_phrase_query && !stage_positions,
+                                    metrics,
+                                )
                                 .await?
                         }
                         PostingReadPolicy::CacheAwareExact => {
                             self.inverted_list
                                 .posting_list_with_policy(
                                     token_id,
-                                    is_phrase_query,
+                                    is_phrase_query && !stage_positions,
                                     metrics,
                                     read_policy,
                                 )
@@ -1481,7 +1495,7 @@ impl InvertedPartition {
         // A leaf usually reads a handful of postings; joining them directly
         // avoids a stream task allocation per read. Larger expansions keep the
         // store's read concurrency bound.
-        let loaded_postings = if token_count <= io_parallelism {
+        let mut loaded_postings = if token_count <= io_parallelism {
             futures::future::try_join_all(reads).await?
         } else {
             stream::iter(reads)
@@ -1500,6 +1514,22 @@ impl InvertedPartition {
                 .any(|(_, _, _, posting)| posting.is_empty())
         {
             return Ok(None);
+        }
+
+        if stage_positions {
+            // Smaller posting lists tend to have smaller position streams.
+            // Preserve query-position order in the result while delaying the
+            // largest read until its peers can no longer hold decoder scratch.
+            let mut order = (0..loaded_postings.len()).collect::<Vec<_>>();
+            order.sort_unstable_by_key(|index| loaded_postings[*index].3.len());
+            for index in order {
+                let (token_id, _, _, posting) = &mut loaded_postings[index];
+                let positions = self
+                    .inverted_list
+                    .read_positions(*token_id, metrics)
+                    .await?;
+                posting.set_positions(positions);
+            }
         }
 
         let docs_for_union = if needs_union {

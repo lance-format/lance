@@ -294,22 +294,13 @@ impl DeepSizeOf for CompressedPositionStorage {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::LegacyPerDoc(positions) => sliced_cache_bytes(positions),
-            Self::SharedStream(stream) => {
-                stream.size()
-                    + std::mem::size_of::<PositionStreamData>()
-                    + 2 * std::mem::size_of::<usize>()
-            }
+            Self::SharedStream(stream) => stream.size(),
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedPositionStream {
-    data: Arc<PositionStreamData>,
-}
-
-#[derive(Debug, Default)]
-struct PositionStreamData {
     codec: PositionStreamCodec,
     block_offsets: Arc<[u32]>,
     // Stored with shared ownership so cache hits can clone position streams
@@ -320,9 +311,9 @@ struct PositionStreamData {
 
 impl PartialEq for SharedPositionStream {
     fn eq(&self, other: &Self) -> bool {
-        self.data.codec == other.data.codec
-            && self.data.block_offsets == other.data.block_offsets
-            && self.data.bytes == other.data.bytes
+        self.codec == other.codec
+            && self.block_offsets == other.block_offsets
+            && self.bytes == other.bytes
     }
 }
 
@@ -331,12 +322,10 @@ impl Eq for SharedPositionStream {}
 impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
-            data: Arc::new(PositionStreamData {
-                codec,
-                block_offsets: Arc::from(block_offsets.into_boxed_slice()),
-                retained_bytes: bytes.len(),
-                bytes,
-            }),
+            codec,
+            block_offsets: Arc::from(block_offsets.into_boxed_slice()),
+            retained_bytes: bytes.len(),
+            bytes,
         }
     }
 
@@ -374,106 +363,44 @@ impl SharedPositionStream {
                 len,
             ),
         };
-        Self {
-            data: Arc::new(PositionStreamData {
-                codec,
-                block_offsets: Arc::from(block_offsets.into_boxed_slice()),
-                bytes,
-                retained_bytes,
-            }),
-        }
+        let mut stream = Self::new(codec, block_offsets, bytes);
+        stream.retained_bytes = retained_bytes;
+        stream
     }
 
     pub fn codec(&self) -> PositionStreamCodec {
-        self.data.codec
+        self.codec
     }
 
     pub fn block_count(&self) -> usize {
-        self.data.block_offsets.len()
+        self.block_offsets.len()
     }
 
     pub fn block_range(&self, index: usize) -> Range<usize> {
-        let start = self.data.block_offsets[index] as usize;
+        let start = self.block_offsets[index] as usize;
         let end = self
-            .data
             .block_offsets
             .get(index + 1)
             .map(|offset| *offset as usize)
-            .unwrap_or(self.data.bytes.len());
+            .unwrap_or(self.bytes.len());
         start..end
     }
 
     pub fn block(&self, index: usize) -> &[u8] {
         let range = self.block_range(index);
-        &self.data.bytes[range]
+        &self.bytes[range]
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.data.bytes
+        &self.bytes
     }
 
     pub fn block_offsets(&self) -> &[u32] {
-        self.data.block_offsets.as_ref()
+        self.block_offsets.as_ref()
     }
 
     pub fn size(&self) -> usize {
-        self.data.block_offsets.len() * std::mem::size_of::<u32>() + self.data.retained_bytes
-    }
-}
-
-// A cache eviction must not force another copy of a stream still held by a
-// running query. This direct-mapped table is only a reuse hint: collisions and
-// contention fall back to the normal cache loader. Weak references retain no
-// position payload after the last cache/query owner drops it.
-const ACTIVE_POSITION_SLOTS: usize = 256;
-
-pub(super) struct ActivePositionStreams {
-    entries: Mutex<[Option<ActivePositionStream>; ACTIVE_POSITION_SLOTS]>,
-}
-
-struct ActivePositionStream {
-    token_id: u32,
-    data: std::sync::Weak<PositionStreamData>,
-}
-
-impl Default for ActivePositionStreams {
-    fn default() -> Self {
-        Self {
-            entries: Mutex::new(std::array::from_fn(|_| None)),
-        }
-    }
-}
-
-impl ActivePositionStreams {
-    pub(super) fn get(&self, token_id: u32) -> Option<SharedPositionStream> {
-        let entries = self.entries.try_lock().ok()?;
-        let entry = entries[token_id as usize % ACTIVE_POSITION_SLOTS].as_ref()?;
-        if entry.token_id != token_id {
-            return None;
-        }
-        entry
-            .data
-            .upgrade()
-            .map(|data| SharedPositionStream { data })
-    }
-
-    pub(super) fn remember(&self, token_id: u32, stream: &SharedPositionStream) {
-        if let Ok(mut entries) = self.entries.try_lock() {
-            entries[token_id as usize % ACTIVE_POSITION_SLOTS] = Some(ActivePositionStream {
-                token_id,
-                data: Arc::downgrade(&stream.data),
-            });
-        }
-    }
-
-    pub(super) fn retained_metadata_bytes(&self) -> usize {
-        // Weak references can retain the Arc control allocation, but not its
-        // already-dropped byte/offset buffers. Charge the fixed worst case
-        // without locking or traversing live query data during cache sizing.
-        std::mem::size_of::<Self>()
-            + 2 * std::mem::size_of::<usize>()
-            + ACTIVE_POSITION_SLOTS
-                * (std::mem::size_of::<PositionStreamData>() + 2 * std::mem::size_of::<usize>())
+        self.block_offsets.len() * std::mem::size_of::<u32>() + self.retained_bytes
     }
 }
 
