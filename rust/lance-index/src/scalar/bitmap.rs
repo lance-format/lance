@@ -54,7 +54,7 @@ use crate::cache_pb::BitmapIndexHeader;
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    progress::IndexBuildProgress,
+    progress::{IndexBuildProgress, stage_until_first_batch},
     scalar::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
@@ -1980,6 +1980,7 @@ impl BitmapIndexPlugin {
     ) -> Result<IndexFile> {
         let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
         let file_name = bitmap_shard_file_name(partition_id);
+        let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
@@ -2654,7 +2655,13 @@ impl BasicTrainer for BitmapIndexPlugin {
                     .to_string(),
             ));
         } else {
-            Self::train_bitmap_index(data, index_store).await?
+            let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
+            progress
+                .stage_start("write_bitmap_index", None, "files")
+                .await?;
+            let file = Self::train_bitmap_index(data, index_store).await?;
+            progress.stage_complete("write_bitmap_index").await?;
+            file
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())

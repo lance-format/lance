@@ -1403,12 +1403,20 @@ impl BloomFilterIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<BloomFilterIndexBuilderParams>,
+        progress: &dyn crate::progress::IndexBuildProgress,
     ) -> Result<Vec<IndexFile>> {
         let mut builder = BloomFilterIndexBuilder::try_new(options.unwrap_or_default())?;
 
+        progress.stage_start("train_zones", None, "rows").await?;
         builder.train(batches_source).await?;
+        progress.stage_complete("train_zones").await?;
 
-        builder.write_index(index_store).await
+        progress
+            .stage_start("write_bloomfilter_index", None, "files")
+            .await?;
+        let files = builder.write_index(index_store).await?;
+        progress.stage_complete("write_bloomfilter_index").await?;
+        Ok(files)
     }
 }
 
@@ -1473,7 +1481,7 @@ impl BasicTrainer for BloomFilterIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
@@ -1482,7 +1490,13 @@ impl BasicTrainer for BloomFilterIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        let files = Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
+        let files = Self::train_bloomfilter_index(
+            data,
+            index_store,
+            Some(request.params),
+            progress.as_ref(),
+        )
+        .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
@@ -1595,6 +1609,7 @@ impl TrainingRequest for BloomFilterIndexTrainingRequest {
 #[cfg(test)]
 mod tests {
     use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
+    use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1669,9 +1684,14 @@ mod tests {
         ));
         let data_stream = add_row_addr(data_stream);
 
-        BloomFilterIndexPlugin::train_bloomfilter_index(data_stream, test_store.as_ref(), None)
-            .await
-            .unwrap();
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            None,
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
 
         log::debug!("Successfully wrote the index file");
 
@@ -1715,6 +1735,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1799,6 +1820,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.05)), // ~5% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1884,6 +1906,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1972,6 +1995,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(1000, 0.001)), // 10 blocks total
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2062,6 +2086,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2144,6 +2169,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.05)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2212,6 +2238,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.05)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2272,6 +2299,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.01)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2332,6 +2360,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(50, 0.01)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2414,6 +2443,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(25, 0.05)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2465,6 +2495,7 @@ mod tests {
             data_stream,
             test_store.as_ref(),
             Some(BloomFilterIndexBuilderParams::new(250, 0.01)), // 4 zones total
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2522,9 +2553,14 @@ mod tests {
         let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
         // Train and write the bloomfilter index
-        BloomFilterIndexPlugin::train_bloomfilter_index(stream, store.as_ref(), None)
-            .await
-            .unwrap();
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            stream,
+            store.as_ref(),
+            None,
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
 
         let cache = LanceCache::with_capacity(1024 * 1024);
         let index = BloomFilterIndex::load(store.clone(), None, &cache)
@@ -2942,6 +2978,7 @@ mod tests {
                 stream,
                 store.as_ref(),
                 Some(params.clone()),
+                &NoopIndexBuildProgress,
             )
             .await
             .unwrap();

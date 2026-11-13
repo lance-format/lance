@@ -582,8 +582,7 @@ pub(super) async fn build_scalar_index(
                     .data_type()
             })
             .unwrap_or_else(|| field.data_type().clone());
-        progress.stage_start("load_data", None, "rows").await?;
-        let created = zonemap::build_segment_with_seeds(
+        return zonemap::build_segment_with_seeds(
             dataset,
             column,
             zone_map_params,
@@ -591,10 +590,9 @@ pub(super) async fn build_scalar_index(
             fragment_ids,
             training_request.criteria(),
             &index_store,
+            progress.as_ref(),
         )
-        .await?;
-        progress.stage_complete("load_data").await?;
-        return Ok(created);
+        .await;
     }
 
     progress.stage_start("load_data", None, "rows").await?;
