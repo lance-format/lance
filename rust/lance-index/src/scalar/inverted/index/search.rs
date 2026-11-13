@@ -1165,69 +1165,67 @@ impl InvertedIndex {
                             )))
                         }
                     });
-                    let loaded = stream::iter(loads)
+                    let loads = stream::iter(loads)
                         .buffer_unordered(io_parallelism)
-                        .try_collect::<Vec<_>>()
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
-                    if loaded.is_empty() {
-                        return Result::Ok(Vec::new());
-                    }
+                        .try_filter_map(|loaded| async move { Ok(loaded) });
 
                     // Iterators are built here rather than during the load so
                     // their decode buffers are allocated and freed by the same
                     // thread that runs WAND.
-                    let results = spawn_cpu(move || {
-                        let mut results = Vec::with_capacity(loaded.len());
-                        for (partition_ordinal, part, lengths, visibility, postings) in loaded {
-                            let LoadedPostings {
-                                postings,
-                                grouped_expansions,
-                                impact_safe,
-                                exact_scoring_required,
-                                ..
-                            } = postings.into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
-                            if postings.is_empty() {
-                                continue;
-                            }
-                            let use_global_scorer = impact_safe || exact_scoring_required;
-                            let threshold = if use_global_scorer {
-                                impact_shared_threshold.clone()
-                            } else {
-                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
-                            };
-                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                            let idf_by_position =
-                                idf_by_position(&postings, impact_scorer.as_ref());
-                            let candidates = part.bm25_search_modern(
-                                lengths.as_ref(),
-                                &visibility,
-                                params.as_ref(),
-                                operator,
-                                postings,
-                                wand_scorer,
-                                shared_norm_addends.clone(),
-                                metrics.as_ref(),
-                                threshold,
-                            )?;
-                            // Rescore here too, so each candidate's frequency
-                            // list is freed by the thread that allocated it.
-                            let scored = rescore_partition_candidates(
-                                PartitionCandidates {
-                                    idf_by_position,
+                    let results = super::scheduling::score_ready_partitions(
+                        loads,
+                        chunk_size,
+                        move |loaded| {
+                            let mut results = Vec::with_capacity(loaded.len());
+                            for (partition_ordinal, part, lengths, visibility, postings) in loaded {
+                                let LoadedPostings {
+                                    postings,
                                     grouped_expansions,
-                                    candidates,
-                                },
-                                impact_scorer.as_ref(),
-                            );
-                            if !scored.is_empty() {
-                                results.push((partition_ordinal, scored));
+                                    impact_safe,
+                                    exact_scoring_required,
+                                    ..
+                                } = postings
+                                    .into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
+                                if postings.is_empty() {
+                                    continue;
+                                }
+                                let use_global_scorer = impact_safe || exact_scoring_required;
+                                let threshold = if use_global_scorer {
+                                    impact_shared_threshold.clone()
+                                } else {
+                                    Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                                };
+                                let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                                let idf_by_position =
+                                    idf_by_position(&postings, impact_scorer.as_ref());
+                                let candidates = part.bm25_search_modern(
+                                    lengths.as_ref(),
+                                    &visibility,
+                                    params.as_ref(),
+                                    operator,
+                                    postings,
+                                    wand_scorer,
+                                    shared_norm_addends.clone(),
+                                    metrics.as_ref(),
+                                    threshold,
+                                )?;
+                                // Rescore here too, so each candidate's frequency
+                                // list is freed by the thread that allocated it.
+                                let scored = rescore_partition_candidates(
+                                    PartitionCandidates {
+                                        idf_by_position,
+                                        grouped_expansions,
+                                        candidates,
+                                    },
+                                    impact_scorer.as_ref(),
+                                );
+                                if !scored.is_empty() {
+                                    results.push((partition_ordinal, scored));
+                                }
                             }
-                        }
-                        Result::Ok(results)
-                    })
+                            Result::Ok(results)
+                        },
+                    )
                     .await?;
                     Result::Ok(results)
                 }

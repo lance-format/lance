@@ -3,7 +3,35 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::{Stream, TryStreamExt};
+use lance_core::{Result, utils::tokio::spawn_cpu};
+
 use super::format::{DEFAULT_FTS_SEARCH_CHUNK, configured_fts_search_chunk};
+
+/// Consume ready inputs before unrelated reads finish. The caller retains its
+/// original bounded I/O window; at most two bounded CPU batches overlap.
+pub(super) async fn score_ready_partitions<T, R, S, F>(
+    loads: S,
+    chunk_size: usize,
+    score: F,
+) -> Result<Vec<R>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    S: Stream<Item = Result<T>>,
+    F: Fn(Vec<T>) -> Result<Vec<R>> + Clone + Send + 'static,
+{
+    loads
+        .try_ready_chunks(chunk_size)
+        .map_err(|error| error.1)
+        .map_ok(move |loaded| {
+            let score = score.clone();
+            async move { spawn_cpu(move || score(loaded)).await }
+        })
+        .try_buffer_unordered(2)
+        .try_concat()
+        .await
+}
 
 /// Preserve the original partition-load window when scoring batches shrink.
 pub(super) fn buffered_search_chunks(
@@ -67,6 +95,60 @@ impl Drop for SearchGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn ready_partition_releases_before_pending_load() {
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let progress = released.clone();
+        let loads = futures::stream::once(async { Ok(7) }).chain(futures::stream::once(async {
+            // The next read cannot acquire its resource until the first
+            // result has been consumed, even though both fit one CPU batch.
+            while progress.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+            Ok(11)
+        }));
+        let mut result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            score_ready_partitions(loads, 16, move |items| {
+                released.fetch_add(items.len(), Ordering::Release);
+                Ok(items)
+            }),
+        )
+        .await
+        .expect("ready work must not wait for the whole I/O window")
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, vec![7, 11]);
+    }
+
+    #[tokio::test]
+    async fn ready_scoring_bounds_retained_batches() {
+        struct Input(std::sync::Arc<AtomicUsize>, usize);
+        impl Drop for Input {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let loads = futures::stream::iter(0..33).map(|id| {
+            let count = live.fetch_add(1, Ordering::Relaxed) + 1;
+            peak.fetch_max(count, Ordering::Relaxed);
+            Ok(Input(live.clone(), id))
+        });
+        let mut result = score_ready_partitions(loads, 4, |items| {
+            assert!(items.len() <= 4);
+            Ok(items.into_iter().map(|item| item.1).collect())
+        })
+        .await
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, (0..33).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::Relaxed) <= 8);
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
 
     #[rstest::rstest]
     #[case::remote(128, 2, 32, 128, 128)]
