@@ -1951,6 +1951,35 @@ fn make_two_fragment_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
     (schema, vec![batch])
 }
 
+fn make_sq_merge_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
+    let (schema, batches) = make_two_fragment_batches();
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            let vectors = batch["vector"].as_fixed_size_list();
+            let mut values = vectors
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            // Every training sample contains both bounds, so independently trained
+            // shards use the same SQ model without requiring a model injection API.
+            for vector in values.as_chunks_mut::<TWO_FRAG_DIM>().0 {
+                vector[0] = 0.0;
+                vector[1] = 1.0;
+            }
+            let vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(values),
+                TWO_FRAG_DIM as i32,
+            )
+            .unwrap();
+            RecordBatch::try_new(schema.clone(), vec![batch["id"].clone(), Arc::new(vectors)])
+                .unwrap()
+        })
+        .collect();
+    (schema, batches)
+}
+
 async fn write_dataset_from_batches(
     test_uri: &str,
     schema: Arc<Schema>,
@@ -2525,7 +2554,11 @@ async fn test_distributed_vector_grouped_build_allows_concurrent_group_execution
     let test_dir = TempStrDir::default();
     let base_uri = test_dir.as_str();
 
-    let (schema, batches) = make_two_fragment_batches();
+    let (schema, batches) = if matches!(index_type, IndexType::IvfSq) {
+        make_sq_merge_batches()
+    } else {
+        make_two_fragment_batches()
+    };
     let ds_single_uri = format!("{}/grouped_single", base_uri);
     let ds_split_uri = format!("{}/grouped_split", base_uri);
 
@@ -4255,6 +4288,9 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
     let (schema, batches, max_rows_per_file) = if expected_index_type == "IVF_HNSW_PQ" {
         let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS * 2);
         (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
+    } else if expected_index_type == "IVF_HNSW_SQ" {
+        let (schema, batches) = make_sq_merge_batches();
+        (schema, batches, 500)
     } else {
         let (schema, batches) = make_two_fragment_batches();
         (schema, batches, TWO_FRAG_ROWS_PER_FILE)
