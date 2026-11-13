@@ -3807,14 +3807,32 @@ async fn test_versions_reads_manifests_concurrently() {
     let dataset = dataset.with_object_store_wrappers(vec![
         probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
     ]);
+    // LANCE_IO_THREADS can legitimately reduce the window to one, so overlap is
+    // only required when the effective window permits it.
+    let effective_window = dataset.object_store.io_parallelism();
     let versions = dataset.versions().await.unwrap();
 
     let ids: Vec<u64> = versions.iter().map(|v| v.version).collect();
     assert_eq!(ids, (1..=VERSIONS as u64).collect::<Vec<_>>());
+
+    let peak_in_flight = probe.peak_in_flight.load(AtomicOrdering::SeqCst);
+    let max_in_flight = (VERSIONS as usize).min(effective_window);
     assert!(
-        probe.peak_in_flight.load(AtomicOrdering::SeqCst) > 1,
-        "manifests were read one at a time"
+        peak_in_flight > 0,
+        "no manifest reads were observed through the probe"
     );
+    assert!(
+        peak_in_flight <= max_in_flight,
+        "observed {peak_in_flight} concurrent manifest reads, but at most \
+         {max_in_flight} are expected for {VERSIONS} versions with an effective window of \
+         {effective_window}"
+    );
+    if effective_window > 1 {
+        assert!(
+            peak_in_flight > 1,
+            "manifests were read one at a time despite an effective window of {effective_window}"
+        );
+    }
 }
 
 fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
