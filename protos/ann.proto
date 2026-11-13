@@ -30,6 +30,18 @@ enum VectorApproxMode {
   Accurate = 2;
 }
 
+/* How an HNSW search over RQ codes (IVF_HNSW_RQ) scores the nodes it visits.
+ * Other index types ignore this setting.
+ */
+enum VectorRqGraphScoring {
+  // Score every visited node with the full multi-bit RQ estimator.
+  MultiBit = 0;
+  /* Walk the graph with the 1-bit sign codes, then rescore the ef finalists
+   * with the full multi-bit codes.
+   */
+  OneBitRerank = 1;
+}
+
 /* The covering ("included") index columns a query needs materialized, as dataset
  * field ids.
  *
@@ -80,6 +92,10 @@ message VectorQueryProto {
    * subject to caller bounds. Later candidate-count expansion is unchanged.
    */
   optional double search_effort = 16;
+  /* How an IVF_HNSW_RQ graph search scores visited nodes. Other index types
+   * ignore this setting.
+   */
+  VectorRqGraphScoring rq_graph_scoring = 17;
 }
 
 /* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

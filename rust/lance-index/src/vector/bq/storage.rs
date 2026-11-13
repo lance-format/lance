@@ -3263,7 +3263,7 @@ mod tests {
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
     use crate::vector::transform::Transformer;
     use crate::vector::v3::subindex::IvfSubIndex;
-    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN};
+    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN, RqGraphScoring};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -5717,6 +5717,32 @@ mod tests {
         }
     }
 
+    /// A multi-bit search scores visited nodes with the full multi-bit
+    /// estimator and a reranking search with the 1-bit walk.
+    #[test]
+    fn test_rq_graph_scoring_selects_search_calculator() {
+        let num_rows = 32;
+        let storage = hnsw_partition(5, DistanceType::L2, num_rows as usize);
+        let (query, dist_q_c) = residual_query_array(storage.code_dim());
+        let full = storage.dist_calculator(query.clone(), dist_q_c);
+        let walk = storage.graph_dist_calculator(query.clone(), dist_q_c);
+        let params = |rq_graph_scoring| HnswQueryParams {
+            ef: num_rows as usize,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c,
+            use_acorn: false,
+            rq_graph_scoring,
+        };
+        let multi_bit = params(RqGraphScoring::MultiBit).dist_calculator(&storage, query.clone());
+        let one_bit = params(RqGraphScoring::OneBitRerank).dist_calculator(&storage, query);
+        for id in 0..num_rows {
+            assert_eq!(multi_bit.distance(id), full.distance(id), "row {id}");
+            assert_eq!(one_bit.distance(id), walk.distance(id), "row {id}");
+        }
+        assert!((0..num_rows).any(|id| full.distance(id) != walk.distance(id)));
+    }
+
     #[derive(Clone, Copy)]
     enum RangeSearchPath {
         Graph,
@@ -5725,7 +5751,8 @@ mod tests {
     }
 
     /// HNSW range bounds judge the reranked score, not the walk score, on the
-    /// graph search, the sparse-mask flat scan and the ACORN search. 32 rows
+    /// graph search, the sparse-mask flat scan and the ACORN search, and the
+    /// full multi-bit score when the search never walks. 32 rows
     /// put a one-row mask below HNSW's 10% flat-scan threshold.
     #[rstest]
     #[case::graph_drops_reranked_out(RangeSearchPath::Graph, false)]
@@ -5738,6 +5765,8 @@ mod tests {
         #[case] path: RangeSearchPath,
         #[case] reranked_in_range: bool,
         #[values(1, 5)] num_bits: u8,
+        #[values(RqGraphScoring::MultiBit, RqGraphScoring::OneBitRerank)]
+        rq_graph_scoring: RqGraphScoring,
     ) {
         let num_rows = 32u64;
         let storage = hnsw_partition(num_bits, DistanceType::L2, num_rows as usize);
@@ -5779,6 +5808,7 @@ mod tests {
             upper_bound: upper,
             dist_q_c,
             use_acorn: matches!(path, RangeSearchPath::Acorn),
+            rq_graph_scoring,
         };
         let batch = hnsw
             .search(

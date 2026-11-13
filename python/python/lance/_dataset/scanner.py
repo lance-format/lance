@@ -490,6 +490,7 @@ def _build_vector_search_query(
     refine_column: Optional[str] = None,
     refine_q: Optional[QueryVectorLike] = None,
     refine_metric: Optional[str] = None,
+    rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -573,6 +574,12 @@ def _build_vector_search_query(
         and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
         coarse TopM still precedes refinement. Query filters are unsupported;
         scalar filters retain their usual prefilter/postfilter behavior.
+    rq_graph_scoring: {"multi_bit", "one_bit_rerank"}, default "multi_bit"
+        How an IVF_HNSW_RQ graph search scores the nodes it visits. Other index
+        types ignore this setting. ``multi_bit`` scores every visited node with
+        the full multi-bit RQ codes. ``one_bit_rerank`` walks the graph with
+        the 1-bit sign codes and rescores only the ``ef`` finalists with the
+        full codes, which is faster but can lower recall at a given ``ef``.
 
     Returns
     -------
@@ -670,6 +677,7 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "rq_graph_scoring": rq_graph_scoring,
         "search_effort": search_effort,
         "distance_range": distance_range,
         "refine_column": refine_column,
@@ -1048,6 +1056,7 @@ class ScannerBuilder:
         refine_column: Optional[str] = None,
         refine_q: Optional[QueryVectorLike] = None,
         refine_metric: Optional[str] = None,
+        rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -1119,6 +1128,12 @@ class ScannerBuilder:
             and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
             coarse TopM still precedes refinement. Query filters are unsupported;
             scalar filters retain their usual prefilter/postfilter behavior.
+        rq_graph_scoring: {"multi_bit", "one_bit_rerank"}, default "multi_bit"
+            How an IVF_HNSW_RQ graph search scores the nodes it visits. Other index
+            types ignore this setting. ``multi_bit`` scores every visited node with
+            the full multi-bit RQ codes. ``one_bit_rerank`` walks the graph with
+            the 1-bit sign codes and rescores only the ``ef`` finalists with the
+            full codes, which is faster but can lower recall at a given ``ef``.
 
         Examples
         --------
@@ -1154,6 +1169,7 @@ class ScannerBuilder:
             refine_column=refine_column,
             refine_q=refine_q,
             refine_metric=refine_metric,
+            rq_graph_scoring=rq_graph_scoring,
         )
         return self
 
@@ -1631,6 +1647,7 @@ class VectorSearchQuery:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         search_effort: Optional[float] = None,
+        rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -1646,6 +1663,7 @@ class VectorSearchQuery:
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
             search_effort=search_effort,
+            rq_graph_scoring=rq_graph_scoring,
         )
 
     def inner(self):

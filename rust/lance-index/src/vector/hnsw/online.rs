@@ -358,6 +358,7 @@ impl OnlineHnswBuilder {
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn: false,
+                rq_graph_scoring: Default::default(),
             },
             dist_calc,
             None,
@@ -432,6 +433,7 @@ impl OnlineHnswBuilder {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (result, _) = beam_search(
             &bottom,
@@ -753,6 +755,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 &mut visited,

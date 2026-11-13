@@ -1153,6 +1153,7 @@ impl Dataset {
                 query_parallelism,
                 approx_mode,
                 search_effort,
+                rq_graph_scoring,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1227,6 +1228,7 @@ impl Dataset {
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
+                    s = s.rq_graph_scoring(rq_graph_scoring);
                     s = s.search_effort(search_effort)?;
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
