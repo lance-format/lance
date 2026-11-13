@@ -78,6 +78,16 @@ jobs:
           ref: ${{ inputs.sha }}
           fetch-depth: 1
           lfs: true
+      # The published source predates this recovery helper. Keep the helper
+      # from the workflow revision separate from the source being rebuilt.
+      - name: Check out the recovery helper
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .recovery-tools
+          sparse-checkout: ci/check_beta_wheel_recovery.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -109,7 +119,7 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
         shell: bash
-        run: python ci/check_beta_wheel_recovery.py --tag "$TAG" --wheel-dir python/target/wheels
+        run: python .recovery-tools/ci/check_beta_wheel_recovery.py --tag "$TAG" --wheel-dir python/target/wheels
       - name: Upload the wheel as an artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -123,7 +133,7 @@ jobs:
           SHA: ${{ inputs.sha }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
-        run: python ci/check_beta_wheel_recovery.py --tag "$TAG" --sha "$SHA"
+        run: python .recovery-tools/ci/check_beta_wheel_recovery.py --tag "$TAG" --sha "$SHA"
       - name: Publish to the Gemfury beta channel
         if: ${{ inputs.publish }}
         uses: ./.github/workflows/upload_wheel
