@@ -2745,6 +2745,8 @@ impl Dataset {
             file_field: &lance_core::datatypes::Field,
             path: &str,
         ) -> Result<()> {
+            use arrow_schema::DataType::{LargeList, List, Timestamp};
+
             if dataset_field.name != file_field.name {
                 return Err(Error::invalid_input(format!(
                     "Schema mismatch: expected field '{}' but file has '{}'",
@@ -2754,6 +2756,31 @@ impl Dataset {
 
             if dataset_field.is_blob() && file_field.is_blob() {
                 return Ok(());
+            }
+
+            // Reads decode a replacement file's values as the dataset field
+            // types, so values stored as another type read back as other
+            // values or fail to decode. List offset widths and timestamp time
+            // zone names do not change the stored values, and list items are
+            // compared as children below. Blob columns are skipped: their
+            // file layout can legitimately differ from the dataset's type.
+            let same_values = match (dataset_field.data_type(), file_field.data_type()) {
+                (List(_) | LargeList(_), List(_) | LargeList(_)) => true,
+                // A naive timestamp is a wall-clock time and one with a time
+                // zone is an instant, so only the zone's name may differ.
+                (Timestamp(dataset_unit, dataset_tz), Timestamp(file_unit, file_tz)) => {
+                    dataset_unit == file_unit && dataset_tz.is_some() == file_tz.is_some()
+                }
+                _ => dataset_field.logical_type == file_field.logical_type,
+            };
+            if !same_values
+                && !field_contains_blob(dataset_field)
+                && !field_contains_blob(file_field)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: field '{}' has type {} in dataset schema but {} in file schema",
+                    path, dataset_field.logical_type, file_field.logical_type
+                )));
             }
 
             if dataset_field.children.len() != file_field.children.len() {
@@ -3108,17 +3135,15 @@ impl Dataset {
         let mut versions: Vec<Version> = self
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_filter_map(|location| async move {
+            .map_ok(|location| async move {
                 let manifest_size = location.size;
-                match read_manifest(&self.object_store, &location.path, manifest_size).await {
-                    Ok(manifest) => {
-                        let mut version = Version::from(&manifest);
-                        version.manifest_size = manifest_size;
-                        Ok(Some(version))
-                    }
-                    Err(e) => Err(e),
-                }
+                let manifest =
+                    read_manifest(&self.object_store, &location.path, manifest_size).await?;
+                let mut version = Version::from(&manifest);
+                version.manifest_size = manifest_size;
+                Ok(version)
             })
+            .try_buffer_unordered(self.object_store.io_parallelism())
             .try_collect()
             .await?;
 
