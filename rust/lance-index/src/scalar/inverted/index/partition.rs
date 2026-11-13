@@ -1923,6 +1923,7 @@ mod tests {
         // VarintDelta tail: document 0, frequency 1. The preceding value is
         // outside this posting but its allocation remains owned by the slice.
         let blocks = LargeBinaryArray::from_iter_values([unrelated.as_slice(), &[0, 1]]);
+        let backing = blocks.get_buffer_memory_size();
         let posting = PostingList::Compressed(CompressedPostingList::new(
             blocks.slice(1, 1),
             1.0,
@@ -1941,8 +1942,8 @@ mod tests {
             docs_for_union: None,
         };
         let retained = fetched.retained_bytes();
-        assert!(retained >= unrelated.len());
-        assert!(retained < 2 * unrelated.len());
+        assert!(retained >= backing);
+        assert!(retained < 2 * backing);
     }
 
     fn dictionary(terms: &[&str]) -> TokenSet {
