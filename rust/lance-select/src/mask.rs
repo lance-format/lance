@@ -12,6 +12,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
+use tracing::warn;
 
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::utils::address::RowAddress;
@@ -789,13 +790,12 @@ impl RowAddrTreeMap {
 
         let inner = buckets
             .into_iter()
-            .map(|(fragment, (mut offsets, sorted))| {
-                if !sorted {
-                    offsets.sort_unstable();
-                }
-                offsets.dedup();
-                let bitmap = RoaringBitmap::from_sorted_iter(offsets)
-                    .expect("offsets were sorted and deduplicated");
+            .map(|(fragment, (offsets, sorted))| {
+                let bitmap = if offsets.len() <= SMALL_BUCKET_ROWS {
+                    bitmap_from_array_offsets(offsets, sorted)
+                } else {
+                    bitmap_from_offsets(offsets, sorted)
+                };
                 (fragment, RowAddrSelection::Partial(bitmap))
             })
             .collect();
@@ -1278,6 +1278,112 @@ impl Extend<Self> for RowAddrTreeMap {
             }
         }
     }
+}
+
+/// Bytes occupied by one 65,536-offset Roaring bitset container.
+const CONTAINER_BYTES: usize = 1 << 13;
+/// Roaring's canonical array representation includes exactly 4,096 offsets.
+const ARRAY_LIMIT: u32 = 4096;
+/// Preserve the draft's small-bucket path without bitset setup or a maximum scan.
+const SMALL_BUCKET_ROWS: usize = 256;
+
+fn use_sorted_offsets(max: u32, count: usize) -> bool {
+    // from_lsb0_bytes validates byte_length * 8 in u32, including word padding.
+    // Its last u64 word therefore cannot represent offsets near u32::MAX.
+    max > u32::MAX - 64 || usize::try_from(max / 64).map_or(true, |words| words >= count)
+}
+
+#[inline(never)]
+fn bitmap_from_offsets(offsets: Vec<u32>, is_sorted: bool) -> RoaringBitmap {
+    let Some(&last) = offsets.last() else {
+        return RoaringBitmap::new();
+    };
+    let max = if is_sorted || use_sorted_offsets(last, offsets.len()) {
+        last
+    } else {
+        offsets.iter().copied().fold(last, u32::max)
+    };
+    if use_sorted_offsets(max, offsets.len()) {
+        return bitmap_from_array_offsets(offsets, is_sorted);
+    }
+    // Sorting remains the correctness-preserving path when a dense temporary
+    // cannot be represented on the current platform.
+    if let Some(bitmap) = bitmap_from_dense_offsets(&offsets, max) {
+        bitmap
+    } else {
+        bitmap_from_array_offsets(offsets, is_sorted)
+    }
+}
+
+#[inline(always)]
+fn bitmap_from_array_offsets(mut offsets: Vec<u32>, is_sorted: bool) -> RoaringBitmap {
+    if !is_sorted {
+        offsets.sort_unstable();
+    }
+    offsets.dedup();
+    match RoaringBitmap::from_sorted_iter(offsets.iter().copied()) {
+        Ok(bitmap) => bitmap,
+        Err(error) => {
+            // This can only occur if a caller violates from_sorted_runs' sorted
+            // input contract. Preserve set semantics without a library panic.
+            warn!(
+                ?error,
+                "Sorted row-offset construction failed; collecting offsets as a set"
+            );
+            offsets.into_iter().collect()
+        }
+    }
+}
+
+fn bitmap_from_dense_offsets(offsets: &[u32], max: u32) -> Option<RoaringBitmap> {
+    let word_count = usize::try_from(u64::from(max) / 64 + 1).ok()?;
+    let byte_count = word_count.checked_mul(8)?;
+    u32::try_from(byte_count).ok()?.checked_mul(8)?;
+    let mut words = vec![0_u64; word_count];
+    let mut index = usize::try_from(*offsets.first()? / 64).ok()?;
+    let mut word = 0_u64;
+    for &offset in offsets {
+        let next = usize::try_from(offset / 64).ok()?;
+        if next != index {
+            *words.get_mut(index)? |= word;
+            (index, word) = (next, 0);
+        }
+        word |= 1_u64 << (offset % 64);
+    }
+    *words.get_mut(index)? |= word;
+    let mut bits = Vec::with_capacity(byte_count);
+    for word in words {
+        bits.extend_from_slice(&word.to_le_bytes());
+    }
+    // Roaring's byte constructor leaves exactly-4096 containers as bitsets;
+    // equality/serialization use arrays at this boundary. Rebuild those few
+    // containers as ordered offsets, retaining canonical serialized bytes.
+    let mut exact = RoaringBitmap::new();
+    for (key, chunk) in bits.chunks_mut(CONTAINER_BYTES).enumerate() {
+        if chunk.iter().map(|byte| byte.count_ones()).sum::<u32>() == ARRAY_LIMIT {
+            let base = u32::try_from(key.checked_mul(CONTAINER_BYTES)?.checked_mul(8)?).ok()?;
+            let mut array = Vec::with_capacity(usize::try_from(ARRAY_LIMIT).ok()?);
+            for (index, &byte) in chunk.iter().enumerate() {
+                let offset = u32::try_from(index).ok()?.checked_mul(8)?;
+                for bit in 0..8 {
+                    if byte & (1_u8 << bit) != 0 {
+                        array.push(base.checked_add(offset)?.checked_add(bit)?);
+                    }
+                }
+            }
+            if let Err(error) = exact.append(array) {
+                warn!(
+                    ?error,
+                    "Ordered Roaring container append failed; using sorted-offset path"
+                );
+                return None;
+            }
+            chunk.fill(0);
+        }
+    }
+    let mut bitmap = RoaringBitmap::from_lsb0_bytes(0, &bits);
+    bitmap |= exact;
+    Some(bitmap)
 }
 
 pub fn bitmap_to_ranges(bitmap: &RoaringBitmap) -> Vec<Range<u64>> {
@@ -3165,5 +3271,104 @@ mod tests {
                 prop_assert_eq!(mask.selected(id), expected);
             }
         }
+    }
+
+    fn assert_producer_bitmap_matches_insert(offsets: Vec<u32>) {
+        let expected: RoaringBitmap = offsets.iter().copied().collect();
+        let actual = bitmap_from_offsets(offsets.clone(), offsets.is_sorted());
+        assert_eq!(actual, expected);
+        let mut actual_bytes = Vec::new();
+        let mut expected_bytes = Vec::new();
+        actual.serialize_into(&mut actual_bytes).unwrap();
+        expected.serialize_into(&mut expected_bytes).unwrap();
+        assert_eq!(actual_bytes, expected_bytes);
+        assert_eq!(
+            RoaringBitmap::deserialize_from(actual_bytes.as_slice()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn producer_word_padding_boundary() {
+        for max in [
+            u32::MAX - 128,
+            u32::MAX - 64,
+            u32::MAX - 63,
+            u32::MAX - 1,
+            u32::MAX,
+        ] {
+            let words = u64::from(max) / 64 + 1;
+            let length_fits = u32::try_from(words * 8).unwrap().checked_mul(8).is_some();
+            assert_eq!(
+                use_sorted_offsets(max, usize::try_from(words).unwrap()),
+                !length_fits
+            );
+        }
+    }
+
+    #[test]
+    fn producer_sparse_and_edge_offsets() {
+        for offsets in [
+            vec![],
+            vec![3_000_000_000, 7, 1_000_000, 7],
+            vec![9_000_000, 3, 1_000_000],
+            vec![64, 0],
+            (u32::MAX - 100..=u32::MAX).rev().collect(),
+        ] {
+            assert_producer_bitmap_matches_insert(offsets);
+        }
+    }
+
+    #[test]
+    fn producer_array_bitset_serialization() {
+        for count in [255_u32, 256, 257, 4095, 4096, 4097, 65536] {
+            for is_reversed in [false, true] {
+                for has_duplicates in [false, true] {
+                    let mut offsets = (0..count).collect::<Vec<u32>>();
+                    if is_reversed {
+                        offsets.reverse();
+                    }
+                    if has_duplicates {
+                        offsets.extend(offsets.clone());
+                    }
+                    assert_producer_bitmap_matches_insert(offsets);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn producer_mixed_containers_serialization() {
+        let mut offsets = (0..4095_u32)
+            .map(|i| i * 16)
+            .chain((0..4096_u32).map(|i| 65536 + i * 16))
+            .chain((0..4097_u32).map(|i| 2 * 65536 + i * 15))
+            .chain((0..65536_u32).map(|i| 3 * 65536 + i))
+            .chain((0..4096_u32).map(|i| 5 * 65536 + i))
+            .collect::<Vec<_>>();
+        offsets.reverse();
+        assert_producer_bitmap_matches_insert(offsets);
+    }
+
+    #[test]
+    fn producer_sorted_runs_interleaved_dense_fragments() {
+        let address = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+        let mut runs = (0..7_u32)
+            .map(|page| {
+                [0, 3, u32::MAX]
+                    .into_iter()
+                    .flat_map(|fragment| {
+                        (page..12000)
+                            .step_by(7)
+                            .map(move |offset| address(fragment, offset))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        runs.push(vec![address(3, 7), address(u32::MAX, u32::MAX)]);
+        runs.push(vec![]);
+        let actual = RowAddrTreeMap::from_sorted_runs(runs.iter().map(Vec::as_slice));
+        let expected: RowAddrTreeMap = runs.iter().flatten().copied().collect();
+        assert_eq!(actual, expected);
     }
 }
