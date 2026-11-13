@@ -431,13 +431,12 @@ async fn cached_fragment(
         .get_with_key(&RowIdFragmentAliasKey(source_key))
         .await
         .and_then(|alias| alias.0.upgrade())
+        && prepared.usable_without_validation(fragment, key.deletion)
     {
-        // A known pruned source must go through coverage/rebuild validation,
-        // rather than falling back to an older unpruned cache entry.
-        return prepared
-            .usable_without_validation(fragment, key.deletion)
-            .then_some(prepared);
+        return Some(prepared);
     }
+    // An older snapshot can still use the resident full source map. The same
+    // threshold check prevents it from bypassing a needed deletion rebuild.
     dataset
         .index_cache
         .get_with_key(&source_key)
@@ -773,6 +772,9 @@ mod tests {
         );
         let initial = dataset.index_cache.get_with_key(&key).await.unwrap();
         let initial_bytes = initial.index.as_ref().unwrap().deep_size_of();
+        dataset.delete("i = 3").await.unwrap();
+        resolve_row_ids(&dataset, &ids, true).await.unwrap();
+        let lightly_deleted = dataset.clone();
         dataset.delete("i % 16 != 0").await.unwrap();
         assert_eq!(
             resolve_row_ids(&dataset, &ids, true)
@@ -847,6 +849,19 @@ mod tests {
         let final_map = dataset.index_cache.get_with_key(&final_key).await.unwrap();
         assert!(!Arc::ptr_eq(&compacted, &final_map));
         assert_eq!(final_map.retained.as_ref().unwrap().len(), 128);
+        let before = dataset.object_store.io_stats_snapshot();
+        assert_eq!(
+            resolve_row_ids(&lightly_deleted, &[2053], true)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![Some(RowAddress::new_from_parts(fragment_id, 1))]
+        );
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_bytes,
+            before.read_bytes,
+            "an older snapshot must reuse a compatible resident source mapping"
+        );
         assert_eq!(
             resolve_row_ids(&first_deleted, &[80], true)
                 .await
