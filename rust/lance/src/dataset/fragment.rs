@@ -2333,7 +2333,7 @@ impl FileFragment {
             // Sorting the deletion vector costs O(M log M), where M is the
             // deletion vector length. Each index is then resolved with a
             // binary search over the sorted deletions, for a total of
-            // O(N log^2 M + M log M) where N = indices.len().
+            // O(N log M + M log M) where N = indices.len().
             let mut sorted_deleted_ids = deletion_vector
                 .as_ref()
                 .clone()
@@ -3341,39 +3341,31 @@ impl FileFragment {
 
 /// Using deleted ids to remap row ids into actual row ids.
 ///
-/// For each logical row index we resolve the physical row id of the row that
-/// survives the deletions. The physical id `p` for logical index `i` is the
-/// smallest `p` with `p - rank(p) == i`, where `rank(p)` is the number of
-/// deleted ids less than or equal to `p`: `p - rank(p)` is the logical index
-/// of the last live row at or before `p`. It never decreases and grows by at
-/// most one per physical row (deletion ids are unique), so a binary search
-/// finds `p` in O(log M) steps. For example, if deleted rows are [2, 3, 5] and
-/// we want row 4: 6 - rank(6) = 6 - 3 = 3 < 4 while 7 - rank(7) = 7 - 3 = 4, so
-/// the answer is 7.
+/// The live row with logical index `i` sits at physical row `i + k`, where `k`
+/// is the number of deleted rows before it. Deleted row `j` (0-based) has
+/// `deleted[j] - j` live rows before it, a count that never decreases with
+/// `j`, so it comes before the live row exactly when `deleted[j] - j <= i`.
+/// One binary search over the sorted deletions finds `k`. For example, if
+/// deleted rows are [2, 3, 5], the counts are [2, 2, 3], and row 4 has all
+/// three deletions before it, so it is at physical row 7.
 pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
-    let mut row_ids = row_ids.to_vec();
-    for row_id in row_ids.iter_mut() {
-        let logical_index = *row_id as u64;
-        // Even if every deleted id falls below the row, advancing past all of
-        // them is always enough, so the answer lies within this bound.
-        let mut lo = logical_index;
-        let mut hi = logical_index + sorted_deleted_ids.len() as u64;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let rank = sorted_deleted_ids.partition_point(|v| (*v as u64) <= mid) as u64;
-            // `mid - rank < logical_index`, written without subtraction so a
-            // dense deletion prefix cannot underflow.
-            if mid < logical_index + rank {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        *row_id = lo as u32;
-    }
-
     row_ids
+        .iter()
+        .map(|&row_id| {
+            let logical_index = row_id as usize;
+            // Deletion ids are unique and ascending, so `deleted[j] >= j`.
+            let (mut lo, mut hi) = (0, sorted_deleted_ids.len());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if sorted_deleted_ids[mid] as usize - mid <= logical_index {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            (logical_index + lo) as u32
+        })
+        .collect()
 }
 
 // Cache key for file metadata
