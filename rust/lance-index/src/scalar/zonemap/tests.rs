@@ -6488,15 +6488,18 @@ async fn test_merge_rejects_segments_with_different_null_bitmap_settings() {
 /// An update whose scan covers a partial fragment's uncovered interval
 /// and a whole fragment: zones are cut at the configured boundaries,
 /// seed and scan fold into one zone, positions stay exact.
+#[rstest::rstest]
+#[case::update(false)]
+#[case::merge(true)]
 #[tokio::test]
-async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones() {
+async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones(#[case] is_merge: bool) {
     let tmpdir = TempObjDir::default();
     let store = local_store(&tmpdir);
-    // Fragment 0 from a scan, with a bitmap, target zones of 4.
+    // Fragment 0 is retained; fragment 1 is replaced by the new seed/scan data.
     build_segment_from_batches(
         store.as_ref(),
         ZoneMapIndexBuilderParams::new(4),
-        vec![vec![None, Some(1)]],
+        vec![vec![None, Some(1)], vec![None, Some(-1)]],
     )
     .await;
     let existing = ZoneMapIndex::load(
@@ -6547,16 +6550,32 @@ async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones() {
     let physical_rows = HashMap::from([(1u64, 6u64), (2, 2)]);
     let dest = TempObjDir::default();
     let dest_store = local_store(&dest);
-    let created = build_zonemap_segment(
-        ZoneMapSegmentBase::Update(&existing),
-        &DataType::Int32,
-        reused,
-        Some(scanned),
-        &physical_rows,
-        &[1, 2],
-        dest_store.as_ref(),
-    )
-    .await
+    let created = if is_merge {
+        let scanned =
+            super::train_zonemap_scan(&DataType::Int32, 4, true, physical_rows.clone(), scanned)
+                .await
+                .unwrap();
+        super::merge_zonemap_segments(
+            &[existing.as_ref()],
+            &RoaringBitmap::from_iter([0, 1]),
+            reused,
+            scanned,
+            &[1, 2],
+            dest_store.as_ref(),
+        )
+        .await
+    } else {
+        build_zonemap_segment(
+            ZoneMapSegmentBase::Update(&existing),
+            &DataType::Int32,
+            reused,
+            Some(scanned),
+            &physical_rows,
+            &[1, 2],
+            dest_store.as_ref(),
+        )
+        .await
+    }
     .unwrap();
     let details = created
         .index_details

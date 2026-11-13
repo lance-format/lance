@@ -1423,17 +1423,14 @@ fn remap_zone(
     Ok(zones)
 }
 
-/// Merge caller-selected ZoneMap segments into one self-contained segment.
-pub async fn merge_zonemap_indices(
+fn merge_zonemap_builder(
     source_indices: &[&ZoneMapIndex],
-    dest_store: &dyn IndexStore,
     fragment_filter: &RoaringBitmap,
-) -> Result<CreatedIndex> {
+) -> Result<ZoneMapIndexBuilder> {
     let first = source_indices.first().ok_or_else(|| {
         Error::invalid_input("merge_zonemap_indices requires at least one source index")
     })?;
     let rows_per_zone = first.rows_per_zone;
-    let use_seeds = first.use_seeds;
     let store_null_bitmap = first.store_null_bitmap;
     let data_type = first.data_type.clone();
     // The output keeps the sources' version; this entry has no source data
@@ -1526,9 +1523,21 @@ pub async fn merge_zonemap_indices(
         ZoneMapIndexBuilder::try_new(first.builder_params(), data_type)?.with_version(version);
     builder.maps = zones;
     builder.set_null_rows((!any_missing_bitmap).then_some(merged_null_rows));
+    Ok(builder)
+}
+
+/// Merge caller-selected ZoneMap segments into one self-contained segment.
+pub async fn merge_zonemap_indices(
+    source_indices: &[&ZoneMapIndex],
+    dest_store: &dyn IndexStore,
+    fragment_filter: &RoaringBitmap,
+) -> Result<CreatedIndex> {
+    let builder = merge_zonemap_builder(source_indices, fragment_filter)?;
+    let rows_per_zone = builder.options.rows_per_zone;
+    let use_seeds = builder.options.use_seeds_for(&builder.items_type);
+    let version = builder.version;
     let has_null_bitmap = builder.null_rows.is_some();
     let files = builder.write_index(dest_store).await?;
-
     Ok(CreatedIndex {
         index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
         index_version: version as u32,
@@ -3670,14 +3679,9 @@ pub async fn write_zonemap_segment(
     }
     let data_type = existing.map_or(data_type, |index| &index.data_type);
     params.use_seeds = Some(params.use_seeds_for(data_type));
-    if keep_positions && !reused.with_null_positions && !reused.zones.is_empty() {
-        return Err(Error::internal(
-            "zone map seeds were reused without null positions for an index that keeps them",
-        ));
-    }
 
     let refreshed: HashSet<u64> = refreshed_fragments.iter().copied().collect();
-    let mut zones: Vec<ZoneMapStatistics> = existing
+    let zones: Vec<ZoneMapStatistics> = existing
         .map(|index| {
             index
                 .zones
@@ -3687,19 +3691,80 @@ pub async fn write_zonemap_segment(
                 .collect()
         })
         .unwrap_or_default();
-    let mut null_rows = keep_positions.then(|| {
-        let mut rows = existing
+    let null_rows = keep_positions.then(|| {
+        existing
             .and_then(|index| index.null_rows.as_ref())
             .map(|rows| without_fragments(rows, refreshed.iter().copied()))
-            .unwrap_or_default();
-        rows |= &reused.null_rows;
-        rows
+            .unwrap_or_default()
     });
+    let mut builder = ZoneMapIndexBuilder::try_new(params, data_type.clone())?;
+    builder.maps = zones;
+    builder.set_null_rows(null_rows);
+    finish_zonemap_segment(builder, reused, scanned, dest_store).await
+}
+
+/// Merge existing v1 segments and new zone statistics into one output segment.
+/// Only source fragments in `fragment_filter` are retained. Statistics for
+/// `refreshed_fragments` are replaced by `reused` and `scanned`.
+/// Sources must have matching versions and zone parameters; v0 upgrades still
+/// require a rebuild from the data.
+///
+/// ```
+/// # use lance_index::scalar::{CreatedIndex, IndexStore};
+/// # use lance_index::scalar::zonemap::{ZoneMapIndex, ReusedZones, ScannedZones, merge_zonemap_segments};
+/// # use roaring::RoaringBitmap;
+/// # async fn example(sources: &[&ZoneMapIndex], fragments: &RoaringBitmap, store: &dyn IndexStore) -> lance_core::Result<CreatedIndex> {
+/// merge_zonemap_segments(sources, fragments, ReusedZones::default(), ScannedZones::default(), &[], store).await
+/// # }
+/// ```
+pub async fn merge_zonemap_segments(
+    source_indices: &[&ZoneMapIndex],
+    fragment_filter: &RoaringBitmap,
+    reused: ReusedZones,
+    scanned: ScannedZones,
+    refreshed_fragments: &[u64],
+    dest_store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let mut retained = fragment_filter.clone();
+    for &fragment in refreshed_fragments {
+        if let Ok(fragment) = u32::try_from(fragment) {
+            retained.remove(fragment);
+        }
+    }
+    let builder = merge_zonemap_builder(source_indices, &retained)?;
+    if builder.version != ZoneMapIndexVersion::V1 {
+        return Err(Error::not_supported_source(
+            format!(
+                "cannot update a version {} ZoneMap segment in place; rebuild it from its \
+                 data (optimize_indices) instead",
+                builder.version as u32
+            )
+            .into(),
+        ));
+    }
+    finish_zonemap_segment(builder, reused, scanned, dest_store).await
+}
+
+async fn finish_zonemap_segment(
+    mut builder: ZoneMapIndexBuilder,
+    reused: ReusedZones,
+    scanned: ScannedZones,
+    dest_store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    if builder.null_rows.is_some() && !reused.with_null_positions && !reused.zones.is_empty() {
+        return Err(Error::internal(
+            "zone map seeds were reused without null positions for an index that keeps them",
+        ));
+    }
+    if let Some(rows) = builder.null_rows.as_mut() {
+        *rows |= &reused.null_rows;
+        *rows |= &scanned.null_rows;
+    }
     let mut targets = reused.zones;
     for piece in scanned.zones {
         let key = (
             piece.bound.fragment_id,
-            piece.bound.start / params.rows_per_zone,
+            piece.bound.start / builder.options.rows_per_zone,
         );
         match targets.get_mut(&key) {
             Some(zone) => fold_zone_stats(zone, &piece)?,
@@ -3708,17 +3773,13 @@ pub async fn write_zonemap_segment(
             }
         }
     }
-    if let Some(rows) = null_rows.as_mut() {
-        *rows |= &scanned.null_rows;
-    }
-    zones.extend(targets.into_values());
-    zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
+    builder.maps.extend(targets.into_values());
+    builder
+        .maps
+        .sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
-    let rows_per_zone = params.rows_per_zone;
-    let use_seeds = params.use_seeds.unwrap_or(false);
-    let mut builder = ZoneMapIndexBuilder::try_new(params, data_type.clone())?;
-    builder.maps = zones;
-    builder.set_null_rows(null_rows);
+    let rows_per_zone = builder.options.rows_per_zone;
+    let use_seeds = builder.options.use_seeds_for(&builder.items_type);
     let has_null_bitmap = builder.null_rows.is_some();
     let files = builder.write_index(dest_store).await?;
     Ok(CreatedIndex {
