@@ -67,4 +67,15 @@ pub use utils::PreFilterSource;
 ///
 /// This does not include changes to the behavior of the nodes unless that behavior is a change
 /// in semantic meaning.
+///
+/// This is the version produced by default. Newer versions, up to
+/// [`LANCE_MAX_RELATIONAL_ALGEBRA_VERSION`], are opt-in through
+/// [`crate::dataset::scanner::Scanner::relational_algebra_version`].
 pub const LANCE_RELATIONAL_ALGEBRA_VERSION: u32 = 1;
+
+/// The newest relational algebra version this build can produce.
+///
+/// * 1: scalar-index results use the three-variant layout with `Binary` masks, so a single
+///   serialized mask is limited to 2 GiB.
+/// * 2: scalar-index results use the two-mask layout with `LargeBinary` masks.
+pub const LANCE_MAX_RELATIONAL_ALGEBRA_VERSION: u32 = 2;

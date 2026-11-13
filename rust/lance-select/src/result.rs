@@ -44,7 +44,10 @@
 
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::{Array, RecordBatch, UInt32Array, builder::BinaryBuilder};
+use arrow_array::{
+    Array, RecordBatch, UInt32Array,
+    builder::{BinaryBuilder, LargeBinaryBuilder},
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use roaring::RoaringBitmap;
 
@@ -354,8 +357,10 @@ impl std::ops::BitOr<Self> for IndexExprResult {
 
 static TWO_MASK_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
-        Field::new("lower", DataType::Binary, true),
-        Field::new("upper", DataType::Binary, true),
+        // LargeBinary: masks over huge tables can exceed the 2 GiB Binary limit.
+        // ThreeVariant (relational algebra version 1) keeps Binary for older readers.
+        Field::new("lower", DataType::LargeBinary, true),
+        Field::new("upper", DataType::LargeBinary, true),
         Field::new("fragments_covered", DataType::Binary, true),
     ]))
 });
@@ -389,14 +394,14 @@ impl IndexExprResult {
     /// hand scalar-index results to the read planner.
     #[tracing::instrument(skip_all)]
     fn serialize_standard(&self, fragments_covered: &RoaringBitmap) -> Result<RecordBatch> {
-        let lower_arr = self.lower.into_arrow()?;
+        let lower_arr = self.lower.into_large_arrow()?;
         let upper_arr = if self.is_exact() {
-            let mut b = BinaryBuilder::new();
+            let mut b = LargeBinaryBuilder::new();
             b.append_null();
             b.append_null();
             b.finish()
         } else {
-            self.upper.into_arrow()?
+            self.upper.into_large_arrow()?
         };
         let mut frags_builder = BinaryBuilder::new();
         let mut frags_bytes = Vec::with_capacity(fragments_covered.serialized_size());
@@ -487,8 +492,8 @@ impl IndexExprResult {
 
         let first_col_name = batch.schema().field(0).name().clone();
         let index_result = if first_col_name == "lower" {
-            let lower = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-            let upper_col = batch.column(1).as_binary::<i32>();
+            let lower = RowAddrMask::from_arrow(batch.column(0).as_ref())?;
+            let upper_col = batch.column(1).as_ref();
             if upper_col.is_null(0) && upper_col.is_null(1) {
                 // Null upper column is the serialized form of an exact result.
                 Self::exact(lower)
@@ -501,7 +506,7 @@ impl IndexExprResult {
                 }
             }
         } else if first_col_name == "result" {
-            let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
+            let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_ref())?;
             let match_type = batch
                 .column(1)
                 .as_primitive::<arrow_array::types::UInt32Type>()
