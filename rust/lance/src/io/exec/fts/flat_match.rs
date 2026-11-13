@@ -1180,6 +1180,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
 #[cfg(test)]
 mod tests {
+    mod empty_segments;
     mod filter_binding;
     use super::*;
     use crate::dataset::transaction::{Operation, TransactionBuilder};
