@@ -1470,39 +1470,10 @@ mod tests {
         (test_dir, dataset)
     }
 
-    /// An overlay replaces the validity of a struct whose required child is itself a
-    /// struct. Restoring the outer struct before the inner one would build an illegal
-    /// intermediate: the required `middle` still carries the base null on the row the
-    /// overlay makes valid, which arrow rejects. `middle_nullable = true` is the
-    /// control, since the required-child check does not apply to it.
-    #[rstest]
-    #[tokio::test]
-    async fn test_required_inner_struct_validity_is_replaced(
-        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
-        version: LanceFileVersion,
-        #[values(false, true)] middle_nullable: bool,
-    ) {
-        let (_test_dir, dataset) = double_nested_dataset(middle_nullable, version).await;
-        let outer_id = field_id(&dataset, "outer");
-        let mut writer = open_writer_on(&dataset, 0, &[outer_id]).await;
-        writer
-            .write_batch(&batch(
-                0,
-                &[0, 1],
-                vec![(
-                    "outer",
-                    double_nested_array(
-                        vec![-7, 0],
-                        Some(NullBuffer::from(vec![true, false])),
-                        Some(NullBuffer::from(vec![true, false])),
-                        middle_nullable,
-                    ),
-                )],
-            ))
-            .await
-            .unwrap();
-        let dataset = commit(dataset, writer.finish().await.unwrap().unwrap()).await;
-
+    /// Every row and validity bit the overlay in
+    /// `test_required_inner_struct_validity_is_replaced` can affect, read through
+    /// whichever handle is passed in.
+    async fn assert_double_nested_overlay_rows(dataset: &Dataset) {
         let batch = dataset
             .scan()
             .project(&["id", "outer"])
@@ -1539,6 +1510,47 @@ mod tests {
         assert_eq!(a.value(5), 101);
         assert_eq!(a.value(6), 102);
         assert_eq!(a.value(7), 103);
+    }
+
+    /// An overlay replaces the validity of a struct whose required child is itself a
+    /// struct. Restoring the outer struct before the inner one would build an illegal
+    /// intermediate: the required `middle` still carries the base null on the row the
+    /// overlay makes valid, which arrow rejects. `middle_nullable = true` is the
+    /// control, since the required-child check does not apply to it.
+    #[rstest]
+    #[tokio::test]
+    async fn test_required_inner_struct_validity_is_replaced(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+        #[values(false, true)] middle_nullable: bool,
+    ) {
+        let (_test_dir, dataset) = double_nested_dataset(middle_nullable, version).await;
+        let outer_id = field_id(&dataset, "outer");
+        let mut writer = open_writer_on(&dataset, 0, &[outer_id]).await;
+        writer
+            .write_batch(&batch(
+                0,
+                &[0, 1],
+                vec![(
+                    "outer",
+                    double_nested_array(
+                        vec![-7, 0],
+                        Some(NullBuffer::from(vec![true, false])),
+                        Some(NullBuffer::from(vec![true, false])),
+                        middle_nullable,
+                    ),
+                )],
+            ))
+            .await
+            .unwrap();
+        let committed = commit(dataset, writer.finish().await.unwrap().unwrap()).await;
+        // The commit handle may still serve readers from write-side state. Reopen the
+        // published version so the persisted struct columns go through the normal read
+        // path as well, and assert both handles against the same oracle.
+        let reopened = Dataset::open(committed.uri()).await.unwrap();
+        for dataset in [&committed, &reopened] {
+            assert_double_nested_overlay_rows(dataset).await;
+        }
     }
 
     #[tokio::test]
