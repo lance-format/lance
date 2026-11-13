@@ -331,6 +331,9 @@ pub async fn row_addrs_to_row_ids(
 /// that are unknown or deleted yield `None`. Without stable row ids, row ids
 /// are row addresses, so each id is returned unchanged.
 ///
+/// With stable row ids, this may read row-id metadata and deletion vectors from
+/// the dataset and returns an error if either read fails.
+///
 /// ```
 /// # use lance::{Dataset, Result};
 /// # use lance::dataset::rowids::row_ids_to_row_addrs;
@@ -365,6 +368,57 @@ pub(crate) async fn live_row_addrs_to_row_ids(
     addrs: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<Vec<Option<u64>>> {
     row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
+}
+
+/// Builds a synchronous lookup, for the rows of `fragment_ids`, that a caller
+/// can use like [`live_row_addrs_to_row_ids`] one address at a time (e.g.
+/// inside a scoring loop) instead of as a batch. This function itself is
+/// still async: it awaits loading every fragment's row id sequence and
+/// deletion vector up front, so the returned closure never has to.
+///
+/// The returned lookup yields `None` for an address in a fragment outside
+/// `fragment_ids` or no longer in the dataset, past the end of its fragment,
+/// or at a deleted physical slot. Requires stable row ids.
+pub(crate) async fn live_row_addr_to_row_id_lookup(
+    dataset: &Dataset,
+    fragment_ids: impl IntoIterator<Item = u32>,
+) -> Result<impl Fn(u64) -> Option<u64> + Send + Sync + 'static> {
+    // Loaded concurrently (bounded by io_parallelism): on a dataset with many
+    // fragments, loading each one's row id sequence and deletion vector in
+    // turn serializes IO that has no reason to wait on the last one.
+    let to_load: Vec<_> = fragment_ids
+        .into_iter()
+        .filter_map(|fragment_id| {
+            dataset
+                .get_fragment(fragment_id as usize)
+                .map(|fragment| (fragment_id, fragment))
+        })
+        .collect();
+    let loaded: Vec<_> = futures::stream::iter(to_load)
+        .map(|(fragment_id, fragment)| async move {
+            let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+            let deletion_vector = fragment.get_deletion_vector().await?;
+            Result::Ok((fragment_id, sequence, deletion_vector))
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    let fragments: std::collections::HashMap<_, _> = loaded
+        .into_iter()
+        .map(|(fragment_id, sequence, deletion_vector)| (fragment_id, (sequence, deletion_vector)))
+        .collect();
+    Ok(move |row_addr: u64| {
+        let row_addr = RowAddress::from(row_addr);
+        let (sequence, deletion_vector) = fragments.get(&row_addr.fragment_id())?;
+        let offset = row_addr.row_offset();
+        if deletion_vector
+            .as_ref()
+            .is_some_and(|deletions| deletions.contains(offset))
+        {
+            return None;
+        }
+        sequence.get(offset as usize)
+    })
 }
 
 #[derive(Clone, Copy)]

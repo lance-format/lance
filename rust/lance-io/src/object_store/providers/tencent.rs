@@ -96,6 +96,8 @@ impl ObjectStoreProvider for TencentStoreProvider {
         Ok(ObjectStore {
             scheme: "cos".to_string(),
             inner: opendal_store,
+            external_blob_inner: None,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             block_size,

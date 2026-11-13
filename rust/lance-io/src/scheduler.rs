@@ -14,10 +14,11 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+use lance_core::memory::{Component, register_component};
 use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
@@ -340,6 +341,12 @@ impl IoQueue {
         emit_scheduler_state_event(event, &self.stats);
 
         self.notify.notify_one();
+    }
+
+    /// Bytes admitted and not yet consumed, as the state event reports them.
+    fn reserved_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.io_buffer_size as i64 - state.bytes_avail).max(0) as u64
     }
 
     fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
@@ -674,7 +681,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run());
+                lance_core::utils::tokio::spawn(task.run());
             }
             None => {
                 // The sender has been dropped, we are done
@@ -1054,16 +1061,36 @@ impl ScanScheduler {
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
             // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
             // to wait for it to finish but that doesn't seem helpful.
-            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+            lance_core::utils::tokio::spawn(async move { run_io_loop(io_queue_clone).await });
             IoQueueType::Standard(io_queue)
         };
-        Arc::new(Self {
+        let scheduler = Arc::new(Self {
             object_store,
             io_queue,
             stats,
             error_mode,
             io_buffer_size: config.io_buffer_size_bytes,
-        })
+        });
+        // The scheduler rather than its queue: a lite queue keeps the
+        // reservations of the reads its closing scheduler cancelled until
+        // their handles are dropped.
+        register_component(Component::IoScheduler, &scheduler, Self::reserved_bytes);
+        scheduler
+    }
+
+    /// Bytes this scheduler admitted for reading that its callers have not
+    /// received yet. Priority reads can take it past the I/O buffer size, and
+    /// reads that bypass backpressure are not counted. A scheduler without an
+    /// I/O buffer size applies no backpressure and reports 0: the standard
+    /// queue does not account its reads then, so neither queue reports them.
+    fn reserved_bytes(&self) -> u64 {
+        if self.io_buffer_size == 0 {
+            return 0;
+        }
+        match &self.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue.reserved_bytes(),
+            IoQueueType::Lite(io_queue) => io_queue.reserved_bytes(),
+        }
     }
 
     /// Open a file for reading
@@ -3255,14 +3282,17 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_zero_buffer_size_no_backpressure() {
+    async fn test_zero_buffer_size_no_backpressure(#[case] use_lite_scheduler: bool) {
         // With io_buffer_size_bytes=0 (no_backpressure=true), reads at any priority go
         // through without blocking, even though a zero budget would normally halt all I/O.
         let obj_store = Arc::new(ObjectStore::memory());
         let config = SchedulerConfig {
             io_buffer_size_bytes: 0,
-            use_lite_scheduler: Some(false),
+            use_lite_scheduler: Some(use_lite_scheduler),
         };
         let scheduler = ScanScheduler::new(obj_store, config);
 
@@ -3277,6 +3307,8 @@ mod tests {
         let fut1 = scheduler.submit_request(reader.clone(), vec![0..1000], 0, false);
         let fut2 = scheduler.submit_request(reader.clone(), vec![1000..2000], 1, false);
         let fut3 = scheduler.submit_request(reader.clone(), vec![2000..3000], 2, false);
+        // Without a budget the memory gauges have nothing to report.
+        assert_eq!(scheduler.reserved_bytes(), 0);
 
         let bytes1 = timeout(Duration::from_secs(5), fut1)
             .await
@@ -3294,6 +3326,79 @@ mod tests {
         assert_eq!(bytes2[0].len(), 1000);
         assert_eq!(bytes3[0].len(), 1000);
         assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+    }
+
+    /// Waits up to five seconds for `condition`, failing with `what` otherwise.
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let waited = timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting until {what}");
+    }
+
+    /// The memory gauges count what a scheduler admitted for reading until its
+    /// caller receives it, past the I/O buffer size for chunks of a request it
+    /// already admitted.
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reserved_bytes_count_admitted_reads_until_received(
+        #[case] use_lite_scheduler: bool,
+    ) {
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::memory()),
+            SchedulerConfig {
+                io_buffer_size_bytes: 100,
+                use_lite_scheduler: Some(use_lite_scheduler),
+            },
+        );
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        let pending = scheduler.submit_request(reader, vec![0..100, 200..250], 0, false);
+        // The standard queue admits reads on its I/O loop, after the submit.
+        wait_until("both chunks are admitted", || {
+            scheduler.reserved_bytes() == 150
+        })
+        .await;
+        if !use_lite_scheduler {
+            // The standard queue reads ahead of its caller, and a finished read
+            // stays counted until the caller receives it. A lite read only runs
+            // when its caller polls it.
+            wait_until("both chunks are read", || {
+                get_range_count.load(Ordering::Acquire) == 2
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(scheduler.reserved_bytes(), 150);
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let bypass_reads = Arc::new(AtomicU64::new(0));
+        let blocking: Arc<dyn Reader> = Arc::new(BlockingReader {
+            semaphore: semaphore.clone(),
+            get_range_count: bypass_reads.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+        let bypass = tokio::spawn(scheduler.submit_request(blocking, vec![300..400], 1, true));
+        wait_until("the bypass read runs", || {
+            bypass_reads.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert_eq!(scheduler.reserved_bytes(), 150);
+        semaphore.add_permits(1);
+        assert_eq!(bypass.await.unwrap().unwrap()[0].len(), 100);
+        assert_eq!(scheduler.reserved_bytes(), 150);
+
+        assert_eq!(pending.await.unwrap().len(), 2);
+        assert_eq!(scheduler.reserved_bytes(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3432,6 +3537,7 @@ mod tests {
         while get_range_count.load(Ordering::Acquire) == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        assert_eq!(scheduler.reserved_bytes(), 50);
 
         // Step 2: drop the caller-side future while its `rx` is still pending.
         handle.abort();
@@ -3443,6 +3549,10 @@ mod tests {
         // Give the read time to run to completion so the refund would already have
         // happened.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_until("the dropped request is refunded", || {
+            scheduler.reserved_bytes() == 0
+        })
+        .await;
 
         // Step 4: submit the follow-up. Add a permit up front so that, if it *is*
         // admitted, its own read can complete rather than block on the semaphore.
