@@ -94,7 +94,8 @@ pub struct OrderedIndexScanExec {
 
 impl OrderedIndexScanExec {
     /// Plans an ordered read of `segment`, one segment of a single-column
-    /// B-tree index on `dataset`.
+    /// B-tree index on `dataset`. A segment that also declares carried columns
+    /// is read by its key; the carried values stay out of the output.
     ///
     /// `query` limits the read to the rows it selects, and `options` is the key
     /// order. `fragments`, when set, limits the output to rows in those
@@ -106,17 +107,17 @@ impl OrderedIndexScanExec {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when the segment indexes more or fewer
-    /// than one column, names a field the dataset does not have, or records no
-    /// fragment coverage, or when the index rejects `query`.
+    /// Returns [`Error::InvalidInput`] when the segment is keyed on more or
+    /// fewer than one column, names a field the dataset does not have, or
+    /// records no fragment coverage, or when the index rejects `query`.
     ///
     /// Returns [`Error::NotSupported`] in these cases:
     ///
     /// - The dataset uses stable row ids and the segment stores them instead
     ///   of row addresses. Segments written before the row address migration
     ///   do.
-    /// - A data overlay committed after the segment changes the indexed column
-    ///   in a fragment the scan reads.
+    /// - A data overlay committed after the segment changes a keyed column in
+    ///   a fragment the scan reads.
     /// - The index cannot search in key order, because it is not a B-tree or
     ///   its pages are not in key order.
     ///
@@ -129,11 +130,13 @@ impl OrderedIndexScanExec {
         options: SortOptions,
         fragments: Option<&RoaringBitmap>,
     ) -> Result<Self> {
-        let [field_id] = segment.fields[..] else {
+        let Some(field_id) = segment.keyed_field() else {
             return Err(Error::invalid_input(format!(
                 "ordered index scan reads a single-column index, but segment {} of index '{}' \
-                 has field ids {:?}",
-                segment.uuid, segment.name, segment.fields
+                 is keyed on field ids {:?}",
+                segment.uuid,
+                segment.name,
+                segment.keyed_fields()
             )));
         };
         let Some(coverage) = &segment.fragment_bitmap else {
@@ -287,9 +290,13 @@ fn newer_key_overlay(
             continue;
         }
         for overlay in &fragment.overlays {
+            // The scan emits keyed columns only, so a carried column cannot
+            // move its row in key order. `collect_overlay_stale_rows_for_segment`
+            // above stays dependency-wide, because the segment is stale as a
+            // whole; this check asks only whether the key order changed.
             let changed_rows = overlay_exclusion_offsets(
                 std::slice::from_ref(overlay),
-                &segment.fields,
+                segment.keyed_fields(),
                 segment.dataset_version,
                 dataset.schema(),
             )?;
@@ -973,6 +980,70 @@ mod tests {
             error.to_string().contains(&segment.uuid.to_string()),
             "{error}"
         );
+    }
+
+    /// A covered index names its carried columns after its key. Reading it by
+    /// key keeps the key a single keyed field, and an overlay on a carried
+    /// column cannot move a row in the key order the node streams.
+    #[tokio::test]
+    async fn carried_columns_are_not_keys_and_do_not_block_key_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, true),
+            Field::new("carried", DataType::Int32, true),
+        ]));
+        let keys = Int32Array::from_iter((0..ROWS).map(|row| fixture_key(row, false)));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(keys),
+                Arc::new(Int32Array::from_iter_values(0..ROWS)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = indexed_dataset(batch, "key", false).await;
+        let (key_id, carried_id) =
+            crate::utils::test::covering::declare_covering(&mut dataset, "key", "carried").await;
+        let segment = key_segment(&dataset).await;
+        assert_eq!(
+            segment.fields,
+            vec![key_id, carried_id],
+            "the fixture must store the carried column as a suffix of `fields`"
+        );
+        assert_eq!(segment.keyed_fields(), [key_id]);
+
+        let plan = |dataset: Arc<Dataset>| async move {
+            OrderedIndexScanExec::try_new(
+                dataset.clone(),
+                key_segment(&dataset).await,
+                None,
+                ASC_NULLS_LAST,
+                None,
+            )
+            .await
+        };
+
+        let dataset = Arc::new(dataset);
+        let mut expected = live_keys(&dataset)
+            .await
+            .into_iter()
+            .map(|(addr, key)| (key, addr))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(
+            run(Arc::new(plan(dataset.clone()).await.unwrap())).await,
+            expected
+        );
+
+        let dataset = overlay_value(dataset, "carried", 10, 1000).await;
+        assert_eq!(
+            run(Arc::new(plan(dataset.clone()).await.unwrap())).await,
+            expected
+        );
+
+        let dataset = overlay_value(dataset, "key", 20, 100).await;
+        let error = plan(dataset).await.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("column 'key'"), "{error}");
     }
 
     #[tokio::test]
