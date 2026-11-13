@@ -313,6 +313,18 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}"
+      - name: Run FTS queries with one compute worker
+        env:
+          LANCE_CPU_THREADS: "1"
+          TOKIO_WORKER_THREADS: "2"
+        run: |
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}" \
+            -E 'package(lance-index) & test(scalar::inverted::index)'
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x
