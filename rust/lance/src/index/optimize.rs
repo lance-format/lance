@@ -21,16 +21,21 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, NGram, Inverted) is split: tasks build one uncommitted segment each
-//! over a group of fragments, encoded against the model of a reference
-//! segment; merges combine the task results that carry their `group` with the
-//! committed segments they list into one segment. A task that is the only
-//! input of its merge folds those old segments in itself, in one pass. For a
-//! vector index `num_indices_to_merge` unset means append only: the
-//! single-process optimize appends a delta too, unless the partitions need
-//! rebalancing, which a split build does not do (set `retrain` for that). The
-//! other kinds are rebuilt whole by the single-process optimize, so they stay
-//! one task.
+//! Bitmap, NGram, RTree, Inverted) is split: tasks build one uncommitted
+//! segment each over a group of fragments, encoded against the model of a
+//! reference segment; merges combine the task results that carry their `group`
+//! with the committed segments they list into one segment. A task that is the
+//! only input of its merge folds those old segments in itself, in one pass. The
+//! one exception is a scalar kind that moved to the row-address domain while a
+//! committed segment still stores row ids (an RTree segment written by a
+//! release before the move, say): the split plan would rebuild only the
+//! segments it absorbs, leaving a row-id-domain sibling that the commit then
+//! rejects, so such a cohort is left to the single-process migration that
+//! folds every such segment into one rebuild. For a vector index
+//! `num_indices_to_merge` unset means append only: the single-process optimize
+//! appends a delta too, unless the partitions need rebalancing, which a split
+//! build does not do (set `retrain` for that). The other kinds are rebuilt
+//! whole by the single-process optimize, so they stay one task.
 //!
 //! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
 //! segments within a physical-row budget, leaving unindexed fragments alone.
@@ -299,6 +304,24 @@ fn is_vector_field(data_type: DataType) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether this segment stores row ids because it predates its index type's
+/// move to the row-address domain.
+///
+/// Only the scalar kinds that made that move carry a `row_id_domain_version`.
+/// Vector segments also report row ids, but they keep their own identifiers
+/// across a merge and stay split-capable.
+fn stores_legacy_row_ids(segment: &IndexMetadata) -> bool {
+    if segment.results_are_row_addrs() {
+        return false;
+    }
+    let Some(details) = segment.index_details.as_ref() else {
+        return false;
+    };
+    scalar::IndexDetails(details.clone())
+        .get_plugin()
+        .is_ok_and(|plugin| scalar::row_id_domain_version(plugin.name()).is_some())
 }
 
 /// A plan to optimize the indices of a dataset.
@@ -689,7 +712,16 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         let split = bounded
             && !consolidate::is_consolidation(options)
             && segment_has_merge_primitive(last)
-            && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids());
+            && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids())
+            // A split task rebuilds what it absorbs in the row-address domain
+            // but absorbs only the segments it selects. A row-id-domain segment
+            // of a migrated scalar type left beside that result would mix
+            // result domains, which the commit rejects. The unsplit plan folds
+            // every such segment into one rebuild, so let it run instead.
+            && !(dataset.manifest.uses_stable_row_ids()
+                && segments
+                    .iter()
+                    .any(|segment| stores_legacy_row_ids(segment)));
         // Split scalar planning needs the tokenizer on the driver before it
         // can dispatch tasks. Tagged histories are refused before that open.
         let requires_local_tokenizer =

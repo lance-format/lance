@@ -659,11 +659,8 @@ fn inner_get_row_addresses<'local>(
         .into_iter()
         .map(|id| id as u64)
         .collect();
-    let addrs = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(row_ids_to_row_addrs(&dataset_guard.inner, &row_ids))?
-    };
+    let dataset = clone_dataset(env, &java_dataset)?;
+    let addrs = block_on(row_ids_to_row_addrs(&dataset.inner, &row_ids))?;
     let addrs: Vec<i64> = addrs
         .into_iter()
         .map(|addr| addr.map_or(-1, |addr| addr as i64))

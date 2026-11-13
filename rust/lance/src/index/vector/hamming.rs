@@ -171,11 +171,20 @@ async fn open_hash_index_segments(
     };
 
     let fields = metadatas[0].fields.clone();
-    if let Some(mismatched) = metadatas.iter().find(|meta| meta.fields != fields) {
+    if let Some(mismatched) = metadatas
+        .iter()
+        .find(|meta| !meta.declares_same_fields(&metadatas[0]))
+    {
         return Err(Error::invalid_input(format!(
             "Index '{}' segments cover different fields: segment {} covers {:?} \
-             while segment {} covers {:?}",
-            index_name, metadatas[0].uuid, fields, mismatched.uuid, mismatched.fields
+             (carried {:?}) while segment {} covers {:?} (carried {:?})",
+            index_name,
+            metadatas[0].uuid,
+            fields,
+            metadatas[0].covering_fields,
+            mismatched.uuid,
+            mismatched.fields,
+            mismatched.covering_fields
         )));
     }
 
