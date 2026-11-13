@@ -260,7 +260,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
         let indices = self.indices.clone();
         let query = self.query.clone();
         let query_count = self.query_count;
-        let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            AnnIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
 

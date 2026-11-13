@@ -51,8 +51,9 @@ use super::{
     btree::{OrderableScalarValue, filter_keeps_nothing},
 };
 use crate::cache_pb::BitmapIndexHeader;
+use crate::metrics::{MetricsCollector, reserve_index_load};
 use crate::pbold;
-use crate::{Index, IndexType, metrics::MetricsCollector};
+use crate::{Index, IndexType};
 use crate::{
     progress::IndexBuildProgress,
     scalar::{
@@ -724,10 +725,21 @@ impl BitmapIndex {
         }
 
         // Record that we're loading a partition from disk
-        if let Some(metrics) = metrics {
-            metrics.record_index_cache_miss();
-            metrics.record_part_load();
-        }
+        let _reservation = match metrics {
+            Some(metrics) => {
+                metrics.record_index_cache_miss();
+                metrics.record_part_load();
+                reserve_index_load(metrics, || async {
+                    self.lazy_reader
+                        .get()
+                        .await?
+                        .estimate_read(&[row_offset..row_offset + 1], Some(&["bitmaps"]))
+                        .await
+                })
+                .await?
+            }
+            None => None,
+        };
 
         let bitmap = self.read_bitmap_at(row_offset).await?;
 

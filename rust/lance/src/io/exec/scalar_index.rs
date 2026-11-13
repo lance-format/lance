@@ -332,11 +332,11 @@ impl ScalarIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
+        metrics: IndexMetrics,
         result_format: IndexExprResultWireFormat,
         fragment_scope: Option<Arc<RoaringBitmap>>,
         segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
     ) -> Result<RecordBatch> {
-        let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
@@ -447,12 +447,13 @@ impl ExecutionPlan for ScalarIndexExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
+        context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),
             self.metrics.clone(),
+            IndexMetrics::new(&self.metrics, 0).with_read_budget(&self.dataset.session, &context),
             self.result_format,
             self.fragment_scope.clone(),
             self.segment_uuids.clone(),
@@ -998,13 +999,15 @@ impl ExecutionPlan for MapIndexExec {
         // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
+        let index_metrics = IndexMetrics::new(&self.metrics, partition)
+            .with_read_budget(&self.dataset.session, &context);
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
             partition,
             self.dataset.clone(),
             self.lookups.clone(),
-            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            Arc::new(index_metrics),
             self.metrics.clone(),
             candidate_reservation,
         );
@@ -1319,7 +1322,10 @@ impl ExecutionPlan for MaterializeIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            IndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),

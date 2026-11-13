@@ -14,7 +14,9 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
-use lance_file::reader::{CachedFileMetadata, FileReader as CurrentFileReader, FileReaderOptions};
+use lance_file::reader::{
+    CachedFileMetadata, FileReader as CurrentFileReader, FileReaderOptions, ReaderProjection,
+};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::{self, OpenedFileReader};
@@ -285,6 +287,21 @@ impl CurrentIndexReader {
         let end = (start + batch_size).min(num_rows);
         (start as usize, end as usize)
     }
+
+    /// The named columns, or the whole schema when `projection` is `None`.
+    fn projection(&self, projection: Option<&[&str]>) -> Result<ReaderProjection> {
+        Ok(match projection {
+            Some(projection) => versions::reader_projection_from_column_names(
+                self.0.metadata().version(),
+                self.0.schema(),
+                projection,
+            )?,
+            None => versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            ),
+        })
+    }
 }
 
 #[async_trait]
@@ -345,18 +362,7 @@ impl IndexReader for CurrentIndexReader {
                 self.0.schema().as_ref().into(),
             )));
         }
-        let projection = if let Some(projection) = projection {
-            versions::reader_projection_from_column_names(
-                self.0.metadata().version(),
-                self.0.schema(),
-                projection,
-            )?
-        } else {
-            versions::reader_projection_from_whole_schema(
-                self.0.schema(),
-                self.0.metadata().version(),
-            )
-        };
+        let projection = self.projection(projection)?;
         let batches = self
             .0
             .read_stream_projected(
@@ -373,6 +379,27 @@ impl IndexReader for CurrentIndexReader {
         Ok(batches[0].clone())
     }
 
+    async fn estimate_read(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+        projection: Option<&[&str]>,
+    ) -> Result<u64> {
+        let num_rows = self.0.num_rows();
+        let ranges = ranges
+            .iter()
+            .map(|range| (range.start as u64).min(num_rows)..(range.end as u64).min(num_rows))
+            .filter(|range| !range.is_empty())
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return Ok(0);
+        }
+        let estimate = self
+            .0
+            .estimate_read(&ranges, Some(self.projection(projection)?))
+            .await?;
+        Ok(estimate.bytes + estimate.decoded_bytes)
+    }
+
     async fn read_ranges(
         &self,
         ranges: &[std::ops::Range<usize>],
@@ -386,18 +413,7 @@ impl IndexReader for CurrentIndexReader {
         if ranges.is_empty() {
             return empty_batch();
         }
-        let projection = if let Some(projection) = projection {
-            versions::reader_projection_from_column_names(
-                self.0.metadata().version(),
-                self.0.schema(),
-                projection,
-            )?
-        } else {
-            versions::reader_projection_from_whole_schema(
-                self.0.schema(),
-                self.0.metadata().version(),
-            )
-        };
+        let projection = self.projection(projection)?;
         // `DecodeBatchScheduler::schedule_ranges` requires sorted,
         // non-overlapping ranges; sort internally and permute the
         // result back to caller order so callers don't have to know.
@@ -469,18 +485,7 @@ impl IndexReader for CurrentIndexReader {
                 futures::stream::empty(),
             )));
         }
-        let projection = if let Some(projection) = projection {
-            versions::reader_projection_from_column_names(
-                self.0.metadata().version(),
-                self.0.schema(),
-                projection,
-            )?
-        } else {
-            versions::reader_projection_from_whole_schema(
-                self.0.schema(),
-                self.0.metadata().version(),
-            )
-        };
+        let projection = self.projection(projection)?;
         // The v2 decoder emits exactly `batch_size` rows per batch for a range read
         // (only the final batch is shorter), so the stream is page-aligned with
         // `read_record_batch` when the range starts on a page boundary.

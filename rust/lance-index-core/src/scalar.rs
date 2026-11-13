@@ -219,6 +219,17 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
+    /// Estimates the bytes reading `ranges` (sorted and disjoint) of
+    /// `projection` (as for [`Self::read_ranges`]) loads and decodes, for
+    /// sizing a reservation of the read memory budget. The default returns 0:
+    /// unknown.
+    async fn estimate_read(
+        &self,
+        _ranges: &[std::ops::Range<usize>],
+        _projection: Option<&[&str]>,
+    ) -> Result<u64> {
+        Ok(0)
+    }
     /// Read multiple ranges and concatenate into a single batch.
     /// Default impl runs `read_range`s in parallel via `try_join_all`.
     async fn read_ranges(

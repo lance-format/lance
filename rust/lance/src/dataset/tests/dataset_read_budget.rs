@@ -463,13 +463,10 @@ async fn test_budgeted_reads_of_extreme_layouts(
     assert_released(&dataset);
 }
 
-/// Index-driven reads: a scalar-index filter loads scattered rows, and a
-/// vector search refines its candidates with a take.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_budgeted_index_reads() {
-    let dir = TempStrDir::default();
-    let rows = write(&dir, LanceFileVersion::V2_2, Shape::Vector, 4, None).await;
-    let mut dataset = (*open(&dir, None).await).clone();
+/// Writes vectors with a BTree index on `id` and an IVF_FLAT index on `value`.
+async fn write_indexed(dir: &str) -> u64 {
+    let rows = write(dir, LanceFileVersion::V2_2, Shape::Vector, 4, None).await;
+    let mut dataset = (*open(dir, None).await).clone();
     dataset
         .create_index(
             &["id"],
@@ -490,7 +487,20 @@ async fn test_budgeted_index_reads() {
         )
         .await
         .unwrap();
-    let query = arrow_array::Float32Array::from(vec![0.5; 128]);
+    rows
+}
+
+fn query_vector() -> arrow_array::Float32Array {
+    arrow_array::Float32Array::from(vec![0.5; 128])
+}
+
+/// Index-driven reads: a scalar-index filter loads scattered rows, and a
+/// vector search refines its candidates with a take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_budgeted_index_reads() {
+    let dir = TempStrDir::default();
+    let rows = write_indexed(&dir).await;
+    let query = query_vector();
     let search = |dataset: Arc<Dataset>| {
         let query = query.clone();
         async move {
@@ -522,6 +532,92 @@ async fn test_budgeted_index_reads() {
         assert_eq!(actual, expected, "limit {limit}");
         assert_released(&dataset);
     }
+}
+
+/// Index searches that read no table data, so only their index loads reserve.
+#[derive(Clone, Copy, Debug)]
+enum IndexSearch {
+    /// An IVF search, which loads partitions.
+    Vector,
+    /// A BTree equality filter, which loads a page.
+    BTree,
+}
+
+/// The row ids `search` finds, without reading any column.
+async fn index_search(dataset: &Arc<Dataset>, search: IndexSearch) -> RecordBatch {
+    let mut scanner = dataset.scan();
+    match search {
+        IndexSearch::Vector => {
+            scanner.nearest("value", &query_vector(), 10).unwrap();
+        }
+        IndexSearch::BTree => {
+            scanner.filter("id = 4000").unwrap();
+        }
+    }
+    scanner.with_row_id().project::<&str>(&[]).unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    concat_batches(&batches[0].schema(), &batches).unwrap()
+}
+
+/// An index search on a cold cache reserves what its index loads read and
+/// releases it once loaded, so it peaks above the same search on a warm cache.
+#[rstest]
+#[case::vector(IndexSearch::Vector)]
+#[case::btree(IndexSearch::BTree)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_index_loads_reserve_the_budget(#[case] search: IndexSearch) {
+    let dir = TempStrDir::default();
+    write_indexed(&dir).await;
+    let expected = index_search(&open(&dir, None).await, search).await;
+    assert!(expected.num_rows() > 0);
+    let dataset = open(&dir, Some(64 * 1024 * 1024)).await;
+    let budget = dataset.session.read_budget().unwrap();
+    let mut peaks = Vec::new();
+    for _ in 0..2 {
+        budget.reset_peak();
+        assert_eq!(index_search(&dataset, search).await, expected);
+        assert_released(&dataset);
+        peaks.push(budget.stats().peak_reserved_bytes);
+    }
+    assert!(peaks[0] > peaks[1], "cold peak {peaks:?} not above warm");
+}
+
+/// A cold index load waits for room: while another query holds the
+/// overdraft and the budget is full, a vector search cannot load its
+/// partitions; once that query releases, it finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_index_load_waits_for_the_budget() {
+    let dir = TempStrDir::default();
+    write_indexed(&dir).await;
+    let expected = index_search(&open(&dir, None).await, IndexSearch::Vector).await;
+    let limit = 64 * 1024;
+    let dataset = open(&dir, Some(limit)).await;
+    let budget = dataset.session.read_budget().unwrap();
+    let held = budget
+        .reader(QueryId::unique())
+        .admission()
+        .reserve(limit + 1)
+        .await;
+    held.resize(limit);
+    let search = tokio::spawn({
+        let dataset = dataset.clone();
+        async move { index_search(&dataset, IndexSearch::Vector).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!search.is_finished(), "an index load ignored the budget");
+    drop(held);
+    let actual = tokio::time::timeout(Duration::from_secs(60), search)
+        .await
+        .expect("the index load stayed blocked after the budget freed")
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_released(&dataset);
 }
 
 /// A read dropped after its first batch releases everything it reserved,

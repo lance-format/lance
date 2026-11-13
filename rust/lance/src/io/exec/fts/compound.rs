@@ -696,7 +696,10 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let residual_input = self.residual_input.clone();
         let indexed_input = self.indexed_input.clone();
         let metrics_set = self.metrics.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let schema = self.schema();
 
         let stream = stream::once(async move {
@@ -1061,7 +1064,10 @@ impl ExecutionPlan for CompoundQueryExec {
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
         let metrics_set = self.metrics.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
 
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1715,7 +1721,10 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let columns = self.columns.clone();
         let external_mask = self.external_mask.clone();
         let metrics_set = self.metrics.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
 
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();

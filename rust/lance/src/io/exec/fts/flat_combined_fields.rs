@@ -385,7 +385,10 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
         let prefilter_context = context.clone();
         let stats_mask_ds = self.dataset.clone();
         let metrics_set = self.metrics.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
         let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();

@@ -37,7 +37,7 @@ use futures::stream::FuturesUnordered;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, CacheTier, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -47,7 +47,9 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
-use lance_index::metrics::{IndexTimer, IndexTiming, LocalMetricsCollector, MetricsCollector};
+use lance_index::metrics::{
+    IndexTimer, IndexTiming, LocalMetricsCollector, MetricsCollector, reserve_index_load,
+};
 use lance_index::prefilter::NoFilter;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -2344,6 +2346,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
 
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
+        let _reservation = reserve_index_load(metrics, || async {
+            if self.index_cache.peek_tier_with_key(&cache_key).await != CacheTier::Absent {
+                return Ok(0);
+            }
+            self.estimate_partition_load(partition_id).await
+        })
+        .await?;
 
         if write_cache {
             let result = self
@@ -2446,6 +2455,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         self.rabit_scan
             .as_ref()
             .is_some_and(|scan| scan.cache_layout() == RabitCacheLayout::Planes)
+    }
+
+    /// The bytes [`Self::load_partition_entry`] reads and decodes.
+    async fn estimate_partition_load(&self, partition_id: usize) -> Result<u64> {
+        let rows = |range: Range<usize>| [range.start as u64..range.end as u64];
+        let mut bytes = 0;
+        let sub_index_rows = self.ivf.row_range(partition_id);
+        if !sub_index_rows.is_empty() {
+            let estimate = self
+                .reader
+                .estimate_read(&rows(sub_index_rows), self.read_projection.clone())
+                .await?;
+            bytes += estimate.bytes + estimate.decoded_bytes;
+        }
+        let storage_rows = self.storage.ivf().row_range(partition_id);
+        if !storage_rows.is_empty() {
+            let estimate = self
+                .storage
+                .reader()
+                .estimate_read(&rows(storage_rows), None)
+                .await?;
+            bytes += estimate.bytes + estimate.decoded_bytes;
+        }
+        Ok(bytes)
     }
 
     async fn load_partition_entry(

@@ -490,7 +490,10 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             external_mask: self.external_mask.clone(),
         };
         let exec_metrics = self.metrics.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let address_domain = !ds.manifest.uses_stable_row_ids();

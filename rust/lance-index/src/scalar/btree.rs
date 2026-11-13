@@ -10,7 +10,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
-    ops::Bound,
+    ops::{Bound, Range},
     pin::Pin,
     sync::{Arc, OnceLock},
 };
@@ -21,6 +21,7 @@ use super::{
     SearchOptions, SearchResult, compute_next_prefix, lookup_batch,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
+use crate::metrics::reserve_index_load;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexType};
 use crate::{
@@ -67,7 +68,7 @@ use datafusion_physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use hashbrown::{HashTable, hash_table::Entry};
-use lance_core::cache::CacheLoadOrigin;
+use lance_core::cache::{CacheLoadOrigin, CacheTier};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -2247,9 +2248,20 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<FlatIndex>> {
+        let key = BTreePageKey { page_number };
+        let _reservation = reserve_index_load(metrics, || async {
+            if self.index_cache.peek_tier_with_key(&key).await != CacheTier::Absent {
+                return Ok(0);
+            }
+            let reader = index_reader.get().await?;
+            reader
+                .estimate_read(&[self.page_rows(page_number)], None)
+                .await
+        })
+        .await?;
         let result = self
             .index_cache
-            .get_or_insert_with_key_hit(BTreePageKey { page_number }, move || async move {
+            .get_or_insert_with_key_hit(key, move || async move {
                 self.read_page(page_number, index_reader, metrics).await
             })
             .await;
@@ -2298,6 +2310,16 @@ impl BTreeIndex {
                 .iter()
                 .map(|matches| matches.page_id() as u64)
                 .collect::<Vec<_>>();
+            // Held until the chunk's pages are evaluated and dropped.
+            let _reservation = reserve_index_load(metrics, || {
+                let pages = batch_numbers
+                    .iter()
+                    .map(|&page| self.page_rows(page as u32))
+                    .collect::<Vec<_>>();
+                let reader = reader.clone();
+                async move { reader.estimate_read(&pages, None).await }
+            })
+            .await?;
             let batches = reader
                 .read_record_batches(&batch_numbers, self.batch_size)
                 .await?;
@@ -2340,6 +2362,12 @@ impl BTreeIndex {
             }
         }
         Ok(results)
+    }
+
+    /// The rows of page `page_number` in its pages file.
+    fn page_rows(&self, page_number: u32) -> Range<usize> {
+        let start = page_number as usize * self.batch_size as usize;
+        start..start + self.batch_size as usize
     }
 
     #[instrument(level = "debug", skip_all)]
