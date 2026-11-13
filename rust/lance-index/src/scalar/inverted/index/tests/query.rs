@@ -36,6 +36,154 @@ struct OffsetBatchRemapper {
     calls: AtomicU32,
 }
 
+struct MaskFilter(RowAddrMask);
+
+#[async_trait]
+impl PreFilter for MaskFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_select_all()
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        Arc::new(self.0.clone())
+    }
+
+    fn filter_row_ids<'a>(&self, rows: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        rows.enumerate()
+            .filter_map(|(position, row)| self.0.selected(*row).then_some(position as u64))
+            .collect()
+    }
+}
+
+#[rstest::rstest]
+#[case::sparse(1, false)]
+#[case::broad(32, false)]
+#[case::translated(32, true)]
+#[case::full_bucket(64, false)]
+#[tokio::test]
+async fn test_prefilter_skips_excluded_partition_postings(
+    #[case] selected_rows: u64,
+    #[case] translated: bool,
+) {
+    let object_store = ObjectStore::memory();
+    let directory = object_store::path::Path::from("index");
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(object_store.clone()),
+        directory.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    for partition in 0..2 {
+        let rows = (0..64)
+            .rev()
+            .map(|row| {
+                (
+                    "alpha",
+                    if row % 2 == 0 { "beta" } else { "gamma" },
+                    (partition << 32) + row,
+                )
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition(&store, partition, &rows).await;
+    }
+    write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+    let remapper =
+        translated.then(|| Arc::new(OffsetBatchRemapper::default()) as Arc<dyn BatchRowIdRemapper>);
+    let reference =
+        InvertedIndex::load_with_remapping(store, remapper.clone(), &LanceCache::no_cache())
+            .await
+            .unwrap();
+    let tokens = Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text);
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(128)));
+    let prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&reference),
+            tokens,
+            &params,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let all = reference
+        .bm25_search_prepared_documents(
+            prepared.clone(),
+            params.clone(),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    let offset = if translated { 1000 } else { 0 };
+    let mask = if selected_rows == 64 {
+        let mut allowed = RowAddrTreeMap::default();
+        allowed.insert_fragment(0);
+        RowAddrMask::from_allowed(allowed)
+    } else {
+        RowAddrMask::from_allowed((offset..offset + selected_rows).collect())
+    };
+    let mut expected = all
+        .into_iter()
+        .filter(|doc| mask.selected(doc.row_id))
+        .map(|doc| (doc.row_id, doc.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(expected.len(), selected_rows as usize);
+
+    let counter = Arc::new(super::stats::PostingMetadataCounter::default());
+    let store = Arc::new(super::stats::CountingStore {
+        inner: Arc::new(LanceIndexStore::new(
+            Arc::new(object_store),
+            directory,
+            Arc::new(LanceCache::no_cache()),
+        )),
+        posting_file: posting_file_path(1),
+        counter: counter.clone(),
+    });
+    let index = InvertedIndex::load_with_remapping(store, remapper, &LanceCache::no_cache())
+        .await
+        .unwrap();
+    // Statistics still cover both partitions. Only candidate posting reads may be skipped.
+    let prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            prepared.tokens().as_ref().clone(),
+            &params,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(counter.posting_rows_read(), 0);
+    let actual = index
+        .bm25_search_prepared_documents(
+            prepared,
+            params,
+            Operator::Or,
+            Arc::new(MaskFilter(mask)),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    let mut actual = actual
+        .into_iter()
+        .map(|doc| (doc.row_id, doc.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        counter.posting_rows_read(),
+        0,
+        "excluded partition posting payload must not be read"
+    );
+}
+
 #[async_trait]
 impl BatchRowIdRemapper for OffsetBatchRemapper {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
@@ -538,8 +686,11 @@ async fn test_fuzzy_and_groups_expansions_by_original_position() {
     );
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
+async fn test_fuzzy_expansion_cap_applies_to_whole_query(
+    #[values(false, true)] has_independent_groups: bool,
+) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -567,22 +718,48 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
     let params = FtsSearchParams::new()
         .with_fuzziness(Some(1))
         .with_max_expansions(3);
-    let tokens = Tokens::new(vec!["alphx".to_owned(), "betx".to_owned()], DocType::Text);
+    let tokens = Tokens::with_positions(
+        vec!["alphx".to_owned(), "betx".to_owned()],
+        if has_independent_groups {
+            vec![0, 0]
+        } else {
+            vec![0, 1]
+        },
+        DocType::Text,
+    )
+    .with_term_groups(vec![0, 1]);
 
-    let expanded = partition.expand_fuzzy(&tokens, &params).unwrap();
-    let expanded_terms = (0..expanded.len())
-        .map(|idx| (expanded.get_token(idx).to_owned(), expanded.position(idx)))
-        .collect::<Vec<_>>();
+    for expanded in [
+        partition.expand_fuzzy(&tokens, &params).unwrap(),
+        index.expand_fuzzy_tokens(&tokens, &params).unwrap(),
+        crate::scalar::inverted::final_query_tokens(std::slice::from_ref(&index), &tokens, &params)
+            .unwrap(),
+    ] {
+        let expanded_terms = (0..expanded.len())
+            .map(|idx| (expanded.get_token(idx).to_owned(), expanded.term_group(idx)))
+            .collect::<Vec<_>>();
 
-    assert_eq!(
-        expanded_terms,
-        vec![
-            ("alpha".to_owned(), 0),
-            ("alphi".to_owned(), 0),
-            ("beta".to_owned(), 1),
-        ],
-        "max_expansions should cap the whole fuzzy query, not each token"
-    );
+        assert_eq!(
+            expanded_terms,
+            vec![
+                ("alpha".to_owned(), 0),
+                ("alphi".to_owned(), 0),
+                ("beta".to_owned(), 1),
+            ],
+            "max_expansions should cap the whole fuzzy query, not each token"
+        );
+        assert_eq!(
+            (0..expanded.len())
+                .map(|index| expanded.position(index))
+                .collect::<Vec<_>>(),
+            if has_independent_groups {
+                vec![0, 0, 0]
+            } else {
+                vec![0, 0, 1]
+            },
+            "fuzzy expansion must preserve phrase positions separately from Match groups"
+        );
+    }
 }
 
 /// Write one partition holding `variants` in order, with one

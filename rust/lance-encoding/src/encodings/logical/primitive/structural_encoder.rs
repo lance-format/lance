@@ -209,6 +209,7 @@ pub struct PrimitiveStructuralEncoder {
     accumulation_queue: AccumulationQueue,
 
     keep_original_array: bool,
+    flush_next: bool,
     accumulated_repdefs: Vec<RepDefBuilder>,
     page_encodings: Arc<[PrimitivePageEncoding]>,
     column_index: u32,
@@ -271,7 +272,35 @@ pub(super) struct PrimitivePlanContext<'a> {
 
 pub(super) enum PrimitiveEncodeAttempt {
     Encoded(EncodedPage),
+    FullZip(FullZipRequest),
     Unhandled(PrimitivePageData),
+}
+
+pub(super) struct FullZipRequest {
+    column_idx: u32,
+    data: DataBlock,
+    compressor: Arc<dyn PerValueCompressor>,
+    validity: Option<BooleanBuffer>,
+    repdef: SerializedRepDefs,
+    num_items: u64,
+    num_visible_items: u64,
+    row_number: u64,
+    num_rows: u64,
+    pub(super) planar: bool,
+}
+
+pub(super) enum DensePageEncoding {
+    Encoded(EncodedPage),
+    FullZip(FullZipRequest),
+}
+
+impl From<DensePageEncoding> for PrimitiveEncodeAttempt {
+    fn from(encoding: DensePageEncoding) -> Self {
+        match encoding {
+            DensePageEncoding::Encoded(page) => Self::Encoded(page),
+            DensePageEncoding::FullZip(request) => Self::FullZip(request),
+        }
+    }
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -308,6 +337,7 @@ impl PrimitiveStructuralEncoder {
                 options.keep_original_array,
             ),
             keep_original_array: options.keep_original_array,
+            flush_next: false,
             accumulated_repdefs: Vec::new(),
             column_index,
             page_encodings,
@@ -316,24 +346,42 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn encode_page(
-        page_encodings: &[PrimitivePageEncoding],
-        ctx: &PrimitiveEncodeContext,
-        mut page: PrimitivePageData,
-    ) -> Result<EncodedPage> {
-        for page_encoding in page_encodings {
-            match page_encoding.behavior.try_encode_page(ctx, page)? {
-                PrimitiveEncodeAttempt::Encoded(page) => return Ok(page),
-                PrimitiveEncodeAttempt::Unhandled(unhandled) => page = unhandled,
+    fn encode_page_async(
+        page_encodings: Arc<[PrimitivePageEncoding]>,
+        ctx: PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> BoxFuture<'static, Result<EncodedPage>> {
+        async move {
+            let field_name = ctx.field.name.clone();
+            let attempt = spawn_cpu(move || {
+                let mut page = page;
+                for page_encoding in page_encodings.iter() {
+                    match page_encoding.behavior.try_encode_page(&ctx, page)? {
+                        PrimitiveEncodeAttempt::Encoded(page) => {
+                            return Ok(PrimitiveEncodeAttempt::Encoded(page));
+                        }
+                        PrimitiveEncodeAttempt::FullZip(request) => {
+                            return Ok(PrimitiveEncodeAttempt::FullZip(request));
+                        }
+                        PrimitiveEncodeAttempt::Unhandled(unhandled) => page = unhandled,
+                    }
+                }
+                Err(Error::invalid_input_source(
+                    format!("No primitive page encoding atom supports field '{field_name}'").into(),
+                ))
+            })
+            .await?;
+            match attempt {
+                PrimitiveEncodeAttempt::Encoded(page) => Ok(page),
+                PrimitiveEncodeAttempt::FullZip(request) => {
+                    Self::encode_full_zip_async(request).await
+                }
+                PrimitiveEncodeAttempt::Unhandled(_) => Err(Error::internal(
+                    "primitive page encoding returned an unhandled page after selection",
+                )),
             }
         }
-        Err(Error::invalid_input_source(
-            format!(
-                "No primitive page encoding atom supports field '{}'",
-                ctx.field.name
-            )
-            .into(),
-        ))
+        .boxed()
     }
 
     // TODO: This is a heuristic we may need to tune at some point
@@ -1432,15 +1480,51 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_lists: u64,
     ) -> Result<EncodedPage> {
-        let max_rep = repdef
-            .repetition_levels
-            .as_ref()
-            .map_or(0, |r| r.iter().max().copied().unwrap_or(0));
-        let max_def = repdef
-            .definition_levels
-            .as_ref()
-            .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
+        let request = Self::prepare_full_zip(
+            column_idx,
+            field,
+            compression_strategy,
+            data,
+            repdef,
+            row_number,
+            num_lists,
+        )?;
+        let FullZipRequest {
+            column_idx,
+            data,
+            compressor,
+            validity,
+            repdef,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            planar: _,
+        } = request;
+        let (compressed_data, value_encoding) =
+            compressor.compress_with_validity(data, validity.as_ref())?;
+        Self::finish_full_zip(
+            column_idx,
+            repdef,
+            compressed_data,
+            value_encoding,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            false,
+        )
+    }
 
+    fn prepare_full_zip(
+        column_idx: u32,
+        field: &Field,
+        compression_strategy: &dyn CompressionStrategy,
+        data: DataBlock,
+        repdef: SerializedRepDefs,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<FullZipRequest> {
         // To handle FSL we just flatten
         // let data = data.flatten();
 
@@ -1454,8 +1538,89 @@ impl PrimitiveStructuralEncoder {
                 (data.num_values(), data.num_values())
             };
 
-        let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
+        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
+        let data = match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            other => other,
+        };
 
+        let compressor: Arc<dyn PerValueCompressor> =
+            Arc::from(compression_strategy.create_per_value(field, &data)?);
+        let validity = if compressor.needs_row_validity() {
+            Self::leaf_validity(&repdef, data.num_values() as usize)?
+        } else {
+            None
+        };
+        Ok(FullZipRequest {
+            column_idx,
+            data,
+            compressor,
+            validity,
+            repdef,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            planar: false,
+        })
+    }
+
+    async fn encode_full_zip_async(request: FullZipRequest) -> Result<EncodedPage> {
+        let FullZipRequest {
+            column_idx,
+            data,
+            compressor,
+            validity,
+            repdef,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            planar,
+        } = request;
+        let (compressed_data, value_encoding) = compressor
+            .compress_with_validity_async(data, validity)
+            .await?;
+
+        spawn_cpu(move || {
+            Self::finish_full_zip(
+                column_idx,
+                repdef,
+                compressed_data,
+                value_encoding,
+                num_items,
+                num_visible_items,
+                row_number,
+                num_rows,
+                planar,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_full_zip(
+        column_idx: u32,
+        repdef: SerializedRepDefs,
+        compressed_data: PerValueDataBlock,
+        value_encoding: CompressiveEncoding,
+        num_items: u64,
+        num_visible_items: u64,
+        row_number: u64,
+        num_lists: u64,
+        planar: bool,
+    ) -> Result<EncodedPage> {
+        let max_rep = repdef
+            .repetition_levels
+            .as_ref()
+            .map_or(0, |r| r.iter().max().copied().unwrap_or(0));
+        let max_def = repdef
+            .definition_levels
+            .as_ref()
+            .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
+        let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
         let repdef_iter = build_control_word_iterator(
             repdef.repetition_levels.as_deref(),
             max_rep,
@@ -1466,23 +1631,6 @@ impl PrimitiveStructuralEncoder {
         );
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
-
-        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
-        let data = match data {
-            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
-                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
-            }
-            other => other,
-        };
-
-        let compressor = compression_strategy.create_per_value(field, &data)?;
-        let validity = if compressor.needs_row_validity() {
-            Self::leaf_validity(&repdef, data.num_values() as usize)?
-        } else {
-            None
-        };
-        let (compressed_data, value_encoding) =
-            compressor.compress_with_validity(data, validity.as_ref())?;
 
         let description = match &compressed_data {
             PerValueDataBlock::Fixed(fixed) => EncodingUtils::fixed_full_zip_layout(
@@ -1513,11 +1661,16 @@ impl PrimitiveStructuralEncoder {
             vec![zipped.values]
         };
 
+        let description = if planar {
+            PageEncoding::Planar(crate::format::planar::from_dense_execution(description)?)
+        } else {
+            PageEncoding::Structural(description)
+        };
         Ok(EncodedPage {
             num_rows: num_lists,
             column_idx,
             data,
-            description: PageEncoding::Structural(description),
+            description,
             row_number,
         })
     }
@@ -1738,6 +1891,60 @@ impl PrimitiveStructuralEncoder {
     /// support dictionary encoding. Returns `None` for malformed data.
     fn sample_unique_ratio(data_block: &DataBlock, max_samples: usize) -> Option<Option<f64>> {
         use std::collections::HashSet;
+        use std::hash::{BuildHasherDefault, Hasher};
+
+        #[derive(Default)]
+        struct FastSampleHasher(u64);
+
+        impl Hasher for FastSampleHasher {
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                let mut x = i;
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                self.0 = x ^ (x >> 31);
+            }
+
+            #[inline]
+            fn write_u128(&mut self, i: u128) {
+                let lo = i as u64;
+                let hi = (i >> 64) as u64;
+                self.write_u64(lo ^ hi.wrapping_mul(0x9e3779b97f4a7c15));
+            }
+        }
+
+        #[derive(Default)]
+        struct IdentityU64Hasher(u64);
+
+        impl Hasher for IdentityU64Hasher {
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                self.0 = i;
+            }
+        }
+
+        type FastSampleSet<K> = HashSet<K, BuildHasherDefault<FastSampleHasher>>;
+        type PrehashedSet = HashSet<u64, BuildHasherDefault<IdentityU64Hasher>>;
 
         const NUM_SAMPLE_BLOCKS: usize = 32;
         const MIN_RELIABLE_SAMPLES: usize = 1024;
@@ -1754,87 +1961,129 @@ impl PrimitiveStructuralEncoder {
 
         let block_count = NUM_SAMPLE_BLOCKS.min(sample_count).min(num_values).max(1);
         let samples_per_block = (sample_count / block_count).max(1);
-        let mut indices = Vec::with_capacity(sample_count);
+
+        let mut total_samples = 0usize;
         for block_idx in 0..block_count {
             let block_start = block_idx * num_values / block_count;
             let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
             let block_len = next_block_start.saturating_sub(block_start);
-            let samples_in_block = samples_per_block.min(block_len);
-            indices.extend((0..samples_in_block).map(|offset| block_start + offset));
+            total_samples += samples_per_block.min(block_len);
         }
 
-        if indices.len() < MIN_RELIABLE_SAMPLES {
+        if total_samples < MIN_RELIABLE_SAMPLES {
             return Some(None);
         }
+
+        let for_each_block = |visit: &mut dyn FnMut(usize, usize) -> Option<()>| -> Option<()> {
+            for block_idx in 0..block_count {
+                let block_start = block_idx * num_values / block_count;
+                let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
+                let block_len = next_block_start.saturating_sub(block_start);
+                let count = samples_per_block.min(block_len);
+                if count > 0 {
+                    visit(block_start, block_start + count)?;
+                }
+            }
+            Some(())
+        };
 
         let ratio = match data_block {
             DataBlock::FixedWidth(fixed) => match fixed.bits_per_value {
                 64 => {
                     let values = fixed.data.borrow_to_typed_slice::<u64>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u64> =
-                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
-                    for idx in indices.iter().copied() {
-                        unique.insert(values.get(idx).copied()?);
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = FastSampleSet::<u64>::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let slice = values.get(start..end)?;
+                        for &v in slice {
+                            unique.insert(v);
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 128 => {
                     let values = fixed.data.borrow_to_typed_slice::<u128>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u128> =
-                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
-                    for idx in indices.iter().copied() {
-                        unique.insert(values.get(idx).copied()?);
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = FastSampleSet::<u128>::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let slice = values.get(start..end)?;
+                        for &v in slice {
+                            unique.insert(v);
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 bits if bits > 0 && bits.is_multiple_of(8) => {
                     let width = usize::try_from(bits / 8).ok()?;
-                    let mut unique = HashSet::with_capacity(indices.len());
-                    for &index in &indices {
-                        let start = index.checked_mul(width)?;
-                        let end = start.checked_add(width)?;
-                        unique.insert(xxhash_rust::xxh3::xxh3_64(fixed.data.get(start..end)?));
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = PrehashedSet::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let byte_start = start.checked_mul(width)?;
+                        let byte_end = end.checked_mul(width)?;
+                        let bytes = fixed.data.get(byte_start..byte_end)?;
+                        for chunk in bytes.chunks_exact(width) {
+                            unique.insert(xxhash_rust::xxh3::xxh3_64(chunk));
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 _ => return Some(None),
             },
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
-                // Hash variable-width slices instead of storing borrowed slice keys.
-                let mut unique: HashSet<u64> =
-                    HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                let mut unique = PrehashedSet::with_capacity_and_hasher(
+                    total_samples,
+                    BuildHasherDefault::default(),
+                );
+                let raw_data = var.data.as_ref();
                 match var.bits_per_offset {
                     32 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u32>();
                         let offsets: &[u32] = offsets_ref.as_ref();
-                        for i in indices.iter().copied() {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
+                        for_each_block(&mut |start, end| {
+                            let win_slice = offsets.get(start..=end)?;
+                            for win in win_slice.windows(2) {
+                                let s = usize::try_from(win[0]).ok()?;
+                                let e = usize::try_from(win[1]).ok()?;
+                                if s > e || e > raw_data.len() {
+                                    return None;
+                                }
+                                unique.insert(xxh3_64(&raw_data[s..e]));
                             }
-                            unique.insert(xxh3_64(&var.data[start..end]));
-                        }
+                            Some(())
+                        })?;
                     }
                     64 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u64>();
                         let offsets: &[u64] = offsets_ref.as_ref();
-                        for i in indices.iter().copied() {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
+                        for_each_block(&mut |start, end| {
+                            let win_slice = offsets.get(start..=end)?;
+                            for win in win_slice.windows(2) {
+                                let s = usize::try_from(win[0]).ok()?;
+                                let e = usize::try_from(win[1]).ok()?;
+                                if s > e || e > raw_data.len() {
+                                    return None;
+                                }
+                                unique.insert(xxh3_64(&raw_data[s..e]));
                             }
-                            unique.insert(xxh3_64(&var.data[start..end]));
-                        }
+                            Some(())
+                        })?;
                     }
                     _ => return Some(None),
                 }
-                unique.len() as f64 / indices.len() as f64
+                unique.len() as f64 / total_samples as f64
             }
             _ => return Some(None),
         };
@@ -1961,7 +2210,7 @@ impl PrimitiveStructuralEncoder {
         miniblock_chunk_size: MiniblockChunkSize,
         complex_null_encoding: ComplexNullEncoding,
         dictionary_policy: DictionaryEncodingPolicy,
-    ) -> Result<EncodedPage> {
+    ) -> Result<DensePageEncoding> {
         let PrimitiveEncodeContext {
             column_idx,
             field,
@@ -1976,6 +2225,17 @@ impl PrimitiveStructuralEncoder {
             num_rows,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+        let full_zip_request = |data, repdef| {
+            Self::prepare_full_zip(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data,
+                repdef,
+                row_number,
+                num_rows,
+            )
+        };
 
         let (repdef, single_row_miniblock_repdef_levels) = match structure {
             PrimitivePageStructure::Dense {
@@ -2003,7 +2263,8 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 complex_null_encoding,
                 compression_strategy.as_ref(),
-            );
+            )
+            .map(DensePageEncoding::Encoded);
         }
 
         let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
@@ -2013,7 +2274,7 @@ impl PrimitiveStructuralEncoder {
             .unwrap_or(false);
 
         if all_null {
-            return if is_simple_validity {
+            return (if is_simple_validity {
                 log::debug!(
                     "Encoding column {} with {} items ({} rows) using simple-null layout",
                     column_idx,
@@ -2036,7 +2297,8 @@ impl PrimitiveStructuralEncoder {
                     complex_null_encoding,
                     compression_strategy.as_ref(),
                 )
-            };
+            })
+            .map(DensePageEncoding::Encoded);
         }
 
         if let DataType::Struct(fields) = &field.data_type()
@@ -2047,10 +2309,14 @@ impl PrimitiveStructuralEncoder {
             }
             // This is maybe a little confusing but the reader should never look at this anyways and it
             // seems like overkill to invent a new layout just for "empty structs".
-            return Self::encode_simple_all_null(column_idx, num_values, row_number);
+            return Self::encode_simple_all_null(column_idx, num_values, row_number)
+                .map(DensePageEncoding::Encoded);
         }
 
         let data_block = DataBlock::from_arrays(&arrays, num_values);
+        // The data block owns the normalized page buffers.  Release any
+        // detached source snapshots before compression allocates its output.
+        drop(arrays);
 
         if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
@@ -2109,15 +2375,9 @@ impl PrimitiveStructuralEncoder {
                     if let Some(reason) = fullzip_error {
                         return Err(Error::invalid_input_source(reason.into()));
                     }
-                    return Self::encode_full_zip(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    );
+                    return Ok(DensePageEncoding::FullZip(full_zip_request(
+                        data_block, repdef,
+                    )?));
                 }
                 Some(STRUCTURAL_ENCODING_MINIBLOCK) | None => {
                     if requested_encoding.is_none() && fullzip_error.is_none() {
@@ -2126,15 +2386,9 @@ impl PrimitiveStructuralEncoder {
                             column_idx,
                             num_values
                         );
-                        return Self::encode_full_zip(
-                            column_idx,
-                            &field,
-                            compression_strategy.as_ref(),
-                            data_block,
-                            repdef,
-                            row_number,
-                            num_rows,
-                        );
+                        return Ok(DensePageEncoding::FullZip(full_zip_request(
+                            data_block, repdef,
+                        )?));
                     }
                     return Err(Error::invalid_input_source(
                         format!(
@@ -2163,15 +2417,9 @@ impl PrimitiveStructuralEncoder {
                 column_idx,
                 num_values
             );
-            return Self::encode_full_zip(
-                column_idx,
-                &field,
-                compression_strategy.as_ref(),
-                data_block,
-                repdef,
-                row_number,
-                num_rows,
-            );
+            return Ok(DensePageEncoding::FullZip(full_zip_request(
+                data_block, repdef,
+            )?));
         }
 
         if let DataBlock::Dictionary(dict) = data_block {
@@ -2212,7 +2460,8 @@ impl PrimitiveStructuralEncoder {
                 Some(dictionary_data_block),
                 num_rows,
                 miniblock_chunk_size,
-            );
+            )
+            .map(DensePageEncoding::Encoded);
         }
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
@@ -2232,6 +2481,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 miniblock_chunk_size,
             )
+            .map(DensePageEncoding::Encoded)
         } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
             log::debug!(
                 "Encoding column {} with {} items using mini-block layout",
@@ -2249,21 +2499,16 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 miniblock_chunk_size,
             )
+            .map(DensePageEncoding::Encoded)
         } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
             log::debug!(
                 "Encoding column {} with {} items using full-zip layout",
                 column_idx,
                 num_values
             );
-            Self::encode_full_zip(
-                column_idx,
-                &field,
-                compression_strategy.as_ref(),
-                data_block,
-                repdef,
-                row_number,
-                num_rows,
-            )
+            Ok(DensePageEncoding::FullZip(full_zip_request(
+                data_block, repdef,
+            )?))
         } else {
             Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
         }
@@ -2413,9 +2658,7 @@ impl PrimitiveStructuralEncoder {
         for page in pages {
             let ctx = ctx.clone();
             let page_encodings = self.page_encodings.clone();
-            let task =
-                spawn_cpu(move || Self::encode_page(page_encodings.as_ref(), &ctx, page)).boxed();
-            tasks.push(task);
+            tasks.push(Self::encode_page_async(page_encodings, ctx, page));
         }
         Ok(tasks)
     }
@@ -2537,16 +2780,15 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
         if !matches!(&page.structure, PrimitivePageStructure::Dense { .. }) {
             return Ok(PrimitiveEncodeAttempt::Unhandled(page));
         }
-        Ok(PrimitiveEncodeAttempt::Encoded(
-            PrimitiveStructuralEncoder::encode_dense_page(
-                ctx.clone(),
-                page,
-                self.compression.clone(),
-                MiniblockChunkSize::U16,
-                ComplexNullEncoding::RawLevels,
-                DictionaryEncodingPolicy::LegacyU16,
-            )?,
-        ))
+        Ok(PrimitiveStructuralEncoder::encode_dense_page(
+            ctx.clone(),
+            page,
+            self.compression.clone(),
+            MiniblockChunkSize::U16,
+            ComplexNullEncoding::RawLevels,
+            DictionaryEncodingPolicy::LegacyU16,
+        )?
+        .into())
     }
 }
 
@@ -2573,16 +2815,15 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
         if !matches!(&page.structure, PrimitivePageStructure::Dense { .. }) {
             return Ok(PrimitiveEncodeAttempt::Unhandled(page));
         }
-        Ok(PrimitiveEncodeAttempt::Encoded(
-            PrimitiveStructuralEncoder::encode_dense_page(
-                ctx.clone(),
-                page,
-                self.compression.clone(),
-                MiniblockChunkSize::U32,
-                ComplexNullEncoding::CompressedLevels,
-                DictionaryEncodingPolicy::LegacyU32,
-            )?,
-        ))
+        Ok(PrimitiveStructuralEncoder::encode_dense_page(
+            ctx.clone(),
+            page,
+            self.compression.clone(),
+            MiniblockChunkSize::U32,
+            ComplexNullEncoding::CompressedLevels,
+            DictionaryEncodingPolicy::LegacyU32,
+        )?
+        .into())
     }
 }
 
@@ -2646,14 +2887,73 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
 
-        if let Some((arrays, row_number, num_rows)) =
-            self.accumulation_queue.insert(array, row_number, num_rows)
-        {
-            let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
+        let pages = if self.flush_next {
+            self.flush_next = false;
+            self.accumulation_queue
+                .insert_for_page_boundary(array, row_number, num_rows)
         } else {
-            Ok(vec![])
+            self.accumulation_queue
+                .insert_with_pages(array, row_number, num_rows)
+        };
+        if pages.is_empty() {
+            return Ok(vec![]);
         }
+
+        let mut tasks = Vec::new();
+        match pages.as_slice() {
+            [page] if page.includes_inserted_array => {
+                let repdefs = std::mem::take(&mut self.accumulated_repdefs);
+                tasks.extend(self.do_flush(
+                    page.arrays.clone(),
+                    repdefs,
+                    page.row_number,
+                    page.num_rows,
+                )?);
+            }
+            [page] => {
+                let current_repdef = self.accumulated_repdefs.pop();
+                let repdefs = std::mem::take(&mut self.accumulated_repdefs);
+                tasks.extend(self.do_flush(
+                    page.arrays.clone(),
+                    repdefs,
+                    page.row_number,
+                    page.num_rows,
+                )?);
+                if let Some(current_repdef) = current_repdef {
+                    self.accumulated_repdefs.push(current_repdef);
+                }
+            }
+            [previous, current] if current.includes_inserted_array => {
+                let current_repdef = self
+                    .accumulated_repdefs
+                    .pop()
+                    .ok_or_else(|| Error::internal("missing current repdef"))?;
+                let repdefs = std::mem::take(&mut self.accumulated_repdefs);
+                tasks.extend(self.do_flush(
+                    previous.arrays.clone(),
+                    repdefs,
+                    previous.row_number,
+                    previous.num_rows,
+                )?);
+                tasks.extend(self.do_flush(
+                    current.arrays.clone(),
+                    vec![current_repdef],
+                    current.row_number,
+                    current.num_rows,
+                )?);
+            }
+            _ => {
+                return Err(Error::internal(format!(
+                    "accumulation queue returned {} pages for one input",
+                    pages.len()
+                )));
+            }
+        }
+        Ok(tasks)
+    }
+
+    fn prepare_for_flush(&mut self) {
+        self.flush_next = true;
     }
 
     // If there is any data left in the buffer then create an encode task from it

@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use arc_swap::ArcSwapWeak;
 use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
-use lance_core::cache::{CacheKey, WeakLanceCache};
+use lance_core::cache::{CacheKey, CacheLoadOrigin, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
@@ -404,6 +404,8 @@ pub(super) struct VersionAddressProjection {
     /// slot but are absent from this bitmap.
     live_docs: Option<RoaringBitmap>,
     doc_ids_by_address: OnceCell<Arc<AddressDocIdLookup>>,
+    /// Inclusive live bounds in this version's row-ID domain, computed lazily.
+    live_address_hull: OnceCell<Option<(u64, u64)>>,
     ordered_validation: AtomicU8,
     /// Upper-bound candidate work materialized while order is still unknown.
     /// Once this exceeds the normal one-query flat-search budget, the next
@@ -721,6 +723,7 @@ pub(super) fn resident_row_address_projection_for_test(
         addresses: AddressValues::Owned(Arc::new(addresses)),
         live_docs: None,
         doc_ids_by_address: OnceCell::new(),
+        live_address_hull: OnceCell::new(),
         ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
         materialized_candidate_cost: AtomicUsize::new(0),
         ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -807,6 +810,7 @@ impl VersionAddressProjection {
                 addresses: AddressValues::Shared { len: raw.len() },
                 live_docs: None,
                 doc_ids_by_address: OnceCell::new(),
+                live_address_hull: OnceCell::new(),
                 ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
                 materialized_candidate_cost: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -833,6 +837,7 @@ impl VersionAddressProjection {
             addresses: AddressValues::Owned(Arc::new(addresses)),
             live_docs: Some(live_docs),
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             #[cfg(test)]
@@ -875,10 +880,8 @@ impl ResidentAddressProjection {
 
     /// Inclusive minimum and maximum row addresses among live documents.
     ///
-    /// Unlike [`OrderedRowAddressProjection::live_address_hull`], this scans
-    /// the live projection because remapping may reorder addresses. Deleted
+    /// This scans the live projection because remapping may reorder addresses. Deleted
     /// DocId slots never contribute to the hull.
-    #[cfg(test)]
     pub(super) fn live_address_hull(&self) -> Option<(u64, u64)> {
         let mut hull: Option<(u64, u64)> = None;
         let mut include_doc = |doc_id: u32| {
@@ -1026,6 +1029,15 @@ impl ResidentAddressProjection {
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
     fn dense_and_strictly_ascending(&self) -> bool {
+        // A cached invalid verdict already decides the answer. Asking for the
+        // ordered view would rebuild its diagnostics by rescanning the documents
+        // up to the first violation, only to discard them.
+        if matches!(
+            self.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder
+        ) {
+            return false;
+        }
         match self.try_ordered_row_addresses() {
             Ok(ordered) => !ordered.has_sparse_live_docs(),
             Err(_) => false,
@@ -1132,6 +1144,48 @@ impl DocVisibility {
 
     pub(crate) fn is_empty(&self) -> bool {
         matches!(self, Self::Selected(selected) if selected.is_empty())
+    }
+
+    /// Conservatively prove a partition empty before loading its posting lists.
+    /// Bounds use live, remapped row IDs; overlapping bounds still require exact
+    /// filtering during scoring. Block lists cannot use this allow-list proof.
+    pub(super) async fn may_match(&self) -> Result<bool> {
+        let Self::Filtered { projection, mask } = self else {
+            return Ok(!self.is_empty());
+        };
+        let Some(allowed) = mask.allow_list() else {
+            return Ok(true);
+        };
+        let hull = projection
+            .projection
+            .live_address_hull
+            .get_or_try_init(|| {
+                let projection = projection.clone();
+                async move { spawn_cpu(move || Result::Ok(projection.live_address_hull())).await }
+            })
+            .await?;
+        let Some((minimum, maximum)) = *hull else {
+            return Ok(false);
+        };
+        Ok(allowed.iter().any(|(&key, selection)| {
+            // These are numeric buckets for both stable IDs and physical
+            // addresses; no physical-fragment ownership is assumed here.
+            let bucket_start = u64::from(RowAddress::new_from_parts(key, 0));
+            let bucket_end = u64::from(RowAddress::new_from_parts(key, u32::MAX));
+            if bucket_end < minimum || bucket_start > maximum {
+                return false;
+            }
+            match selection {
+                RowAddrSelection::Full => true,
+                RowAddrSelection::Partial(rows) => rows
+                    .range(
+                        (minimum.max(bucket_start) - bucket_start) as u32
+                            ..=(maximum.min(bucket_end) - bucket_start) as u32,
+                    )
+                    .next()
+                    .is_some(),
+            }
+        }))
     }
 
     pub(crate) fn iter(&self) -> Option<impl Iterator<Item = DocId> + '_> {
@@ -1606,11 +1660,17 @@ impl PartitionDocuments {
     }
 
     async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+        self.row_ids_column_with_cache(&self.index_cache).await
+    }
+
+    async fn row_ids_column_with_cache(
+        &self,
+        index_cache: &WeakLanceCache,
+    ) -> Result<Arc<UInt64Array>> {
         let store = self.store.clone();
         let path = self.path.clone();
         let num_docs = self.num_docs;
-        let cached = self
-            .index_cache
+        let cached = index_cache
             .get_or_insert_with_key(
                 DocRowIdsKey {
                     partition_id: self.partition_id,
@@ -1710,11 +1770,18 @@ impl PartitionDocuments {
     }
 
     pub(crate) async fn address_projection(&self) -> Result<ResidentAddressProjection> {
+        self.address_projection_with_cache(&self.index_cache).await
+    }
+
+    async fn address_projection_with_cache(
+        &self,
+        index_cache: &WeakLanceCache,
+    ) -> Result<ResidentAddressProjection> {
         if let Some(projection) = self.resident_address_projection() {
             return Ok(projection);
         }
 
-        let row_ids = self.row_ids_column().await?;
+        let row_ids = self.row_ids_column_with_cache(index_cache).await?;
         let projection = self
             .projection
             .get_or_try_init(|| async {
@@ -2143,6 +2210,7 @@ impl PartitionDocuments {
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         self.prewarm_complete
             .get_or_try_init(|| async {
                 if self.lengths.get().is_none() && self.projection.get().is_none() {
@@ -2180,7 +2248,7 @@ impl PartitionDocuments {
                     let cached_row_ids = Arc::new(CachedDocRowIds {
                         row_ids: row_ids.clone(),
                     });
-                    self.index_cache
+                    warm_cache
                         .insert_with_key(
                             &DocRowIdsKey {
                                 partition_id: self.partition_id,
@@ -2203,14 +2271,14 @@ impl PartitionDocuments {
                     Result::Ok(())
                 })
                 .await?;
-                let projection = self.address_projection().await?;
+                let projection = self.address_projection_with_cache(&warm_cache).await?;
                 projection.doc_ids_by_address().await?;
                 self.strictly_ascending_addresses(&projection).await?;
                 Result::Ok(())
             })
             .await?;
         if !self.projection_resident() {
-            self.address_projection().await?;
+            self.address_projection_with_cache(&warm_cache).await?;
         }
         Ok(())
     }
@@ -2655,12 +2723,13 @@ mod tests {
         assert!(wrong_type.to_string().contains("expected UInt32"));
     }
 
-    #[test]
-    fn live_documents_use_doc_ids() {
+    #[tokio::test]
+    async fn live_documents_use_doc_ids() {
         let projection = Arc::new(VersionAddressProjection {
             addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -2669,16 +2738,87 @@ mod tests {
         let selected = projection.live_doc_ids();
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 2]);
         assert_eq!(projection.live_address_hull(), Some((10, 30)));
+        let visibility = DocVisibility::Filtered {
+            projection: projection.clone(),
+            mask: Arc::new(RowAddrMask::from_allowed([9, 31].into_iter().collect())),
+        };
+        assert!(!visibility.may_match().await.unwrap());
+        assert_eq!(
+            projection.projection.live_address_hull.get(),
+            Some(&Some((10, 30)))
+        );
 
         let empty = Arc::new(VersionAddressProjection {
             addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::new()),
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
         });
-        assert_eq!(empty.resident(None).unwrap().live_address_hull(), None);
+        let empty = empty.resident(None).unwrap();
+        assert_eq!(empty.live_address_hull(), None);
+        assert!(
+            !DocVisibility::Filtered {
+                projection: empty,
+                mask: Arc::new(RowAddrMask::from_allowed([0, 10, 30].into_iter().collect())),
+            }
+            .may_match()
+            .await
+            .unwrap()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::below(vec![30, 10, 20], vec![0, 9], None, false)]
+    #[case::above(vec![30, 10, 20], vec![31, 100], None, false)]
+    #[case::minimum(vec![30, 10, 20], vec![10], None, true)]
+    #[case::maximum(vec![30, 10, 20], vec![30], None, true)]
+    #[case::overlapping_hole(vec![30, 10], vec![20], None, true)]
+    #[case::duplicates(vec![30, 10, 10], vec![10], None, true)]
+    #[case::empty(vec![], vec![10], None, false)]
+    #[case::full_bucket(vec![30, 10], vec![], Some(0), true)]
+    #[case::other_bucket(vec![30, 10], vec![], Some(1), false)]
+    #[case::cross_bucket(vec![(1 << 32) + 10, (1 << 32) - 10], vec![1 << 32], None, true)]
+    #[case::cross_bucket_miss(vec![(1 << 32) + 10, (1 << 32) - 10], vec![(1 << 32) + 11], None, false)]
+    #[case::last_bucket(vec![u64::MAX - 1], vec![], Some(u32::MAX), true)]
+    #[tokio::test]
+    async fn visibility_bounds_are_conservative(
+        #[case] addresses: Vec<u64>,
+        #[case] allowed: Vec<u64>,
+        #[case] full_bucket: Option<u32>,
+        #[case] expected: bool,
+    ) {
+        let mut allowed = allowed.into_iter().collect::<RowAddrTreeMap>();
+        if let Some(key) = full_bucket {
+            allowed.insert_fragment(key);
+        }
+        let visibility = DocVisibility::Filtered {
+            projection: resident_row_address_projection_for_test(addresses),
+            mask: Arc::new(RowAddrMask::from_allowed(allowed)),
+        };
+        assert_eq!(visibility.may_match().await.unwrap(), expected);
+        // Reusing cached bounds must give the same conservative answer.
+        assert_eq!(visibility.may_match().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn block_list_does_not_use_allow_list_bounds() {
+        let projection = resident_row_address_projection_for_test(vec![10, 20]);
+        let visibility = DocVisibility::Filtered {
+            projection: projection.clone(),
+            mask: Arc::new(!RowAddrMask::from_allowed([10, 20].into_iter().collect())),
+        };
+        assert!(visibility.may_match().await.unwrap());
+        assert!(projection.projection.live_address_hull.get().is_none());
+        assert!(DocVisibility::All.may_match().await.unwrap());
+        assert!(
+            !DocVisibility::Selected(RoaringBitmap::new())
+                .may_match()
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2690,6 +2830,7 @@ mod tests {
             },
             live_docs: None,
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -2800,6 +2941,7 @@ mod tests {
             addresses: AddressValues::Owned(Arc::new(vec![10, 0, 30, 0, 50])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2, 4])),
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -2838,8 +2980,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ordered_row_address_projection_rejects_nonmonotonic_remap() {
+    #[tokio::test]
+    async fn ordered_row_address_projection_rejects_nonmonotonic_remap() {
         let raw = UInt64Array::from(vec![10, 20, 30, 40]);
         let remapper = TestRemapper {
             mapping: HashMap::from([(10, Some(100)), (20, None), (30, Some(300))]),
@@ -2874,6 +3016,19 @@ mod tests {
             CachedRowAddressOrder::OutOfOrder
         );
         assert_eq!(projection.ordered_validation_visited_docs(), 6);
+        for (allowed, may_match) in [
+            (20, false),
+            (40, true),
+            (100, true),
+            (300, true),
+            (301, false),
+        ] {
+            let visibility = DocVisibility::Filtered {
+                projection: projection.clone(),
+                mask: Arc::new(RowAddrMask::from_allowed([allowed].into_iter().collect())),
+            };
+            assert_eq!(visibility.may_match().await.unwrap(), may_match);
+        }
     }
 
     #[test]
@@ -2882,6 +3037,7 @@ mod tests {
             addresses: AddressValues::Owned(Arc::new(vec![10, 20, 20, 30])),
             live_docs: None,
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -2983,6 +3139,7 @@ mod tests {
             ])),
             live_docs: None,
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -3033,6 +3190,7 @@ mod tests {
             addresses: AddressValues::Owned(Arc::new(vec![30, 10, 10, 20])),
             live_docs: Some(RoaringBitmap::from_iter([0, 1, 3])),
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -3053,6 +3211,7 @@ mod tests {
             addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
             doc_ids_by_address: OnceCell::new(),
+            live_address_hull: OnceCell::new(),
             ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
             materialized_candidate_cost: AtomicUsize::new(0),
             ordered_validation_visited_docs: AtomicUsize::new(0),
@@ -3109,6 +3268,10 @@ mod tests {
         let projection = projection.resident(Some(raw)).unwrap();
 
         assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        // Later checks answer from the cached verdict without rescanning.
+        let visited = projection.ordered_validation_visited_docs();
+        assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        assert_eq!(projection.ordered_validation_visited_docs(), visited);
     }
 
     #[test]
@@ -3426,7 +3589,55 @@ mod tests {
         assert!(!documents.projection_resident());
         assert!(!documents.query_ready());
 
+        let before = cache.diagnostics().activity;
+        let before_by_type = cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Refreshed)
+            .await
+            .by_type
+            .unwrap();
         documents.prewarm().await.unwrap();
+        let after = cache.diagnostics().activity;
+        let after_by_type = cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Refreshed)
+            .await
+            .by_type
+            .unwrap();
+        assert!(after.warm.attempts > before.warm.attempts);
+        assert!(after.warm.loads_succeeded > before.warm.loads_succeeded);
+        let before_doc_row_ids = before_by_type
+            .activity
+            .iter()
+            .find(|row| row.type_name == "DocRowIds")
+            .unwrap()
+            .activity
+            .clone();
+        let after_doc_row_ids = after_by_type
+            .activity
+            .iter()
+            .find(|row| row.type_name == "DocRowIds")
+            .unwrap()
+            .activity
+            .clone();
+        assert!(after_doc_row_ids.warm.attempts > before_doc_row_ids.warm.attempts);
+        assert!(after_doc_row_ids.warm.loads_succeeded > before_doc_row_ids.warm.loads_succeeded);
+        assert_eq!(
+            after_doc_row_ids
+                .hits
+                .saturating_sub(after_doc_row_ids.warm.hits),
+            before_doc_row_ids
+                .hits
+                .saturating_sub(before_doc_row_ids.warm.hits),
+            "prewarm address reloads must not add demand hits"
+        );
+        assert_eq!(
+            after_doc_row_ids
+                .misses
+                .saturating_sub(after_doc_row_ids.warm.loads_succeeded),
+            before_doc_row_ids
+                .misses
+                .saturating_sub(before_doc_row_ids.warm.loads_succeeded),
+            "prewarm address reloads must not add demand misses"
+        );
         assert!(documents.query_ready());
         assert_eq!(
             documents

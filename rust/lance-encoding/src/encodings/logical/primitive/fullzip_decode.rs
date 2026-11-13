@@ -14,7 +14,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use lance_core::Result;
-use lance_core::cache::{Context, DeepSizeOf};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::error::Error;
 
 use crate::EncodingsIo;
@@ -23,7 +23,7 @@ use crate::compression::{
     DecompressionStrategy, FixedPerValueDecompressor, VariablePerValueDecompressor,
 };
 use crate::data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, VariableWidthBlock};
-use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
+use crate::decoder::{DecodePageTask, DecodedPage, ListReadMode, StructuralPageDecoder};
 use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{
@@ -31,10 +31,13 @@ use crate::repdef::{
 };
 use crate::utils::bytepack::ByteUnpacker;
 
+use super::structure::{StructuralMetadataIo, StructuralProjection};
 use super::{
     CachedPageData, NoCachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     StructuralPageScheduler,
 };
+
+mod structure;
 
 #[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
@@ -147,6 +150,8 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     pub(super) enable_cache: bool,
+    pub(super) structural_projection: Option<StructuralProjection>,
+    structural_cache: Option<Arc<LanceCache>>,
 }
 
 impl FullZipScheduler {
@@ -157,59 +162,112 @@ impl FullZipScheduler {
         layout: &metadata::FullZipLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
-        let (data_buf_position, data_buf_size) = buffer_offsets_and_sizes[0];
-        let rep_index = buffer_offsets_and_sizes.get(1).map(|(pos, len)| {
-            let num_reps = rows_in_page + 1;
-            let bytes_per_rep = len / num_reps;
-            debug_assert_eq!(len % num_reps, 0);
-            debug_assert!(
-                bytes_per_rep == 1
-                    || bytes_per_rep == 2
-                    || bytes_per_rep == 4
-                    || bytes_per_rep == 8
-            );
-            FullZipRepIndexDetails {
-                buf_position: *pos,
-                bytes_per_value: bytes_per_rep,
-            }
-        });
+        let (data_buf_position, data_buf_size) =
+            *buffer_offsets_and_sizes.first().ok_or_else(|| {
+                Error::corrupt_file_named("full_zip_layout", "Full-zip page has no data buffer")
+            })?;
+        let rep_index = buffer_offsets_and_sizes
+            .get(1)
+            .map(|(pos, len)| {
+                let num_reps = rows_in_page.checked_add(1).ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "full_zip_layout",
+                        format!(
+                            "Full-zip page row count {rows_in_page} overflows the repetition index"
+                        ),
+                    )
+                })?;
+                if len % num_reps != 0 {
+                    return Err(Error::corrupt_file_named(
+                        "full_zip_layout",
+                        format!(
+                            "Full-zip repetition index has {len} bytes, which is not a whole number of {num_reps} rows"
+                        ),
+                    ));
+                }
+                let bytes_per_rep = len / num_reps;
+                if !matches!(bytes_per_rep, 1 | 2 | 4 | 8) {
+                    return Err(Error::corrupt_file_named(
+                        "full_zip_layout",
+                        format!(
+                            "Full-zip repetition index has an unsupported width of {bytes_per_rep} bytes per row"
+                        ),
+                    ));
+                }
+                Ok(FullZipRepIndexDetails {
+                    buf_position: *pos,
+                    bytes_per_value: bytes_per_rep,
+                })
+            })
+            .transpose()?;
 
-        let value_decompressor = match layout.details {
-            Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => {
-                let decompressor = decompressors.create_fixed_per_value_decompressor(
-                    layout.value_compression.as_ref().unwrap(),
-                )?;
-                PerValueDecompressor::Fixed(decompressor.into())
-            }
-            Some(metadata::full_zip_layout::Details::BitsPerOffset(_)) => {
-                let decompressor = decompressors.create_variable_per_value_decompressor(
-                    layout.value_compression.as_ref().unwrap(),
-                )?;
-                PerValueDecompressor::Variable(decompressor.into())
-            }
-            None => {
-                panic!("Full-zip layout must have a `details` field");
-            }
-        };
-        let ctrl_word_parser = ControlWordParser::new(
-            layout.bits_rep.try_into().unwrap(),
-            layout.bits_def.try_into().unwrap(),
-        );
+        let bits_rep = u8::try_from(layout.bits_rep).map_err(|_| {
+            Error::corrupt_file_named(
+                "full_zip_layout",
+                format!("Full-zip bits_rep {} does not fit in a u8", layout.bits_rep),
+            )
+        })?;
+        let bits_def = u8::try_from(layout.bits_def).map_err(|_| {
+            Error::corrupt_file_named(
+                "full_zip_layout",
+                format!("Full-zip bits_def {} does not fit in a u8", layout.bits_def),
+            )
+        })?;
+        // Levels are u16 values, and the parser supports at most a 32-bit word.
+        if bits_rep > 16 || bits_def > 16 {
+            return Err(Error::corrupt_file_named(
+                "full_zip_layout",
+                format!(
+                    "Full-zip control word uses {bits_rep} repetition and {bits_def} definition bits, but each side supports at most 16 bits (32 bits total)"
+                ),
+            ));
+        }
+        let ctrl_word_parser = ControlWordParser::new(bits_rep, bits_def);
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-            .collect::<Vec<_>>();
+            .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+            .collect::<Result<Vec<_>>>()?;
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
         let max_visible_def = max_visible_level(&def_meaning);
+
+        let value_compression = layout.value_compression.as_ref().ok_or_else(|| {
+            Error::corrupt_file_named(
+                "full_zip_layout",
+                "Full-zip layout is missing its value compression",
+            )
+        })?;
+        let value_decompressor = match layout.details {
+            Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => {
+                let decompressor =
+                    decompressors.create_fixed_per_value_decompressor(value_compression)?;
+                PerValueDecompressor::Fixed(decompressor.into())
+            }
+            Some(metadata::full_zip_layout::Details::BitsPerOffset(_)) => {
+                let decompressor =
+                    decompressors.create_variable_per_value_decompressor(value_compression)?;
+                PerValueDecompressor::Variable(decompressor.into())
+            }
+            None => {
+                return Err(Error::corrupt_file_named(
+                    "full_zip_layout",
+                    "Full-zip layout must have a `details` field",
+                ));
+            }
+        };
 
         let bits_per_offset = match layout.details {
             Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => 32,
             Some(metadata::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
                 bits_per_offset as u8
             }
-            None => panic!("Full-zip layout must have a `details` field"),
+            None => {
+                return Err(Error::corrupt_file_named(
+                    "full_zip_layout",
+                    "Full-zip layout must have a `details` field",
+                ));
+            }
         };
 
         let details = Arc::new(FullZipDecodeDetails {
@@ -229,6 +287,8 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
+            structural_cache: None,
         })
     }
 
@@ -521,6 +581,9 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        self.structural_cache = self.structural_projection.is_some().then_some(cache);
+    }
     fn needs_initialization(&self) -> bool {
         self.enable_cache && self.rep_index.is_some()
     }
@@ -571,6 +634,9 @@ impl StructuralPageScheduler for FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
+        if let Some(projection) = &self.structural_projection {
+            return self.schedule_list_structure(ranges, io, projection.clone());
+        }
         if let Some(rep_index) = self.rep_index {
             self.schedule_ranges_rep(ranges, io, rep_index)
         } else {
@@ -747,6 +813,20 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
     }
 }
 
+#[derive(Debug)]
+enum VariableFullZipRowIndex {
+    /// No control words (`ControlWordParser::NIL`): every row is a single valid,
+    /// visible item, so row `i` maps directly to offset `i` and byte offset `offsets[i]`.
+    Flat,
+    /// General case with repetition and/or definition control words.
+    Indexed {
+        repdef_starts: Vec<usize>,
+        data_starts: Vec<usize>,
+        offset_starts: Vec<usize>,
+        visible_item_counts: Vec<u64>,
+    },
+}
+
 /// A decoder for full-zip encoded data when the data has a variable-width
 ///
 /// Here we need to unzip the control words AND lengths from the values and
@@ -759,10 +839,11 @@ struct VariableFullZipDecoder {
     offsets: LanceBuffer,
     rep: ScalarBuffer<u16>,
     def: ScalarBuffer<u16>,
-    repdef_starts: Vec<usize>,
-    data_starts: Vec<usize>,
-    offset_starts: Vec<usize>,
-    visible_item_counts: Vec<u64>,
+    row_index: VariableFullZipRowIndex,
+    /// True when `unzip` validated that `offsets` starts at `0`, is monotonically
+    /// non-decreasing, and ends at `data.len()`, allowing a full-page `drain` to
+    /// move `data` and `offsets` without rebasing or copying.
+    full_page_zero_copy_valid: bool,
     bits_per_offset: u8,
     current_idx: usize,
     num_rows: u64,
@@ -784,6 +865,19 @@ impl VariableFullZipDecoder {
         assert_eq!(in_bits_per_length % 8, 0);
         assert!(out_bits_per_offset == 32 || out_bits_per_offset == 64);
 
+        let is_flat = matches!(details.ctrl_word_parser, ControlWordParser::NIL);
+        let row_index = if is_flat {
+            VariableFullZipRowIndex::Flat
+        } else {
+            let cap = (num_rows as usize).saturating_add(1);
+            VariableFullZipRowIndex::Indexed {
+                repdef_starts: Vec::with_capacity(cap),
+                data_starts: Vec::with_capacity(cap),
+                offset_starts: Vec::with_capacity(cap),
+                visible_item_counts: Vec::with_capacity(cap),
+            }
+        };
+
         let mut decoder = Self {
             details,
             decompressor,
@@ -791,11 +885,9 @@ impl VariableFullZipDecoder {
             offsets: LanceBuffer::empty(),
             rep: LanceBuffer::empty().borrow_to_typed_slice(),
             def: LanceBuffer::empty().borrow_to_typed_slice(),
+            row_index,
+            full_page_zero_copy_valid: false,
             bits_per_offset: out_bits_per_offset,
-            repdef_starts: Vec::with_capacity(num_rows as usize + 1),
-            data_starts: Vec::with_capacity(num_rows as usize + 1),
-            offset_starts: Vec::with_capacity(num_rows as usize + 1),
-            visible_item_counts: Vec::with_capacity(num_rows as usize + 1),
             current_idx: 0,
             num_rows,
         };
@@ -877,8 +969,6 @@ impl VariableFullZipDecoder {
         }
 
         let sliced_data = data.slice_with_length(data_start, data_end - data_start);
-        // Copy into a compact buffer so each output batch owns only what it references.
-        let sliced_data = LanceBuffer::copy_slice(&sliced_data);
         let rebased_offsets = LanceBuffer::reinterpret_vec(rebased_offsets);
         Ok((sliced_data, rebased_offsets))
     }
@@ -926,6 +1016,125 @@ impl VariableFullZipDecoder {
         })
     }
 
+    fn parse_control_word(
+        parser: &ControlWordParser,
+        src: &[u8],
+        max_rep: u16,
+        max_visible_def: u16,
+        dst_rep: &mut Vec<u16>,
+        dst_def: &mut Vec<u16>,
+    ) -> Result<(usize, crate::repdef::ControlWordDesc)> {
+        let bytes_per_word = parser.bytes_per_word();
+        if src.len() < bytes_per_word {
+            return Err(Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "truncated control word: {} byte(s) remain in the page buffer \
+                     but a control word requires {bytes_per_word}",
+                    src.len()
+                ),
+            ));
+        }
+        let desc = match *parser {
+            ControlWordParser::BOTH8(shift, mask) => {
+                let word = src[0];
+                let rep = (word >> shift) as u16;
+                let def = (word & mask as u8) as u16;
+                dst_rep.push(rep);
+                dst_def.push(def);
+                crate::repdef::ControlWordDesc {
+                    is_visible: def <= max_visible_def,
+                    is_new_row: rep == max_rep,
+                    is_valid_item: def == 0,
+                }
+            }
+            ControlWordParser::BOTH16(shift, mask) => {
+                let word = u16::from_le_bytes([src[0], src[1]]);
+                let rep = word >> shift;
+                let def = word & mask as u16;
+                dst_rep.push(rep);
+                dst_def.push(def);
+                crate::repdef::ControlWordDesc {
+                    is_visible: def <= max_visible_def,
+                    is_new_row: rep == max_rep,
+                    is_valid_item: def == 0,
+                }
+            }
+            ControlWordParser::BOTH32(shift, mask) => {
+                let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                let rep = (word >> shift) as u16;
+                let def = (word & mask) as u16;
+                dst_rep.push(rep);
+                dst_def.push(def);
+                crate::repdef::ControlWordDesc {
+                    is_visible: def <= max_visible_def,
+                    is_new_row: rep == max_rep,
+                    is_valid_item: def == 0,
+                }
+            }
+            ControlWordParser::REP8 => {
+                let rep = src[0] as u16;
+                dst_rep.push(rep);
+                crate::repdef::ControlWordDesc {
+                    is_new_row: rep == max_rep,
+                    is_visible: true,
+                    is_valid_item: true,
+                }
+            }
+            ControlWordParser::REP16 => {
+                let rep = u16::from_le_bytes([src[0], src[1]]);
+                dst_rep.push(rep);
+                crate::repdef::ControlWordDesc {
+                    is_new_row: rep == max_rep,
+                    is_visible: true,
+                    is_valid_item: true,
+                }
+            }
+            ControlWordParser::REP32 => {
+                let rep = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as u16;
+                dst_rep.push(rep);
+                crate::repdef::ControlWordDesc {
+                    is_new_row: rep == max_rep,
+                    is_visible: true,
+                    is_valid_item: true,
+                }
+            }
+            ControlWordParser::DEF8 => {
+                let def = src[0] as u16;
+                dst_def.push(def);
+                crate::repdef::ControlWordDesc {
+                    is_new_row: true,
+                    is_visible: def <= max_visible_def,
+                    is_valid_item: def == 0,
+                }
+            }
+            ControlWordParser::DEF16 => {
+                let def = u16::from_le_bytes([src[0], src[1]]);
+                dst_def.push(def);
+                crate::repdef::ControlWordDesc {
+                    is_new_row: true,
+                    is_visible: def <= max_visible_def,
+                    is_valid_item: def == 0,
+                }
+            }
+            ControlWordParser::DEF32 => {
+                let def = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as u16;
+                dst_def.push(def);
+                crate::repdef::ControlWordDesc {
+                    is_new_row: true,
+                    is_visible: def <= max_visible_def,
+                    is_valid_item: def == 0,
+                }
+            }
+            ControlWordParser::NIL => crate::repdef::ControlWordDesc {
+                is_new_row: true,
+                is_visible: true,
+                is_valid_item: true,
+            },
+        };
+        Ok((bytes_per_word, desc))
+    }
+
     fn unzip(
         &mut self,
         data: VecDeque<LanceBuffer>,
@@ -933,64 +1142,205 @@ impl VariableFullZipDecoder {
         out_bits_per_offset: u8,
         num_rows: u64,
     ) -> Result<()> {
-        // This undercounts if there are lists but, at this point, we don't really know how many items we have
-        let mut rep = Vec::with_capacity(num_rows as usize);
-        let mut def = Vec::with_capacity(num_rows as usize);
-        let bytes_cw = self.details.ctrl_word_parser.bytes_per_word() * num_rows as usize;
+        let expected_rows = usize::try_from(num_rows).map_err(|_| {
+            Error::corrupt_file_named(
+                "variable_full_zip",
+                format!("page row count {num_rows} overflows the row index"),
+            )
+        })?;
+        let expected_starts = expected_rows.checked_add(1).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "variable_full_zip",
+                format!("page row count {num_rows} overflows the row index"),
+            )
+        })?;
 
-        // This undercounts if there are lists
-        // It can also overcount if there are invisible items
         let bytes_per_offset = out_bits_per_offset as usize / 8;
-        let bytes_offsets = bytes_per_offset * (num_rows as usize + 1);
-        let mut offsets_data = Vec::with_capacity(bytes_offsets);
-
         let bytes_per_length = in_bits_per_length as usize / 8;
-        let bytes_lengths = bytes_per_length * num_rows as usize;
-
-        let bytes_data = data.iter().map(|d| d.len()).sum::<usize>();
+        let bytes_lengths = bytes_per_length.saturating_mul(expected_rows);
+        let bytes_cw = self
+            .details
+            .ctrl_word_parser
+            .bytes_per_word()
+            .saturating_mul(expected_rows);
+        let bytes_data = data
+            .iter()
+            .fold(0usize, |total, buffer| total.saturating_add(buffer.len()));
         // This overcounts since bytes_lengths and bytes_cw are undercounts
-        // It can also undercount if there are invisible items (hence the saturating_sub)
-        let mut unzipped_data =
-            Vec::with_capacity((bytes_data - bytes_cw).saturating_sub(bytes_lengths));
+        // It can also undercount if there are invisible items (hence the saturating_sub).
+        // A malformed page can make the control-word size exceed the payload, so both
+        // subtractions saturate instead of underflowing into a huge allocation.
+        let mut unzipped_data = Vec::with_capacity(
+            bytes_data
+                .saturating_sub(bytes_cw)
+                .saturating_sub(bytes_lengths),
+        );
 
         let mut current_offset = 0_u64;
+
+        if matches!(self.row_index, VariableFullZipRowIndex::Flat) {
+            let mut rows_seen = 0usize;
+            match out_bits_per_offset {
+                32 => {
+                    let mut offsets = Vec::with_capacity(expected_starts);
+                    for databuf in data {
+                        let mut databuf = databuf.as_ref();
+                        while !databuf.is_empty() {
+                            let length = Self::parse_length(databuf, in_bits_per_length)?;
+                            offsets.push(current_offset as u32);
+                            databuf = &databuf[bytes_per_length..];
+                            if length as usize > databuf.len() {
+                                return Err(Error::corrupt_file_named(
+                                    "variable_full_zip",
+                                    format!(
+                                        "item length {} exceeds the {} byte(s) remaining in the \
+                                         page buffer",
+                                        length,
+                                        databuf.len()
+                                    ),
+                                ));
+                            }
+                            unzipped_data.extend_from_slice(&databuf[..length as usize]);
+                            databuf = &databuf[length as usize..];
+                            current_offset += length;
+                            rows_seen += 1;
+                        }
+                    }
+                    if rows_seen != expected_rows {
+                        return Err(Error::corrupt_file_named(
+                            "variable_full_zip",
+                            format!(
+                                "page declares {num_rows} rows but the zipped data contains {rows_seen} row starts"
+                            ),
+                        ));
+                    }
+                    offsets.push(current_offset as u32);
+                    self.offsets = LanceBuffer::reinterpret_vec(offsets);
+                    self.full_page_zero_copy_valid = current_offset <= u32::MAX as u64;
+                }
+                64 => {
+                    let mut offsets = Vec::with_capacity(expected_starts);
+                    for databuf in data {
+                        let mut databuf = databuf.as_ref();
+                        while !databuf.is_empty() {
+                            let length = Self::parse_length(databuf, in_bits_per_length)?;
+                            offsets.push(current_offset);
+                            databuf = &databuf[bytes_per_length..];
+                            if length as usize > databuf.len() {
+                                return Err(Error::corrupt_file_named(
+                                    "variable_full_zip",
+                                    format!(
+                                        "item length {} exceeds the {} byte(s) remaining in the \
+                                         page buffer",
+                                        length,
+                                        databuf.len()
+                                    ),
+                                ));
+                            }
+                            unzipped_data.extend_from_slice(&databuf[..length as usize]);
+                            databuf = &databuf[length as usize..];
+                            current_offset += length;
+                            rows_seen += 1;
+                        }
+                    }
+                    if rows_seen != expected_rows {
+                        return Err(Error::corrupt_file_named(
+                            "variable_full_zip",
+                            format!(
+                                "page declares {num_rows} rows but the zipped data contains {rows_seen} row starts"
+                            ),
+                        ));
+                    }
+                    offsets.push(current_offset);
+                    self.offsets = LanceBuffer::reinterpret_vec(offsets);
+                    self.full_page_zero_copy_valid = true;
+                }
+                _ => unreachable!(),
+            }
+            self.data = LanceBuffer::from(unzipped_data);
+            return Ok(());
+        }
+
+        let VariableFullZipRowIndex::Indexed {
+            repdef_starts,
+            data_starts,
+            offset_starts,
+            visible_item_counts,
+        } = &mut self.row_index
+        else {
+            unreachable!()
+        };
+
+        let parser = self.details.ctrl_word_parser;
+        let max_rep = self.details.max_rep;
+        let max_visible_def = self.details.max_visible_def;
+        let has_def = !matches!(
+            parser,
+            ControlWordParser::REP8
+                | ControlWordParser::REP16
+                | ControlWordParser::REP32
+                | ControlWordParser::NIL
+        );
+        // This undercounts if there are lists, and skips allocation entirely when unused.
+        let mut rep = if parser.has_rep() {
+            Vec::with_capacity(expected_rows)
+        } else {
+            Vec::new()
+        };
+        let mut def = if has_def {
+            Vec::with_capacity(expected_rows)
+        } else {
+            Vec::new()
+        };
+
+        let mut offsets_u32 = if out_bits_per_offset == 32 {
+            Vec::with_capacity(expected_starts)
+        } else {
+            Vec::new()
+        };
+        let mut offsets_u64 = if out_bits_per_offset == 64 {
+            Vec::with_capacity(expected_starts)
+        } else {
+            Vec::new()
+        };
+
         let mut visible_item_count = 0_u64;
-        for databuf in data.into_iter() {
+        for databuf in data {
             let mut databuf = databuf.as_ref();
             while !databuf.is_empty() {
                 let data_start = unzipped_data.len();
-                let offset_start = offsets_data.len();
-                // We might have only-rep or only-def, neither, or both.  They move at the same
-                // speed though so we only need one index into it
+                let offset_start = if out_bits_per_offset == 32 {
+                    offsets_u32.len() * 4
+                } else {
+                    offsets_u64.len() * 8
+                };
                 let repdef_start = rep.len().max(def.len());
-                // TODO: Kind of inefficient we parse the control word twice here
-                let ctrl_desc = self.details.ctrl_word_parser.parse_desc(
+                let (cw_bytes, ctrl_desc) = Self::parse_control_word(
+                    &parser,
                     databuf,
-                    self.details.max_rep,
-                    self.details.max_visible_def,
-                );
-                self.details
-                    .ctrl_word_parser
-                    .parse(databuf, &mut rep, &mut def);
-                databuf = &databuf[self.details.ctrl_word_parser.bytes_per_word()..];
+                    max_rep,
+                    max_visible_def,
+                    &mut rep,
+                    &mut def,
+                )?;
+                databuf = &databuf[cw_bytes..];
 
                 if ctrl_desc.is_new_row {
-                    self.repdef_starts.push(repdef_start);
-                    self.data_starts.push(data_start);
-                    self.offset_starts.push(offset_start);
-                    self.visible_item_counts.push(visible_item_count);
+                    repdef_starts.push(repdef_start);
+                    data_starts.push(data_start);
+                    offset_starts.push(offset_start);
+                    visible_item_counts.push(visible_item_count);
                 }
                 if ctrl_desc.is_visible {
                     visible_item_count += 1;
+                    if out_bits_per_offset == 32 {
+                        offsets_u32.push(current_offset as u32);
+                    } else {
+                        offsets_u64.push(current_offset);
+                    }
                     if ctrl_desc.is_valid_item {
                         let length = Self::parse_length(databuf, in_bits_per_length)?;
-                        match out_bits_per_offset {
-                            32 => offsets_data
-                                .extend_from_slice(&(current_offset as u32).to_le_bytes()),
-                            64 => offsets_data.extend_from_slice(&current_offset.to_le_bytes()),
-                            _ => unreachable!(),
-                        };
-                        databuf = &databuf[bytes_per_offset..];
+                        databuf = &databuf[bytes_per_length..];
                         if length as usize > databuf.len() {
                             return Err(Error::corrupt_file_named(
                                 "variable_full_zip",
@@ -1005,67 +1355,301 @@ impl VariableFullZipDecoder {
                         unzipped_data.extend_from_slice(&databuf[..length as usize]);
                         databuf = &databuf[length as usize..];
                         current_offset += length;
-                    } else {
-                        // Null items still get an offset
-                        match out_bits_per_offset {
-                            32 => offsets_data
-                                .extend_from_slice(&(current_offset as u32).to_le_bytes()),
-                            64 => offsets_data.extend_from_slice(&current_offset.to_le_bytes()),
-                            _ => unreachable!(),
-                        }
                     }
                 }
             }
         }
-        self.repdef_starts.push(rep.len().max(def.len()));
-        self.data_starts.push(unzipped_data.len());
-        self.offset_starts.push(offsets_data.len());
-        self.visible_item_counts.push(visible_item_count);
-        match out_bits_per_offset {
-            32 => offsets_data.extend_from_slice(&(current_offset as u32).to_le_bytes()),
-            64 => offsets_data.extend_from_slice(&current_offset.to_le_bytes()),
-            _ => unreachable!(),
-        };
+        repdef_starts.push(rep.len().max(def.len()));
+        data_starts.push(unzipped_data.len());
+        offset_starts.push(if out_bits_per_offset == 32 {
+            offsets_u32.len() * bytes_per_offset
+        } else {
+            offsets_u64.len() * bytes_per_offset
+        });
+        visible_item_counts.push(visible_item_count);
+        if offset_starts.len() != expected_starts
+            || repdef_starts.len() != expected_starts
+            || data_starts.len() != expected_starts
+            || visible_item_counts.len() != expected_starts
+        {
+            return Err(Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "page declares {num_rows} rows but the zipped data contains {} row starts",
+                    offset_starts.len().saturating_sub(1)
+                ),
+            ));
+        }
+        if out_bits_per_offset == 32 {
+            offsets_u32.push(current_offset as u32);
+            self.offsets = LanceBuffer::reinterpret_vec(offsets_u32);
+            self.full_page_zero_copy_valid = current_offset <= u32::MAX as u64;
+        } else {
+            offsets_u64.push(current_offset);
+            self.offsets = LanceBuffer::reinterpret_vec(offsets_u64);
+            self.full_page_zero_copy_valid = true;
+        }
         self.rep = ScalarBuffer::from(rep);
         self.def = ScalarBuffer::from(def);
         self.data = LanceBuffer::from(unzipped_data);
-        self.offsets = LanceBuffer::from(offsets_data);
         Ok(())
     }
 }
 
 impl StructuralPageDecoder for VariableFullZipDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if num_rows == 0 {
+            return Ok(0);
+        }
+
+        let start = self.current_idx;
+        let end = usize::try_from(
+            u64::try_from(start)
+                .map_err(|_| {
+                    Error::corrupt_file_named(
+                        "variable_full_zip",
+                        "decoder row index does not fit u64",
+                    )
+                })?
+                .checked_add(num_rows)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "variable_full_zip",
+                        "decoded byte planning row range overflowed u64",
+                    )
+                })?,
+        )
+        .map_err(|_| {
+            Error::corrupt_file_named(
+                "variable_full_zip",
+                "decoded byte planning row range does not fit usize",
+            )
+        })?;
+
+        let bytes_per_offset = usize::from(self.bits_per_offset / 8);
+        let (data_start, data_end, offset_start, offset_end) = match &self.row_index {
+            VariableFullZipRowIndex::Flat => {
+                let total_starts = (self.num_rows as usize).saturating_add(1);
+                if end >= total_starts || start >= total_starts {
+                    return Err(Error::corrupt_file_named(
+                        "variable_full_zip",
+                        format!(
+                            "decoded byte planning requested rows {start}..{end}, but the page has {total_starts} data starts and {total_starts} offset starts"
+                        ),
+                    ));
+                }
+                let offset_start = start.checked_mul(bytes_per_offset).ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "variable_full_zip",
+                        "decoded byte planning offset range overflowed usize",
+                    )
+                })?;
+                let offset_end = end
+                    .checked_add(1)
+                    .and_then(|e| e.checked_mul(bytes_per_offset))
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named(
+                            "variable_full_zip",
+                            "decoded byte planning offset range overflowed usize",
+                        )
+                    })?;
+                let (data_start, data_end) = match self.bits_per_offset {
+                    32 => {
+                        let offs = self.offsets.borrow_to_typed_view::<u32>();
+                        (offs[start] as usize, offs[end] as usize)
+                    }
+                    64 => {
+                        let offs = self.offsets.borrow_to_typed_view::<u64>();
+                        (
+                            usize::try_from(offs[start]).map_err(|_| {
+                                Error::corrupt_file_named(
+                                    "variable_full_zip",
+                                    "decoded byte planning data offset does not fit usize",
+                                )
+                            })?,
+                            usize::try_from(offs[end]).map_err(|_| {
+                                Error::corrupt_file_named(
+                                    "variable_full_zip",
+                                    "decoded byte planning data offset does not fit usize",
+                                )
+                            })?,
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                (data_start, data_end, offset_start, offset_end)
+            }
+            VariableFullZipRowIndex::Indexed {
+                data_starts,
+                offset_starts,
+                ..
+            } => {
+                if end >= data_starts.len()
+                    || end >= offset_starts.len()
+                    || start >= data_starts.len()
+                    || start >= offset_starts.len()
+                {
+                    return Err(Error::corrupt_file_named(
+                        "variable_full_zip",
+                        format!(
+                            "decoded byte planning requested rows {start}..{end}, but the page has {} data starts and {} offset starts",
+                            data_starts.len(),
+                            offset_starts.len()
+                        ),
+                    ));
+                }
+                let offset_start = offset_starts[start];
+                let offset_end = offset_starts[end]
+                    .checked_add(bytes_per_offset)
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named(
+                            "variable_full_zip",
+                            "decoded byte planning offset range overflowed usize",
+                        )
+                    })?;
+                (
+                    data_starts[start],
+                    data_starts[end],
+                    offset_start,
+                    offset_end,
+                )
+            }
+        };
+
+        let data_slice = self.data.as_ref().get(data_start..data_end).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "decoded byte planning data range {data_start}..{data_end} exceeds {} bytes",
+                    self.data.len()
+                ),
+            )
+        })?;
+
+        let offsets_slice = self
+            .offsets
+            .as_ref()
+            .get(offset_start..offset_end)
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    format!(
+                        "decoded byte planning offset range {offset_start}..{offset_end} exceeds {} bytes",
+                        self.offsets.len()
+                    ),
+                )
+            })?;
+        let offset_bytes =
+            u64::try_from(offset_end.checked_sub(offset_start).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    "decoded byte planning selected reversed offset starts",
+                )
+            })?)
+            .map_err(|_| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    "decoded offset byte count does not fit u64",
+                )
+            })?;
+
+        let value_bytes = self
+            .decompressor
+            .decompressed_size(data_slice, offsets_slice, self.bits_per_offset)
+            .ok_or_else(|| {
+                Error::not_supported(
+                    "decoded_bytes: value decompressor does not report a reliable size".to_string(),
+                )
+            })?;
+        value_bytes.checked_add(offset_bytes).ok_or_else(|| {
+            Error::not_supported(
+                "decoded_bytes: variable full-zip byte count overflowed u64".to_string(),
+            )
+        })
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let start = self.current_idx;
         let end = start + num_rows as usize;
+        let bytes_per_offset = self.bits_per_offset as usize / 8;
 
-        let offset_start = self.offset_starts[start];
-        let offset_end = self.offset_starts[end] + (self.bits_per_offset as usize / 8);
+        // Full-page drain fast path: `unzip` already built compact `data` starting at 0
+        // and monotonic `offsets` starting at 0 and ending at `data.len()`, so transferring
+        // ownership directly avoids both offset rebasing and copying the entire page payload.
+        if start == 0 && end == self.num_rows as usize && self.full_page_zero_copy_valid {
+            let data = std::mem::replace(&mut self.data, LanceBuffer::empty());
+            let offsets = std::mem::replace(&mut self.offsets, LanceBuffer::empty());
+            let empty_levels: ScalarBuffer<u16> = LanceBuffer::empty().borrow_to_typed_slice();
+            let rep = std::mem::replace(&mut self.rep, empty_levels.clone());
+            let def = std::mem::replace(&mut self.def, empty_levels);
+            let num_visible_items = match &self.row_index {
+                VariableFullZipRowIndex::Flat => self.num_rows,
+                VariableFullZipRowIndex::Indexed {
+                    visible_item_counts,
+                    ..
+                } => visible_item_counts[end] - visible_item_counts[0],
+            };
+            self.current_idx = end;
+            return Ok(Box::new(VariableFullZipDecodeTask {
+                details: self.details.clone(),
+                decompressor: self.decompressor.clone(),
+                data,
+                offsets,
+                bits_per_offset: self.bits_per_offset,
+                num_visible_items,
+                rep,
+                def,
+            }));
+        }
+
+        let (offset_start, offset_end, rep, def, num_visible_items) = match &self.row_index {
+            VariableFullZipRowIndex::Flat => (
+                start * bytes_per_offset,
+                (end + 1) * bytes_per_offset,
+                self.rep.clone(),
+                self.def.clone(),
+                num_rows,
+            ),
+            VariableFullZipRowIndex::Indexed {
+                repdef_starts,
+                offset_starts,
+                visible_item_counts,
+                ..
+            } => {
+                let offset_start = offset_starts[start];
+                let offset_end = offset_starts[end] + bytes_per_offset;
+                let repdef_start = repdef_starts[start];
+                let repdef_end = repdef_starts[end];
+                let rep = if self.rep.is_empty() {
+                    self.rep.clone()
+                } else {
+                    self.rep.slice(repdef_start, repdef_end - repdef_start)
+                };
+                let def = if self.def.is_empty() {
+                    self.def.clone()
+                } else {
+                    self.def.slice(repdef_start, repdef_end - repdef_start)
+                };
+                let num_visible_items = visible_item_counts[end] - visible_item_counts[start];
+                (offset_start, offset_end, rep, def, num_visible_items)
+            }
+        };
+
         let offsets = self
             .offsets
             .slice_with_length(offset_start, offset_end - offset_start);
-        // Keep each batch's variable data buffer bounded to the selected rows.
+        // Keep each partial batch's variable data buffer bounded to the selected rows.
         let (data, offsets) =
             Self::slice_batch_data_and_rebase_offsets(&self.data, &offsets, self.bits_per_offset)?;
-
-        let repdef_start = self.repdef_starts[start];
-        let repdef_end = self.repdef_starts[end];
-        let rep = if self.rep.is_empty() {
-            self.rep.clone()
+        // Copy into a compact buffer so each partial output batch owns only what it references,
+        // unless the decompressor writes its output to new buffers anyway.
+        let data = if self.decompressor.allocates_output() {
+            data
         } else {
-            self.rep.slice(repdef_start, repdef_end - repdef_start)
-        };
-        let def = if self.def.is_empty() {
-            self.def.clone()
-        } else {
-            self.def.slice(repdef_start, repdef_end - repdef_start)
+            LanceBuffer::copy_slice(&data)
         };
 
-        let visible_item_counts_start = self.visible_item_counts[start];
-        let visible_item_counts_end = self.visible_item_counts[end];
-        let num_visible_items = visible_item_counts_end - visible_item_counts_start;
-
-        self.current_idx += num_rows as usize;
+        self.current_idx = end;
 
         Ok(Box::new(VariableFullZipDecodeTask {
             details: self.details.clone(),
@@ -1283,16 +1867,26 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt8Array, make_array};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, StringArray, UInt8Array, make_array,
+    };
     use arrow_schema::{DataType, Field as ArrowField};
 
     use crate::buffer::LanceBuffer;
-    use crate::compression::FixedPerValueDecompressor;
+    use crate::compression::{DecompressionStrategy, FixedPerValueDecompressor};
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-    use crate::decoder::DecodePageTask;
-    use crate::encodings::logical::primitive::StructuralPageScheduler;
+    use crate::decoder::{DecodePageTask, LoadedPageShard, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
+    use crate::encodings::logical::primitive::{
+        StructuralPageScheduler, StructuralPrimitiveFieldDecoder,
+    };
+    use crate::encodings::physical::binary::VariableEncoder;
+    #[cfg(feature = "zstd")]
+    use crate::encodings::physical::block::{
+        CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+    };
+    use crate::encodings::physical::fsst::FsstPerValueEncoder;
     use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
     use crate::format::metadata::compressive_encoding::Compression;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
@@ -1652,6 +2246,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1778,6 +2374,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: true,
+            structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1903,6 +2501,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -2043,6 +2643,181 @@ mod tests {
             max_rep: 0,
             max_visible_def: 0,
         })
+    }
+
+    fn compressed_variable_full_zip(
+        compressor: &dyn PerValueCompressor,
+        values: &[&str],
+    ) -> VariableFullZipDecoder {
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+
+        let array = StringArray::from_iter_values(values.iter().copied());
+        let (encoded, encoding) = compressor.compress(DataBlock::from_array(array)).unwrap();
+        let PerValueDataBlock::Variable(encoded) = encoded else {
+            panic!("variable-width compressor returned a fixed-width block");
+        };
+
+        let (compressed_data, compressed_offsets) = match encoded.bits_per_offset {
+            32 => (
+                encoded.data,
+                encoded
+                    .offsets
+                    .borrow_to_typed_slice::<u32>()
+                    .as_ref()
+                    .to_vec(),
+            ),
+            64 => {
+                let offsets = encoded
+                    .offsets
+                    .borrow_to_typed_slice::<u64>()
+                    .as_ref()
+                    .to_vec();
+                assert!(
+                    offsets.iter().all(|offset| u32::try_from(*offset).is_ok()),
+                    "full-zip test page requires 32-bit lengths"
+                );
+                let offsets = offsets.into_iter().map(|offset| offset as u32).collect();
+                (encoded.data, offsets)
+            }
+            bits => panic!("unsupported offset width {bits}"),
+        };
+
+        let mut zipped = Vec::new();
+        for offsets in compressed_offsets.windows(2) {
+            let start = offsets[0] as usize;
+            let end = offsets[1] as usize;
+            let value = &compressed_data[start..end];
+            zipped.extend_from_slice(
+                &(u32::try_from(value.len()).expect("test value fits u32")).to_le_bytes(),
+            );
+            zipped.extend_from_slice(value);
+        }
+
+        let decompressor = crate::compression::DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(&encoding)
+            .unwrap();
+        let details = Arc::new(FullZipDecodeDetails {
+            value_decompressor: PerValueDecompressor::Variable(Arc::from(decompressor)),
+            def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
+            ctrl_word_parser: ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        });
+        VariableFullZipDecoder::new(
+            details,
+            std::collections::VecDeque::from([LanceBuffer::from(zipped)]),
+            values.len() as u64,
+            32,
+            32,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_planned_compressed_fullzip_matches_partial_drain() {
+        let compressor = CompressedBufferEncoder::try_new(CompressionConfig::new(
+            CompressionScheme::Zstd,
+            Some(0),
+        ))
+        .unwrap();
+        let page = compressed_variable_full_zip(
+            &compressor,
+            &[
+                "alpha-alpha",
+                "beta-beta",
+                "gamma-gamma",
+                "delta-delta",
+                "epsilon",
+            ],
+        );
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: Box::new(page),
+                path: std::collections::VecDeque::new(),
+            })
+            .unwrap();
+
+        decoder.drain(2).unwrap().decode().unwrap();
+        let planned = decoder.plan_decoded_bytes(3).unwrap()[1];
+        let actual = decoder.drain(3).unwrap().decode().unwrap();
+        assert_eq!(planned, actual.data_size);
+    }
+
+    #[test]
+    fn test_planned_fsst_fullzip_bounds_partial_drain() {
+        let compressor = FsstPerValueEncoder::new(Box::new(VariableEncoder::default()));
+        let page = compressed_variable_full_zip(
+            &compressor,
+            &[
+                "alpha-alpha-alpha",
+                "beta-beta-beta",
+                "gamma-gamma-gamma",
+                "delta-delta-delta",
+                "epsilon-epsilon",
+            ],
+        );
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: Box::new(page),
+                path: std::collections::VecDeque::new(),
+            })
+            .unwrap();
+
+        decoder.drain(2).unwrap().decode().unwrap();
+        let planned = decoder.plan_decoded_bytes(3).unwrap()[1];
+        let actual = decoder.drain(3).unwrap().decode().unwrap();
+        assert!(
+            planned >= actual.data_size,
+            "planned {planned} bytes must cover actual {} bytes",
+            actual.data_size
+        );
+    }
+
+    /// A partial output batch must own its value buffer instead of aliasing the
+    /// full-zip page, for both pass-through and allocating decompressors.
+    #[test]
+    fn test_full_zip_batch_data_does_not_alias_page_buffer() {
+        use crate::decoder::StructuralPageDecoder;
+
+        let values = ["alpha-alpha", "beta-beta", "gamma-gamma"];
+        let num_rows = 2;
+        let expected: Vec<u8> = values[..num_rows]
+            .iter()
+            .flat_map(|value| value.as_bytes().iter().copied())
+            .collect();
+        let compressors: [(&str, Box<dyn PerValueCompressor>); 2] = [
+            ("pass-through", Box::new(VariableEncoder::default())),
+            (
+                "fsst",
+                Box::new(FsstPerValueEncoder::new(Box::new(
+                    VariableEncoder::default(),
+                ))),
+            ),
+        ];
+
+        for (name, compressor) in compressors {
+            let mut decoder = compressed_variable_full_zip(compressor.as_ref(), &values);
+            let page_data = decoder.data.clone();
+            let page_start = page_data.as_ptr() as usize;
+            let page_end = page_start + page_data.len();
+
+            let decoded = decoder.drain(num_rows as u64).unwrap().decode().unwrap();
+            let DataBlock::VariableWidth(block) = decoded.data else {
+                panic!("{name} full-zip decode did not produce variable-width data");
+            };
+            let out_start = block.data.as_ptr() as usize;
+            let out_end = out_start + block.data.len();
+            assert!(
+                out_end <= page_start || out_start >= page_end,
+                "{name} full-zip batch data aliases the page buffer"
+            );
+            assert_eq!(block.data.as_ref(), expected.as_slice());
+        }
     }
 
     fn decode_variable_full_zip(
@@ -2221,5 +2996,129 @@ mod tests {
                 "error should say what is wrong, got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_full_zip_scheduler_rejects_bad_rep_index() {
+        use crate::compression::DefaultDecompressionStrategy;
+        use crate::format::{EncodingUtils, metadata};
+
+        let layout = metadata::FullZipLayout::default();
+        // Two buffers: data + repetition index.  With 3 rows the index must be a
+        // multiple of 4 entries, so 7 bytes is not a whole number of rows.
+        let error = FullZipScheduler::try_new(
+            &[(0, 100), (0, 7)],
+            0,
+            3,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .expect_err("a partial repetition-index width must fail");
+        assert!(
+            error.to_string().contains("not a whole number"),
+            "unexpected error: {error}"
+        );
+
+        // 3 bytes per row is not a supported width (only 1, 2, 4 or 8).
+        let error = FullZipScheduler::try_new(
+            &[(0, 100), (0, 9)],
+            0,
+            2,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .expect_err("an unsupported repetition-index width must fail");
+        assert!(
+            error.to_string().contains("unsupported width"),
+            "unexpected error: {error}"
+        );
+
+        // A page without a data buffer must fail rather than panic on `[0]`.
+        let error =
+            FullZipScheduler::try_new(&[], 0, 2, &layout, &DefaultDecompressionStrategy::default())
+                .expect_err("a page without a data buffer must fail");
+        assert!(
+            error.to_string().contains("no data buffer"),
+            "unexpected error: {error}"
+        );
+
+        let layout = metadata::FullZipLayout {
+            bits_rep: 200,
+            bits_def: 100,
+            details: Some(metadata::full_zip_layout::Details::BitsPerValue(32)),
+            value_compression: Some(EncodingUtils::flat(32, None)),
+            ..Default::default()
+        };
+        let error = FullZipScheduler::try_new(
+            &[(0, 100)],
+            0,
+            2,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .expect_err("a control word wider than 32 bits must fail");
+        assert!(
+            error.to_string().contains("at most 16 bits"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn variable_full_zip_row_count_mismatch_is_corrupt_file() {
+        use lance_core::Error;
+
+        let error = decode_variable_full_zip(Vec::new(), 32)
+            .expect_err("a page with no row starts must not decode");
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("row starts"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_variable_full_zip_full_page_zero_copy_matches_partial_drains() {
+        use crate::decoder::StructuralPageDecoder;
+
+        let values = [
+            "alpha-alpha",
+            "beta-beta",
+            "",
+            "delta-delta-delta",
+            "epsilon",
+        ];
+        let compressor = VariableEncoder::default();
+
+        let mut full_decoder = compressed_variable_full_zip(&compressor, &values);
+        let unzipped_ptr = full_decoder.data.as_ptr() as usize;
+        let full_decoded = full_decoder
+            .drain(values.len() as u64)
+            .unwrap()
+            .decode()
+            .unwrap();
+        let DataBlock::VariableWidth(full_block) = full_decoded.data else {
+            panic!("expected VariableWidth block");
+        };
+        assert_eq!(
+            full_block.data.as_ptr() as usize,
+            unzipped_ptr,
+            "full-page pass-through drain should move the unzipped buffer without copying"
+        );
+
+        let mut split_decoder = compressed_variable_full_zip(&compressor, &values);
+        let part1 = split_decoder.drain(2).unwrap().decode().unwrap();
+        let part2 = split_decoder.drain(3).unwrap().decode().unwrap();
+        let DataBlock::VariableWidth(b1) = part1.data else {
+            panic!("expected VariableWidth block");
+        };
+        let DataBlock::VariableWidth(b2) = part2.data else {
+            panic!("expected VariableWidth block");
+        };
+        let mut combined = b1.data.as_ref().to_vec();
+        combined.extend_from_slice(b2.data.as_ref());
+        assert_eq!(full_block.data.as_ref(), combined.as_slice());
     }
 }

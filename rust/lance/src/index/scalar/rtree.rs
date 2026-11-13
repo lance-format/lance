@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
+use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::rtree::RTreeIndex;
 use lance_index::scalar::{OldIndexDataFilter, index_files_to_table};
 use lance_select::RowSetOps;
 use lance_table::format::IndexMetadata;
@@ -15,7 +15,10 @@ use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
-        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(
+            OldIndexDataFilter::Fragments { to_keep, .. }
+            | OldIndexDataFilter::RowAddresses { to_keep, .. },
+        ) => to_keep.is_empty(),
         Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
         None => false,
     }
@@ -44,8 +47,12 @@ pub(in crate::index) async fn merge_segments(
         .min()
         .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
+    // Without stable row ids the two domains coincide, so once a row-id-domain
+    // segment is refused on a stable-row-id dataset the filters can always be
+    // address-domain. `merge_rtree_indices` keeps the sources' own domain.
+    super::shared_segment_domain(dataset, "RTree", &segment_refs)?;
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
             .await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
@@ -80,12 +87,7 @@ pub(in crate::index) async fn merge_segments(
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = lance_index::scalar::rtree::merge_rtree_indices(
-        &source_indices,
-        &new_store,
-        &source_filters,
-    )
-    .await?;
+    let created_index = merge_rtree_indices(&source_indices, &new_store, &source_filters).await?;
 
     Ok(IndexMetadata {
         uuid: new_uuid,

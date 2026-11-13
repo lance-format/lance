@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, ShardSnapshot};
 use crate::dataset::Dataset;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
+use crate::dataset::mem_wal::util::sstable_uri;
 
 /// A point-in-time handle to one in-memory memtable, active or frozen —
 /// structurally identical (a frozen memtable is just the immutable case).
@@ -102,6 +104,8 @@ pub struct LsmDataSourceCollector {
     shard_snapshots: Vec<ShardSnapshot>,
     /// In-memory memtables by shard (active + frozen-awaiting-flush).
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// The MemWAL's `dir_id`; SSTables resolve under its directory.
+    dir_id: String,
 }
 
 impl LsmDataSourceCollector {
@@ -120,6 +124,7 @@ impl LsmDataSourceCollector {
             base_path,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            dir_id: String::new(),
         }
     }
 
@@ -137,7 +142,15 @@ impl LsmDataSourceCollector {
             base_path: base_path.into().trim_end_matches('/').to_string(),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            dir_id: String::new(),
         }
+    }
+
+    /// Set the MemWAL `dir_id` the snapshots' SSTables live under. Defaults to
+    /// empty (legacy `_mem_wal`); without it a `dir_id` MemWAL's SSTables won't resolve.
+    pub fn with_mem_wal_dir_id(mut self, dir_id: impl Into<String>) -> Self {
+        self.dir_id = dir_id.into();
+        self
     }
 
     /// Set a shard's active memtable. Back-compat / test entry point; the
@@ -380,10 +393,10 @@ impl LsmDataSourceCollector {
 
     /// Resolve an SSTable path to an absolute path.
     ///
-    /// SSTables are stored at: `{base_path}/_mem_wal/{shard_id}/{folder_name}`
+    /// SSTables are stored at: `{base_path}/{mem_wal_dir}/{shard_id}/{folder_name}`
     /// The `folder_name` is what's stored in `SsTable.path`.
     fn resolve_sstable_path(&self, shard_id: &Uuid, folder_name: &str) -> String {
-        format!("{}/_mem_wal/{}/{}", self.base_path, shard_id, folder_name)
+        sstable_uri(&self.base_path, &self.dir_id, shard_id, folder_name)
     }
 }
 

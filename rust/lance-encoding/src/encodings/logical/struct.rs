@@ -268,7 +268,7 @@ impl StructuralStructDecoder {
     ) -> Result<Box<dyn StructuralFieldDecoder>> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() || field.is_blob() {
+                if field.is_packed_struct() || field.is_blob() || fields.is_empty() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Ok(Box::new(decoder))
@@ -868,6 +868,29 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
+            &TestCases::default().with_structural_encodings(),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_struct_list_nulls_in_only_some_pages() {
+        // Two pages of STRUCT<LIST<INT32>>, only the second has null structs.  A batch that
+        // spans both must count the first page's struct validity per list, not per item.
+        let make_page = |nulls: Option<NullBuffer>| -> ArrayRef {
+            let list = ListArray::new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(3, 1050)),
+                Arc::new(Int32Array::from_iter_values(0..3150)),
+                None,
+            );
+            let fields = Fields::from(vec![Field::new("l", list.data_type().clone(), true)]);
+            Arc::new(StructArray::new(fields, vec![Arc::new(list)], nulls))
+        };
+        let nulls = NullBuffer::from_iter((0..1050).map(|i| i % 7 != 0));
+        check_round_trip_encoding_of_data(
+            vec![make_page(None), make_page(Some(nulls))],
             &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )

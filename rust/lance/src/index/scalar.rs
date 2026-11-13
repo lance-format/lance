@@ -10,6 +10,7 @@ pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
+pub(crate) mod list_element;
 pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
@@ -26,7 +27,8 @@ use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::create::CreateIndexBuilder;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
     Dataset,
@@ -41,6 +43,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
@@ -52,6 +55,7 @@ use lance_index::pbold::{
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
+use lance_index::scalar::inverted::builder::resolve_num_workers;
 use lance_index::scalar::inverted::{InvertedIndex, METADATA_FILE};
 use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
@@ -153,6 +157,17 @@ pub(crate) enum TrainingRows {
     Rows(RowAddrTreeMap),
 }
 
+/// Optional row selection, progress, and decode concurrency for a training scan.
+#[derive(Default)]
+pub(crate) struct TrainingScanOptions {
+    /// Restricts the scan to these physical rows.
+    physical_rows: Option<RowAddrTreeMap>,
+    /// Progress total when the caller already knows the selected row count.
+    expected_rows: Option<u64>,
+    /// Decoded batches that may be in flight ahead of the consumer.
+    batch_readahead: Option<usize>,
+}
+
 /// Reads the rows a scalar index is built from: `column` projected as the
 /// index's value column, with row ids or addresses as `criteria` asks, sorted
 /// by value when the index type needs it. The scan goes through the regular
@@ -165,15 +180,17 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     selection: Option<TrainingRows>,
-    physical_rows: Option<RowAddrTreeMap>,
-    expected_rows: Option<u64>,
+    options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let num_rows = match expected_rows {
+    let num_rows = match options.expected_rows {
         Some(rows) => rows as usize,
         None => dataset.count_all_rows().await?,
     };
 
     let mut scan = dataset.scan();
+    if let Some(batch_readahead) = options.batch_readahead {
+        scan.batch_readahead(batch_readahead);
+    }
     #[cfg(test)]
     if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
         scan.io_buffer_size(io_buffer_size);
@@ -210,7 +227,7 @@ pub(crate) async fn scan_training_data(
     }
     // A physical selection restricts the scan to these rows of the selected
     // fragments (the two intersect); the caller includes every row it wants.
-    if let Some(physical_rows) = physical_rows {
+    if let Some(physical_rows) = options.physical_rows {
         scan.with_physical_row_addr_prefilter(physical_rows);
     }
 
@@ -252,7 +269,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
-    physical_rows: Option<RowAddrTreeMap>,
+    options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -287,10 +304,10 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(dataset, column, criteria, selection, physical_rows, None).await
+            scan_training_data(dataset, column, criteria, selection, options).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(dataset, column, criteria, selection, physical_rows, None).await
+            scan_training_data(dataset, column, criteria, selection, options).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -304,20 +321,41 @@ pub(crate) async fn load_fts_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    params: &InvertedIndexParams,
 ) -> Result<SendableRecordBatchStream> {
+    // Row-count batching alone can retain large decoded text buffers in the
+    // scanner and indexing workers. Keep explicit reader settings, and apply
+    // a byte target only to this training scan, not to the caller's dataset.
+    let mut dataset = dataset.clone();
+    Arc::make_mut(
+        dataset
+            .file_reader_options
+            .get_or_insert_with(Default::default),
+    )
+    .batch_size_bytes
+    .get_or_insert(16 * 1024 * 1024);
     let scan_column = if resolved.has_lists() {
         resolved.root_column.as_str()
     } else {
         resolved.canonical_path.as_str()
     };
     let stream = load_training_data(
-        dataset,
+        &dataset,
         scan_column,
         criteria,
         fragments,
         train,
         fragment_ids,
-        None,
+        TrainingScanOptions {
+            // Allow decoding to overlap consumption without scaling speculative
+            // input buffers to every CPU in a build with only a few workers.
+            batch_readahead: Some(
+                resolve_num_workers(params)
+                    .saturating_mul(2)
+                    .min(get_num_compute_intensive_cpus().max(1)),
+            ),
+            ..Default::default()
+        },
     )
     .await?;
     if resolved.has_lists() {
@@ -327,8 +365,22 @@ pub(crate) async fn load_fts_training_data(
     }
 }
 
+// The R-tree plugin is added here because `register_scalar_index_plugin` only works before the
+// first default registry is built, and code outside `lance` can build one at any time.
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| {
+        #[cfg(feature = "geo")]
+        {
+            IndexPluginRegistry::with_default_plugins_and(|registry| {
+                registry.add_plugin::<
+                    lance_index::pb::RTreeIndexDetails,
+                    lance_geo::rtree::RTreeIndexPlugin,
+                >();
+            })
+        }
+        #[cfg(not(feature = "geo"))]
+        IndexPluginRegistry::with_default_plugins()
+    });
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
@@ -386,6 +438,68 @@ impl IndexDetails {
     }
 }
 
+/// The format version of `index_type` from before it moved to the row-address
+/// domain, for the index types that did so with a version bump.
+pub(in crate::index) fn row_id_domain_version(index_type: &str) -> Option<u32> {
+    use lance_index::scalar::{bitmap, btree, label_list, ngram};
+    let is = |builtin: BuiltinIndexType| index_type.eq_ignore_ascii_case(builtin.as_str());
+    #[cfg(feature = "geo")]
+    if is(BuiltinIndexType::RTree) {
+        return Some(lance_geo::rtree::RTREE_ROW_ID_DOMAIN_VERSION);
+    }
+    if is(BuiltinIndexType::BTree) {
+        Some(btree::BTREE_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::Bitmap) {
+        Some(bitmap::BITMAP_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::LabelList) {
+        Some(label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::NGram) {
+        Some(ngram::NGRAM_ROW_ID_DOMAIN_VERSION)
+    } else {
+        None
+    }
+}
+
+/// The domain (see [`IndexMetadata::results_are_row_addrs`]) shared by
+/// `segments`, for a merge that reuses their stored data without a rescan and
+/// so writes its result in that same domain.
+///
+/// Refuses segments that disagree, since their stored identifiers would be
+/// combined as-is, and -- on a dataset with stable row ids -- a segment
+/// persisted before its type moved to the row-address domain: its row ids
+/// differ from the row addresses newly scanned data holds. Such a segment
+/// must be rebuilt first (e.g. with `create_index(..., replace: true)`).
+pub(in crate::index) fn shared_segment_domain(
+    dataset: &Dataset,
+    index_type: &str,
+    segments: &[&IndexMetadata],
+) -> Result<bool> {
+    let Some(first) = segments.first() else {
+        return Ok(true);
+    };
+    let results_are_row_addrs = first.results_are_row_addrs();
+    if let Some(other) = segments
+        .iter()
+        .find(|segment| segment.results_are_row_addrs() != results_are_row_addrs)
+    {
+        return Err(Error::invalid_input(format!(
+            "{index_type} segments {} and {} disagree on whether they store row ids or row \
+             addresses and cannot be merged; rebuild the index first (e.g. with \
+             create_index(..., replace: true))",
+            first.uuid, other.uuid,
+        )));
+    }
+    if !results_are_row_addrs && dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(format!(
+            "{index_type} segment {} predates row-address-domain support and cannot be merged \
+             on a dataset with stable row IDs; rebuild it first (e.g. with \
+             create_index(..., replace: true))",
+            first.uuid,
+        )));
+    }
+    Ok(results_are_row_addrs)
+}
+
 /// Build a Scalar Index (returns details to store in the manifest)
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
@@ -399,43 +513,6 @@ pub(super) async fn build_scalar_index(
     preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
-    // A JSON-wrapped BTREE/Bitmap/LabelList index cannot yet carry the
-    // row-address-domain migration through its own metadata: `JsonIndexDetails`
-    // has no field for the target's persisted version (`JsonIndexPlugin::load_index`
-    // stands in with the target plugin's current max version instead), and the
-    // generic domain-safety checks that protect a plain segment during
-    // merge/compaction (`IndexMetadata::results_are_row_addrs`, append.rs's
-    // `legacy_domain_mismatch`) key off the index's own type_url, which a
-    // JSON wrapper's details never match. A wrapped segment that genuinely
-    // stored row addresses on a stable-row-id dataset would be invisible to
-    // all of that machinery, which assumes row-id domain by construction.
-    // Reject it outright until the wrapper preserves the target's own domain
-    // through its own metadata (lance-format/lance#9721); a plain (non-wrapped)
-    // index of any of these types is unaffected, and so is this same
-    // combination without stable row ids, where a row id already is a row
-    // address.
-    if params.index_type.eq_ignore_ascii_case("json")
-        && dataset.manifest.uses_stable_row_ids()
-        && let Some(target) = params
-            .params
-            .as_deref()
-            .and_then(lance_index::scalar::json::json_wrapped_target_type)
-        && let Some(builtin) = [
-            BuiltinIndexType::BTree,
-            BuiltinIndexType::Bitmap,
-            BuiltinIndexType::LabelList,
-        ]
-        .into_iter()
-        .find(|builtin| target.eq_ignore_ascii_case(builtin.as_str()))
-    {
-        let name = builtin.as_str().to_uppercase();
-        return Err(Error::not_supported(format!(
-            "a JSON-wrapped {name} index is not yet supported on a dataset with stable row \
-             ids enabled -- create a plain {name} index on this column instead, or disable \
-             stable row ids for this dataset"
-        )));
-    }
-
     let inverted_params = (params.index_type.eq_ignore_ascii_case("inverted")
         || params.index_type.eq_ignore_ascii_case("fts"))
     .then(|| serde_json::from_str::<InvertedIndexParams>(params.params.as_deref().unwrap_or("{}")))
@@ -534,6 +611,9 @@ pub(super) async fn build_scalar_index(
             preprocessed_data
         }
         (None, Some(resolved)) => {
+            let fts_params = inverted_params.as_ref().ok_or_else(|| {
+                Error::internal("resolved FTS field is missing its training parameters")
+            })?;
             load_fts_training_data(
                 dataset,
                 resolved,
@@ -541,6 +621,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                fts_params,
             )
             .await?
         }
@@ -552,7 +633,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
-                None,
+                TrainingScanOptions::default(),
             )
             .await?
         }
@@ -569,35 +650,37 @@ pub(super) async fn build_scalar_index(
         )
         .await?;
 
-    // BTree, Bitmap, and LabelList always train on physical row addresses --
-    // the plugins' TrainingCriteria has no per-dataset awareness to vary
-    // that -- but a row address and a row id are the same value on a
+    // A list-element index names its keys; record which fields they are, so
+    // the index follows them through renames.
+    if list_element::is_list_element(&created_index.index_details) {
+        let indexed_field = dataset
+            .schema()
+            .field(column)
+            .ok_or_else(|| Error::invalid_input(format!("No column with name {column}")))?;
+        list_element::record_key_field_ids(indexed_field, &mut created_index)?;
+    }
+
+    // BTree, Bitmap, LabelList, NGram, and RTree always train on physical row
+    // addresses -- the plugins' TrainingCriteria has no per-dataset awareness
+    // to vary that -- but a row address and a row id are the same value on a
     // dataset that does not use stable row ids, so the trained page data is
     // identical either way there. Label it with the pre-migration version in
     // that case: an old build already understands it, so a user who never
     // turns on stable row ids sees no forward-compatibility impact from the
     // address-domain migration (see BTREE_ROW_ID_DOMAIN_VERSION,
-    // BITMAP_ROW_ID_DOMAIN_VERSION, and LABEL_LIST_ROW_ID_DOMAIN_VERSION).
+    // BITMAP_ROW_ID_DOMAIN_VERSION, LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+    // NGRAM_ROW_ID_DOMAIN_VERSION, and RTREE_ROW_ID_DOMAIN_VERSION).
     // Only a stable-row-id dataset -- where the two domains genuinely
     // diverge -- needs the address-domain version these plugins actually
     // trained.
     if !dataset.manifest.uses_stable_row_ids() {
-        if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
-        {
-            created_index.index_version = lance_index::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION;
-        } else if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::Bitmap.as_str())
-        {
-            created_index.index_version = lance_index::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION;
-        } else if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::LabelList.as_str())
-        {
-            created_index.index_version =
-                lance_index::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION;
+        if let Some(version) = row_id_domain_version(&params.index_type) {
+            created_index.index_version = version;
+        } else if params.index_type.eq_ignore_ascii_case("json") {
+            // A JSON index trains its target the same way the target's own
+            // plugin would, so the same relabeling applies to a wrapped BTree,
+            // Bitmap, or LabelList.
+            lance_index::scalar::json::relabel_as_row_id_domain(&mut created_index)?;
         }
     }
 
@@ -645,7 +728,7 @@ pub(super) async fn build_bitmap_index_segment(
         None,
         true,
         Some(fragment_ids),
-        None,
+        TrainingScanOptions::default(),
     )
     .await?;
     progress.stage_complete("load_data").await?;
@@ -851,7 +934,10 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
-    let index_details = fetch_index_details(dataset, column, index).await?;
+    let mut index_details = fetch_index_details(dataset, column, index).await?;
+    if list_element::is_list_element(&index_details) {
+        index_details = list_element::details_for_open(dataset.schema(), index, index_details)?;
+    }
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
     let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
@@ -863,7 +949,7 @@ pub(crate) async fn open_scalar_index_with_plan(
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
     let (frag_reuse_index, batch_remapping) =
         match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
+            Some(ResolvedRemapping::V0 { remapper, .. }) => (Some(remapper.clone()), None),
             // An untouched segment on a tagged dataset loads the original way,
             // with no remapper; every plugin (including legacy-API-only ones)
             // supports this.
@@ -875,12 +961,13 @@ pub(crate) async fn open_scalar_index_with_plan(
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
     // already validated this session, saving the extra `open_index_file` IOP.
-    let load: ScalarIndexLoad = Box::pin({
+    let make_load = || -> ScalarIndexLoad<'_> {
         let index_store = index_store.clone();
         let batch_remapping = batch_remapping.clone();
         let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
-        async move {
+        let index_details = index_details.clone();
+        Box::pin(async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
                 validate_label_list_index_compatibility(
                     dataset,
@@ -921,26 +1008,37 @@ pub(crate) async fn open_scalar_index_with_plan(
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
             metrics.record_index_load();
             Ok(index)
-        }
-    });
+        })
+    };
 
-    if batch_remapping.is_some() {
+    let opened = if let Some(batch_remapping) = batch_remapping.clone() {
         let rebind_store = index_store.clone();
         lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
-            index_store,
+            index_store.clone(),
             &index_cache,
-            load,
+            make_load(),
             move |index| async move {
-                plugin.rebind_with_remapping(index.as_ref(), rebind_store, batch_remapping)
+                plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(batch_remapping))
             },
             |index| plugin.cache_snapshot(index),
         )
-        .await
+        .await?
     } else {
         plugin
-            .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-            .await
+            .get_or_insert_in_cache(
+                index_store.clone(),
+                frag_reuse_index.clone(),
+                &index_cache,
+                make_load(),
+            )
+            .await?
+    };
+    // A list-element index cached before a rename reads its keys by their old
+    // names. Searching does not use them, but updating does, so load it again.
+    if list_element::has_other_key_names(opened.as_ref(), &index_details) {
+        return make_load().await;
     }
+    Ok(opened)
 }
 
 pub(crate) async fn cached_scalar_index_container(
@@ -1169,15 +1267,15 @@ pub async fn initialize_scalar_index(
             inverted_params.get_document_granularity(),
         )?;
 
-        target_dataset
-            .create_index(
-                &[&resolved.canonical_path],
-                index_type,
-                Some(source_index.name.clone()),
-                &inverted_params,
-                false,
-            )
-            .await?;
+        CreateIndexBuilder::new(
+            target_dataset,
+            &[&resolved.canonical_path],
+            index_type,
+            &inverted_params,
+        )
+        .name(source_index.name.clone())
+        .copy_of_existing()
+        .await?;
     } else {
         target_dataset
             .create_index(
@@ -1219,7 +1317,7 @@ mod tests {
         name: &str,
         field_id: i32,
         index_type: Option<IndexType>,
-    ) -> crate::index::IndexMetadata {
+    ) -> lance_table::format::IndexMetadata {
         let index_details = index_type
             .map(|index_type| match index_type {
                 IndexType::BTree => {
@@ -1239,7 +1337,7 @@ mod tests {
                 }
             })
             .map(Arc::new);
-        crate::index::IndexMetadata {
+        lance_table::format::IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: name.to_string(),
             fields: vec![field_id],
@@ -1721,7 +1819,7 @@ mod tests {
             None,
             true,
             None,
-            None,
+            TrainingScanOptions::default(),
         )
         .await
         .unwrap();
@@ -1743,6 +1841,82 @@ mod tests {
             }
         }
         assert_eq!(max_frag_id_seen, 3);
+    }
+
+    #[rstest::rstest]
+    #[case::default_limit(None)]
+    #[case::explicit_limit(Some(64 * 1024 * 1024))]
+    #[tokio::test]
+    async fn test_fts_training_scan_byte_target(
+        #[case] byte_target: Option<u64>,
+        #[values(1, 3)] workers: usize,
+    ) {
+        async fn largest_original_batch(dataset: &Dataset) -> usize {
+            let mut scan = dataset.scan();
+            scan.project(&["content"]).unwrap();
+            scan.try_into_stream()
+                .await
+                .unwrap()
+                .map_ok(|batch| batch.num_rows())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .max()
+                .unwrap()
+        }
+
+        let text = "x".repeat(512 * 1024);
+        let mut dataset = lance_datagen::gen_batch()
+            .col("content", array::fill_utf8(text.clone()))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(40))
+            .await
+            .unwrap();
+        if let Some(byte_target) = byte_target {
+            dataset.file_reader_options = Some(Arc::new(lance_file::reader::FileReaderOptions {
+                batch_size_bytes: Some(byte_target),
+                read_chunk_size: 1024 * 1024,
+                ..Default::default()
+            }));
+        }
+        assert!(largest_original_batch(&dataset).await >= 40);
+        let params = InvertedIndexParams::default().num_workers(workers);
+        let resolved = inverted::resolve_fts_field(
+            dataset.schema(),
+            "content",
+            params.get_document_granularity(),
+        )
+        .unwrap();
+        let mut stream = load_fts_training_data(
+            &dataset,
+            &resolved,
+            &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            None,
+            true,
+            None,
+            &params,
+        )
+        .await
+        .unwrap();
+        let mut batch_rows = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batch_rows.push(batch.num_rows());
+            let values = batch[VALUE_COLUMN_NAME].as_string::<i32>();
+            for value in values.iter() {
+                assert_eq!(value, Some(text.as_str()));
+            }
+        }
+        assert_eq!(batch_rows.iter().sum::<usize>(), 80);
+        if byte_target.is_none() {
+            assert!(batch_rows.iter().all(|&rows| rows < 40), "{batch_rows:?}");
+            assert!(dataset.file_reader_options.is_none());
+        } else {
+            assert!(batch_rows.iter().any(|&rows| rows >= 40), "{batch_rows:?}");
+            let options = dataset.file_reader_options.as_ref().unwrap();
+            assert_eq!(options.batch_size_bytes, byte_target);
+            assert_eq!(options.read_chunk_size, 1024 * 1024);
+        }
+        assert!(largest_original_batch(&dataset).await >= 40);
     }
 
     #[tokio::test]

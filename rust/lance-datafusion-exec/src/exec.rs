@@ -18,7 +18,7 @@ use datafusion_execution::{
     TaskContext,
     config::SessionConfig,
     disk_manager::DiskManagerBuilder,
-    memory_pool::{FairSpillPool, TrackConsumersPool},
+    memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool},
     runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
@@ -36,6 +36,7 @@ use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
+    memory::{Component, register_component},
     utils::{
         futures::FinallyStreamExt,
         tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
@@ -51,6 +52,9 @@ use crate::{
         PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
+
+mod record_batch;
+pub use record_batch::RecordBatchExec;
 
 /// An source execution node created from an existing stream
 ///
@@ -242,6 +246,29 @@ impl LanceExecutionOptions {
     }
 
     pub fn mem_pool_size(&self) -> u64 {
+        self.mem_pool_size_with_default(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION)
+    }
+
+    /// Resolves the memory-pool size for one execution partition.
+    ///
+    /// An explicit value always takes precedence over the supplied fallback.
+    /// Otherwise `LANCE_MEM_POOL_SIZE` is used when set, and the fallback is
+    /// multiplied by the effective partition count only when the environment
+    /// variable is absent.
+    ///
+    /// ```
+    /// use lance_datafusion_exec::exec::LanceExecutionOptions;
+    ///
+    /// let options = LanceExecutionOptions {
+    ///     mem_pool_size: Some(64 * 1024 * 1024),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(
+    ///     options.mem_pool_size_with_default(256 * 1024 * 1024),
+    ///     64 * 1024 * 1024
+    /// );
+    /// ```
+    pub fn mem_pool_size_with_default(&self, default_per_partition: u64) -> u64 {
         let num_partitions = self.effective_target_partition();
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
@@ -249,10 +276,10 @@ impl LanceExecutionOptions {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
-                        DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
+                        default_per_partition * num_partitions
                     }
                 })
-                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
+                .unwrap_or(default_per_partition * num_partitions)
         })
     }
 
@@ -339,7 +366,19 @@ pub fn new_runtime_env(options: &LanceExecutionOptions) -> Arc<RuntimeEnv> {
     }
     // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
     // reservations. This bypasses the configured pool limit, not actual RAM limits.
-    runtime_env_builder.build_arc().unwrap()
+    let runtime_env = runtime_env_builder.build_arc().unwrap();
+    // The pool rather than the environment: every reservation holds its pool,
+    // so the pool and the bytes reserved in it can outlive the environment.
+    register_component(
+        Component::DataFusionPool,
+        &runtime_env.memory_pool,
+        pool_reserved_bytes,
+    );
+    runtime_env
+}
+
+fn pool_reserved_bytes(pool: &(dyn MemoryPool + 'static)) -> u64 {
+    pool.reserved() as u64
 }
 
 /// Returns a new task context to execute one plan with `options`.
@@ -973,6 +1012,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), default_per_partition * 4);
+        assert_eq!(opts.mem_pool_size_with_default(256), 256 * 4);
 
         // 8 partitions → 8x the per-partition size
         let opts = LanceExecutionOptions {
@@ -980,6 +1020,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), default_per_partition * 8);
+        assert_eq!(opts.mem_pool_size_with_default(256), 256 * 8);
 
         // Explicit mem_pool_size is not scaled
         let opts = LanceExecutionOptions {
@@ -988,6 +1029,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+        assert_eq!(opts.mem_pool_size_with_default(256), 50 * 1024 * 1024);
     }
 
     #[test]

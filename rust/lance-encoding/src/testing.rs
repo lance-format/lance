@@ -942,6 +942,7 @@ fn tag(e: &Compression) -> &'static str {
         Delta(_) => "delta",
         AxisDelta(_) => "axis_delta",
         Alp(_) => "alp",
+        Pcodec(_) => "pcodec",
     }
 }
 
@@ -989,6 +990,7 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
             Some(children)
         }
         FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        Pcodec(p) => p.values.as_ref().map(|b| vec![b.as_ref()]),
         VariablePackedStruct(v) => {
             let nested: Vec<&CompressiveEncoding> = v
                 .fields
@@ -1572,6 +1574,11 @@ async fn check_round_trip_random(
                 };
 
                 for num_ingest_batches in test_cases.ingest_batch_counts.iter().copied() {
+                    // A single slice covering the whole array at offset 0 is the
+                    // same array as the unsliced single batch.
+                    if use_slicing && num_ingest_batches == 1 {
+                        continue;
+                    }
                     let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                     let mut data = Vec::new();
 

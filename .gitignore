@@ -115,13 +115,17 @@ test_data/venv
 docs/src/format/catalog/**
 docs/src/format/namespace/**
 docs/src/format/layout.png
+docs/src/integrations/context/**
 docs/src/integrations/duckdb/**
+docs/src/integrations/flink/**
 docs/src/integrations/huggingface/**
 docs/src/integrations/ray/**
 docs/src/integrations/spark/**
 docs/src/integrations/trino/**
 docs/src/community/project-specific/.pages
 docs/src/community/project-specific/lance/**
+docs/src/community/project-specific/context.md
+docs/src/community/project-specific/flink.md
 docs/src/community/project-specific/namespace.md
 docs/src/community/project-specific/namespace-impls.md
 docs/src/community/project-specific/ray.md

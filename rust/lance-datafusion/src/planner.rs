@@ -9,14 +9,17 @@ use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_filter_type_to_boolean, resolve_expr};
+use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{OffsetBuffer, i256};
 use arrow_cast::cast_with_options;
-use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use arrow_schema::{
+    DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType as ArrowDataType, Field,
+    SchemaRef, TimeUnit,
+};
 use arrow_select::concat::concat;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
@@ -28,17 +31,18 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
     ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
 };
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
-    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan,
+    AccessExpr, Array as SQLArray, BinaryOperator, CeilFloorKind, DataType as SQLDataType,
+    DateTimeField, ExactNumberInfo, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator,
+    Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
@@ -59,6 +63,51 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
         .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
+/// Parses the text of a SQL number, such as `0.05`, `.5` or `1.5e-3`, as a
+/// decimal holding exactly its digits. `None` when its digits, counting the
+/// zeros after the decimal point, are more than a 256-bit decimal holds, or
+/// its exponent puts the scale outside `i8`; such a number stays a float.
+fn parse_decimal(number: &str, negative: bool) -> Option<ScalarValue> {
+    let (mantissa, exponent) = match number.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (number, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{integer}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    let scale = i32::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+    let scale = i8::try_from(scale).ok()?;
+    // Arrow requires the scale to fit the precision.
+    let precision = u8::try_from(
+        digits
+            .len()
+            .max(1)
+            .max(usize::from(scale.max(0).unsigned_abs())),
+    )
+    .ok()?;
+    if precision > DECIMAL256_MAX_PRECISION {
+        return None;
+    }
+    let value = i256::from_string(if digits.is_empty() { "0" } else { digits })?;
+    let value = if negative {
+        value.checked_neg()?
+    } else {
+        value
+    };
+    if precision <= DECIMAL128_MAX_PRECISION {
+        Some(ScalarValue::Decimal128(
+            Some(value.to_i128()?),
+            precision,
+            scale,
+        ))
+    } else {
+        Some(ScalarValue::Decimal256(Some(value), precision, scale))
+    }
 }
 
 // The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
@@ -293,6 +342,16 @@ impl Planner {
         }
     }
 
+    /// Like [`Self::new`], but resolves functions against `session` instead of
+    /// Lance's default session, so functions registered on it can be planned.
+    pub fn new_with_session(schema: SchemaRef, session: SessionContext) -> Self {
+        Self {
+            schema,
+            context_provider: LanceContextProvider::new(session),
+            enable_relations: false,
+        }
+    }
+
     /// If passed with `true`, then the first identifier in column reference
     /// is parsed as the relation. For example, `table.field.inner` will be
     /// read as the nested field `field.inner` (`inner` on struct field `field`)
@@ -450,11 +509,90 @@ impl Planner {
             return Self::balanced_binary_expr(exprs, df_op);
         }
 
-        Ok(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(self.parse_sql_expr(left)?),
+        let mut left_expr = self.parse_sql_expr(left)?;
+        let mut right_expr = self.parse_sql_expr(right)?;
+        if matches!(
             df_op,
-            Box::new(self.parse_sql_expr(right)?),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            if let Some(decimal) = self.decimal_operand(right, &left_expr) {
+                right_expr = decimal;
+            } else if let Some(decimal) = self.decimal_operand(left, &right_expr) {
+                left_expr = decimal;
+            }
+        }
+        Ok(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left_expr),
+            df_op,
+            Box::new(right_expr),
         )))
+    }
+
+    /// The type of the column or nested field `expr` refers to.
+    fn column_type(&self, expr: &Expr) -> Option<ArrowDataType> {
+        match expr {
+            Expr::Column(column) => Some(
+                self.schema
+                    .field_with_name(&column.name)
+                    .ok()?
+                    .data_type()
+                    .clone(),
+            ),
+            Expr::ScalarFunction(function) if function.name() == GetFieldFunc::default().name() => {
+                let ArrowDataType::Struct(fields) = self.column_type(function.args.first()?)?
+                else {
+                    return None;
+                };
+                let name = get_as_string_scalar_opt(function.args.get(1)?)?;
+                Some(fields.find(name)?.1.data_type().clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `operand` as an exact decimal literal when it is a fractional number
+    /// such as `0.05` and `column` is a decimal column. Parsed as a float, its
+    /// digits would no longer be known, so a comparison with the column could
+    /// neither be exact nor use an index on it.
+    fn decimal_operand(&self, operand: &SQLExpr, column: &Expr) -> Option<Expr> {
+        let (number, negative) = match operand {
+            SQLExpr::Value(ValueWithSpan {
+                value: Value::Number(number, _),
+                ..
+            }) => (number, false),
+            SQLExpr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match expr.as_ref() {
+                SQLExpr::Value(ValueWithSpan {
+                    value: Value::Number(number, _),
+                    ..
+                }) => (number, true),
+                _ => return None,
+            },
+            SQLExpr::Nested(inner) => return self.decimal_operand(inner, column),
+            _ => return None,
+        };
+        // Integers keep the integer literal the planner builds for them, which
+        // the lowering compares exactly. A negative literal past `i64` is
+        // built as a float, so it is parsed here too.
+        let is_integer =
+            number.parse::<i64>().is_ok() || (!negative && number.parse::<u64>().is_ok());
+        if is_integer {
+            return None;
+        }
+        if !matches!(
+            self.column_type(column)?,
+            ArrowDataType::Decimal128(..) | ArrowDataType::Decimal256(..)
+        ) {
+            return None;
+        }
+        Some(Expr::Literal(parse_decimal(number, negative)?, None))
     }
 
     fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
@@ -836,11 +974,65 @@ impl Planner {
                 let value_expr = self.parse_sql_expr(expr)?;
                 let list_exprs = list
                     .iter()
-                    .map(|e| self.parse_sql_expr(e))
+                    .map(|e| match self.decimal_operand(e, &value_expr) {
+                        Some(decimal) => Ok(decimal),
+                        None => self.parse_sql_expr(e),
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
+            SQLExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let string = self.parse_sql_expr(expr)?;
+                let from = substring_from
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr))
+                    .transpose()?;
+                let for_expr = substring_for
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr))
+                    .transpose()?;
+
+                match (from, for_expr) {
+                    (Some(from), Some(for_expr)) => Ok(
+                        datafusion_functions::unicode::expr_fn::substring(string, from, for_expr),
+                    ),
+                    (Some(from), None) => {
+                        Ok(datafusion_functions::unicode::expr_fn::substr(string, from))
+                    }
+                    (None, Some(for_expr)) => {
+                        Ok(datafusion_functions::unicode::expr_fn::substring(
+                            string,
+                            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+                            for_expr,
+                        ))
+                    }
+                    (None, None) => Err(Error::invalid_input(
+                        "SUBSTRING requires a FROM or FOR clause",
+                    )),
+                }
+            }
+            SQLExpr::Floor { expr, field } => match field {
+                CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => Ok(
+                    datafusion_functions::math::expr_fn::floor(self.parse_sql_expr(expr)?),
+                ),
+                _ => Err(Error::invalid_input(
+                    "FLOOR with datetime or scale is not supported",
+                )),
+            },
+            SQLExpr::Ceil { expr, field } => match field {
+                CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => Ok(
+                    datafusion_functions::math::expr_fn::ceil(self.parse_sql_expr(expr)?),
+                ),
+                _ => Err(Error::invalid_input(
+                    "CEIL with datetime or scale is not supported",
+                )),
+            },
             SQLExpr::Function(_) => self.parse_function(expr.clone()),
             SQLExpr::ILike {
                 negated,
@@ -948,8 +1140,14 @@ impl Planner {
             } => {
                 // Parse the main expression and bounds
                 let expr = self.parse_sql_expr(expr)?;
-                let low = self.parse_sql_expr(low)?;
-                let high = self.parse_sql_expr(high)?;
+                let low = match self.decimal_operand(low, &expr) {
+                    Some(decimal) => decimal,
+                    None => self.parse_sql_expr(low)?,
+                };
+                let high = match self.decimal_operand(high, &expr) {
+                    Some(decimal) => decimal,
+                    None => self.parse_sql_expr(high)?,
+                };
 
                 let between = Expr::Between(Between::new(
                     Box::new(expr),
@@ -970,15 +1168,34 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_expr()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
-        // Allow sqlparser to parse filter as part of ONE SQL statement.
-        let ast_expr = parse_sql_filter(filter)?;
-        let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        let resolved = resolve_expr(&expr, &schema).map_err(|e| {
+        self.parse_filter_with_schema(filter, &schema)
+    }
+
+    /// Like [`Self::parse_filter`], but resolves column types against `schema`
+    /// instead of converting the planner's Arrow schema on every call.
+    ///
+    /// `schema` must describe the same fields as the planner's Arrow schema.
+    pub fn parse_filter_with_schema(&self, filter: &str, schema: &Schema) -> Result<Expr> {
+        // Allow sqlparser to parse filter as part of ONE SQL statement.
+        let mut ast_expr = parse_sql_filter(filter)?;
+        self.rewrite_filter_lambdas(&mut ast_expr)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
+        let resolved = resolve_expr(&expr, schema).map_err(|e| {
             Error::invalid_input(format!("Error resolving filter expression {filter}: {e}"))
         })?;
 
         Ok(coerce_filter_type_to_boolean(resolved))
+    }
+
+    /// Rewrite each `array_any_match(list, x -> predicate)` in a parsed filter
+    /// to `any_element(list, 'predicate')`, and reject any other lambda.
+    pub(crate) fn rewrite_filter_lambdas(&self, filter: &mut SQLExpr) -> Result<()> {
+        crate::udf::rewrite_element_lambdas(filter, |list| {
+            let expr = self.parse_sql_expr(list)?;
+            let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+            Ok(expr.get_type(&schema)?)
+        })
     }
 
     /// Create Logical [Expr] from a SQL expression.
@@ -1405,6 +1622,161 @@ mod tests {
             predicates.into_array(batch.num_rows()).unwrap().as_ref(),
             &BooleanArray::from(vec![Some(true), Some(false), None, None])
         );
+    }
+
+    #[test]
+    fn test_parse_filter_with_schema_matches_parse_filter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new(
+                "st",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "x",
+                    DataType::Float32,
+                    false,
+                )])),
+                true,
+            ),
+        ]));
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let planner = Planner::new(schema);
+
+        for filter in [
+            "i > 3 AND st.x <= 5.0",
+            "i BETWEEN 1 AND 7 OR s IN ('a', 'b')",
+            "NOT (i = 2.5) AND s IS NOT NULL",
+        ] {
+            assert_eq!(
+                planner
+                    .parse_filter_with_schema(filter, &lance_schema)
+                    .unwrap(),
+                planner.parse_filter(filter).unwrap(),
+                "{filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_scalar_expressions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float32, true),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let planner = Planner::new(schema.clone());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float32Array::from(vec![
+                    Some(1.2),
+                    Some(-1.2),
+                    Some(2.0),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("hello"),
+                    Some("world"),
+                    Some("lance"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let cases = [
+            (
+                "floor(value) = -2",
+                vec![Some(false), Some(true), Some(false), None],
+            ),
+            (
+                "ceil(value) = 2",
+                vec![Some(true), Some(false), Some(true), None],
+            ),
+            (
+                "substring(text FROM 2 FOR 3) = 'ell'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "substring(text FROM 2) = 'ello'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "substring(text FOR 3) = 'wor'",
+                vec![Some(false), Some(true), Some(false), None],
+            ),
+            (
+                "substring(text, 2, 3) = 'ell'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "substr(text, 2, 3) = 'ell'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+        ];
+
+        for (filter, expected) in cases {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            let physical_expr = planner.create_physical_expr(&expr).unwrap();
+            let result = physical_expr
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
+        }
+    }
+
+    #[rstest::rstest]
+    #[case("CASE WHEN value > 1 THEN TRUE ELSE FALSE END")]
+    #[case("CASE value WHEN 1 THEN TRUE ELSE FALSE END")]
+    fn test_case_filters_remain_unsupported(#[case] filter: &str) {
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )])));
+        let error = planner.parse_filter(filter).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not supported SQL"));
+    }
+
+    #[rstest::rstest]
+    #[case("id + 0.5 > 1.0", vec![Some(false), Some(true), Some(true), None])]
+    #[case("id + 300 = 300", vec![Some(true), Some(false), Some(false), None])]
+    fn test_arithmetic_filter_preserves_numeric_promotion(
+        #[case] filter: &str,
+        #[case] expected: Vec<Option<bool>>,
+    ) {
+        let batch =
+            arrow_array::record_batch!(("id", UInt8, [Some(0), Some(1), Some(2), None])).unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
+    }
+
+    #[rstest::rstest]
+    #[case("floor(value TO DAY)", "FLOOR with datetime or scale is not supported")]
+    #[case("ceil(value, 2)", "CEIL with datetime or scale is not supported")]
+    #[case("substring(text)", "SUBSTRING requires a FROM or FOR clause")]
+    fn test_unsupported_scalar_expression_forms(#[case] filter: &str, #[case] message: &str) {
+        let planner = Planner::new(Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float32, true),
+            Field::new("text", DataType::Utf8, true),
+        ])));
+        let error = planner.parse_filter(filter).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     #[test]
@@ -2439,6 +2811,30 @@ mod tests {
                 .udf_names()
                 .contains(&"registered_later".to_string())
         );
+    }
+
+    #[test]
+    fn test_planner_with_session_plans_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "echo",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        let batch = arrow_array::record_batch!(("s", Utf8, ["a", "b"])).unwrap();
+
+        let err = Planner::new(batch.schema())
+            .parse_expr("echo(s)")
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid function 'echo'"), "{err}");
+
+        let planner = Planner::new_with_session(batch.schema(), session);
+        let expr = planner.parse_expr("echo(s)").unwrap();
+        let physical = planner.create_physical_expr(&expr).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        assert_eq!(result.as_ref(), batch.column(0).as_ref());
     }
 
     #[test]

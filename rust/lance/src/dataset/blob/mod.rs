@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod clone;
+mod compaction;
 mod external;
 mod file;
 mod locate;
@@ -9,17 +10,21 @@ mod managed;
 mod materialize;
 mod prepared;
 mod read;
+mod rewrite;
+#[cfg(test)]
+mod rewrite_tests;
 #[cfg(test)]
 pub mod test_util;
 mod write;
 
+pub(super) use compaction::SidecarRewrite;
 pub(super) use external::{
     ExternalBaseCandidate, ExternalBaseResolver, validate_external_blob_references,
 };
 pub use file::BlobFile;
 pub(super) use locate::{collect_blob_v2_descriptor_files, data_file_key_from_path};
 pub use managed::preserve_managed_descriptors;
-pub(super) use managed::{field_contains_blob, managed_paths};
+pub(super) use managed::{field_contains_blob, managed_paths, may_be_same_store};
 pub use materialize::{
     BlobMaterializationAdmission, BlobMaterializationContext, MaterializedBlobBatch,
     blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,
@@ -32,6 +37,7 @@ pub use read::{
     ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,
 };
 pub(super) use read::{take_blobs, validate_blob_column};
+pub use rewrite::{BlobV2BatchRewritePlan, field_contains_blob_v2, transform_blob_v2_batch};
 pub use write::BlobPayloadInventory;
 pub use write::BlobPreprocessor;
 pub(super) use write::{

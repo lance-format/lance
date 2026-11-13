@@ -3,8 +3,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, make_array};
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type};
+use arrow_array::{Array, GenericByteArray, RecordBatch, make_array};
+use arrow_buffer::{
+    ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, Buffer, MutableBuffer, NullBuffer,
+    OffsetBuffer, ScalarBuffer,
+};
 use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
 use arrow_schema::DataType;
 
@@ -93,14 +98,15 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
 
     // Which index this takes depends on the layout, because arrow's extenders
-    // disagree about who applies `ArrayData::offset()`. The bit-packed one adds
-    // it to the raw values buffer itself, so an offset-applied index there
-    // reads from twice the offset and runs off the end of the buffer. Every
-    // other layout either reads through an already-offset-applied view or
-    // forwards the index to children carrying their own offsets, and takes the
-    // absolute index it has always been given.
+    // disagree about who applies `ArrayData::offset()`. The boolean and
+    // fixed-size-list ones add it themselves (the latter since arrow 59.3.2),
+    // so an offset-applied index there reads from twice the offset and runs
+    // off the end of the buffer. Every other layout either reads through an
+    // already-offset-applied view or, like struct, forwards the index to
+    // children that do not carry the parent's offset, and takes the absolute
+    // index.
     let start = match data.data_type() {
-        DataType::Boolean => 0,
+        DataType::Boolean | DataType::FixedSizeList(..) => 0,
         _ => data.offset(),
     };
     // The copy holds no more data than the valid source array, so offsets cannot overflow.
@@ -112,14 +118,58 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     mutable.freeze()
 }
 
-/// Deep copy an array, extracting only the sliced portion using MutableArrayData
+/// Deep copy an array, extracting only the sliced portion.
 pub fn deep_copy_array_sliced(array: &dyn Array) -> Arc<dyn Array> {
+    match array.data_type() {
+        DataType::Utf8 => return deep_copy_bytes(array.as_bytes::<Utf8Type>()),
+        DataType::LargeUtf8 => return deep_copy_bytes(array.as_bytes::<LargeUtf8Type>()),
+        DataType::Binary => return deep_copy_bytes(array.as_bytes::<BinaryType>()),
+        DataType::LargeBinary => return deep_copy_bytes(array.as_bytes::<LargeBinaryType>()),
+        _ => {}
+    }
     let data = array.to_data();
     let data = deep_copy_array_data_sliced(&data);
     make_array(data)
 }
 
-/// Deep copy a RecordBatch, extracting only the sliced portion using MutableArrayData
+fn deep_copy_bytes<T: ByteArrayType>(array: &GenericByteArray<T>) -> Arc<dyn Array> {
+    let offsets = array.value_offsets();
+    let first = offsets[0];
+    let last = offsets[array.len()];
+    let copied_offsets = if first.as_usize() == 0 {
+        Buffer::from_slice_ref(offsets)
+    } else {
+        let mut buffer = MutableBuffer::new(std::mem::size_of_val(offsets));
+        buffer.extend(offsets.iter().map(|offset| *offset - first));
+        buffer.into()
+    };
+    let values = Buffer::from(&array.value_data()[first.as_usize()..last.as_usize()]);
+    let nulls = array
+        .nulls()
+        .filter(|nulls| nulls.null_count() > 0)
+        .map(|nulls| {
+            let mut buffer = BooleanBufferBuilder::new_from_buffer(
+                MutableBuffer::from_len_zeroed(nulls.len().div_ceil(8)),
+                0,
+            );
+            buffer.append_buffer(nulls.inner());
+            // SAFETY: append_buffer preserves the validity bits, length, and null count.
+            unsafe { NullBuffer::new_unchecked(buffer.finish(), nulls.null_count()) }
+        });
+    let copied_offsets = ScalarBuffer::new(copied_offsets, 0, offsets.len());
+    // SAFETY: Subtracting the first offset preserves nonnegative, monotonic offsets.
+    // The copied byte range retains the source's value boundaries and UTF-8 validity.
+    // Offsets and validity retain their original lengths.
+    unsafe {
+        Arc::new(GenericByteArray::<T>::new_unchecked(
+            OffsetBuffer::new_unchecked(copied_offsets),
+            values,
+            nulls,
+        ))
+    }
+}
+
+/// Deep copy a RecordBatch, extracting only the sliced portion.
 pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch> {
     let arrays = batch
         .columns()
@@ -142,9 +192,8 @@ mod tests {
         // `ArrayData::slice` records the offset on the parent and leaves the
         // child whole -- a shape `FixedSizeListArray::slice` never produces,
         // but a legal one this public helper can be handed directly. Arrow's
-        // extender forwards `start * size` to that unsliced child and adds
-        // nothing, so the index it gets has to be the absolute one; this is
-        // here to stop the boolean fix from being generalised over it.
+        // extender adds that offset itself before scaling by the list size,
+        // so it has to be given the index relative to the slice.
         let child = Int32Array::from(vec![10, 11, 20, 21]).to_data();
         let field = Arc::new(Field::new_list_field(DataType::Int32, false));
         let data = ArrayDataBuilder::new(DataType::FixedSizeList(field, 2))
@@ -160,11 +209,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_sliced_struct_of_fixed_size_list_reaches_the_right_values() {
-        // Slicing raw struct data pushes the window into the struct's children,
-        // and a fixed-size-list child takes it as its own parent offset with
-        // its values left whole. Two levels of offset, and the absolute index
-        // has to remain right through both of them.
+    fn raw_parent_offset_struct_of_fixed_size_list_reaches_the_right_values() {
+        // A struct window held as the parent offset over whole children (the
+        // shape `StructArray::from` reads), with a fixed-size-list child: the
+        // struct extender forwards the absolute index, and the list scales it
+        // by its size into its own whole values.
         let values = Int32Array::from(vec![10, 11, 20, 21, 30, 31]).to_data();
         let item = Arc::new(Field::new_list_field(DataType::Int32, false));
         let list = ArrayDataBuilder::new(DataType::FixedSizeList(item, 2))
@@ -174,13 +223,13 @@ mod tests {
             .unwrap();
         let field = Arc::new(Field::new("l", list.data_type().clone(), false));
         let data = ArrayDataBuilder::new(DataType::Struct(vec![field].into()))
-            .len(3)
+            .len(1)
+            .offset(2)
             .add_child_data(list)
             .build()
             .unwrap();
-        let sliced = data.slice(2, 1);
 
-        let copied = super::deep_copy_array_data_sliced(&sliced);
+        let copied = super::deep_copy_array_data_sliced(&data);
         let copied_values = Int32Array::from(copied.child_data()[0].child_data()[0].clone());
         assert_eq!(copied_values.values().as_ref(), &[30, 31]);
     }
@@ -273,6 +322,26 @@ mod tests {
         for i in 0..10 {
             assert_eq!(copied_array.value(i), 100 + i as i32);
         }
+    }
+
+    #[test]
+    fn test_deep_copy_string_slice_without_values() {
+        let array = StringArray::from(vec![Some("unused"), None, Some(""), Some("value")]);
+        let prefix = array.slice(0, 2);
+        assert_eq!(super::deep_copy_array_sliced(&prefix).as_ref(), &prefix);
+        let slice = array.slice(1, 2);
+        let copied = super::deep_copy_array_sliced(&slice);
+        assert_eq!(copied.as_ref(), &slice);
+        let copied = copied.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(copied.value_data().is_empty());
+        assert_eq!(copied.value_offsets(), &[0, 0, 0]);
+
+        let empty = array.slice(3, 0);
+        let copied = super::deep_copy_array_sliced(&empty);
+        assert_eq!(copied.as_ref(), &empty);
+        let copied = copied.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(copied.value_data().is_empty());
+        assert_eq!(copied.value_offsets(), &[0]);
     }
 
     #[test]

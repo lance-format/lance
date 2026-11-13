@@ -46,7 +46,9 @@ use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use super::zoned::{
+    ParallelZoneTrainer, ZoneBound, ZoneProcessor, rebuild_zones_parallel, search_zones,
+};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -72,10 +74,10 @@ struct BloomFilterStatistics {
 
 impl DeepSizeOf for BloomFilterStatistics {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        // Estimate the size of the bloom filter
-        // We could try to get the actual size from the Sbbf if it has a method for that,
-        // but for now we'll estimate based on the number of bytes it serializes to
-        self.bloom_filter.to_bytes().len()
+        // Identical to `to_bytes().len()` but O(1): the serialized payload is
+        // exactly `blocks.len() * 32` bytes, so there is no need to materialize
+        // it just to measure the filter.
+        self.bloom_filter.size_bytes()
     }
 }
 
@@ -113,8 +115,10 @@ impl BloomFilterIndex {
         fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
-            .await
+        Ok(Arc::new(
+            Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
+                .await?,
+        ))
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -125,18 +129,28 @@ impl BloomFilterIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
+        let mut index = Self::load_with_max_array_length(
+            store,
+            None,
+            index_cache,
+            MAX_BLOOMFILTER_ARRAY_LENGTH,
+        )
+        .await?;
         index.batch_remapper = remapping;
         debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
         Ok(Arc::new(index))
     }
 
+    /// Load the index, returning it owned rather than shared. `load` and
+    /// `load_with_remapping` wrap the result in an [`Arc`] at their boundary;
+    /// `load_with_remapping` relies on the unique ownership to attach its
+    /// remapper without copying the zone payload.
     async fn load_with_max_array_length(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
         max_array_length: usize,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Self> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
         let file_schema = index_file.schema();
 
@@ -176,14 +190,14 @@ impl BloomFilterIndex {
             }
         }
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             zones,
             number_of_items,
             probability,
             null_rows,
             frag_reuse_index: fri,
             batch_remapper: None,
-        }))
+        })
     }
 
     fn read_batch_size(
@@ -584,9 +598,13 @@ impl ScalarIndex for BloomFilterIndex {
             probability: self.probability,
         };
 
-        let processor = BloomFilterProcessor::new(params.clone())?;
-        let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
-        let (updated_blocks, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
+        let factory_params = params.clone();
+        let trainer = ParallelZoneTrainer::new(
+            move || BloomFilterProcessor::new(factory_params.clone()),
+            params.number_of_items,
+        )?;
+        let (updated_blocks, new_null_rows) =
+            rebuild_zones_parallel(&self.zones, trainer, new_data).await?;
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
         // (legacy format — null positions unknown), preserve that None: updating cannot
@@ -841,12 +859,15 @@ impl BloomFilterIndexBuilder {
         })
     }
 
-    /// Train the builder using the shared ZoneTrainer. The input stream is expected to
+    /// Train the builder using the shared parallel zone trainer. The input stream is expected to
     /// contain the value column followed by `_rowaddr`, matching the order emitted by
     /// the scalar index training pipeline.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = BloomFilterProcessor::new(self.params.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
+        let params = self.params.clone();
+        let trainer = ParallelZoneTrainer::new(
+            move || BloomFilterProcessor::new(params.clone()),
+            self.params.number_of_items,
+        )?;
         let (blocks, null_rows) = trainer.train(batches_source).await?;
         self.blocks = blocks;
         self.null_rows = Some(null_rows);
@@ -1473,6 +1494,10 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1581,6 +1606,7 @@ mod tests {
     use datafusion_execution::SendableRecordBatchStream;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
@@ -1589,7 +1615,7 @@ mod tests {
         BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
         bloomfilter::{
             BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterIndexBuilderParams,
-            merge_bloomfilter_indices,
+            BloomFilterProcessor, BloomFilterStatistics, ZoneBound, merge_bloomfilter_indices,
         },
         lance_format::LanceIndexStore,
     };
@@ -3071,6 +3097,44 @@ mod tests {
                 .await
                 .unwrap(),
             SearchResult::exact(RowAddrTreeMap::new())
+        );
+    }
+
+    // Deep size counts each zone's filter as its serialized payload size.
+    #[test]
+    fn test_bloomfilter_deep_size_equals_serialized_payload() {
+        // Default parameters yield a zone payload of tens of KiB.
+        let params = BloomFilterIndexBuilderParams::new(8192, 0.00057);
+        let filter = BloomFilterProcessor::build_filter(&params).unwrap();
+        let zone_payload = filter.size_bytes();
+        assert!(
+            zone_payload >= 8 * 1024,
+            "fixture too small to be meaningful: {zone_payload} bytes"
+        );
+
+        let make_zone = |fragment_id: u64| BloomFilterStatistics {
+            bound: ZoneBound {
+                fragment_id,
+                start: 0,
+                length: 1,
+            },
+            has_null: false,
+            bloom_filter: filter.clone(),
+        };
+        let index = BloomFilterIndex {
+            zones: vec![make_zone(0), make_zone(1)],
+            number_of_items: params.number_of_items,
+            probability: params.probability,
+            null_rows: None,
+            frag_reuse_index: None,
+            batch_remapper: None,
+        };
+
+        assert_eq!(
+            index.deep_size_of(),
+            std::mem::size_of::<BloomFilterIndex>()
+                + index.zones.capacity() * std::mem::size_of::<BloomFilterStatistics>()
+                + 2 * zone_payload
         );
     }
 }

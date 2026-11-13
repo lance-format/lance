@@ -12,11 +12,11 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::format::pb;
+use crate::format::pb_actions;
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
+    RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
 use lance_core::Result;
@@ -131,12 +131,12 @@ impl KeyExistenceFilterBuilder {
     }
 }
 
-impl From<&KeyExistenceFilterBuilder> for pb::transaction::KeyExistenceFilter {
+impl From<&KeyExistenceFilterBuilder> for pb_actions::KeyExistenceFilter {
     fn from(builder: &KeyExistenceFilterBuilder) -> Self {
         Self {
             field_ids: builder.field_ids.clone(),
-            data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-                pb::transaction::BloomFilter {
+            data: Some(pb_actions::key_existence_filter::Data::Bloom(
+                pb_actions::BloomFilter {
                     bitmap: builder.sbbf.to_bytes(),
                     num_bits: (builder.sbbf.size_bytes() as u32) * 8,
                     number_of_items: BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS,
@@ -167,9 +167,49 @@ pub struct KeyExistenceFilter {
     pub filter: FilterType,
 }
 
+enum ParsedKeyExistenceFilter<'a> {
+    ExactSet(&'a HashSet<u64>),
+    Bloom(Sbbf),
+}
+
+impl ParsedKeyExistenceFilter<'_> {
+    fn might_contain(&self, key: &KeyValue) -> bool {
+        match self {
+            Self::ExactSet(hashes) => hashes.contains(&key.hash_value()),
+            Self::Bloom(sbbf) => sbbf.check(&key.to_bytes()[..]),
+        }
+    }
+}
+
 impl KeyExistenceFilter {
     pub fn from_bloom_filter(bloom: &KeyExistenceFilterBuilder) -> Self {
         bloom.build()
+    }
+
+    /// Validate the filter data before exposing it through the Python bridge.
+    pub fn validate(&self) -> Result<()> {
+        self.parse().map(|_| ())
+    }
+
+    fn parse(&self) -> Result<ParsedKeyExistenceFilter<'_>> {
+        match &self.filter {
+            FilterType::ExactSet(hashes) => Ok(ParsedKeyExistenceFilter::ExactSet(hashes)),
+            FilterType::Bloom { bitmap, .. } => {
+                // `Sbbf::new` accepts an empty bitset, but `Sbbf::check` indexes
+                // the block array, so an empty payload must fail here instead.
+                if bitmap.is_empty() {
+                    return Err(lance_core::Error::invalid_input(
+                        "inserted_rows_filter bloom bitmap must not be empty",
+                    ));
+                }
+                let sbbf = Sbbf::new(bitmap).map_err(|err| {
+                    lance_core::Error::invalid_input(format!(
+                        "inserted_rows_filter bloom bitmap is invalid: {err}"
+                    ))
+                })?;
+                Ok(ParsedKeyExistenceFilter::Bloom(sbbf))
+            }
+        }
     }
 
     /// Check if two filters intersect. Returns (has_intersection, might_be_false_positive).
@@ -210,15 +250,77 @@ impl KeyExistenceFilter {
             }
         }
     }
+
+    /// Whether `key` might have been recorded in this filter.
+    ///
+    /// Exact sets compare hashed keys, so a different key with the same hash
+    /// also matches. Bloom filters never return a false negative, but they can
+    /// return a false positive.
+    pub fn might_contain(&self, key: &KeyValue) -> Result<bool> {
+        Ok(self.parse()?.might_contain(key))
+    }
+
+    /// Check one key per row. `columns` are in `field_ids` order.
+    ///
+    /// A null in any key column is reported as absent.
+    pub fn might_contain_columns(&self, columns: &[ArrayRef]) -> Result<Vec<bool>> {
+        if columns.is_empty() {
+            return Err(lance_core::Error::invalid_input(
+                "might_contain requires at least one key column".to_string(),
+            ));
+        }
+        if columns.len() != self.field_ids.len() {
+            return Err(lance_core::Error::invalid_input(format!(
+                "might_contain expected {} key column(s) for field ids {:?}, got {}",
+                self.field_ids.len(),
+                self.field_ids,
+                columns.len()
+            )));
+        }
+        let num_rows = columns[0].len();
+        if columns.iter().any(|column| column.len() != num_rows) {
+            return Err(lance_core::Error::invalid_input(
+                "might_contain columns must have the same number of rows".to_string(),
+            ));
+        }
+
+        // Parse the bloom filter once for the whole batch instead of rebuilding
+        // it for every row.
+        let parsed = self.parse()?;
+        let mut present = Vec::with_capacity(num_rows);
+        for row_idx in 0..num_rows {
+            if columns.iter().any(|column| column.is_null(row_idx)) {
+                present.push(false);
+                continue;
+            }
+            let mut parts = Vec::with_capacity(columns.len());
+            for column in columns {
+                let Some(part) = extract_key_value(column.as_ref(), row_idx) else {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "might_contain: unsupported key type {} at row {row_idx}",
+                        column.data_type()
+                    )));
+                };
+                parts.push(part);
+            }
+            let key = if parts.len() == 1 {
+                parts.swap_remove(0)
+            } else {
+                KeyValue::Composite(parts)
+            };
+            present.push(parsed.might_contain(&key));
+        }
+        Ok(present)
+    }
 }
 
-impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
+impl From<&KeyExistenceFilter> for pb_actions::KeyExistenceFilter {
     fn from(filter: &KeyExistenceFilter) -> Self {
         match &filter.filter {
             FilterType::ExactSet(hashes) => Self {
                 field_ids: filter.field_ids.clone(),
-                data: Some(pb::transaction::key_existence_filter::Data::Exact(
-                    pb::transaction::ExactKeySetFilter {
+                data: Some(pb_actions::key_existence_filter::Data::Exact(
+                    pb_actions::ExactKeySetFilter {
                         key_hashes: hashes.iter().copied().collect(),
                     },
                 )),
@@ -230,8 +332,8 @@ impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
                 probability,
             } => Self {
                 field_ids: filter.field_ids.clone(),
-                data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-                    pb::transaction::BloomFilter {
+                data: Some(pb_actions::key_existence_filter::Data::Bloom(
+                    pb_actions::BloomFilter {
                         bitmap: bitmap.clone(),
                         num_bits: *num_bits,
                         number_of_items: *number_of_items,
@@ -243,15 +345,15 @@ impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
     }
 }
 
-impl TryFrom<&pb::transaction::KeyExistenceFilter> for KeyExistenceFilter {
+impl TryFrom<&pb_actions::KeyExistenceFilter> for KeyExistenceFilter {
     type Error = lance_core::Error;
 
-    fn try_from(message: &pb::transaction::KeyExistenceFilter) -> Result<Self> {
+    fn try_from(message: &pb_actions::KeyExistenceFilter) -> Result<Self> {
         let filter = match message.data.as_ref() {
-            Some(pb::transaction::key_existence_filter::Data::Exact(exact)) => {
+            Some(pb_actions::key_existence_filter::Data::Exact(exact)) => {
                 FilterType::ExactSet(exact.key_hashes.iter().copied().collect())
             }
-            Some(pb::transaction::key_existence_filter::Data::Bloom(b)) => {
+            Some(pb_actions::key_existence_filter::Data::Bloom(b)) => {
                 // Use defaults for backwards compatibility
                 let number_of_items = if b.number_of_items == 0 {
                     BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS
@@ -342,6 +444,10 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
             let arr = array.as_any().downcast_ref::<LargeBinaryArray>()?;
             KeyValue::Binary(arr.value(row_idx).to_vec())
         }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_fixed_size_binary();
+            KeyValue::Binary(arr.value(row_idx).to_vec())
+        }
         DataType::List(_) => {
             let list_array = array.as_any().downcast_ref::<ListArray>().unwrap();
             let values = list_array.value(row_idx);
@@ -394,8 +500,47 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::builder::{Int32Builder, ListBuilder, StringBuilder};
-    use arrow_array::{Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{Field, Schema};
+
+    #[rstest::rstest]
+    #[case::one_byte(1)]
+    #[case::uuid(16)]
+    #[case::content_hash(32)]
+    fn test_extract_fixed_size_binary_key(#[case] size: i32) {
+        let values = [
+            Some(vec![0; size as usize]),
+            Some(vec![1; size as usize]),
+            None,
+            Some(vec![2; size as usize]),
+        ];
+        let array =
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), size).unwrap();
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(array) as ArrayRef)])
+            .unwrap()
+            .slice(1, 3);
+        let on_columns = vec!["id".to_string()];
+        let key = KeyValue::Binary(vec![1; size as usize]);
+        assert_eq!(
+            extract_key_value_from_batch(&batch, 0, &on_columns),
+            Some(key.clone())
+        );
+        assert_eq!(extract_key_value_from_batch(&batch, 1, &on_columns), None);
+        assert_eq!(
+            extract_key_value_from_batch(&batch, 2, &on_columns),
+            Some(KeyValue::Binary(vec![2; size as usize]))
+        );
+
+        let mut builder = KeyExistenceFilterBuilder::new(vec![0]);
+        builder.insert(key).unwrap();
+        assert_eq!(
+            builder
+                .build()
+                .might_contain_columns(batch.columns())
+                .unwrap(),
+            vec![true, false, false]
+        );
+    }
 
     #[test]
     fn test_extract_key_value_from_batch_list_int() {
@@ -714,6 +859,67 @@ mod tests {
             key1.is_none(),
             "struct row with a null child should not produce a key",
         );
+    }
+
+    #[test]
+    fn test_might_contain_exact_set_and_bloom_batches() {
+        let present = KeyValue::Int64(4);
+        let absent = KeyValue::Int64(99);
+        let exact = KeyExistenceFilter {
+            field_ids: vec![0],
+            filter: FilterType::ExactSet(HashSet::from([present.hash_value()])),
+        };
+        assert!(exact.might_contain(&present).unwrap());
+        assert!(!exact.might_contain(&absent).unwrap());
+
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(4), None, Some(99)]));
+        assert_eq!(
+            exact.might_contain_columns(&[column]).unwrap(),
+            vec![true, false, false]
+        );
+
+        let mut builder = KeyExistenceFilterBuilder::new(vec![0]);
+        builder.insert(present.clone()).unwrap();
+        builder.insert(KeyValue::Int64(8)).unwrap();
+        let bloom = KeyExistenceFilter::from_bloom_filter(&builder);
+        assert!(bloom.might_contain(&present).unwrap());
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(4), Some(8), None]));
+        assert_eq!(
+            bloom.might_contain_columns(&[column]).unwrap(),
+            vec![true, true, false]
+        );
+    }
+
+    #[test]
+    fn test_might_contain_rejects_invalid_bloom_payloads() {
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(4)]));
+        for (bitmap, expected) in [
+            (Vec::new(), "must not be empty"),
+            (vec![0; 33], "multiple of 32"),
+        ] {
+            let filter = KeyExistenceFilter {
+                field_ids: vec![0],
+                filter: FilterType::Bloom {
+                    num_bits: (bitmap.len() as u32) * 8,
+                    bitmap,
+                    number_of_items: BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS,
+                    probability: BLOOM_FILTER_DEFAULT_PROBABILITY,
+                },
+            };
+            let err = filter.might_contain(&KeyValue::Int64(4)).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for invalid bloom payload: {err}"
+            );
+            let err = filter
+                .might_contain_columns(std::slice::from_ref(&column))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected batch error for invalid bloom payload: {err}"
+            );
+            assert!(filter.validate().is_err());
+        }
     }
 
     /// The conflict check concurrent merge-inserts run: disjoint inserted keys
