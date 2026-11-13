@@ -710,32 +710,32 @@ impl Dataset {
             // which column this index answers for.
             !idx.keyed_fields().is_empty() && (has_non_empty_bitmap || is_fts_index)
         }) {
-            let keys = index
+            let keyed_columns = index
                 .keyed_fields()
                 .iter()
-                .map(|&field| {
-                    let field = schema.field_by_id(field).ok_or_else(|| {
+                .map(|&field_id| {
+                    schema.field_by_id(field_id).ok_or_else(|| {
                         Error::internal(format!(
-                            "Index referenced a field with id {field} which did not exist in the schema"
+                            "Index referenced a field with id {field_id} which did not exist in the schema"
                         ))
-                    })?;
-
-                    // Build the full field path for nested fields
-                    let field_path =
-                        if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-                            let field_refs: Vec<&str> =
-                                ancestors.iter().map(|f| f.name.as_str()).collect();
-                            lance_core::datatypes::format_field_path(&field_refs)
-                        } else {
-                            field.name.clone()
-                        };
-                    Ok(ArrowField::new(
-                        field_path,
-                        field.data_type(),
-                        field.nullable,
-                    ))
+                    })
                 })
-                .collect::<Result<Fields>>()?;
+                .collect::<Result<Vec<&Field>>>()?;
+            let keys = keyed_columns
+                .iter()
+                .map(|field| {
+                    // Build the full field path for nested fields
+                    let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id)
+                    {
+                        let field_refs: Vec<&str> =
+                            ancestors.iter().map(|f| f.name.as_str()).collect();
+                        lance_core::datatypes::format_field_path(&field_refs)
+                    } else {
+                        field.name.clone()
+                    };
+                    ArrowField::new(field_path, field.data_type(), field.nullable)
+                })
+                .collect::<Fields>();
             let field_path = keys[0].name().clone();
 
             let mut index_details =
@@ -746,7 +746,7 @@ impl Dataset {
             // A list-element index finds its key fields by ID; plan with the
             // names they have now, or not at all if one is gone or changed.
             if list_element::is_list_element(&index_details.0) {
-                match list_element::bind_key_fields(field, &index_details.0) {
+                match list_element::bind_key_fields(keyed_columns[0], &index_details.0) {
                     Ok(Some(bound)) => index_details = IndexDetails(Arc::new(bound)),
                     Ok(None) => {
                         log::warn!(

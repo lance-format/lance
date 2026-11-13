@@ -23,12 +23,13 @@
 //! as one conjunct. Inside an AND, an OR or NOT conjunct reaches the planners
 //! whole.
 //!
-//! The rule reads the filter that [`apply_scalar_indices`] receives.
-//! [`PlannerIndexExt::create_filter_plan`] optimizes the filter first, so the
-//! root can differ from the one the user wrote. For example, the optimizer
-//! turns `NOT (a = 1 AND b = 2)` into an OR over two columns, which skips
-//! step 1, and it turns `a IN (1, 2)` into `a = 1 OR a = 2`, which reaches the
-//! planners. Aliases around the root do not change the rule.
+//! The rule reads the filter that [`apply_scalar_indices`] receives, which
+//! [`create_filter_plan`] passes through unchanged. The dataset scanner
+//! optimizes the filter with `Planner::optimize_expr` before calling
+//! [`create_filter_plan`], so the root can differ from the one the user wrote.
+//! For example, the optimizer turns `NOT (a = 1 AND b = 2)` into an OR over two
+//! columns, which skips step 1, and it turns `a IN (1, 2)` into `a = 1 OR a = 2`,
+//! which reaches the planners. Aliases around the root do not change the rule.
 
 use std::{
     cmp::{Ordering, Reverse},
