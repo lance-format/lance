@@ -2036,3 +2036,112 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
 
     assert_eq!(row_ids, vec![100]);
 }
+
+#[rstest::rstest]
+#[case::and(Operator::And)]
+#[case::or(Operator::Or)]
+#[tokio::test]
+async fn test_exact_single_term_phrase_uses_frequencies_without_positions(
+    #[case] operator: Operator,
+    #[values(0, 17)] query_position: u32,
+) {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().with_position(true);
+    let format = params.resolved_format_version();
+    let mut partition =
+        InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format);
+    partition.tokens.get_or_add("hit");
+    let mut posting =
+        PostingListBuilder::new_with_posting_tail_codec(true, format.posting_tail_codec());
+    posting.add(0, PositionRecorder::Position(vec![3, 7, 9].into()));
+    posting.add(1, PositionRecorder::Position(vec![4].into()));
+    partition.posting_lists.push(posting);
+    partition.docs.append(100, 10);
+    partition.docs.append(200, 6);
+    partition.docs.append(300, 6);
+    partition.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+
+    let index = InvertedIndex::load(store, None, &LanceCache::with_capacity(1 << 20))
+        .await
+        .unwrap();
+    let tokens = Arc::new(Tokens::with_positions(
+        vec!["hit".to_owned()],
+        vec![query_position],
+        DocType::Text,
+    ));
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let phrase = index
+        .bm25_search(
+            tokens.clone(),
+            Arc::new(params.clone().with_phrase_slop(Some(0))),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        index.partitions[0]
+            .inverted_list
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .is_none(),
+        "a singleton exact phrase must not read or cache its position stream"
+    );
+    let matched = index
+        .bm25_search(
+            tokens,
+            Arc::new(params),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(phrase, matched);
+    let mut rows = phrase.0;
+    rows.sort_unstable();
+    assert_eq!(rows, vec![100, 200]);
+}
+
+#[tokio::test]
+async fn test_exact_single_term_phrase_still_requires_positional_index() {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = write_single_partition_index(
+        store,
+        InvertedIndexParams::default().with_position(false),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await
+    .unwrap();
+    let error = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_phrase_slop(Some(0))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("position is not found"),
+        "{error}"
+    );
+}

@@ -936,8 +936,19 @@ impl InvertedIndex {
 
     pub(super) async fn bm25_search_modern(
         &self,
-        request: ModernSearchRequest<'_>,
+        mut request: ModernSearchRequest<'_>,
     ) -> Result<Vec<ScoredDoc>> {
+        // One exact term has no relative-position constraint. Keep the layout
+        // check so an index without positions retains its phrase validation.
+        if request.params.phrase_slop == Some(0)
+            && request.tokens.len() == 1
+            && self
+                .partitions
+                .iter()
+                .all(|partition| partition.inverted_list.has_positions())
+        {
+            request.params = Arc::new(request.params.as_ref().clone().with_phrase_slop(None));
+        }
         // Select a concrete completion path before candidate search.  The
         // fully resident future never builds deferred address-read state, while
         // a cold query keeps DocIds until its final bounded I/O phase.
@@ -1076,9 +1087,6 @@ impl InvertedIndex {
                 )
             })
             .collect::<Vec<_>>();
-        let partition_loads = Arc::new(tokio::sync::Semaphore::new(
-            search_guard.partition_load_limit(workers)?,
-        ));
         let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
         let buffered_chunks = super::scheduling::buffered_search_chunks(
             searched_partitions.len(),
@@ -1100,20 +1108,15 @@ impl InvertedIndex {
                 let impact_scorer = impact_scorer.clone();
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let shared_norm_addends = shared_norm_addends.clone();
-                let partition_loads = partition_loads.clone();
                 async move {
                     let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
                         let tokens = tokens.clone();
                         let params = params.clone();
                         let mask = mask.clone();
                         let metrics = metrics.clone();
-                        let partition_loads = partition_loads.clone();
                         let partition_term_ids =
                             term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
-                            let permit = partition_loads.acquire_owned().await.map_err(|_| {
-                                Error::internal("modern FTS partition admission is closed")
-                            })?;
                             let documents = part.docs.modern().ok_or_else(|| {
                                 Error::internal("modern index contains legacy partition documents")
                             })?;
@@ -1134,7 +1137,7 @@ impl InvertedIndex {
                                 }
                             };
                             if !visibility.may_match().await? {
-                                return Result::Ok((None, permit));
+                                return Result::Ok(None);
                             }
                             let Some(postings) = part
                                 .fetch_posting_lists(
@@ -1147,30 +1150,38 @@ impl InvertedIndex {
                                 )
                                 .await?
                             else {
-                                return Result::Ok((None, permit));
+                                return Result::Ok(None);
                             };
                             let lengths = match documents.cached_lengths() {
                                 Some(lengths) => lengths,
                                 None => documents.lengths().await?,
                             };
-                            Result::Ok((
-                                Some((partition_ordinal, part, lengths, visibility, postings)),
-                                permit,
-                            ))
+                            Result::Ok(Some((
+                                partition_ordinal,
+                                part,
+                                lengths,
+                                visibility,
+                                postings,
+                            )))
                         }
                     });
-                    let loads = stream::iter(loads).buffer_unordered(io_parallelism);
-                    let tokens = tokens.clone();
-                    let params = params.clone();
-                    let metrics = metrics.clone();
-                    // Score ready partitions before an unrelated slow read completes.
-                    // Hot loads still form full batches; decoding stays on the CPU
-                    // thread that allocates and frees its scratch buffers.
-                    super::scheduling::score_ready_partitions(loads, chunk_size, move |loaded| {
+                    let loaded = stream::iter(loads)
+                        .buffer_unordered(io_parallelism)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    if loaded.is_empty() {
+                        return Result::Ok(Vec::new());
+                    }
+
+                    // Iterators are built here rather than during the load so
+                    // their decode buffers are allocated and freed by the same
+                    // thread that runs WAND.
+                    let results = spawn_cpu(move || {
                         let mut results = Vec::with_capacity(loaded.len());
-                        for (partition_ordinal, part, lengths, visibility, postings) in
-                            loaded.into_iter().flatten()
-                        {
+                        for (partition_ordinal, part, lengths, visibility, postings) in loaded {
                             let LoadedPostings {
                                 postings,
                                 grouped_expansions,
@@ -1217,7 +1228,8 @@ impl InvertedIndex {
                         }
                         Result::Ok(results)
                     })
-                    .await
+                    .await?;
+                    Result::Ok(results)
                 }
             })
             .collect::<Vec<_>>();

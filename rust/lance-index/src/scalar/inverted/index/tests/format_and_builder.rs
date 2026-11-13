@@ -6,6 +6,71 @@ use super::*;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 #[rstest::rstest]
+#[case::exact(1024, 0, true)]
+#[case::alignment_tail(1088, 0, true)]
+#[case::oversized_tail(1089, 0, false)]
+#[case::rare_slice(16 * 1024, 512, false)]
+fn test_shared_positions_bound_retained_allocation_and_preserve_lifetime(
+    #[case] capacity: usize,
+    #[case] offset: i64,
+    #[case] shares_backing: bool,
+) {
+    let backing = Buffer::from_vec(vec![7_u8; capacity]);
+    let values = LargeBinaryArray::new(
+        arrow_buffer::OffsetBuffer::new(vec![offset, offset + 1024].into()),
+        backing.clone(),
+        None,
+    );
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0, 512], &values);
+    assert_eq!(
+        stream.bytes().as_ptr() == values.value(0).as_ptr(),
+        shares_backing
+    );
+    let retained = if shares_backing { capacity } else { 1024 };
+    assert_eq!(stream.size(), retained + 2 * std::mem::size_of::<u32>());
+    let clone = stream.clone();
+    drop(values);
+    assert_eq!(backing.strong_count(), if shares_backing { 2 } else { 1 });
+    assert_eq!(stream.block(0), &[7_u8; 512]);
+    drop(stream);
+    assert_eq!(clone.block(1), &[7_u8; 512]);
+    // Allocation accounting is not part of position-stream value equality.
+    assert_eq!(
+        clone,
+        SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            vec![0, 512],
+            bytes::Bytes::from(vec![7_u8; 1024]),
+        )
+    );
+    drop(clone);
+    assert_eq!(backing.strong_count(), 1);
+}
+
+#[test]
+fn test_shared_positions_copy_external_owner_with_unknown_capacity() {
+    let backing = lance_encoding::buffer::LanceBuffer::from_bytes(
+        bytes::Bytes::from(vec![9_u8; 16 * 1024]),
+        1,
+    )
+    .into_buffer();
+    assert_eq!(backing.capacity(), 0);
+    let values = LargeBinaryArray::new(
+        arrow_buffer::OffsetBuffer::new(vec![512_i64, 1536].into()),
+        backing.clone(),
+        None,
+    );
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], &values);
+    assert_ne!(stream.bytes().as_ptr(), values.value(0).as_ptr());
+    assert_eq!(stream.size(), 1024 + std::mem::size_of::<u32>());
+    drop(values);
+    assert_eq!(backing.strong_count(), 1);
+    assert_eq!(stream.block(0), &[9_u8; 1024]);
+}
+
+#[rstest::rstest]
 #[case::zero_width(vec![2; 2048], 16 * 1024)]
 #[case::chunk_boundary(vec![3000, 1096], 5 * 1024)]
 fn test_position_blocks_keep_small_blocks_compact(

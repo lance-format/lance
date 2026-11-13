@@ -299,21 +299,56 @@ impl DeepSizeOf for CompressedPositionStorage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
     block_offsets: Arc<[u32]>,
     // Stored with shared ownership so cache hits can clone position streams
     // without copying either offsets or bytes.
     bytes: bytes::Bytes,
+    retained_bytes: usize,
 }
+
+impl PartialEq for SharedPositionStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.codec == other.codec
+            && self.block_offsets == other.block_offsets
+            && self.bytes == other.bytes
+    }
+}
+
+impl Eq for SharedPositionStream {}
 
 impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
             block_offsets: Arc::from(block_offsets.into_boxed_slice()),
+            retained_bytes: bytes.len(),
             bytes,
+        }
+    }
+
+    pub(super) fn from_arrow(
+        codec: PositionStreamCodec,
+        block_offsets: Vec<u32>,
+        values: &LargeBinaryArray,
+    ) -> Self {
+        debug_assert_eq!(values.len(), 1);
+        let value = values.value(0);
+        let capacity = values.values().capacity();
+        // Keep a nearly exact owned allocation, avoiding a second full term
+        // copy on the async reader thread. A rare slice must not pin a large
+        // group/page; external owners report zero capacity, so copy those too.
+        // Allow at most one 64-byte Arrow alignment tail and charge it in full.
+        if capacity > 0 && capacity <= value.len().saturating_add(64) {
+            let offset = values.value_offsets()[0] as usize;
+            let buffer = values.values().slice_with_length(offset, value.len());
+            let mut stream = Self::new(codec, block_offsets, bytes::Bytes::from_owner(buffer));
+            stream.retained_bytes = capacity;
+            stream
+        } else {
+            Self::new(codec, block_offsets, bytes::Bytes::copy_from_slice(value))
         }
     }
 
@@ -349,7 +384,7 @@ impl SharedPositionStream {
     }
 
     pub fn size(&self) -> usize {
-        self.block_offsets.len() * std::mem::size_of::<u32>() + self.bytes.len()
+        self.block_offsets.len() * std::mem::size_of::<u32>() + self.retained_bytes
     }
 }
 

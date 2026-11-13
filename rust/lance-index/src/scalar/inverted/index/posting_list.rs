@@ -480,7 +480,6 @@ impl CompressedPostingList {
             .as_binary::<i64>()
             .clone();
         let positions = if let Some(col) = batch.column_by_name(COMPRESSED_POSITION_COL) {
-            let bytes = bytes::Bytes::from(col.as_binary::<i64>().value(0).to_vec());
             let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
                 .as_list::<i32>()
                 .value(0)
@@ -492,7 +491,7 @@ impl CompressedPostingList {
                     .expect("shared position stream codec metadata should be valid")
             });
             Some(CompressedPositionStorage::SharedStream(
-                SharedPositionStream::new(codec, block_offsets, bytes),
+                SharedPositionStream::from_arrow(codec, block_offsets, col.as_binary::<i64>()),
             ))
         } else {
             batch.column_by_name(POSITION_COL).map(|col| {
