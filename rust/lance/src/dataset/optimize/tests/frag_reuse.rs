@@ -2906,9 +2906,9 @@ async fn test_defer_index_remap_allows_a_repack_only_plan() {
     dataset
         .create_index(
             &["cat"],
-            IndexType::NGram,
+            IndexType::Inverted,
             Some("cat_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             false,
         )
         .await
