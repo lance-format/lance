@@ -13,6 +13,7 @@
 mod aggregate;
 mod builder;
 pub(crate) mod fts;
+mod list_structure;
 mod minhash;
 mod plan;
 mod source;
@@ -427,7 +428,7 @@ impl ExprFilter {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema.clone());
-                let filter = planner.parse_filter(sql)?;
+                let filter = planner.parse_filter_with_schema(sql, full_schema)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
@@ -565,6 +566,8 @@ pub struct Scanner {
     ordering: Option<Vec<ColumnOrdering>>,
 
     nearest: Option<Query>,
+    /// When set, score coarse candidates in this separate vector space.
+    nearest_refine: Option<vector::VectorRefinement>,
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,

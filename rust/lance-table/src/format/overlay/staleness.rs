@@ -61,11 +61,9 @@ pub fn overlay_affects_index(
     schema: &Schema,
 ) -> bool {
     overlay.committed_version > index_version
-        && overlay
-            .data_file
-            .fields
-            .iter()
-            .any(|field_id| field_affects_index(*field_id, indexed_field_ids, schema))
+        && overlay.data_file.fields.iter().any(|field_id| {
+            *field_id >= 0 && field_affects_index(*field_id, indexed_field_ids, schema)
+        })
 }
 
 /// Whether `field_id` is, contains, or is nested in an indexed field.
@@ -179,6 +177,10 @@ pub fn collect_overlay_stale_rows_for_segment(
 
 /// Remove from `coverage` every fragment with an overlay that makes `index`
 /// stale ([`overlay_affects_index`]).
+///
+/// Address translation does not incorporate newer overlay values. Call this
+/// before advancing a segment's maintenance watermark, using its source
+/// `dataset_version`. Unknown coverage must keep its original watermark.
 pub fn remove_overlay_stale_frags(
     coverage: &mut RoaringBitmap,
     fragments: &[Fragment],
@@ -453,5 +455,86 @@ mod tests {
             stale.is_empty(),
             "fragment absent from bitmap contributes no rows"
         );
+    }
+
+    #[test]
+    fn test_selected_segments_keep_their_own_freshness() {
+        let schema = flat_test_schema();
+        let fragments = [
+            fragment_with_overlay(0, dense_overlay(vec![3], [1], 9)),
+            fragment_with_overlay(1, dense_overlay(vec![3], [2], 9)),
+        ];
+        let overlaid = overlaid_fragments(&fragments);
+        let older = segment(vec![3], 5, Some(bitmap([0])));
+        let newer = segment(vec![3], 9, Some(bitmap([1])));
+        let mut stale = HashMap::new();
+        for selected in [&newer, &older] {
+            collect_overlay_stale_rows_for_segment(selected, &overlaid, &mut stale, &schema)
+                .unwrap();
+        }
+        assert_eq!(stale, HashMap::from([(0, bitmap([1]))]));
+
+        // Selecting just the newer segment cannot inherit another segment's stale rows.
+        stale.clear();
+        collect_overlay_stale_rows_for_segment(&newer, &overlaid, &mut stale, &schema).unwrap();
+        assert!(stale.is_empty());
+
+        let withdrawn = segment(vec![3], 5, Some(RoaringBitmap::new()));
+        collect_overlay_stale_rows_for_segment(&withdrawn, &overlaid, &mut stale, &schema).unwrap();
+        assert!(
+            stale.is_empty(),
+            "empty coverage is different from unknown coverage"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::parent("outer", "outer.middle.a", true)]
+    #[case::child("outer.middle.a", "outer", true)]
+    #[case::middle("outer.middle", "outer.middle.a", true)]
+    #[case::sibling("outer.middle.a", "outer.middle.b", false)]
+    fn test_overlay_dependency_checks_agree_for_ancestors_and_siblings(
+        #[case] changed: &str,
+        #[case] indexed: &str,
+        #[case] expected: bool,
+    ) {
+        let schema = nested_struct_schema();
+        let changed = schema.field(changed).unwrap().id;
+        let indexed = schema.field(indexed).unwrap().id;
+        let overlay = dense_overlay(vec![changed], [1], 9);
+        assert_eq!(
+            overlay_affects_index(&overlay, &[indexed], 5, &schema),
+            expected
+        );
+        assert_eq!(
+            !overlay_exclusion_offsets(&[overlay], &[indexed], 5, &schema)
+                .unwrap()
+                .is_empty(),
+            expected
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::parent(0, 2, 5, true)]
+    #[case::child(2, 0, 5, true)]
+    #[case::sibling(2, 3, 5, false)]
+    #[case::incorporated(0, 2, 9, false)]
+    #[case::obsolete(-1, 2, 5, false)]
+    fn test_remap_withdraws_stale_values_before_advancing_watermark(
+        #[case] changed: i32,
+        #[case] indexed: i32,
+        #[case] source_version: u64,
+        #[case] is_stale: bool,
+    ) {
+        let schema = nested_struct_schema();
+        let fragments = [fragment_with_overlay(
+            0,
+            dense_overlay(vec![changed], [1], 9),
+        )];
+        let source = segment(vec![indexed], source_version, Some(bitmap([0, 1])));
+        let mut coverage = source.fragment_bitmap.clone().unwrap();
+        remove_overlay_stale_frags(&mut coverage, &fragments, &source, &schema);
+        assert_eq!(coverage.contains(0), !is_stale);
+        assert!(coverage.contains(1));
+        assert_eq!(source.dataset_version, source_version);
     }
 }

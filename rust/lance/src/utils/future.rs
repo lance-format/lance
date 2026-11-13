@@ -47,7 +47,7 @@ impl<T: Clone> SharedPrerequisite<T> {
     {
         let cell = AsyncCell::<std::result::Result<T, String>>::shared();
         let dst = cell.clone();
-        tokio::spawn(
+        lance_core::utils::tokio::spawn(
             (async move {
                 let res = future.await;
                 dst.set(res.map_err(|err| err.to_string()));

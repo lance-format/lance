@@ -80,10 +80,9 @@ impl ScalarIndexLoader for Dataset {
             return Ok(result);
         }
 
-        let NullableIndexExprResult { lower, upper, .. } = result;
-        let lower = translate_addr_mask_to_row_ids(self, lower).await?;
-        let upper = translate_addr_mask_to_row_ids(self, upper).await?;
-        Ok(NullableIndexExprResult::new(lower, upper))
+        result
+            .try_map(|mask| translate_addr_mask_to_row_ids(self, mask))
+            .await
     }
 }
 
@@ -136,7 +135,9 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
                 }
                 mask => mask,
             };
-            NullableIndexExprResult::new(restrict(result.lower), restrict(result.upper))
+            result
+                .try_map(|mask| std::future::ready(Ok::<_, Error>(restrict(mask))))
+                .await?
         } else {
             result
         };
@@ -146,9 +147,12 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
 
 /// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
 ///
-/// Address-domain index results are always positive allow-lists (`AtMost`), so
-/// a block-list here would mean a boolean op was applied before translation,
-/// which is unsupported.
+/// Address-domain index results are almost always positive allow-lists
+/// (`AtMost`); a non-empty block-list here would mean a boolean op was
+/// applied before translation, which is unsupported. The one exception is an
+/// empty block-list (`AtLeast(empty)`, e.g. NGram's "cannot tell, scan
+/// everything" result for an untokenizable query): blocking nothing is the
+/// same set of rows in either domain, so it needs no translation.
 async fn translate_addr_mask_to_row_ids(
     dataset: &Dataset,
     mask: NullableRowAddrMask,
@@ -157,6 +161,9 @@ async fn translate_addr_mask_to_row_ids(
         NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
             translate_addr_set_to_row_ids(dataset, set).await?,
         )),
+        NullableRowAddrMask::BlockList(set) if set.is_empty() => {
+            Ok(NullableRowAddrMask::BlockList(set))
+        }
         NullableRowAddrMask::BlockList(_) => Err(Error::internal(
             "cannot translate a block-list address mask to the row-id domain",
         )),
@@ -231,13 +238,33 @@ impl ScalarIndexExec {
     /// Address-domain results are restricted before translation to stable row ids. Native
     /// row-id results can still cover other fragments, so the consumer remains responsible
     /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// Codecs can inspect this setting with [`Self::fragment_scope`].
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) {
+    /// let exec = exec.with_fragment_scope([1].into_iter().collect());
+    /// assert!(exec.fragment_scope().unwrap().contains(1));
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    /// Codecs can inspect this setting with [`Self::segment_uuids`].
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use uuid::Uuid;
+    /// # fn selected(exec: ScalarIndexExec, uuid: Uuid) {
+    /// let exec = exec.with_segment_uuids(Arc::new(HashSet::from([uuid])));
+    /// assert!(exec.segment_uuids().unwrap().contains(&uuid));
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
     }
@@ -255,6 +282,20 @@ impl ScalarIndexExec {
     /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
+    }
+
+    /// Fragment scope used for index loading and address-to-row-ID translation.
+    /// `None` searches every selected segment. Native row-ID results are not bounded by this scope.
+    /// See [`Self::with_fragment_scope`] for an example.
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
+    /// Explicit scalar segment selection to preserve across a codec round trip.
+    /// `None` searches all committed segments whose coverage intersects the scope.
+    /// See [`Self::with_segment_uuids`] for an example.
+    pub fn segment_uuids(&self) -> Option<&Arc<HashSet<uuid::Uuid>>> {
+        self.segment_uuids.as_ref()
     }
 
     #[async_recursion]
@@ -886,7 +927,16 @@ impl MapIndexExec {
         }
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
+            // The deletion mask is shared by every batch of the stream, so apply
+            // it to an allow-list probe in place instead of copying it per batch.
+            // Other probes keep the by-value intersection.
+            row_addr_mask = match row_addr_mask {
+                RowAddrMask::AllowList(mut rows) => {
+                    rows.mask(deletion_mask);
+                    RowAddrMask::AllowList(rows)
+                }
+                probe => probe & deletion_mask.as_ref().clone(),
+            };
         }
 
         let row_id_iter = row_addr_mask
@@ -1317,8 +1367,11 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
     use arrow::record_batch::RecordBatchIterator;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, UInt64Array, cast::AsArray, record_batch,
+    };
     use arrow_schema::Schema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::{
         error::DataFusionError,
         execution::{
@@ -1331,9 +1384,11 @@ mod tests {
     };
     use futures::TryStreamExt;
     use lance_core::{
+        ROW_ID,
         deepsize::DeepSizeOf,
         utils::{address::RowAddress, tempfile::TempStrDir},
     };
+    use lance_datafusion::exec::OneShotExec;
     use lance_datafusion::utils::{
         MetricsExt, SCALAR_INDEX_MAX_ALLOWED_METRIC, SCALAR_INDEX_MAX_BLOCKED_METRIC,
         SCALAR_INDEX_MIN_ALLOWED_METRIC, SCALAR_INDEX_MIN_BLOCKED_METRIC,
@@ -1341,23 +1396,35 @@ mod tests {
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
+        metrics::NoOpMetricsCollector,
         scalar::{
-            SargableQuery, ScalarIndexParams,
-            expression::{ScalarIndexExpr, ScalarIndexSearch},
+            BuiltinIndexType, SargableQuery, ScalarIndexParams,
+            expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+            zonemap::ZoneMapIndexBuilderParams,
         },
     };
-    use lance_select::{RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat};
+    use lance_select::{
+        NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrTreeMap,
+        RowSetOps, result::IndexExprResultWireFormat,
+    };
+    use rstest::rstest;
 
     use crate::{
         Dataset,
-        dataset::WriteParams,
+        dataset::{
+            WriteParams,
+            optimize::{CompactionOptions, compact_files},
+        },
         io::exec::scalar_index::MaterializeIndexExec,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
+        utils::test::{
+            DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture,
+            copy_test_data_to_tmp,
+        },
     };
 
     use super::{
         DistinctRowAddrs, MAP_INDEX_CANDIDATES_MEMORY_CONSUMER, MapIndexExec,
-        ROW_ADDR_INSERT_RESERVATION_BYTES, ScalarIndexExec,
+        ROW_ADDR_INSERT_RESERVATION_BYTES, ScalarIndexExec, ScopedScalarIndexLoader,
     };
 
     struct TestFixture {
@@ -1576,6 +1643,230 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(row_ids, vec![6, 8]);
+
+        let mut nulls = RowAddrTreeMap::new();
+        nulls.insert(RowAddress::new_from_parts(fragment_id, 3).into());
+        let mask = NullableRowAddrMask::AllowList(NullableRowAddrSet::new(partial_fragment, nulls));
+        let exact = dataset
+            .row_addr_result_to_row_ids(NullableIndexExprResult::exact(mask.clone()))
+            .await
+            .unwrap();
+        assert!(exact.is_exact());
+        assert!(exact.lower.selected(6));
+        assert!(!exact.lower.selected(8));
+        let NullableRowAddrMask::AllowList(set) = &exact.lower else {
+            unreachable!()
+        };
+        assert!(set.null_rows().contains(8));
+
+        let interval = dataset
+            .row_addr_result_to_row_ids(NullableIndexExprResult::at_most(mask.clone()))
+            .await
+            .unwrap();
+        assert!(!interval.is_exact());
+        assert!(!interval.lower.selected(6));
+        assert!(interval.upper.selected(6));
+
+        let scope = [0].into_iter().collect();
+        let loader = ScopedScalarIndexLoader {
+            dataset: &dataset,
+            fragments: Some(&scope),
+            segment_uuids: None,
+        };
+        let scoped = loader
+            .row_addr_result_to_row_ids(NullableIndexExprResult::exact(mask))
+            .await
+            .unwrap();
+        assert!(scoped.is_exact());
+        assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
+    }
+
+    /// An empty block-list (e.g. NGram's "cannot tell, scan everything" result
+    /// for an untokenizable query -- see `test_basic_ngram_index`'s "too short"
+    /// cases) blocks the same set of rows in either domain, so it passes
+    /// through unchanged; any other block-list is unsupported and must error.
+    #[tokio::test]
+    async fn test_translate_addr_mask_to_row_ids_block_list() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..4).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::empty());
+        let translated = super::translate_addr_mask_to_row_ids(&dataset, empty)
+            .await
+            .unwrap();
+        assert!(matches!(
+            translated,
+            NullableRowAddrMask::BlockList(set) if set.is_empty()
+        ));
+
+        let mut selected = RowAddrTreeMap::new();
+        selected.insert(RowAddress::new_from_parts(0, 0).into());
+        let non_empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::new(
+            selected,
+            RowAddrTreeMap::new(),
+        ));
+        let err = super::translate_addr_mask_to_row_ids(&dataset, non_empty)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot translate a block-list address mask"),
+            "{err}"
+        );
+    }
+
+    #[rstest]
+    #[case::deleted(false)]
+    #[case::compacted(true)]
+    #[tokio::test]
+    async fn nullable_prefilter_preserves_sql_semantics(#[case] compact: bool) {
+        let zone: Vec<Option<i32>> = (0..24).map(|id| (id % 6 >= 3).then_some(id / 6)).collect();
+        let batch = record_batch!(
+            ("id", Int32, (0..24).collect::<Vec<_>>()),
+            ("zone", Int32, zone.clone())
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 6,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (1, 9)").await.unwrap();
+        if compact {
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+            assert_eq!(dataset.fragments().len(), 1);
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::to_value(ZoneMapIndexBuilderParams::new(3)).unwrap());
+        dataset
+            .create_index(&["zone"], IndexType::ZoneMap, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        type Predicate = fn(i32, Option<i32>) -> bool;
+        let cases: &[(&str, Predicate)] = &[
+            ("zone IS NULL", |_, value| value.is_none()),
+            ("zone IS NOT NULL", |_, value| value.is_some()),
+            ("zone = 1", |_, value| value == Some(1)),
+            ("zone = 99", |_, value| value == Some(99)),
+            ("zone >= 0 OR zone IS NULL", |_, _| true),
+            (
+                "(zone IS NULL AND id >= 8) OR (zone > 1 AND id < 20)",
+                |id, value| {
+                    (value.is_none() && id >= 8) || (value.is_some_and(|v| v > 1) && id < 20)
+                },
+            ),
+            ("NOT (zone = 1 OR id < 4)", |id, value| {
+                value.is_some_and(|v| v != 1) && id >= 4
+            }),
+        ];
+        for (filter, predicate) in cases {
+            let expected: Vec<i32> = (0..24)
+                .filter(|id| ![1, 9].contains(id) && predicate(*id, zone[*id as usize]))
+                .collect();
+            let mut scanner = dataset.scan();
+            scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndex"), "{filter}: {plan}");
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut actual = batch["id"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{filter}, compact={compact}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nullable_prefilter_combines_address_and_row_id_indices() {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::to_value(ZoneMapIndexBuilderParams::new(1)).unwrap());
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::ZoneMap,
+                Some("value_zonemap".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let old =
+            ScalarIndexLoader::load_index(&dataset, "value", "value_idx", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let current = ScalarIndexLoader::load_index(
+            &dataset,
+            "value",
+            "value_zonemap",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert!(!old.results_are_row_addresses());
+        assert!(current.results_are_row_addresses());
+        let query = |name: &str, index_type: &str, query: SargableQuery| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "value".into(),
+                index_name: name.into(),
+                index_type: index_type.into(),
+                query: Arc::new(query),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })
+        };
+        let range = query(
+            "value_idx",
+            "BTree",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(9))),
+                Bound::Excluded(ScalarValue::Int32(Some(12))),
+            ),
+        );
+        let nulls = query("value_zonemap", "ZoneMap", SargableQuery::IsNull());
+        let expression = ScalarIndexExpr::Or(Box::new(range), Box::new(nulls));
+        let result = expression
+            .evaluate_nullable(&dataset, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact());
+        for id in 0..16 {
+            assert_eq!(result.lower.selected(id), [0, 8, 9, 10, 11].contains(&id));
+            assert_eq!(result.upper.selected(id), [0, 8, 9, 10, 11].contains(&id));
+        }
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
@@ -1687,6 +1978,54 @@ mod tests {
         // Negating it turns both bounds into block lists of the same rows
         let bounds = run(ScalarIndexExpr::Not(Box::new(less_than_47))).await;
         assert_eq!(bounds, [None, Some(47), None, Some(47)]);
+    }
+
+    /// Every batch of the stream applies the shared deletion mask: deleted
+    /// keys in any batch produce no candidates.
+    #[tokio::test]
+    async fn test_map_index_exec_drops_deleted_rows_in_every_batch() {
+        let mut dataset = gen_batch()
+            .col("key", lance_datagen::array::step::<UInt64Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset.delete("key % 2 = 0").await.unwrap();
+
+        let batches = [vec![0_u64, 1, 2, 3], vec![10, 11, 12, 13]]
+            .map(|keys| Ok(record_batch!(("key", UInt64, keys)).unwrap()));
+        let schema = batches[0].as_ref().unwrap().schema();
+        let input = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ))));
+        let plan = MapIndexExec::new(
+            Arc::new(dataset),
+            "key".to_string(),
+            "key_idx".to_string(),
+            input,
+        );
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut row_ids = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, vec![1, 3, 11, 13]);
     }
 
     #[test]
