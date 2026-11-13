@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use lance_core::datatypes::Schema;
+use lance_core::memory::{Component, register_component};
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
@@ -146,6 +147,16 @@ pub(super) fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &Writer
         // Oldest first, so the front of the queue is what a waiter parks on.
         oldest_flush: state.frozen_flush_watchers.front().cloned(),
     }));
+}
+
+/// The bytes a MemTable-mode writer holds, for the memory gauges.
+fn memtable_retained_bytes(memory: &ArcSwap<ResidentMemTables>) -> u64 {
+    ShardMemory::retained_in(&memory.load()) as u64
+}
+
+/// The bytes a WAL-only writer holds, for the memory gauges.
+fn wal_queue_bytes(state: &WalOnlyState) -> u64 {
+    state.queue_bytes() as u64
 }
 
 /// ShardWriter state shared across tasks.
@@ -1267,6 +1278,7 @@ impl ShardWriter {
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
 
         let memory = Arc::new(ArcSwap::<ResidentMemTables>::default());
+        register_component(Component::MemWal, &memory, memtable_retained_bytes);
 
         let state = WriterState {
             memtable,
@@ -1408,6 +1420,7 @@ impl ShardWriter {
         // no-interval); a non-durable writer may pass no interval and rely on
         // the size/close triggers alone.
         let state = Arc::new(WalOnlyState::default());
+        register_component(Component::MemWal, &state, wal_queue_bytes);
 
         // Background WAL flush handler — no MemTable state to consult, so
         // pass `None` for the frozen-vs-active detection; the pending queue and
