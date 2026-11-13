@@ -107,7 +107,7 @@ impl ManifestCursor {
 struct Run {
     id: u64,
     size: u64,
-    manifest: Arc<dyn IndexReader>,
+    terms: usize,
     docs: usize,
     rank: usize,
     dictionary_bytes: u64,
@@ -388,7 +388,7 @@ impl FinalMerge {
             runs.push(Run {
                 id,
                 size,
-                manifest,
+                terms: manifest.num_rows(),
                 docs,
                 rank,
                 dictionary_bytes,
@@ -535,9 +535,7 @@ impl FinalMerge {
             metadata_bytes = metadata_bytes
                 .checked_add(4096)
                 .and_then(|bytes| bytes.checked_add(run.dictionary_bytes.saturating_mul(6)))
-                .and_then(|bytes| {
-                    bytes.checked_add((run.manifest.num_rows() as u64).saturating_mul(32))
-                })
+                .and_then(|bytes| bytes.checked_add((run.terms as u64).saturating_mul(32)))
                 .and_then(|bytes| bytes.checked_add((run.docs as u64).saturating_mul(16)))
                 .ok_or_else(|| Error::index("FTS merge metadata size overflow"))?;
         }
@@ -552,7 +550,7 @@ impl FinalMerge {
                 .open_index_file(&self.target.token_path(run.id))
                 .await?;
             let dictionary = TokenSet::load(reader, self.token_format).await?;
-            if dictionary.len() != run.manifest.num_rows() {
+            if dictionary.len() != run.terms {
                 return Err(Error::index(
                     "FTS run dictionary and resource manifest lengths differ",
                 ));
@@ -561,10 +559,18 @@ impl FinalMerge {
         }
         let read_limit = self.budget / (8 * runs.len() as u64);
         let work_limit = self.budget / 4;
-        let mut manifests = runs
-            .iter()
-            .map(|run| ManifestCursor::new(run.manifest.clone()))
-            .collect::<Vec<_>>();
+        let mut manifests = Vec::with_capacity(runs.len());
+        for run in runs {
+            check_running(&self.stop)?;
+            let reader = self
+                .store
+                .open_index_file(&manifest_path(self.target, run.id))
+                .await?;
+            if reader.num_rows() != run.terms {
+                return Err(Error::index("FTS run manifest changed after planning"));
+            }
+            manifests.push(ManifestCursor::new(reader));
+        }
         let mut terms = Terms::new(&tokens)?;
         let mut count = 0u64;
         // Validate every hot term before creating output or reading posting
@@ -644,7 +650,7 @@ impl FinalMerge {
             if input_schema != *schema {
                 return Err(Error::index("FTS run posting schemas differ"));
             }
-            if reader.num_rows() != run.manifest.num_rows() {
+            if reader.num_rows() != run.terms {
                 return Err(Error::index("FTS run posting and manifest lengths differ"));
             }
             postings.push(PostingCursor {

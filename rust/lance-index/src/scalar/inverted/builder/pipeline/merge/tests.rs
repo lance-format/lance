@@ -250,6 +250,8 @@ struct Probe {
     fault: Fault,
     reads: std::sync::atomic::AtomicUsize,
     writes: std::sync::atomic::AtomicUsize,
+    manifest_live: std::sync::atomic::AtomicUsize,
+    manifest_peak: std::sync::atomic::AtomicUsize,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -268,6 +270,8 @@ impl ProbeStore {
                 fault,
                 reads: Default::default(),
                 writes: Default::default(),
+                manifest_live: Default::default(),
+                manifest_peak: Default::default(),
                 started: Default::default(),
                 release: Default::default(),
             }),
@@ -327,10 +331,16 @@ impl IndexStore for ProbeStore {
     }
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let reader = self.inner.open_index_file(name).await?;
-        if name.ends_with("invert.lance") {
+        let is_manifest = name.ends_with(".merge.lance");
+        if is_manifest || name.ends_with("invert.lance") {
+            if is_manifest {
+                let live = self.probe.manifest_live.fetch_add(1, Ordering::Relaxed) + 1;
+                self.probe.manifest_peak.fetch_max(live, Ordering::Relaxed);
+            }
             Ok(Arc::new(ProbeReader {
                 inner: reader,
                 probe: self.probe.clone(),
+                is_manifest,
             }))
         } else {
             Ok(reader)
@@ -353,6 +363,15 @@ impl IndexStore for ProbeStore {
 struct ProbeReader {
     inner: Arc<dyn IndexReader>,
     probe: Arc<Probe>,
+    is_manifest: bool,
+}
+
+impl Drop for ProbeReader {
+    fn drop(&mut self) {
+        if self.is_manifest {
+            self.probe.manifest_live.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -370,11 +389,13 @@ impl IndexReader for ProbeReader {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
         assert!(
-            range.len() <= 128,
+            self.is_manifest || range.len() <= 128,
             "external merge must not materialize the posting file"
         );
-        self.probe.reads.fetch_add(1, Ordering::Relaxed);
-        if self.probe.fault == Fault::Read {
+        if !self.is_manifest {
+            self.probe.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        if !self.is_manifest && self.probe.fault == Fault::Read {
             return Err(Error::execution("injected final read"));
         }
         self.inner.read_range(range, projection).await
@@ -595,5 +616,31 @@ async fn arrow_dictionary_is_preserved_by_final_merge() -> Result<()> {
     for term in 0..256 {
         assert_eq!(tokens.get(&format!("term{term:04}")), Some(term));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_runs_do_not_keep_manifest_readers_alive() -> Result<()> {
+    let inner = store();
+    let mut input = WorkerOutput::default();
+    for id in 0..16 {
+        let (id, files) = write_run(
+            run(id, false, false),
+            inner.as_ref(),
+            PartitionWriteTarget::Final,
+            &Stop::default(),
+        )
+        .await?;
+        input.partitions.push(id);
+        input.files.extend(files);
+    }
+    let store = ProbeStore::new(inner, Fault::None);
+    let output = merger(Arc::new(store.clone()), false).finish(input).await?;
+    assert_eq!(output.partitions.len(), 4);
+    assert!(
+        store.probe.manifest_peak.load(Ordering::Relaxed) <= 4,
+        "idle runs retained file readers outside the admitted merge group"
+    );
+    assert_eq!(store.probe.manifest_live.load(Ordering::Relaxed), 0);
     Ok(())
 }
