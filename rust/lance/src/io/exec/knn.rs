@@ -2094,9 +2094,8 @@ impl ANNIvfSubIndexExec {
                     )
                     .await
                     .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "failed to search bounded quantized refinement candidates: {e}"
-                        ))
+                        DataFusionError::from(e)
+                            .context("failed to search bounded quantized refinement candidates")
                     })?;
                 restrict_to_segment(batch, seg_mask.as_deref())?
             } else {
@@ -2121,9 +2120,8 @@ impl ANNIvfSubIndexExec {
                     )
                     .await
                     .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "failed to discover quantized refinement candidates: {e}"
-                        ))
+                        DataFusionError::from(e)
+                            .context("failed to discover quantized refinement candidates")
                     })?;
                 let offsets = candidates
                     .candidates
@@ -2134,21 +2132,19 @@ impl ANNIvfSubIndexExec {
                     .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
                     .await
                     .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "failed to score quantized refinement candidates: {e}"
-                        ))
+                        DataFusionError::from(e)
+                            .context("failed to score quantized refinement candidates")
                     })?;
                 let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
                 quantized_top_k(&scored, &query).map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "failed to select quantized refinement results: {e}"
-                    ))
+                    DataFusionError::from(e)
+                        .context("failed to select quantized refinement results")
                 })?
             }
         } else {
             let batch = index
                 .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
-                .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {e}")))
+                .map_err(|e| DataFusionError::from(e).context("Failed to calculate KNN"))
                 .await?;
             restrict_to_segment(batch, seg_mask.as_deref())?
         };
@@ -2315,7 +2311,7 @@ impl ANNIvfSubIndexExec {
                         )
                         .await
                         .map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to search partitions: {e}"))
+                            DataFusionError::from(e).context("Failed to search partitions")
                         })?;
                     Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
                         Self::instrument_sequential_partition_stream(
@@ -2404,9 +2400,7 @@ impl ANNIvfSubIndexExec {
                         index_metrics,
                     )
                     .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to search partitions: {e}"))
-                    })?;
+                    .map_err(|e| DataFusionError::from(e).context("Failed to search partitions"))?;
                 Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
                     Self::instrument_sequential_partition_stream(
                         stream.boxed(),
@@ -2948,9 +2942,11 @@ mod tests {
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizationType;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
     use lance_index::{Index, IndexType};
@@ -2986,6 +2982,87 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         }
+    }
+
+    #[rstest]
+    #[case::sequential(1)]
+    #[case::parallel(2)]
+    #[tokio::test]
+    async fn hnsw_input_errors_survive_ann_execution(#[case] parallelism: i32) {
+        let batches = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(4)),
+            )
+            .into_reader_rows(RowCount::from(16), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            batches,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            4,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap(),
+            HnswBuildParams::default().num_edges(4).ef_construction(8),
+            SQBuildParams::default(),
+        );
+        Box::pin(dataset.create_index(&["vector"], IndexType::Vector, None, &params, true))
+            .await
+            .unwrap();
+        let key = Float32Array::from(vec![0.1; 4]);
+        let mut invalid = dataset.scan();
+        invalid
+            .nearest("vector", &key, 8)
+            .unwrap()
+            .minimum_nprobes(2)
+            .query_parallelism(parallelism)
+            .ef(1);
+        let error = Box::pin(invalid.try_into_batch()).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("ef=1, k=8"), "{error}");
+
+        let mut valid = dataset.scan();
+        valid
+            .nearest("vector", &key, 8)
+            .unwrap()
+            .minimum_nprobes(2)
+            .query_parallelism(parallelism)
+            .ef(8)
+            .with_row_id();
+        let result = Box::pin(valid.try_into_batch()).await.unwrap();
+        let mut exact = dataset.scan();
+        exact
+            .nearest("vector", &key, 8)
+            .unwrap()
+            .use_index(false)
+            .with_row_id();
+        let truth = Box::pin(exact.try_into_batch()).await.unwrap();
+        let truth = truth
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let found = result
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let hits = found
+            .values()
+            .iter()
+            .filter(|row| truth.values().contains(row))
+            .count();
+        assert_eq!(result.num_rows(), 8);
+        assert!(hits as f32 / 8.0 >= 0.5, "recall below 0.5: {hits}/8");
     }
 
     #[rstest]
