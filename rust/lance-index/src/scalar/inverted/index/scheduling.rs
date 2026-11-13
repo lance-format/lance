@@ -81,7 +81,7 @@ where
 }
 
 /// Consume ready inputs before unrelated reads finish. The caller retains its
-/// original bounded I/O window; at most one CPU batch and one pending input
+/// original bounded I/O window; at most two CPU batches and one pending input
 /// are retained here. The byte target bounds queued cache references, not RSS
 /// or the upstream decoder's working memory.
 pub(super) async fn score_ready_partitions<T, R, S, W, F>(
@@ -102,10 +102,7 @@ where
             let score = score.clone();
             async move { spawn_cpu(move || score(loaded)).await }
         })
-        // Each original window already supplies concurrent I/O, and concurrent
-        // windows and searches supply CPU work. Queuing another batch here pins
-        // loaded position streams while the shared CPU pool is saturated.
-        .try_buffer_unordered(1)
+        .try_buffer_unordered(2)
         .try_concat()
         .await
 }
@@ -233,7 +230,7 @@ mod tests {
         .unwrap();
         result.sort_unstable();
         assert_eq!(result, (0..33).collect::<Vec<_>>());
-        assert!(peak.load(Ordering::Relaxed) <= 4);
+        assert!(peak.load(Ordering::Relaxed) <= 8);
         assert_eq!(live.load(Ordering::Relaxed), 0);
     }
 
@@ -309,8 +306,8 @@ mod tests {
         .unwrap();
         result.sort_unstable();
         assert_eq!(result, (0..17).collect::<Vec<_>>());
-        // One submitted batch plus the next partition that did not fit.
-        assert!(peak.load(Ordering::Relaxed) <= 2 * bytes);
+        // Two submitted batches plus the next partition that did not fit.
+        assert!(peak.load(Ordering::Relaxed) <= 3 * bytes);
         assert_eq!(live.load(Ordering::Relaxed), 0);
     }
 
