@@ -6154,14 +6154,16 @@ mod tests {
             RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
         let mut builder =
             InvertedIndexBuilder::new(params).with_format_version(InvertedListFormatVersion::V3);
-        builder
+        let files = builder
             .update_index_with_pipeline(
                 document_input(Box::pin(input), "doc")?,
                 pipeline_store.as_ref(),
                 Some(config),
             )
             .await?;
-        builder.write(pipeline_store.as_ref()).await?;
+        builder
+            .write(pipeline_store.as_ref(), files, FinalizeOptions::default())
+            .await?;
         let reference = InvertedIndex::load(reference_store, None, &LanceCache::no_cache()).await?;
         let actual = InvertedIndex::load(pipeline_store, None, &LanceCache::no_cache()).await?;
         if all_null || docs_per_fragment == 0 {
