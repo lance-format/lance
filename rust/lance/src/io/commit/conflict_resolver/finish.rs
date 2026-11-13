@@ -44,7 +44,12 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            | Operation::UpdateBases { .. }
+            // An action set needs no rewriting to move to a newer version: its
+            // minted ids are allocated when the actions are applied, against
+            // whichever manifest they land on, and its committed references
+            // name coordinates that do not move.
+            | Operation::CompositeOperation(_) => Ok(self.transaction),
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",
