@@ -122,9 +122,12 @@ fn load(path: &Path, codec: PositionStreamCodec) -> Result<SharedPositionStream>
             return Err(std::io::Error::last_os_error().into());
         }
         let pointer = NonNull::new(pointer.cast::<u8>()).expect("non-null mmap region");
-        // Disable speculative sequential readahead for the sparse access candidate.
-        let result =
-            unsafe { libc::madvise(pointer.as_ptr().cast(), directory.length, libc::MADV_RANDOM) };
+        let advice = match std::env::var("FTS_RESEARCH_POSITIONS_MODE").as_deref() {
+            Ok("map-normal") => libc::MADV_NORMAL,
+            Ok("map-sequential") => libc::MADV_SEQUENTIAL,
+            _ => libc::MADV_RANDOM,
+        };
+        let result = unsafe { libc::madvise(pointer.as_ptr().cast(), directory.length, advice) };
         if result != 0 {
             unsafe {
                 libc::munmap(pointer.as_ptr().cast(), directory.length);
@@ -138,6 +141,7 @@ fn load(path: &Path, codec: PositionStreamCodec) -> Result<SharedPositionStream>
     };
     // Keep existing cache accounting conservative: full logical bytes, not a zero
     // weight for mmap. Actual RSS/page-cache occupancy is independently measured.
+    trace_term(&bytes, path.to_str().unwrap(), 0);
     Ok(SharedPositionStream::new(codec, directory.offsets, bytes))
 }
 
@@ -146,10 +150,44 @@ pub(super) fn read_mapped(
     token: u32,
     codec: PositionStreamCodec,
 ) -> Result<Option<SharedPositionStream>> {
-    if !std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| m == "map") {
+    if !std::env::var("FTS_RESEARCH_POSITIONS_MODE")
+        .is_ok_and(|m| matches!(m.as_str(), "map" | "map-normal" | "map-sequential"))
+    {
         return Ok(None);
     }
     Ok(Some(load(&location(source, token)?, codec)?))
+}
+
+// Traces run separately from performance measurements. No per-block output is
+// written in ordinary runs; all modes share the same disabled cached check.
+fn trace(value: serde_json::Value) {
+    static OUTPUT: std::sync::OnceLock<Option<std::sync::Mutex<fs::File>>> =
+        std::sync::OnceLock::new();
+    if let Some(output) = OUTPUT.get_or_init(|| {
+        std::env::var_os("FTS_RESEARCH_POSITION_TRACE").map(|path| {
+            std::sync::Mutex::new(fs::File::create(path).expect("create research trace"))
+        })
+    }) {
+        use std::io::Write;
+        let mut file = output.lock().unwrap();
+        writeln!(file, "{value}").expect("write research trace");
+    }
+}
+fn tracing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FTS_RESEARCH_POSITION_TRACE").is_some())
+}
+pub(super) fn trace_term(bytes: &bytes::Bytes, source: &str, token: u32) {
+    if tracing_enabled() {
+        trace(
+            serde_json::json!({"event":"term","pointer":bytes.as_ptr() as usize,"source":source,"token":token,"length":bytes.len()}),
+        );
+    }
+}
+pub(super) fn trace_block(pointer: usize, start: usize, end: usize) {
+    if tracing_enabled() {
+        trace(serde_json::json!({"event":"block","pointer":pointer,"start":start,"end":end}));
+    }
 }
 
 #[cfg(test)]

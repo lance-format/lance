@@ -1028,6 +1028,8 @@ impl PostingListReader {
                     super::research_positions::export(
                         self.research_path.as_deref(), token_id, &block_offsets, &bytes,
                     )?;
+                    #[cfg(feature = "fts-format-research")]
+                    super::research_positions::trace_term(&bytes, self.research_path.as_deref().unwrap_or("unknown"), token_id);
                     CompressedPositionStorage::SharedStream(SharedPositionStream::new(
                         codec,
                         block_offsets,
