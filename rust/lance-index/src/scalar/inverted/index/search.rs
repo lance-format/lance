@@ -1154,23 +1154,18 @@ impl InvertedIndex {
                             )))
                         }
                     });
-                    let loaded = stream::iter(loads)
-                        .buffer_unordered(io_parallelism)
-                        .try_collect::<Vec<_>>()
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
-                    if loaded.is_empty() {
-                        return Result::Ok(Vec::new());
-                    }
-
-                    // Iterators are built here rather than during the load so
-                    // their decode buffers are allocated and freed by the same
-                    // thread that runs WAND.
-                    let results = spawn_cpu(move || {
+                    let loads = stream::iter(loads).buffer_unordered(io_parallelism);
+                    let tokens = tokens.clone();
+                    let params = params.clone();
+                    let metrics = metrics.clone();
+                    // Score ready partitions before an unrelated slow read completes.
+                    // Hot loads still form full batches; decoding stays on the CPU
+                    // thread that allocates and frees its scratch buffers.
+                    super::scheduling::score_ready_partitions(loads, chunk_size, move |loaded| {
                         let mut results = Vec::with_capacity(loaded.len());
-                        for (partition_ordinal, part, lengths, visibility, postings) in loaded {
+                        for (partition_ordinal, part, lengths, visibility, postings) in
+                            loaded.into_iter().flatten()
+                        {
                             let LoadedPostings {
                                 postings,
                                 grouped_expansions,
@@ -1217,8 +1212,7 @@ impl InvertedIndex {
                         }
                         Result::Ok(results)
                     })
-                    .await?;
-                    Result::Ok(results)
+                    .await
                 }
             })
             .collect::<Vec<_>>();

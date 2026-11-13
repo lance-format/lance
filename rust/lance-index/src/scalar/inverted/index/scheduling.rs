@@ -3,7 +3,35 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::{Stream, TryStreamExt};
+use lance_core::{Result, utils::tokio::spawn_cpu};
+
 use super::format::{DEFAULT_FTS_SEARCH_CHUNK, configured_fts_search_chunk};
+
+/// Score loaded partitions without waiting for unrelated remote reads. At most
+/// two CPU batches per load window overlap, keeping both stages bounded.
+pub(super) async fn score_ready_partitions<T, R, S, F>(
+    loads: S,
+    chunk_size: usize,
+    score: F,
+) -> Result<Vec<R>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    S: Stream<Item = Result<T>>,
+    F: Fn(Vec<T>) -> Result<Vec<R>> + Clone + Send + 'static,
+{
+    loads
+        .try_ready_chunks(chunk_size)
+        .map_err(|error| error.1)
+        .map_ok(move |loaded| {
+            let score = score.clone();
+            spawn_cpu(move || score(loaded))
+        })
+        .try_buffer_unordered(2)
+        .try_concat()
+        .await
+}
 
 /// Preserve the original partition-load window when scoring batches shrink.
 pub(super) fn buffered_search_chunks(
@@ -67,6 +95,85 @@ impl Drop for SearchGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn ready_partition_scores_before_pending_load() {
+        let scored = std::sync::Arc::new(AtomicUsize::new(0));
+        let progress = scored.clone();
+        let loads = futures::stream::once(async { Ok(7) }).chain(futures::stream::once(async {
+            // Model a remote read that cannot complete until already loaded
+            // work has released its resources.
+            while progress.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+            Ok(11)
+        }));
+        let mut result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            score_ready_partitions(loads, 16, move |items| {
+                scored.fetch_add(items.len(), Ordering::Release);
+                Ok(items)
+            }),
+        )
+        .await
+        .expect("ready partitions must score without waiting for the whole load window")
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, vec![7, 11]);
+    }
+
+    #[tokio::test]
+    async fn ready_batches_bound_retained_inputs() {
+        struct Input(std::sync::Arc<AtomicUsize>, usize);
+        impl Drop for Input {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let loads = futures::stream::iter(0..33).map(|id| {
+            let count = live.fetch_add(1, Ordering::Relaxed) + 1;
+            peak.fetch_max(count, Ordering::Relaxed);
+            Ok(Input(live.clone(), id))
+        });
+        let mut result = score_ready_partitions(loads, 4, |items| {
+            assert!(items.len() <= 4);
+            Ok(items.into_iter().map(|item| item.1).collect())
+        })
+        .await
+        .unwrap();
+        result.sort_unstable();
+        assert_eq!(result, (0..33).collect::<Vec<_>>());
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+        assert!(peak.load(Ordering::Relaxed) <= 8);
+    }
+
+    #[tokio::test]
+    async fn ready_batches_preserve_errors_and_empty_input() {
+        let empty = futures::stream::empty::<Result<usize>>();
+        let result: Vec<usize> = score_ready_partitions(empty, 4, |_| {
+            panic!("empty input must not dispatch a CPU task")
+        })
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+
+        let loads = futures::stream::iter([Ok(7), Err(lance_core::Error::io("load failed"))]);
+        let error = score_ready_partitions(loads, 4, Ok).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::IO { .. }));
+        assert!(error.to_string().contains("load failed"));
+
+        let loads = futures::stream::iter([Ok(7)]);
+        let error = score_ready_partitions::<_, usize, _, _>(loads, 4, |_| {
+            Err(lance_core::Error::index("score failed"))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::Index { .. }));
+        assert!(error.to_string().contains("score failed"));
+    }
 
     #[rstest::rstest]
     #[case::remote(128, 2, 32, 128, 128)]
