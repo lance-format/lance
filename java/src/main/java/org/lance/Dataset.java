@@ -1085,8 +1085,19 @@ public class Dataset implements Closeable {
   /**
    * Get one page of the version history of the dataset.
    *
-   * @param offset the number of versions to skip
-   * @param limit the maximum number of versions to return, or empty for all remaining versions
+   * <p>Versions are ordered ascending by version, or descending when {@code descending} is true.
+   * Detached versions are never part of the history, and only the manifests in the returned page
+   * are read.
+   *
+   * <p>On a lexically ordered store with V2 manifest paths, a descending page stops listing once
+   * {@code offset + limit} manifest entries have been observed. Ascending pages, V1 manifest paths,
+   * and stores without lexically ordered listings enumerate every manifest location before
+   * selecting the page.
+   *
+   * @param offset the number of versions to skip; an offset past the end of the history returns an
+   *     empty list
+   * @param limit the maximum number of versions to return, or empty for every remaining version;
+   *     zero returns an empty list without listing or reading any manifest
    * @param descending whether to return the newest version first
    * @return the requested page of versions
    */

@@ -3266,14 +3266,33 @@ impl Dataset {
         self.session.deep_size_of() as u64
     }
 
-    /// Get all versions.
+    /// Get all versions, in ascending order.
+    ///
+    /// Every manifest in the history is read. Use [`Self::versions_with_options`] to
+    /// read only a page, or [`Self::count_versions`] to avoid reading manifests at all.
     pub async fn versions(&self) -> Result<Vec<Version>> {
         self.versions_with_options(0, None, false).await
     }
 
-    /// Get a page of versions in the current version history.
+    /// Get one page of versions in the current version history.
     ///
-    /// Only the manifests for the requested page are read.
+    /// Versions are ordered ascending by version, or descending when `descending`
+    /// is true. `offset` is the number of versions to skip and `limit` is the
+    /// maximum number to return, so `versions_with_options(0, None, false)` is the
+    /// whole history. `None` means no limit, `Some(0)` returns an empty page without
+    /// listing or reading any manifest, and an `offset` past the end of the history
+    /// returns an empty page. Detached versions are never part of the history.
+    ///
+    /// Only the manifests in the returned page are read, concurrently within the
+    /// store's effective IO window.
+    ///
+    /// With `descending` on a store whose listing is lexically ordered and whose
+    /// manifests are V2 paths, listing stops after `offset + limit` manifest entries
+    /// have been observed, so a page near the newest version does not enumerate the
+    /// history. Every other case (ascending pages, V1 manifest paths, or a listing
+    /// that is not lexically ordered) enumerates every manifest location before
+    /// selecting the page. These are listing-entry bounds: a store may still
+    /// materialize more keys, or issue more requests, than the entries it yields.
     pub async fn versions_with_options(
         &self,
         offset: usize,

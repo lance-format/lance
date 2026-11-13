@@ -41,6 +41,7 @@ use tokio::sync::Barrier;
 
 use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_data_to_tmp};
+use futures::StreamExt as _;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use lance_core::Error;
@@ -3995,10 +3996,14 @@ async fn test_branch() {
 }
 
 /// Delays every read under `_versions/` and records how many are in flight at once.
+///
+/// Also counts the manifest entries each listing actually yields, which is what a
+/// consumer can stop early on; the store may still have materialized every key.
 #[derive(Debug, Default)]
 struct ManifestReadProbe {
     in_flight: Arc<AtomicUsize>,
     peak_in_flight: Arc<AtomicUsize>,
+    listed_manifests: Arc<AtomicUsize>,
 }
 
 impl lance_io::object_store::WrappingObjectStore for ManifestReadProbe {
@@ -4007,6 +4012,7 @@ impl lance_io::object_store::WrappingObjectStore for ManifestReadProbe {
             inner: original,
             in_flight: self.in_flight.clone(),
             peak_in_flight: self.peak_in_flight.clone(),
+            listed_manifests: self.listed_manifests.clone(),
         })
     }
 
@@ -4024,6 +4030,7 @@ struct ManifestReadProbeStore {
     inner: Arc<dyn OSObjectStore>,
     in_flight: Arc<AtomicUsize>,
     peak_in_flight: Arc<AtomicUsize>,
+    listed_manifests: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Display for ManifestReadProbeStore {
@@ -4072,7 +4079,21 @@ impl OSObjectStore for ManifestReadProbeStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        let listed_manifests = self.listed_manifests.clone();
+        self.inner
+            .list(prefix)
+            .map(move |entry| {
+                // Count the entries `list_manifests` accepts, not every key in the
+                // directory, and only once the stream yields them.
+                if entry
+                    .as_ref()
+                    .is_ok_and(|meta| ManifestLocation::try_from(meta.clone()).is_ok())
+                {
+                    listed_manifests.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                entry
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
@@ -4130,6 +4151,116 @@ async fn test_versions_reads_manifests_concurrently() {
             "manifests were read one at a time despite an effective window of {effective_window}"
         );
     }
+}
+
+/// A descending page on a lexically ordered store with V2 manifest names stops
+/// consuming the listing once the page is filled.
+#[tokio::test]
+async fn test_versions_descending_page_stops_listing_early() {
+    let dataset = write_versions("memory://", 5, true).await;
+    let probe = Arc::new(ManifestReadProbe::default());
+    let dataset = dataset.with_object_store_wrappers(vec![
+        probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+    ]);
+
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    let page = dataset
+        .versions_with_options(1, Some(2), true)
+        .await
+        .unwrap();
+    assert_eq!(version_ids(&page), vec![4, 3]);
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        3,
+        "a descending page of 2 at offset 1 should stop after 3 manifest entries"
+    );
+
+    // A zero limit returns without listing at all.
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    assert!(
+        dataset
+            .versions_with_options(0, Some(0), true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        0,
+        "a zero limit must not list any manifest"
+    );
+
+    // Ascending pages select from the full history, so they enumerate it.
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    let page = dataset
+        .versions_with_options(3, Some(2), false)
+        .await
+        .unwrap();
+    assert_eq!(version_ids(&page), vec![4, 5]);
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        5,
+        "an ascending page must enumerate every manifest location"
+    );
+}
+
+/// When the listing cannot stop early (V1 names, or a store whose listing is not
+/// lexically ordered) the descending page still selects the same versions, but it
+/// consumes the whole directory in order to sort it.
+#[rstest]
+#[case::v1_naming(false, false)]
+#[case::local_store(true, true)]
+#[tokio::test]
+async fn test_versions_descending_page_enumerates_all_when_it_cannot_stop_early(
+    #[case] local_store: bool,
+    #[case] enable_v2_manifest_paths: bool,
+) {
+    let temp_dir = TempStrDir::default();
+    let uri = if local_store {
+        temp_dir.as_str().to_string()
+    } else {
+        "memory://".to_string()
+    };
+    let dataset = write_versions(&uri, 5, enable_v2_manifest_paths).await;
+    let probe = Arc::new(ManifestReadProbe::default());
+    let dataset = dataset.with_object_store_wrappers(vec![
+        probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+    ]);
+    let context =
+        format!("local_store={local_store}, enable_v2_manifest_paths={enable_v2_manifest_paths}");
+
+    probe.listed_manifests.store(0, AtomicOrdering::SeqCst);
+    let page = dataset
+        .versions_with_options(1, Some(2), true)
+        .await
+        .unwrap();
+    assert_eq!(version_ids(&page), vec![4, 3], "{context}");
+    assert_eq!(
+        probe.listed_manifests.load(AtomicOrdering::SeqCst),
+        5,
+        "the page is selected by sorting, so every entry is consumed: {context}"
+    );
+}
+
+fn version_ids(versions: &[crate::dataset::Version]) -> Vec<u64> {
+    versions.iter().map(|version| version.version).collect()
+}
+
+async fn write_versions(uri: &str, count: i32, enable_v2_manifest_paths: bool) -> Dataset {
+    let mut dataset = Dataset::write(
+        id_rows(0, 1),
+        uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for i in 1..count {
+        dataset.append(id_rows(i, 1), None).await.unwrap();
+    }
+    dataset
 }
 
 fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
