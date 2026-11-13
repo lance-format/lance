@@ -1076,6 +1076,9 @@ impl InvertedIndex {
                 )
             })
             .collect::<Vec<_>>();
+        let partition_loads = Arc::new(tokio::sync::Semaphore::new(
+            search_guard.partition_load_limit(workers),
+        ));
         let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
         let buffered_chunks = super::scheduling::buffered_search_chunks(
             searched_partitions.len(),
@@ -1097,15 +1100,20 @@ impl InvertedIndex {
                 let impact_scorer = impact_scorer.clone();
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let shared_norm_addends = shared_norm_addends.clone();
+                let partition_loads = partition_loads.clone();
                 async move {
                     let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
                         let tokens = tokens.clone();
                         let params = params.clone();
                         let mask = mask.clone();
                         let metrics = metrics.clone();
+                        let partition_loads = partition_loads.clone();
                         let partition_term_ids =
                             term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
+                            let permit = partition_loads.acquire_owned().await.map_err(|_| {
+                                Error::internal("modern FTS partition admission is closed")
+                            })?;
                             let documents = part.docs.modern().ok_or_else(|| {
                                 Error::internal("modern index contains legacy partition documents")
                             })?;
@@ -1126,7 +1134,7 @@ impl InvertedIndex {
                                 }
                             };
                             if !visibility.may_match().await? {
-                                return Result::Ok(None);
+                                return Result::Ok((None, permit));
                             }
                             let Some(postings) = part
                                 .fetch_posting_lists(
@@ -1139,19 +1147,16 @@ impl InvertedIndex {
                                 )
                                 .await?
                             else {
-                                return Result::Ok(None);
+                                return Result::Ok((None, permit));
                             };
                             let lengths = match documents.cached_lengths() {
                                 Some(lengths) => lengths,
                                 None => documents.lengths().await?,
                             };
-                            Result::Ok(Some((
-                                partition_ordinal,
-                                part,
-                                lengths,
-                                visibility,
-                                postings,
-                            )))
+                            Result::Ok((
+                                Some((partition_ordinal, part, lengths, visibility, postings)),
+                                permit,
+                            ))
                         }
                     });
                     let loads = stream::iter(loads).buffer_unordered(io_parallelism);
