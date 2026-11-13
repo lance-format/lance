@@ -282,9 +282,24 @@ impl Writer {
         //
         // Also, there is no point in trying to make write_page parallel anyways
         // because we wouldn't want buffers getting mixed up across pages.
+        // Encoding futures can already own work in the shared CPU pool.
+        // Dropping them on the first error would detach that work. Stop writes
+        // after failure but retain and drain every accepted encoder join.
+        let mut first_error = None;
         while let Some(encoding_task) = encoding_tasks.next().await {
-            let encoded_page = encoding_task?;
-            self.write_page(encoded_page).await?;
+            if first_error.is_some() {
+                continue;
+            }
+            let result = match encoding_task {
+                Ok(page) => self.write_page(page).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         // Flushing here reaps any upload that has already failed, so the error
         // is attributed to this batch rather than to whichever later batch or
@@ -944,4 +959,22 @@ pub fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<B
     data.put(MAGIC.as_slice());
 
     Ok(data.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn page_encoder_failure_drains_remaining_work() {
+        let store = lance_io::object_store::ObjectStore::memory();
+        let writer = store
+            .create(&object_store::path::Path::from("failure.lance"))
+            .await
+            .unwrap();
+        let mut writer =
+            super::Writer::new_lazy(writer, crate::writer::FileWriterOptions::default());
+        crate::writer::writer_tests::assert_page_encoder_failure_drains(move |tasks| async move {
+            writer.write_pages(tasks).await
+        })
+        .await;
+    }
 }

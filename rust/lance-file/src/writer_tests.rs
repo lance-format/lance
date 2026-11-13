@@ -1,6 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+/// A failed page must not drop another encoder's still-owned work. The
+/// second future stands in for an already-dispatched encoder join handle.
+pub async fn assert_page_encoder_failure_drains<F, Fut>(write: F)
+where
+    F: FnOnce(futures::stream::FuturesOrdered<lance_encoding::encoder::EncodeTask>) -> Fut,
+    Fut: std::future::Future<Output = lance_core::Result<()>>,
+{
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let failed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = futures::stream::FuturesOrdered::new();
+    let start_wait = started.clone();
+    let first_failed = failed.clone();
+    tasks.push_back(Box::pin(async move {
+        start_wait.notified().await;
+        first_failed.notify_one();
+        Err(lance_core::Error::execution("first page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let finish = finished.clone();
+    let continue_work = release.clone();
+    tasks.push_back(Box::pin(async move {
+        started.notify_one();
+        continue_work.notified().await;
+        finish.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(lance_core::Error::execution("later page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let operation = write(tasks);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("writer returned before the remaining encoder drained: {result:?}"),
+        _ = failed.notified() => {},
+    }
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(matches!(
+        futures::poll!(&mut operation),
+        std::task::Poll::Pending
+    ));
+    release.notify_one();
+    let error = operation.await.unwrap_err();
+    assert!(matches!(error, lance_core::Error::Execution { .. }));
+    assert!(error.to_string().contains("first page encoder failed"));
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
