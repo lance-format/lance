@@ -613,8 +613,8 @@ enum Unsupported {
 /// A table without one is unaffected: the presence of a MemWAL is the only
 /// thing this looks at.
 ///
-/// Takes the decision already made rather than the alterations themselves: a
-/// reference to them held across the await would have to be `Sync`.
+/// Takes the decision already made rather than the request itself: a
+/// reference to it held across the await would have to be `Sync`.
 async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) -> Result<()> {
     let Some(unsupported) = unsupported else {
         return Ok(());
@@ -1313,6 +1313,9 @@ pub(super) async fn alter_columns(
 /// rules here is easy to get wrong, because dropping a struct's last child
 /// removes the struct, and a field whose data files disagree on metadata
 /// semantics is refused outright.
+///
+/// The one check left to [`drop_columns`] is its refusal to drop a primary key
+/// column on a table with a MemWAL attached, which needs an index read.
 pub fn plan_drop_columns(dataset: &Dataset, columns: &[&str]) -> Result<Schema> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {

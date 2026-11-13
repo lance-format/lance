@@ -4309,6 +4309,10 @@ impl Dataset {
     ///
     /// For a caller that must not write anything until the whole projection
     /// is known to be valid against this revision.
+    ///
+    /// The one check left to [`Self::drop_columns`] is its refusal to drop a
+    /// primary key column on a table with a MemWAL attached, which needs an
+    /// index read.
     pub fn plan_drop_columns(&self, columns: &[&str]) -> Result<Schema> {
         schema_evolution::plan_drop_columns(self, columns)
     }
