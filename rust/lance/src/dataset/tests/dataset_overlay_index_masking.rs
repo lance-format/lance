@@ -1925,13 +1925,16 @@ async fn test_nested_dependency_row_rewrite(
     let mut dataset = updated.as_ref().clone();
     let newest = dataset.fragments().last().unwrap().id as u32;
     let indices = dataset.load_indices_by_name("nested_idx").await.unwrap();
-    assert_eq!(
-        indices[0]
+    // NGram is address-domain under stable row ids, so a moved row's physical
+    // address changes even though its stable row id (and the indexed value)
+    // did not; `can_follow_stable_row_ids` therefore never lets this segment
+    // claim the new fragment without a remap, the same as BTree/Bitmap.
+    assert!(
+        !indices[0]
             .fragment_bitmap
             .as_ref()
             .unwrap()
-            .contains(newest),
-        !replaces_parent && !has_carried_field
+            .contains(newest)
     );
     assert_ids_match_oracle(
         &dataset,
