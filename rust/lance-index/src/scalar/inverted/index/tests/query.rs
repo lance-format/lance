@@ -192,6 +192,86 @@ impl BatchRowIdRemapper for OffsetBatchRemapper {
     }
 }
 
+#[rstest::rstest]
+#[case::plain_unfiltered(false, None)]
+#[case::plain_kept(false, Some(true))]
+#[case::plain_removed(false, Some(false))]
+#[case::translated_unfiltered(true, None)]
+#[case::translated_kept(true, Some(true))]
+#[case::translated_removed(true, Some(false))]
+#[tokio::test]
+async fn test_single_partition_merge_preserves_remapping_and_filtering(
+    #[case] translated: bool,
+    #[case] keep_old: Option<bool>,
+) -> Result<()> {
+    let object_store = Arc::new(ObjectStore::memory());
+    let source = Arc::new(LanceIndexStore::new(
+        object_store.clone(),
+        "source".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let dest = Arc::new(LanceIndexStore::new(
+        object_store,
+        "dest".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_single_partition_index(
+        source.clone(),
+        InvertedIndexParams::default(),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await?;
+    let remapper =
+        translated.then(|| Arc::new(OffsetBatchRemapper::default()) as Arc<dyn BatchRowIdRemapper>);
+    let index =
+        InvertedIndex::load_with_remapping(source, remapper, &LanceCache::no_cache()).await?;
+    let old_row = if translated { 1100 } else { 100 };
+    let filter = keep_old.map(|keep| {
+        crate::scalar::OldIndexDataFilter::RowIds(if keep {
+            RowAddrTreeMap::from_iter([old_row])
+        } else {
+            RowAddrTreeMap::new()
+        })
+    });
+    let batch = arrow_array::record_batch!(("doc", Utf8, ["hit"]), ("_rowid", UInt64, [200]))?;
+    let input = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter([Ok(batch)]),
+    ));
+    InvertedIndex::merge_segments(
+        std::slice::from_ref(&index),
+        input,
+        dest.as_ref(),
+        &[filter],
+        crate::progress::noop_progress(),
+    )
+    .await?;
+    // Reload without any translator: maintenance must have persisted the
+    // current old address, while leaving the newly appended address alone.
+    let updated = InvertedIndex::load(dest, None, &LanceCache::no_cache()).await?;
+    let (mut row_ids, _) = updated
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await?;
+    row_ids.sort_unstable();
+    let mut expected = vec![200];
+    if keep_old != Some(false) {
+        expected.push(old_row);
+    }
+    expected.sort_unstable();
+    assert_eq!(row_ids, expected);
+    assert_eq!(updated.partition_count(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_resources() {
     let object_store = ObjectStore::memory();
