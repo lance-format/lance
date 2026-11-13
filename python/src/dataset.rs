@@ -1207,6 +1207,12 @@ impl Dataset {
                     None
                 };
 
+            let warp_imputation_rank: Option<usize> =
+                match nearest.get_item("warp_imputation_rank")? {
+                    Some(rank) if !rank.is_none() => Some(rank.extract()?),
+                    _ => None,
+                };
+
             let scanner = scanner
                 .and_then(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
@@ -1228,6 +1234,9 @@ impl Dataset {
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
                     s = s.search_effort(search_effort)?;
+                    if let Some(rank) = warp_imputation_rank {
+                        s = s.warp_imputation_rank(rank);
+                    }
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);

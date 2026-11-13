@@ -85,6 +85,7 @@ mod adaptive_probe;
 mod batch;
 mod batch_probe;
 mod refine;
+pub mod warp;
 
 pub use batch::{ANNIvfBatchExec, new_knn_batch_exec};
 pub use refine::BatchRefineExec;
