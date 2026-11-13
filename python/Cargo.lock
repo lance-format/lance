@@ -4080,6 +4080,7 @@ dependencies = [
  "arrow-row",
  "arrow-schema",
  "arrow-select",
+ "async-channel",
  "async-recursion",
  "async-trait",
  "async_cell",
