@@ -2859,6 +2859,45 @@ def test_commit_batch_append():
     assert merged_txn.operation.fragments == fragments2 + fragments3
 
 
+def test_commit_with_expected_latest_version(tmp_path: Path):
+    from lance.commit import CommitConflictError
+
+    table = pa.Table.from_pydict({"a": range(4)})
+    base_dir = tmp_path / "expected_head"
+    dataset = lance.write_dataset(table, base_dir)
+    expected = dataset.version
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    operation = lance.LanceOperation.Append([fragment])
+    committed = lance.LanceDataset.commit(
+        dataset,
+        operation,
+        read_version=expected,
+        expected_latest_version=expected,
+    )
+    assert committed.version == expected + 1
+
+    # The old handle is stale, even though the intervening commit is compatible.
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    commit = lance.LanceOperation.Append([fragment])
+    advanced = lance.LanceDataset.commit(
+        committed,
+        commit,
+        read_version=committed.version,
+    )
+    assert advanced.version == expected + 2
+
+    stale_fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    stale_commit = lance.LanceOperation.Append([stale_fragment])
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(
+            dataset,
+            stale_commit,
+            read_version=expected,
+            expected_latest_version=expected,
+        )
+
+
 def test_delete_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

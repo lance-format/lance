@@ -4616,6 +4616,7 @@ class LanceDataset(pa.dataset.Dataset):
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
+        expected_latest_version: Optional[int] = None,
         *,
         commit_message: Optional[str] = None,
         enable_stable_row_ids: Optional[bool] = None,
@@ -4680,6 +4681,12 @@ class LanceDataset(pa.dataset.Dataset):
             the future.
         max_retries : int
             The maximum number of retries to perform when committing the dataset.
+        expected_latest_version : int, optional
+            Require the dataset head to be exactly this version. The transaction's
+            ``read_version`` must match. A changed head raises
+            :class:`CommitConflictError`; strict commits do not rebase or retry and
+            are only supported for existing, non-detached datasets with a
+            conflict-safe commit handler.
         commit_message: str, optional
             A message to associate with this commit. This message will be stored in the
             dataset's metadata and can be retrieved using read_transaction().
@@ -4776,6 +4783,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
+                expected_latest_version=expected_latest_version,
                 enable_stable_row_ids=enable_stable_row_ids,
                 namespace_client=namespace_client,
                 table_id=table_id,
@@ -4792,6 +4800,7 @@ class LanceDataset(pa.dataset.Dataset):
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
+                expected_latest_version=expected_latest_version,
                 commit_message=commit_message,
                 enable_stable_row_ids=enable_stable_row_ids,
                 namespace_client=namespace_client,

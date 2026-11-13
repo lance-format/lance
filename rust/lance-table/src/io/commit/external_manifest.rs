@@ -712,6 +712,10 @@ impl ExternalManifestCommitHandler {
 
 #[async_trait]
 impl CommitHandler for ExternalManifestCommitHandler {
+    fn supports_expected_head_commit(&self) -> bool {
+        true
+    }
+
     async fn version_exists(
         &self,
         base_path: &Path,

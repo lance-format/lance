@@ -2812,7 +2812,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, expected_latest_version = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit(
         dest: PyWriteDest,
         operation: &Bound<'_, PyAny>,
@@ -2822,6 +2822,7 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        expected_latest_version: Option<u64>,
         commit_message: Option<String>,
         enable_stable_row_ids: Option<bool>,
         namespace_client: Option<&Bound<'_, PyAny>>,
@@ -2850,6 +2851,7 @@ impl Dataset {
             enable_v2_manifest_paths,
             detached,
             max_retries,
+            expected_latest_version,
             enable_stable_row_ids,
             namespace_client,
             table_id,
@@ -2861,7 +2863,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, expected_latest_version = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: &Bound<'_, PyAny>,
@@ -2870,6 +2872,7 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        expected_latest_version: Option<u64>,
         enable_stable_row_ids: Option<bool>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
@@ -2982,6 +2985,9 @@ impl Dataset {
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20))
             .with_timeout(commit_timeout);
+        if let Some(expected_latest_version) = expected_latest_version {
+            builder = builder.with_expected_latest_version(expected_latest_version);
+        }
 
         if let Some(enable) = enable_stable_row_ids {
             builder = builder.use_stable_row_ids(enable);
