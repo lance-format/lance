@@ -9966,6 +9966,106 @@ def test_shallow_clone(tmp_path: Path):
     assert lance.dataset(clone_branch_v3).to_table() == table_v3
 
 
+def test_shallow_clone_cross_store_returns_readable_dataset():
+    """A cross-store shallow clone is returned already bound to the source store.
+
+    Arrange:
+      - Register one in-memory provider per scheme and open a session on that
+        registry, so source, target, and chained target live in different stores
+        that are built from different storage options.
+      - Write a two-fragment source dataset into the source store.
+    Act:
+      - Shallow clone it into the target store with target-only options, then
+        shallow clone the returned dataset into a third store.
+    Assert:
+      - The returned handles read the shared data files without any caller-side
+        ``base_store_params`` and the target store holds metadata but no data
+        files, so nothing was copied into it.
+
+    Local paths cannot express this: a target opened with target-only options
+    would still reach the source files, while a distinct provider only serves the
+    source data to a handle that kept the source bindings.
+    """
+    from lance.lance import (
+        _ObjectStoreProvider,
+        _ObjectStoreRegistry,
+        _Session,
+    )
+
+    registry = _ObjectStoreRegistry()
+    for scheme in ["test-clone-src", "test-clone-dst", "test-clone-chain"]:
+        registry.register_provider(scheme, _ObjectStoreProvider.memory())
+    session = _Session(store_registry=registry)
+
+    source_uri = "test-clone-src://bucket/source.lance"
+    target_uri = "test-clone-dst://bucket/target.lance"
+    chained_uri = "test-clone-chain://bucket/chained.lance"
+    source_options = {"test_store_options": "source"}
+    target_options = {"test_store_options": "target"}
+
+    expected = pa.table(
+        {
+            "id": pa.array(range(8), type=pa.int32()),
+            "value": pa.array([f"row-{i}" for i in range(8)], type=pa.string()),
+        }
+    )
+    source = lance.write_dataset(
+        expected,
+        source_uri,
+        mode="create",
+        storage_options=source_options,
+        session=session,
+        max_rows_per_file=4,
+    )
+    assert len(source.get_fragments()) == 2
+    assert source.to_table() == expected
+
+    cloned = source.shallow_clone(
+        target_uri, source.version, storage_options=target_options
+    )
+    assert cloned.uri == target_uri
+    assert cloned.version == 1
+    assert {base.path for base in cloned.base_paths().values()} == {source_uri}
+    assert cloned.to_table() == expected
+
+    # The chained clone resolves the source binding inherited through `cloned`.
+    chained = cloned.shallow_clone(
+        chained_uri,
+        cloned.version,
+        storage_options={"test_store_options": "chain"},
+    )
+    assert {base.path for base in chained.base_paths().values()} == {
+        source_uri,
+        target_uri,
+    }
+    assert chained.to_table() == expected
+
+    # The clone publishes its own metadata and references the shared files instead
+    # of copying them into the target store.
+    target_paths = cloned.all_files().read_all().column("path").to_pylist()
+    assert target_paths
+    assert not [path for path in target_paths if path.startswith("data/")]
+
+
+def test_shallow_clone_rejects_dataset_constructor_kwargs(tmp_path: Path):
+    """shallow_clone no longer reopens the target, so reopen-only args are rejected."""
+    expected = pa.table({"id": [1, 2, 3]})
+    source = lance.write_dataset(expected, tmp_path / "source")
+
+    with pytest.raises(TypeError, match="does not accept"):
+        source.shallow_clone(tmp_path / "clone", source.version, block_size=1024)
+
+    assert not (tmp_path / "clone").exists()
+
+    cloned = source.shallow_clone(
+        tmp_path / "clone_ok",
+        source.version,
+        default_scan_options={"batch_size": 2},
+    )
+    assert cloned.to_table() == expected
+    assert cloned._default_scan_options == {"batch_size": 2}
+
+
 def test_deep_clone(tmp_path: Path):
     source_dir = tmp_path / "deep_src"
     destination_dir = tmp_path / "deep_clone"

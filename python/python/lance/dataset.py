@@ -4969,25 +4969,65 @@ class LanceDataset(pa.dataset.Dataset):
             explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
-            endpoints). If not specified, the storage options of the source dataset
-            will be used.
+            endpoints). This replaces the store the target metadata is written
+            through; it does not replace the bindings used to read files that stay
+            in the source dataset. If not specified, the storage options of the
+            source dataset will be used.
+        **kwargs
+            ``default_scan_options`` and ``read_params`` for the returned handle.
+            Any other :class:`LanceDataset` argument is rejected, see Notes.
 
         Returns
         -------
         LanceDataset
             A new LanceDataset representing the shallow-cloned dataset.
+
+        Notes
+        -----
+        Only metadata is copied, so the returned handle keeps the source dataset's
+        store bindings and session to read the shared data files. Reopening it later
+        in another process therefore requires the source store options, passed as
+        :func:`lance.dataset`'s ``base_store_params``.
         """
         if isinstance(target_path, Path):
             target_uri = os.fspath(target_path)
         else:
             target_uri = target_path
 
+        default_scan_options = kwargs.pop("default_scan_options", None)
+        read_params = kwargs.pop("read_params", None)
+        if kwargs:
+            raise TypeError(
+                "shallow_clone() returns the native clone handle instead of "
+                f"reopening the target, so it does not accept {sorted(kwargs)}. "
+                "Pass storage_options to configure the target store, or open the "
+                "clone with lance.dataset(uri, base_store_params=...) instead."
+            )
+
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, reference, storage_options)
+        # The native handle keeps the source store bindings for the files that stay
+        # behind. Reopening the target here would only have the target's options and
+        # could not read a single row of a cross-store clone.
+        new_ds = self._ds.shallow_clone(target_uri, reference, storage_options)
 
-        # Open and return a fresh dataset at the target URI to avoid manual overrides
-        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._storage_options = storage_options
+        # Mirror the native bindings for Python-side reconstruction (e.g. pickling):
+        # the clone's own base is this dataset, and bases inherited through earlier
+        # shallow clones keep the bindings this dataset was opened with.
+        base_store_params = dict(self._base_store_params or {})
+        if self._storage_options is not None:
+            base_store_params[self.uri] = self._storage_options
+        ds._base_store_params = base_store_params or None
+        ds._namespace_client = None
+        ds._table_id = None
+        ds._namespace_client_managed_versioning = False
+        ds._default_scan_options = default_scan_options
+        ds._read_params = read_params
+        return ds
 
     def deep_clone(
         self,

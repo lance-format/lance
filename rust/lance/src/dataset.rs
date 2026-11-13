@@ -2448,8 +2448,12 @@ impl Dataset {
     /// Clone this dataset with a different object store binding.
     ///
     /// The returned dataset shares metadata, session state, and caches with the
-    /// original dataset, but all subsequent operations on the returned dataset
-    /// use the supplied object store.
+    /// original dataset, but its primary object store — and the dataset-level
+    /// default params used for base paths that have no explicit binding — are
+    /// replaced by the supplied ones. Explicit per-base bindings still win: a base
+    /// path bound through [`DatasetBuilder::with_base_store_params`], or inherited
+    /// from the dataset a shallow clone was taken from, keeps reading through its
+    /// own store.
     pub fn with_object_store(
         &self,
         object_store: Arc<ObjectStore>,
