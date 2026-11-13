@@ -349,6 +349,7 @@ pub(super) struct FinalMerge {
     store: Arc<dyn IndexStore>,
     target: PartitionWriteTarget,
     budget: u64,
+    target_bytes: Option<u64>,
     ids: Arc<AtomicU64>,
     fragment_mask: u64,
     token_format: TokenSetFormat,
@@ -363,12 +364,14 @@ impl FinalMerge {
         store: Arc<dyn IndexStore>,
         target: PartitionWriteTarget,
         budget: u64,
+        target_bytes: Option<u64>,
         stop: Stop,
     ) -> Self {
         Self {
             store,
             target,
             budget,
+            target_bytes,
             stop,
             ids: builder.partition_id_allocator(),
             fragment_mask: builder.fragment_mask.unwrap_or(0),
@@ -443,7 +446,7 @@ impl FinalMerge {
         // Like a size-tiered policy, prefer similarly-sized runs and limit
         // fan-in independently of the final serialized-size estimate. The
         // target is independent of indexing-worker and merger counts.
-        let target_bytes = (self.budget / 2).max(1);
+        let target_bytes = self.target_bytes.unwrap_or((self.budget / 2).max(1));
         let floor_bytes = (self.budget / 128).max(1);
         for run in runs {
             let skewed = group.first().is_some_and(|first: &Run| {

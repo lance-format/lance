@@ -66,6 +66,7 @@ fn merger(store: Arc<dyn IndexStore>, positions: bool) -> FinalMerge {
         store,
         target: PartitionWriteTarget::Final,
         budget: 4 << 20,
+        target_bytes: None,
         ids: Arc::new(AtomicU64::new(100)),
         fragment_mask: 0,
         token_format: TokenSetFormat::Fst,
@@ -93,6 +94,85 @@ async fn inputs(
         output.files.extend(files);
     }
     Ok(output)
+}
+
+#[rstest::rstest]
+#[case::counts(false)]
+#[case::positions(true)]
+#[tokio::test]
+async fn final_serialized_target_bounds_grouping_without_changing_memory(
+    #[case] positions: bool,
+) -> Result<()> {
+    let store = store();
+    let input = inputs(store.as_ref(), positions, false).await?;
+    let mut sizes = input
+        .partitions
+        .iter()
+        .map(|id| {
+            input
+                .files
+                .iter()
+                .filter(|file| {
+                    [
+                        PartitionWriteTarget::Final.posting_path(*id),
+                        PartitionWriteTarget::Final.token_path(*id),
+                        PartitionWriteTarget::Final.doc_path(*id),
+                    ]
+                    .contains(&file.path)
+                })
+                .map(|file| file.size_bytes)
+                .sum::<u64>()
+        })
+        .collect::<Vec<_>>();
+    sizes.sort_unstable();
+    let target = sizes[2] + sizes[3];
+    assert!(sizes[..3].iter().sum::<u64>() > target);
+    let mut merger = merger(store.clone(), positions);
+    merger.target_bytes = Some(target);
+    assert_eq!(merger.budget, 4 << 20);
+    let output = merger.finish(input).await?;
+    assert_eq!(output.partitions.len(), 2);
+    let mut rows = Vec::new();
+    for id in output.partitions {
+        let docs = DocSet::load(
+            store
+                .open_index_file(&PartitionWriteTarget::Final.doc_path(id))
+                .await?,
+            false,
+            None,
+        )
+        .await?;
+        assert_eq!(docs.len(), 16);
+        rows.extend((0..docs.len()).map(|doc| docs.row_id(doc as u32)));
+    }
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        (0..4)
+            .flat_map(|source| (0..8).map(move |doc| source * 100 + doc))
+            .collect::<Vec<u64>>()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn serialized_target_retains_valid_larger_inputs() -> Result<()> {
+    let store = store();
+    let input = inputs(store.as_ref(), false, false).await?;
+    let expected = input.partitions.clone();
+    let mut merger = merger(store.clone(), false);
+    merger.target_bytes = Some(1);
+    let output = merger.finish(input).await?;
+    assert_eq!(output.partitions, expected);
+    assert_eq!(output.files.len(), 12);
+    assert!(
+        store
+            .list_files_with_sizes()
+            .await?
+            .iter()
+            .all(|file| !file.path.ends_with(".merge.lance"))
+    );
+    Ok(())
 }
 
 #[rstest::rstest]

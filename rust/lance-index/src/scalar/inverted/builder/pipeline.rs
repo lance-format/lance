@@ -11,7 +11,11 @@
 //! unchanged. `LANCE_FTS_PIPELINE_MERGE_WORKERS` defaults to one; it is not
 //! inferred from CPU count. Optional `RUN_MIB`, `TARGET_MIB` and `QUEUE_RUNS`
 //! settings under the same `LANCE_FTS_PIPELINE_` prefix control the producer
-//! flush trigger, final partition target and bounded queue count. Merge workers
+//! flush trigger, in-memory output trigger and bounded queue count. Optional
+//! `FINAL_TARGET_MIB` controls the estimated serialized output of the persisted
+//! merge, independently of its working-memory reservation. By default it uses
+//! half the build budget. A valid input larger than this target is retained.
+//! Merge workers
 //! are a maximum concurrency: memory admission can reduce the active count,
 //! rather than reducing partition size to accommodate more workers.
 //! The working set includes a conservative allocation-growth allowance and
@@ -84,7 +88,7 @@ pub(super) async fn build(
     }
     let workers = resolve_num_workers(&builder.params);
     log::info!(
-        "FTS_PIPELINE_CONFIG workers={} requested_merge_workers={} merge_workers={} queue_runs={} run_trigger_bytes={} max_run_bytes={} output_target_bytes={} merge_working_set_bytes={} queue_bytes={}",
+        "FTS_PIPELINE_CONFIG workers={} requested_merge_workers={} merge_workers={} queue_runs={} run_trigger_bytes={} max_run_bytes={} output_target_bytes={} merge_working_set_bytes={} queue_bytes={} final_target_bytes={}",
         workers,
         config.requested_merge_workers,
         config.merge_workers,
@@ -94,6 +98,9 @@ pub(super) async fn build(
         config.output_target_bytes,
         config.merge_memory_limit_bytes,
         config.queue_memory_bytes,
+        config
+            .final_target_bytes
+            .unwrap_or(config.total_memory_bytes / 2),
     );
     let tokenizer = builder.params.build()?;
     let worker_config = IndexWorkerConfig {
@@ -118,6 +125,7 @@ pub(super) async fn build(
         store.clone(),
         target,
         config.total_memory_bytes,
+        config.final_target_bytes,
         stop.clone(),
     );
 
@@ -252,6 +260,7 @@ pub(super) struct Config {
     pub max_run_bytes: u64,
     pub output_target_bytes: u64,
     pub total_memory_bytes: u64,
+    pub final_target_bytes: Option<u64>,
     // Includes allocation growth and positions scratch, not just the output.
     pub merge_memory_limit_bytes: u64,
 }
@@ -294,15 +303,29 @@ impl Config {
                 )));
             }
         };
-        Self::new(
+        let config = Self::new(
             total_budget,
             workers,
             merge_workers,
             target,
             run,
             queue_runs,
-        )
-        .map(Some)
+        )?;
+        let config = match optional_mib("LANCE_FTS_PIPELINE_FINAL_TARGET_MIB")? {
+            Some(target) => config.with_final_target(target)?,
+            None => config,
+        };
+        Ok(Some(config))
+    }
+
+    pub(super) fn with_final_target(mut self, target: u64) -> Result<Self> {
+        if target == 0 {
+            return Err(Error::invalid_input(
+                "LANCE_FTS_PIPELINE_FINAL_TARGET_MIB must be positive",
+            ));
+        }
+        self.final_target_bytes = Some(target);
+        Ok(self)
     }
 
     pub(super) fn new(
@@ -390,6 +413,7 @@ impl Config {
             max_run_bytes,
             output_target_bytes,
             total_memory_bytes: total_budget,
+            final_target_bytes: None,
             merge_memory_limit_bytes,
         })
     }
@@ -711,6 +735,39 @@ mod tests {
         }
         builder.posting_lists.push(posting);
         builder
+    }
+
+    #[rstest::rstest]
+    #[case::query_target(2 << 30)]
+    #[case::streamed_output_larger_than_memory(32 << 30)]
+    fn final_target_does_not_change_live_memory_reservations(#[case] target: u64) -> Result<()> {
+        let original = Config::new(16 << 30, 16, 2, None, Some(64 << 20), None)?;
+        assert_eq!(original.final_target_bytes, None);
+        let tuned = original.with_final_target(target)?;
+        assert_eq!(tuned.final_target_bytes, Some(target));
+        assert_eq!(tuned.total_memory_bytes, original.total_memory_bytes);
+        assert_eq!(tuned.merge_workers, original.merge_workers);
+        assert_eq!(tuned.output_target_bytes, original.output_target_bytes);
+        assert_eq!(tuned.max_run_bytes, original.max_run_bytes);
+        assert_eq!(tuned.queue_memory_bytes, original.queue_memory_bytes);
+        assert_eq!(
+            tuned.merge_memory_limit_bytes,
+            original.merge_memory_limit_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn final_target_rejects_zero() -> Result<()> {
+        let error = Config::new(16 << 30, 16, 2, None, Some(64 << 20), None)?
+            .with_final_target(0)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("FINAL_TARGET_MIB must be positive")
+        );
+        Ok(())
     }
 
     #[tokio::test]
