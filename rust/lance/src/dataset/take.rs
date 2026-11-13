@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    collections::HashMap,
+    ops::Range,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index_with;
 use crate::io::exec::AddRowOffsetExec;
+use crate::io::exec::column_width::MeasuredWidths;
+use crate::io::exec::utils::estimated_bytes_per_row;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
@@ -22,7 +33,7 @@ use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
-use lance_core::{ROW_ADDR, ROW_OFFSET};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 
 use super::ProjectionRequest;
@@ -544,6 +555,136 @@ impl TakeBuilder {
         take_rows(self).await
     }
 
+    /// Read the selection incrementally, preserving its order and repeated IDs.
+    ///
+    /// `batch_size` is the maximum number of requested rows per read (1 through
+    /// [`u32::MAX`]). `batch_size_bytes` is a positive target for decoded Arrow
+    /// bytes per output batch. Schema estimates and observed batch widths reduce
+    /// the number of rows requested before reading; oversized output batches are
+    /// split. A single indivisible row may exceed the byte target.
+    ///
+    /// `batch_readahead` must be positive and limits concurrent batch reads,
+    /// including completed batches waiting for earlier reads. Reads start only
+    /// when the stream is polled. Dropping it drops in-flight batch futures and
+    /// stops scheduling further batches.
+    /// The dataset snapshot, projection, and missing-row behavior are the same
+    /// as [`Self::execute`]. A read error terminates the stream after any earlier
+    /// batches have been returned. Empty selections produce no batches.
+    ///
+    /// The byte target is not a process memory limit: variable-width rows may
+    /// exceed estimates, and decoders, projections, caches, and concurrently
+    /// decoded batches require additional memory. The input ID vector is retained
+    /// for the stream's lifetime; result payloads are never collected in full.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use futures::TryStreamExt;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{ProjectionRequest, TakeBuilder};
+    /// # async fn example(dataset: Arc<Dataset>, ids: Vec<u64>) -> Result<()> {
+    /// let projection = ProjectionRequest::Schema(Arc::new(dataset.schema().clone()));
+    /// let mut batches = TakeBuilder::try_new_from_ids(dataset, ids, projection)?
+    ///     .execute_stream(1024, 16 * 1024 * 1024, 2)?;
+    /// while let Some(batch) = batches.try_next().await? {
+    ///     // Consume each batch before requesting more data.
+    ///     assert!(batch.num_rows() <= 1024);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn execute_stream(
+        mut self,
+        batch_size: usize,
+        batch_size_bytes: usize,
+        batch_readahead: usize,
+    ) -> Result<DatasetRecordBatchStream> {
+        if batch_size == 0 || batch_size > u32::MAX as usize {
+            return Err(Error::invalid_input(format!(
+                "batch_size must be between 1 and {}, got {batch_size}",
+                u32::MAX
+            )));
+        }
+        if batch_size_bytes == 0 || batch_readahead == 0 {
+            return Err(Error::invalid_input(format!(
+                "batch_size_bytes and batch_readahead must be positive, got {batch_size_bytes} and {batch_readahead}"
+            )));
+        }
+
+        let mut schema = self.projection.output_schema()?;
+        if self.with_row_address && schema.column_with_name(ROW_ADDR).is_none() {
+            schema = arrow_schema::Schema::try_merge([
+                schema,
+                arrow_schema::Schema::new(vec![ROW_ADDR_FIELD.clone()]),
+            ])?;
+        }
+        let schema = to_logical_json_batch(RecordBatch::new_empty(Arc::new(schema)))?.schema();
+        let physical_schema = (&self.projection.physical_projection.to_bare_schema()).into();
+        let widths = MeasuredWidths::default();
+        let input_width = estimated_bytes_per_row(&physical_schema, self.dataset.schema(), &widths);
+        let output_width = estimated_bytes_per_row(&schema, self.dataset.schema(), &widths);
+        // Unknown widths start with one row; observations can then inform later
+        // requests without first materializing the complete selection.
+        let width = input_width
+            .zip(output_width)
+            .map(|(input, output)| input.max(output).ceil() as usize)
+            .unwrap_or(0);
+        let observed_width = Arc::new(AtomicUsize::new(width));
+        let use_row_ids = self.row_addrs.is_none();
+        let mut selection = self
+            .row_addrs
+            .take()
+            .or_else(|| self.row_ids.take())
+            .ok_or_else(|| Error::internal("TakeBuilder has no row selection"))?
+            .into_iter();
+        // Do not clone the complete selection into every in-flight read.
+        self.row_ids = None;
+        let request_width = observed_width.clone();
+        let requests = std::iter::from_fn(move || {
+            let width = request_width.load(Ordering::Relaxed);
+            let rows = (batch_size_bytes / if width == 0 { batch_size_bytes } else { width })
+                .max(1)
+                .min(batch_size);
+            let selection = selection.by_ref().take(rows).collect::<Vec<_>>();
+            (!selection.is_empty()).then_some(selection)
+        });
+        let stream_schema = schema.clone();
+        let batches = futures::stream::iter(requests)
+            .map(move |selection| {
+                let mut builder = self.clone();
+                if use_row_ids {
+                    builder.row_ids = Some(selection);
+                } else {
+                    builder.row_addrs = Some(selection);
+                }
+                let observed_width = observed_width.clone();
+                let schema = stream_schema.clone();
+                async move {
+                    // Take paths can narrow nullability, for example when they
+                    // synthesize _rowaddr instead of reading it from a fragment.
+                    // Every batch in a stream must use its declared schema.
+                    let batch = take_rows(builder).await?.with_schema(schema)?;
+                    if batch.num_rows() > 0 {
+                        observed_width.fetch_max(
+                            batch.get_array_memory_size().div_ceil(batch.num_rows()),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    super::blob::split_batch_by_bytes(batch, batch_size_bytes)
+                }
+            })
+            .buffered(batch_readahead)
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok::<_, Error>)))
+            .try_flatten()
+            .boxed();
+        let batches = futures::stream::try_unfold(batches, |mut batches| async move {
+            Ok(batches.try_next().await?.map(|batch| (batch, batches)))
+        })
+        .map_err(|err: Error| DataFusionError::External(Box::new(err)));
+        Ok(DatasetRecordBatchStream::new(Box::pin(
+            RecordBatchStreamAdapter::new(schema, batches),
+        )))
+    }
+
     pub fn is_empty(&self) -> bool {
         match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
             (Some(ids), _) => ids.is_empty(),
@@ -668,6 +809,283 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    #[rstest]
+    #[case::serial(1)]
+    #[case::readahead(3)]
+    #[tokio::test]
+    async fn test_take_stream_stable_ids(#[case] readahead: usize) {
+        let data = test_batch(0..12);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let ids = vec![8, 1, 8, 3, 99, 4, 7];
+        let projection = ProjectionRequest::from_sql(vec![("value", "i * 2"), ("id", "_rowid")]);
+        let original = TakeBuilder::try_new_from_ids(
+            Arc::new(dataset.clone()),
+            ids.clone(),
+            projection.clone(),
+        )
+        .unwrap()
+        .execute_stream(2, 4096, readahead)
+        .unwrap();
+
+        // Remove both a partial fragment and a whole fragment, then move rows.
+        dataset.delete("i >= 3 AND i <= 7").await.unwrap();
+        super::super::optimize::compact_files(&mut dataset, Default::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let builder = TakeBuilder::try_new_from_ids(Arc::new(dataset), ids, projection).unwrap();
+        let stream = builder
+            .clone()
+            .with_row_address(true)
+            .execute_stream(2, 4096, readahead)
+            .unwrap();
+        let output_schema = lance_io::stream::RecordBatchStream::schema(&stream);
+        let batches: Vec<_> = require_send(stream.try_collect()).await.unwrap();
+        for batch in &batches {
+            assert!(batch.num_rows() <= 2);
+            assert_eq!(batch.schema(), output_schema);
+        }
+        let values = concat_batches(&output_schema, &batches).unwrap();
+        assert_eq!(
+            values["value"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .as_ref(),
+            &[16, 2, 16]
+        );
+        assert_eq!(
+            values["id"].as_primitive::<UInt64Type>().values().as_ref(),
+            &[8, 1, 8]
+        );
+        let addresses = values[ROW_ADDR].as_primitive::<UInt64Type>();
+        assert_eq!(addresses.value(0), addresses.value(2));
+
+        let original: Vec<_> = original.try_collect().await.unwrap();
+        let original = concat_batches(&original[0].schema(), &original).unwrap();
+        assert_eq!(
+            original["id"]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[8, 1, 8, 3, 4, 7]
+        );
+
+        for ids in [vec![], vec![99, 100]] {
+            let mut empty = builder.clone();
+            empty.row_ids = Some(ids);
+            let mut empty = empty
+                .with_row_address(true)
+                .execute_stream(2, 4096, readahead)
+                .unwrap();
+            assert_eq!(
+                lance_io::stream::RecordBatchStream::schema(&empty),
+                output_schema
+            );
+            assert!(empty.try_next().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_take_stream_error_and_limits() {
+        let data = test_batch(0..2);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let builder = TakeBuilder::try_new_from_ids(
+            dataset.clone(),
+            vec![0, 99, 1],
+            ProjectionRequest::Schema(Arc::new(dataset.schema().clone())),
+        )
+        .unwrap()
+        .with_missing_row_policy(MissingRowPolicy::Error);
+        for (rows, bytes, readahead, message) in [
+            (0, 4096, 1, "batch_size"),
+            (1, 0, 1, "batch_size_bytes"),
+            (1, 4096, 0, "batch_readahead"),
+        ] {
+            let error = builder
+                .clone()
+                .execute_stream(rows, bytes, readahead)
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(message));
+        }
+        let mut stream = builder.execute_stream(1, 4096, 1).unwrap();
+        // Resolving the invalid second request must not prevent the first batch.
+        assert_eq!(stream.try_next().await.unwrap().unwrap().num_rows(), 1);
+        let error = stream.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("first missing row ID 99"));
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_take_stream_byte_target() {
+        let data = arrow_array::record_batch!(
+            ("i", Int32, [0, 1, 2, 3]),
+            (
+                "text",
+                Utf8,
+                [Some("small"), None, Some(&"x".repeat(8192)), Some("last")]
+            )
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let stream = TakeBuilder::try_new_from_ids(
+            dataset.clone(),
+            vec![2, 1, 0, 2, 3],
+            ProjectionRequest::Schema(Arc::new(dataset.schema().clone())),
+        )
+        .unwrap()
+        .execute_stream(4, 1024, 2)
+        .unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.num_rows() == 1 || b.get_array_memory_size() <= 1024)
+        );
+        let values = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(
+            values["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .as_ref(),
+            &[2, 1, 0, 2, 3]
+        );
+        let strings = values["text"].as_string::<i32>();
+        assert_eq!(strings.value(0), "x".repeat(8192));
+        assert!(strings.is_null(1));
+        assert_eq!(strings.value(3), strings.value(0));
+    }
+
+    #[rstest]
+    #[case::serial(1)]
+    #[case::readahead(2)]
+    #[tokio::test]
+    async fn test_take_stream_backpressure(#[case] readahead: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = test_batch(0..8);
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+        let fragments = dataset.get_fragments();
+        let addresses = fragments
+            .iter()
+            .map(|f| u64::from(RowAddress::new_from_parts(f.id() as u32, 0)))
+            .collect();
+        let projection = ProjectionRequest::from_columns(["i"], dataset.schema())
+            .into_projection_plan(dataset.clone())
+            .unwrap();
+        dataset.object_store.io_stats_incremental();
+        let mut stream =
+            TakeBuilder::try_new_from_addresses(dataset.clone(), addresses, Arc::new(projection))
+                .unwrap()
+                .execute_stream(1, 4096, readahead)
+                .unwrap();
+        assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+        let first = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(
+            first["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(0),
+            0
+        );
+        drop(stream);
+        tokio::task::yield_now().await;
+        let requests = dataset.object_store.io_stats_incremental().requests;
+        assert!(!requests.is_empty());
+        for fragment in &fragments[readahead..] {
+            let file = &fragment.metadata().files[0].path;
+            assert!(
+                requests.iter().all(|r| !r.path.as_ref().ends_with(file)),
+                "read beyond the readahead window: {file}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_take_stream_json_schema() {
+        let data = nested_json_batch(NestedJson::Struct, &[0, 1], 10);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        for ids in [vec![], vec![1, 0, 1]] {
+            let mut stream = TakeBuilder::try_new_from_ids(
+                dataset.clone(),
+                ids.clone(),
+                ProjectionRequest::Schema(Arc::new(dataset.schema().clone())),
+            )
+            .unwrap()
+            .execute_stream(1, 4096, 2)
+            .unwrap();
+            let schema = lance_io::stream::RecordBatchStream::schema(&stream);
+            assert!(is_arrow_json_field(&nested_json_leaf(
+                NestedJson::Struct,
+                schema.field_with_name("payload").unwrap()
+            )));
+            for id in ids {
+                let batch = stream.try_next().await.unwrap().unwrap();
+                assert_eq!(batch.schema(), schema);
+                assert_eq!(
+                    nested_json_doc(NestedJson::Struct, &batch["payload"], 0),
+                    format!(r#"{{"v":{}}}"#, id + 10)
+                );
+            }
+            assert!(stream.try_next().await.unwrap().is_none());
+        }
     }
 
     /// How a nested field carries one Arrow JSON document per row.
