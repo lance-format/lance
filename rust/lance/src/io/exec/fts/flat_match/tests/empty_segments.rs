@@ -25,7 +25,7 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
         .await
         .unwrap();
     let params = InvertedIndexParams::default()
-        .lower_case(false)
+        .lower_case(true)
         .stem(false)
         .remove_stop_words(false);
     if indexed_rows > 0 {
@@ -58,8 +58,8 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
         )
         .unwrap(),
     );
-    // N=3, DF=2, and every document has length=avgdl=2. Indexed rows
-    // must affect neither N nor DF; the case-sensitive tokenizer excludes HELLO.
+    // N=3 and every document has length=avgdl=2. Indexed rows must affect
+    // neither N nor DF. Only the configured index tokenizer folds case.
     for _ in 0..2 {
         let batches = collect(exec.clone(), Default::default()).await.unwrap();
         let batch = arrow::compute::concat_batches(&exec.schema(), &batches).unwrap();
@@ -71,10 +71,10 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
             .to_vec();
         ids.sort_unstable();
         let (expected_ids, expected_score) = if indexed_rows > 0 {
-            (vec![10, 11], 1.6_f32.ln())
-        } else {
-            // The unindexed default tokenizer folds case: N=DF=3.
             (vec![10, 11, 12], (8_f32 / 7.0).ln())
+        } else {
+            // The unindexed SimpleTokenizer has no lowercase filter: DF=2.
+            (vec![10, 11], 1.6_f32.ln())
         };
         assert_eq!(ids, expected_ids);
         let scores = batch["_score"].as_primitive::<arrow_array::types::Float32Type>();
