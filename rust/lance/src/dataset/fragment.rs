@@ -2346,9 +2346,13 @@ impl FileFragment {
         };
 
         // Then call take rows
-        let batch = self
-            .take_rows(&row_ids, projection, FragReadConfig::default())
-            .await?;
+        let read_config = FragReadConfig::default().with_row_address(projection.fields.is_empty());
+        let batch = self.take_rows(&row_ids, projection, read_config).await?;
+
+        if projection.fields.is_empty() {
+            // Drop the internal address after selection and duplicate restoration.
+            return Ok(batch.project(&[])?);
+        }
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
         // for user-facing output.
@@ -4388,7 +4392,7 @@ impl FragmentReader {
 mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatchIterator,
         StringArray,
@@ -6422,6 +6426,59 @@ mod tests {
             .validate()
             .await
             .unwrap();
+    }
+
+    #[rstest]
+    #[case::empty(&[])]
+    #[case::contiguous(&[0, 1])]
+    #[case::sorted(&[0, 1, 1])]
+    #[case::unsorted(&[1, 0, 1])]
+    #[tokio::test]
+    async fn test_take_empty_projection(
+        #[case] indices: &[u32],
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(false, true)] delete_row: bool,
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if delete_row {
+            dataset.delete("i = 1").await.unwrap();
+        }
+        let fragment = dataset.get_fragment(0).unwrap();
+        let projection = dataset.schema().project::<&str>(&[]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let batch = fragment.take(indices, &projection).await.unwrap();
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), indices.len());
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request.path.as_ref().contains("/data/"))
+        );
+        let invalid_offset = if delete_row { 2 } else { 3 };
+        let error = fragment
+            .take(&[invalid_offset], &projection)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Invalid read params"), "{error}");
     }
 
     /// A fragment with one data file per column group reads only the files
