@@ -252,6 +252,7 @@ struct Probe {
     writes: std::sync::atomic::AtomicUsize,
     manifest_live: std::sync::atomic::AtomicUsize,
     manifest_peak: std::sync::atomic::AtomicUsize,
+    posting_bytes_peak: std::sync::atomic::AtomicUsize,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -272,6 +273,7 @@ impl ProbeStore {
                 writes: Default::default(),
                 manifest_live: Default::default(),
                 manifest_peak: Default::default(),
+                posting_bytes_peak: Default::default(),
                 started: Default::default(),
                 release: Default::default(),
             }),
@@ -389,8 +391,8 @@ impl IndexReader for ProbeReader {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
         assert!(
-            self.is_manifest || range.len() <= 128,
-            "external merge must not materialize the posting file"
+            self.is_manifest || range.len() <= 4096,
+            "external merge must bound rows even for empty payloads"
         );
         if !self.is_manifest {
             self.probe.reads.fetch_add(1, Ordering::Relaxed);
@@ -398,7 +400,13 @@ impl IndexReader for ProbeReader {
         if !self.is_manifest && self.probe.fault == Fault::Read {
             return Err(Error::execution("injected final read"));
         }
-        self.inner.read_range(range, projection).await
+        let batch = self.inner.read_range(range, projection).await?;
+        if !self.is_manifest {
+            self.probe
+                .posting_bytes_peak
+                .fetch_max(batch.get_array_memory_size(), Ordering::Relaxed);
+        }
+        Ok(batch)
     }
     async fn num_batches(&self, batch_size: u64) -> u32 {
         self.inner.num_batches(batch_size).await
@@ -450,6 +458,48 @@ async fn persisted_postings_are_read_in_bounded_windows() -> Result<()> {
     let result = merger(Arc::new(store.clone()), true).finish(input).await?;
     assert_eq!(result.partitions.len(), 1);
     assert!(store.probe.reads.load(Ordering::Relaxed) >= 8);
+    assert!(store.probe.posting_bytes_peak.load(Ordering::Relaxed) <= (4 << 20) / (8 * 4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn small_postings_fill_the_admitted_read_window() -> Result<()> {
+    let inner = store();
+    let mut input = WorkerOutput::default();
+    for id in 0..4 {
+        let mut builder = run(id, false, false);
+        builder.tokens = TokenDictionary::default();
+        builder.posting_lists.clear();
+        for term in 0..1024 {
+            builder.tokens.get_or_add(&format!("small{term:04}"));
+            let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                false,
+                builder.posting_tail_codec,
+                builder.block_size,
+            );
+            posting.add(0, PositionRecorder::Count(1));
+            builder.posting_lists.push(posting);
+        }
+        let (id, files) = write_run(
+            builder,
+            inner.as_ref(),
+            PartitionWriteTarget::Final,
+            &Stop::default(),
+        )
+        .await?;
+        input.partitions.push(id);
+        input.files.extend(files);
+    }
+    let store = ProbeStore::new(inner, Fault::None);
+    let mut ctx = merger(Arc::new(store.clone()), false);
+    ctx.budget = 64 << 20;
+    let output = ctx.finish(input).await?;
+    assert_eq!(output.partitions.len(), 1);
+    assert!(
+        store.probe.reads.load(Ordering::Relaxed) <= 8,
+        "small posting rows must amortize remote reads across the admitted byte window"
+    );
+    assert!(store.probe.posting_bytes_peak.load(Ordering::Relaxed) <= (64 << 20) / (8 * 4));
     Ok(())
 }
 

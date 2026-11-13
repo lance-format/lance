@@ -28,6 +28,10 @@ const RETAINED: &str = "retained_bytes";
 const SCRATCH: &str = "scratch_bytes";
 const MAX_FAN_IN: usize = 4;
 const METADATA_ROWS: usize = 128;
+// Merge scans are sequential and do not share query-time read amplification
+// goals. Amortize remote latency for small terms while the byte quota below
+// remains the primary bound; cap rows too for zero-sized posting payloads.
+const POSTING_READ_ROWS: usize = 4096;
 
 #[derive(Clone, Copy, Default)]
 struct Bounds {
@@ -226,7 +230,7 @@ impl PostingCursor {
             self.start = row;
             let mut end = row;
             let mut bytes = 0u64;
-            while end < self.reader.num_rows() && end - row < METADATA_ROWS {
+            while end < self.reader.num_rows() && end - row < POSTING_READ_ROWS {
                 let next = self.manifest.at(end).await?.read_bytes()?;
                 if next > self.limit {
                     return Err(Error::index("FTS run row exceeds its admitted read buffer"));
