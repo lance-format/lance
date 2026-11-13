@@ -992,7 +992,7 @@ impl PostingListReader {
                     #[cfg(feature = "fts-format-research")]
                     if let Some(stream) = super::research_positions::read_mapped(
                         self.research_path.as_deref(), token_id, codec,
-                    )? {
+                    ).await? {
                         return Ok(Positions(CompressedPositionStorage::SharedStream(stream)));
                     }
                     let batch = self

@@ -78,36 +78,50 @@ pub(super) fn export(
     Ok(())
 }
 
-fn load_cache(path: &Path, expected_codec: PositionStreamCodec) -> Result<SharedPositionStream> {
-    let file = fs::File::open(path.with_extension("cache"))?;
+fn load_cache(
+    path: &Path,
+    expected_codec: PositionStreamCodec,
+    whole: bool,
+) -> Result<SharedPositionStream> {
+    let mut file = fs::File::open(path.with_extension("cache"))?;
     let len = usize::try_from(file.metadata()?.len())
         .map_err(|_| Error::index("research cache entry too large"))?;
     if len == 0 {
         return Err(Error::index("empty research cache entry"));
     }
-    // SAFETY: same private immutable-file contract as the raw sidecar mapping.
-    let pointer = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    if pointer == libc::MAP_FAILED {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let pointer = NonNull::new(pointer.cast::<u8>()).expect("non-null mmap region");
-    let advice = unsafe { libc::madvise(pointer.as_ptr().cast(), len, libc::MADV_NORMAL) };
-    if advice != 0 {
-        unsafe {
-            libc::munmap(pointer.as_ptr().cast(), len);
+    let mapped = if whole {
+        use std::io::Read;
+        let mut data = Vec::with_capacity(len);
+        file.read_to_end(&mut data)?;
+        if data.len() != len {
+            return Err(Error::index("cache entry changed during research read"));
         }
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let mapped = bytes::Bytes::from_owner(Mapping { pointer, len });
+        bytes::Bytes::from(data)
+    } else {
+        // SAFETY: same private immutable-file contract as the raw sidecar mapping.
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let pointer = NonNull::new(pointer.cast::<u8>()).expect("non-null mmap region");
+        let advice = unsafe { libc::madvise(pointer.as_ptr().cast(), len, libc::MADV_NORMAL) };
+        if advice != 0 {
+            unsafe {
+                libc::munmap(pointer.as_ptr().cast(), len);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        bytes::Bytes::from_owner(Mapping { pointer, len })
+    };
     let value = CacheCodec::from_impl::<Positions>()
         .deserialize(&mapped)
         .hit()
@@ -211,7 +225,7 @@ fn load(path: &Path, codec: PositionStreamCodec) -> Result<SharedPositionStream>
     Ok(SharedPositionStream::new(codec, directory.offsets, bytes))
 }
 
-pub(super) fn read_mapped(
+pub(super) async fn read_mapped(
     source: Option<&str>,
     token: u32,
     codec: PositionStreamCodec,
@@ -219,14 +233,33 @@ pub(super) fn read_mapped(
     if !std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| {
         matches!(
             m.as_str(),
-            "map" | "map-normal" | "map-sequential" | "map-cache"
+            "map" | "map-normal" | "map-sequential" | "map-cache" | "cache-whole"
         )
     }) {
         return Ok(None);
     }
     let path = location(source, token)?;
-    if std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| m == "map-cache") {
-        return Ok(Some(load_cache(&path, codec)?));
+    let mode = std::env::var("FTS_RESEARCH_POSITIONS_MODE").unwrap_or_default();
+    if mode == "map-cache" || mode == "cache-whole" {
+        // Both existing-codec controls have the same bounded, asynchronous local
+        // loader. Do not make the whole-entry control block Tokio runtime threads.
+        static IO: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+            ))
+        });
+        let permit = IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::internal(format!("research IO semaphore: {e}")))?;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            load_cache(&path, codec, mode == "cache-whole")
+        })
+        .await
+        .map_err(|e| Error::internal(format!("research cache loader: {e}")))??;
+        return Ok(Some(result));
     }
     Ok(Some(load(&path, codec)?))
 }
@@ -316,14 +349,16 @@ mod tests {
             .serialize(&value, &mut encoded)
             .unwrap();
         fs::write(path.with_extension("cache"), &encoded).unwrap();
-        let mapped_cache = load_cache(&path, codec).unwrap();
+        let mapped_cache = load_cache(&path, codec, false).unwrap();
         assert_eq!(mapped_cache.block(2), &data[4090..4200]);
         let survivor = mapped_cache.clone();
         drop(mapped_cache);
         assert_eq!(survivor.block(3), &data[4200..]);
+        let whole_cache = load_cache(&path, codec, true).unwrap();
+        assert_eq!(whole_cache.bytes(), &data);
         let bad = root.path().join("bad");
         fs::write(bad.with_extension("cache"), b"invalid cache envelope").unwrap();
-        assert!(load_cache(&bad, codec).is_err());
+        assert!(load_cache(&bad, codec, false).is_err());
         fs::write(
             path.with_extension("json"),
             b"{\"length\":9000,\"offsets\":[0,9001]}",
