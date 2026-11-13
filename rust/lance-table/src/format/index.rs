@@ -139,6 +139,9 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
     let is_bitmap_addr_domain = IndexMetadata::is_bitmap_addr_domain(details, index_version);
     let is_label_list_addr_domain =
         IndexMetadata::is_label_list_addr_domain(details, index_version);
+    let is_ngram_addr_domain = IndexMetadata::is_ngram_addr_domain(details, index_version);
+    let is_rtree_addr_domain = IndexMetadata::is_rtree_addr_domain(details, index_version);
+    let is_minhash_addr_domain = IndexMetadata::is_minhash_addr_domain(details, index_version);
     // A JSON index takes its domain from the target index it wraps. It is
     // stamped with format version 1
     // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
@@ -148,9 +151,13 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
     details.type_url.ends_with("ZoneMapIndexDetails")
         || details.type_url.ends_with("BloomFilterIndexDetails")
         || is_fm
+        || IndexMetadata::is_list_element(details)
         || is_btree_addr_domain
         || is_bitmap_addr_domain
         || is_label_list_addr_domain
+        || is_ngram_addr_domain
+        || is_rtree_addr_domain
+        || is_minhash_addr_domain
         || is_json_addr_domain
 }
 
@@ -249,16 +256,11 @@ impl IndexMetadata {
             ("lance.table" | "lance.index.pb", "btreeindexdetails") => self.index_version < 1,
             ("lance.table" | "lance.index.pb", "bitmapindexdetails") => self.index_version < 1,
             ("lance.table" | "lance.index.pb", "labellistindexdetails") => self.index_version < 2,
-            ("lance.table" | "lance.index.pb", "ngramindexdetails" | "invertedindexdetails") => {
-                true
-            }
-            (
-                "lance.index.pb",
-                "vectorindexdetails"
-                | "jsonindexdetails"
-                | "rtreeindexdetails"
-                | "minhashlshindexdetails",
-            ) => true,
+            ("lance.table" | "lance.index.pb", "ngramindexdetails") => self.index_version < 1,
+            ("lance.table" | "lance.index.pb", "invertedindexdetails") => true,
+            ("lance.index.pb", "rtreeindexdetails") => self.index_version < 1,
+            ("lance.index.pb", "minhashlshindexdetails") => self.index_version < 1,
+            ("lance.index.pb", "vectorindexdetails" | "jsonindexdetails") => true,
             // MemWAL flush briefly emitted this native vector identity.
             ("lance.index", "vectorindexdetails") => true,
             _ => false,
@@ -284,19 +286,51 @@ impl IndexMetadata {
         details.type_url.ends_with("LabelListIndexDetails") && index_version >= 2
     }
 
+    // A list-element segment wraps a B-tree that always stores row addresses
+    // (`lance_index::scalar::list_element`), at every format version.
+    fn is_list_element(details: &prost_types::Any) -> bool {
+        details
+            .type_url
+            .rsplit_once('/')
+            .is_some_and(|(_, details_type_name)| {
+                details_type_name.eq_ignore_ascii_case("lance.index.pb.ListElementIndexDetails")
+            })
+    }
+
+    // An NGram segment stores row addresses only from format version 1 onward
+    // (`lance_index::scalar::ngram::NGRAM_ROW_ADDR_DOMAIN_VERSION`).
+    fn is_ngram_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("NGramIndexDetails") && index_version >= 1
+    }
+
+    // An RTree segment stores row addresses only from format version 1 onward
+    // (`lance_index::scalar::rtree::RTREE_ROW_ADDR_DOMAIN_VERSION`).
+    fn is_rtree_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("RTreeIndexDetails") && index_version >= 1
+    }
+
+    // A MinHash LSH segment stores row addresses only from format version 1
+    // onward (`lance_index::scalar::minhash_lsh::MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`).
+    fn is_minhash_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("MinHashLshIndexDetails") && index_version >= 1
+    }
+
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, BTree, Bitmap and LabelList's indexes support
-    /// this today (`ScalarIndexPlugin::can_remap`); ZoneMap, BloomFilter and FM
-    /// cannot remap. This gate recognizes the supported built-in address-domain
-    /// formats without opening index files.
+    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram and
+    /// MinHash LSH's indexes support this today (`ScalarIndexPlugin::can_remap`);
+    /// ZoneMap, BloomFilter, FM and RTree cannot remap. This gate recognizes the
+    /// supported built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             Self::is_btree_addr_domain(details, self.index_version)
                 || Self::is_bitmap_addr_domain(details, self.index_version)
                 || Self::is_label_list_addr_domain(details, self.index_version)
+                || Self::is_list_element(details)
+                || Self::is_ngram_addr_domain(details, self.index_version)
+                || Self::is_minhash_addr_domain(details, self.index_version)
         })
     }
 
@@ -1016,6 +1050,16 @@ mod tests {
     #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true, false)]
     #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true, false)]
     #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false, false)]
+    #[case::list_element(
+        "type.googleapis.com/lance.index.pb.ListElementIndexDetails",
+        true,
+        false
+    )]
+    #[case::foreign_list_element_terminal_name(
+        "type.googleapis.com/example.ListElementIndexDetails",
+        false,
+        false
+    )]
     #[case::custom("type.googleapis.com/example.ExampleIndexDetails", false, false)]
     #[case::foreign_bitmap("type.googleapis.com/example.BitmapIndexDetails", false, false)]
     #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false, true)]
@@ -1052,38 +1096,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_results_are_row_addrs_btree_is_version_gated() {
-        let mut metadata = index_metadata_with(vec![0], vec![]);
-        assert!(metadata.can_follow_stable_row_ids());
-        metadata.index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
-            value: Vec::new(),
-        }));
-
-        metadata.index_version = 0;
-        assert!(
-            !metadata.results_are_row_addrs(),
-            "a legacy BTree segment stores row ids directly"
-        );
-        assert!(metadata.can_follow_stable_row_ids());
-        assert!(!metadata.supports_eager_remap());
-
-        metadata.index_version = 1;
-        assert!(
-            metadata.results_are_row_addrs(),
-            "a BTree segment built with address-domain support stores row addresses"
-        );
-        assert!(!metadata.can_follow_stable_row_ids());
-        assert!(metadata.supports_eager_remap());
-    }
-
     #[rstest]
-    #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", 1)]
-    #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", 2)]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", 1, true)]
+    #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", 1, true)]
+    // RTree cannot remap at all (`ScalarIndexPlugin::can_remap` is always
+    // false), unlike every other address-domain type here.
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", 1, false)]
+    #[case::minhash_lsh("type.googleapis.com/lance.index.pb.MinHashLshIndexDetails", 1, true)]
+    #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", 1, true)]
+    #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", 2, true)]
     fn test_results_are_row_addrs_is_version_gated(
         #[case] type_url: &str,
         #[case] addr_domain_version: i32,
+        #[case] supports_eager_remap: bool,
     ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
@@ -1105,10 +1130,23 @@ mod tests {
             "a segment built with address-domain support stores row addresses"
         );
         assert!(!metadata.can_follow_stable_row_ids());
-        assert!(
-            metadata.supports_eager_remap(),
-            "BitmapIndex and LabelListIndex both support remapping, same as BTree"
-        );
+        assert_eq!(metadata.supports_eager_remap(), supports_eager_remap);
+    }
+
+    /// A list-element index stores row addresses at every version, and remaps
+    /// its B-tree during compaction, so it keeps covering rewritten fragments on
+    /// a stable-row-ID table.
+    #[rstest]
+    fn test_list_element_is_remappable_addr_domain(#[values(0, 1)] index_version: i32) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.ListElementIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+        metadata.index_version = index_version;
+        assert!(metadata.results_are_row_addrs());
+        assert!(!metadata.can_follow_stable_row_ids());
+        assert!(metadata.supports_eager_remap());
     }
 
     #[test]

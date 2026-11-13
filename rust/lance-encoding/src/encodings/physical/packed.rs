@@ -21,8 +21,8 @@ use crate::{
         VariablePerValueDecompressor,
     },
     data::{
-        BlockInfo, DataBlock, DataBlockBuilder, FixedWidthDataBlock, StructDataBlock,
-        VariableWidthBlock,
+        AllNullDataBlock, BlockInfo, DataBlock, DataBlockBuilder, FixedWidthDataBlock,
+        StructDataBlock, VariableWidthBlock,
     },
     encodings::logical::primitive::{
         fullzip::{PerValueCompressor, PerValueDataBlock},
@@ -666,6 +666,13 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
             ));
         }
 
+        // Empty/null list batches contain no visible struct values. The generic
+        // empty block materializes the requested Arrow type without initializing
+        // child builders or inventing placeholder rows.
+        if num_values == 0 {
+            return Ok(DataBlock::AllNull(AllNullDataBlock { num_values: 0 }));
+        }
+
         let mut accumulators = Vec::with_capacity(self.fields.len());
         for field in &self.fields {
             match &field.kind {
@@ -1031,9 +1038,10 @@ mod tests {
         },
     };
     use arrow_array::{
-        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
-        StructArray, UInt32Array,
+        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeListArray, LargeStringArray,
+        ListArray, StringArray, StructArray, UInt32Array,
     };
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field as ArrowField, Fields};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1285,6 +1293,54 @@ mod tests {
         check_round_trip_encoding_of_data(vec![array], &test_cases, meta).await;
     }
 
+    #[rstest::rstest]
+    #[case::list(false)]
+    #[case::large_list(true)]
+    #[tokio::test]
+    async fn variable_packed_struct_empty_lists(#[case] large: bool) {
+        let values = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("id", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![1, 2])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("text", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec!["first", "last"])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("large_text", DataType::LargeUtf8, false)),
+                Arc::new(LargeStringArray::from(vec!["first", "last"])) as ArrayRef,
+            ),
+        ]));
+        let item = Arc::new(
+            ArrowField::new("item", values.data_type().clone(), false).with_metadata(
+                HashMap::from([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]),
+            ),
+        );
+        let validity = Some(NullBuffer::from(vec![true, true, false, true]));
+        let array: ArrayRef = if large {
+            Arc::new(LargeListArray::new(
+                item,
+                OffsetBuffer::new(vec![0i64, 1, 1, 1, 2].into()),
+                values,
+                validity,
+            ))
+        } else {
+            Arc::new(ListArray::new(
+                item,
+                OffsetBuffer::new(vec![0i32, 1, 1, 1, 2].into()),
+                values,
+                validity,
+            ))
+        };
+        let test_cases = TestCases::default()
+            .with_u32_structural_encodings()
+            .with_batch_size(1)
+            .with_range(1..3)
+            .with_expected_encoding("variable_packed_struct");
+        check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
+    }
+
     #[test]
     fn variable_packed_struct_multi_variable_round_trip() -> Result<()> {
         let arrow_fields: Fields = vec![
@@ -1473,6 +1529,23 @@ mod tests {
             &[0_u32, 1_u32, 1_u32, 1_u32]
         );
         assert_eq!(variable.data.as_ref(), b"a");
+
+        let empty = decompressor.decompress(VariableWidthBlock {
+            data: LanceBuffer::empty(),
+            bits_per_offset: 32,
+            offsets: LanceBuffer::reinterpret_vec(vec![0_u32]),
+            num_values: 0,
+            block_info: BlockInfo::new(),
+        })?;
+        let data_type = DataType::Struct(
+            vec![
+                ArrowField::new("value", DataType::UInt32, false),
+                ArrowField::new("text", DataType::Utf8, false),
+            ]
+            .into(),
+        );
+        let empty = empty.into_arrow(data_type.clone(), true)?;
+        assert_eq!(empty, arrow_array::new_empty_array(&data_type).to_data());
 
         Ok(())
     }

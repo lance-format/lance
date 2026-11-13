@@ -315,7 +315,7 @@ impl InvertedIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
-        let tokens_fut = tokio::spawn({
+        let tokens_fut = lance_core::utils::tokio::spawn({
             let store = store.clone();
             async move {
                 let token_reader = store.open_index_file(TOKENS_FILE).await?;
@@ -330,7 +330,7 @@ impl InvertedIndex {
                 Result::Ok((tokenizer, tokens))
             }
         });
-        let invert_list_fut = tokio::spawn({
+        let invert_list_fut = lance_core::utils::tokio::spawn({
             let store = store.clone();
             let index_cache_clone = index_cache.clone();
             async move {
@@ -340,7 +340,7 @@ impl InvertedIndex {
                 Result::Ok(Arc::new(invert_list))
             }
         });
-        let docs_fut = tokio::spawn({
+        let docs_fut = lance_core::utils::tokio::spawn({
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
@@ -385,7 +385,7 @@ impl InvertedIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
-        let tokens_fut = tokio::spawn({
+        let tokens_fut = lance_core::utils::tokio::spawn({
             let store = store.clone();
             async move {
                 let token_reader = store.open_index_file(TOKENS_FILE).await?;
@@ -400,7 +400,7 @@ impl InvertedIndex {
                 Result::Ok((tokenizer, tokens))
             }
         });
-        let invert_list_fut = tokio::spawn({
+        let invert_list_fut = lance_core::utils::tokio::spawn({
             let store = store.clone();
             let index_cache_clone = index_cache.clone();
             async move {
@@ -410,7 +410,7 @@ impl InvertedIndex {
                 Result::Ok(Arc::new(invert_list))
             }
         });
-        let docs_fut = tokio::spawn({
+        let docs_fut = lance_core::utils::tokio::spawn({
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;

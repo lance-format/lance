@@ -168,6 +168,10 @@ macro_rules! bitpacked_decode {
                     .to_vec();
                 chunk_num += 1;
                 let chunk = cast_slice(&chunk_in_u8);
+                // SAFETY: `chunk` is the `128 * width` bytes of one packed chunk, which is the
+                // `1024 * width / T` words the kernel requires for any width it accepts (it
+                // panics on a width above `T` before touching memory), and
+                // `decompress_chunk_buf` holds 1024 values.
                 unsafe {
                     BitPacking::unchecked_unpack(
                         $compressed_bit_width as usize,

@@ -681,7 +681,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run());
+                lance_core::utils::tokio::spawn(task.run());
             }
             None => {
                 // The sender has been dropped, we are done
@@ -1061,7 +1061,7 @@ impl ScanScheduler {
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
             // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
             // to wait for it to finish but that doesn't seem helpful.
-            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+            lance_core::utils::tokio::spawn(async move { run_io_loop(io_queue_clone).await });
             IoQueueType::Standard(io_queue)
         };
         let scheduler = Arc::new(Self {

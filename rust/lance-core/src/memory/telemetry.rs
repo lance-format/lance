@@ -18,8 +18,9 @@ pub const METRIC_CGROUP_LIMIT: &str = "lance_memory_cgroup_limit_bytes";
 /// Peak resident set size during each stage of an index build, in bytes,
 /// labelled by `operation`, `index_type` and `stage`.
 pub const METRIC_STAGE_PEAK: &str = "lance_memory_stage_peak_bytes";
-/// Peak resident set size during a whole index build, in bytes, labelled by
-/// `operation` and `index_type`.
+/// Peak resident set size during a whole index build, including its commit
+/// when the operation commits the index, in bytes, labelled by `operation` and
+/// `index_type`.
 pub const METRIC_OPERATION_PEAK: &str = "lance_memory_operation_peak_bytes";
 /// Bytes that Lance components hold right now, labelled by `component`.
 pub const METRIC_COMPONENT: &str = "lance_memory_component_bytes";
@@ -88,7 +89,7 @@ pub fn describe_metrics() {
         metrics::describe_histogram!(
             METRIC_OPERATION_PEAK,
             Bytes,
-            "Peak resident set size during each index build, by operation and index type."
+            "Peak resident set size during each index build operation, by operation and index type."
         );
         metrics::describe_gauge!(
             METRIC_COMPONENT,
@@ -118,7 +119,7 @@ pub fn refresh_metrics() {
                 super::proc::read_process_memory(),
                 super::cgroup::read_cgroup_memory(),
             );
-            #[cfg(not(all(feature = "metrics", target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             super::observer::warn_unsupported();
         }
         Ok(false) => {}
@@ -150,8 +151,12 @@ fn publish_gauges(
 }
 
 /// Record the peak resident set size of one stage of an index build.
-#[doc(hidden)]
-pub fn record_stage_peak(operation: &'static str, index_type: &str, stage: &str, peak_bytes: u64) {
+pub(super) fn record_stage_peak(
+    operation: &'static str,
+    index_type: &str,
+    stage: &str,
+    peak_bytes: u64,
+) {
     #[cfg(feature = "metrics")]
     metrics::histogram!(
         METRIC_STAGE_PEAK,
@@ -165,8 +170,7 @@ pub fn record_stage_peak(operation: &'static str, index_type: &str, stage: &str,
 }
 
 /// Record the peak resident set size of a whole index build.
-#[doc(hidden)]
-pub fn record_operation_peak(operation: &'static str, index_type: &str, peak_bytes: u64) {
+pub(super) fn record_operation_peak(operation: &'static str, index_type: &str, peak_bytes: u64) {
     #[cfg(feature = "metrics")]
     metrics::histogram!(
         METRIC_OPERATION_PEAK,

@@ -192,9 +192,8 @@ impl MemoryObserver {
     /// The process-wide observer, or `None` unless [`OBSERVE_ENV_VAR`] turns
     /// observation on.
     ///
-    /// Observation also needs Linux and the `metrics` feature, the only
-    /// consumer so far; without them this logs a warning once and returns
-    /// `None`.
+    /// Observation also needs Linux; elsewhere this logs a warning once and
+    /// returns `None`.
     ///
     /// # Errors
     ///
@@ -213,7 +212,7 @@ impl MemoryObserver {
         if !observe_flag()? {
             return Ok(None);
         }
-        if !cfg!(all(feature = "metrics", target_os = "linux")) {
+        if !cfg!(target_os = "linux") {
             warn_unsupported();
             return Ok(None);
         }
