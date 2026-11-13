@@ -31,8 +31,6 @@ impl PostingReader {
                 .get_or_init(|| {
                     Arc::new(PostingFileMetadata {
                         schema: reader.schema().clone(),
-                        #[cfg(feature = "fts-format-research")]
-                        research_path: None,
                         num_rows: reader.num_rows(),
                         file_size: reader.file_size_bytes(),
                     })
@@ -255,6 +253,8 @@ impl PostingListReader {
         });
 
         Ok(Self {
+            #[cfg(feature = "fts-format-research")]
+            research_path: None,
             num_rows: reader.num_rows(),
             reader: PostingReader::Opened {
                 reader,

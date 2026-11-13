@@ -1011,7 +1011,7 @@ impl PostingListReader {
                     #[cfg(feature = "fts-format-research")]
                     let bytes = if std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| m == "zero-copy") {
                         let offsets = values.value_offsets();
-                        bytes::Bytes::from_owner(values.values().clone())
+                        super::research_positions::owned_buffer(values.values().clone())
                             .slice(offsets[0] as usize..offsets[1] as usize)
                     } else {
                         bytes::Bytes::copy_from_slice(values.value(0))

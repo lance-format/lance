@@ -18,6 +18,16 @@ struct Directory {
     offsets: Vec<u32>,
 }
 
+struct BufferOwner(Buffer);
+impl AsRef<[u8]> for BufferOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+pub(super) fn owned_buffer(buffer: Buffer) -> bytes::Bytes {
+    bytes::Bytes::from_owner(BufferOwner(buffer))
+}
+
 fn location(source: Option<&str>, token: u32) -> Result<PathBuf> {
     let root = std::env::var_os("FTS_RESEARCH_POSITIONS_ROOT").ok_or_else(|| {
         Error::invalid_input("research sidecar requires a private index-bound root")
