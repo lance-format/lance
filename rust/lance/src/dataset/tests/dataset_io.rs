@@ -44,7 +44,7 @@ use arrow_array::{
     types::{Float32Type, Int32Type},
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
@@ -621,6 +621,152 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
         err.to_string().contains("Schema mismatch"),
         "unexpected error: {err}"
     );
+}
+
+/// A replacement file must store each column's values as the dataset field's
+/// type: reads decode it as the dataset type, so `x: double` under `x: int64`
+/// returns the doubles' bit patterns. Nullability, list offset width and the
+/// name of a timestamp's time zone may differ.
+#[rstest::rstest]
+#[case::same_width(DataType::Int64, DataType::Float64, false)]
+#[case::narrower(DataType::Int64, DataType::Int32, false)]
+#[case::wider_string(DataType::Utf8, DataType::LargeUtf8, false)]
+#[case::other_timestamp_unit(
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    false
+)]
+#[case::list_item(
+    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    DataType::List(Arc::new(ArrowField::new("item", DataType::Float64, true))),
+    false
+)]
+#[case::timestamp_gains_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    false
+)]
+#[case::same_type(DataType::Int64, DataType::Int64, true)]
+#[case::list_offset_width(
+    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    DataType::List(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    true
+)]
+#[case::timestamp_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+    true
+)]
+#[tokio::test]
+async fn test_create_data_file_checks_column_types(
+    #[case] dataset_type: DataType,
+    #[case] file_type: DataType,
+    #[case] accepted: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("x", dataset_type.clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef,
+            column_of(&dataset_type, &[10, 11, 12]),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // A non-nullable column under the dataset's nullable `x` is still allowed.
+    let file_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x", file_type, false,
+    )]));
+    let values = column_of(file_schema.field(0).data_type(), &[20, 21, 22]);
+    let file_batch = RecordBatch::try_new(file_schema.clone(), vec![values]).unwrap();
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join("x.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        crate::datatypes::Schema::try_from(file_schema.as_ref()).unwrap(),
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&file_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let result = dataset.create_data_file("x.lance", None).await;
+    if accepted {
+        // The accepted file reads back as its own values, in the dataset type.
+        let data_file = result.unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![crate::dataset::transaction::DataReplacementGroup(
+                    0, data_file,
+                )],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["x"].as_ref(),
+            column_of(&dataset_type, &[20, 21, 22]).as_ref()
+        );
+    } else {
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("Schema mismatch: field 'x"),
+            "{err}"
+        );
+    }
+
+    fn column_of(data_type: &DataType, values: &[i64]) -> ArrayRef {
+        let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+        match data_type {
+            DataType::List(item) | DataType::LargeList(item) => {
+                let items = arrow::compute::cast(&values, item.data_type()).unwrap();
+                let offsets = arrow_buffer::OffsetBuffer::from_lengths(vec![1; values.len()]);
+                if matches!(data_type, DataType::List(_)) {
+                    Arc::new(arrow_array::ListArray::new(
+                        item.clone(),
+                        offsets,
+                        items,
+                        None,
+                    ))
+                } else {
+                    let offsets =
+                        arrow_buffer::OffsetBuffer::<i64>::from_lengths(vec![1; values.len()]);
+                    Arc::new(arrow_array::LargeListArray::new(
+                        item.clone(),
+                        offsets,
+                        items,
+                        None,
+                    ))
+                }
+            }
+            _ => arrow::compute::cast(&values, data_type).unwrap(),
+        }
+    }
 }
 
 async fn write_multi_fragment_source(uri: &str) -> Dataset {
