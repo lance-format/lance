@@ -788,7 +788,13 @@ fn apply_struct_validities(
     columns: &mut [ArrayRef],
     struct_validities: StructValidityMap,
 ) -> Result<()> {
-    for candidates in struct_validities.into_values() {
+    // Restore deeper structs first. Rebuilding a struct makes arrow check that every
+    // required child has no null the parent does not mask, and a nested struct still
+    // carrying its base validity can fail that check until its own candidate is
+    // applied, so an ancestor must be rebuilt only after its descendants are final.
+    let mut candidates = struct_validities.into_values().collect::<Vec<_>>();
+    candidates.sort_by_key(|candidates| std::cmp::Reverse(candidates.ancestor_ids.len()));
+    for candidates in candidates {
         let Some(idx) = schema.index_of(&candidates.top_field.name).ok() else {
             continue;
         };
