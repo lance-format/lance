@@ -491,7 +491,9 @@ pub struct DatasetRuntimeConfig {
     pub session: Option<Arc<Session>>,
     /// Replacement commit handler.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
-    /// Replacement storage-options accessor for the primary store params.
+    /// Replacement storage-options accessor for the primary store. The primary
+    /// store is rebuilt through the session registry so subsequent primary I/O
+    /// consults this accessor.
     pub storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
     /// Explicit per-base bindings to merge. Caller entries win over inherited ones.
     pub base_store_params: HashMap<String, ObjectStoreParams>,
@@ -2497,6 +2499,9 @@ impl Dataset {
     /// cache sizes create a new session on the same store registry so custom
     /// object-store providers keep resolving. When `block_size` is set, the
     /// primary store keeps its existing backend and only changes its read hint.
+    /// Replacing `storage_options_accessor` rebuilds the primary store through
+    /// the session's registry, because the accessor is consumed when the store is
+    /// constructed and must reach the backend that serves primary I/O.
     pub async fn reconfigure(&self, config: DatasetRuntimeConfig) -> Result<Self> {
         let mut ds = self.clone();
 
@@ -2524,6 +2529,7 @@ impl Dataset {
         }
 
         let mut store_params = ds.store_params.as_deref().cloned();
+        let accessor_replaced = config.storage_options_accessor.is_some();
         if let Some(accessor) = config.storage_options_accessor {
             let params = store_params.get_or_insert_default();
             params.storage_options_accessor = Some(accessor);
@@ -2531,21 +2537,39 @@ impl Dataset {
         if let Some(block_size) = config.block_size {
             let params = store_params.get_or_insert_default();
             params.block_size = Some(block_size);
+        }
+
+        if accessor_replaced {
+            // A store consumes its accessor at construction time, so replacing it
+            // in `store_params` alone leaves the opened backend on the previous
+            // (possibly expiring) credentials. Rebuild through the handle's
+            // session registry so the new accessor, and every other params-bound
+            // setting, reach the backend that serves primary metadata, refs, and
+            // commits. Explicit base bindings stay untouched; `with_object_store`
+            // drops the derived fallback cache so bases are re-resolved from their
+            // own bindings, or from the new default params when they have none,
+            // instead of keeping the replaced stores.
+            let params = store_params.clone().unwrap_or_default();
+            let (object_store, _) =
+                ObjectStore::from_uri_and_params(ds.session.store_registry(), &ds.uri, &params)
+                    .await?;
+            ds = ds.with_object_store(object_store, Some(params));
+        } else if let Some(block_size) = config.block_size {
+            let params = store_params.unwrap_or_default();
             ds = ds.with_object_store(
                 Arc::new(ds.object_store.with_block_size(block_size)),
-                Some(params.clone()),
-            );
-            ds.refs = Refs::new(
-                ds.object_store.clone(),
-                ds.commit_handler.clone(),
-                ds.branch_location(),
+                Some(params),
             );
         } else if store_params.is_some() {
             ds.store_params = store_params.map(Box::new);
         }
 
+        let commit_handler_replaced = config.commit_handler.is_some();
         if let Some(commit_handler) = config.commit_handler {
             ds.commit_handler = commit_handler;
+        }
+        if accessor_replaced || config.block_size.is_some() || commit_handler_replaced {
+            // Refs binds the primary store and commit handler when it is built.
             ds.refs = Refs::new(
                 ds.object_store.clone(),
                 ds.commit_handler.clone(),

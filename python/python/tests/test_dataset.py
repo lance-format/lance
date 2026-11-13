@@ -10149,6 +10149,50 @@ def test_shallow_clone_applies_read_params_to_native_handle(tmp_path: Path):
     assert with_cache > without_cache
 
 
+def test_shallow_clone_installs_namespace_credentials_on_target(tmp_path: Path):
+    """Constructor namespace credentials must back the returned handle.
+
+    The native clone builds its target store from the static ``storage_options``
+    before the refreshable namespace accessor is installed. The installed
+    accessor must still reach the live target handle and vendor refreshed
+    credentials for it, and the handle must stay readable and writable.
+    """
+    from lance_namespace import DescribeTableResponse, LanceNamespace
+
+    class RotatingNamespace(LanceNamespace):
+        def namespace_id(self) -> str:
+            return "shallow-clone-rotating-namespace"
+
+        def describe_table(self, request):
+            return DescribeTableResponse(
+                location=str(tmp_path / "cloned"),
+                storage_options={"test_credential": "refreshed-temporary"},
+            )
+
+    expected = pa.table({"id": pa.array(range(8), type=pa.int32())})
+    source = lance.write_dataset(expected, tmp_path / "source")
+    initial_options = {
+        "test_credential": "expired-temporary",
+        "expires_at_millis": "0",
+        "refresh_offset_millis": "1000",
+    }
+
+    cloned = source.shallow_clone(
+        tmp_path / "cloned",
+        source.version,
+        storage_options=initial_options,
+        namespace_client=RotatingNamespace(),
+        table_id=["test_ns", "cloned"],
+    )
+
+    accessor = cloned.storage_options_accessor
+    assert accessor.has_provider()
+    assert accessor.get_storage_options()["test_credential"] == "refreshed-temporary"
+    assert cloned.to_table() == expected
+    cloned.delete("id < 2")
+    assert cloned.count_rows() == 6
+
+
 def test_deep_clone(tmp_path: Path):
     source_dir = tmp_path / "deep_src"
     destination_dir = tmp_path / "deep_clone"

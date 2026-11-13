@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use std::vec;
@@ -69,7 +69,8 @@ use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptionsAccessor,
+    StorageOptionsProvider, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::MetricType;
@@ -77,7 +78,7 @@ use lance_table::io::commit::{ConditionalPutCommitHandler, write_manifest_file_t
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -3128,6 +3129,298 @@ async fn test_reconfigure_preserves_clone_bindings_and_read_options() {
     assert!(!options.decoder_config.cache_repetition_index);
     assert!(options.decoder_config.validate_on_decode);
     assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+}
+
+/// Storage option carrying the credential the fixture backend authenticates with.
+const TEST_CREDENTIAL_KEY: &str = "test_credential";
+const EXPIRED_CREDENTIAL: &str = "expired-temporary";
+const REFRESHED_CREDENTIAL: &str = "refreshed-temporary";
+
+#[derive(Debug)]
+struct RotatingStorageOptionsProvider {
+    fetches: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StorageOptionsProvider for RotatingStorageOptionsProvider {
+    async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(HashMap::from([(
+            TEST_CREDENTIAL_KEY.to_string(),
+            REFRESHED_CREDENTIAL.to_string(),
+        )])))
+    }
+
+    fn provider_id(&self) -> String {
+        "shallow-clone-rotating-credentials".to_string()
+    }
+}
+
+/// Serves a shared in-memory backend through stores that reject I/O once the
+/// test marks credentials expired, unless the accessor captured when the store
+/// was built vends the refreshed credential.
+#[derive(Debug)]
+struct CredentialCheckingProvider {
+    backend: Arc<dyn object_store::ObjectStore>,
+    expired: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for CredentialCheckingProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore> {
+        ObjectStore::try_new(
+            Arc::new(CredentialCheckingStore {
+                backend: self.backend.clone(),
+                accessor: params.get_accessor(),
+                expired: self.expired.clone(),
+            }),
+            base_path,
+            params.block_size,
+            None,
+            false,
+            true,
+            64,
+            3,
+            params.storage_options(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CredentialCheckingStore {
+    backend: Arc<dyn object_store::ObjectStore>,
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl CredentialCheckingStore {
+    async fn require_fresh_credentials(&self) -> OSResult<()> {
+        if !self.expired.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let failure = |message: String| OSError::Generic {
+            store: "credential-test",
+            source: Box::new(std::io::Error::other(message)),
+        };
+        let Some(accessor) = self.accessor.as_ref() else {
+            return Err(failure("primary backend has no accessor".to_string()));
+        };
+        let options = accessor
+            .get_storage_options()
+            .await
+            .map_err(|source| OSError::Generic {
+                store: "credential-test",
+                source: Box::new(source),
+            })?;
+        match options.get(TEST_CREDENTIAL_KEY).map(String::as_str) {
+            Some(REFRESHED_CREDENTIAL) => Ok(()),
+            stale => Err(failure(format!(
+                "primary backend still authenticates with {stale:?}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialCheckingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CredentialCheckingStore({})", self.backend)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for CredentialCheckingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.require_fresh_credentials().await?;
+        self.backend.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.require_fresh_credentials().await?;
+        self.backend.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.require_fresh_credentials().await?;
+        self.backend.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.require_fresh_credentials().await?;
+        self.backend.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.backend.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.backend.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.backend.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.require_fresh_credentials().await?;
+        self.backend.copy_opts(from, to, opts).await
+    }
+}
+
+/// The accessor installed by `reconfigure` must reach the primary backend that
+/// was already built, not only the handle's params. The Python `shallow_clone`
+/// path builds the target store from static namespace credentials and only then
+/// installs the refreshable namespace accessor; updating params alone leaves the
+/// opened backend authenticating with the expired credentials.
+#[tokio::test]
+async fn test_reconfigure_installs_accessor_in_opened_primary_store() {
+    let source_backend: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_backend: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let expired = Arc::new(AtomicBool::new(false));
+    let fetches = Arc::new(AtomicUsize::new(0));
+
+    let source_uri = "memory:///accessor-refresh-source";
+    let target_uri = "credential-test:///accessor-refresh-target";
+    #[allow(deprecated)]
+    let source_params = ObjectStoreParams {
+        object_store: Some((source_backend, url::Url::parse(source_uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(source_params),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = source.scan().try_into_batch().await.unwrap();
+
+    source.session.store_registry().insert(
+        "credential-test",
+        Arc::new(CredentialCheckingProvider {
+            backend: target_backend,
+            expired: expired.clone(),
+        }),
+    );
+
+    // The public binding forwards the namespace's initial temporary credentials
+    // as a static accessor, so the clone's store is built from them.
+    let initial_options = HashMap::from([
+        (
+            TEST_CREDENTIAL_KEY.to_string(),
+            EXPIRED_CREDENTIAL.to_string(),
+        ),
+        ("expires_at_millis".to_string(), "0".to_string()),
+    ]);
+    let cloned = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(initial_options.clone()),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Credentials expire while the handle still holds the backend built above.
+    expired.store(true, Ordering::SeqCst);
+
+    let mut configured = cloned
+        .reconfigure(DatasetRuntimeConfig {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    initial_options,
+                    Arc::new(RotatingStorageOptionsProvider {
+                        fetches: fetches.clone(),
+                    }),
+                ),
+            )),
+            // The rebuild must keep the explicit block-size precedence too.
+            block_size: Some(1024),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        configured.storage_options_accessor().unwrap().accessor_id(),
+        "shallow-clone-rotating-credentials"
+    );
+    assert_eq!(configured.object_store.block_size(), 1024);
+
+    // A real metadata read through the primary backend must refresh credentials.
+    let versions = configured.versions().await.unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "primary metadata reads must consult the refreshed accessor exactly once"
+    );
+
+    // The primary backend itself was replaced, not only the handle's params.
+    assert!(
+        !Arc::ptr_eq(&cloned.object_store, &configured.object_store),
+        "reconfigure must replace the primary backend when the accessor changes"
+    );
+
+    // Shared source files keep their own bindings after the primary rebuild.
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+
+    // Commits and refs use the rebuilt backend too.
+    configured.delete("id < 2").await.unwrap();
+    configured
+        .tags()
+        .create("after-reconfigure", configured.version().version)
+        .await
+        .unwrap();
+    assert_eq!(
+        configured
+            .tags()
+            .get("after-reconfigure")
+            .await
+            .unwrap()
+            .version,
+        configured.version().version
+    );
+    assert_eq!(configured.count_rows(None).await.unwrap(), 6);
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)
