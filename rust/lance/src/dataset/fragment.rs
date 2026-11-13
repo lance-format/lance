@@ -3342,7 +3342,7 @@ impl FileFragment {
 /// Using deleted ids to remap row ids into actual row ids.
 ///
 /// The live row with logical index `i` sits at physical row `i + k`, where `k`
-/// is the number of deleted rows before it. Deleted row `j` (0-based) has
+/// is the number of deleted rows before it. The `j`-th deletion (0-based) has
 /// `deleted[j] - j` live rows before it, a count that never decreases with
 /// `j`, so it comes before the live row exactly when `deleted[j] - j <= i`.
 /// One binary search over the sorted deletions finds `k`. For example, if
