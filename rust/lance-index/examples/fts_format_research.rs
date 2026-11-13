@@ -298,13 +298,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::from_filesystem_path(fs::canonicalize(&root)?)?,
         metadata_cache.clone(),
     ));
-    if mode == "build" {
+    if mode == "build" || mode == "build-ipc" {
         let schema = Arc::new(Schema::new(vec![
             Field::new("text", DataType::LargeUtf8, true),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let batch_schema = schema.clone();
-        let batches = stream::iter(0..rows.div_ceil(8192)).map(move |batch| {
+        let synthetic_batches = (0..rows.div_ceil(8192)).map(move |batch| {
             let start = batch * 8192;
             let end = (start + 8192).min(rows);
             RecordBatch::try_new(
@@ -320,6 +320,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map_err(Into::into)
         });
+        let batches: Box<dyn Iterator<Item = lance_core::Result<RecordBatch>> + Send> =
+            if mode == "build-ipc" {
+                let path = args.get(4).ok_or("build-ipc requires an Arrow IPC file")?;
+                let reader = arrow_ipc::reader::FileReader::try_new(fs::File::open(path)?, None)?;
+                if reader.schema().fields() != schema.fields() {
+                    return Err("IPC input must contain text: LargeUtf8 and _rowid: UInt64".into());
+                }
+                Box::new(reader.map(|batch| batch.map_err(Into::into)))
+            } else {
+                Box::new(synthetic_batches)
+            };
         let params = InvertedIndexParams::default()
             .with_position(true)
             .stem(false)
@@ -330,7 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         builder
             .update(
-                Box::pin(RecordBatchStreamAdapter::new(schema, batches)),
+                Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(batches))),
                 store.as_ref(),
                 None,
             )
@@ -367,7 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let concurrency: usize = args.get(4).map(String::as_str).unwrap_or("1").parse()?;
     let sweeps: usize = args.get(5).map(String::as_str).unwrap_or("10").parse()?;
-    let queries = [
+    let default_queries = [
         ("missing", false, false),
         ("needle", false, false),
         ("alpha", false, false),
@@ -377,25 +388,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("needle alpha beta", true, true),
         ("term00007 term10000 term20000", false, false),
     ];
+    let queries: Vec<(String, bool, bool)> = if let Some(path) = args.get(7) {
+        serde_json::from_slice(&fs::read(path)?)?
+    } else {
+        default_queries
+            .into_iter()
+            .map(|(q, and, phrase)| (q.to_owned(), and, phrase))
+            .collect()
+    };
     for sweep in 0..sweeps {
         let start = Instant::now();
         let index_ref = &index;
         let results: Vec<_> = stream::iter(queries.iter().enumerate())
-            .map(|(query_id, &(text, and, phrase))| async move {
+            .map(|(query_id, (text, and, phrase))| async move {
                 let start = Instant::now();
                 let tokens = Arc::new(Tokens::new(
                     text.split_whitespace().map(str::to_owned).collect(),
                     DocType::Text,
                 ));
                 let mut params = FtsSearchParams::new().with_limit(Some(10));
-                if phrase {
+                if *phrase {
                     params = params.with_phrase_slop(Some(0));
                 }
                 let (ids, scores) = index_ref
                     .bm25_search(
                         tokens,
                         params.into(),
-                        if and { Operator::And } else { Operator::Or },
+                        if *and { Operator::And } else { Operator::Or },
                         Arc::new(NoFilter),
                         Arc::new(NoOpMetricsCollector),
                         None,
