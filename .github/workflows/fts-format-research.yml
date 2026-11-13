@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fts-format-research-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   range-contract:
     runs-on: ubuntu-24.04

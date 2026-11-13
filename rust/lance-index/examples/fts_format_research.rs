@@ -10,7 +10,9 @@ use arrow_array::{Array, LargeStringArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, stream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{ROW_ID, cache::LanceCache};
+use lance_file::{reader::FileReader, version::ConcreteFileVersion};
 use lance_index::scalar::inverted::{
     COMPRESSED_POSITION_COL, InvertedIndex, InvertedIndexBuilder, InvertedIndexParams,
     POSITION_BLOCK_OFFSET_COL, POSTING_COL, PostingListBuilder,
@@ -21,6 +23,10 @@ use lance_index::scalar::inverted::{
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{Index, metrics::NoOpMetricsCollector, prefilter::NoFilter};
 use lance_io::object_store::ObjectStore;
+use lance_io::{
+    scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
+};
 use object_store::path::Path;
 use serde_json::json;
 
@@ -145,6 +151,12 @@ mod tests {
 
     #[tokio::test]
     async fn native_query_matches_raw_text_reference() {
+        for container in [ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_2] {
+            assert_native_contract(container).await;
+        }
+    }
+
+    async fn assert_native_contract(container: ConcreteFileVersion) {
         let texts = [
             None,
             Some(""),
@@ -172,10 +184,11 @@ mod tests {
             .unwrap(),
         ];
         let temporary = tempfile::tempdir().unwrap();
-        let store = Arc::new(LanceIndexStore::new(
+        let store = Arc::new(LanceIndexStore::with_format_version(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(temporary.path()).unwrap(),
             Arc::new(LanceCache::no_cache()),
+            container,
         ));
         let mut builder = InvertedIndexBuilder::new(
             InvertedIndexParams::default()
@@ -279,7 +292,9 @@ mod tests {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).ok_or("mode: build/query/export")?;
+    let mode = args
+        .get(1)
+        .ok_or("mode: build/build-ipc/query/export/inspect/stats")?;
     let root = PathBuf::from(args.get(2).ok_or("index directory")?);
     let rows: usize = args
         .get(3)
@@ -293,10 +308,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata_cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
     let index_cache = LanceCache::with_capacity(64 * 1024 * 1024);
     fs::create_dir_all(&root)?;
-    let store = Arc::new(LanceIndexStore::new(
+    let container = match std::env::var("FTS_RESEARCH_CONTAINER_VERSION")
+        .unwrap_or_else(|_| "2.2".to_owned())
+        .as_str()
+    {
+        "2.0" => ConcreteFileVersion::V2_0,
+        "2.1" => ConcreteFileVersion::V2_1,
+        "2.2" => ConcreteFileVersion::V2_2,
+        _ => return Err("research container must be 2.0, 2.1 or 2.2".into()),
+    };
+    if mode == "inspect" {
+        let output = PathBuf::from(args.get(4).ok_or("inspect output directory")?);
+        fs::create_dir_all(&output)?;
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let mut files: Vec<_> = fs::read_dir(&root)?.collect::<std::io::Result<Vec<_>>>()?;
+        files.sort_by_key(|entry| entry.file_name());
+        for entry in files {
+            if entry.path().extension().is_none_or(|ext| ext != "lance") {
+                continue;
+            }
+            let path = Path::from_filesystem_path(fs::canonicalize(entry.path())?)?;
+            let file = scheduler
+                .open_file_with_priority(&path, 0, &CachedFileSize::unknown())
+                .await?;
+            let metadata = FileReader::read_all_metadata(&file).await?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            fs::write(
+                output.join(format!("{name}.metadata.txt")),
+                format!("{metadata:#?}"),
+            )?;
+            emit(
+                json!({"phase":"file_metadata","file":name,"version":format!("{:?}",metadata.version),
+                "rows":metadata.num_rows,"file_bytes":metadata.file_size_bytes,
+                "data_bytes":metadata.num_data_bytes,"column_metadata_bytes":metadata.num_column_metadata_bytes,
+                "global_buffer_bytes":metadata.num_global_buffer_bytes,"footer_bytes":metadata.num_footer_bytes,
+                "heap_estimate_bytes":metadata.deep_size_of()}),
+            );
+        }
+        return Ok(());
+    }
+    let store = Arc::new(LanceIndexStore::with_format_version(
         object_store.clone(),
         Path::from_filesystem_path(fs::canonicalize(&root)?)?,
         metadata_cache.clone(),
+        container,
     ));
     if mode == "build" || mode == "build-ipc" {
         let schema = Arc::new(Schema::new(vec![
@@ -348,12 +406,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         let io = object_store.io_stats_incremental();
         emit(
-            json!({"phase":"build", "rows":rows, "elapsed_s":start.elapsed().as_secs_f64(),
+            json!({"phase":"build", "rows":rows, "container":format!("{container:?}"), "elapsed_s":start.elapsed().as_secs_f64(),
             "read_bytes":io.read_bytes, "write_bytes":io.written_bytes, "process":process_snapshot()}),
         );
         return Ok(());
     }
-    if mode != "query" {
+    if mode != "query" && mode != "stats" {
         return Err("unknown mode".into());
     }
     let start = Instant::now();
@@ -363,8 +421,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         json!({"phase":"open", "elapsed_s":start.elapsed().as_secs_f64(),
         "partitions":index.partition_count(), "read_bytes":io.read_bytes,"read_iops":io.read_iops,
         "index_cache_bytes":index_cache.size_bytes().await,
-        "metadata_cache_bytes":metadata_cache.size_bytes().await,"process":process_snapshot()}),
+        "metadata_cache_bytes":metadata_cache.size_bytes().await,"index_heap_estimate_bytes":index.deep_size_of(),"process":process_snapshot()}),
     );
+    if mode == "stats" {
+        let path = args.get(4).ok_or("stats query JSON file")?;
+        let queries: Vec<(String, bool, bool)> = serde_json::from_slice(&fs::read(path)?)?;
+        let terms: Vec<_> = queries
+            .iter()
+            .flat_map(|(q, _, _)| q.split_whitespace().map(str::to_owned))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let start = Instant::now();
+        let (total_tokens, documents, df) = index.bm25_stats_for_terms(&terms, None).await?;
+        let io = object_store.io_stats_incremental();
+        emit(
+            json!({"phase":"stats","elapsed_s":start.elapsed().as_secs_f64(),"terms":terms,
+            "df":df,"documents":documents,"total_tokens":total_tokens,
+            "read_bytes":io.read_bytes,"read_iops":io.read_iops,
+            "index_heap_estimate_bytes":index.deep_size_of(),"index_cache_bytes":index_cache.size_bytes().await,
+            "metadata_cache_bytes":metadata_cache.size_bytes().await,"process":process_snapshot()}),
+        );
+        return Ok(());
+    }
     if args.get(6).is_some_and(|s| s == "prewarm") {
         let start = Instant::now();
         index.prewarm().await?;
