@@ -72,13 +72,13 @@ The metadata file contains JSON-serialized configuration and partition informati
 |----------------------|----------------|--------------------|----------------------------------------------------------------|
 | `lance_tokenizer`    | String?        | null               | Document-level tokenizer: `text` for string documents, `json` for JSON string documents. When absent, it is inferred from the Arrow field type during index build. |
 | `base_tokenizer`     | String         | "simple"           | Lexical tokenizer type (see Tokenizers section)                |
-| `language`           | String         | "English"          | Language for stemming and stop words                           |
+| `language`           | String         | "English"          | Language for stemming and non-ICU built-in stop words           |
 | `with_position`      | Boolean        | false              | Store term positions for phrase queries (increases index size) |
 | `max_token_length`   | UInt32?        | 40                 | Remove tokens whose UTF-8 byte length is greater than or equal to this value. Null disables the limit. |
 | `lower_case`         | Boolean        | true               | Convert tokens to lowercase                                    |
 | `stem`               | Boolean        | true (code: false) | Apply language-specific stemming                               |
-| `remove_stop_words`  | Boolean        | true (code: false) | Remove common stop words for the specified language            |
-| `custom_stop_words`  | Array<String>? | null               | Replace the built-in stop word list. Null uses the built-in list for `language`. |
+| `remove_stop_words`  | Boolean        | true (code: false) | Remove stop words using the custom or built-in list             |
+| `custom_stop_words`  | Array<String>? | null               | Replace the built-in stop word list when `remove_stop_words` is true. Null uses the multilingual built-in list for `icu` and `icu/split`, or the list for `language` for other tokenizers. |
 | `ascii_folding`      | Boolean        | true               | Convert accented characters to ASCII equivalents               |
 | `min_ngram_length`   | UInt32         | 3                  | Minimum n-gram length (only for ngram tokenizer)               |
 | `max_ngram_length`   | UInt32         | 3                  | Maximum n-gram length (only for ngram tokenizer)               |
