@@ -278,7 +278,7 @@ pub async fn spilling_table_provider_with_job_disk_manager(
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
     // while later readers replay the complete source.
-    let drain_handle = tokio::task::spawn(async move {
+    let drain_handle = lance_core::utils::tokio::spawn(async move {
         let mut errored = false;
         while let Some(res) = source.next().await {
             match res {
@@ -317,11 +317,11 @@ pub async fn spilling_table_provider_with_job_disk_manager(
 }
 
 struct AbortOnDropHandle<T> {
-    handle: tokio::task::JoinHandle<T>,
+    handle: lance_core::utils::tokio::JoinHandle<T>,
 }
 
 impl<T> AbortOnDropHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    fn new(handle: lance_core::utils::tokio::JoinHandle<T>) -> Self {
         Self { handle }
     }
 }

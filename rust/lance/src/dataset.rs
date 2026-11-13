@@ -165,8 +165,9 @@ use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, apply_index_object_metadata_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, validate_non_reusable_field_id_flags, validate_paired_feature_flags,
+    CoveringContract, apply_feature_flags, apply_index_object_metadata_flag,
+    ensure_can_read_manifest, ensure_can_write_manifest, validate_non_reusable_field_id_flags,
+    validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -655,6 +656,14 @@ impl Dataset {
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
+    /// A literal `.` path segment is rejected.
+    ///
+    /// New branch names are limited to a portable budget of 211 bytes, measured
+    /// after the name is path-part encoded twice: once for the branch metadata
+    /// filename and once for the local atomic staging filename. The check runs
+    /// before any branch metadata or dataset files are written. Longer names
+    /// that already exist remain available for lookup, checkout, metadata
+    /// updates, and deletion.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -984,10 +993,11 @@ impl Dataset {
             // from, and an index this build cannot decode still has to survive
             // into the next manifest. Version filtering happens on the way out,
             // in `DatasetIndexExt::load_indices`.
+            let contract = CoveringContract::of(&manifest);
             let indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
-                .map(IndexMetadata::try_from)
+                .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
                 .collect::<Result<Vec<_>>>()?;
             crate::index::loading::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);

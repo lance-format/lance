@@ -13,8 +13,8 @@ use crate::{
         BuiltinIndexType, bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin,
         btree::BTreeIndexPlugin, fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin,
         json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        minhash_lsh::MinHashLshIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
-        zonemap::ZoneMapIndexPlugin,
+        list_element::ListElementIndexPlugin, minhash_lsh::MinHashLshIndexPlugin,
+        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -281,6 +281,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+        registry.add_plugin::<pb::ListElementIndexDetails, ListElementIndexPlugin>();
         registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
         registry.add_plugin::<pb::MinHashLshIndexDetails, MinHashLshIndexPlugin>();
 

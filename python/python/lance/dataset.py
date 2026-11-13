@@ -411,7 +411,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         branch: str
             Name of the branch to create. ``"main"`` is reserved for the
-            default branch and cannot be used as a new branch name.
+            default branch and cannot be used as a new branch name. A literal
+            ``"."`` path segment is rejected. New names are limited to a
+            portable budget of 211 bytes measured after the name is storage
+            path encoded twice; longer names that already exist remain
+            available for lookup, checkout, metadata updates, and deletion.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
@@ -631,6 +635,8 @@ class LanceDataset(pa.dataset.Dataset):
             used for batch nearest-neighbor search. When ``use_index`` is true and a
             vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
+            For multivector columns, ``"warp_imputation_rank"`` tunes WARP search;
+            see :meth:`ScannerBuilder.nearest`.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
