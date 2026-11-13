@@ -586,7 +586,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         // gets the full budget; the most constrained child bounds the batch.
         self.children
             .iter()
-            .try_fold(DrainLimit::all_rows(num_rows), |limit, child| {
+            .try_fold(DrainLimit::unconstrained(num_rows), |limit, child| {
                 child
                     .max_rows_to_drain(num_rows, byte_budget)
                     .map(|child_limit| limit.combine_sibling(child_limit))

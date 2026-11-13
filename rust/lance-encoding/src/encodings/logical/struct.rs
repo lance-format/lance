@@ -341,7 +341,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         self.children
             .iter()
-            .try_fold(DrainLimit::all_rows(num_rows), |limit, child| {
+            .try_fold(DrainLimit::unconstrained(num_rows), |limit, child| {
                 child
                     .max_rows_to_drain(num_rows, byte_budget)
                     .map(|child_limit| limit.combine_sibling(child_limit))

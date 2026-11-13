@@ -368,7 +368,7 @@ pub struct DrainLimit {
 
 impl DrainLimit {
     /// Creates a limit that accepts all requested rows without consuming bytes.
-    pub(crate) fn all_rows(num_rows: u64) -> Self {
+    pub(crate) fn unconstrained(num_rows: u64) -> Self {
         Self {
             rows: num_rows,
             bytes: 0,
@@ -482,7 +482,9 @@ impl DecodeProgress {
         })
     }
 
-    fn loaded_need(&self, rows_to_drain: u64) -> u64 {
+    /// Returns the inclusive row index required by `wait_for_loaded`, which
+    /// waits until the loaded row count is strictly greater than this index.
+    fn last_row_needed(&self, rows_to_drain: u64) -> u64 {
         debug_assert!(rows_to_drain > 0, "a decode batch must contain rows");
         self.rows_drained + rows_to_drain - 1
     }
@@ -1895,13 +1897,12 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        // wait_for_loaded waits for *>* loaded_need (not >=) so we do a -1 here
-        let loaded_need = self.progress.loaded_need(to_take);
+        let last_row_needed = self.progress.last_row_needed(to_take);
         trace!(
-            "Waiting for I/O (desire at least {} fully loaded rows)",
-            loaded_need
+            "Waiting for I/O through row {} (inclusive)",
+            last_row_needed
         );
-        self.root_decoder.wait_for_loaded(loaded_need).await?;
+        self.root_decoder.wait_for_loaded(last_row_needed).await?;
 
         let byte_budget =
             if self.limit_i32_offset_batch_size && has_i32_offsets(self.root_decoder.data_type()) {
@@ -2087,12 +2088,12 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             }
         }
 
-        let loaded_need = self
+        let last_row_needed = self
             .progress
-            .loaded_need(to_take.min(self.rows_per_batch as u64));
+            .last_row_needed(to_take.min(self.rows_per_batch as u64));
 
         self.root_decoder
-            .wait(loaded_need, &self.wait_for_io_runtime)?;
+            .wait(last_row_needed, &self.wait_for_io_runtime)?;
         Ok(self.progress.rows_scheduled())
     }
 
@@ -2344,10 +2345,7 @@ impl StructuralBatchDecodeStream {
             self.progress.rows_drained(),
             self.progress.rows_scheduled(),
         );
-        let row_limit = self
-            .progress
-            .rows_remaining()
-            .min(self.rows_per_batch as u64);
+        let row_limit = self.rows_per_batch as u64;
         let row_limit = if let Some(batch_size_bytes) = self.batch_size_bytes {
             let feedback = self.bytes_per_row_feedback.load(Ordering::Relaxed);
             let bpr = if feedback > 0 {
@@ -4177,11 +4175,39 @@ mod tests {
 
         let rows_to_drain = plan.rows_to_drain(3);
         progress.set_rows_scheduled(3);
-        let reserved = progress.reserve_drain(DrainLimit::all_rows(rows_to_drain), rows_to_drain);
+        let reserved =
+            progress.reserve_drain(DrainLimit::unconstrained(rows_to_drain), rows_to_drain);
         assert_eq!(reserved, 3);
         progress.record_drain(reserved);
         assert_eq!(progress.rows_remaining(), 7);
         assert_eq!(progress.rows_drained(), 3);
+    }
+
+    #[rstest::rstest]
+    #[case::over_budget(0, None, 4, 1)]
+    #[case::dictionary_capacity(4, Some(2), 4, 2)]
+    #[case::oversized_dictionary(4, Some(0), 4, 1)]
+    #[case::request_limit(8, None, 4, 4)]
+    #[case::empty_request(0, Some(0), 0, 0)]
+    fn test_reserve_drain_constraints(
+        #[case] rows: u64,
+        #[case] dictionary_rows: Option<u64>,
+        #[case] requested_rows: u64,
+        #[case] expected_rows: u64,
+    ) {
+        let mut progress = DecodeProgress::new(10);
+        progress.set_rows_scheduled(10);
+        let limit = DrainLimit {
+            rows,
+            bytes: 0,
+            dictionary_rows,
+        };
+
+        let reserved = progress.reserve_drain(limit, requested_rows);
+        assert_eq!(reserved, expected_rows);
+        assert_eq!(progress.rows_remaining(), 10 - expected_rows);
+        progress.record_drain(reserved);
+        assert_eq!(progress.rows_drained(), expected_rows);
     }
 
     #[tokio::test]
