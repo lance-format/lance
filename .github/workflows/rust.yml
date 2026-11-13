@@ -305,6 +305,15 @@ jobs:
             --no-run
       - name: Start DynamoDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
+      - name: Run compact decode and nested selection regressions
+        run: |
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}" \
+            -E '(package(lance-encoding) & (test(test_empty_fixed_width_builder_preserves_arrow_alignment) | test(test_miniblock_planned_binary_bytes_match_partial_drain))) | (package(lance) & test(test_filtered_scan_preserves_nullable_struct_validity))'
       - name: Run tests
         run: |
           ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
