@@ -70,14 +70,6 @@ pub trait CommitIndexHook: Send + Sync {
         index: &IndexMetadata,
     ) -> Result<Option<bool>>;
 
-    /// Whether a user index segment no longer serves queries and is never
-    /// rebuilt, for example a list-element segment whose key field was dropped
-    /// or retyped. A deferred rewrite withdraws such a segment's coverage.
-    /// An error means the details could not be decoded, which is not a verdict.
-    fn is_stale_segment(&self, _table: &Table, _index: &IndexMetadata) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Verify that the user indices can coexist with fragment reuse on a table
     /// with stable row IDs.
     fn validate_stable_row_id_indices(

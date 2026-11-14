@@ -21,13 +21,9 @@ use super::decode_frag_reuse_ledger;
 /// whose type cannot translate stored addresses through the history in
 /// batches.
 ///
-/// The classification is the reader's own (`segment_supports_batch_remapping`),
-/// so a segment the reader would translate keeps its provenance, except stale
-/// segments (below):
-/// - a segment the index hook reports stale (for a list-element segment, its
-///   key fields no longer resolve in `dataset`'s schema) is listed before the
-///   probe runs: nothing queries or rebuilds it, so keeping its provenance
-///   would only pin the history;
+/// The classification is the reader's own
+/// (`segment_supports_batch_remapping`), so a segment the reader would
+/// translate keeps its provenance:
 /// - `Some(true)`: deferrable, not listed;
 /// - `Some(false)`: listed, its coverage of the rewritten sources withdrawn;
 /// - `None`: not listed. Details that cannot be interpreted are refused
@@ -145,20 +141,6 @@ pub async fn undeferrable_segments_covering<'a>(
                 index.name, index.uuid,
             ))
         })?;
-        // A stale segment (for a list-element segment, a key was dropped or
-        // retyped in the schema this rewrite builds on) is never queried or
-        // rebuilt, so a deferred rewrite must withdraw its coverage rather than
-        // leave it pinning the history. This is deliberately not part of the
-        // reader's probe: `remap_column_index` can still catch such a segment
-        // up. An undecodable one is unknown, not a verdict.
-        match hook.is_stale_segment(dataset, index) {
-            Ok(true) => {
-                undeferrable.push(index.uuid);
-                continue;
-            }
-            Ok(false) => {}
-            Err(_) => continue,
-        }
         match hook.supports_batch_remapping(dataset, index).await {
             Ok(Some(false)) => undeferrable.push(index.uuid),
             Ok(_) => {}
