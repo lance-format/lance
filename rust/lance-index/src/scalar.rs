@@ -48,6 +48,7 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+pub mod list_element;
 #[cfg(test)]
 pub(crate) mod lookup_test_util;
 pub mod minhash_lsh;

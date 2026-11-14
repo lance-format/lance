@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use lance_core::datatypes::Schema;
+use lance_core::memory::{Component, register_component};
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
@@ -146,6 +147,16 @@ pub(super) fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &Writer
         // Oldest first, so the front of the queue is what a waiter parks on.
         oldest_flush: state.frozen_flush_watchers.front().cloned(),
     }));
+}
+
+/// The bytes a MemTable-mode writer holds, for the memory gauges.
+fn memtable_retained_bytes(memory: &ArcSwap<ResidentMemTables>) -> u64 {
+    ShardMemory::retained_in(&memory.load()) as u64
+}
+
+/// The bytes a WAL-only writer holds, for the memory gauges.
+fn wal_queue_bytes(state: &WalOnlyState) -> u64 {
+    state.queue_bytes() as u64
 }
 
 /// ShardWriter state shared across tasks.
@@ -386,6 +397,9 @@ impl SharedWriterState {
         let Some(target) = memtable.target() else {
             return Ok((batches, None, false));
         };
+        // Reject capacity overflow before preparing Blob sidecars: a shared
+        // open pack may already contain payloads from accepted writes.
+        memtable.reserve_dictionary_values(&batches)?;
         let logical_schema = Schema::try_from(schema.storage.as_ref())?;
         let data_dir = target
             .generation_path(&self.base_path, &self.config.dir_id, &self.shard_id)
@@ -1267,6 +1281,7 @@ impl ShardWriter {
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
 
         let memory = Arc::new(ArcSwap::<ResidentMemTables>::default());
+        register_component(Component::MemWal, &memory, memtable_retained_bytes);
 
         let state = WriterState {
             memtable,
@@ -1408,6 +1423,7 @@ impl ShardWriter {
         // no-interval); a non-durable writer may pass no interval and rely on
         // the size/close triggers alone.
         let state = Arc::new(WalOnlyState::default());
+        register_component(Component::MemWal, &state, wal_queue_bytes);
 
         // Background WAL flush handler — no MemTable state to consult, so
         // pass `None` for the frozen-vs-active detection; the pending queue and
@@ -1450,6 +1466,12 @@ impl ShardWriter {
     /// All batches are inserted atomically with a single lock acquisition.
     /// This is more efficient than calling put() multiple times for Arrow IPC
     /// streams that contain multiple batches.
+    ///
+    /// In memtable mode, each narrow-key dictionary must fit its declared key
+    /// capacity across the active generation's encoded values (including values
+    /// stored under null keys). An overflowing write is rejected atomically.
+    /// Call [`Self::force_freeze_active`] and retry; if the write alone exceeds
+    /// capacity, split it into smaller writes with a freeze between them.
     ///
     /// # Arguments
     ///

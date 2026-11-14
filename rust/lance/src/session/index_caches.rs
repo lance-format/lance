@@ -416,21 +416,19 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 }
 
-/// Cache key for the query-time index listing DERIVED from a v1 (tagged) FRI:
-/// the coverage-rewritten, filtered listing produced by `frag_reuse_reader`.
-/// For a v0 FRI it holds the listing `load_all_indices` remapped through it; a
-/// snapshot carries one FRI entry, so the two never share a key.
+/// Cache key for the listing `load_all_indices` remaps through a v0 FRI: the
+/// fragment bitmaps rewritten so query planning sees live fragments. A snapshot
+/// carries one FRI entry, so one key per snapshot.
 ///
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
-/// listing. This one caches the per-snapshot result of the coverage backtrack so
-/// `load_indices` does not recompute `segment_coverage` and the per-index bitmap
-/// rewrites on every query-planning / merge_insert call. Keyed by the same
-/// snapshot identity: a different table (`store_identity`), a different snapshot
-/// (`version`), or any index add/replace (which commits a new manifest and bumps
-/// `version`/`e_tag`) yields a different key, so a stale derived listing is never
-/// reused.
+/// listing. Query loading records its own value under `QueryIndexListingKey`,
+/// which also tracks whether an incomplete listing needs another inference or
+/// format-verification attempt. Keyed by the same snapshot identity: a different
+/// table (`store_identity`), a different snapshot (`version`), or any index
+/// add/replace (which commits a new manifest and bumps `version`/`e_tag`) yields
+/// a different key, so a stale remapped listing is never reused.
 ///
-/// This cache is MEMORY-ONLY (no `codec`): the derived listing depends on the
+/// This cache is MEMORY-ONLY (no `codec`): the remapped listing depends on the
 /// READER's translation capability, not only on the snapshot. Different builds
 /// admit different segments for the same snapshot (a build that cannot translate
 /// a segment excludes it; one that can includes it), so a persisted entry
@@ -442,6 +440,19 @@ pub struct DerivedIndexListingKey<'a> {
     pub version: u64,
     pub store_identity: &'a str,
     pub e_tag: Option<&'a str>,
+}
+
+/// Query-visible metadata and whether a later call should retry derivation.
+#[derive(Debug)]
+pub(crate) struct QueryIndexListing {
+    pub(crate) indices: Arc<Vec<IndexMetadata>>,
+    pub(crate) retry_derivation: bool,
+}
+
+impl DeepSizeOf for QueryIndexListing {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.indices.deep_size_of_children(context)
+    }
 }
 
 impl CacheKey for DerivedIndexListingKey<'_> {
@@ -479,6 +490,34 @@ impl CacheKey for DerivedIndexListingKey<'_> {
 
     // No `codec`: memory-only. See the type doc: the derived listing is
     // reader-capability dependent and must not be persisted across builds.
+}
+
+/// Cache the complete query listing using the same snapshot identity as the
+/// legacy derived listing. A separate key preserves its public value type and
+/// prevents cached values with different concrete types from sharing a namespace.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryIndexListingKey<'a>(pub(crate) DerivedIndexListingKey<'a>);
+
+impl CacheKey for QueryIndexListingKey<'_> {
+    type ValueType = QueryIndexListing;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.0.key()
+    }
+
+    fn type_name() -> &'static str {
+        "QueryIndexListing"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.query-listing-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.0.write_key(builder);
+    }
+
+    // Reader compatibility depends on the current build, so keep this memory-only.
 }
 
 pub struct ProstAny(pub Arc<prost_types::Any>);
@@ -620,6 +659,18 @@ mod tests {
         assert_ne!(base.key(), other_table.key());
         assert_ne!(base.key(), other_version.key());
         assert_ne!(base.key(), other_generation.key());
+        assert_ne!(
+            QueryIndexListingKey(base).key(),
+            QueryIndexListingKey(other_table).key()
+        );
+        assert_ne!(
+            QueryIndexListingKey(base).key(),
+            QueryIndexListingKey(other_version).key()
+        );
+        assert_ne!(
+            QueryIndexListingKey(base).key(),
+            QueryIndexListingKey(other_generation).key()
+        );
     }
 
     #[test]
@@ -630,6 +681,14 @@ mod tests {
         assert_ne!(
             DerivedIndexListingKey::schema().id(),
             IndexMetadataKey::schema().id()
+        );
+        assert_ne!(
+            QueryIndexListingKey::schema().id(),
+            IndexMetadataKey::schema().id()
+        );
+        assert_ne!(
+            QueryIndexListingKey::schema().id(),
+            DerivedIndexListingKey::schema().id()
         );
     }
 }
