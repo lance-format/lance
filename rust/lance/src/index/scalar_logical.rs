@@ -442,6 +442,14 @@ pub async fn open_scalar_index_segments(
                 .is_none_or(|coverage| coverage.intersection_len(fragments) > 0)
         });
     }
+    if metrics.records_index_segments() {
+        metrics.record_index_segments(
+            &indices
+                .iter()
+                .map(|index| index.uuid.to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
     match indices.len() {
         0 => Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
@@ -605,6 +613,175 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(key_indices, vec![1]);
+    }
+
+    #[rstest]
+    #[case::addresses(false, false)]
+    #[case::stable_ids(true, false)]
+    #[case::addresses_null(false, true)]
+    #[case::stable_ids_null(true, true)]
+    #[tokio::test]
+    async fn test_segment_ownership_after_update(
+        #[case] stable_row_ids: bool,
+        #[case] nullable: bool,
+        #[values(IndexType::BTree, IndexType::Bitmap)] index_type: IndexType,
+    ) {
+        let batch = arrow_array::record_batch!(
+            (
+                "value",
+                Int32,
+                [
+                    Some(0),
+                    if nullable { None } else { Some(1) },
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                    Some(7)
+                ]
+            ),
+            (
+                "text",
+                Utf8,
+                [
+                    "token", "token", "token", "token", "token", "token", "token", "token"
+                ]
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(match index_type {
+            IndexType::Bitmap => BuiltinIndexType::Bitmap,
+            _ => BuiltinIndexType::BTree,
+        });
+        let old = dataset
+            .create_index_builder(&["value"], index_type, &params)
+            .name("value_idx".to_owned())
+            .fragments(vec![0, 1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![old.clone()])
+            .await
+            .unwrap();
+        dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .update_where(if nullable {
+                "value IS NULL"
+            } else {
+                "value = 1"
+            })
+            .unwrap()
+            .set("value", "101")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        let moved_fragment = dataset.fragments().last().unwrap().id as u32;
+        let new = dataset
+            .create_index_builder(&["value"], index_type, &params)
+            .name("value_idx".to_owned())
+            .replace(true)
+            .fragments(vec![moved_fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![old, new])
+            .await
+            .unwrap();
+        let predicates = if nullable {
+            [
+                "value IS NULL",
+                "value = 101",
+                "NOT (value IS NULL)",
+                "NOT (value < 5)",
+                "NOT (value < 0)",
+            ]
+        } else {
+            [
+                "value = 1",
+                "value = 101",
+                "NOT (value = 1)",
+                "NOT (value < 5)",
+                "NOT (value < 0)",
+            ]
+        };
+        for predicate in predicates {
+            let mut indexed = dataset.scan();
+            indexed.filter(predicate).unwrap().with_row_id();
+            let actual = indexed.try_into_batch().await.unwrap();
+            indexed.use_scalar_index(false);
+            let expected = indexed.try_into_batch().await.unwrap();
+            let ids = |batch: &arrow_array::RecordBatch| {
+                batch[lance_core::ROW_ID]
+                    .as_primitive::<arrow_array::types::UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(
+                ids(&actual),
+                ids(&expected),
+                "{predicate}, stable_row_ids={stable_row_ids}"
+            );
+        }
+        let missing =
+            arrow_array::record_batch!(("value", Int32, [202]), ("text", Utf8, ["token"])).unwrap();
+        dataset
+            .append(
+                arrow_array::RecordBatchIterator::new(vec![Ok(missing.clone())], missing.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &lance_index::scalar::inverted::tokenizer::InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let mut scan = dataset.scan();
+        scan.prefilter(true)
+            .filter(if nullable {
+                "value IS NULL OR value = 202"
+            } else {
+                "value = 1 OR value = 202"
+            })
+            .unwrap();
+        scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new(
+            "token".to_owned(),
+        ))
+        .unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            result["value"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref(),
+            &[202]
+        );
     }
 
     #[tokio::test]
@@ -2093,6 +2270,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // No committed index needs the compaction's record, so trim drops it
+        // and nothing maps the retired coverage.
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
 
         let direct_err = dataset
             .commit_existing_index_segments("text_ngram", "text", segments.clone())

@@ -24,6 +24,7 @@ import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.update.UpdateParams;
 import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -842,7 +843,13 @@ public class ScalarIndexTest {
       testDataset.createEmptyDataset().close();
       testDataset.write(1, 10).close();
       // The second fragment holds two NULL names and "P0" through "P5".
-      try (Dataset dataset = testDataset.writeSortByDataset(2)) {
+      try (Dataset written = testDataset.writeSortByDataset(2);
+          Dataset dataset =
+              written
+                  .update(
+                      new UpdateParams(Collections.singletonMap("name", "'Person\0007'"))
+                          .withWhere("name = 'Person 0'"))
+                  .getDataset()) {
         IndexParams indexParams =
             IndexParams.builder()
                 .setScalarIndexParams(FmIndexParams.builder().numSegments(2).build())
@@ -855,15 +862,27 @@ public class ScalarIndexTest {
         List<Index> segments = dataset.describeIndices().get(0).getSegments();
         assertEquals(2, segments.size());
         assertEquals(IndexType.FM, segments.get(0).indexType());
-        // The first fragment holds "Person 0" through "Person 9"; a one-character
-        // pattern is answered by the index as well.
+        // Both the original "Person 7" and the NUL-containing name contain '7'.
         assertEquals(
-            1, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
-        assertEquals(
-            1, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
         // Every non-NULL name contains 'P'; the two NULL rows do not match.
         assertEquals(
             18, dataset.countIndexedRows("name_fm", "contains(name, 'P')", Optional.empty()));
+
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(1, dataset.countRows(spacedFilter));
+        // The normalized NUL is an FM candidate, but source rechecking excludes it.
+        assertEquals(1, dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
+        // NUL patterns still cannot produce a sound FM candidate set.
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                    dataset.countIndexedRows(
+                        "name_fm", "contains(name, 'Person\0')", Optional.empty()));
+        assertTrue(
+            error.getMessage().contains("Filter cannot be planned using scalar index 'name_fm'"));
+        assertEquals(1, dataset.countRows("contains(name, 'Person\0')"));
       }
     }
   }
@@ -886,7 +905,10 @@ public class ScalarIndexTest {
 
         assertEquals(1, dataset.describeIndices().get(0).getSegments().size());
         assertEquals(
-            2, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(2, dataset.countRows(spacedFilter));
+        assertEquals(2, dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
       }
     }
   }

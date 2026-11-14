@@ -2,18 +2,29 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Index-friendly comparisons of integer and decimal columns with numeric
-//! operands. They use exact mathematical values, rather than rounding the
-//! operand or the column to a float.
+//! operands.
+//!
+//! [`rewrite`] compares an integer or decimal column with a numeric operand by
+//! exact mathematical value, rather than rounding the operand or the column to
+//! a float. [`unwrap_widening_casts`] handles a column that is explicitly cast
+//! to a float first, and keeps the rounding of that cast.
+
+use std::collections::VecDeque;
 
 use arrow_buffer::i256;
 use arrow_schema::{DECIMAL128_MAX_PRECISION, DataType};
-use datafusion::logical_expr::{Between, BinaryExpr, Operator};
+use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{Between, BinaryExpr, ExprSchemable, Operator};
 use datafusion::prelude::{Expr, lit};
 use datafusion::scalar::ScalarValue;
+use lance_core::Result;
 use lance_core::datatypes::Schema;
 
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_expr, resolve_column_type};
+use crate::planner::Planner;
 
 /// Inclusive lower and exclusive upper bounds, exactly representable as f64.
 fn int_bounds(data_type: &DataType) -> Option<(f64, f64)> {
@@ -370,15 +381,316 @@ pub fn rewrite(expr: &Expr, schema: &Schema) -> Option<Expr> {
     }
 }
 
+/// Most integers rounding to one value of an `IN` list that are listed
+/// individually: the spacing of doubles up to 2^57, or of Float32 up to 2^28.
+const MAX_LISTED_INTEGERS: i128 = 16;
+
+/// A column read through a cast that widens it to a float type.
+struct WidenedColumn<'a> {
+    column: &'a Expr,
+    column_type: DataType,
+    /// `Float32` or `Float64`; for a `Float32` column, always `Float64`.
+    float_type: DataType,
+}
+
+fn is_field_reference(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) => true,
+        Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
+            udf.args.first().is_some_and(is_field_reference)
+        }
+        _ => false,
+    }
+}
+
+fn widened_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<WidenedColumn<'a>> {
+    // An integer or `Float32` never fails to convert to a float, so `TRY_CAST`
+    // is the same function as `CAST` here.
+    let (column, float_type) = match expr {
+        Expr::Cast(cast) => (cast.expr.as_ref(), cast.field.data_type()),
+        Expr::TryCast(cast) => (cast.expr.as_ref(), cast.field.data_type()),
+        _ => return None,
+    };
+    let column_type = column.get_type(schema).ok()?;
+    let is_widening = (column_type.is_integer()
+        && matches!(float_type, DataType::Float32 | DataType::Float64))
+        || (column_type == DataType::Float32 && *float_type == DataType::Float64);
+    (is_widening && is_field_reference(column)).then(|| WidenedColumn {
+        column,
+        column_type,
+        float_type: float_type.clone(),
+    })
+}
+
+/// The literal operand as an `f64`, `Some(None)` for NULL, or `None` for
+/// anything else. Only a literal of the cast's own type is taken, which is what
+/// coercion leaves next to the cast.
+fn widened_literal(expr: &Expr, float_type: &DataType) -> Option<Option<f64>> {
+    let value = extract_literal(expr)?;
+    if value.data_type() != *float_type {
+        return None;
+    }
+    match value.cast_to(&DataType::Float64).ok()? {
+        ScalarValue::Float64(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// The integers `start..stop` of the column's domain `min..end`.
+struct SelectedIntegers {
+    start: i128,
+    stop: i128,
+    min: i128,
+    end: i128,
+}
+
+/// The integers whose rounding to `float_type` compares `op` `value`.
+///
+/// Rounding is monotonic, so the integers that round above `value` (or not
+/// below it) are a suffix of the domain, found by binary search, and each
+/// comparison selects one interval. Comparisons against NaN are false, which
+/// places NaN above every integer, as float filters do regardless of its sign.
+fn select_integers(widened: &WidenedColumn, op: Operator, value: f64) -> Option<SelectedIntegers> {
+    let WidenedColumn {
+        column_type,
+        float_type,
+        ..
+    } = widened;
+    let bits = column_type.primitive_width()? as u32 * 8;
+    let (min, end) = if column_type.is_signed_integer() {
+        (-(1_i128 << (bits - 1)), 1_i128 << (bits - 1))
+    } else {
+        (0, 1_i128 << bits)
+    };
+    let round = |integer: i128| match float_type {
+        DataType::Float32 => f64::from(integer as f32),
+        _ => integer as f64,
+    };
+    let first = |above: bool| {
+        let (mut start, mut stop) = (min, end);
+        while start < stop {
+            let mid = start + (stop - start) / 2;
+            if round(mid) > value || (!above && round(mid) == value) {
+                stop = mid;
+            } else {
+                start = mid + 1;
+            }
+        }
+        start
+    };
+    let (start, stop) = match op {
+        Operator::Gt => (first(true), end),
+        Operator::GtEq => (first(false), end),
+        Operator::Lt => (min, first(false)),
+        Operator::LtEq => (min, first(true)),
+        Operator::Eq => (first(false), first(true)),
+        _ => return None,
+    };
+    Some(SelectedIntegers {
+        start,
+        stop,
+        min,
+        end,
+    })
+}
+
+fn integer_literal(value: i128, column_type: &DataType) -> Option<ScalarValue> {
+    let value = match i64::try_from(value) {
+        Ok(value) => ScalarValue::Int64(Some(value)),
+        Err(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
+    };
+    value.cast_to(column_type).ok()
+}
+
+/// `column op value` for an integer column compared after rounding it to
+/// `float_type`, as one interval of integers.
+fn unwrap_integer(widened: &WidenedColumn, op: Operator, value: f64) -> Option<Expr> {
+    let (column, column_type) = (widened.column, &widened.column_type);
+    let SelectedIntegers {
+        start,
+        stop,
+        min,
+        end,
+    } = select_integers(widened, op, value)?;
+    let compare = |op, value: i128| {
+        let value = integer_literal(value, column_type)?;
+        comparison_expr(column, column_type, Comparison::Literal(op, value))
+    };
+    let constant = |value| comparison_expr(column, column_type, Comparison::Constant(value));
+    match (start == min, stop == end) {
+        _ if start >= stop => constant(false),
+        (true, true) => constant(true),
+        (true, false) => compare(Operator::Lt, stop),
+        (false, true) => compare(Operator::GtEq, start),
+        _ if stop == start + 1 => compare(Operator::Eq, start),
+        _ => Some(compare(Operator::GtEq, start)?.and(compare(Operator::Lt, stop)?)),
+    }
+}
+
+/// `column op value` for a column that the comparison reads widened to a
+/// float, without the cast.
+fn unwrap_comparison(widened: &WidenedColumn, op: Operator, value: Option<f64>) -> Option<Expr> {
+    let (column, column_type) = (widened.column, &widened.column_type);
+    if op == Operator::NotEq {
+        return Some(!unwrap_comparison(widened, Operator::Eq, value)?);
+    }
+    let Some(value) = value else {
+        let null = ScalarValue::try_new_null(column_type).ok()?;
+        return comparison_expr(column, column_type, Comparison::Literal(op, null));
+    };
+    if column_type.is_integer() {
+        return unwrap_integer(widened, op, value);
+    }
+    // A float comparison against NaN also orders NaN payloads, which a Float32
+    // bound would not keep.
+    if value.is_nan() {
+        return None;
+    }
+    let nearest = value as f32;
+    let comparison = if f64::from(nearest) == value {
+        Comparison::Literal(op, ScalarValue::Float32(Some(nearest)))
+    } else {
+        // There is no Float32 between `below` and `value`, so `value` can be
+        // replaced by `below` once `<` and `>=` include it.
+        let below = if f64::from(nearest) < value {
+            nearest
+        } else {
+            nearest.next_down()
+        };
+        let below = ScalarValue::Float32(Some(below));
+        match op {
+            Operator::Gt | Operator::GtEq => Comparison::Literal(Operator::Gt, below),
+            Operator::Lt | Operator::LtEq => Comparison::Literal(Operator::LtEq, below),
+            Operator::Eq => Comparison::Constant(false),
+            _ => return None,
+        }
+    };
+    comparison_expr(column, column_type, comparison)
+}
+
+fn unwrap_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            if !matches!(
+                op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+            ) {
+                return None;
+            }
+            let (widened, op, literal) = match widened_column(left, schema) {
+                Some(widened) => (widened, *op, right),
+                None => (widened_column(right, schema)?, op.swap()?, left),
+            };
+            let value = widened_literal(literal, &widened.float_type)?;
+            unwrap_comparison(&widened, op, value)
+        }
+        Expr::Between(Between {
+            expr,
+            negated,
+            low,
+            high,
+        }) => {
+            let widened = widened_column(expr, schema)?;
+            let low = widened_literal(low, &widened.float_type)?;
+            let high = widened_literal(high, &widened.float_type)?;
+            let between = unwrap_comparison(&widened, Operator::GtEq, low)?.and(unwrap_comparison(
+                &widened,
+                Operator::LtEq,
+                high,
+            )?);
+            Some(if *negated { !between } else { between })
+        }
+        Expr::InList(InList {
+            expr,
+            list,
+            negated,
+        }) => {
+            // The integers that round to a value (and NULL) stay one list,
+            // which evaluates as a single hash lookup. Only values that more
+            // than `MAX_LISTED_INTEGERS` round to become ranges, OR'd as a
+            // balanced tree: a list can be long, and one `OR` level per value
+            // would overflow the stack in the passes that walk the filter.
+            let widened = widened_column(expr, schema)?;
+            let never = comparison_expr(
+                widened.column,
+                &widened.column_type,
+                Comparison::Constant(false),
+            )?;
+            let mut values = Vec::new();
+            let mut ranges = VecDeque::new();
+            for item in list {
+                let value = widened_literal(item, &widened.float_type)?;
+                if let (true, Some(value)) = (widened.column_type.is_integer(), value) {
+                    let selected = select_integers(&widened, Operator::Eq, value)?;
+                    if selected.stop - selected.start <= MAX_LISTED_INTEGERS {
+                        for integer in selected.start..selected.stop {
+                            values.push(lit(integer_literal(integer, &widened.column_type)?));
+                        }
+                        continue;
+                    }
+                }
+                match unwrap_comparison(&widened, Operator::Eq, value)? {
+                    matches if matches == never => {}
+                    Expr::BinaryExpr(BinaryExpr {
+                        op: Operator::Eq,
+                        right,
+                        ..
+                    }) => values.push(*right),
+                    matches => ranges.push_back(matches),
+                }
+            }
+            if !values.is_empty() {
+                ranges.push_front(widened.column.clone().in_list(values, false));
+            }
+            let matches = if ranges.is_empty() {
+                never
+            } else {
+                Planner::balanced_binary_expr(ranges, Operator::Or).ok()?
+            };
+            Some(if *negated { !matches } else { matches })
+        }
+        _ => None,
+    }
+}
+
+/// Rewrites comparisons of a column widened to a float against a literal, such
+/// as `CAST(i AS double) > 2.5` or `TRY_CAST(f32 AS double) = 0.1`, into
+/// comparisons on the column itself, so that its scalar index applies.
+///
+/// The result keeps the semantics of the cast: an integer is compared after
+/// rounding it to the float type, so `CAST(i AS double) = 9007199254740992.0`
+/// also matches `i = 9007199254740993`. A `Float32` widens exactly, and a bound
+/// it cannot represent is replaced by the nearest `Float32` below it.
+///
+/// Expects coerced input, in which a `Float32` column compared with a `Float64`
+/// literal carries the cast, and has to run before the float comparison rewrite
+/// turns these comparisons into ranges on the cast.
+pub fn unwrap_widening_casts(expr: Expr, schema: &DFSchema) -> Result<Expr> {
+    Ok(expr
+        .transform_up(|node| {
+            Ok(match unwrap_node(&node, schema) {
+                Some(rewritten) => Transformed::yes(rewritten),
+                None => Transformed::no(node),
+            })
+        })?
+        .data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::planner::Planner;
     use arrow_array::{
-        ArrayRef, BooleanArray, Decimal128Array, Decimal256Array, RecordBatch, cast::AsArray,
-        record_batch,
+        ArrayRef, BooleanArray, Decimal128Array, Decimal256Array, Float32Array, Int64Array,
+        RecordBatch, UInt64Array, cast::AsArray, record_batch,
     };
     use datafusion::prelude::col;
+    use datafusion_common::tree_node::TreeNodeRecursion;
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -661,5 +973,338 @@ mod tests {
     fn plans_decimal_on_column(#[case] sql: &str, #[case] expected: Expr) {
         let planner = Planner::new(decimal_batch(&PRICE, 0).schema());
         assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    const COMPARISONS: [&str; 6] = ["=", "!=", "<", "<=", ">", ">="];
+
+    fn compare(x: f64, op: &str, value: f64) -> bool {
+        match op {
+            "=" => x == value,
+            "!=" => x != value,
+            "<" => x < value,
+            "<=" => x <= value,
+            ">" => x > value,
+            _ => x >= value,
+        }
+    }
+
+    fn float_sql(value: f64, sql_type: &str) -> String {
+        let text = match value {
+            value if value.is_nan() && value.is_sign_negative() => "'-NaN'".to_string(),
+            value if value.is_nan() => "'NaN'".to_string(),
+            f64::INFINITY => "'inf'".to_string(),
+            f64::NEG_INFINITY => "'-inf'".to_string(),
+            value => format!("{value:?}"),
+        };
+        format!("CAST({text} AS {sql_type})")
+    }
+
+    fn has_cast(expr: &Expr) -> bool {
+        let mut found = false;
+        expr.apply(|node| {
+            found |= matches!(node, Expr::Cast(_) | Expr::TryCast(_));
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    fn evaluate(batch: &RecordBatch, sql: &str) -> (Expr, BooleanArray) {
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(sql).unwrap())
+            .unwrap();
+        // The scan path optimizes a filter twice.
+        assert_eq!(planner.optimize_expr(expr.clone()).unwrap(), expr, "{sql}");
+        let result = planner.create_physical_expr(&expr).unwrap();
+        let result = result.evaluate(batch).unwrap();
+        let result = result.into_array(batch.num_rows()).unwrap();
+        (expr, result.as_boolean().clone())
+    }
+
+    fn integers(data_type: &DataType) -> ArrayRef {
+        let two_53 = 1_i128 << 53;
+        let values = [
+            i128::from(i64::MIN),
+            -two_53 - 1,
+            -two_53,
+            -1,
+            0,
+            1,
+            2,
+            3,
+            (1 << 24) + 1,
+            two_53 - 1,
+            two_53,
+            two_53 + 1,
+            two_53 + 2,
+            two_53 + 3,
+            i128::from(i64::MAX),
+            i128::from(u64::MAX),
+        ];
+        let array: ArrayRef = if data_type.is_signed_integer() {
+            let values = values.iter().filter_map(|v| i64::try_from(*v).ok());
+            Arc::new(Int64Array::from_iter(values.map(Some).chain([None])))
+        } else {
+            let values = values.iter().filter_map(|v| u64::try_from(*v).ok());
+            Arc::new(UInt64Array::from_iter(values.map(Some).chain([None])))
+        };
+        arrow_cast::cast(&array, data_type).unwrap()
+    }
+
+    /// Every comparison of an integer cast to a float gives the rows that
+    /// comparing the rounded value does, and plans on the column.
+    #[rstest]
+    fn widened_integers_compare_rounded(
+        #[values(DataType::Int64, DataType::UInt64, DataType::Int32, DataType::Int8)]
+        data_type: DataType,
+        #[values("CAST(i AS double)", "TRY_CAST(i AS double)", "CAST(i AS float)")] operand: &str,
+    ) {
+        let column = integers(&data_type);
+        let batch = RecordBatch::try_from_iter([("i", column.clone())]).unwrap();
+        let is_float32 = operand.ends_with("float)");
+        let column = arrow_cast::cast(
+            &column,
+            if is_float32 {
+                &DataType::Float32
+            } else {
+                &DataType::Float64
+            },
+        )
+        .unwrap();
+        let column = arrow_cast::cast(&column, &DataType::Float64).unwrap();
+        let rounded = column.as_primitive::<arrow_array::types::Float64Type>();
+        let two_53 = 2_f64.powi(53);
+        for value in [
+            f64::NEG_INFINITY,
+            -1e19,
+            -9223372036854775808.0,
+            -two_53,
+            -129.0,
+            -2.5,
+            -0.0,
+            0.0,
+            0.5,
+            1.0,
+            2.5,
+            16777218.0,
+            two_53,
+            two_53 + 2.0,
+            9223372036854775808.0,
+            18446744073709551616.0,
+            1e300,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ] {
+            let value = if is_float32 {
+                f64::from(value as f32)
+            } else {
+                value
+            };
+            let literal = float_sql(value, if is_float32 { "float" } else { "double" });
+            for op in COMPARISONS {
+                let sql = format!("{operand} {op} {literal}");
+                let (expr, result) = evaluate(&batch, &sql);
+                assert!(!has_cast(&expr), "{sql} kept a cast: {expr}");
+                // Float filters place every NaN above every number.
+                let holds = |x: f64| {
+                    if value.is_nan() {
+                        matches!(op, "!=" | "<" | "<=")
+                    } else {
+                        compare(x, op, value)
+                    }
+                };
+                let expected = rounded
+                    .iter()
+                    .map(|x| x.map(holds))
+                    .collect::<BooleanArray>();
+                assert_eq!(result, expected, "{sql} on {data_type}");
+            }
+        }
+    }
+
+    /// Every comparison of a `Float32` widened to `Float64`, written as a cast
+    /// on the column or as a typed literal, gives the rows that comparing the
+    /// widened value does, and plans on the column.
+    #[rstest]
+    fn widened_float32_compares_exactly(
+        #[values(
+            "CAST(f AS double) {op} {literal}",
+            "TRY_CAST(f AS double) {op} {literal}",
+            "f {op} {literal}"
+        )]
+        template: &str,
+    ) {
+        let one_tenth = 0.1_f32;
+        let values = [
+            f32::NEG_INFINITY,
+            -f32::MAX,
+            -1.0,
+            -f32::from_bits(1),
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            one_tenth,
+            one_tenth.next_up(),
+            0.5,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+            -f32::NAN,
+        ];
+        let column = Float32Array::from_iter(values.map(Some).into_iter().chain([None]));
+        let batch =
+            RecordBatch::try_from_iter([("f", Arc::new(column.clone()) as ArrayRef)]).unwrap();
+        for value in [
+            f64::NEG_INFINITY,
+            -1e300,
+            -1.0,
+            -1e-50,
+            -0.0,
+            0.0,
+            1e-50,
+            0.1,
+            f64::from(one_tenth),
+            0.5,
+            f64::from(f32::MAX),
+            3.5e38,
+            1e300,
+            f64::INFINITY,
+        ] {
+            let literal = float_sql(value, "double");
+            for op in COMPARISONS {
+                let sql = template.replace("{op}", op).replace("{literal}", &literal);
+                let (expr, result) = evaluate(&batch, &sql);
+                assert!(!has_cast(&expr), "{sql} kept a cast: {expr}");
+                // Float filters place every NaN above every number.
+                let holds = |x: f32| {
+                    if x.is_nan() {
+                        matches!(op, "!=" | ">" | ">=")
+                    } else {
+                        compare(f64::from(x), op, value)
+                    }
+                };
+                let expected = column
+                    .iter()
+                    .map(|x| x.map(holds))
+                    .collect::<BooleanArray>();
+                assert_eq!(result, expected, "{sql}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::between("CAST(i AS double) BETWEEN 1.5 AND 3.0", [false, false, true, true, false])]
+    #[case::not_between("CAST(i AS double) NOT BETWEEN 1.5 AND 3.0", [true, true, false, false, true])]
+    #[case::in_list("CAST(i AS double) IN (1.0, 2.5, 9007199254740994.0)", [false, true, false, false, true])]
+    #[case::not_in_list("TRY_CAST(i AS double) NOT IN (1.0, 2.5)", [true, false, true, true, true])]
+    #[case::never_in("CAST(i AS double) IN (2.5, CAST('NaN' AS double))", [false; 5])]
+    // 2^53 is the rounding of 2^53 and 2^53 + 1, neither of which is in the
+    // batch.
+    #[case::rounded_in_list("CAST(i AS double) IN (9007199254740992.0)", [false; 5])]
+    #[case::in_list_rounded("CAST(i AS double) IN (1.0, 9007199254740992.0)", [false, true, false, false, false])]
+    #[case::not_in_list_rounded("CAST(i AS double) NOT IN (1.0, 9007199254740992.0)", [true, false, true, true, true])]
+    #[case::reversed("2.5 < CAST(i AS double)", [false, false, false, true, true])]
+    fn widened_integer_lists_and_ranges(#[case] sql: &str, #[case] expected: [bool; 5]) {
+        let batch = record_batch!((
+            "i",
+            Int64,
+            [
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(9007199254740994),
+                None
+            ]
+        ))
+        .unwrap();
+        let (expr, result) = evaluate(&batch, sql);
+        assert!(!has_cast(&expr), "{sql} kept a cast: {expr}");
+        let expected = expected.map(Some).into_iter().chain([None]);
+        let expected = expected.collect::<BooleanArray>();
+        assert_eq!(result, expected, "{sql}");
+    }
+
+    /// A long list must not become one `OR` level per value, which overflows
+    /// the stack in the passes that walk the filter afterwards.
+    #[rstest]
+    #[case::values("CAST(i AS double)", "double", 0.0, 2.0)]
+    // From 2^24 on, Float32 values are 2 apart and some round from three
+    // integers, which are listed.
+    #[case::listed_intervals("CAST(i AS float)", "float", 16777216.0, 2.0)]
+    // Near 2^62, doubles are 1024 apart, so each value is a range.
+    #[case::ranges("CAST(i AS double)", "double", 4611686018427387904.0, 2048.0)]
+    fn widened_long_lists_stay_shallow(
+        #[case] operand: &str,
+        #[case] sql_type: &str,
+        #[case] start: f64,
+        #[case] step: f64,
+        #[values("IN", "NOT IN")] membership: &str,
+    ) {
+        let values = (0..10_000)
+            .map(|n| start + step * f64::from(n))
+            .collect::<Vec<_>>();
+        let list = values
+            .iter()
+            .map(|value| float_sql(*value, sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{operand} {membership} ({list})");
+        let column = integers(&DataType::Int64);
+        let batch = RecordBatch::try_from_iter([("i", column.clone())]).unwrap();
+        let (expr, result) = evaluate(&batch, &sql);
+        assert!(!has_cast(&expr), "{operand} {membership} kept a cast");
+        let expected = column
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .iter()
+            .map(|x| {
+                x.map(|x| {
+                    let rounded = if sql_type == "float" {
+                        f64::from(x as f32)
+                    } else {
+                        x as f64
+                    };
+                    values.contains(&rounded) != (membership == "NOT IN")
+                })
+            })
+            .collect::<BooleanArray>();
+        assert_eq!(result, expected, "{operand} {membership}");
+    }
+
+    #[rstest]
+    #[case::fraction("CAST(i AS double) > 2.5", col("i").gt_eq(lit(3_i64)))]
+    #[case::try_cast("TRY_CAST(i AS double) <= 2.5", col("i").lt(lit(3_i64)))]
+    #[case::exact("CAST(i AS double) = 3.0", col("i").eq(lit(3_i64)))]
+    #[case::not_equal("CAST(i AS double) != 3.0", col("i").not_eq(lit(3_i64)))]
+    #[case::rounded(
+        "CAST(i AS double) = 9007199254740992.0",
+        col("i")
+            .gt_eq(lit(9007199254740992_i64))
+            .and(col("i").lt(lit(9007199254740994_i64)))
+    )]
+    #[case::in_list(
+        "CAST(i AS double) IN (1.0, 2.5, 3.0, 4.0, 5.0)",
+        col("i").in_list(vec![lit(1_i64), lit(3_i64), lit(4_i64), lit(5_i64)], false)
+    )]
+    // The integers rounding to each value are listed: 2^53 is the rounding of
+    // two integers, and 2^53 + 4 of three.
+    #[case::rounded_in_list(
+        "CAST(i AS double) IN (9007199254740992.0, 9007199254740996.0)",
+        col("i").in_list(
+            [0, 1, 3, 4, 5]
+                .map(|offset| lit(9007199254740992_i64 + offset))
+                .to_vec(),
+            false
+        )
+    )]
+    #[case::never("CAST(u AS double) < -1.0", col("u").lt(lit(0_u8)))]
+    #[case::always("CAST(u AS float) <= CAST(255.0 AS float)", col("u").gt_eq(lit(0_u8)))]
+    fn widened_plans_on_column(#[case] sql: &str, #[case] expected: Expr) {
+        let batch = record_batch!(("i", Int64, [Some(1)]), ("u", UInt8, [Some(1)])).unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.optimize_expr(planner.parse_filter(sql).unwrap());
+        assert_eq!(expr.unwrap(), expected, "{sql}");
     }
 }

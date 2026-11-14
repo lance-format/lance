@@ -72,9 +72,9 @@ const JSON_INDEX_VERSION: u32 = JSON_ROW_ADDR_DOMAIN_VERSION;
 /// when loading the target, for the targets whose format has changed since.
 ///
 /// Those builds loaded the target at the target plugin's then-current version,
-/// which for BTree, Bitmap, and LabelList was the row-id-domain format. `None`
-/// for every other target, whose format has not changed since: its plugin's
-/// current version is still correct.
+/// which for BTree, Bitmap, LabelList, NGram, and RTree was the row-id-domain
+/// format. `None` for every other target, whose format has not changed since:
+/// its plugin's current version is still correct.
 fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32> {
     if target_details.type_url.ends_with("BTreeIndexDetails") {
         Some(crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION)
@@ -82,6 +82,14 @@ fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32>
         Some(crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION)
     } else if target_details.type_url.ends_with("LabelListIndexDetails") {
         Some(crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION)
+    } else if target_details.type_url.ends_with("NGramIndexDetails") {
+        Some(crate::scalar::ngram::NGRAM_ROW_ID_DOMAIN_VERSION)
+    } else if target_details.type_url.ends_with("RTreeIndexDetails") {
+        // RTree lives in lance-geo, which depends on lance-index -- this
+        // crate cannot import lance_geo::rtree::RTREE_ROW_ID_DOMAIN_VERSION
+        // without a cycle. Its value (0) is a fixed historical constant, not
+        // something that can change under this match.
+        Some(0)
     } else {
         None
     }
@@ -91,12 +99,13 @@ fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32>
 /// are [`JSON_ROW_ADDR_DOMAIN_VERSION`], so that a segment of it written before
 /// that version is classified as row-id domain while a fresh one is not.
 ///
-/// That covers targets that moved from row ids to row addresses (BTree, Bitmap,
-/// LabelList), whose legacy segments really store row ids, and targets that
-/// always stored row addresses (ZoneMap, BloomFilter, FM), whose legacy
-/// segments store addresses but carry the version-0 wrapper that
-/// `IndexMetadata::results_are_row_addrs` reads as row ids. Either way such a
-/// segment cannot share a named index with a fresh one and must be rebuilt.
+/// That covers targets that moved from row ids to row addresses (BTree,
+/// Bitmap, LabelList, NGram, RTree), whose legacy segments really store row
+/// ids, and targets that always stored row addresses (ZoneMap, BloomFilter,
+/// FM), whose legacy segments store addresses but carry the version-0
+/// wrapper that `IndexMetadata::results_are_row_addrs` reads as row ids.
+/// Either way such a segment cannot share a named index with a fresh one and
+/// must be rebuilt.
 pub fn wraps_row_addr_domain_target(index_details: &prost_types::Any) -> bool {
     index_details.type_url.ends_with("JsonIndexDetails")
         && crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())
@@ -626,6 +635,10 @@ impl AnyQuery for JsonQuery {
             Some(o) => self == o,
             None => false,
         }
+    }
+
+    fn reports_null_rows(&self) -> bool {
+        self.target_query.reports_null_rows()
     }
 }
 
@@ -3330,7 +3343,7 @@ mod tests {
     #[case::btree("btree", TrainingOrdering::None, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
     #[case::bitmap("bitmap", TrainingOrdering::None, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
     #[case::zonemap("zonemap", TrainingOrdering::Addresses, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
-    #[case::ngram("ngram", TrainingOrdering::None, &[r#"{"v": "alpha"}"#, r#"{"v": "bravo"}"#], false)]
+    #[case::ngram("ngram", TrainingOrdering::None, &[r#"{"v": "alpha"}"#, r#"{"v": "bravo"}"#], true)]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_index_version_tracks_target_domain(
@@ -3428,13 +3441,17 @@ mod tests {
             prost_types::Any::from_msg(&crate::pbold::BitmapIndexDetails::default()).unwrap();
         let ngram =
             prost_types::Any::from_msg(&crate::pbold::NGramIndexDetails::default()).unwrap();
+        let rtree = prost_types::Any::from_msg(&crate::pb::RTreeIndexDetails::default()).unwrap();
         let zonemap =
             prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails::default()).unwrap();
 
         assert!(wraps_row_addr_domain_target(&json_over(btree.clone())));
         assert!(wraps_row_addr_domain_target(&json_over(bitmap)));
         assert!(wraps_row_addr_domain_target(&json_over(zonemap)));
-        assert!(!wraps_row_addr_domain_target(&json_over(ngram)));
+        // NGram and RTree also moved from row ids to row addresses, so a JSON
+        // wrapper over either must be treated the same as one over BTree.
+        assert!(wraps_row_addr_domain_target(&json_over(ngram)));
+        assert!(wraps_row_addr_domain_target(&json_over(rtree)));
         assert!(!wraps_row_addr_domain_target(&btree));
     }
 
@@ -3656,9 +3673,11 @@ mod tests {
             .search(&json_query, &NoOpMetricsCollector)
             .await
             .unwrap();
+        // Row 2's address is fragment 1, offset 0 (`RowAddress::new_from_parts(1, 0)`),
+        // not the row index 2: `needs_row_addrs` test data is address-domain.
         assert_eq!(
             result,
-            SearchResult::at_most(RowAddrTreeMap::from_iter([2u64])),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([1u64 << 32])),
         );
     }
 }

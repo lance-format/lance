@@ -204,7 +204,10 @@ impl FuzzyAutomaton {
         if token.is_ascii() {
             let levenshtein = fst::automaton::Levenshtein::new(token, fuzzy.edit_distance)
                 .map_err(|error| {
-                    Error::index(format!("failed to construct the fuzzy query: {error}"))
+                    Error::invalid_input(format!(
+                        "failed to construct fuzzy query with fuzziness {}: {error}; reduce fuzziness or shorten the query",
+                        fuzzy.edit_distance
+                    ))
                 })?;
             Ok(Self::Ascii(AsciiFuzzyAutomaton {
                 levenshtein,
@@ -217,7 +220,10 @@ impl FuzzyAutomaton {
                 fuzzy.edit_distance,
             )
             .map_err(|error| {
-                Error::index(format!("failed to construct the fuzzy query: {error}"))
+                Error::invalid_input(format!(
+                    "failed to construct fuzzy query with fuzziness {}: {error}; reduce fuzziness or shorten the query",
+                    fuzzy.edit_distance
+                ))
             })?;
             Ok(Self::Unicode(levenshtein))
         }
@@ -1993,6 +1999,22 @@ mod tests {
 
         assert!(automaton_accepts(&automaton, "café".as_bytes()));
         assert!(!automaton_accepts(&automaton, "dafé".as_bytes()));
+    }
+
+    #[rstest]
+    #[case::ascii("quick")]
+    #[case::unicode("éabcdefghijklmnopqrstuvwxyz")]
+    fn excessive_fuzziness_is_an_input_error(#[case] token: &str) {
+        let params = FtsSearchParams::new().with_fuzziness(Some(10));
+        let Err(error) = FuzzyAutomaton::new(token, &DocType::Text, &params) else {
+            panic!("fuzziness=10 must exceed the automaton construction budget");
+        };
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("fuzziness 10"), "{message}");
+        assert!(message.contains("10000"), "{message}");
+        assert!(message.contains("reduce fuzziness"), "{message}");
     }
 
     #[test]

@@ -191,6 +191,7 @@ async fn test_overlay_compaction_reconciles_stale_index(#[case] defer_index_rema
         )
         .await
         .unwrap();
+    let indexed_version = dataset.version().version;
 
     // Overlay val[0] 0 -> 100 (committed after the index) and push fragment 0
     // over the overlay limit.
@@ -267,6 +268,20 @@ async fn test_overlay_compaction_reconciles_stale_index(#[case] defer_index_rema
     scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
     let batch = scanner.try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
+
+    // Pages a fresh reader of the latest snapshot warms through the reuse
+    // index must not serve the snapshot from before the compaction.
+    let historical = dataset.checkout_version(indexed_version).await.unwrap();
+    let latest = historical
+        .checkout_version(dataset.version().version)
+        .await
+        .unwrap();
+    latest.prewarm_index("val_idx").await.unwrap();
+    let mut scanner = historical.scan();
+    scanner.filter("val = 0").unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 1);
 }
 /// Round 6: unlike `migrate_fragments`, the reuse-record normalization
 /// must keep a fully-deleted fragment: the rewrite group still removes

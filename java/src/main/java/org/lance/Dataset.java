@@ -41,6 +41,7 @@ import org.lance.memwal.InitializeMemWalParams;
 import org.lance.memwal.MemWalIndexDetails;
 import org.lance.memwal.ShardWriter;
 import org.lance.memwal.ShardWriterConfig;
+import org.lance.merge.MergeInsertAnalysis;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 import org.lance.namespace.LanceNamespace;
@@ -921,6 +922,39 @@ public class Dataset implements Closeable {
   private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
 
   /**
+   * Resolve row IDs (from the {@code _rowid} column) to their current row addresses.
+   *
+   * <p>A row address is {@code (fragmentId << 32) | rowOffset}, so callers can tell which fragment
+   * holds each row without scanning. With stable row IDs, a row keeps its ID when compaction or an
+   * update moves it, so its address can differ between versions. Without stable row IDs, a row ID
+   * is its row address, and each input is returned unchanged without checking that the row exists.
+   *
+   * <p>Reading stable row IDs may access row-id metadata and deletion files; I/O failures surface
+   * as {@link IOException}.
+   *
+   * @param rowIds the row IDs to resolve
+   * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
+   *     is unknown or its row was deleted
+   * @throws RuntimeException if a row ID is live in more than one fragment, which means the stable
+   *     row IDs are corrupt
+   */
+  public List<Long> getRowAddresses(List<Long> rowIds) {
+    Preconditions.checkArgument(rowIds != null, "rowIds cannot be null");
+    long[] addresses;
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      addresses = nativeGetRowAddresses(rowIds);
+    }
+    List<Long> result = new ArrayList<>(addresses.length);
+    for (long address : addresses) {
+      result.add(address == -1L ? null : address);
+    }
+    return result;
+  }
+
+  private native long[] nativeGetRowAddresses(List<Long> rowIds);
+
+  /**
    * Randomly sample n rows from the dataset.
    *
    * <p>The returned rows are in row-id order (not random order), which allows the underlying take
@@ -1048,6 +1082,40 @@ public class Dataset implements Closeable {
   }
 
   private native List<Version> nativeListVersions();
+
+  /**
+   * Get one page of the version history of the dataset.
+   *
+   * <p>Versions are ordered ascending by version, or descending when {@code descending} is true.
+   * Detached versions are never part of the history, and only the manifests in the returned page
+   * are read.
+   *
+   * <p>On a lexically ordered store with V2 manifest paths, a descending page stops listing once
+   * {@code offset + limit} manifest entries have been observed. Ascending pages, V1 manifest paths,
+   * and stores without lexically ordered listings enumerate every manifest location before
+   * selecting the page.
+   *
+   * @param offset the number of versions to skip; an offset past the end of the history returns an
+   *     empty list
+   * @param limit the maximum number of versions to return, or empty for every remaining version;
+   *     zero returns an empty list without listing or reading any manifest
+   * @param descending whether to return the newest version first
+   * @return the requested page of versions
+   */
+  public List<Version> listVersions(long offset, Optional<Long> limit, boolean descending) {
+    Preconditions.checkArgument(offset >= 0, "offset must be non-negative, got %s", offset);
+    Preconditions.checkNotNull(limit, "limit must not be null");
+    limit.ifPresent(
+        value ->
+            Preconditions.checkArgument(value >= 0, "limit must be non-negative, got %s", value));
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListVersionsWithOptions(offset, limit.orElse(-1L), descending);
+    }
+  }
+
+  private native List<Version> nativeListVersionsWithOptions(
+      long offset, long limit, boolean descending);
 
   /**
    * Get the number of versions in the current version history.
@@ -2524,7 +2592,7 @@ public class Dataset implements Closeable {
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
-      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
+      update(tag, Ref.ofMain(versionNumber));
     }
 
     /**
@@ -2691,6 +2759,32 @@ public class Dataset implements Closeable {
   }
 
   private native MergeInsertResult nativeMergeInsert(
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Analyze one streaming merge without committing a dataset version.
+   *
+   * <p>The stream has no materialized statistics and is consumed once. Analysis can write temporary
+   * data, deletion and replay files, then cleans up uncommitted data. Execution errors return
+   * partial reports; planning/validation errors throw. Cleanup failures are logged for orphan
+   * cleanup. Cancelling execution can interrupt cleanup. Join and write times overlap; pool peaks
+   * measure DataFusion reservations rather than process memory.
+   *
+   * <p>For example, inspect {@code report.getReplaySpills().getBytesWritten()} to diagnose staging,
+   * and {@code report.getExecution().getError()} for an execution failure.
+   *
+   * @param mergeInsert the same options accepted by {@link #mergeInsert}
+   * @param source streaming source, consumed by this call
+   * @return an operation-owned protobuf-backed diagnostic snapshot
+   */
+  public MergeInsertAnalysis analyzeMergeInsert(
+      MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock ignored = lockManager.acquireReadLock()) {
+      return nativeAnalyzeMergeInsert(mergeInsert, source.memoryAddress());
+    }
+  }
+
+  private native MergeInsertAnalysis nativeAnalyzeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**

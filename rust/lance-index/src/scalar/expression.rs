@@ -1,8 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Split a filter into scalar index searches and a refine expression.
+//!
+//! [`apply_scalar_indices`] routes a filter in two steps.
+//!
+//! 1. Planners. The filter's top-level AND is split into conjuncts, and each
+//!    [`ScalarIndexPlanner`] from [`IndexInformationProvider::planners`] is
+//!    offered all of them. The plan that consumes the most conjuncts wins. A tie
+//!    goes to the index name that sorts first.
+//! 2. Per-column parsers. The conjuncts the winning plan leaves, or the whole
+//!    filter when no planner returns a plan, go to the per-column visitor. It
+//!    asks each column's [`MultiQueryParser`] for searches. What no parser
+//!    answers becomes the refine expression, which the scan evaluates on rows.
+//!
+//! The result ANDs the winning plan's search with the searches from step 2.
+//! A conjunct that an index evaluates on its own key columns counts as
+//! consumed, even when the index cannot seek on it. A filter whose root is an
+//! OR or NOT over more than one column skips step 1, so the per-column visitor
+//! can combine two column indices. A nested field such as `s.x` counts as its
+//! own column. An OR or NOT root over at most one column reaches the planners
+//! as one conjunct. Inside an AND, an OR or NOT conjunct reaches the planners
+//! whole.
+//!
+//! The rule reads the filter that [`apply_scalar_indices`] receives, which
+//! [`create_filter_plan`] passes through unchanged. The dataset scanner
+//! optimizes the filter with `Planner::optimize_expr` before calling
+//! [`create_filter_plan`], so the root can differ from the one the user wrote.
+//! For example, the optimizer turns `NOT (a = 1 AND b = 2)` into an OR over two
+//! columns, which skips step 1, and it turns `a IN (1, 2)` into `a = 1 OR a = 2`,
+//! which reaches the planners. Aliases around the root do not change the rule.
+
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{HashMap, HashSet, hash_map::Entry},
     ops::Bound,
     sync::Arc,
@@ -15,6 +45,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
     expr::{InList, Like, ScalarFunction},
+    utils::{conjunction, split_conjunction},
 };
 use tokio::try_join;
 
@@ -31,6 +62,10 @@ use roaring::RoaringBitmap;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
+
+/// Most index searches that `a = b` / `a != b` between two predicates may
+/// expand to; see [`visit_predicate_equality`].
+const MAX_PREDICATE_EQUALITY_SEARCHES: usize = 64;
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -59,7 +94,7 @@ const MAX_DEPTH: usize = 500;
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedExpression {
     /// The portion of the query that can be satisfied by scalar indices
     pub scalar_query: Option<ScalarIndexExpr>,
@@ -162,6 +197,123 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
             _ => None,
         }
     }
+}
+
+/// A [`ScalarIndexPlanner`]'s claim on some conjuncts of a filter.
+#[derive(Debug)]
+pub struct ScalarIndexPlan<'a> {
+    /// The search to run. Set `column` to the index's first key column, which
+    /// keys its fragment coverage. The query's `to_expr` must express the
+    /// consumed conjuncts, because a recheck evaluates it on rows. Set
+    /// `needs_recheck` when the index can return [`SearchResult::AtMost`] or
+    /// [`SearchResult::AtLeast`], because some scans decide whether to recheck
+    /// rows before the search runs.
+    pub search: ScalarIndexSearch,
+    /// The conjuncts that `search` answers, borrowed from the slice passed to
+    /// [`ScalarIndexPlanner::plan`]. Every other conjunct goes on to the
+    /// per-column parsers and then to row evaluation.
+    pub consumed: Vec<&'a Expr>,
+}
+
+/// Plans a conjunctive filter across the key columns of one index.
+///
+/// [`apply_scalar_indices`] offers the conjuncts of each filter to every planner
+/// before the per-column parsers, and runs the plan that consumes the most. The
+/// module docs give the full rule.
+///
+/// The example builds on [`plan_tuple_predicate`]. Its query carries the key
+/// residual, which the index evaluates on the keys it reads. So the planner
+/// consumes the key residual too, and the search returns
+/// [`SearchResult::Exact`]. The row residual stays unconsumed.
+///
+/// [`plan_tuple_predicate`]: crate::scalar::tuple::planner::plan_tuple_predicate
+///
+/// ```
+/// use std::any::Any;
+/// use std::sync::Arc;
+///
+/// use arrow_schema::{DataType, Field, Fields};
+/// use datafusion_expr::{Expr, col, lit, utils::conjunction};
+/// use lance_index::scalar::AnyQuery;
+/// use lance_index::scalar::expression::{ScalarIndexPlan, ScalarIndexPlanner, ScalarIndexSearch};
+/// use lance_index::scalar::tuple::TupleQuery;
+/// use lance_index::scalar::tuple::planner::plan_tuple_predicate;
+///
+/// #[derive(Debug, PartialEq)]
+/// struct KeyQuery {
+///     tuples: TupleQuery,
+///     key_residual: Vec<Expr>,
+/// }
+///
+/// impl AnyQuery for KeyQuery {
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+///
+///     fn format(&self, col: &str) -> String {
+///         self.to_expr(col.to_string()).to_string()
+///     }
+///
+///     fn to_expr(&self, col: String) -> Expr {
+///         let tuples = self.tuples.to_expr(col);
+///         conjunction(std::iter::once(tuples).chain(self.key_residual.iter().cloned())).unwrap()
+///     }
+///
+///     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+///         other.as_any().downcast_ref::<Self>() == Some(self)
+///     }
+/// }
+///
+/// #[derive(Debug)]
+/// struct TuplePlanner {
+///     keys: Fields,
+/// }
+///
+/// impl ScalarIndexPlanner for TuplePlanner {
+///     fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+///         let tuple = plan_tuple_predicate(conjuncts, &self.keys)?;
+///         let query = KeyQuery {
+///             tuples: tuple.query,
+///             key_residual: tuple.key_residual.iter().map(|&term| term.clone()).collect(),
+///         };
+///         Some(ScalarIndexPlan {
+///             search: ScalarIndexSearch {
+///                 column: self.keys[0].name().clone(),
+///                 index_name: "tenant_ts_idx".to_string(),
+///                 index_type: "Tuple".to_string(),
+///                 query: Arc::new(query),
+///                 needs_recheck: false,
+///                 fragment_bitmap: None,
+///             },
+///             consumed: [tuple.consumed, tuple.key_residual].concat(),
+///         })
+///     }
+/// }
+///
+/// let planner = TuplePlanner {
+///     keys: Fields::from(vec![
+///         Field::new("tenant", DataType::Int32, true),
+///         Field::new("ts", DataType::Int64, true),
+///     ]),
+/// };
+/// let conjuncts = [
+///     col("tenant").eq(lit(1)),
+///     col("ts").gt(lit(10_i64)),
+///     (col("ts") % lit(7_i64)).eq(lit(0_i64)),
+///     col("status").eq(lit("a")),
+/// ];
+/// let plan = planner.plan(&conjuncts).expect("tenant binds the first key");
+/// assert_eq!(plan.consumed, vec![&conjuncts[0], &conjuncts[1], &conjuncts[2]]);
+/// assert_eq!(
+///     plan.search.query.to_expr("tenant".to_string()).to_string(),
+///     "tenant = Int32(1) AND ts > Int64(10) AND ts % Int64(7) = Int64(0)"
+/// );
+/// ```
+pub trait ScalarIndexPlanner: std::fmt::Debug + Send + Sync {
+    /// Plan `conjuncts`, the terms of a filter's top-level AND.
+    ///
+    /// Returns None when the index answers none of them.
+    fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>>;
 }
 
 /// A generic parser that wraps multiple scalar query parsers
@@ -892,6 +1044,17 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
+/// How an index can answer a particular substring pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainsQuerySupport {
+    /// The index returns exact matches for this pattern.
+    Exact,
+    /// The index returns candidates that must be rechecked against source values.
+    NeedsRecheck,
+    /// The index cannot produce a sound candidate set for this pattern.
+    Unsupported,
+}
+
 /// A parser for indices that handle string `contains` queries, and -- when
 /// `supports_regex` is set -- `regexp_like` / `regexp_match` queries.
 #[derive(Debug, Clone)]
@@ -904,6 +1067,7 @@ pub struct TextQueryParser {
     /// say anything useful about.  Shorter patterns bypass the index entirely so
     /// they are answered by a full scan.  Use 0 for indices with no such limit.
     min_contains_chars: usize,
+    contains_query_support: Option<fn(&str) -> ContainsQuerySupport>,
 }
 
 impl TextQueryParser {
@@ -920,7 +1084,17 @@ impl TextQueryParser {
             needs_recheck,
             supports_regex,
             min_contains_chars,
+            contains_query_support: None,
         }
+    }
+
+    /// Override exactness or bypass the index according to its representation of a pattern.
+    pub(crate) fn with_contains_query_support(
+        mut self,
+        support: fn(&str) -> ContainsQuerySupport,
+    ) -> Self {
+        self.contains_query_support = Some(support);
+        self
     }
 }
 
@@ -975,6 +1149,7 @@ impl ScalarQueryParser for TextQueryParser {
             return None;
         };
 
+        let mut needs_recheck = self.needs_recheck;
         let query = match func.name() {
             "contains" if args.len() == 2 => {
                 // Every non-null string contains the empty pattern, so no index
@@ -985,6 +1160,13 @@ impl ScalarQueryParser for TextQueryParser {
                 // not bytes.
                 if pattern.is_empty() || pattern.chars().count() < self.min_contains_chars {
                     return None;
+                }
+                if let Some(support) = self.contains_query_support {
+                    match support(&pattern) {
+                        ContainsQuerySupport::Exact => {}
+                        ContainsQuerySupport::NeedsRecheck => needs_recheck = true,
+                        ContainsQuerySupport::Unsupported => return None,
+                    }
                 }
                 TextQuery::StringContains(pattern)
             }
@@ -1009,7 +1191,7 @@ impl ScalarQueryParser for TextQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -1988,6 +2170,26 @@ impl ScalarIndexExpr {
             Self::Query(search) => search.needs_recheck,
         }
     }
+
+    /// Whether every search in the expression reports rows where its predicate
+    /// is NULL, see [`AnyQuery::reports_null_rows`].
+    pub fn reports_null_rows(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.reports_null_rows(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.reports_null_rows() && rhs.reports_null_rows()
+            }
+            Self::Query(search) => search.query.reports_null_rows(),
+        }
+    }
+
+    fn search_count(&self) -> usize {
+        match self {
+            Self::Not(inner) => inner.search_count(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.search_count() + rhs.search_count(),
+            Self::Query(_) => 1,
+        }
+    }
 }
 
 // Extract a column from the expression, if it is a column, or None
@@ -2373,17 +2575,174 @@ fn visit_or(
     })
 }
 
+/// `left = right` or `left != right` between two predicates, as
+/// `(left AND right) OR (NOT left AND NOT right)` or
+/// `(left AND NOT right) OR (NOT left AND right)`.
+///
+/// The result is NULL if either `left` or `right` are null, provided that
+/// each side reports its NULL rows.
+///
+/// Each side appears twice, so nested comparisons double the plan per level;
+/// past [`MAX_PREDICATE_EQUALITY_SEARCHES`] the comparison is left to the scan.
+fn visit_predicate_equality(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let (Some(left), Some(right)) = (
+        visit_node(&expr.left, index_info, depth + 1)?,
+        visit_node(&expr.right, index_info, depth + 1)?,
+    ) else {
+        return Ok(None);
+    };
+    let (Some(left_query), Some(right_query)) = (&left.scalar_query, &right.scalar_query) else {
+        return Ok(None);
+    };
+    let searches = 2 * (left_query.search_count() + right_query.search_count());
+    if searches > MAX_PREDICATE_EQUALITY_SEARCHES
+        || !left_query.reports_null_rows()
+        || !right_query.reports_null_rows()
+    {
+        return Ok(None);
+    }
+    let (Some(not_left), Some(not_right)) = (left.clone().maybe_not(), right.clone().maybe_not())
+    else {
+        return Ok(None);
+    };
+    Ok(if expr.op == Operator::Eq {
+        left.and(right).maybe_or(not_left.and(not_right), expr)
+    } else {
+        left.and(not_right).maybe_or(not_left.and(right), expr)
+    })
+}
+
+/// Returns the plain column whose NULL values make `predicate` evaluate to NULL.
+///
+/// Supports a Boolean column, comparisons, `BETWEEN`, or `IN` against non-NULL
+/// literals, and `NOT`/`AND`/`OR` combinations that all refer to the same column.
+/// Computed expressions, such as JSON accessors, are excluded because they can
+/// be NULL even when the underlying column is not.
+fn null_where_column_is<'a>(
+    predicate: &'a Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<&'a Expr> {
+    let against_literals = |column: &'a Expr, literals: &[&Expr]| {
+        if !matches!(column, Expr::Column(_)) {
+            return None;
+        }
+        let (_, column_type, _) = maybe_indexed_column(column, index_info)?;
+        literals
+            .iter()
+            .all(|literal| maybe_scalar(literal, &column_type).is_some_and(|v| !v.is_null()))
+            .then_some(column)
+    };
+    match predicate {
+        Expr::Column(_) => Some(predicate),
+        Expr::Not(inner) => null_where_column_is(inner, index_info),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And | Operator::Or,
+            right,
+        }) => {
+            let column = null_where_column_is(left, index_info)?;
+            (null_where_column_is(right, index_info)? == column).then_some(column)
+        }
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op:
+                Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq,
+            right,
+        }) => against_literals(left, &[right]),
+        Expr::Between(between) => against_literals(&between.expr, &[&between.low, &between.high]),
+        Expr::InList(in_list) => {
+            against_literals(&in_list.expr, &in_list.list.iter().collect::<Vec<_>>())
+        }
+        _ => None,
+    }
+}
+
+/// `predicate IS TRUE`, or `predicate IS FALSE` when `value` is false, for a
+/// predicate that is NULL exactly where one indexed column is, such as a
+/// Boolean column or a comparison against a non-null literal.
+///
+/// That makes `IS TRUE` the predicate with the column's NULL rows excluded,
+/// which is what tells the two apart once negated: `NOT (x = 1)` drops NULL
+/// rows, `NOT ((x = 1) IS TRUE)` keeps them.
+fn visit_is_truth_value(
+    predicate: &Expr,
+    value: bool,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let Some(column) = null_where_column_is(predicate, index_info) else {
+        return Ok(None);
+    };
+    let Some((column, _, query_parser)) = maybe_indexed_column(column, index_info) else {
+        return Ok(None);
+    };
+    let matches = match predicate {
+        Expr::Column(_) => visit_is_bool(predicate, index_info, value),
+        _ if value => visit_node(predicate, index_info, depth + 1)?,
+        _ => visit_node(predicate, index_info, depth + 1)?.and_then(IndexedExpression::maybe_not),
+    };
+    let Some(matches) = matches else {
+        return Ok(None);
+    };
+    let not_null = query_parser
+        .visit_is_null(&column)
+        .and_then(IndexedExpression::maybe_not);
+    Ok(Some(match not_null {
+        Some(not_null) => matches.and(not_null),
+        // Without an exact search for NULL rows the index can only narrow the
+        // rows down, and the predicate is rechecked on them.
+        None if value => matches.refine(predicate.clone().is_true()),
+        None => matches.refine(predicate.clone().is_false()),
+    }))
+}
+
+/// `column IS [NOT] DISTINCT FROM literal`, as `column IS [NOT] NULL` for a NULL
+/// literal and as `(column = literal) IS [NOT] TRUE` otherwise.
+fn visit_distinct_from(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let is_distinct = expr.op == Operator::IsDistinctFrom;
+    if matches!(expr.right.as_ref(), Expr::Literal(value, _) if value.is_null()) {
+        return Ok(visit_is_null(&expr.left, index_info, is_distinct));
+    }
+    let equals = (*expr.left).clone().eq((*expr.right).clone());
+    let is_true = visit_is_truth_value(&equals, true, index_info, depth)?;
+    Ok(if is_distinct {
+        is_true.and_then(IndexedExpression::maybe_not)
+    } else {
+        is_true
+    })
+}
+
 fn visit_binary_expr(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     match &expr.op {
-        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
             Ok(visit_comparison(expr, index_info))
         }
-        // visit_comparison will maybe create an Eq query which we negate
-        Operator::NotEq => Ok(visit_comparison(expr, index_info).and_then(|node| node.maybe_not())),
+        Operator::Eq | Operator::NotEq => match visit_comparison(expr, index_info) {
+            Some(node) if expr.op == Operator::Eq => Ok(Some(node)),
+            // visit_comparison creates an Eq query which we negate
+            Some(node) => Ok(node.maybe_not()),
+            None => visit_predicate_equality(expr, index_info, depth),
+        },
+        Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => {
+            visit_distinct_from(expr, index_info, depth)
+        }
         Operator::And => visit_and(expr, index_info, depth),
         Operator::Or => visit_or(expr, index_info, depth),
         _ => Ok(None),
@@ -2443,8 +2802,12 @@ fn visit_node(
         Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
-        Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
-        Expr::IsTrue(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, true)),
+        Expr::IsFalse(expr) => visit_is_truth_value(expr, false, index_info, depth),
+        Expr::IsTrue(expr) => visit_is_truth_value(expr, true, index_info, depth),
+        Expr::IsNotFalse(expr) => Ok(visit_is_truth_value(expr, false, index_info, depth)?
+            .and_then(IndexedExpression::maybe_not)),
+        Expr::IsNotTrue(expr) => Ok(visit_is_truth_value(expr, true, index_info, depth)?
+            .and_then(IndexedExpression::maybe_not)),
         Expr::IsNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, false)),
         Expr::IsNotNull(expr) => {
             // `regexp_match(col, pat)` returns a list and is coerced to
@@ -2488,20 +2851,118 @@ pub trait IndexInformationProvider {
     fn fragment_bitmap(&self, _column: &str, _index_name: &str) -> Option<RoaringBitmap> {
         None
     }
+
+    /// Planners for indices keyed on more than one column. The default has none.
+    fn planners(&self) -> &[Box<dyn ScalarIndexPlanner>] {
+        &[]
+    }
 }
 
 /// Attempt to split a filter expression into a search of scalar indexes and an
 ///   optional post-search refinement query
+///
+/// The module docs describe how planners and per-column parsers share a filter.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when a planner returns a plan whose consumed
+/// conjuncts are empty, repeated, or not among the conjuncts it was offered.
 pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
 ) -> Result<IndexedExpression> {
-    let mut result =
-        visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr));
+    let mut result = match apply_index_planners(&expr, index_info)? {
+        Some(planned) => planned,
+        None => visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr)),
+    };
     if let Some(query) = result.scalar_query.as_mut() {
         populate_fragment_bitmaps(query, index_info);
     }
     Ok(result)
+}
+
+fn apply_index_planners(
+    expr: &Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Result<Option<IndexedExpression>> {
+    let planners = index_info.planners();
+    let mut root = expr;
+    while let Expr::Alias(alias) = root {
+        root = alias.expr.as_ref();
+    }
+    let root_is_or_not = matches!(
+        root,
+        Expr::Not(_)
+            | Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Or,
+                ..
+            })
+    );
+    if planners.is_empty() || (root_is_or_not && column_names_in_expr(root).len() > 1) {
+        return Ok(None);
+    }
+    let conjuncts = split_conjunction(root)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut best: Option<(usize, ScalarIndexSearch, Vec<bool>)> = None;
+    for planner in planners {
+        let Some(plan) = planner.plan(&conjuncts) else {
+            continue;
+        };
+        let consumed = consumed_mask(&conjuncts, &plan)?;
+        let count = plan.consumed.len();
+        let search = plan.search;
+        let wins = best.as_ref().is_none_or(|(best_count, best_search, _)| {
+            (count, Reverse(&search.index_name)) > (*best_count, Reverse(&best_search.index_name))
+        });
+        if wins {
+            best = Some((count, search, consumed));
+        }
+    }
+    let Some((_, search, consumed)) = best else {
+        return Ok(None);
+    };
+    let planned = IndexedExpression {
+        scalar_query: Some(ScalarIndexExpr::Query(search)),
+        refine_expr: None,
+    };
+    let rest = conjunction(
+        conjuncts
+            .into_iter()
+            .zip(consumed)
+            .filter_map(|(conjunct, consumed)| (!consumed).then_some(conjunct)),
+    );
+    let Some(rest) = rest else {
+        return Ok(Some(planned));
+    };
+    let rest = visit_node(&rest, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(rest));
+    Ok(Some(planned.and(rest)))
+}
+
+fn consumed_mask(conjuncts: &[Expr], plan: &ScalarIndexPlan) -> Result<Vec<bool>> {
+    let index_name = &plan.search.index_name;
+    if plan.consumed.is_empty() {
+        return Err(Error::internal(format!(
+            "Scalar index planner for '{index_name}' returned a plan that consumes no conjuncts"
+        )));
+    }
+    let mut consumed = vec![false; conjuncts.len()];
+    for conjunct in &plan.consumed {
+        match conjuncts
+            .iter()
+            .position(|offered| std::ptr::eq(offered, *conjunct))
+        {
+            Some(position) if !consumed[position] => consumed[position] = true,
+            _ => {
+                return Err(Error::internal(format!(
+                    "Scalar index planner for '{index_name}' consumed `{conjunct}`, which is not a distinct member of the {} conjuncts it was offered",
+                    conjuncts.len()
+                )));
+            }
+        }
+    }
+    Ok(consumed)
 }
 
 /// Walk a [`ScalarIndexExpr`] and fill in `fragment_bitmap` on each leaf from
@@ -2646,6 +3107,8 @@ mod tests {
     use rstest::rstest;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
+    use crate::scalar::registry::ScalarIndexPlugin;
+    use datafusion_expr::{col, lit};
 
     use super::*;
 
@@ -2783,6 +3246,32 @@ mod tests {
             )),
             true,
         )
+    }
+
+    /// `on_sale = value AND NOT on_sale IS NULL`, negated when `negated`.
+    fn check_is_truth_value(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        value: bool,
+        negated: bool,
+    ) {
+        let query = |query| {
+            IndexedExpression::index_query(
+                "on_sale".to_string(),
+                "on_sale_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(query),
+            )
+        };
+        let not_null = query(SargableQuery::IsNull()).maybe_not().unwrap();
+        let is_value =
+            query(SargableQuery::Equals(ScalarValue::Boolean(Some(value)))).and(not_null);
+        let expected = if negated {
+            is_value.maybe_not().unwrap()
+        } else {
+            is_value
+        };
+        check(index_info, expr, Some(expected), false)
     }
 
     fn check_simple_negated(
@@ -3155,30 +3644,24 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt32(Some(10))),
             ),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS TRUE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        check_is_truth_value(&index_info, "on_sale IS TRUE", true, false);
         check_simple(
             &index_info,
             "on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
+        // NULL rows are not TRUE, so they are in the negation of `IS TRUE`.
+        check_is_truth_value(&index_info, "on_sale IS NOT TRUE", true, true);
+        check_is_truth_value(&index_info, "NOT (on_sale IS TRUE)", true, true);
+        check_is_truth_value(&index_info, "on_sale IS NOT FALSE", false, true);
         check_simple_negated(
             &index_info,
             "NOT on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS FALSE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
+        check_is_truth_value(&index_info, "on_sale IS FALSE", false, false);
         check_simple_negated(
             &index_info,
             "aisle NOT BETWEEN 5 AND 10",
@@ -3255,18 +3738,8 @@ mod tests {
                 ScalarValue::UInt32(Some(9)),
             ]),
         );
-        check_simple(
-            &index_info,
-            "on_sale is false",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
-        check_simple(
-            &index_info,
-            "on_sale is true",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        check_is_truth_value(&index_info, "on_sale is false", false, false);
+        check_is_truth_value(&index_info, "on_sale is true", true, false);
         check_simple(
             &index_info,
             "aisle < 10",
@@ -4167,6 +4640,52 @@ mod tests {
                 )),
             ),
         )])
+    }
+
+    #[rstest]
+    #[case::nul("left\0right", ContainsQuerySupport::Unsupported)]
+    #[case::nul_and_space("left\0 right", ContainsQuerySupport::Unsupported)]
+    #[case::space("left right", ContainsQuerySupport::NeedsRecheck)]
+    #[case::space_only(" ", ContainsQuerySupport::NeedsRecheck)]
+    #[case::safe("left_right", ContainsQuerySupport::Exact)]
+    fn test_fm_contains_eligibility(#[case] pattern: &str, #[case] support: ContainsQuerySupport) {
+        let fm_parser = crate::scalar::fmindex::FMIndexPlugin
+            .new_query_parser("color_idx".to_string(), &prost_types::Any::default())
+            .unwrap();
+        let index_info =
+            MockIndexInfoProvider::new(vec![("color", ColInfo::new(DataType::Utf8, fm_parser))]);
+        let expr = datafusion::functions::string::expr_fn::contains(col("color"), lit(pattern));
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let plan = plan_filter(schema.clone(), expr.clone(), &index_info);
+        let is_supported = support != ContainsQuerySupport::Unsupported;
+        assert_eq!(plan.index_query.is_some(), is_supported);
+        if let Some(query) = plan.index_query.as_ref() {
+            assert_eq!(
+                query.needs_recheck(),
+                support == ContainsQuerySupport::NeedsRecheck
+            );
+            assert_eq!(plan.skip_recheck, support == ContainsQuerySupport::Exact);
+        }
+        let negated = plan_filter(schema.clone(), !expr.clone(), &index_info);
+        if support != ContainsQuerySupport::Exact {
+            assert!(negated.index_query.is_none());
+            assert!(negated.refine_expr.is_some());
+            let safe = datafusion::functions::string::expr_fn::contains(col("color"), lit("right"));
+            let combined = plan_filter(schema.clone(), expr.clone().and(safe.clone()), &index_info);
+            assert!(combined.index_query.is_some());
+            assert_eq!(combined.refine_expr.is_some(), !is_supported);
+            assert_eq!(combined.skip_recheck, !is_supported);
+            let combined = plan_filter(schema.clone(), expr.clone().or(safe), &index_info);
+            assert_eq!(combined.index_query.is_some(), is_supported);
+            assert_eq!(combined.refine_expr.is_some(), !is_supported);
+            assert!(!combined.skip_recheck);
+        }
+        // NGRAM retains its existing eligibility for both normalized bytes.
+        let ngram_plan = plan_filter(schema, expr, &ngram_index_info());
+        assert_eq!(
+            ngram_plan.index_query.is_some(),
+            pattern.chars().count() >= 3
+        );
     }
 
     fn expect_query<Q: AnyQuery>(plan: &FilterPlan) -> &Q {
@@ -5467,6 +5986,114 @@ mod tests {
         }));
     }
 
+    #[rstest]
+    #[case::not_distinct(
+        "x IS NOT DISTINCT FROM 3",
+        "AND([x = 3]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::distinct(
+        "x IS DISTINCT FROM 3",
+        "NOT(AND([x = 3]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::not_distinct_null("x IS NOT DISTINCT FROM NULL", "[x IS NULL]@x_idx(BTree)")]
+    #[case::distinct_null("x IS DISTINCT FROM NULL", "NOT([x IS NULL]@x_idx(BTree))")]
+    #[case::in_list_is_true(
+        "(x IN (1, 2)) IS TRUE",
+        "AND([x IN [1,2]]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::is_not_true(
+        "(x = 1) IS NOT TRUE",
+        "NOT(AND([x = 1]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::or_chain(
+        "(x = 1 OR NOT x BETWEEN 3 AND 5) IS NOT TRUE",
+        "NOT(AND(OR([x = 1]@x_idx(BTree),NOT([x >= 3 && x <= 5]@x_idx(BTree))),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::is_false(
+        "(x = 1) IS FALSE",
+        "AND(NOT([x = 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::is_not_false(
+        "(x < 1) IS NOT FALSE",
+        "NOT(AND(NOT([x < 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::xor(
+        "(x > 2) != (y < 6)",
+        "OR(AND([x > 2]@x_idx(BTree),NOT([y < 6]@y_idx(BTree))),AND(NOT([x > 2]@x_idx(BTree)),[y < 6]@y_idx(BTree)))"
+    )]
+    #[case::equivalent(
+        "(x > 2) = (y < 6)",
+        "OR(AND([x > 2]@x_idx(BTree),[y < 6]@y_idx(BTree)),AND(NOT([x > 2]@x_idx(BTree)),NOT([y < 6]@y_idx(BTree))))"
+    )]
+    fn test_predicate_truth_and_equality_use_index(#[case] filter: &str, #[case] expected: &str) {
+        let indexed = parse_int64_filter(filter, &int64_index_info("BTree", false));
+        assert_eq!(indexed.refine_expr, None, "{filter}");
+        assert_eq!(
+            indexed.scalar_query.unwrap().to_string(),
+            expected,
+            "{filter}"
+        );
+    }
+
+    #[rstest]
+    // `x IN (1, NULL)` is NULL for every row but 1, not just the NULL ones.
+    #[case::null_in_list("(x IN (1, NULL)) IS TRUE")]
+    #[case::null_literal("(x = CAST(NULL AS BIGINT)) IS NOT TRUE")]
+    #[case::computed("(x + 1 = 2) IS TRUE")]
+    #[case::two_columns("(x = 1 OR y = 2) IS NOT TRUE")]
+    #[case::computed_side("(x > 2) != (x + y > 3)")]
+    #[case::recheck_xor("(x > 2) != (y < 6)")]
+    #[case::recheck_distinct("x IS DISTINCT FROM 3")]
+    fn test_predicate_truth_and_equality_decline(#[case] filter: &str) {
+        // The last two only decline because the index needs a recheck, which
+        // cannot be negated.
+        let needs_recheck = filter.contains("!=") || filter.contains("DISTINCT");
+        let indexed = parse_int64_filter(filter, &int64_index_info("BTree", needs_recheck));
+        assert_eq!(indexed.scalar_query, None, "{filter}");
+    }
+
+    /// Each side of a predicate equality appears twice in its plan, so a chain
+    /// of them grows exponentially until the budget declines it.
+    #[rstest]
+    #[case::one(2, Some(4))]
+    #[case::three(4, Some(22))]
+    #[case::four(5, Some(46))]
+    #[case::five(6, None)]
+    #[case::seventeen(18, None)]
+    fn test_nested_predicate_equality_is_bounded(
+        #[case] comparisons: usize,
+        #[case] expected_searches: Option<usize>,
+    ) {
+        let filter = (1..comparisons).fold("x > 0".to_string(), |lhs, rhs| {
+            format!("({lhs}) = (x > {rhs})")
+        });
+        let indexed = parse_int64_filter(&filter, &int64_index_info("BTree", false));
+        let searches = indexed
+            .scalar_query
+            .as_ref()
+            .map(ScalarIndexExpr::search_count);
+        assert_eq!(searches, expected_searches, "{filter}");
+    }
+
+    /// An index whose NULL search needs a recheck still narrows `IS TRUE` down,
+    /// and rechecks the predicate on what it finds.
+    #[rstest]
+    #[case::is_true("(x = 3) IS TRUE", "[x = 3]@x_idx(ZoneMap)")]
+    #[case::not_distinct("x IS NOT DISTINCT FROM 3", "[x = 3]@x_idx(ZoneMap)")]
+    fn test_is_truth_value_rechecks_without_exact_null_search(
+        #[case] filter: &str,
+        #[case] expected: &str,
+    ) {
+        let indexed = parse_int64_filter(filter, &int64_index_info("ZoneMap", true));
+        assert_eq!(
+            indexed.scalar_query.unwrap().to_string(),
+            expected,
+            "{filter}"
+        );
+        let refine = indexed.refine_expr.unwrap();
+        assert!(matches!(refine, Expr::IsTrue(_)), "{filter}: {refine}");
+    }
+
     #[test]
     fn test_optimize_parser_handles_in_list_null_semantics() {
         let index_info = int64_index_info("BTree", false);
@@ -6146,5 +6773,489 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use std::any::Any;
+
+    use arrow_schema::{Fields, Schema};
+    use datafusion_expr::{col, lit};
+    use lance_core::deepsize::{Context, DeepSizeOf};
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_datafusion::planner::Planner;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
+
+    use super::*;
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::{CreatedIndex, IndexStore, ScalarIndexParams, UpdateCriteria};
+    use crate::{Index, IndexType};
+
+    /// Consumes every conjunct that reads only its key columns.
+    #[derive(Debug)]
+    struct KeyPlanner {
+        index_name: &'static str,
+        keys: &'static [&'static str],
+        needs_recheck: bool,
+    }
+
+    fn key_planner(index_name: &'static str, keys: &'static [&'static str]) -> KeyPlanner {
+        KeyPlanner {
+            index_name,
+            keys,
+            needs_recheck: false,
+        }
+    }
+
+    impl ScalarIndexPlanner for KeyPlanner {
+        fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+            let consumed = conjuncts
+                .iter()
+                .filter(|conjunct| {
+                    let columns = conjunct.column_refs();
+                    !columns.is_empty()
+                        && columns
+                            .iter()
+                            .all(|column| self.keys.contains(&column.name.as_str()))
+                })
+                .collect::<Vec<_>>();
+            let filter = conjunction(consumed.iter().map(|conjunct| (*conjunct).clone()))?;
+            Some(ScalarIndexPlan {
+                search: ScalarIndexSearch {
+                    column: self.keys[0].to_string(),
+                    index_name: self.index_name.to_string(),
+                    index_type: "Keys".to_string(),
+                    query: Arc::new(KeyQuery(filter)),
+                    needs_recheck: self.needs_recheck,
+                    fragment_bitmap: None,
+                },
+                consumed,
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct KeyQuery(Expr);
+
+    impl AnyQuery for KeyQuery {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn format(&self, _col: &str) -> String {
+            self.0.to_string()
+        }
+
+        fn to_expr(&self, _col: String) -> Expr {
+            self.0.clone()
+        }
+
+        fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+            other.as_any().downcast_ref::<Self>() == Some(self)
+        }
+    }
+
+    struct Indices {
+        btrees: HashMap<String, (DataType, MultiQueryParser)>,
+        planners: Vec<Box<dyn ScalarIndexPlanner>>,
+    }
+
+    impl Indices {
+        fn new(btree_columns: &[&str], planners: Vec<Box<dyn ScalarIndexPlanner>>) -> Self {
+            let btrees = btree_columns
+                .iter()
+                .map(|column| {
+                    let parser = SargableQueryParser::new(
+                        format!("{column}_idx"),
+                        "BTree".to_string(),
+                        false,
+                    );
+                    (
+                        column.to_string(),
+                        (DataType::Int32, MultiQueryParser::single(Box::new(parser))),
+                    )
+                })
+                .collect();
+            Self { btrees, planners }
+        }
+    }
+
+    impl IndexInformationProvider for Indices {
+        fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
+            self.btrees
+                .get(col)
+                .map(|(data_type, parser)| (data_type, parser))
+        }
+
+        fn planners(&self) -> &[Box<dyn ScalarIndexPlanner>] {
+            &self.planners
+        }
+    }
+
+    fn plan(indices: &Indices, filter: &str) -> Result<FilterPlan> {
+        let mut fields = ["a", "b", "c", "d"]
+            .map(|name| Field::new(name, DataType::Int32, true))
+            .to_vec();
+        fields.push(Field::new("flag", DataType::Boolean, true));
+        let planner = Planner::new(Arc::new(Schema::new(fields)));
+        create_filter_plan(
+            planner.optimize_expr(planner.parse_filter(filter)?)?,
+            indices,
+            true,
+        )
+    }
+
+    fn render(plan: &FilterPlan) -> (Option<String>, Option<String>) {
+        (
+            plan.index_query.as_ref().map(ToString::to_string),
+            plan.refine_expr.as_ref().map(ToString::to_string),
+        )
+    }
+
+    const AB: &[&str] = &["a", "b"];
+    const AB_QUERY: &str = "[a = Int32(1) AND b > Int32(5)]@ab_idx(Keys)";
+
+    #[rstest]
+    #[case::full_consumption(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::partial_consumption(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "a = 1 AND b > 5 AND c = 3",
+        "AND([a = Int32(1) AND b > Int32(5)]@ab_idx(Keys),[c = 3]@c_idx(BTree))",
+        None
+    )]
+    #[case::more_consumed_conjuncts_win(
+        vec![key_planner("ab_idx", AB), key_planner("abc_idx", &["a", "b", "c"])],
+        &[],
+        "a = 1 AND b > 5 AND c = 3",
+        "[a = Int32(1) AND b > Int32(5) AND c = Int32(3)]@abc_idx(Keys)",
+        None
+    )]
+    #[case::tie_goes_to_first_name(
+        vec![key_planner("zz_idx", AB), key_planner("ab_idx", AB)],
+        &[],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::tie_ignores_registration_order(
+        vec![key_planner("ab_idx", AB), key_planner("zz_idx", AB)],
+        &[],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::planner_beats_column_index_on_its_key(
+        vec![key_planner("ab_idx", AB)],
+        &["a", "b"],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::query_carries_key_residual(
+        vec![key_planner("ab_idx", AB)],
+        &["b"],
+        "a = 1 AND b <> 7",
+        "[a = Int32(1) AND b != Int32(7)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::leftover_conjunct_goes_to_rows(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a = 1 AND b > 5 AND d < 7",
+        AB_QUERY,
+        Some("d < Int32(7)")
+    )]
+    #[case::declined_filter_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "c = 3",
+        "[c = 3]@c_idx(BTree)",
+        None
+    )]
+    #[case::or_root_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["a", "b"],
+        "a = 1 OR b = 2",
+        "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))",
+        None
+    )]
+    #[case::two_value_in_list_reaches_planners(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a IN (1, 2)",
+        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::three_value_in_list_reaches_planners(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a IN (1, 2, 3)",
+        "[a = Int32(1) OR a = Int32(2) OR a = Int32(3)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::not_of_boolean_key_reaches_planners(
+        vec![key_planner("flag_idx", &["flag"])],
+        &[],
+        "NOT flag",
+        "[NOT flag]@flag_idx(Keys)",
+        None
+    )]
+    #[case::declined_one_column_or_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "c IN (1, 2)",
+        "OR([c = 1]@c_idx(BTree),[c = 2]@c_idx(BTree))",
+        None
+    )]
+    fn routes_conjuncts_to_planners(
+        #[case] planners: Vec<KeyPlanner>,
+        #[case] btree_columns: &[&str],
+        #[case] filter: &str,
+        #[case] index_query: &str,
+        #[case] refine: Option<&str>,
+    ) {
+        let planners = planners
+            .into_iter()
+            .map(|planner| Box::new(planner) as Box<dyn ScalarIndexPlanner>)
+            .collect();
+        let plan = plan(&Indices::new(btree_columns, planners), filter).unwrap();
+        assert_eq!(
+            render(&plan),
+            (
+                Some(index_query.to_string()),
+                refine.map(ToString::to_string)
+            )
+        );
+    }
+
+    // The filter planner's simplifier pushes NOT below comparisons and ANDs, so
+    // build the roots directly, as callers of apply_scalar_indices may.
+    #[rstest]
+    #[case::or_over_two_columns(
+        col("a").eq(lit(1)).or(col("b").eq(lit(2))),
+        "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))"
+    )]
+    #[case::or_over_one_column(
+        col("a").eq(lit(1)).or(col("a").eq(lit(2))),
+        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)"
+    )]
+    #[case::not_over_two_columns(
+        Expr::Not(Box::new(col("a").is_null().and(col("b").is_null()))),
+        "NOT(AND([a IS NULL]@a_idx(BTree),[b IS NULL]@b_idx(BTree)))"
+    )]
+    #[case::not_over_one_column(
+        Expr::Not(Box::new(col("a").is_null())),
+        "[NOT a IS NULL]@ab_idx(Keys)"
+    )]
+    #[case::and(col("a").eq(lit(1)).and(col("b").gt(lit(5))), AB_QUERY)]
+    fn aliased_roots_route_like_bare_roots(
+        #[case] root: Expr,
+        #[case] index_query: &str,
+        #[values(0, 1, 2)] aliases: usize,
+    ) {
+        let indices = Indices::new(AB, vec![Box::new(key_planner("ab_idx", AB))]);
+        let filter = (0..aliases).fold(root, |expr, depth| expr.alias(format!("alias_{depth}")));
+        let planned = apply_scalar_indices(filter, &indices).unwrap();
+        assert_eq!(
+            planned.scalar_query.as_ref().map(ToString::to_string),
+            Some(index_query.to_string())
+        );
+        assert_eq!(planned.refine_expr, None);
+    }
+
+    #[test]
+    fn nested_fields_count_as_separate_columns() {
+        let indices = Indices::new(
+            &["s.x", "s.y"],
+            vec![Box::new(key_planner("s_idx", &["s"]))],
+        );
+        let fields = Fields::from(
+            ["x", "y"]
+                .map(|name| Field::new(name, DataType::Int32, true))
+                .to_vec(),
+        );
+        let schema = Schema::new(vec![Field::new("s", DataType::Struct(fields), true)]);
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter("s.x = 1 OR s.y = 2").unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &indices, true).unwrap();
+        assert_eq!(
+            render(&plan),
+            (
+                Some("OR([s.x = 1]@s.x_idx(BTree),[s.y = 2]@s.y_idx(BTree))".to_string()),
+                None
+            )
+        );
+    }
+
+    #[derive(Debug)]
+    struct FixedIndex(fn() -> SearchResult);
+
+    impl DeepSizeOf for FixedIndex {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl Index for FixedIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+        fn index_type(&self) -> IndexType {
+            IndexType::Scalar
+        }
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndex for FixedIndex {
+        async fn search(&self, _: &dyn AnyQuery, _: &dyn MetricsCollector) -> Result<SearchResult> {
+            Ok((self.0)())
+        }
+        fn can_remap(&self) -> bool {
+            false
+        }
+        async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _: datafusion::execution::SendableRecordBatchStream,
+            _: &dyn IndexStore,
+            _: Option<crate::scalar::OldIndexDataFilter>,
+        ) -> Result<CreatedIndex> {
+            unimplemented!()
+        }
+        fn update_criteria(&self) -> UpdateCriteria {
+            unimplemented!()
+        }
+        fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndexLoader for FixedIndex {
+        async fn load_index(
+            &self,
+            _column: &str,
+            _index_name: &str,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Ok(Arc::new(Self(self.0)))
+        }
+    }
+
+    fn rows_1_2() -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter([1, 2])
+    }
+
+    #[rstest]
+    #[case::exact(|| SearchResult::exact(rows_1_2()), false)]
+    #[case::at_most(|| SearchResult::at_most(rows_1_2()), true)]
+    #[case::at_least(|| SearchResult::at_least(rows_1_2()), true)]
+    #[tokio::test]
+    async fn inexact_planner_results_request_recheck(
+        #[case] result: fn() -> SearchResult,
+        #[case] needs_recheck: bool,
+    ) {
+        let planner = KeyPlanner {
+            needs_recheck,
+            ..key_planner("ab_idx", AB)
+        };
+        let indices = Indices::new(&[], vec![Box::new(planner)]);
+        let plan = plan(&indices, "a = 1 AND b > 5").unwrap();
+        assert_eq!(render(&plan), (Some(AB_QUERY.to_string()), None));
+        assert_eq!(plan.skip_recheck, !needs_recheck);
+
+        let evaluated = plan
+            .index_query
+            .unwrap()
+            .evaluate(&FixedIndex(result), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let rows = RowAddrMask::from_allowed(rows_1_2());
+        let (lower, upper) = match result() {
+            SearchResult::Exact(_) => (rows.clone(), rows),
+            SearchResult::AtMost(_) => (RowAddrMask::allow_nothing(), rows),
+            SearchResult::AtLeast(_) => (rows, RowAddrMask::all_rows()),
+        };
+        assert_eq!((evaluated.lower, evaluated.upper), (lower, upper));
+    }
+
+    #[derive(Debug)]
+    enum Forgery {
+        NoConjuncts,
+        RepeatedConjunct,
+        SubExpression,
+    }
+
+    impl ScalarIndexPlanner for Forgery {
+        fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+            let consumed = match self {
+                Self::NoConjuncts => vec![],
+                Self::RepeatedConjunct => vec![&conjuncts[0], &conjuncts[0]],
+                Self::SubExpression => match &conjuncts[0] {
+                    Expr::BinaryExpr(binary) => vec![binary.left.as_ref()],
+                    other => panic!("expected a comparison, got {other}"),
+                },
+            };
+            Some(ScalarIndexPlan {
+                search: ScalarIndexSearch {
+                    column: "a".to_string(),
+                    index_name: "forged_idx".to_string(),
+                    index_type: "Keys".to_string(),
+                    query: Arc::new(KeyQuery(conjuncts[0].clone())),
+                    needs_recheck: false,
+                    fragment_bitmap: None,
+                },
+                consumed,
+            })
+        }
+    }
+
+    #[rstest]
+    #[case::no_conjuncts(Forgery::NoConjuncts, "consumes no conjuncts")]
+    #[case::repeated_conjunct(
+        Forgery::RepeatedConjunct,
+        "not a distinct member of the 2 conjuncts it was offered"
+    )]
+    #[case::sub_expression(
+        Forgery::SubExpression,
+        "not a distinct member of the 2 conjuncts it was offered"
+    )]
+    fn rejects_plans_that_misreport_consumed_conjuncts(
+        #[case] forgery: Forgery,
+        #[case] reason: &str,
+    ) {
+        let indices = Indices::new(&[], vec![Box::new(forgery)]);
+        let error = plan(&indices, "a = 1 AND b > 5").unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'forged_idx'") && message.contains(reason),
+            "{message}"
+        );
     }
 }
