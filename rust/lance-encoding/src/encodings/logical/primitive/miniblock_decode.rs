@@ -2375,7 +2375,7 @@ mod tests {
     };
     use crate::encodings::logical::primitive::tests::encoded_u16_frame;
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
-    use crate::encodings::physical::binary::VariableEncoder;
+    use crate::encodings::physical::binary::{BinaryMiniBlockDecompressor, VariableEncoder};
     #[cfg(feature = "bitpacking")]
     use crate::encodings::physical::bitpacking::InlineBitpacking;
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
@@ -2386,6 +2386,64 @@ mod tests {
         ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, MiniBlockDecoder,
         PreambleAction, Words, build_chunk_index,
     };
+
+    #[rstest]
+    fn test_miniblock_cancelled_tasks_release_exhausted_input(
+        #[values(false, true)] disjoint_selections: bool,
+        #[values(1, 2)] batch_size: u64,
+    ) {
+        // Cancellation drops tasks before decoding. Track the input allocation,
+        // including when a partial drain or a later selection still needs it.
+        let owner: Arc<[u8]> = Arc::from([0_u8; 16]);
+        let weak = Arc::downgrade(&owner);
+        let instructions = if disjoint_selections {
+            [(0, 1), (2, 1)].as_slice()
+        } else {
+            [(0, 2)].as_slice()
+        }
+        .iter()
+        .map(|&(rows_to_skip, rows_to_take)| ChunkInstructions {
+            chunk_idx: 0,
+            preamble: PreambleAction::Absent,
+            rows_to_skip,
+            rows_to_take,
+            take_trailer: false,
+        })
+        .collect();
+        let mut decoder = MiniBlockDecoder {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::from([LoadedChunk {
+                data: LanceBuffer::reinterpret_slice(owner),
+                items_in_chunk: if disjoint_selections { 3 } else { 2 },
+                byte_range: 0..16,
+                chunk_idx: 0,
+            }]),
+            instructions,
+            offset_in_current_chunk: 0,
+            num_rows: 2,
+            num_buffers: 1,
+            dictionary: None,
+            has_large_chunk: false,
+        };
+
+        let first = decoder.drain(batch_size).unwrap();
+        assert!(weak.upgrade().is_some());
+        if batch_size == 1 {
+            drop(first);
+            assert!(weak.upgrade().is_some(), "remaining selection needs input");
+            let last = decoder.drain(1).unwrap();
+            assert!(weak.upgrade().is_some(), "pending task needs input");
+            drop(last);
+        } else {
+            drop(first);
+        }
+        assert!(weak.upgrade().is_none(), "exhausted decoder retains input");
+        std::hint::black_box(&decoder);
+    }
 
     #[test]
     fn test_miniblock_decode_uses_exact_fixed_width_output_size() {
