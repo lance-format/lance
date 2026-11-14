@@ -2344,7 +2344,7 @@ async fn selective_phrase_search_reads_committed_partitions(
         .map(|Reverse(hit)| {
             (
                 hit.document.partition_ordinal(),
-                hit.document.doc_id(),
+                hit.document.doc_id,
                 hit.score,
             )
         })
@@ -2354,7 +2354,7 @@ async fn selective_phrase_search_reads_committed_partitions(
         .map(|Reverse(hit)| {
             (
                 hit.document.partition_ordinal(),
-                hit.document.doc_id(),
+                hit.document.doc_id,
                 hit.score,
             )
         })
