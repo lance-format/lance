@@ -446,8 +446,10 @@ fn conflicts_with_unseen_schema_change(
                 read_schema.field_by_id(*field_id),
                 latest_schema.field_by_id(*field_id),
             ) {
+                // An overwrite can reuse an id for another column of the same type.
                 (Some(read_field), Some(latest_field)) => {
-                    read_field.data_type() != latest_field.data_type()
+                    read_field.name != latest_field.name
+                        || read_field.data_type() != latest_field.data_type()
                 }
                 _ => true,
             }

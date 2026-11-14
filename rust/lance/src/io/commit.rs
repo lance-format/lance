@@ -2818,6 +2818,7 @@ mod tests {
     #[case::append_after_cast("cast")]
     #[case::append_null_after_set_not_null("set_not_null")]
     #[case::append_after_overwrite_reusing_field_ids("overwrite")]
+    #[case::append_after_overwrite_swapping_same_type_columns("overwrite_swap")]
     #[tokio::test]
     async fn test_schema_dependent_commit_rejects_cleaned_history(#[case] concurrent: &str) {
         let initial = arrow_array::record_batch!(
@@ -2874,6 +2875,20 @@ mod tests {
                     })
                     .execute(vec![
                         arrow_array::record_batch!(("id", Utf8, ["a"]), ("x", Utf8, ["b"]))
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            // The reused field ids keep their types but now name the other column.
+            "overwrite_swap" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![
+                        arrow_array::record_batch!(("x", Int32, [Some(5)]), ("id", Int32, [6]))
                             .unwrap(),
                     ])
                     .await
