@@ -28,7 +28,8 @@ jobs:
       - name: Validate admitted decoder buffer boundaries
         run: cargo test --profile ci --locked -p lance-encoding --all-features --lib buffer::tests -- --nocapture
       - name: Validate admitted bitpacking and existing range decoding
-        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::physical::bitpacking:: -- --nocapture
+        run: >-
+          cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::physical::bitpacking:: -- --nocapture
       - name: Validate MiniBlock composition after chunk validation refactor
         run: cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::miniblock_decode::tests -- --nocapture
       - name: Validate allocation API examples
