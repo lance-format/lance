@@ -3563,6 +3563,7 @@ mod tests {
     struct WindowedBatchReader {
         batches: Vec<RecordBatch>,
         windows_read: Arc<AtomicUsize>,
+        second_window_started: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -3612,15 +3613,17 @@ mod tests {
             max_decoded_bytes: usize,
         ) -> Result<ShufflePartitionWindow> {
             let plan = self.plan_partition_window(start_partition_id, max_decoded_bytes)?;
-            self.windows_read.fetch_add(1, Ordering::Relaxed);
+            let window_index = self.windows_read.fetch_add(1, Ordering::Relaxed);
+            if window_index == 1 {
+                // notify_one stores a permit, so this is safe even if the first
+                // window has not started waiting yet.
+                self.second_window_started.notify_one();
+            }
+            // Holding the first window open until the second one starts proves
+            // the builder admits windows concurrently. A wait on a signal rather
+            // than a deadline keeps this deterministic on loaded CI runners.
             if start_partition_id == 0 {
-                tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                    while self.windows_read.load(Ordering::Relaxed) < 2 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .map_err(|_| Error::internal("second partition window was not admitted"))?;
+                self.second_window_started.notified().await;
             }
             let partitions = plan
                 .partition_range
@@ -3734,6 +3737,7 @@ mod tests {
         let reader = Arc::new(WindowedBatchReader {
             batches: (0..num_partitions).map(flat_partition_batch).collect(),
             windows_read: windows_read.clone(),
+            second_window_started: tokio::sync::Notify::new(),
         });
         let mut build_stream = build_fresh_partitions_windowed(
             reader,
