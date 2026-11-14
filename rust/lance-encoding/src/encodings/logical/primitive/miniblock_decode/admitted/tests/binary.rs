@@ -117,7 +117,7 @@ fn binary_values_preserve_task_overlap_and_list_semantics(
     } else {
         LargeBinaryArray::from_vec(selected.to_vec()).to_data()
     };
-    assert_eq!(array.to_data(), expected);
+    assert_eq!(array, expected);
     assert_eq!(array.get_buffer_memory_size(), output_bytes);
     assert_eq!(work.len(), if nested && !multiple { 24 } else { 0 });
     drop(task);

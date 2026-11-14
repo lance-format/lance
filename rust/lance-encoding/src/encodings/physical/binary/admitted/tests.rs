@@ -96,7 +96,7 @@ fn binary_ranges_charge_selected_payload_and_offsets(
         DataType::LargeBinary
     };
     let array = output.try_to_arrow_in(&ty, &mut work).unwrap().unwrap();
-    assert_eq!(array.to_data(), expected(selected, bits));
+    assert_eq!(array, expected(selected, bits));
     assert_eq!(array.get_buffer_memory_size(), bytes);
     drop(output);
     drop(data);
@@ -215,7 +215,7 @@ fn current_writer_flat_fallback_round_trip(#[values(32, 64)] bits: u8) {
         DataType::LargeBinary
     };
     let actual = block.try_to_arrow_in(&ty, &mut work).unwrap().unwrap();
-    assert_eq!(actual.to_data(), expected(&values[1..], bits));
+    assert_eq!(actual, expected(&values[1..], bits));
 }
 
 #[derive(Debug)]
