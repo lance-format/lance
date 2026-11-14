@@ -467,7 +467,7 @@ async fn test_analyze_plan() {
     );
 
     // Also validate the full string structure with pattern matching
-    let expected_pattern = "[...MergeInsert: elapsed=..., on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_skipped_duplicates=0, num_updated_rows=1]
+    let expected_pattern = "[...MergeInsert: elapsed=..., on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_skipped_duplicates=0, num_updated_rows=1, merge_write_time=...]
     ...
     StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[]...]";
     assert_string_matches(&analysis, expected_pattern).unwrap();
