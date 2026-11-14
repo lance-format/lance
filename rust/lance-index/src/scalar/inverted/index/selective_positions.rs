@@ -6,8 +6,11 @@
 use super::*;
 use crate::scalar::IndexBinaryReader;
 use crate::scalar::inverted::wand::selective_phrase::{
-    PhraseProgress, PhraseSearch, PositionBlockRequest, PositionWindow,
+    PhraseProgress, PhraseSearch, PositionWindow,
 };
+
+mod read_ahead;
+use read_ahead::ReadAhead;
 
 // Kept opt-in until exact-head CI and matched low-cache VM qualification.
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -164,7 +167,7 @@ impl PreparedPositions {
         Ok(u64::from(start)..end)
     }
 
-    async fn read(&self, index: usize, metrics: &dyn MetricsCollector) -> Result<PositionWindow> {
+    fn window_bounds(&self, index: usize) -> Result<(usize, usize, Range<u64>)> {
         self.block_range(index)?;
         let ordinal = self.window_ends.partition_point(|end| *end <= index);
         let end = self
@@ -176,6 +179,35 @@ impl PreparedPositions {
             .checked_sub(1)
             .map_or(0, |prior| self.window_ends[prior]);
         let range = self.block_range(first)?.start..self.block_range(end - 1)?.end;
+        Ok((first, end, range))
+    }
+
+    fn read_ahead_blocks(
+        &self,
+        current: &PositionWindow,
+        clause_budget: u64,
+    ) -> Result<Option<Range<usize>>> {
+        if current.offsets.is_empty() {
+            return Err(Error::index(
+                "cannot prefetch after an empty position window",
+            ));
+        }
+        let next = current
+            .first_block
+            .checked_add(current.offsets.len())
+            .ok_or_else(|| Error::index("position window block endpoint overflows"))?;
+        if next >= self.offsets.len() {
+            return Ok(None);
+        }
+        let (first, end, range) = self.window_bounds(next)?;
+        let fits = (current.bytes.len() as u64)
+            .checked_add(range.end - range.start)
+            .is_some_and(|bytes| bytes <= clause_budget);
+        Ok(fits.then_some(first..end))
+    }
+
+    async fn read(&self, index: usize, metrics: &dyn MetricsCollector) -> Result<PositionWindow> {
+        let (first, end, range) = self.window_bounds(index)?;
         let expected = range.end - range.start;
         let start = range.start;
         let (window, hit) = self
@@ -411,22 +443,26 @@ impl InvertedIndex {
                             Ok::<_, Error>((PhraseSearch::new(loaded.postings, limit)?, idf))
                         })
                         .await?;
+                        let mut read_ahead = ReadAhead::new(positions.len());
+                        let clause_budget = MAX_LIVE_WINDOW_BYTES / request.tokens.len() as u64;
                         loop {
                             let lengths = lengths.clone();
                             let visibility = visibility.clone();
                             let scorer = request.impact_scorer.clone();
                             let shared = shared.clone();
                             let metrics = request.metrics.clone();
-                            let (next, progress) = spawn_cpu(move || {
+                            let advance = spawn_cpu(move || {
                                 let docs = ModernWandDocuments::filtered(&lengths, &visibility);
                                 let progress =
                                     search.advance(&docs, scorer, shared, metrics.as_ref())?;
                                 Ok::<_, Error>((search, progress))
-                            })
-                            .await?;
+                            });
+                            let (next, progress) = read_ahead.drive(advance).await?;
                             search = next;
                             match progress {
                                 PhraseProgress::Done(candidates) => {
+                                    read_ahead.clear();
+                                    drop(search);
                                     let scorer = request.impact_scorer.clone();
                                     let scored = spawn_cpu(move || {
                                         Ok::<_, Error>(rescore_partition_candidates(
@@ -442,39 +478,48 @@ impl InvertedIndex {
                                     return Result::Ok((ordinal, scored));
                                 }
                                 PhraseProgress::Read(requests) => {
-                                    // One window per clause, at most 32 MiB in aggregate.
-                                    // try_join_all cancellation drops accepted I/O futures;
-                                    // no background tasks or parked CPU workers are spawned.
-                                    let reads = requests.into_iter().map(
-                                        |block_request: PositionBlockRequest| {
-                                            let positions = &positions;
-                                            let metrics = request.metrics.clone();
-                                            async move {
-                                                let plan = positions
-                                                    .iter()
-                                                    .find(|plan| {
-                                                        plan.token_id == block_request.token_id
-                                                    })
-                                                    .ok_or_else(|| {
-                                                        Error::internal(
-                                                            "position request has no prepared term",
-                                                        )
-                                                    })?;
-                                                Ok::<_, Error>((
-                                                    block_request,
-                                                    plan.read(
-                                                        block_request.index,
-                                                        metrics.as_ref(),
-                                                    )
-                                                    .await?,
-                                                ))
-                                            }
-                                        },
-                                    );
-                                    for (request, block) in
-                                        futures::future::try_join_all(reads).await?
-                                    {
-                                        search.supply(request, block)?;
+                                    let mut reads = Vec::with_capacity(requests.len());
+                                    for block_request in requests {
+                                        let (term, plan) = positions
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(_, plan)| {
+                                                plan.token_id == block_request.token_id
+                                            })
+                                            .ok_or_else(|| {
+                                                Error::internal(
+                                                    "position request has no prepared term",
+                                                )
+                                            })?;
+                                        let metrics = request.metrics.as_ref();
+                                        let read = read_ahead
+                                            .take(term, block_request.index)
+                                            .unwrap_or_else(|| {
+                                                plan.read(block_request.index, metrics).boxed()
+                                            });
+                                        reads.push(async move {
+                                            Ok::<_, Error>((term, block_request, read.await?))
+                                        });
+                                    }
+                                    let windows = read_ahead
+                                        .drive(futures::future::try_join_all(reads))
+                                        .await?;
+                                    for (term, block_request, window) in windows {
+                                        let plan = &positions[term];
+                                        // Current plus speculative encoded bytes share the
+                                        // original clause budget. Oversized neighbors skip
+                                        // speculation; offsets/scratch/cache/I/O are separate.
+                                        if let Some(blocks) =
+                                            plan.read_ahead_blocks(&window, clause_budget)?
+                                        {
+                                            read_ahead.insert(
+                                                term,
+                                                blocks.clone(),
+                                                plan.read(blocks.start, request.metrics.as_ref())
+                                                    .boxed(),
+                                            )?;
+                                        }
+                                        search.supply(block_request, window)?;
                                     }
                                 }
                             }
@@ -712,5 +757,116 @@ mod tests {
         assert_eq!(value.active.load(Ordering::SeqCst), 1);
         drop(read);
         assert_eq!(value.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn selective_phrase_read_ahead_shares_the_current_window_budget() {
+        let cache = LanceCache::no_cache();
+        let plan = prepared(binary_value(false, false), &cache);
+        let current = PositionWindow {
+            first_block: 0,
+            codec: PositionStreamCodec::PackedDelta,
+            offsets: vec![0].into(),
+            bytes: vec![9; 4].into(),
+        };
+        // The current four bytes and next eight bytes must both fit.
+        assert_eq!(plan.read_ahead_blocks(&current, 11).unwrap(), None);
+        assert_eq!(plan.read_ahead_blocks(&current, 12).unwrap(), Some(1..2));
+        let final_window = PositionWindow {
+            first_block: 2,
+            ..current
+        };
+        assert_eq!(plan.read_ahead_blocks(&final_window, 16).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_read_ahead_reuses_a_completed_read() -> Result<()> {
+        let cache = LanceCache::no_cache();
+        let value = binary_value(false, false);
+        let plan = prepared(value.clone(), &cache);
+        let metrics = NoOpMetricsCollector;
+        let mut ahead = ReadAhead::new(1);
+        ahead.insert(0, 2..3, plan.read(2, &metrics).boxed())?;
+        ahead.drive(value.started.notified()).await;
+        let window = ahead.take(0, 2).unwrap().await?;
+        assert_eq!(window.block(2)?, &[9; 4]);
+        assert!(ahead.take(0, 2).is_none());
+        assert_eq!(value.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(value.active.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::moka(LanceCache::with_capacity(4096))]
+    #[case::quick(LanceCache::with_backend(Arc::new(
+        lance_core::cache::QuickCacheBackend::with_capacity(4096)
+    )))]
+    #[case::disabled(LanceCache::no_cache())]
+    #[tokio::test]
+    async fn selective_phrase_read_ahead_releases_unused_pending_io(#[case] cache: LanceCache) {
+        let value = binary_value(false, true);
+        let plan = prepared(value.clone(), &cache);
+        let metrics = NoOpMetricsCollector;
+        let mut ahead = ReadAhead::new(1);
+        ahead
+            .insert(0, 2..3, plan.read(2, &metrics).boxed())
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ahead.drive(value.started.notified()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value.active.load(Ordering::SeqCst), 1);
+        // Skipping the predicted window drops the already accepted read.
+        assert!(ahead.take(0, 0).is_none());
+        assert_eq!(value.active.load(Ordering::SeqCst), 0);
+        ahead
+            .insert(0, 2..3, plan.read(2, &metrics).boxed())
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ahead.drive(value.started.notified()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value.active.load(Ordering::SeqCst), 1);
+        // Dropping the request owner requires no join, task or sender wakeup.
+        drop(ahead);
+        assert_eq!(value.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_read_ahead_does_not_start_when_essential_work_is_ready() {
+        let cache = LanceCache::no_cache();
+        let value = binary_value(false, true);
+        let plan = prepared(value.clone(), &cache);
+        let metrics = NoOpMetricsCollector;
+        let mut ahead = ReadAhead::new(1);
+        ahead
+            .insert(0, 2..3, plan.read(2, &metrics).boxed())
+            .unwrap();
+        assert_eq!(ahead.drive(futures::future::ready(7)).await, 7);
+        ahead.clear();
+        assert_eq!(value.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_read_ahead_defers_an_unused_failure() -> Result<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut ahead = ReadAhead::new(1);
+        ahead.insert(
+            0,
+            2..3,
+            async move {
+                send.send(()).unwrap();
+                Err(Error::index("speculative read unavailable"))
+            }
+            .boxed(),
+        )?;
+        ahead.drive(receive).await.unwrap();
+        let error = ahead.take(0, 2).unwrap().await.err().unwrap();
+        assert!(error.to_string().contains("speculative read unavailable"));
+        Ok(())
     }
 }
