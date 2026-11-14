@@ -391,7 +391,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             elif self.shard_granularity == "fragment":
                 sampler = ShardedFragmentSampler(rank, world_size)
             else:
-                raise ValueError("Invalid shard_granularity: {}")
+                raise ValueError(f"Invalid shard_granularity: {self.shard_granularity}")
         else:
             sampler = self.sampler
 

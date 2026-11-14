@@ -151,6 +151,16 @@ def test_iter_filter(tmp_path):
         )
 
 
+@pytest.mark.parametrize("shard_granularity", ["bogus", "Batch"])
+def test_invalid_shard_granularity(tmp_path: Path, shard_granularity):
+    ds = lance.write_dataset(pa.table({"ids": range(100)}), tmp_path / "data.lance")
+    dataset = LanceDataset(ds, batch_size=10, shard_granularity=shard_granularity)
+    with pytest.raises(
+        ValueError, match=f"Invalid shard_granularity: {shard_granularity}"
+    ):
+        next(iter(dataset))
+
+
 def test_sample_fragments(tmp_path: Path):
     arr = pa.array(range(2000))
     tbl = pa.Table.from_arrays([arr], ["ids"])
