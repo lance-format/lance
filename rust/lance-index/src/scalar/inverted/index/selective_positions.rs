@@ -6,7 +6,7 @@
 use super::*;
 use crate::scalar::IndexBinaryReader;
 use crate::scalar::inverted::wand::selective_phrase::{
-    PhraseProgress, PhraseSearch, PositionBlock, PositionBlockRequest,
+    PhraseProgress, PhraseSearch, PositionBlockRequest, PositionWindow,
 };
 
 // Kept opt-in until exact-head CI and matched low-cache VM qualification.
@@ -20,43 +20,84 @@ pub(super) fn enabled() -> bool {
 
 // This bounds encoded blocks held by one partition search, not process RSS.
 // Postings, offsets, decode scratch, I/O buffers and other queries are separate.
-const MAX_LIVE_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LIVE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+// Search seed for the opt-in path, pending matched VM qualification.
+const POSITION_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUSES: usize = 16;
 const MAX_OFFSET_BYTES: usize = 1024 * 1024;
 
-struct EncodedPositionBlock(Arc<[u8]>);
-
-impl DeepSizeOf for EncodedPositionBlock {
+impl DeepSizeOf for PositionWindow {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.0.len() + 2 * std::mem::size_of::<usize>()
+        self.bytes.len()
+            + std::mem::size_of_val(self.offsets.as_ref())
+            + 4 * std::mem::size_of::<usize>()
     }
 }
 
 #[derive(Debug)]
-struct PositionBlockKey {
+struct PositionWindowKey {
     token_id: u32,
-    index: usize,
+    first_block: usize,
 }
-
-impl CacheKey for PositionBlockKey {
-    type ValueType = EncodedPositionBlock;
-
+impl CacheKey for PositionWindowKey {
+    type ValueType = PositionWindow;
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!("position-block-{}-{}", self.token_id, self.index).into()
+        format!(
+            "position-window-{}-{}-{POSITION_WINDOW_BYTES}",
+            self.token_id, self.first_block
+        )
+        .into()
     }
-
     fn type_name() -> &'static str {
-        "EncodedPositionBlock"
+        "EncodedPositionWindow"
     }
-
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.scalar.inverted.position-block", 1)
+        CacheKeySchema::new("lance.scalar.inverted.position-window", 1)
     }
-
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u32(self.token_id);
-        builder.write_u64(self.index as u64);
+        builder.write_u64(self.first_block as u64);
+        builder.write_u64(POSITION_WINDOW_BYTES);
     }
+}
+
+/// Greedy byte groups are deterministic for this immutable term. Never split
+/// a codec block, including a final block whose endpoint is the value length.
+fn position_window_ends(
+    offsets: &[u32],
+    length: u64,
+    target: u64,
+    max_block: u64,
+) -> Result<Option<Vec<usize>>> {
+    if target == 0 || target > max_block {
+        return Err(Error::invalid_input(
+            "position window target must be positive and fit the clause budget",
+        ));
+    }
+    if offsets.first().is_some_and(|start| *start != 0) {
+        return Err(Error::index("position window offsets must start at zero"));
+    }
+    let mut ends = Vec::new();
+    let mut first = 0;
+    for (index, start) in offsets.iter().enumerate() {
+        let end = offsets.get(index + 1).map_or(length, |end| u64::from(*end));
+        if u64::from(*start) > end || end > length {
+            return Err(Error::index(
+                "position window offsets exceed the value length or decrease",
+            ));
+        }
+        if end - u64::from(*start) > max_block {
+            return Ok(None);
+        }
+        if index > first && end - u64::from(offsets[first]) > target {
+            ends.push(index);
+            first = index;
+        }
+    }
+    if !offsets.is_empty() {
+        ends.push(offsets.len());
+    }
+    Ok(Some(ends))
 }
 
 /// Request-local preparation. Never put the statistics-bound I/O handle in the cache.
@@ -64,6 +105,7 @@ struct PreparedPositions {
     token_id: u32,
     codec: PositionStreamCodec,
     offsets: Vec<u32>,
+    window_ends: Vec<usize>,
     value: Arc<dyn IndexBinaryReader>,
     cache: WeakLanceCache,
 }
@@ -90,15 +132,26 @@ impl PreparedPositions {
         Ok(u64::from(start)..end)
     }
 
-    async fn read(&self, index: usize, metrics: &dyn MetricsCollector) -> Result<PositionBlock> {
-        let range = self.block_range(index)?;
+    async fn read(&self, index: usize, metrics: &dyn MetricsCollector) -> Result<PositionWindow> {
+        self.block_range(index)?;
+        let ordinal = self.window_ends.partition_point(|end| *end <= index);
+        let end = self
+            .window_ends
+            .get(ordinal)
+            .copied()
+            .ok_or_else(|| Error::index("position block has no byte window"))?;
+        let first = ordinal
+            .checked_sub(1)
+            .map_or(0, |prior| self.window_ends[prior]);
+        let range = self.block_range(first)?.start..self.block_range(end - 1)?.end;
         let expected = range.end - range.start;
-        let (block, hit) = self
+        let start = range.start;
+        let (window, hit) = self
             .cache
             .get_or_insert_with_key_hit(
-                PositionBlockKey {
+                PositionWindowKey {
                     token_id: self.token_id,
-                    index,
+                    first_block: first,
                 },
                 || async {
                     let mut buffers = self.value.read_slices(&[range]).await?;
@@ -108,9 +161,19 @@ impl PreparedPositions {
                         ));
                     }
                     let bytes = buffers.remove(0);
-                    // Copy even a uniquely visible slice: it can own a much larger
-                    // coalesced buffer through a custom owner. Arc<[u8]> is compact.
-                    Ok(EncodedPositionBlock(Arc::from(bytes.as_ref())))
+                    let offsets = self.offsets[first..end]
+                        .iter()
+                        .map(|offset| {
+                            u32::try_from(u64::from(*offset) - start)
+                                .map_err(|_| Error::index("position window offset exceeds u32"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(PositionWindow {
+                        first_block: first,
+                        codec: self.codec,
+                        offsets: Arc::from(offsets.into_boxed_slice()),
+                        bytes: Arc::from(bytes.as_ref()),
+                    })
                 },
             )
             .await?;
@@ -119,11 +182,7 @@ impl PreparedPositions {
         } else {
             metrics.record_index_cache_miss();
         }
-        Ok(PositionBlock {
-            index,
-            codec: self.codec,
-            bytes: block.0.clone(),
-        })
+        Ok(window.as_ref().clone())
     }
 }
 
@@ -180,21 +239,23 @@ impl InvertedPartition {
                     "selective position block offsets are not monotonic from zero",
                 ));
             }
+            let Some(window_ends) = position_window_ends(
+                offsets,
+                value.len(),
+                POSITION_WINDOW_BYTES,
+                MAX_LIVE_WINDOW_BYTES / tokens.len() as u64,
+            )?
+            else {
+                return Ok(None);
+            };
             let plan = PreparedPositions {
                 token_id,
                 codec,
                 offsets: offsets.to_vec(),
+                window_ends,
                 value,
                 cache: inverted.index_cache.clone(),
             };
-            // Check every block before consuming any search state. Oversized
-            // values use ordinary loading, never a partial, silently incomplete search.
-            for index in 0..plan.offsets.len() {
-                let range = plan.block_range(index)?;
-                if range.end - range.start > MAX_LIVE_BLOCK_BYTES / tokens.len() as u64 {
-                    return Ok(None);
-                }
-            }
             prepared.push(plan);
         }
         Ok(Some(prepared))
@@ -333,7 +394,7 @@ impl InvertedIndex {
                                     return Result::Ok((ordinal, scored));
                                 }
                                 PhraseProgress::Read(requests) => {
-                                    // One block per clause, at most 8 MiB in aggregate.
+                                    // One window per clause, at most 32 MiB in aggregate.
                                     // try_join_all cancellation drops accepted I/O futures;
                                     // no background tasks or parked CPU workers are spawned.
                                     let reads = requests.into_iter().map(
@@ -403,6 +464,7 @@ mod tests {
     struct BinaryValue {
         calls: AtomicUsize,
         short: bool,
+        expected_range: Range<u64>,
         pending: bool,
         active: Arc<AtomicUsize>,
         backing: std::sync::Mutex<Option<std::sync::Weak<()>>>,
@@ -437,14 +499,16 @@ mod tests {
             if self.pending {
                 return futures::future::pending().await;
             }
-            assert_eq!(slices, &[12..16]);
+            assert_eq!(slices, &[self.expected_range.clone()]);
             let lifetime = Arc::new(());
             *self.backing.lock().unwrap() = Some(Arc::downgrade(&lifetime));
             let bytes = bytes::Bytes::from_owner(Backing {
                 bytes: vec![9; 4096],
                 _lifetime: lifetime,
             });
-            Ok(vec![bytes.slice(12..if self.short { 15 } else { 16 })])
+            let range = self.expected_range.start as usize
+                ..self.expected_range.end as usize - usize::from(self.short);
+            Ok(vec![bytes.slice(range)])
         }
     }
 
@@ -452,6 +516,7 @@ mod tests {
         Arc::new(BinaryValue {
             calls: AtomicUsize::new(0),
             short,
+            expected_range: 12..16,
             pending,
             active: Arc::new(AtomicUsize::new(0)),
             backing: std::sync::Mutex::new(None),
@@ -463,9 +528,60 @@ mod tests {
             token_id: 7,
             codec: PositionStreamCodec::PackedDelta,
             offsets: vec![0, 4, 12],
+            window_ends: vec![1, 2, 3],
             value,
             cache: WeakLanceCache::from(cache),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::greedy(vec![0, 4, 7, 12], 16, 8, 8, Some(vec![2, 3, 4]))]
+    #[case::large_single_block(vec![0, 6, 9], 10, 4, 8, Some(vec![1, 3]))]
+    #[case::fallback(vec![0, 9], 10, 4, 8, None)]
+    #[case::empty(vec![], 0, 4, 8, Some(vec![]))]
+    #[case::empty_blocks(vec![0, 0, 0], 0, 4, 8, Some(vec![3]))]
+    fn selective_phrase_window_plan_respects_bytes(
+        #[case] offsets: Vec<u32>,
+        #[case] length: u64,
+        #[case] target: u64,
+        #[case] max_block: u64,
+        #[case] expected: Option<Vec<usize>>,
+    ) {
+        assert_eq!(
+            position_window_ends(&offsets, length, target, max_block).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::nonzero_start(vec![1], 8)]
+    #[case::decreasing(vec![0, 4, 3], 8)]
+    #[case::outside_value(vec![0, 9], 8)]
+    fn selective_phrase_window_plan_rejects_invalid_offsets(
+        #[case] offsets: Vec<u32>,
+        #[case] length: u64,
+    ) {
+        let error = position_window_ends(&offsets, length, 4, 8).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_prefetched_neighbors_share_one_read() -> Result<()> {
+        let cache = LanceCache::with_capacity(4096);
+        let mut value = binary_value(false, false);
+        Arc::get_mut(&mut value).unwrap().expected_range = 0..16;
+        let mut plan = prepared(value.clone(), &cache);
+        plan.window_ends = vec![3];
+        let window = plan.read(0, &NoOpMetricsCollector).await?;
+        assert_eq!(window.block(0)?, &[9; 4]);
+        assert_eq!(window.block(1)?, &[9; 8]);
+        assert_eq!(window.block(2)?, &[9; 4]);
+        assert!(!window.contains(3));
+        assert!(matches!(window.block(3), Err(Error::Index { .. })));
+        let neighbor = plan.read(2, &NoOpMetricsCollector).await?;
+        assert!(Arc::ptr_eq(&window.bytes, &neighbor.bytes));
+        assert_eq!(value.calls.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[tokio::test]

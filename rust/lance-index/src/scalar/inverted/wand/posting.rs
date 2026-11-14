@@ -199,7 +199,7 @@ pub struct PostingIterator {
     // out of the interior-mutable compressed state.
     pub(super) position_scratch: RefCell<Option<Vec<u32>>>,
     // Query-local compact block supplied by the async selective phrase reader.
-    pub(super) selected_position_block: Option<selective_phrase::PositionBlock>,
+    pub(super) position_window: Option<selective_phrase::PositionWindow>,
 
     // for compressed posting list
     pub(super) compressed: Option<UnsafeCell<CompressedState>>,
@@ -720,7 +720,7 @@ impl PostingIterator {
             use_scorer_upper_bound: false,
             grouped_terms: None,
             position_scratch: RefCell::new(Some(Vec::new())),
-            selected_position_block: None,
+            position_window: None,
             compressed,
         };
         posting.refresh_current_doc();
@@ -772,7 +772,7 @@ impl PostingIterator {
             use_scorer_upper_bound: self.use_scorer_upper_bound,
             grouped_terms: self.grouped_terms.clone(),
             position_scratch: RefCell::new(Some(Vec::new())),
-            selected_position_block: None,
+            position_window: None,
             compressed,
         };
         posting.refresh_current_doc();
@@ -965,19 +965,13 @@ impl PostingIterator {
                     self.position as i32,
                 ))
             }
-            PostingList::Compressed(ref list) if self.selected_position_block.is_some() => {
+            PostingList::Compressed(ref list) if self.position_window.is_some() => {
                 let block = self
-                    .selected_position_block
+                    .position_window
                     .as_ref()
                     .ok_or_else(|| Error::internal("selected position block disappeared"))?;
                 let block_idx = self.index >> list.block_shift();
-                if block.index != block_idx {
-                    return Err(Error::index(format!(
-                        "selected position block {} does not contain posting block {block_idx}",
-                        block.index
-                    )));
-                }
-                self.shared_position_cursor(list, block.codec, block.bytes.as_ref())
+                self.shared_position_cursor(list, block.codec, block.block(block_idx)?)
             }
             PostingList::Compressed(ref list) => match list.positions.as_ref().ok_or_else(|| {
                 Error::index(format!(

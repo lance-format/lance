@@ -8,12 +8,43 @@ use crate::scalar::inverted::DocInfo;
 use crate::scalar::inverted::index::PositionStreamCodec;
 use lance_core::Error;
 
+/// One compact contiguous read containing complete adjacent position blocks.
 #[derive(Clone)]
-pub(in crate::scalar::inverted) struct PositionBlock {
-    pub(in crate::scalar::inverted) index: usize,
+pub(in crate::scalar::inverted) struct PositionWindow {
+    pub(in crate::scalar::inverted) first_block: usize,
     pub(in crate::scalar::inverted) codec: PositionStreamCodec,
-    // An exact-size allocation: never retain a slice of a coalesced I/O buffer.
+    pub(in crate::scalar::inverted) offsets: Arc<[u32]>,
     pub(in crate::scalar::inverted) bytes: Arc<[u8]>,
+}
+
+impl PositionWindow {
+    pub(in crate::scalar::inverted) fn contains(&self, index: usize) -> bool {
+        index
+            .checked_sub(self.first_block)
+            .is_some_and(|relative| relative < self.offsets.len())
+    }
+
+    pub(in crate::scalar::inverted) fn block(&self, index: usize) -> Result<&[u8]> {
+        let relative = index
+            .checked_sub(self.first_block)
+            .filter(|relative| *relative < self.offsets.len())
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "position block {index} is outside window starting at {}",
+                    self.first_block
+                ))
+            })?;
+        let start = self.offsets[relative] as usize;
+        let end = self
+            .offsets
+            .get(relative + 1)
+            .map_or(self.bytes.len(), |end| *end as usize);
+        self.bytes.get(start..end).ok_or_else(|| {
+            Error::index(format!(
+                "position block {index} has invalid window range {start}..{end}"
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +59,7 @@ pub(in crate::scalar::inverted) enum PhraseProgress<C> {
 }
 
 /// No document/scorer/metrics borrow, I/O handle or parked CPU closure survives
-/// a suspension. There is at most one encoded block per query clause.
+/// a suspension. There is at most one encoded window per query clause.
 pub(in crate::scalar::inverted) struct PhraseSearch {
     #[allow(clippy::vec_box)]
     lead: Vec<Box<PostingIterator>>,
@@ -74,15 +105,15 @@ impl PhraseSearch {
         })
     }
 
-    /// Supply only a requested block. Repeated query terms share its allocation.
+    /// Supply a window containing the requested block. Repeated terms share it.
     pub(in crate::scalar::inverted) fn supply(
         &mut self,
         request: PositionBlockRequest,
-        block: PositionBlock,
+        window: PositionWindow,
     ) -> Result<()> {
-        if request.index != block.index {
+        if !window.contains(request.index) {
             return Err(Error::invalid_input(
-                "supplied position block index differs from request",
+                "supplied position window does not contain requested block",
             ));
         }
         let mut found = false;
@@ -93,12 +124,12 @@ impl PhraseSearch {
                         "selective phrase posting became uncompressed",
                     ));
                 };
-                if posting.index >> list.block_shift() != block.index {
+                if !window.contains(posting.index >> list.block_shift()) {
                     return Err(Error::invalid_input(
                         "supplied position block does not contain the pending document",
                     ));
                 }
-                posting.selected_position_block = Some(block.clone());
+                posting.position_window = Some(window.clone());
                 found = true;
             }
         }
@@ -170,12 +201,12 @@ impl PhraseSearch {
                 };
                 let index = posting.index >> list.block_shift();
                 if posting
-                    .selected_position_block
+                    .position_window
                     .as_ref()
-                    .is_none_or(|block| block.index != index)
+                    .is_none_or(|window| !window.contains(index))
                 {
                     // Release the old allocation before asynchronous replacement.
-                    posting.selected_position_block = None;
+                    posting.position_window = None;
                     let request = PositionBlockRequest {
                         token_id: posting.token_id,
                         index,

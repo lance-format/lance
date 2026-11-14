@@ -26,8 +26,9 @@ fn selective_phrase_resumes_blocks_and_keeps_late_high_score(
     #[case] codec: PositionStreamCodec,
     #[values(1, 500)] limit: usize,
     #[values(false, true)] repeated_term: bool,
+    #[values(1, 3)] window_blocks: usize,
 ) -> Result<()> {
-    use super::selective_phrase::{PhraseProgress, PhraseSearch, PositionBlock};
+    use super::selective_phrase::{PhraseProgress, PhraseSearch, PositionWindow};
     let total = BLOCK_SIZE * 5 + 7;
     let docs = unit_length_docs(total);
     let build = || {
@@ -124,12 +125,20 @@ fn selective_phrase_resumes_blocks_and_keeps_late_high_score(
                         .find(|(id, _)| *id == request.token_id)
                         .unwrap()
                         .1;
+                    let first = request.index / window_blocks * window_blocks;
+                    let end = (first + window_blocks).min(stream.block_count());
+                    let range = stream.block_range(first).start..stream.block_range(end - 1).end;
+                    let offsets = stream.block_offsets()[first..end]
+                        .iter()
+                        .map(|offset| *offset - range.start as u32)
+                        .collect::<Vec<_>>();
                     search.supply(
                         request,
-                        PositionBlock {
-                            index: request.index,
+                        PositionWindow {
+                            first_block: first,
                             codec,
-                            bytes: Arc::from(stream.block(request.index)),
+                            offsets: Arc::from(offsets.into_boxed_slice()),
+                            bytes: Arc::from(&stream.bytes()[range]),
                         },
                     )?;
                 }
@@ -181,7 +190,7 @@ fn selective_phrase_resumes_blocks_and_keeps_late_high_score(
 
 #[test]
 fn selective_phrase_rejects_wrong_block_and_drops_owned_state() -> Result<()> {
-    use super::selective_phrase::{PhraseProgress, PhraseSearch, PositionBlock};
+    use super::selective_phrase::{PhraseProgress, PhraseSearch, PositionWindow};
     let docs = unit_length_docs(1);
     let postings = (0..2)
         .map(|term| {
@@ -210,19 +219,25 @@ fn selective_phrase_rejects_wrong_block_and_drops_owned_state() -> Result<()> {
     let error = search
         .supply(
             requests[0],
-            PositionBlock {
-                index: requests[0].index + 1,
+            PositionWindow {
+                first_block: requests[0].index + 1,
+                offsets: Arc::from([0]),
                 codec: PositionStreamCodec::PackedDelta,
                 bytes: bytes.clone(),
             },
         )
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("index differs"));
+    assert!(
+        error
+            .to_string()
+            .contains("does not contain requested block")
+    );
     search.supply(
         requests[0],
-        PositionBlock {
-            index: requests[0].index,
+        PositionWindow {
+            first_block: requests[0].index,
+            offsets: Arc::from([0]),
             codec: PositionStreamCodec::PackedDelta,
             bytes,
         },
