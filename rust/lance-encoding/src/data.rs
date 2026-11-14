@@ -42,6 +42,7 @@ use crate::{
 };
 
 mod admitted;
+mod concat;
 
 /// A data block with no buffers where everything is null
 ///
