@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use crate::progress::{IndexBuildProgress, noop_progress};
 
 /// Options for optimizing all indices.
@@ -67,7 +69,11 @@ pub struct OptimizeOptions {
     /// split (nor is a fragment); with neither set each index is one task.
     ///
     /// Setting either bound splits the build of every index that can merge
-    /// segments, in `optimize_indices` as in the distributed plan; the
+    /// segments, in `optimize_indices` as in the distributed plan, except an
+    /// index whose committed segments still store row ids from before their
+    /// type moved to the row-address domain: that cohort migrates in one task,
+    /// because a split would rebuild only the segments it absorbs and the
+    /// commit refuses a result that mixes both domains. The
     /// `lance::index::optimize` module documents how that differs.
     pub max_rows_per_task: Option<u64>,
 
@@ -91,6 +97,9 @@ pub struct OptimizeOptions {
     /// merge count, or `max_rows_per_segment`. `max_rows_per_task` may bound the
     /// re-encoding tasks, but fragments are indivisible and must fit that bound.
     pub max_rows_to_consolidate: Option<u64>,
+    /// Consolidate these segments of one vector index instead of a bounded
+    /// suffix; set with [`Self::consolidate_selected`]. Default: unset.
+    pub segments_to_consolidate: Option<Vec<Uuid>>,
 }
 
 impl Default for OptimizeOptions {
@@ -105,6 +114,7 @@ impl Default for OptimizeOptions {
             max_rows_per_task: None,
             max_rows_per_segment: None,
             max_rows_to_consolidate: None,
+            segments_to_consolidate: None,
         }
     }
 }
@@ -137,6 +147,23 @@ impl OptimizeOptions {
     pub fn consolidate(max_rows: u64) -> Self {
         Self {
             max_rows_to_consolidate: Some(max_rows),
+            ..Default::default()
+        }
+    }
+
+    /// Consolidate the named segments of one vector index, wherever they sit.
+    ///
+    /// Their rows are re-encoded, dropping deleted ones. Segments that share
+    /// one model keep it; otherwise a new model is trained on the selected
+    /// rows, since encoding data under a model trained on other data loses
+    /// recall. Output is one segment, or segments of at most
+    /// [`Self::max_rows_per_segment`] live rows; a fragment larger than that is
+    /// an output of its own. The selection is not bounded by a row budget, and
+    /// segments the index no longer has are skipped.
+    pub fn consolidate_selected(index_name: impl Into<String>, segments: Vec<Uuid>) -> Self {
+        Self {
+            index_names: Some(vec![index_name.into()]),
+            segments_to_consolidate: Some(segments),
             ..Default::default()
         }
     }

@@ -1560,6 +1560,11 @@ async fn check_round_trip_random(
                 };
 
                 for num_ingest_batches in test_cases.ingest_batch_counts.iter().copied() {
+                    // A single slice covering the whole array at offset 0 is the
+                    // same array as the unsliced single batch.
+                    if use_slicing && num_ingest_batches == 1 {
+                        continue;
+                    }
                     let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                     let mut data = Vec::new();
 

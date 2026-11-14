@@ -47,13 +47,10 @@ jobs:
         working-directory: java/lance-jni
         run: cargo clippy --all-targets --locked -- -D warnings
 
-  build-and-test-java:
+  build-jni:
     runs-on: ubuntu-24.04-4x
     timeout-minutes: 60
-    strategy:
-      matrix:
-        java-version: [11, 17, 21, 25]
-    name: Build and Test with Java ${{ matrix.java-version }}
+    name: Build and Test lance-jni
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -69,6 +66,42 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           workspaces: java/lance-jni -> ../target/rust-maven-plugin/lance-jni
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: "maven"
+      # Runs the build-jni profile (cargo build + cargo test) but skips the Java
+      # tests, which run in the per-JDK jobs against the uploaded library.
+      - name: Build and test lance-jni
+        working-directory: java
+        run: mvn test -Dmaven.test.skip=true -Dspotless.skip=true
+      - name: Upload native library
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lance-jni-nativelib
+          path: java/target/classes/nativelib
+          if-no-files-found: error
+          retention-days: 1
+
+  build-and-test-java:
+    needs: build-jni
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        java-version: [11, 17, 21, 25]
+    name: Build and Test with Java ${{ matrix.java-version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # JarJniLoader loads the library from /nativelib/<platform> on the classpath.
+      - name: Download native library
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lance-jni-nativelib
+          path: java/target/classes/nativelib
       - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
@@ -96,4 +129,4 @@ jobs:
           # spotless is also bound into the build lifecycle, so on Java 25 the
           # format gate must be skipped here too (-Dspotless.skip=true), not just
           # in the standalone step above.
-          mvn install ${{ matrix.java-version == '25' && '-Dspotless.skip=true' || '' }}
+          mvn install -Dskip.build.jni=true ${{ matrix.java-version == '25' && '-Dspotless.skip=true' || '' }}

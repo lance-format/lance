@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -198,6 +198,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let source_budget_mode = env
+        .call_method(
+            &java_options,
+            "getSourceBudgetMode",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -217,6 +225,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_bytes,
         &excluded_fragment_ids,
         &data_storage_version,
+        Some(&source_budget_mode),
         config,
     )
 }
@@ -337,8 +346,7 @@ fn inner_explain_cleanup_with_policy<'local>(
         .transpose()?;
 
     let explanation = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let dataset = clone_dataset(env, &jdataset)?;
         let mut operation = dataset.inner.cleanup(policy);
         if let Some(value) = retention_policy {
             operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
@@ -396,11 +404,7 @@ fn inner_explain_expire_versions<'local>(
 ) -> Result<JObject<'local>> {
     let policy = extract_expire_versions_policy(env, &jpolicy)?;
 
-    let plan = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_expire_versions(policy)
-    }?;
+    let plan = clone_dataset(env, &jdataset)?.explain_expire_versions(policy)?;
 
     expire_versions_plan_to_java(env, plan)
 }
