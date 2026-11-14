@@ -138,7 +138,7 @@ fn fixed_case(scheme: CompressionScheme, rle: bool, displacement: usize, range: 
     assert_eq!(block.num_values, range.end - range.start);
     assert_eq!(
         block.data.as_ref(),
-        bytemuck::cast_slice(&values[range.start as usize..range.end as usize])
+        bytemuck::cast_slice::<u32, u8>(&values[range.start as usize..range.end as usize])
     );
     assert_eq!(work.len(), scratch);
     let last = block.data.clone();
@@ -284,7 +284,7 @@ fn prepared_finite_consumers_progress_after_final_output_drop() {
         .unwrap();
     assert_eq!(
         third.as_fixed_width_ref().unwrap().data.as_ref(),
-        bytemuck::cast_slice(&[10_u32, 20])
+        bytemuck::cast_slice::<u32, u8>(&[10_u32, 20])
     );
     drop((second, third, work, buffers, sibling));
     assert_eq!(pool.reserved(), 0);
@@ -592,7 +592,7 @@ fn prepared_real_writer_and_factory_preserve_range_decode() {
             .unwrap();
         assert_eq!(
             result.as_fixed_width_ref().unwrap().data.as_ref(),
-            bytemuck::cast_slice(&expected[first_row + 3..first_row + rows - 2])
+            bytemuck::cast_slice::<u32, u8>(&expected[first_row + 3..first_row + rows - 2])
         );
         assert_eq!(work.len(), rows * 4);
         drop((result, work, buffers, sibling));
