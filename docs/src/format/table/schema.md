@@ -328,6 +328,39 @@ optimizations such as storage-partitioned joins.
 Column encoding configurations are specified with the `lance-encoding:` prefix.
 See [File Format Encoding Specification](../file/encoding.md) for complete details on available encodings.
 
+### Zone Write Seed Collection Metadata
+
+The field metadata key `lance.zone_write_seeds.rows_per_zone` opts a top-level
+field into collecting [version 1 zone write seeds](../index/scalar/zone_write_seeds.md)
+whenever its values are written to a V2.0, V2.1, V2.2, or V2.3 data file. Its value is a
+base-10 ASCII digit sequence representing an integer in the range 1 through
+18446744073709551615, giving the
+maximum number of physical rows summarized by each newly collected seed record.
+The final record of a file may be shorter. Absence disables this additional
+collection. Zero, signs, whitespace, and non-integer values are invalid.
+
+The policy is attached to the field's identity and follows renames. It applies
+to integers, floating-point values, Boolean values, decimals, dates, times, timestamps, durations,
+strings, and binary values, excluding blob fields. Nested, dictionary, Null,
+and fixed-size binary types are not supported by this policy. Legacy V1 data
+files cannot carry seeds. Existing files are not scanned or backfilled when
+the policy changes, and removing it does not remove seeds already written.
+
+Enabling the policy atomically sets `FLAG_ZONE_WRITE_SEEDS` in both manifest
+feature words in that same metadata commit, before any subsequent data write
+collects seeds. Both bits remain set after the policy is removed. Writers use
+their schema snapshot's policy; a concurrent policy change does not change an
+already-open writer's snapshot.
+
+Collection does not require or create an index, and seeds alone do not establish
+index coverage. Existing ZoneMap index requests and this policy share one seed
+per column: collection uses the smallest requested row count and includes null
+positions if any consumer requires them. A different index seed format on the
+same column conflicts with this policy and must not replace or duplicate its
+seed locator. Binary-copy compaction may carry complete existing records
+without recomputing or repartitioning them, as defined by the seed format;
+missing input seeds do not trigger a backfill scan.
+
 ### Arrow Extension Type Metadata
 
 Custom Arrow extension types may have metadata under the `ARROW:extension:` namespace
