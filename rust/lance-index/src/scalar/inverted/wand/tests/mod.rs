@@ -36,11 +36,11 @@ use super::bounds::{
     next_up_f32, score_contributions_in_query_order,
 };
 use super::collector::TopKCollector;
-use super::doc_source::{AllModernDocuments, ModernVisibility};
 use super::maxscore::{MAXSCORE_INNER_WINDOW, MaxScoreClause, MaxScoreSoaScratch};
 use super::phrase::counted_anchor_steps;
 use super::posting::{find_next_geq, find_next_geq_in_block, take_position_cursor_calls};
 use super::*;
+use super::{AllModernDocuments, ModernVisibility};
 
 mod bounds;
 mod bulk_conjunction;

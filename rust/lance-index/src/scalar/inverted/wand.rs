@@ -40,6 +40,11 @@ pub(super) use bounds::{
 };
 pub(super) use cursor::WandCursor;
 pub use doc_source::DocCandidate;
+// The pre-split `wand::` paths for these two stay valid (issue #10060) even
+// though only `doc_source` itself and the tests name them, so a plain lib build
+// sees no use for the restricted re-export.
+#[allow(unused_imports)]
+pub(super) use doc_source::{AllModernDocuments, ModernVisibility};
 pub(super) use doc_source::{
     FlatDocuments, LegacyWandDocuments, ModernWandDocuments, WandDocuments,
 };
