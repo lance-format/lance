@@ -38,6 +38,7 @@ use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
+mod admitted;
 mod structure;
 
 use super::chunk_index::{
@@ -936,6 +937,13 @@ impl DecodeMiniBlockTask {
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
+    fn try_decode_in(
+        &self,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DecodedPage>> {
+        admitted::decode(self, workspace)
+    }
+
     fn decode(mut self: Box<Self>) -> Result<DecodedPage> {
         #[cfg(feature = "bitpacking")]
         if self.rep_decompressor.is_none()

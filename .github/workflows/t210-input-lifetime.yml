@@ -21,12 +21,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Reuse the completed Flat/bitpacked and optional ALP evidence. Exercise
-      # the new RLE framing, ownership and structural composition at this head.
-      - name: Validate admitted RLE structural levels
-        run: cargo test --profile ci --locked -p lance-encoding --lib admitted_rle -- --nocapture
-      - name: Validate RLE without optional codecs
-        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --test optional_bitpacking rle_level_admission_requires_no_optional_codec
+      # Reuse the completed codec suites. Exercise their new composition through
+      # real MiniBlock tasks, including late refusal and retained consumers.
+      - name: Validate admitted MiniBlock tasks
+        run: cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests -- --nocapture
+      - name: Check task admission without optional codecs
+        run: cargo check --profile ci --locked -p lance-encoding --no-default-features --lib
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

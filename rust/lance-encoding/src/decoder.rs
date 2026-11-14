@@ -3629,6 +3629,10 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
     /// The default rejects unsupported tasks;
     /// it does not call the unaccounted decoder. Later typed/rep-def/builder stages
     /// require their own admission; this opt-in API does not alter normal scans.
+    /// Single-instruction MiniBlock tasks may decode charged structural scratch
+    /// to map rows to values before discovering insufficient value credit. They
+    /// recycle that scratch and selected levels on refusal, preserving this
+    /// reservation. Multi-instruction concatenation is not yet supported there.
     fn try_decode_in(
         &self,
         _workspace: &mut lance_core::utils::allocation::Reservation,
