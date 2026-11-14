@@ -146,7 +146,7 @@ impl LayerPlan {
 // scanned without temporary offset/index arrays. This metadata is not charged.
 struct OffsetPlan {
     layers: Vec<LayerPlan>,
-    comparisons: Vec<OffsetPlan>,
+    comparisons: Vec<Self>,
     lists: usize,
     children: usize,
     has_bitmap: bool,
