@@ -79,7 +79,9 @@ use crate::{
     statistics::{GetStat, Stat},
 };
 
-use arrow_array::{cast::AsArray, types::UInt64Type};
+#[cfg(feature = "bitpacking")]
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::utils::allocation::Reservation;
@@ -292,6 +294,8 @@ fn rle_beats_raw_and_bitpacking(
         return false;
     }
 
+    #[cfg(not(feature = "bitpacking"))]
+    let _ = data;
     #[cfg(feature = "bitpacking")]
     {
         if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data).map(u128::from)

@@ -7,9 +7,13 @@ use arrow_buffer::Buffer;
 use lance_core::{Error, utils::allocation::AllocationBudget};
 use lance_encoding::{
     buffer::LanceBuffer,
-    compression::{DecompressionStrategy, DefaultDecompressionStrategy, try_bitpacking_block},
+    compression::{
+        DecompressionStrategy, DefaultDecompressionStrategy, MiniBlockDecompressor,
+        try_bitpacking_block,
+    },
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
-    format::{EncodingUtils, metadata::CompressiveEncoding},
+    encodings::physical::alp::AlpMiniBlockDecompressor,
+    format::{EncodingUtils, metadata},
 };
 use rstest::rstest;
 
@@ -28,7 +32,9 @@ fn disabled_bitpacking_is_not_selected() {
 #[rstest]
 #[case::inline(EncodingUtils::inline_bitpacking(16, None))]
 #[case::out_of_line(EncodingUtils::out_of_line_bitpacking(16, EncodingUtils::flat(1, None)))]
-fn disabled_bitpacking_decoder_reports_unsupported(#[case] encoding: CompressiveEncoding) {
+fn disabled_bitpacking_decoder_reports_unsupported(
+    #[case] encoding: metadata::CompressiveEncoding,
+) {
     let error = DefaultDecompressionStrategy::default()
         .create_block_decompressor(&encoding)
         .unwrap_err();
@@ -37,6 +43,34 @@ fn disabled_bitpacking_decoder_reports_unsupported(#[case] encoding: Compressive
         error
             .to_string()
             .contains("not built with bitpacking support")
+    );
+}
+
+#[rstest]
+fn disabled_alp_preserves_empty_and_buffer_validation(#[values(32, 64)] bits: u32) {
+    let codec = AlpMiniBlockDecompressor::from_description(&metadata::Alp {
+        bits_per_value: bits,
+    })
+    .unwrap();
+    let empty = codec.decompress(vec![], 0).unwrap();
+    let empty = empty.as_fixed_width().unwrap();
+    assert_eq!(empty.num_values, 0);
+    assert_eq!(empty.bits_per_value, u64::from(bits));
+
+    let error = codec
+        .decompress(vec![LanceBuffer::empty(); 3], 1)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("expects 4 buffers, got 3"));
+
+    let error = codec
+        .decompress(vec![LanceBuffer::empty(); 4], 1)
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("ALP requires bitpacking support")
     );
 }
 
