@@ -437,7 +437,7 @@ fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
 
     for addr in row_addrs.iter().skip(1) {
         sorted &= *addr >= last_offset;
-        contiguous &= *addr == last_offset + 1;
+        contiguous &= last_offset.checked_add(1) == Some(*addr);
         // Contiguous also requires the fragment ids are all the same
         contiguous &= (*addr >> 32) == first_fragment_id;
         last_offset = *addr;
@@ -645,6 +645,40 @@ mod test {
     };
 
     use super::*;
+
+    #[rstest]
+    #[case::single(&[6])]
+    #[case::repeated(&[6, 6])]
+    #[case::sorted(&[0, 6])]
+    #[case::unsorted(&[6, 0])]
+    #[tokio::test]
+    async fn test_take_out_of_bound(
+        #[case] indices: &[u64],
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let data = test_batch(0..6);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let error = dataset
+            .take(indices, dataset.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("fragment"), "{error}");
+        assert!(error.to_string().contains("4294967295"), "{error}");
+    }
 
     #[rstest]
     #[case::empty(vec![])]
@@ -1694,6 +1728,15 @@ mod test {
             "{}",
             err.to_string()
         );
+
+        // Repeated maximum offsets must reach bounds validation without overflowing.
+        let err = ds
+            .take_rows(&[u32::MAX as u64; 2], ds.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("Invalid read params"), "{err}");
+        assert!(err.to_string().contains("4294967295"), "{err}");
     }
 
     #[rstest]
