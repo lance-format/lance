@@ -573,6 +573,10 @@ opaque compression technique which would limit its usability (e.g. in a full zip
 it before any structural encoding takes place. This allows us to place the dictionary in the search cache for
 random access.
 
+It also lets a reader give the dictionary to the query engine as a hint before decoding the page, so the engine can
+skip pages where the dictionary does not contain values it is filtering for.
+See [Functional Decomposition](index.md#functional-decomposition) for how the responsibilities are split.
+
 ### Struct Packing
 
 Struct packing is an alternative representation to apply to struct values. Instead of storing that struct in a

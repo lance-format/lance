@@ -731,6 +731,46 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
+    /// Returns the sorted row ranges of the pages overlapping `ranges` that may contain a value
+    /// matching `predicate`.
+    ///
+    /// Only dictionary, constant and all-null pages can be skipped. Returns `None` if none of
+    /// the overlapping pages can be checked, or if the column is nested, dictionary-typed or
+    /// from a pre-2.1 file. Page metadata is loaded through `cache` and reused by later reads.
+    pub async fn rows_that_may_match(
+        &self,
+        field: &Field,
+        column_info: Arc<ColumnInfo>,
+        ranges: &[Range<u64>],
+        predicate: &dyn ValuePredicate,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let data_type = field.data_type();
+        // Dictionary types are not currently supported: page values have the value type, not the
+        // dictionary type.
+        if data_type.is_nested()
+            || matches!(data_type, DataType::Dictionary(..))
+            || !column_info.is_structural()
+        {
+            return Ok(None);
+        }
+        let mut scheduler = StructuralPrimitiveFieldScheduler::try_new_lazy(
+            column_info,
+            self.decompressor_strategy.clone(),
+            self.cache_repetition_index,
+            field,
+        )?;
+        scheduler
+            .rows_that_may_match(
+                ranges,
+                &data_type,
+                predicate,
+                &SchedulerContext::new(io, cache),
+            )
+            .await
+    }
+
     /// This is just a sanity check to ensure there is no "wrapped encodings"
     /// that haven't been handled.
     fn ensure_values_encoded(column_info: &ColumnInfo, field_name: &str) -> Result<()> {
@@ -3500,6 +3540,19 @@ impl FilterExpression {
     pub fn is_noop(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// Lets the caller skip pages that can't contain matching rows.
+///
+/// For some pages the decoder knows every value without decoding the rows, e.g. from the page's
+/// dictionary. It passes those values to [`Self::any_may_match`] and leaves the page out of the
+/// returned rows if that returns `false`.
+///
+/// See [`CoreFieldDecoderStrategy::rows_that_may_match`].
+pub trait ValuePredicate: Send + Sync {
+    /// Returns whether any of `values` may match. `values` can be a null array, to check pages
+    /// containing nulls, and can contain entries that no row references.
+    fn any_may_match(&self, values: &ArrayRef) -> bool;
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {

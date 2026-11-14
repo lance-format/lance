@@ -8,7 +8,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::vec;
 
+use arrow_array::new_empty_array;
 use arrow_buffer::ScalarBuffer;
+use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -28,7 +30,7 @@ use crate::repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level
 
 use super::{
     CachedPageData, NoCachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
-    StructuralPageScheduler,
+    PageValues, StructuralPageScheduler,
 };
 
 /// How a complex-all-null page's rep/def level buffer is compressed on disk.
@@ -1117,6 +1119,13 @@ impl StructuralPageScheduler for SimpleAllNullScheduler {
             num_rows,
         };
         Ok(vec![page_load_task])
+    }
+
+    fn known_values(&self, data_type: &DataType) -> Result<PageValues> {
+        Ok(PageValues::AnyOf {
+            values: new_empty_array(data_type),
+            may_have_nulls: true,
+        })
     }
 }
 
