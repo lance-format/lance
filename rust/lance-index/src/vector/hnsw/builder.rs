@@ -1716,9 +1716,10 @@ impl IvfSubIndex for HNSW {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
-            return Err(Error::index(
-                "ef must be greater than or equal to k".to_string(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "ef must be greater than or equal to k: ef={}, k={k}",
+                params.ef
+            )));
         }
 
         let schema = VECTOR_RESULT_SCHEMA.clone();
@@ -1932,7 +1933,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Float32Type;
+    use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
     };
@@ -2139,6 +2140,56 @@ mod tests {
             .collect();
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         all.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn search_rejects_ef_below_k_as_input_error() {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..16).map(|value| value as f32).collect::<Vec<_>>()),
+            2,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let index = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(4).ef_construction(8),
+        )
+        .unwrap();
+        let query = vectors.value(0);
+        let search = |ef| {
+            index.search(
+                query.clone(),
+                8,
+                HnswQueryParams {
+                    ef,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                &store,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+            )
+        };
+
+        let error = search(1).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("ef=1, k=8"),
+            "unexpected error: {error}"
+        );
+
+        let result = search(8).unwrap();
+        let rows = result
+            .column_by_name(lance_core::ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let expected = brute_force_topk(&store, query, 8)
+            .into_iter()
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.values().as_ref(), expected.as_slice());
     }
 
     #[rstest]

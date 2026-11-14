@@ -811,8 +811,8 @@ mod tests {
             index.index_details = None;
             index.index_version = 0;
         }
-        index.covering_fields = index.fields.clone();
-        index.covering_fields.push(999);
+        index.covering_fields = vec![999, 999];
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
@@ -836,7 +836,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("are not among its fields"),
+            error.to_string().contains("more than once"),
             "malformed covering must fail closed via the validator, not be \
              withdrawn as an ordinary covered index; got: {error}"
         );

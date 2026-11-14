@@ -3,6 +3,9 @@
 
 use super::support::*;
 use super::*;
+use crate::session::index_caches::{
+    DerivedIndexListingKey, IndexMetadataKey, QueryIndexListing, QueryIndexListingKey,
+};
 
 #[rstest]
 #[case::v1("v3.0.1/fts_v1", INVERTED_INDEX_VERSION_V1)]
@@ -267,8 +270,15 @@ async fn test_load_indices_singleflights_concurrent_cache_misses() {
     assert!(results.iter().all(|result| result.is_ok()));
     let after = session.index_cache_stats().await;
 
-    assert_eq!(after.misses - before.misses, 1);
+    // One raw manifest listing and one query-visible listing are populated.
+    assert_eq!(after.misses - before.misses, 2);
     assert_eq!(after.hits - before.hits, 31);
+    let first = results[0].as_ref().unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|result| Arc::ptr_eq(first, result.as_ref().unwrap()))
+    );
 }
 
 #[tokio::test]
@@ -382,6 +392,7 @@ async fn test_legacy_vector_index_details_inferred_on_load_and_migration() {
     }
     // Write back via a no-op commit that carries the cleared indices.
     // We commit by doing a delete("false") after replacing the cached indices.
+    dataset.index_cache.clear().await;
     let metadata_key = crate::session::index_caches::IndexMetadataKey {
         version: dataset.version().version,
         store_identity: &dataset.object_store.store_prefix,
@@ -599,5 +610,208 @@ async fn test_a_pre_rotation_cache_entry_is_not_consulted() {
         manifest_index_names(&dataset).await,
         ["id_idx", READABLE_INDEX],
         "a commit read a cache entry written under the key's previous meaning"
+    );
+}
+
+#[tokio::test]
+async fn test_query_listing_changes_after_index_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = gen_batch()
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(2));
+    let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let before = dataset.load_indices().await.unwrap();
+    assert_eq!(before.len(), 1);
+    let indexed_version = dataset.version().version;
+    dataset.drop_index("value_idx").await.unwrap();
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    assert_eq!(before.len(), 1, "the previous snapshot remains immutable");
+    let historical = dataset.checkout_version(indexed_version).await.unwrap();
+    let historical_indices = historical.load_indices().await.unwrap();
+    assert_eq!(historical_indices.len(), 1);
+    assert_eq!(historical_indices[0].uuid, before[0].uuid);
+}
+
+#[tokio::test]
+async fn test_query_listing_retries_failed_legacy_inference() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = gen_batch()
+        .col("vec", array::rand_vec::<Float32Type>(16.into()))
+        .into_reader_rows(RowCount::from(512), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    let params = VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        IvfBuildParams::new(2),
+    );
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, false)
+        .await
+        .unwrap();
+    let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+    indices[0].index_details = Some(Arc::new(vector_index_details_default()));
+    let index_file = directory
+        .path()
+        .join("_indices")
+        .join(indices[0].uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let hidden_file = index_file.with_extension("hidden");
+    std::fs::rename(&index_file, &hidden_file).unwrap();
+    dataset.index_cache.clear().await;
+    let raw_key = IndexMetadataKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    };
+    dataset
+        .index_cache
+        .insert_with_key(&raw_key, Arc::new(indices))
+        .await;
+
+    let incomplete = dataset.load_indices().await.unwrap();
+    assert!(
+        incomplete[0]
+            .index_details
+            .as_ref()
+            .unwrap()
+            .value
+            .is_empty()
+    );
+    std::fs::rename(&hidden_file, &index_file).unwrap();
+    let recovered = dataset.load_indices().await.unwrap();
+    assert!(
+        !recovered[0]
+            .index_details
+            .as_ref()
+            .unwrap()
+            .value
+            .is_empty()
+    );
+    assert!(Arc::ptr_eq(
+        &recovered,
+        &dataset.load_indices().await.unwrap()
+    ));
+}
+
+/// An e-tag is the only generation token in the query-listing key. Without one
+/// a dataset dropped and recreated at the same URI would alias the previous
+/// incarnation's version, so the derived listing must not be published into
+/// the dataset-level cache this PR adds.
+#[tokio::test]
+async fn test_query_listing_is_not_cached_without_a_generation_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = gen_batch()
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(2));
+    let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.manifest_location.e_tag = None;
+
+    let first = dataset.load_indices().await.unwrap();
+    let second = dataset.load_indices().await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].name, "value_idx");
+    assert_eq!(first[0].uuid, second[0].uuid);
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: None,
+    });
+    assert!(
+        dataset.index_cache.get_with_key(&query_key).await.is_none(),
+        "an untagged snapshot must not publish a query listing"
+    );
+    assert_eq!(
+        dataset.load_indices().await.unwrap()[0].uuid,
+        first[0].uuid,
+        "repeated untagged loads must stay correct"
+    );
+}
+
+/// A version-only key can collide with a listing cached for a previous
+/// incarnation at this URI. Seeding exactly that entry proves `load_indices`
+/// neither serves it nor replaces it with the current snapshot's listing.
+#[tokio::test]
+async fn test_query_listing_ignores_stale_entry_without_a_generation_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = gen_batch()
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(2));
+    let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let expected_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    dataset.manifest_location.e_tag = None;
+    // Warm the raw metadata layer so the entry count below isolates the query
+    // listing: that lower cache is keyed independently and is not this test's
+    // subject.
+    crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: None,
+    });
+    dataset
+        .index_cache
+        .insert_with_key(
+            &query_key,
+            Arc::new(QueryIndexListing {
+                indices: Arc::new(Vec::new()),
+                retry_derivation: false,
+            }),
+        )
+        .await;
+    let entries_before = dataset.index_cache_entry_count().await;
+
+    let listing = dataset.load_indices().await.unwrap();
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].uuid, expected_uuid);
+    assert_eq!(
+        dataset.index_cache_entry_count().await,
+        entries_before,
+        "the bypass must not publish a query listing"
+    );
+    let stored = dataset.index_cache.get_with_key(&query_key).await.unwrap();
+    assert!(
+        stored.indices.is_empty(),
+        "the bypass must not replace the seeded entry"
     );
 }
