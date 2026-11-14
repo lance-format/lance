@@ -1149,7 +1149,7 @@ impl Scanner {
     /// Planned as a [`FilteredReadExec`] row-stream read; legacy (v1) storage
     /// keeps using [`TakeExec`].
     #[allow(deprecated)]
-    pub(super) fn take(
+    pub(in crate::dataset) fn take(
         &self,
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,

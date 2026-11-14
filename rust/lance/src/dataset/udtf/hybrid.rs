@@ -32,7 +32,6 @@ use serde_json::Number;
 
 use crate::Dataset;
 use crate::dataset::blob::public_blob_v2_binary_output_schema;
-use crate::io::exec::take::TakeExec;
 
 const RELEVANCE: &str = "_relevance_score";
 const RANK: &str = "__hybrid_rank";
@@ -124,9 +123,22 @@ impl VectorQuery {
             .collect::<Result<Vec<_>>>()?;
         match element.data_type() {
             DataType::Float64 => Ok(Arc::new(Float64Array::from(values))),
-            DataType::Float32 if values.iter().all(|v| (*v as f32).is_finite()) => Ok(Arc::new(
-                Float32Array::from(values.into_iter().map(|v| v as f32).collect::<Vec<_>>()),
-            )),
+            DataType::Float32 => {
+                let values = values
+                    .into_iter()
+                    .map(|value| {
+                        let rounded = value as f32;
+                        if rounded.is_finite() && (value == 0.0 || rounded != 0.0) {
+                            Ok(rounded)
+                        } else {
+                            Err(DataFusionError::Plan(format!(
+                                "hybrid vector value {value} is not representable as Float32"
+                            )))
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(Float32Array::from(values)))
+            }
             DataType::Float16 => {
                 let values = values
                     .into_iter()
@@ -156,6 +168,8 @@ impl VectorQuery {
 /// SQL arguments are `(table_name, vector_json, fts_json, options_json)`.
 /// The vector object contains `column` and a single numeric array `q`.
 /// Values must be finite and representable in the vector column's element type.
+/// Float16 and Float32 values may round to the nearest representable value;
+/// overflow and nonzero values that underflow to zero are rejected.
 /// The FTS object uses the existing full-text query syntax. Options require positive
 /// `vector_candidates`, `fts_candidates` and `limit`; `rrf_k` defaults to 60.
 /// Each row's Float64 `_relevance_score` is the sum of `1 / (rrf_k + rank)`
@@ -171,6 +185,8 @@ impl VectorQuery {
 /// nested fields. Outer SQL WHERE and LIMIT apply after the intrinsic
 /// top-k, and may return fewer rows. Use ORDER BY for presentation order.
 /// `with_row_id` defaults to false. Branch distance and FTS scores are hidden.
+/// Payload and filter fields follow Scanner's default projection, including
+/// descriptors for Blob columns; ordinary binary columns retain their type.
 /// List-element full-text queries and multivectors are unsupported. Top-level
 /// `_relevance_score`, `_score` and `_distance` business columns are unsupported
 /// (the last two names are checked without regard to ASCII case).
@@ -179,6 +195,10 @@ impl VectorQuery {
 /// uses DataFusion operators and the caller's runtime; only final winners need
 /// output payload reads. Candidate budgets bound fusion state, not search-index
 /// memory or the amount of data examined by a flat search.
+/// Final payload reads use Scanner's version-dispatched reader and inherit the
+/// dataset's read options. Output byte targets split batches after decode and
+/// allow an oversized single row; they are not a peak-memory limit. Cancellation
+/// drops modern row-batch tasks, while submitted I/O or blocking CPU work may drain.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -265,7 +285,8 @@ impl TableFunctionImpl for HybridQueryUDTF {
         let options: Options = serde_json::from_str(strings[3])
             .map_err(|e| DataFusionError::Plan(format!("invalid hybrid options JSON: {e}")))?;
         options.validate()?;
-        let mut schema = Schema::from(&public_blob_v2_binary_output_schema(dataset.schema()));
+        let projected = Projection::full(dataset.clone()).to_schema();
+        let mut schema = Schema::from(&public_blob_v2_binary_output_schema(&projected));
         for field in schema.fields() {
             let name = field.name();
             if name == RELEVANCE
@@ -428,9 +449,7 @@ impl TableProvider for HybridTableProvider {
                     payload.union_column(format_field_path_minimal(&[name]), OnMissing::Error)?;
             }
         }
-        if let Some(take) = TakeExec::try_new(self.dataset.clone(), plan.clone(), payload)? {
-            plan = Arc::new(take);
-        }
+        plan = self.dataset.scan().take(plan, payload)?;
         let expressions = indices
             .iter()
             .map(|&index| {
@@ -776,6 +795,21 @@ mod tests {
                 .values(),
             &[0, 255]
         );
+    }
+
+    #[test]
+    fn rounds_single_precision_without_losing_nonzero_values() {
+        let query: VectorQuery =
+            serde_json::from_str(r#"{"column":"v","q":[1.00000006,1e-45]}"#).unwrap();
+        let values = query.array(&vector_schema(DataType::Float32)).unwrap();
+        let values = values.as_primitive::<arrow_array::types::Float32Type>();
+        assert_eq!(values.value(0).to_bits(), 1.0_f32.to_bits() + 1);
+        assert_eq!(values.value(1).to_bits(), 1);
+        let query: VectorQuery = serde_json::from_str(r#"{"column":"v","q":[0,-0.0]}"#).unwrap();
+        let values = query.array(&vector_schema(DataType::Float32)).unwrap();
+        let values = values.as_primitive::<arrow_array::types::Float32Type>();
+        assert_eq!(values.value(0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(values.value(1).to_bits(), (-0.0_f32).to_bits());
     }
 
     #[test]

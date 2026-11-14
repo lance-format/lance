@@ -4,9 +4,10 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int32Type, Int64Type, UInt64Type};
+use arrow_array::types::{Float64Type, Int32Type, Int64Type, UInt8Type, UInt64Type};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, record_batch,
+    Array, FixedSizeListArray, Float32Array, LargeBinaryArray, RecordBatch, RecordBatchIterator,
+    StructArray, record_batch,
 };
 use arrow_schema::{DataType, Field};
 use datafusion::common::DataFusionError;
@@ -14,18 +15,26 @@ use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_expr::{Volatility, create_udf};
-use datafusion_physical_plan::{collect, displayable};
-use lance::Dataset;
+use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
 use lance::dataset::WriteParams;
 use lance::dataset::udtf::HybridQueryUDTFBuilder;
-use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use lance::io::exec::filtered_read::FilteredReadExec;
+use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, SharedFtsScorerExec};
+use lance::{BlobArrayBuilder, Dataset, blob_field};
+use lance_core::datatypes::BLOB_V2_DESC_TYPE;
+use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::tokenizer::DocumentGranularity;
 use lance_linalg::distance::MetricType;
 use rstest::rstest;
 use serde_json::{Value, json};
+
+#[path = "hybrid_udtf/payload.rs"]
+mod payload;
 
 fn batch() -> RecordBatch {
     let batch = record_batch!(
@@ -75,7 +84,7 @@ async fn dataset(stable: bool, indexed: bool) -> Dataset {
             .create_index(
                 &["text"],
                 IndexType::Inverted,
-                None,
+                Some("hybrid_fts".to_string()),
                 &InvertedIndexParams::default(),
                 true,
             )
@@ -126,6 +135,84 @@ async fn query(ctx: &SessionContext, sql: &str) -> RecordBatch {
     arrow_select::concat::concat_batches(&Arc::new(schema), &batches).unwrap()
 }
 
+async fn collect_indexed(
+    ctx: &SessionContext,
+    plan: Arc<dyn ExecutionPlan>,
+    dataset: &Dataset,
+    unindexed: usize,
+) -> Vec<RecordBatch> {
+    let indices = dataset.load_indices_by_name("hybrid_fts").await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(
+        indices[0].fields,
+        vec![dataset.schema().field("text").unwrap().id]
+    );
+    let residual = dataset.unindexed_fragments("hybrid_fts").await.unwrap();
+    assert_eq!(residual.len(), unindexed);
+    let mut pending = vec![plan.clone()];
+    let mut indexed = Vec::new();
+    let mut corpus = Vec::new();
+    let mut flat = 0;
+    while let Some(node) = pending.pop() {
+        if node.is::<SharedFtsScorerExec>() {
+            corpus.push(node.clone());
+        }
+        if let Some(search) = node.downcast_ref::<MatchQueryExec>() {
+            assert_eq!(search.query().column.as_deref(), Some("text"));
+            assert_eq!(
+                search.dataset().version().version,
+                dataset.version().version
+            );
+            if let Some(selected) = search.explicit_segment_uuids() {
+                assert_eq!(selected, vec![indices[0].uuid]);
+            }
+            indexed.push(node.clone());
+        }
+        if let Some(search) = node.downcast_ref::<FlatMatchQueryExec>() {
+            flat += 1;
+            let children = search.children();
+            let reader = children[0].downcast_ref::<FilteredReadExec>().unwrap();
+            let actual = reader.options().fragments.as_ref().unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|fragment| fragment.id)
+                    .collect::<Vec<_>>(),
+                residual
+                    .iter()
+                    .map(|fragment| fragment.id)
+                    .collect::<Vec<_>>()
+            );
+        }
+        pending.extend(node.children().into_iter().cloned());
+    }
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    assert_eq!(indexed.len(), 1, "{shown}");
+    assert_eq!(flat, usize::from(unindexed > 0), "{shown}");
+    let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+    // MatchCorpus rebuilds its template leaves with a shared scorer at execute
+    // time and owns their final metrics. ANN metrics cannot satisfy this check.
+    assert!(corpus.len() <= 1, "{shown}");
+    let expected_counters = if corpus.is_empty() { 1 } else { 2 };
+    for node in if corpus.is_empty() { indexed } else { corpus } {
+        let searched = node
+            .metrics()
+            .unwrap()
+            .iter()
+            .filter(|metric| metric.value().name() == PARTITIONS_SEARCHED_METRIC)
+            .map(|metric| metric.value().as_usize())
+            .collect::<Vec<_>>();
+        // The residual leaf also reads partitions for corpus statistics. Both
+        // distinct counters must be present to prove indexed search executed.
+        assert_eq!(searched.len(), expected_counters, "{searched:?}: {shown}");
+        assert!(
+            searched.iter().all(|count| *count > 0),
+            "FTS index node did not search a segment: {shown}"
+        );
+    }
+    batches
+}
+
 #[rstest]
 #[case::flat_addresses(false, false, 1, 1024)]
 #[case::flat_stable(true, false, 4, 1)]
@@ -138,16 +225,26 @@ async fn hybrid_union_rrf(
     #[case] partitions: usize,
     #[case] batch_size: usize,
 ) {
-    let ctx = context(
-        Arc::new(dataset(stable, indexed).await),
-        partitions,
-        batch_size,
-    );
+    let data = Arc::new(dataset(stable, indexed).await);
+    let ctx = context(data.clone(), partitions, batch_size);
     let sql = format!(
         "SELECT id, _relevance_score, _rowid FROM {} ORDER BY _relevance_score DESC, _rowid",
         relation(json!({}))
     );
-    let result = query(&ctx, &sql).await;
+    let result = if indexed {
+        let plan = ctx
+            .sql(&sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let schema = plan.schema();
+        let batches = collect_indexed(&ctx, plan, &data, 0).await;
+        arrow_select::concat::concat_batches(&schema, &batches).unwrap()
+    } else {
+        query(&ctx, &sql).await
+    };
     assert_eq!(
         result["id"].as_primitive::<Int32Type>().values(),
         &[1, 0, 2]
@@ -175,9 +272,28 @@ async fn hybrid_union_rrf(
     assert_eq!(result, query(&ctx, &sql).await);
 }
 
+fn final_payload_readers(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
+    let mut pending = vec![plan.clone()];
+    let mut found = Vec::new();
+    while let Some(node) = pending.pop() {
+        if let Some(reader) = node.downcast_ref::<FilteredReadExec>()
+            && let Some(input) = reader.row_stream_input()
+            && input.schema().index_of("_relevance_score").is_ok()
+            && input.schema().index_of("_rowid").is_ok()
+        {
+            found.push(node.clone());
+        }
+        pending.extend(node.children().into_iter().cloned());
+    }
+    found
+}
+
+#[rstest]
+#[case::stable(true)]
+#[case::addresses(false)]
 #[tokio::test]
-async fn hybrid_outer_operations_and_late_take() {
-    let ctx = context(Arc::new(dataset(true, false).await), 4, 1);
+async fn hybrid_outer_operations_and_late_materialization(#[case] stable: bool) {
+    let ctx = context(Arc::new(dataset(stable, false).await), 4, 1);
     let table = relation(json!({"limit":2}));
     let full = query(
         &ctx,
@@ -228,11 +344,16 @@ async fn hybrid_outer_operations_and_late_take() {
         .create_physical_plan()
         .await
         .unwrap();
-    let payload_display = displayable(payload_plan.as_ref()).indent(true).to_string();
-    assert!(
-        payload_display.contains("Take:") && payload_display.contains("(id)"),
-        "{payload_display}"
-    );
+    let readers = final_payload_readers(&payload_plan);
+    assert_eq!(readers.len(), 1);
+    let reader = readers[0].downcast_ref::<FilteredReadExec>().unwrap();
+    let input = reader.row_stream_input().unwrap();
+    assert!(input.schema().index_of("id").is_err());
+    assert!(reader.schema().index_of("id").is_ok());
+    let shown = displayable(input.as_ref()).indent(true).to_string();
+    assert!(shown.contains("fetch=2"), "{shown}");
+    let winners = collect(input.clone(), ctx.task_ctx()).await.unwrap();
+    assert_eq!(winners.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
     for projection in ["_relevance_score", "_rowid", "count(*)"] {
         let plan = ctx
             .sql(&format!("SELECT {projection} FROM {table}"))
@@ -243,7 +364,7 @@ async fn hybrid_outer_operations_and_late_take() {
             .unwrap();
         let display = displayable(plan.as_ref()).indent(true).to_string();
         assert!(display.contains("Aggregate"), "{display}");
-        assert!(!display.contains("Take:"), "{display}");
+        assert!(final_payload_readers(&plan).is_empty(), "{display}");
     }
     let reordered = query(
         &ctx,
@@ -437,13 +558,13 @@ async fn hybrid_vector_index_and_residuals(#[case] append: bool) {
             "unindexed vector row was omitted"
         );
     }
-    let ctx = context(data, 4, 1);
+    let ctx = context(data.clone(), 4, 1);
     let table = relation(json!({"vector_candidates":4,"fts_candidates":4,"limit":5}));
     let plan = ctx.sql(&format!("SELECT id, _relevance_score, _rowid FROM {table} ORDER BY _relevance_score DESC, _rowid"))
         .await.unwrap().create_physical_plan().await.unwrap();
     let display = displayable(plan.as_ref()).indent(true).to_string();
     assert!(display.contains("ANN"), "{display}");
-    let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+    let batches = collect_indexed(&ctx, plan, &data, usize::from(append)).await;
     let ids = batches
         .iter()
         .flat_map(|b| b["id"].as_primitive::<Int32Type>().values().to_vec())
@@ -482,7 +603,8 @@ async fn hybrid_vector_index_and_residuals(#[case] append: bool) {
 async fn hybrid_stable_identity_after_compaction() {
     let mut data = dataset(true, true).await;
     data.delete("id = 0").await.unwrap();
-    let old = context(Arc::new(data.clone()), 1, 1);
+    let previous = Arc::new(data.clone());
+    let old = context(previous.clone(), 1, 1);
     lance::dataset::optimize::compact_files(
         &mut data,
         lance::dataset::optimize::CompactionOptions::default(),
@@ -490,12 +612,26 @@ async fn hybrid_stable_identity_after_compaction() {
     )
     .await
     .unwrap();
-    let current = context(Arc::new(data), 4, 2);
+    let data = Arc::new(data);
+    let current = context(data.clone(), 4, 2);
     let sql = format!(
         "SELECT _rowid, id, text, _relevance_score FROM {} ORDER BY _relevance_score DESC, _rowid",
         relation(json!({}))
     );
-    assert_eq!(query(&old, &sql).await, query(&current, &sql).await);
+    let mut results = Vec::new();
+    for (ctx, snapshot) in [(&old, previous), (&current, data)] {
+        let plan = ctx
+            .sql(&sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let schema = plan.schema();
+        let batches = collect_indexed(ctx, plan, &snapshot, 0).await;
+        results.push(arrow_select::concat::concat_batches(&schema, &batches).unwrap());
+    }
+    assert_eq!(results[0], results[1]);
 }
 
 #[rstest]
@@ -505,6 +641,8 @@ async fn hybrid_stable_identity_after_compaction() {
 #[case::unknown(json!({"column":"embedding","q":[0,0],"limit":1}), "unknown field")]
 #[case::wrong_column(json!({"column":"id","q":[0,0]}), "FixedSizeList")]
 #[case::overflow(json!({"column":"embedding","q":[1e100,0]}), "representable")]
+#[case::positive_underflow(json!({"column":"embedding","q":[1e-100,0]}), "representable")]
+#[case::negative_underflow(json!({"column":"embedding","q":[-1e-100,0]}), "representable")]
 #[tokio::test]
 async fn hybrid_invalid_vector(#[case] vector: Value, #[case] message: &str) {
     let ctx = context(Arc::new(dataset(false, false).await), 1, 1024);
@@ -521,6 +659,122 @@ async fn hybrid_invalid_vector(#[case] vector: Value, #[case] message: &str) {
         "{error:?}"
     );
     assert!(error.to_string().contains(message), "{error}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn hybrid_blob_descriptor_schema_and_filter(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+    #[values(false, true)] stable: bool,
+) {
+    let base = batch();
+    let mut blobs = BlobArrayBuilder::new(4);
+    blobs.push_bytes(b"a").unwrap();
+    blobs.push_null().unwrap();
+    blobs.push_bytes(b"ccc").unwrap();
+    blobs.push_bytes(b"dddd").unwrap();
+    let blobs = blobs.finish().unwrap();
+    let nested = Arc::new(StructArray::new(
+        vec![blob_field("blob", true)].into(),
+        vec![blobs.clone()],
+        None,
+    ));
+    let plain = Arc::new(LargeBinaryArray::from(vec![
+        Some(b"zero".as_slice()),
+        Some(b"one".as_slice()),
+        Some(b"two".as_slice()),
+        Some(b"three".as_slice()),
+    ]));
+    let mut fields = base.schema().fields().to_vec();
+    fields.extend([
+        Arc::new(blob_field("direct", true)),
+        Arc::new(Field::new("nested", nested.data_type().clone(), false)),
+        Arc::new(Field::new("plain", DataType::LargeBinary, false)),
+    ]);
+    let mut columns = base.columns().to_vec();
+    columns.extend([blobs, nested as _, plain as _]);
+    let rows = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap();
+    let data = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable,
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(data.get_fragments().len(), 2);
+    let expected = data
+        .scan()
+        .filter("id < 3")
+        .unwrap()
+        .project(&["id", "direct", "nested", "plain"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(expected["direct"].data_type(), &*BLOB_V2_DESC_TYPE);
+    assert_eq!(
+        expected["nested"].as_struct()["blob"].data_type(),
+        &*BLOB_V2_DESC_TYPE
+    );
+    let ctx = context(data, 4, 1);
+    let table = relation(json!({}));
+    let frame = ctx
+        .sql(&format!(
+            "SELECT id, direct, nested, plain FROM {table} ORDER BY id"
+        ))
+        .await
+        .unwrap();
+    let logical_schema = Arc::new(frame.schema().as_arrow().clone());
+    assert_eq!(logical_schema, expected.schema());
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert_eq!(plan.schema(), logical_schema);
+    let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+    let actual = arrow_select::concat::concat_batches(&logical_schema, &batches).unwrap();
+    assert_eq!(actual, expected);
+    let direct = actual["direct"].as_struct();
+    assert!(direct.is_null(1));
+    assert_eq!(direct["size"].as_primitive::<UInt64Type>().value(0), 1);
+    assert_eq!(direct["size"].as_primitive::<UInt64Type>().value(2), 3);
+    let children = query(&ctx, &format!(
+        "SELECT id, direct['size'] AS size, nested['blob']['kind'] AS kind FROM {table} ORDER BY id"
+    )).await;
+    assert_eq!(children["size"].as_primitive::<UInt64Type>().value(2), 3);
+    assert!(children["size"].is_null(1));
+    let kind = direct["kind"].as_primitive::<UInt8Type>().value(0);
+    let filtered = relation(json!({
+        "vector_candidates":4, "fts_candidates":4, "limit":4,
+        "filter":format!("direct['kind'] IS NOT NULL AND nested['blob']['kind'] = {kind}")
+    }));
+    let result = query(
+        &ctx,
+        &format!("SELECT id, _relevance_score FROM {filtered} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        result["id"].as_primitive::<Int32Type>().values(),
+        &[0, 2, 3]
+    );
+    assert!(
+        (result["_relevance_score"]
+            .as_primitive::<Float64Type>()
+            .value(1)
+            - (1.0 / 62.0 + 1.0 / 61.0))
+            .abs()
+            < 1e-12
+    );
+    assert_eq!(
+        query(&ctx, &format!("SELECT count(*) AS n FROM {table}")).await["n"]
+            .as_primitive::<Int64Type>()
+            .value(0),
+        3
+    );
 }
 
 #[rstest]
