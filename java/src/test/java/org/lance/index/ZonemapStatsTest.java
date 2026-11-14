@@ -23,8 +23,10 @@ import org.lance.index.scalar.ZoneStats;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -290,6 +292,56 @@ public class ZonemapStatsTest {
         List<ZoneStats> stats = dataset.getZonemapStats("id");
         assertNotNull(stats);
         assertTrue(stats.isEmpty(), "Expected empty for non-indexed column");
+      }
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsReportsNanCount(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("nan_col").toString();
+    Schema schema =
+        new Schema(
+            Collections.singletonList(
+                Field.nullable(
+                    "score", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))),
+            null);
+    int rowCount = 100;
+    int nanCount = 3;
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(allocator, path, schema, new WriteParams.Builder().build())) {
+        // empty
+      }
+      List<FragmentMetadata> metas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        Float8Vector scores = (Float8Vector) root.getVector("score");
+        for (int i = 0; i < rowCount; i++) {
+          scores.setSafe(i, i < nanCount ? Double.NaN : (double) i);
+        }
+        root.setRowCount(rowCount);
+        metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+      }
+      Dataset.commit(allocator, path, new FragmentOperation.Append(metas), Optional.of(1L)).close();
+
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        ScalarIndexParams params = ScalarIndexParams.create("zonemap", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+        dataset.createIndex(
+            Collections.singletonList("score"),
+            IndexType.ZONEMAP,
+            Optional.of("score_zm"),
+            indexParams,
+            true);
+
+        // 100 rows fit in one zone. The bounds exclude NaN; the count is the
+        // only trace of it.
+        List<ZoneStats> stats = dataset.getZonemapStats("score");
+        assertEquals(1, stats.size());
+        ZoneStats zone = stats.get(0);
+        assertEquals(nanCount, zone.getNanCount());
+        assertEquals((double) nanCount, zone.getMin());
+        assertEquals((double) (rowCount - 1), zone.getMax());
       }
     }
   }

@@ -1996,8 +1996,8 @@ public class Dataset implements Closeable {
   /**
    * Read zonemap statistics for a column.
    *
-   * <p>Returns per-zone min/max/null_count statistics for the given column, if a zonemap index
-   * exists. Returns an empty list if no zonemap index exists for the column.
+   * <p>Returns per-zone min/max/null_count/nan_count statistics for the given column, if a zonemap
+   * index exists. Returns an empty list if no zonemap index exists for the column.
    *
    * <p>The zonemap index file is typically small (one row per zone), so this is a lightweight
    * metadata-only operation suitable for calling on the driver during scan planning.
