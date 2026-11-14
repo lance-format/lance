@@ -16,16 +16,15 @@ use lance_core::{
 use super::{ELEMS_PER_CHUNK, InlineBitpacking};
 use crate::{
     buffer::LanceBuffer,
+    compression::MiniBlockDecodeBudget,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
 };
 
-pub(super) fn decode(
-    bits: u64,
-    data: &[LanceBuffer],
+fn checked_input<'a>(
+    data: &'a [LanceBuffer],
     num_values: u64,
-    range: Range<u64>,
-    workspace: &mut Reservation,
-) -> Result<Option<DataBlock>> {
+    range: &Range<u64>,
+) -> Result<&'a LanceBuffer> {
     let [data] = data else {
         return Err(Error::invalid_input(format!(
             "Inline bitpacking expects one buffer, got {}",
@@ -38,6 +37,17 @@ pub(super) fn decode(
             format!("selection {range:?} exceeds {num_values} decoded values"),
         ));
     }
+    Ok(data)
+}
+
+pub(super) fn decode(
+    bits: u64,
+    data: &[LanceBuffer],
+    num_values: u64,
+    range: Range<u64>,
+    workspace: &mut Reservation,
+) -> Result<Option<DataBlock>> {
+    let data = checked_input(data, num_values, &range)?;
     match bits {
         8 => decode_typed::<u8>(data, num_values, range, workspace),
         16 => decode_typed::<u16>(data, num_values, range, workspace),
@@ -49,18 +59,45 @@ pub(super) fn decode(
     }
 }
 
+pub(super) fn plan(
+    bits: u64,
+    data: &[LanceBuffer],
+    num_values: u64,
+    range: Range<u64>,
+) -> Result<MiniBlockDecodeBudget> {
+    let data = checked_input(data, num_values, &range)?;
+    let plan = match bits {
+        8 => plan_typed::<u8>(data, num_values, &range),
+        16 => plan_typed::<u16>(data, num_values, &range),
+        32 => plan_typed::<u32>(data, num_values, &range),
+        64 => plan_typed::<u64>(data, num_values, &range),
+        _ => {
+            return Err(Error::invalid_input(format!(
+                "unsupported bitpacking width {bits}"
+            )));
+        }
+    }?;
+    Ok(plan.budget)
+}
+
 fn allocate(workspace: &mut Reservation, len: usize) -> Result<ReservedBuffer> {
     workspace
         .try_allocate(len)?
         .ok_or_else(|| Error::internal("bitpacking workspace changed after complete admission"))
 }
 
-fn decode_typed<T: ArrowNativeType + BitPackingUninit + Pod>(
+struct RangePlan {
+    budget: MiniBlockDecodeBudget,
+    width: usize,
+    scratch_bytes: usize,
+    alignment_bytes: usize,
+}
+
+fn plan_typed<T: ArrowNativeType + BitPackingUninit + Pod>(
     data: &LanceBuffer,
     num_values: u64,
-    range: Range<u64>,
-    workspace: &mut Reservation,
-) -> Result<Option<DataBlock>> {
+    range: &Range<u64>,
+) -> Result<RangePlan> {
     let width = if num_values == 0 {
         0
     } else {
@@ -87,12 +124,37 @@ fn decode_typed<T: ArrowNativeType + BitPackingUninit + Pod>(
         .checked_add(scratch_bytes)
         .and_then(|bytes| bytes.checked_add(alignment_bytes))
         .ok_or_else(|| Error::invalid_input("bitpacking workspace size overflow"))?;
+    Ok(RangePlan {
+        budget: MiniBlockDecodeBudget {
+            output_bytes,
+            workspace_bytes: total,
+        },
+        width,
+        scratch_bytes,
+        alignment_bytes,
+    })
+}
+
+fn decode_typed<T: ArrowNativeType + BitPackingUninit + Pod>(
+    data: &LanceBuffer,
+    num_values: u64,
+    range: Range<u64>,
+    workspace: &mut Reservation,
+) -> Result<Option<DataBlock>> {
+    let RangePlan {
+        budget,
+        width,
+        scratch_bytes,
+        alignment_bytes,
+    } = plan_typed::<T>(data, num_values, &range)?;
     // The exclusive workspace was already admitted to the shared budget. Check
     // every simultaneous allocation before splitting any credit or copying input.
-    if total > workspace.len() {
+    if budget.workspace_bytes > workspace.len() {
         return Ok(None);
     }
-    let mut output = allocate(workspace, output_bytes)?;
+    let selected = (range.end - range.start) as usize;
+    let word_size = std::mem::size_of::<T>();
+    let mut output = allocate(workspace, budget.output_bytes)?;
     let aligned = if alignment_bytes > 0 {
         let mut aligned = allocate(workspace, alignment_bytes)?;
         aligned.as_mut().copy_from_slice(data);
@@ -204,6 +266,11 @@ mod tests {
             .unwrap()];
         drop(input);
         let codec = InlineBitpacking::new((word_size * 8) as u64);
+        let planned = codec.plan_range(&buffers, stored, range.clone()).unwrap();
+        assert_eq!(planned.output_bytes, output_bytes);
+        assert_eq!(planned.workspace_bytes, operation_bytes);
+        assert_eq!(workspace.len(), operation_bytes);
+        assert_eq!(budget.reserved(), input_bytes + operation_bytes);
         if operation_bytes > 0 {
             let mut short = workspace.try_split(operation_bytes - 1).unwrap();
             assert!(
@@ -289,8 +356,15 @@ mod tests {
         let budget = AllocationBudget::new(8192);
         let mut workspace = budget.try_reserve(8192).unwrap();
         let codec = InlineBitpacking::new(32);
+        let buffers = [LanceBuffer::from(input)];
         let error = codec
-            .try_decompress_range_in(&[LanceBuffer::from(input)], stored, range, &mut workspace)
+            .plan_range(&buffers, stored, range.clone())
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(workspace.len(), 8192);
+        let error = codec
+            .try_decompress_range_in(&buffers, stored, range, &mut workspace)
             .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
         assert!(error.to_string().contains(message), "{error}");
@@ -311,11 +385,121 @@ mod tests {
         let budget = AllocationBudget::new(1);
         let mut workspace = budget.try_reserve(1).unwrap();
         let error = codec
+            .plan_range(&[LanceBuffer::from(vec![7_u8])], 1, 0..1)
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("no admitted range plan"));
+        let error = codec
             .try_decompress_range_in(&[LanceBuffer::from(vec![7_u8])], 1, 0..1, &mut workspace)
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("no admitted range decoder"));
         assert_eq!(workspace.len(), 1);
+    }
+
+    #[rstest]
+    #[case::concat_peak(2..4, 8..10)]
+    #[case::later_scratch_peak(2..4, 8..72)]
+    #[case::earlier_scratch_peak(1..80, 8..10)]
+    #[case::full_ranges(0..1024, 0..1024)]
+    fn planned_ranges_cover_decode_and_concat_overlap(
+        #[case] first: Range<u64>,
+        #[case] second: Range<u64>,
+        #[values(false, true)] is_unaligned: bool,
+    ) {
+        let values = [0_u32, 1].map(|seed| {
+            (0..1024)
+                .map(|index| (index * 3 + seed) % 8)
+                .collect::<Vec<_>>()
+        });
+        let encoded = values.each_ref().map(|values| {
+            let mut encoded = vec![3_u32; 97];
+            // SAFETY: 1024 values fit in three bits; 96 words hold the packed payload.
+            unsafe { u32::unchecked_pack(3, values, &mut encoded[1..]) };
+            bytemuck::cast_slice(&encoded).to_vec()
+        });
+        let ranges = [first, second];
+        let output_bytes = ranges
+            .each_ref()
+            .map(|range| (range.end - range.start) as usize * 4);
+        // Independent physical layouts: 1024 u32 scratch slots for a dense
+        // partial range, plus a 388-byte copy for either unaligned input.
+        let transient = ranges.each_ref().map(|range| {
+            let selected = range.end - range.start;
+            usize::from(selected > 32 && selected < 1024) * 4096 + usize::from(is_unaligned) * 388
+        });
+        let retained = output_bytes.iter().sum::<usize>();
+        let expected_peak = (output_bytes[0] + transient[0])
+            .max(retained + transient[1])
+            .max(retained * 2);
+        let prefix = usize::from(is_unaligned);
+        let input_bytes = 2 * (388 + prefix);
+        let budget = AllocationBudget::new(input_bytes + expected_peak);
+        let mut input = budget.try_reserve(input_bytes).unwrap().allocate().unwrap();
+        for (index, bytes) in encoded.iter().enumerate() {
+            let start = index * (388 + prefix) + prefix;
+            input.as_mut()[start..start + 388].copy_from_slice(bytes);
+        }
+        let owner = input.freeze();
+        let inputs = [0, 1].map(|index| {
+            let start = index * (388 + prefix) + prefix;
+            [LanceBuffer::from(Buffer::from(
+                owner.slice(start..start + 388),
+            ))]
+        });
+        drop(owner);
+        let codec = InlineBitpacking::new(32);
+        let plans = inputs
+            .iter()
+            .zip(&ranges)
+            .map(|(input, range)| codec.plan_range(input, 1024, range.clone()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(budget.reserved(), input_bytes);
+        let required = plans[0]
+            .workspace_bytes
+            .max(plans[0].output_bytes + plans[1].workspace_bytes)
+            .max((plans[0].output_bytes + plans[1].output_bytes) * 2);
+        assert_eq!(required, expected_peak);
+        assert!(budget.try_reserve(required + 1).is_none());
+        let mut workspace = budget.try_reserve(required).unwrap();
+        let mut decoded = Vec::with_capacity(2);
+        for (input, range) in inputs.iter().zip(&ranges) {
+            decoded.push(
+                codec
+                    .try_decompress_range_in(input, 1024, range.clone(), &mut workspace)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(workspace.len(), required - retained);
+        let output = DataBlock::try_concat_in(&decoded, &mut workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.len(), required - 2 * retained);
+        let expected = values
+            .iter()
+            .zip(&ranges)
+            .flat_map(|(values, range)| {
+                values[range.start as usize..range.end as usize]
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        let array = output
+            .try_to_arrow_in(&DataType::UInt32, &mut workspace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(array.buffers()[0].typed_data::<u32>(), expected);
+        drop(output);
+        drop(decoded);
+        drop(inputs);
+        drop(workspace);
+        assert_eq!(budget.reserved(), retained);
+        let last = array.slice(array.len() - 1, 1);
+        drop(array);
+        assert_eq!(budget.reserved(), retained);
+        drop(last);
+        assert_eq!(budget.reserved(), 0);
     }
 
     #[test]

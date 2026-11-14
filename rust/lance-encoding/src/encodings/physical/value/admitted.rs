@@ -11,7 +11,7 @@ use lance_core::{Error, Result, utils::allocation::Reservation};
 use super::{ValueDecompressor, validate_fixed_buffer};
 use crate::{
     buffer::LanceBuffer,
-    compression::MiniBlockDecompressor,
+    compression::{MiniBlockDecodeBudget, MiniBlockDecompressor},
     data::{BlockInfo, DataBlock, FixedSizeListBlock, NullableDataBlock},
 };
 
@@ -59,13 +59,18 @@ fn copy_selected(
     Ok(LanceBuffer::from(Buffer::from(output.freeze())))
 }
 
-pub(super) fn decode(
+pub(super) struct RangePlan {
+    pub(super) budget: MiniBlockDecodeBudget,
+    selected: Range<u64>,
+    buffer_index: usize,
+}
+
+pub(super) fn plan(
     codec: &ValueDecompressor,
     data: &[LanceBuffer],
     num_values: u64,
     range: Range<u64>,
-    workspace: &mut Reservation,
-) -> Result<Option<DataBlock>> {
+) -> Result<RangePlan> {
     if range.start > range.end || range.end > num_values {
         return Err(Error::corrupt_file_named(
             "mini-block",
@@ -118,7 +123,29 @@ pub(super) fn decode(
     total = total
         .checked_add(output_bytes(&selected, codec.bits_per_item)?)
         .ok_or_else(|| Error::invalid_input("Flat/FSL output size overflows"))?;
-    if total > workspace.len() {
+    Ok(RangePlan {
+        budget: MiniBlockDecodeBudget {
+            output_bytes: total,
+            workspace_bytes: total,
+        },
+        selected,
+        buffer_index,
+    })
+}
+
+pub(super) fn decode(
+    codec: &ValueDecompressor,
+    data: &[LanceBuffer],
+    num_values: u64,
+    range: Range<u64>,
+    workspace: &mut Reservation,
+) -> Result<Option<DataBlock>> {
+    let RangePlan {
+        budget,
+        mut selected,
+        mut buffer_index,
+    } = plan(codec, data, num_values, range)?;
+    if budget.workspace_bytes > workspace.len() {
         return Ok(None);
     }
     let values = copy_selected(
@@ -258,6 +285,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         drop(encoded);
+
+        let planned = codec
+            .plan_range(&buffers, expected.len() as u64, range.clone())
+            .unwrap();
+        assert_eq!(planned.output_bytes, output_bytes);
+        assert_eq!(planned.workspace_bytes, output_bytes);
+        assert_eq!(workspace.len(), output_bytes);
+        assert_eq!(budget.reserved(), input_bytes + output_bytes);
 
         if output_bytes > 0 {
             let mut short = workspace.try_split(output_bytes - 1).unwrap();
@@ -413,6 +448,13 @@ mod tests {
         let budget = AllocationBudget::new(1024);
         let mut workspace = budget.try_reserve(1024).unwrap();
         let range = if kind == 4 { 31..33 } else { 3..27 };
+        let error = decoder.plan_range(&buffers, 32, range.clone()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidInput { .. } | Error::CorruptFile { .. }
+        ));
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(workspace.len(), 1024);
         let error = decoder
             .try_decompress_range_in(&buffers, 32, range, &mut workspace)
             .unwrap_err();
@@ -431,6 +473,11 @@ mod tests {
         let budget = AllocationBudget::new(0);
         let mut workspace = budget.try_reserve(0).unwrap();
         let error = decoder
+            .plan_range(&[LanceBuffer::from(vec![])], u64::MAX, 0..1)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("child value count overflows"));
+        let error = decoder
             .try_decompress_range_in(&[LanceBuffer::from(vec![])], u64::MAX, 0..1, &mut workspace)
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
@@ -443,6 +490,11 @@ mod tests {
         let decoder = codec(EncodingUtils::flat(0, None));
         let budget = AllocationBudget::new(0);
         let mut workspace = budget.try_reserve(0).unwrap();
+        let error = decoder
+            .plan_range(&[LanceBuffer::from(vec![])], 32, 3..27)
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("typed output layout"));
         let error = decoder
             .try_decompress_range_in(&[LanceBuffer::from(vec![])], 32, 3..27, &mut workspace)
             .unwrap_err();

@@ -21,8 +21,18 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Reuse the 28 concat cases, API example and no-default build at83bd8ada9
-      # (run43610825102). This repair changes only recursive type spelling.
+      # The two codec preflights were extracted for composition. Check their
+      # plans against independent physical layouts and their actual decoders.
+      - name: Validate raw and nested range plans
+        run: cargo test --profile ci --locked -p lance-encoding --lib physical::value::admitted::tests -- --nocapture
+      - name: Validate bitpacking range plans and concat overlap
+        run: cargo test --profile ci --locked -p lance-encoding --lib physical::bitpacking::admitted::tests -- --nocapture
+      - name: Validate MiniBlock callers of the refactored codecs
+        run: cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests -- --nocapture
+      - name: Validate range planning API example
+        run: cargo test --profile ci --locked -p lance-encoding --doc compression::MiniBlockDecompressor::plan_range
+      - name: Check planning without optional codecs
+        run: cargo check --profile ci --locked -p lance-encoding --no-default-features --lib
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

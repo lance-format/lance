@@ -90,6 +90,19 @@ use std::{ops::Range, str::FromStr, sync::Arc};
 
 pub mod levels;
 
+/// Payload required by one validated MiniBlock range operation.
+///
+/// Input owners are excluded and must already be charged. These sizes exclude
+/// allocator/plan metadata and later typed or structural reconstruction. A plan
+/// applies only to the codec, immutable input buffers and range it validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiniBlockDecodeBudget {
+    /// Bytes retained by the result after codec scratch is recycled.
+    pub output_bytes: usize,
+    /// Maximum additional bytes simultaneously needed, including output and scratch.
+    pub workspace_bytes: usize,
+}
+
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
 ///
 /// If no threshold is provided, we use a size model instead of a fixed run ratio.
@@ -1151,6 +1164,38 @@ pub fn try_fixed_size_list_block(
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Validate a range and price its complete output/scratch without allocating
+    /// payload. This is the same preflight used by [`Self::try_decompress_range_in`].
+    /// Unsupported codecs return an error rather than an estimate or an ordinary
+    /// decode fallback. No credit is consumed by planning.
+    ///
+    /// For a sequence, keep earlier output charges while admitting each next
+    /// `workspace_bytes`. Concatenation needs its own output allocation while the
+    /// decoded inputs are still alive. Structural levels and input owners also
+    /// need separate admission; summing only the retained outputs is insufficient.
+    ///
+    /// ```
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::value::ValueDecompressor, format::metadata};
+    /// let codec = ValueDecompressor::from_flat(&metadata::Flat {
+    ///     bits_per_value: 32, data: None,
+    /// });
+    /// let input = [LanceBuffer::from(vec![0_u8; 16])];
+    /// let plan = codec.plan_range(&input, 4, 1..3).unwrap();
+    /// assert_eq!(plan.output_bytes, 8);
+    /// assert_eq!(plan.workspace_bytes, 8); // Raw extraction needs no scratch.
+    /// ```
+    fn plan_range(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _range: Range<u64>,
+    ) -> Result<MiniBlockDecodeBudget> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted range plan",
+        ))
+    }
 
     /// Decode a selected range only after all output and codec scratch fit in the
     /// supplied workspace. Inputs must already carry their physical allocation charge.

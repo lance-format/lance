@@ -660,6 +660,15 @@ impl BlockDecompressor for ValueDecompressor {
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self, data, num_values, range).map(|plan| plan.budget)
+    }
+
     fn try_decompress_range_in(
         &self,
         data: &[LanceBuffer],

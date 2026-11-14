@@ -569,6 +569,15 @@ impl BlockCompressor for InlineBitpacking {
 }
 
 impl MiniBlockDecompressor for InlineBitpacking {
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self.uncompressed_bit_width, data, num_values, range)
+    }
+
     fn try_decompress_range_in(
         &self,
         data: &[LanceBuffer],
