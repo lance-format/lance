@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import sys
+from enum import Enum
 from functools import lru_cache
 from importlib import import_module
 from importlib.util import find_spec
@@ -236,7 +237,20 @@ def _is_pydantic_base_model_class(obj: Any) -> bool:
 
 
 def model_to_dict(obj: Any) -> dict[str, Any]:
-    return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
+    data = obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
+    return _enum_values(data)
+
+
+def _enum_values(value: Any) -> Any:
+    # Arrow cannot convert Enum members unless they also subclass str or int, and
+    # the schema stores an Enum field as the type of its values.
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {key: _enum_values(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_enum_values(item) for item in value]
+    return value
 
 
 def _validate_pydantic_list(data: Any, model_class: type) -> None:
