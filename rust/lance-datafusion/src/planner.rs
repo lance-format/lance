@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::numeric_coercion::unwrap_widening_casts;
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
@@ -472,7 +473,7 @@ impl Planner {
         leaves
     }
 
-    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+    pub(crate) fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
         if exprs.is_empty() {
             return Err(Error::invalid_input("Binary expression has no operands"));
         }
@@ -1168,12 +1169,20 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_expr()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
+        let schema = Schema::try_from(self.schema.as_ref())?;
+        self.parse_filter_with_schema(filter, &schema)
+    }
+
+    /// Like [`Self::parse_filter`], but resolves column types against `schema`
+    /// instead of converting the planner's Arrow schema on every call.
+    ///
+    /// `schema` must describe the same fields as the planner's Arrow schema.
+    pub fn parse_filter_with_schema(&self, filter: &str, schema: &Schema) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let mut ast_expr = parse_sql_filter(filter)?;
         self.rewrite_filter_lambdas(&mut ast_expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
-        let schema = Schema::try_from(self.schema.as_ref())?;
-        let resolved = resolve_expr(&expr, &schema).map_err(|e| {
+        let resolved = resolve_expr(&expr, schema).map_err(|e| {
             Error::invalid_input(format!("Error resolving filter expression {filter}: {e}"))
         })?;
 
@@ -1318,6 +1327,11 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // After coercion, which is what casts a `Float32` column compared with a
+        // `Float64` literal, and before the float comparison rewrite, which would
+        // otherwise turn a comparison on the cast into ranges on the cast.
+        let expr = unwrap_widening_casts(expr, &df_schema)?;
 
         // Fold each comparison's own operands and rewrite it before anything above
         // it folds. `simplify` folds an operand and everything above it in one
@@ -1614,6 +1628,39 @@ mod tests {
             predicates.into_array(batch.num_rows()).unwrap().as_ref(),
             &BooleanArray::from(vec![Some(true), Some(false), None, None])
         );
+    }
+
+    #[test]
+    fn test_parse_filter_with_schema_matches_parse_filter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new(
+                "st",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "x",
+                    DataType::Float32,
+                    false,
+                )])),
+                true,
+            ),
+        ]));
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let planner = Planner::new(schema);
+
+        for filter in [
+            "i > 3 AND st.x <= 5.0",
+            "i BETWEEN 1 AND 7 OR s IN ('a', 'b')",
+            "NOT (i = 2.5) AND s IS NOT NULL",
+        ] {
+            assert_eq!(
+                planner
+                    .parse_filter_with_schema(filter, &lance_schema)
+                    .unwrap(),
+                planner.parse_filter(filter).unwrap(),
+                "{filter}"
+            );
+        }
     }
 
     #[test]

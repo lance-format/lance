@@ -2244,7 +2244,7 @@ async fn test_ann_with_deletion(
 
         assert_eq!(
             dataset.index_cache_entry_count().await,
-            2, // 2 for index metadata at version 1 and 2.
+            4, // Raw metadata and query listings at versions 1 and 2.
         );
         // Load the row-id lookup explicitly so cache counts are independent of
         // which scan path resolves stable row ids.
@@ -2260,8 +2260,8 @@ async fn test_ann_with_deletion(
         assert_eq!(
             dataset.index_cache_entry_count().await,
             // The vector index, its partitions and the segment ownership mask,
-            // plus versioned index metadata and the stable-row-id lookup.
-            6 + dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
+            // plus versioned raw metadata and query listings and the stable-row-id lookup.
+            6 + 2 * dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
         );
         assert_eq!(results.len(), 1);
         let batch = &results[0];

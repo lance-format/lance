@@ -789,7 +789,6 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
             }
             entries.push(BlobEntry {
                 selection_index,
-                row_address: 0,
                 file,
                 requested_range: None,
             });
@@ -811,7 +810,6 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         let blobs = execute_blob_entries_with_execution(
             vec![BlobEntry {
                 selection_index: 0,
-                row_address: 0,
                 file: managed_file,
                 requested_range: None,
             }],

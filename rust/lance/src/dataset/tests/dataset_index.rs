@@ -605,6 +605,12 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "value = 6.5",
         "value BETWEEN 6.5 AND 7.5",
         "value IN (6.5, 7)",
+        // So are comparisons of the column cast to a float.
+        "CAST(value AS double) > 6.5",
+        "TRY_CAST(value AS double) = 7.0",
+        "NOT (CAST(value AS double) <= 7.0)",
+        "CAST(value AS double) BETWEEN 6.5 AND 7.5",
+        "CAST(value AS double) IN (6.5, 7.0)",
     ] {
         let mut indexed_scan = dataset.scan();
         indexed_scan

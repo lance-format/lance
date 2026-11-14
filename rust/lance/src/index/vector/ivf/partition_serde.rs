@@ -1265,7 +1265,7 @@ mod tests {
             ivf: ivf.clone(),
             aux_ivf: ivf,
             distance_type: DistanceType::L2,
-            sub_index_metadata: vec!["meta1".to_string()],
+            sub_index_metadata: vec!["meta1".to_string()].into(),
             metadata: lance_index::vector::flat::index::FlatMetadata { dim: 2 },
             sub_index_type: SubIndexType::Flat,
             quantization_type: QuantizationType::Flat,

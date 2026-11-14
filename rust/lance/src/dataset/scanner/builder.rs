@@ -81,6 +81,7 @@ impl Scanner {
             nearest_refine: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
+            warp_imputation_rank: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -1257,6 +1258,15 @@ impl Scanner {
     /// When a distance range is set, the selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
     ///
+    /// Completed partition results may be reused for identical queries in the
+    /// same snapshot, within the session index-cache budget. This memory-only
+    /// cache accepts fully indexed single-vector queries without filters,
+    /// fragment subsets, external masks, or stale vector overlays, and requires
+    /// a proven manifest identity. It stores row IDs and quantized distances;
+    /// exact refinement and projections still run independently. Immutable RQ
+    /// index data is cached separately and can remain reusable across queries
+    /// and snapshots even when completed results cannot be reused.
+    ///
     /// ```
     /// # use arrow_array::Float32Array;
     /// # use lance::{Dataset, Result};
@@ -1272,6 +1282,50 @@ impl Scanner {
     /// ```
     pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
         self.quantized_refine_factor = Some(factor);
+        self
+    }
+
+    /// Set WARP's imputation rank `t'`; most callers should leave it unset.
+    ///
+    /// Indexed multivector search uses WARP (<https://arxiv.org/abs/2501.17788>)
+    /// when every index segment is IVF with a FLAT sub-index (IVF_FLAT, IVF_PQ,
+    /// IVF_SQ or IVF_RQ, but not the legacy IVF_PQ format), and XTR otherwise,
+    /// which ignores this setting.
+    ///
+    /// When none of a document's tokens is in the partitions a query token
+    /// probed, WARP cannot compute that token's similarity to the document,
+    /// so it imputes the similarity of roughly the `t'`-th most similar token
+    /// in the whole index, estimated from the centroids and partition sizes.
+    /// A `t'` of 0 imputes 0. The default follows the WARP reference
+    /// implementation; see
+    /// [`lance_index::vector::warp::default_imputation_rank`]. It is not a
+    /// latency knob: it reads no extra data. Larger values impute lower
+    /// similarities, so documents that only some query tokens observe rank
+    /// lower. Prefer more partitions to raise recall.
+    ///
+    /// WARP probes a fixed number of partitions per query token and segment,
+    /// [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`] by default. As for
+    /// IVF search, [`Self::nprobes`], [`Self::minimum_nprobes`],
+    /// [`Self::maximum_nprobes`] and [`Self::search_effort`] change it, except
+    /// that a maximum set alone is the count WARP probes, since it never
+    /// expands its search.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// // Two query tokens of dimension 128, flattened.
+    /// let query = Float32Array::from(vec![0.0_f32; 256]);
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .nearest("multivector", &query, 10)?
+    ///     .nprobes(32)
+    ///     .warp_imputation_rank(1000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn warp_imputation_rank(&mut self, imputation_rank: usize) -> &mut Self {
+        self.warp_imputation_rank = Some(imputation_rank);
         self
     }
 
