@@ -453,17 +453,18 @@ fn selected_structural_constants_compose_with_admission(
     };
     let levels = level_count * 2 * if nested { 2 } else { 1 };
     let required = levels + payload;
+    let list_output = if nested { 5 * 4 + 1 } else { 0 };
     let mut short = work.try_split(required - 1).unwrap();
     assert!(task.try_decode_in(&mut short).unwrap().is_none());
     assert_eq!(short.len(), required - 1);
     drop(short);
     drop(work);
     let mut work = budget
-        .try_reserve(required + typed + count.div_ceil(8))
+        .try_reserve(required + typed + count.div_ceil(8) + list_output)
         .unwrap();
     let decoded = task.try_decode_in(&mut work).unwrap().unwrap();
     assert_eq!(decoded.data.num_values(), count as u64);
-    assert_eq!(work.len(), typed + count.div_ceil(8));
+    assert_eq!(work.len(), typed + count.div_ceil(8) + list_output);
     let mut repdef = CompositeRepDefUnraveler::new(vec![decoded.repdef]);
     let validity = repdef
         .try_unravel_validity_in(count, &mut work)
@@ -497,15 +498,18 @@ fn selected_structural_constants_compose_with_admission(
     );
     let expected = arrow_select::take::take(original.as_ref(), &indices, None).unwrap();
     assert_eq!(actual, expected.to_data());
-    assert!(work.is_empty());
+    assert_eq!(work.len(), list_output);
     assert_eq!(
         budget.reserved(),
-        scalar_input + level_input + required + typed + count.div_ceil(8)
+        scalar_input + level_input + required + typed + count.div_ceil(8) + list_output
     );
     if nested {
-        // Compatibility check only: List offset reconstruction still needs its
-        // own admitted path; these ordinary offsets are not a bounded-memory proof.
-        let (offsets, nulls) = repdef.unravel_offsets::<i32>().unwrap();
+        // List output shares the admitted workspace with scalar values/levels.
+        let (offsets, nulls) = repdef
+            .try_unravel_offsets_in::<i32>(&mut work)
+            .unwrap()
+            .unwrap();
+        assert!(work.is_empty());
         assert_eq!(offsets.as_ref(), &[0, 2, 2, 2, 4]);
         assert_eq!(
             nulls.unwrap().iter().collect::<Vec<_>>(),
@@ -644,7 +648,7 @@ fn repetition_only_constant_keeps_selected_list_coordinates() {
     let task = decoder.drain(2).unwrap();
     drop(decoder);
     drop(work);
-    let mut work = budget.try_reserve(6 + 25).unwrap();
+    let mut work = budget.try_reserve(6 + 25 + 12).unwrap();
     let decoded = task.try_decode_in(&mut work).unwrap().unwrap();
     let mut repdef = CompositeRepDefUnraveler::new(vec![decoded.repdef]);
     assert!(
@@ -663,10 +667,15 @@ fn repetition_only_constant_keeps_selected_list_coordinates() {
         arrow_select::take::take(original.as_ref(), &UInt64Array::from(vec![0, 0, 0]), None)
             .unwrap();
     assert_eq!(actual, expected.to_data());
+    assert_eq!(work.len(), 12);
+    let (offsets, validity) = repdef
+        .try_unravel_offsets_in::<i32>(&mut work)
+        .unwrap()
+        .unwrap();
     assert!(work.is_empty());
-    let (offsets, validity) = repdef.unravel_offsets::<i32>().unwrap();
     assert_eq!(offsets.as_ref(), &[0, 1, 3]);
     assert!(validity.is_none());
+    drop(offsets);
     drop(repdef);
     drop(decoded.data);
     drop(task);

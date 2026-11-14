@@ -16,6 +16,8 @@ use lance_core::{
 
 use super::{CompositeRepDefUnraveler, DefinitionInterpretation, LevelBuffer, RepDefUnraveler};
 
+mod offsets;
+
 #[derive(Debug)]
 pub(super) enum Levels {
     Ordinary(LevelBuffer),
@@ -291,8 +293,8 @@ impl CompositeRepDefUnraveler {
     /// `Some(None)` means the layer is all valid. All sibling comparisons and row
     /// counts are checked before allocation or cursor advancement. Source level
     /// allocations must already be charged, e.g. by `RepDefUnraveler::try_new_in`.
-    /// List offset reconstruction, sparse plans and decoder integration are not
-    /// covered. Existing ordinary methods retain their behavior and allocations.
+    /// List offsets have their own `try_unravel_offsets_in` admission. Sparse
+    /// plans are not covered. Ordinary methods retain their behavior/allocations.
     pub fn try_unravel_validity_in(
         &mut self,
         num_values: usize,

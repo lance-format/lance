@@ -21,13 +21,15 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Dense storage passed at b71cfe788 (run 43591784167). The new constant task
-      # composes with owned levels, so validate both affected suites at this head.
-      - name: Validate owned structural level adoption
+      # Constant/repdef composition passed at 0c6f774 (run 43594839503).
+      # The admitted List output now changes both suites; validate their composition.
+      - name: Validate admitted levels and list outputs
         run: >-
           cargo test --profile ci --locked -p lance-encoding --all-features --lib repdef:: -- --nocapture
       - name: Validate structural constant task composition
         run: >-
           cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::constant:: -- --nocapture
+      - name: Validate admitted list API example
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc try_unravel_offsets_in
       - name: Lint touched crate
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
