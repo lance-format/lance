@@ -6,6 +6,8 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
+use super::field_dependencies::input_field_ids;
+
 use std::sync::Arc;
 
 use lance_core::utils::address::RowAddress;
@@ -112,15 +114,16 @@ pub(crate) async fn remap_index(
         return Ok(RemapResult::Drop);
     }
 
-    // With covering withdrawn above, `fields` is entirely keyed, so more than one
-    // entry means a genuinely composite index.
-    if matched.fields.len() > 1 {
+    // Additional dependency fields do not make an index composite. Remapping
+    // still requires one operational input after resolving the plugin declaration.
+    let input_fields = input_field_ids(matched)?;
+    if input_fields.len() > 1 {
         return Err(Error::index(format!(
             "Remapping index '{}' is not supported: it has {} keyed fields {:?}; \
              only one keyed field is supported",
             matched.name,
-            matched.fields.len(),
-            matched.fields,
+            input_fields.len(),
+            input_fields,
         )));
     }
 
