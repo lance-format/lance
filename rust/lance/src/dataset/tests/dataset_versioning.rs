@@ -1947,6 +1947,177 @@ async fn test_branch_clone_preserves_landed_commit(
     assert_eq!(branch.versions().await.unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn test_reserve_branch_pins_source_until_completion() {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = dataset.scan().try_into_batch().await.unwrap();
+    dataset.tags().create("rc", 1).await.unwrap();
+
+    let reservation = dataset.reserve_branch("exp", "rc").await.unwrap();
+    assert_eq!(reservation.branch(), "exp");
+    assert_eq!(reservation.source_branch(), None);
+    assert_eq!(reservation.source_version(), 1);
+    let contents = dataset.branches().get("exp").await.unwrap();
+    assert_eq!(&contents.identifier, reservation.identifier());
+    assert_eq!(contents.parent_version, 1);
+    let error = dataset.reserve_branch("exp", 1).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+
+    // Only the ref exists until the reservation is completed.
+    assert!(dataset.list_branches().await.unwrap().contains_key("exp"));
+    assert!(dataset.checkout_branch("exp").await.is_err());
+    let branch_path = dataset
+        .branch_location()
+        .find_branch(Some("exp"))
+        .unwrap()
+        .path;
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Moving the tag or the source branch must not change the reserved source.
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    dataset.tags().update("rc", 2).await.unwrap();
+    let branch = dataset.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    let branch = dataset.checkout_branch("exp").await.unwrap();
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(
+        branch
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        dataset.branches().get("exp").await.unwrap().identifier,
+        contents.identifier
+    );
+}
+
+#[tokio::test]
+async fn test_complete_branch_rejects_a_removed_or_replaced_reservation() {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    let branch_path = dataset
+        .branch_location()
+        .find_branch(Some("exp"))
+        .unwrap()
+        .path;
+
+    let abandoned = dataset.reserve_branch("exp", 1).await.unwrap();
+    dataset.delete_branch("exp").await.unwrap();
+    let error = dataset.complete_branch(abandoned, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let replaced = dataset.reserve_branch("exp", 1).await.unwrap();
+    dataset.delete_branch("exp").await.unwrap();
+    let replacement = dataset.reserve_branch("exp", 2).await.unwrap();
+    let error = dataset.complete_branch(replaced, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        &dataset.branches().get("exp").await.unwrap().identifier,
+        replacement.identifier()
+    );
+
+    let branch = dataset.complete_branch(replacement, None).await.unwrap();
+    assert_eq!(branch.version().version, 2);
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        dataset.scan().try_into_batch().await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_complete_branch_commits_through_the_completing_handle() {
+    let tempdir = TempStrDir::default();
+    let dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let reservation = dataset.reserve_branch("exp", 1).await.unwrap();
+    let identifier = reservation.identifier().clone();
+
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let completer = DatasetBuilder::from_uri(dataset.uri())
+        .with_commit_handler(handler.clone())
+        .load()
+        .await
+        .unwrap();
+    handler.fail_next(AmbiguousFailure::FailOutright);
+    let error = completer
+        .complete_branch(reservation, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated outright commit failure"),
+        "{error}"
+    );
+    // As with create_branch, a failed clone keeps the reservation.
+    assert_eq!(
+        dataset.branches().get("exp").await.unwrap().identifier,
+        identifier
+    );
+    assert!(dataset.checkout_branch("exp").await.is_err());
+}
+
 #[rstest]
 #[case::complete_history(false)]
 #[case::missing_first_manifest(true)]
