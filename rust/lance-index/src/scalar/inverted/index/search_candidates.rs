@@ -321,6 +321,7 @@ pub(in super::super) struct LoadedPostings {
     pub(super) no_impact_fallback: bool,
 }
 
+#[derive(Clone)]
 pub(super) enum LoadedDocLengths {
     Legacy(Arc<DocSet>),
     Modern(Arc<DocLengths>),

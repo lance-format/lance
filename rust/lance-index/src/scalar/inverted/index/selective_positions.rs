@@ -11,6 +11,7 @@ use crate::scalar::inverted::wand::selective_phrase::{
 
 mod read_ahead;
 use read_ahead::ReadAhead;
+mod sliced_search;
 
 // Kept opt-in until exact-head CI and matched low-cache VM qualification.
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -23,14 +24,31 @@ pub(super) fn enabled() -> bool {
 
 // This bounds encoded blocks held by one partition search, not process RSS.
 // Postings, offsets, decode scratch, I/O buffers and other queries are separate.
-const MAX_LIVE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LIVE_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
 // Search seed for the opt-in path, pending matched VM qualification.
-const POSITION_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+const POSITION_WINDOW_BYTES: u64 = 1024 * 1024;
 // Bound speculative request metadata even for arbitrarily small codec windows.
 // Encoded bytes have the stricter current-plus-predicted clause allowance.
 const MAX_PREDICTED_WINDOWS: usize = 7;
 const MAX_CLAUSES: usize = 16;
 const MAX_OFFSET_BYTES: usize = 1024 * 1024;
+
+/// Resource seeds for the opt-in reader, also allowing small CI fixtures to
+/// exercise real window and document-slice boundaries without huge payloads.
+#[derive(Clone, Copy)]
+pub(super) struct SearchConfig {
+    pub(super) window_bytes: u64,
+    pub(super) target_docs: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            window_bytes: POSITION_WINDOW_BYTES,
+            target_docs: 250_000,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct PositionOffsets(Arc<[u32]>);
@@ -76,13 +94,14 @@ impl DeepSizeOf for PositionWindow {
 struct PositionWindowKey {
     token_id: u32,
     first_block: usize,
+    window_bytes: u64,
 }
 impl CacheKey for PositionWindowKey {
     type ValueType = PositionWindow;
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!(
-            "position-window-{}-{}-{POSITION_WINDOW_BYTES}",
-            self.token_id, self.first_block
+            "position-window-{}-{}-{}",
+            self.token_id, self.first_block, self.window_bytes
         )
         .into()
     }
@@ -95,7 +114,7 @@ impl CacheKey for PositionWindowKey {
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u32(self.token_id);
         builder.write_u64(self.first_block as u64);
-        builder.write_u64(POSITION_WINDOW_BYTES);
+        builder.write_u64(self.window_bytes);
     }
 }
 
@@ -146,6 +165,7 @@ struct PreparedPositions {
     window_ends: Vec<usize>,
     value: Arc<dyn IndexBinaryReader>,
     cache: WeakLanceCache,
+    window_bytes: u64,
 }
 
 impl PreparedPositions {
@@ -229,6 +249,7 @@ impl PreparedPositions {
                 PositionWindowKey {
                     token_id: self.token_id,
                     first_block: first,
+                    window_bytes: self.window_bytes,
                 },
                 || async {
                     let mut buffers = self.value.read_slices(&[range]).await?;
@@ -268,6 +289,7 @@ impl InvertedPartition {
         &self,
         tokens: &Tokens,
         term_ids: Option<PartitionTermIds<'_>>,
+        window_bytes: u64,
     ) -> Result<Option<Vec<PreparedPositions>>> {
         let inverted = &self.inverted_list;
         let PositionsLayout::SharedStream(codec) = inverted.positions_layout else {
@@ -335,7 +357,7 @@ impl InvertedPartition {
             let Some(window_ends) = position_window_ends(
                 &offsets.0,
                 value.len(),
-                POSITION_WINDOW_BYTES,
+                window_bytes,
                 MAX_LIVE_WINDOW_BYTES / tokens.len() as u64,
             )?
             else {
@@ -348,6 +370,7 @@ impl InvertedPartition {
                 window_ends,
                 value,
                 cache: inverted.index_cache.clone(),
+                window_bytes,
             };
             prepared.push(plan);
         }
@@ -374,9 +397,24 @@ impl InvertedIndex {
         &'a self,
         request: ModernSearchRequest<'a>,
     ) -> futures::future::BoxFuture<'a, Result<Option<Vec<Reverse<ScoredPartitionDoc>>>>> {
+        self.try_selective_phrase_search_with_config(request, SearchConfig::default())
+    }
+
+    pub(super) fn try_selective_phrase_search_with_config<'a>(
+        &'a self,
+        request: ModernSearchRequest<'a>,
+        config: SearchConfig,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Vec<Reverse<ScoredPartitionDoc>>>>> {
         async move {
             if !eligible(&request) {
                 return Ok(None);
+            }
+            let clause_budget = MAX_LIVE_WINDOW_BYTES / request.tokens.len() as u64;
+            if config.window_bytes == 0 || config.window_bytes > clause_budget || config.target_docs == 0 {
+                return Err(Error::invalid_input(format!(
+                    "selective window {} must fit clause budget {clause_budget}, and slice target {} must be positive",
+                    config.window_bytes, config.target_docs
+                )));
             }
             // Decide all encoding support before loading/consuming postings or
             // publishing a competitive floor. A None cleanly selects ordinary search.
@@ -394,7 +432,7 @@ impl InvertedIndex {
                             return Ok(None);
                         }
                         Ok::<_, Error>(
-                            part.prepare_selective_positions(&tokens, ids)
+                            part.prepare_selective_positions(&tokens, ids, config.window_bytes)
                                 .await?
                                 .map(|positions| (ordinal, part.clone(), positions)),
                         )
@@ -415,9 +453,7 @@ impl InvertedIndex {
                     .unwrap_or(f32::NEG_INFINITY)
                     .to_bits(),
             ));
-            let searches = prepared
-                .into_iter()
-                .map(|(ordinal, part, positions)| {
+            let loads = stream::iter(prepared).map(|(ordinal, part, positions)| {
                     let shared = shared.clone();
                     // Own the request across suspension; erase the future here
                     // rather than borrowing through the outer stream closure.
@@ -428,7 +464,7 @@ impl InvertedIndex {
                         })?;
                         let visibility = documents.visibility(request.mask.clone(), false).await?;
                         if !visibility.may_match().await? {
-                            return Result::Ok((ordinal, Vec::new()));
+                            return Ok::<Vec<sliced_search::SliceTask<'a>>, Error>(Vec::new());
                         }
                         let lengths = documents.lengths().await?;
                         let ids = request.term_ids.map(|ids| ids.partition(ordinal));
@@ -443,107 +479,37 @@ impl InvertedIndex {
                             )
                             .await?
                         else {
-                            return Result::Ok((ordinal, Vec::new()));
+                            return Ok::<Vec<sliced_search::SliceTask<'a>>, Error>(Vec::new());
                         };
-                        let tokens = request.tokens.clone();
-                        let scorer = request.impact_scorer.clone();
-                        let limit = request.params.limit.ok_or_else(|| {
-                            Error::internal("selective phrase lost its finite limit")
-                        })?;
-                        let (mut search, idf) = spawn_cpu(move || {
-                            let loaded = fetched.into_loaded(&tokens, scorer.as_ref())?;
-                            let idf = idf_by_position(&loaded.postings, scorer.as_ref());
-                            Ok::<_, Error>((PhraseSearch::new(loaded.postings, limit)?, idf))
-                        })
-                        .await?;
-                        let mut read_ahead = ReadAhead::new(positions.len());
-                        let clause_budget = MAX_LIVE_WINDOW_BYTES / request.tokens.len() as u64;
-                        loop {
-                            let lengths = lengths.clone();
-                            let visibility = visibility.clone();
-                            let scorer = request.impact_scorer.clone();
-                            let shared = shared.clone();
-                            let metrics = request.metrics.clone();
-                            let advance = spawn_cpu(move || {
-                                let docs = ModernWandDocuments::filtered(&lengths, &visibility);
-                                let progress =
-                                    search.advance(&docs, scorer, shared, metrics.as_ref())?;
-                                Ok::<_, Error>((search, progress))
-                            });
-                            let (next, progress) = read_ahead.drive(advance).await?;
-                            search = next;
-                            match progress {
-                                PhraseProgress::Done(candidates) => {
-                                    read_ahead.clear();
-                                    drop(search);
-                                    let scorer = request.impact_scorer.clone();
-                                    let scored = spawn_cpu(move || {
-                                        Ok::<_, Error>(rescore_partition_candidates(
-                                            PartitionCandidates {
-                                                idf_by_position: idf,
-                                                grouped_expansions: Vec::new(),
-                                                candidates,
-                                            },
-                                            scorer.as_ref(),
-                                        ))
-                                    })
-                                    .await?;
-                                    return Result::Ok((ordinal, scored));
-                                }
-                                PhraseProgress::Read(requests) => {
-                                    let mut reads = Vec::with_capacity(requests.len());
-                                    for block_request in requests {
-                                        let (term, plan) = positions
-                                            .iter()
-                                            .enumerate()
-                                            .find(|(_, plan)| {
-                                                plan.token_id == block_request.token_id
-                                            })
-                                            .ok_or_else(|| {
-                                                Error::internal(
-                                                    "position request has no prepared term",
-                                                )
-                                            })?;
-                                        let metrics = request.metrics.as_ref();
-                                        let read = read_ahead
-                                            .take(term, block_request.index)
-                                            .unwrap_or_else(|| {
-                                                plan.read(block_request.index, metrics).boxed()
-                                            });
-                                        reads.push(async move {
-                                            Ok::<_, Error>((term, block_request, read.await?))
-                                        });
-                                    }
-                                    let windows = read_ahead
-                                        .drive(futures::future::try_join_all(reads))
-                                        .await?;
-                                    for (term, block_request, window) in windows {
-                                        let plan = &positions[term];
-                                        // Current plus speculative encoded bytes share the
-                                        // original clause budget. Oversized neighbors skip
-                                        // speculation; offsets/scratch/cache/I/O are separate.
-                                        let predictions =
-                                            plan.read_ahead_blocks(&window, clause_budget)?;
-                                        read_ahead.schedule(
-                                            term,
-                                            predictions.into_iter().map(|blocks| {
-                                                let future = plan
-                                                    .read(blocks.start, request.metrics.as_ref())
-                                                    .boxed();
-                                                (blocks, future)
-                                            }),
-                                        )?;
-                                        search.supply(block_request, window)?;
-                                    }
-                                }
-                            }
+                        let ranges = sliced_search::document_ranges(documents.len(), config.target_docs)?;
+                        let positions: Arc<[PreparedPositions]> = positions.into();
+                        let visibility = Arc::new(visibility);
+                        let mut slices: Vec<sliced_search::SliceTask<'a>> = Vec::with_capacity(ranges.len());
+                        for range in ranges {
+                            slices.push(sliced_search::SliceSearch {
+                                ordinal,
+                                positions: positions.clone(),
+                                fetched: fetched.clone(),
+                                request: request.clone(),
+                                lengths: lengths.clone(),
+                                visibility: visibility.clone(),
+                                range,
+                                shared: shared.clone(),
+                            }.run().boxed());
                         }
+                        Ok::<_, Error>(slices)
                     }
                     .boxed()
                 })
-                .collect::<Vec<_>>();
-            let mut results =
-                stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus().min(4));
+                // Do not collect loaded partition payloads ahead of their slices.
+                .buffer_unordered(2)
+                .map_ok(|slices| stream::iter(slices.into_iter().map(Ok::<_, Error>)))
+                .try_flatten();
+            // 8 active slices x 16MiB encoded payload preserves the 128MiB
+            // query ceiling; cached/shared inputs and scratch are separate.
+            let mut results = loads.try_buffer_unordered(
+                get_num_compute_intensive_cpus().min(sliced_search::MAX_ACTIVE_SLICES),
+            );
             let mut ranked = BinaryHeap::new();
             while let Some((ordinal, scored)) = results.try_next().await? {
                 for (doc_id, score) in scored {
@@ -641,6 +607,7 @@ mod tests {
             window_ends: vec![1, 2, 3],
             value,
             cache: WeakLanceCache::from(cache),
+            window_bytes: POSITION_WINDOW_BYTES,
         }
     }
 

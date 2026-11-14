@@ -70,6 +70,9 @@ pub(in crate::scalar::inverted) struct PhraseSearch {
     pending: Option<(DocInfo, f32)>,
     collector: TopKCollector,
     limit: usize,
+    doc_range: std::ops::Range<u64>,
+    seek_start: Option<u64>,
+    has_started: bool,
 }
 
 impl PhraseSearch {
@@ -102,7 +105,45 @@ impl PhraseSearch {
             pending: None,
             collector: TopKCollector::new(limit, limit.min(BLOCK_SIZE * 10)),
             limit,
+            doc_range: 0..u64::MAX,
+            seek_start: None,
+            has_started: false,
         })
+    }
+
+    /// Restrict iteration without changing partition/corpus scoring statistics.
+    pub(in crate::scalar::inverted) fn with_doc_range(
+        mut self,
+        range: std::ops::Range<u64>,
+    ) -> Result<Self> {
+        if self.has_started {
+            return Err(Error::invalid_input(
+                "selective phrase document range cannot change after search starts",
+            ));
+        }
+        if range.start > range.end || range.end > u64::from(u32::MAX) {
+            return Err(Error::invalid_input(format!(
+                "selective phrase document range {range:?} must be ordered within the dense DocId domain"
+            )));
+        }
+        self.seek_start = Some(range.start);
+        self.doc_range = range;
+        Ok(self)
+    }
+
+    /// Exclusive position-block limit for each term, including a boundary block.
+    pub(in crate::scalar::inverted) fn position_block_limits(&self) -> Vec<(u32, usize)> {
+        self.lead
+            .iter()
+            .filter_map(|posting| match &posting.list {
+                PostingList::Compressed(list) => Some((
+                    posting.token_id,
+                    list.block_first_docs()
+                        .partition_point(|doc| u64::from(*doc) < self.doc_range.end),
+                )),
+                PostingList::Plain(_) => None,
+            })
+            .collect()
     }
 
     /// Supply a window containing the requested block. Repeated terms share it.
@@ -148,6 +189,7 @@ impl PhraseSearch {
         shared_threshold: Arc<AtomicU32>,
         metrics: &dyn MetricsCollector,
     ) -> Result<PhraseProgress<D::Candidate>> {
+        self.has_started = true;
         let mut wand = Wand::new(Operator::And, std::iter::empty(), documents, scorer)
             .with_shared_threshold(shared_threshold);
         wand.lead = std::mem::take(&mut self.lead);
@@ -160,6 +202,9 @@ impl PhraseSearch {
         // Score-first's borrowed norm cache and bulk scratch stay in their
         // existing non-suspending paths.
         wand.score_first_and_enabled = false;
+        if let Some(start) = self.seek_start.take() {
+            wand.seek(start);
+        }
         let mut comparisons = 0;
         let progress = loop {
             if self.limit == 0 {
@@ -176,7 +221,8 @@ impl PhraseSearch {
                     candidate
                 }
             };
-            let Some((doc, _)) = candidate else {
+            let Some((doc, _)) = candidate.filter(|(doc, _)| doc.doc_id() < self.doc_range.end)
+            else {
                 self.limit = 0;
                 let collector = std::mem::replace(&mut self.collector, TopKCollector::new(0, 0));
                 break PhraseProgress::Done(

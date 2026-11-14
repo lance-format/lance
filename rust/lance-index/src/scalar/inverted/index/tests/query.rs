@@ -2263,37 +2263,7 @@ async fn selective_phrase_search_reads_committed_partitions(
         true,
     )
     .await;
-    // Construct the same current mini-block positions encoding as final
-    // pipeline outputs. Ordinary FullZip and frozen file 2.0 use fallback.
-    for partition_id in 0..3 {
-        let path = posting_file_path(partition_id);
-        let reader = store.open_index_file(&path).await?;
-        let metadata = reader.schema().metadata.clone();
-        let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let schema = batch.schema();
-        let fields = schema
-            .fields()
-            .iter()
-            .map(|field| {
-                if field.name() == COMPRESSED_POSITION_COL {
-                    let mut metadata = field.metadata().clone();
-                    metadata.insert(
-                        lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.into(),
-                        lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.into(),
-                    );
-                    Arc::new(field.as_ref().clone().with_metadata(metadata))
-                } else {
-                    field.clone()
-                }
-            })
-            .collect::<Vec<_>>();
-        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
-        drop(reader);
-        let mut writer = store.new_index_file(&path, schema).await?;
-        writer.write_record_batch(batch).await?;
-        writer.finish_with_metadata(metadata).await?;
-    }
+    rewrite_selective_position_encoding(&store, 0..3).await?;
     // Fixture construction above rewrites files. Start metadata caching only
     // once their immutable contents have been finalized.
     let metadata_cache = Arc::new(if cache_metadata {
@@ -2440,5 +2410,225 @@ async fn selective_phrase_search_reads_committed_partitions(
             .await?
             .is_none()
     );
+    Ok(())
+}
+
+async fn rewrite_selective_position_encoding(
+    store: &Arc<LanceIndexStore>,
+    partition_ids: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    // Use the existing mini-block positions encoding emitted by final mergers.
+    for partition_id in partition_ids {
+        let path = posting_file_path(partition_id);
+        let reader = store.open_index_file(&path).await?;
+        let metadata = reader.schema().metadata.clone();
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let schema = batch.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == COMPRESSED_POSITION_COL {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert(
+                        lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.into(),
+                        lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                    );
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        drop(reader);
+        let mut writer = store.new_index_file(&path, schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish_with_metadata(metadata).await?;
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::unfiltered(false)]
+#[case::filtered(true)]
+#[tokio::test]
+async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) -> Result<()> {
+    let dir = TempObjDir::default();
+    let object_store = Arc::new(ObjectStore::local());
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let mut expected = Vec::new();
+    for partition in 0..2 {
+        // 645 docs make five unequal slices; boundaries cut through posting
+        // blocks. Row addresses are deliberately different from dense DocIds.
+        let rows = (0..645)
+            .map(|doc| {
+                let row = partition * 10_000 + doc * 2;
+                if doc % 3 == 0 && (!filtered || doc % 5 == 0) {
+                    expected.push(row);
+                }
+                if doc % 3 == 0 {
+                    ("alpha", "beta", row)
+                } else if doc % 3 == 1 {
+                    ("beta", "alpha", row)
+                } else {
+                    ("alpha", "gamma", row)
+                }
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition_with_position(&store, partition, &rows, true).await;
+    }
+    rewrite_selective_position_encoding(&store, 0..2).await?;
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store,
+        dir,
+        Arc::new(LanceCache::with_capacity(1 << 20)),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let (index, _cache) = load_prewarmed_index(
+        store,
+        vec![0, 1],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".into(), "beta".into()],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(2000))
+            .with_phrase_slop(Some(0)),
+    );
+    let mask = if filtered {
+        RowAddrMask::from_allowed(
+            (0..2)
+                .flat_map(|part| {
+                    (0..645)
+                        .filter(|doc| doc % 5 == 0)
+                        .map(move |doc| part * 10_000 + doc * 2)
+                })
+                .collect(),
+        )
+    } else {
+        RowAddrMask::default()
+    };
+    let request = ModernSearchRequest {
+        impact_scorer: Arc::new(index.bm25_base_scorer(&tokens, &params, None).await?),
+        tokens,
+        params,
+        operator: Operator::And,
+        mask: Arc::new(mask),
+        metrics: Arc::new(NoOpMetricsCollector),
+        limit: 2000,
+        initial_score_floor: None,
+        term_ids: None,
+    };
+    // An ordinary full-position WAND reference bypasses the selective entry
+    // point regardless of process feature flags, with the same corpus scorer.
+    let mut reference = Vec::new();
+    for part in &index.partitions {
+        let documents = part.docs.modern().unwrap();
+        let lengths = documents.lengths().await?;
+        let visibility = documents.visibility(request.mask.clone(), false).await?;
+        let fetched = part
+            .fetch_posting_lists(
+                &request.tokens,
+                &request.params,
+                Operator::And,
+                request.metrics.as_ref(),
+                PostingLoadOptions::cache_aware_exact(),
+                None,
+            )
+            .await?
+            .unwrap();
+        let loaded = fetched.into_loaded(&request.tokens, request.impact_scorer.as_ref())?;
+        let idf = idf_by_position(&loaded.postings, request.impact_scorer.as_ref());
+        let docs = ModernWandDocuments::filtered(&lengths, &visibility);
+        let candidates = Wand::new(
+            Operator::And,
+            loaded.postings.into_iter(),
+            &docs,
+            request.impact_scorer.clone(),
+        )
+        .search(&request.params, request.metrics.as_ref())?;
+        for (doc, score) in rescore_partition_candidates(
+            PartitionCandidates {
+                idf_by_position: idf,
+                grouped_expansions: Vec::new(),
+                candidates,
+            },
+            request.impact_scorer.as_ref(),
+        ) {
+            let row = documents.resolve_document_keys(&[doc]).await?[0].0;
+            reference.push((row, score));
+        }
+    }
+    reference.sort_unstable_by_key(|hit| hit.0);
+    assert_eq!(
+        reference.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+        expected
+    );
+    // Vary the window key and slice plan on the same immutable files/cache.
+    for (target_docs, window_bytes) in [(150, 16), (usize::MAX, 32), (150, 32)] {
+        let selected = index
+            .try_selective_phrase_search_with_config(
+                request.clone(),
+                selective_positions::SearchConfig {
+                    target_docs,
+                    window_bytes,
+                },
+            )
+            .await?
+            .unwrap();
+        let mut actual = Vec::new();
+        for Reverse(hit) in selected {
+            let row = index.partitions[hit.document.partition_ordinal()]
+                .docs
+                .modern()
+                .unwrap()
+                .resolve_document_keys(&[hit.document.doc_id])
+                .await?[0]
+                .0;
+            actual.push((row, hit.score));
+        }
+        actual.sort_unstable_by_key(|hit| hit.0);
+        assert_eq!(
+            actual, reference,
+            "slice target {target_docs}, window {window_bytes}"
+        );
+    }
+    // Slice-local collectors may publish their kth score globally. A bounded
+    // global top-k must retain a valid cutoff tie rather than prune all slices.
+    let mut limited = request;
+    limited.limit = 1;
+    limited.params = Arc::new(limited.params.as_ref().clone().with_limit(Some(1)));
+    let hits = index
+        .try_selective_phrase_search_with_config(
+            limited,
+            selective_positions::SearchConfig {
+                target_docs: 150,
+                window_bytes: 16,
+            },
+        )
+        .await?
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    let hit = &hits[0].0;
+    let row = index.partitions[hit.document.partition_ordinal()]
+        .docs
+        .modern()
+        .unwrap()
+        .resolve_document_keys(&[hit.document.doc_id])
+        .await?[0]
+        .0;
+    assert!(expected.contains(&row));
+    assert_eq!(hit.score, reference[0].1);
     Ok(())
 }

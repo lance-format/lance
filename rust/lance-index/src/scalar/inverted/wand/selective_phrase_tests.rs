@@ -247,3 +247,145 @@ fn selective_phrase_rejects_wrong_block_and_drops_owned_state() -> Result<()> {
     assert!(weak.upgrade().is_none());
     Ok(())
 }
+
+#[rstest]
+#[case::empty(0..0)]
+#[case::first(0..2)]
+#[case::gap_and_block(1..134)]
+#[case::middle(134..267)]
+#[case::last(267..400)]
+#[case::absent(398..400)]
+fn selective_phrase_doc_ranges_preserve_membership_and_scores(
+    #[case] range: std::ops::Range<u64>,
+    #[values(1, 500)] limit: usize,
+    #[values(false, true)] repeated: bool,
+) -> Result<()> {
+    use super::selective_phrase::{PhraseProgress, PhraseSearch, PositionWindow};
+    let docs = unit_length_docs(400);
+    let codec = PositionStreamCodec::PackedDelta;
+    let build = |selected: std::ops::Range<u64>| {
+        (0..2)
+            .map(|term| {
+                let ids = (0..398_u32)
+                    .step_by(3)
+                    .filter(|doc| selected.contains(&u64::from(*doc)))
+                    .collect::<Vec<_>>();
+                let positions = ids
+                    .iter()
+                    .map(|doc| {
+                        // The late high score must not raise an earlier slice's floor.
+                        let count = if *doc == 396 { 32 } else { 1 + doc / 30 };
+                        (0..count)
+                            .map(|position| position * 4 + if repeated { 0 } else { term })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let mut list =
+                    generate_posting_list_with_positions(ids, positions.clone(), 100.0, true);
+                let PostingList::Compressed(list) = &mut list else {
+                    unreachable!()
+                };
+                let mut bytes = Vec::new();
+                let mut offsets = Vec::new();
+                for block in positions.chunks(list.block_size) {
+                    offsets.push(bytes.len() as u32);
+                    let frequencies = block
+                        .iter()
+                        .map(|positions| positions.len() as u32)
+                        .collect::<Vec<_>>();
+                    let values = block.iter().flatten().copied().collect::<Vec<_>>();
+                    encode_position_stream_block_into(&values, &frequencies, codec, &mut bytes)
+                        .unwrap();
+                }
+                list.positions = Some(CompressedPositionStorage::SharedStream(
+                    SharedPositionStream::new(codec, offsets, bytes::Bytes::from(bytes)),
+                ));
+                PostingIterator::with_query_weight(
+                    "term".into(),
+                    if repeated { 0 } else { term },
+                    if repeated { term * 4 } else { term },
+                    1.0,
+                    PostingList::Compressed(list.clone()),
+                    400,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let postings = build(0..400);
+    let sources = postings
+        .iter()
+        .map(|posting| {
+            let PostingList::Compressed(list) = &posting.list else {
+                unreachable!()
+            };
+            let Some(CompressedPositionStorage::SharedStream(stream)) = &list.positions else {
+                unreachable!()
+            };
+            (posting.token_id, stream.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut search = PhraseSearch::new(postings, limit)?.with_doc_range(range.clone())?;
+    let limits = search.position_block_limits();
+    let shared = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+    let actual = loop {
+        match search.advance(&docs, UnitScorer, shared.clone(), &NoOpMetricsCollector)? {
+            PhraseProgress::Done(hits) => break hits,
+            PhraseProgress::Read(requests) => {
+                for request in requests {
+                    let end = limits
+                        .iter()
+                        .find(|(token, _)| *token == request.token_id)
+                        .unwrap()
+                        .1;
+                    assert!(
+                        request.index < end,
+                        "no read may start beyond the exclusive slice end"
+                    );
+                    let stream = &sources
+                        .iter()
+                        .find(|(token, _)| *token == request.token_id)
+                        .unwrap()
+                        .1;
+                    let bytes = stream.block_range(request.index);
+                    search.supply(
+                        request,
+                        PositionWindow {
+                            first_block: request.index,
+                            codec,
+                            offsets: Arc::from([0]),
+                            bytes: Arc::from(&stream.bytes()[bytes]),
+                        },
+                    )?;
+                }
+            }
+        }
+    };
+    assert!(actual.iter().all(|hit| range.contains(&hit.posting_doc_id)));
+    // The reference removes out-of-range postings before ordinary WAND runs,
+    // while retaining the original document statistics and lengths.
+    let expected = if (0..398_u64).step_by(3).any(|doc| range.contains(&doc)) {
+        let mut reference = Wand::new(Operator::And, build(range).into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Off);
+        reference.search(
+            &FtsSearchParams::default()
+                .with_limit(Some(limit))
+                .with_phrase_slop(Some(0)),
+            &NoOpMetricsCollector,
+        )?
+    } else {
+        Vec::new()
+    };
+    let normalize = |hits: Vec<DocCandidate<u64>>| {
+        let mut hits = hits
+            .into_iter()
+            .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+            .collect::<Vec<_>>();
+        hits.sort_unstable();
+        hits
+    };
+    assert_eq!(normalize(actual), normalize(expected));
+    let error = search.with_doc_range(0..400).err().unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("after search starts"));
+    Ok(())
+}

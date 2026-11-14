@@ -1706,6 +1706,7 @@ impl InvertedPartition {
 /// Building iterators allocates per-cursor decode state, so the modern search
 /// path defers [`Self::into_loaded`] to the CPU task that runs WAND and later
 /// frees that state on the same thread.
+#[derive(Clone)]
 pub(super) struct FetchedPostings {
     /// `(token_id, token_index, position, posting)` sorted by
     /// `(position, token_id)`; `token_index` indexes the fetched `Tokens`.
