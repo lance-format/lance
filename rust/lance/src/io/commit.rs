@@ -2819,13 +2819,24 @@ mod tests {
     #[case::append_null_after_set_not_null("set_not_null")]
     #[case::append_after_overwrite_reusing_field_ids("overwrite")]
     #[case::append_after_overwrite_swapping_same_type_columns("overwrite_swap")]
+    #[case::append_after_overwrite_swapping_same_type_structs("overwrite_nested_swap")]
     #[tokio::test]
     async fn test_schema_dependent_commit_rejects_cleaned_history(#[case] concurrent: &str) {
-        let initial = arrow_array::record_batch!(
-            ("id", Int32, [0, 1, 2, 3]),
-            ("x", Int32, [Some(0), Some(1), Some(2), Some(3)])
-        )
-        .unwrap();
+        let (initial, staged) = if concurrent == "overwrite_nested_swap" {
+            (
+                struct_pair_batch(["a", "b"], [0, 1]),
+                struct_pair_batch(["a", "b"], [7, 70]),
+            )
+        } else {
+            (
+                arrow_array::record_batch!(
+                    ("id", Int32, [0, 1, 2, 3]),
+                    ("x", Int32, [Some(0), Some(1), Some(2), Some(3)])
+                )
+                .unwrap(),
+                arrow_array::record_batch!(("id", Int32, [4]), ("x", Int32, [None])).unwrap(),
+            )
+        };
         let stale = Arc::new(
             crate::dataset::InsertBuilder::new("memory://")
                 .execute(vec![initial])
@@ -2837,9 +2848,7 @@ mod tests {
                 mode: WriteMode::Append,
                 ..Default::default()
             })
-            .execute_uncommitted(vec![
-                arrow_array::record_batch!(("id", Int32, [4]), ("x", Int32, [None])).unwrap(),
-            ])
+            .execute_uncommitted(vec![staged])
             .await
             .unwrap();
         let mut latest = stale.as_ref().clone();
@@ -2894,6 +2903,17 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Only the parents swap: both written leaves are still `x: int32`.
+            "overwrite_nested_swap" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![struct_pair_batch(["b", "a"], [5, 6])])
+                    .await
+                    .unwrap();
+            }
             _ => unreachable!(),
         }
         let latest = CommitBuilder::new(Arc::new(latest))
@@ -2931,6 +2951,18 @@ mod tests {
         );
         assert!(error.to_string().contains("versions [2]"), "{error}");
         assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+    }
+
+    /// One row with two `struct<x: int32>` columns.
+    fn struct_pair_batch(names: [&str; 2], values: [i32; 2]) -> RecordBatch {
+        let column = |value: i32| -> arrow_array::ArrayRef {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("x", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+            )]))
+        };
+        RecordBatch::try_from_iter([(names[0], column(values[0])), (names[1], column(values[1]))])
+            .unwrap()
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {

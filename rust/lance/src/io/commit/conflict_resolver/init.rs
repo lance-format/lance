@@ -443,13 +443,18 @@ fn conflicts_with_unseen_schema_change(
         .filter(|field_id| **field_id >= 0)
         .any(|field_id| {
             match (
-                read_schema.field_by_id(*field_id),
-                latest_schema.field_by_id(*field_id),
+                read_schema.field_ancestry_by_id(*field_id),
+                latest_schema.field_ancestry_by_id(*field_id),
             ) {
-                // An overwrite can reuse an id for another column of the same type.
-                (Some(read_field), Some(latest_field)) => {
-                    read_field.name != latest_field.name
-                        || read_field.data_type() != latest_field.data_type()
+                // An overwrite can reuse an id for another column of the same
+                // type, so the leaf's whole path must still name the same field.
+                (Some(read_path), Some(latest_path)) => {
+                    !read_path
+                        .iter()
+                        .map(|field| &field.name)
+                        .eq(latest_path.iter().map(|field| &field.name))
+                        || read_path.last().map(|field| field.data_type())
+                            != latest_path.last().map(|field| field.data_type())
                 }
                 _ => true,
             }
