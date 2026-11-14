@@ -41,6 +41,8 @@ use crate::{
     statistics::{ComputeStat, Stat},
 };
 
+mod admitted;
+
 /// A data block with no buffers where everything is null
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated

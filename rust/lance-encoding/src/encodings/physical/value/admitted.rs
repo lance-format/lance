@@ -289,9 +289,14 @@ mod tests {
             .unwrap();
         assert!(workspace.is_empty());
         assert_eq!(budget.reserved(), input_bytes + output_bytes);
+        // The admitted codec output must compose with typed materialization without
+        // an extra payload allocation. All fields in this fixture are nullable, so
+        // Arrow needs no non-nullable-child validation scratch either.
         let actual_data = output
-            .into_arrow(expected.data_type().clone(), true)
+            .try_to_arrow_in(expected.data_type(), &mut workspace)
+            .unwrap()
             .unwrap();
+        drop(output);
         // Arrow may discard an all-valid bitmap, but must not create an uncharged payload.
         let retained = actual_data.get_buffer_memory_size();
         assert!(retained <= output_bytes);
