@@ -2107,11 +2107,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
 /// batches.
 ///
 /// The classification is the reader's own (`segment_supports_batch_remapping`),
-/// so a segment the reader would translate keeps its provenance, except stale
-/// list-element segments (below):
-/// - a list-element segment whose key fields no longer resolve in
-///   `dataset`'s schema is listed before the probe runs: nothing queries or
-///   rebuilds it, so keeping its provenance would only pin the history;
+/// so a segment the reader would translate keeps its provenance:
 /// - `Some(true)`: deferrable, not listed;
 /// - `Some(false)`: listed, its coverage of the rewritten sources withdrawn;
 /// - `None`: not listed. Details that cannot be interpreted are refused
@@ -2210,20 +2206,6 @@ pub(crate) async fn undeferrable_segments_covering<'a>(
             });
         if !covers_directly && !covers_through_history {
             continue;
-        }
-        // A stale list-element segment (a key was dropped or retyped in the
-        // schema this rewrite builds on) is never queried or rebuilt, so a
-        // deferred rewrite must withdraw its coverage rather than leave it
-        // pinning the history. This is deliberately not part of the reader's
-        // probe: `remap_column_index` can still catch such a segment up.
-        // An undecodable one is unknown, not a verdict.
-        match super::scalar::list_element::is_stale(dataset.schema(), index) {
-            Ok(true) => {
-                undeferrable.push(index.uuid);
-                continue;
-            }
-            Ok(false) => {}
-            Err(_) => continue,
         }
         // TODO: Support deferred remapping for all index types.
         // Only a CONFIRMED undeferrable verdict withdraws coverage. A probe

@@ -1366,6 +1366,28 @@ mod tests {
         assert_eq!(indices.iter().any(|idx| idx.name == "idx3"), is_retained);
     }
 
+    #[rstest]
+    #[case::all_fields(&["s.x", "s.y", "b"], true)]
+    #[case::indexed_child_dropped(&["s.y", "b"], false)]
+    #[case::unindexed_sibling_dropped(&["s.x", "b"], true)]
+    fn test_retain_unknown_plugin_nested_dependencies(
+        #[case] retained_paths: &[&str],
+        #[case] is_retained: bool,
+    ) {
+        let schema = create_nested_test_schema().project(retained_paths).unwrap();
+        let mut index =
+            create_test_index("external", 0, 1, Some(RoaringBitmap::from_iter([1])), false);
+        index.fields = vec![0, 1];
+        index.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/example.ExternalIndexDetails".to_string(),
+            // Generic schema maintenance must not decode plugin-specific bytes.
+            value: vec![0xff],
+        }));
+        let mut indices = vec![index];
+        Transaction::retain_relevant_indices(&mut indices, &schema, &[Fragment::new(1)]);
+        assert_eq!(indices.len(), usize::from(is_retained));
+    }
+
     #[test]
     fn test_retain_indices_keeps_system_indices() {
         use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;

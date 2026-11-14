@@ -158,10 +158,6 @@ pub(super) async fn segment_supports_batch_remapping(
     let Some(details) = index.index_details.as_ref() else {
         return Ok(None);
     };
-    // The plugin's answer only. A stale list-element segment (a dropped or
-    // retyped key) still answers `Some(true)` here, so `remap_column_index`
-    // can catch it up; only the deferred-compaction withdrawal selector treats
-    // staleness as undeferrable.
     if super::segment::segment_has_vector_details(index) {
         return Ok(Some(
             super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index).await?,

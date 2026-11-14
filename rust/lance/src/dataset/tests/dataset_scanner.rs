@@ -2227,6 +2227,12 @@ async fn test_element_index_follows_renamed_key_fields(
             .unwrap();
         compact_with_frag_reuse(&mut dataset).await;
     }
+    let fields_before = crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.fields)
+        .collect::<Vec<_>>();
     // Open the index before the renames, so it is cached under the old names.
     assert_eq!(
         any_element_ids(&dataset, CAR_ABOVE_09, true).await,
@@ -2244,6 +2250,16 @@ async fn test_element_index_follows_renamed_key_fields(
             .await
             .unwrap();
     }
+    let fields_after = crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.fields)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields_after, fields_before,
+        "renames changed dependency IDs"
+    );
     let batch = detections_named(
         DETECTION_ROWS..DETECTION_ROWS + 400,
         ["label", "area", "confidence"],
@@ -2303,7 +2319,7 @@ enum KeyDropHistory {
     /// Stable row IDs with a deferred compaction already recorded.
     StableRowIds,
     /// A tagged history whose deferred compaction ran while the key still
-    /// resolved, so the segment kept its provenance and went stale afterwards.
+    /// resolved, so the segment kept provenance until the key was dropped.
     TaggedAfterDefer,
 }
 
@@ -2333,13 +2349,9 @@ async fn stable_history_len(dataset: &Dataset) -> usize {
         .len()
 }
 
-/// Dropping a key field leaves the index in place but unusable: queries scan,
-/// and optimizing skips it. What happens to the history depends on the order:
-/// - key dropped BEFORE a deferred compaction: on a tagged history the
-///   tagged withdrawal releases the segment so cleanup drains, and on stable
-///   row IDs the compaction is refused while the segment exists;
-/// - key dropped AFTER one: `remap_column_index` catches the segment up and
-///   cleanup drains.
+/// Dropping an indexed nested key removes the index through ordinary schema
+/// dependency checks, before or after deferred compaction. Queries scan and
+/// later compaction and cleanup need no remap of the removed index.
 #[rstest]
 #[tokio::test]
 async fn test_element_index_dropped_key_field(
@@ -2364,8 +2376,7 @@ async fn test_element_index_dropped_key_field(
             let mut dataset = detection_dataset(true, true).await;
             // Allowed: the key field still resolves.
             compact_with_frag_reuse(&mut dataset).await;
-            // Leave the compacted fragment a rewrite candidate, so a missing
-            // gate would record a version.
+            // Leave the compacted fragment a rewrite candidate after the drop.
             dataset.delete("id % 4 = 0").await.unwrap();
             dataset
         }
@@ -2395,6 +2406,13 @@ async fn test_element_index_dropped_key_field(
         .drop_columns(&["detections.item.confidence"])
         .await
         .unwrap();
+    assert!(
+        crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the dropped key's segment remains in the manifest"
+    );
     let filter = "any_element(detections, 'label = ''carrot''')";
     let mut expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
     match history {
@@ -2413,11 +2431,7 @@ async fn test_element_index_dropped_key_field(
     match history {
         KeyDropHistory::None => {}
         KeyDropHistory::TaggedAfterDefer => {
-            // The segment is stale yet still holds retired provenance, so
-            // `remap_column_index` must be able to release it.
-            remap_column_index(&mut dataset, &["detections"], None)
-                .await
-                .unwrap();
+            // The removed index no longer pins its retired provenance.
             cleanup_frag_reuse_index(&mut dataset).await.unwrap();
             assert_eq!(frag_reuse_entry_version(&dataset).await, None);
             // Give the eager compaction something to rewrite.
@@ -2438,15 +2452,7 @@ async fn test_element_index_dropped_key_field(
             assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
         }
         KeyDropHistory::Tagged => {
-            let live_ids = |dataset: &Dataset| {
-                dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|fragment| fragment.id() as u32)
-                    .collect::<RoaringBitmap>()
-            };
-            let before = live_ids(&dataset);
-            compact_files(
+            let metrics = compact_files(
                 &mut dataset,
                 CompactionOptions {
                     defer_index_remap: true,
@@ -2457,25 +2463,10 @@ async fn test_element_index_dropped_key_field(
             )
             .await
             .unwrap();
-            // The fragments this compaction rewrote.
-            let retired = &before - live_ids(&dataset);
-            assert!(!retired.is_empty());
-            assert!(frag_reuse_entry_version(&dataset).await.unwrap() >= 1);
-            let segments =
-                crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
-                    .await
-                    .unwrap();
-            assert!(!segments.is_empty());
-            for segment in &segments {
-                let bitmap = segment.fragment_bitmap.as_ref().unwrap();
-                assert!(
-                    bitmap.is_disjoint(&retired),
-                    "the stale segment still covers retired fragments: {bitmap:?} vs {retired:?}"
-                );
-            }
+            assert!(metrics.fragments_removed > 0);
             cleanup_frag_reuse_index(&mut dataset).await.unwrap();
             assert_eq!(frag_reuse_entry_version(&dataset).await, None);
-            let metrics = compact_files(
+            compact_files(
                 &mut dataset,
                 CompactionOptions {
                     defer_index_remap: false,
@@ -2485,12 +2476,10 @@ async fn test_element_index_dropped_key_field(
             )
             .await
             .unwrap();
-            assert!(metrics.fragments_removed > 0);
             assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
         }
         KeyDropHistory::StableRowIds => {
-            let version = dataset.manifest.version;
-            let error = compact_files(
+            let metrics = compact_files(
                 &mut dataset,
                 CompactionOptions {
                     defer_index_remap: true,
@@ -2499,19 +2488,9 @@ async fn test_element_index_dropped_key_field(
                 None,
             )
             .await
-            .unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-            assert!(error.to_string().contains("detections_idx"), "{error}");
-            assert!(
-                error.to_string().contains("cleanup_frag_reuse_index"),
-                "{error}"
-            );
-            assert!(error.to_string().contains("remap_column_index"), "{error}");
-            assert_eq!(dataset.manifest.version, version);
-
-            remap_column_index(&mut dataset, &["detections"], None)
-                .await
-                .unwrap();
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            // The independent width index can still pin the stable history.
             remap_column_index(&mut dataset, &["width"], None)
                 .await
                 .unwrap();

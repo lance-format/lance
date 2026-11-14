@@ -1990,6 +1990,7 @@ mod test {
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_index::{IndexType, optimize::OptimizeOptions, scalar::ScalarIndexParams};
     use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
 
@@ -6532,6 +6533,162 @@ mod test {
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
         assert_eq!(dataset.scan().try_into_batch().await?, expected);
+        dataset.validate().await?;
+        Ok(())
+    }
+
+    async fn list_element_schema_dataset() -> Result<Dataset> {
+        let values = record_batch!(
+            ("age", Int32, [25, 35, 40, 28]),
+            ("city", Utf8, ["a", "b", "c", "d"])
+        )?;
+        let item = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(values.schema().fields().clone()),
+            true,
+        ));
+        let people = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([1, 1, 1, 1]),
+            Arc::new(StructArray::from(values)),
+            None,
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+            ("people", Arc::new(people) as ArrayRef),
+        ])?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+        dataset
+            .create_index(
+                &["people"],
+                IndexType::Scalar,
+                Some("people_age".to_string()),
+                &ScalarIndexParams::new("listelement".to_string())
+                    .with_params(&serde_json::json!({"keys": ["age"]})),
+                false,
+            )
+            .await?;
+        Ok(dataset)
+    }
+
+    #[tokio::test]
+    async fn test_cast_list_element_indexed_key_requires_drop() -> Result<()> {
+        let mut dataset = list_element_schema_dataset().await?;
+        let version = dataset.version().version;
+        let schema = dataset.schema().clone();
+        let indices = load_all_indices(&dataset).await?;
+        let cast = ColumnAlteration::new("people.item.age".to_string()).cast_to(DataType::Int64);
+        let error = dataset
+            .alter_columns(std::slice::from_ref(&cast))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("age"), "{error}");
+        assert!(error.to_string().contains("people_age"), "{error}");
+        assert!(error.to_string().contains("drop_index"), "{error}");
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.schema(), &schema);
+        assert_eq!(load_all_indices(&dataset).await?.as_ref(), indices.as_ref());
+
+        dataset.drop_index("people_age").await?;
+        dataset.alter_columns(&[cast]).await?;
+        assert_eq!(
+            dataset
+                .schema()
+                .field("people.item.age")
+                .unwrap()
+                .data_type(),
+            DataType::Int64
+        );
+        dataset
+            .create_index(
+                &["people"],
+                IndexType::Scalar,
+                Some("people_age".to_string()),
+                &ScalarIndexParams::new("listelement".to_string())
+                    .with_params(&serde_json::json!({"keys": ["age"]})),
+                false,
+            )
+            .await?;
+        for use_scalar_index in [false, true] {
+            let mut scan = dataset.scan();
+            scan.project(&["id"])?
+                .filter("any_element(people, 'age >= 35')")?
+                .use_scalar_index(use_scalar_index);
+            if use_scalar_index {
+                let plan = scan.explain_plan(true).await?;
+                assert!(plan.contains("ListElement(people"), "{plan}");
+            }
+            let batch = scan.try_into_batch().await?;
+            let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(ids, [2, 3]);
+        }
+        dataset.validate().await?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::drop(None)]
+    #[case::cast(Some(DataType::LargeUtf8))]
+    #[tokio::test]
+    async fn test_list_element_unindexed_sibling_preserves_index(
+        #[case] cast_type: Option<DataType>,
+    ) -> Result<()> {
+        let mut dataset = list_element_schema_dataset().await?;
+        let index = load_all_indices(&dataset).await?[0].clone();
+        if let Some(cast_type) = cast_type {
+            dataset
+                .alter_columns(&[
+                    ColumnAlteration::new("people.item.city".to_string()).cast_to(cast_type)
+                ])
+                .await?;
+        } else {
+            dataset.drop_columns(&["people.item.city"]).await?;
+        }
+        let retained = load_all_indices(&dataset).await?;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].uuid, index.uuid);
+        assert_eq!(retained[0].fields, index.fields);
+        let mut scan = dataset.scan();
+        scan.project(&["id"])?
+            .filter("any_element(people, 'age >= 35')")?;
+        let batch = scan.try_into_batch().await?;
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, [2, 3]);
+        // Casting can rewrite the list and withdraw coverage; optimization
+        // restores the index using the keys that are still present.
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await?;
+        for use_scalar_index in [false, true] {
+            let mut scan = dataset.scan();
+            scan.project(&["id"])?
+                .filter("any_element(people, 'age >= 35')")?
+                .use_scalar_index(use_scalar_index);
+            if use_scalar_index {
+                let plan = scan.explain_plan(true).await?;
+                assert!(plan.contains("ListElement(people"), "{plan}");
+            }
+            let batch = scan.try_into_batch().await?;
+            let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(ids, [2, 3]);
+        }
         dataset.validate().await?;
         Ok(())
     }

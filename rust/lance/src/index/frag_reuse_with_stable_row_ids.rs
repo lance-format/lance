@@ -214,25 +214,6 @@ fn ensure_frag_reuse_recording_allowed_when(
     }
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
-        // Not part of `address_index_incompatibility`: a stale segment is
-        // otherwise compatible, but nothing queries or rebuilds it, so the
-        // moves recorded for it would never be caught up.
-        if let Some(stale) = indices.iter().find(|index| {
-            !is_frag_reuse_index_entry(index)
-                && super::scalar::list_element::is_stale(&manifest.schema, index).unwrap_or(false)
-        }) {
-            return Err(Error::invalid_input(format!(
-                "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
-                 index `{}` ({}) is a list-element index whose key field was dropped or \
-                 changed type. It is no longer used or rebuilt, so the row-address moves \
-                 recorded for it would never be caught up. Drop the index (and recreate it \
-                 on the remaining keys if it is still needed). If you keep it, run \
-                 remap_column_index on it and then clean up the fragment reuse history \
-                 (cleanup_frag_reuse_index); after that, compaction without \
-                 defer_index_remap works",
-                stale.name, stale.uuid
-            )));
-        }
         return Ok(());
     }
     let listed = list_incompatible(&incompatible);
@@ -622,57 +603,17 @@ mod tests {
         );
         assert_rejected(result, "`bitmap`");
 
-        // A list-element index passes `address_index_incompatibility` either
-        // way; only a key that no longer resolves refuses it.
+        // Field dependencies are maintained by ordinary schema commits. The
+        // recording gate only needs to establish row-address compatibility.
         let mut list_index = index_with("detections_idx", list_element_details(), 0);
         list_index.fields.extend([2, 3]);
         assert!(address_index_incompatibility(&list_index).is_none());
-        let detections = |with_confidence: bool| {
-            let mut item_fields = vec![arrow_schema::Field::new(
-                "label",
-                arrow_schema::DataType::Utf8,
-                true,
-            )];
-            if with_confidence {
-                item_fields.push(arrow_schema::Field::new(
-                    "confidence",
-                    arrow_schema::DataType::Float32,
-                    true,
-                ));
-            }
-            let item = arrow_schema::Field::new(
-                "item",
-                arrow_schema::DataType::Struct(item_fields.into()),
-                true,
-            );
-            let schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "detections",
-                arrow_schema::DataType::List(Arc::new(item)),
-                true,
-            )]);
-            let mut manifest = stable_row_id_manifest();
-            manifest.schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-            manifest
-        };
-        let resolving = detections(true);
-        assert!(
-            crate::index::scalar::list_element::key_fields_resolve(&resolving.schema, &list_index)
-                .unwrap()
-        );
         ensure_frag_reuse_recording_allowed_when(
-            &resolving,
+            &manifest,
             std::slice::from_ref(&list_index),
             true,
         )
         .unwrap();
-        assert_rejected(
-            ensure_frag_reuse_recording_allowed_when(
-                &detections(false),
-                std::slice::from_ref(&list_index),
-                true,
-            ),
-            "`detections_idx`",
-        );
     }
 
     async fn stable_row_id_dataset(uri: &str) -> Dataset {
