@@ -58,6 +58,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayInputStream;
@@ -1194,6 +1196,65 @@ public class DatasetTest {
               dataset2.takeRows(null, columns);
             });
       }
+    }
+  }
+
+  @Test
+  void testTakeStructProjection(@TempDir Path tempDir) throws Exception {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = createStructTakeDataset(allocator, datasetPath)) {
+      assertEquals(2, dataset.getFragments().size());
+      List<Long> rowIds = listRowIds(dataset);
+
+      try (ArrowReader reader = dataset.take(Arrays.asList(0L, 4L), Arrays.asList("id", "s.x"))) {
+        assertStructTakeResult(reader, new long[] {0L, 4L}, new Integer[] {0, 40});
+      }
+
+      // The row IDs come from a scan, so the selectors are physical and cross fragments.
+      try (ArrowReader reader =
+          dataset.takeRows(
+              Arrays.asList(rowIds.get(5), rowIds.get(0)), Arrays.asList("id", "s.x"))) {
+        assertStructTakeResult(reader, new long[] {5L, 0L}, new Integer[] {50, 0});
+      }
+    }
+  }
+
+  @ParameterizedTest(name = "{0} rejects {1}")
+  @MethodSource("missingStructProjections")
+  void testTakeRejectsMissingStructProjection(String api, String missingPath, @TempDir Path tempDir)
+      throws Exception {
+    Path datasetPath =
+        tempDir.resolve("testTakeRejectsMissingStructProjection-" + missingPath.replace('.', '-'));
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = createStructTakeDataset(allocator, datasetPath.toString())) {
+      List<Long> selectors;
+      if (api.equals("take")) {
+        selectors = Arrays.asList(0L, 4L);
+      } else {
+        List<Long> rowIds = listRowIds(dataset);
+        selectors = Arrays.asList(rowIds.get(0), rowIds.get(5));
+      }
+      List<String> columns = Arrays.asList("id", missingPath);
+
+      RuntimeException error =
+          assertThrows(
+              RuntimeException.class,
+              () -> {
+                try (ArrowReader reader =
+                    api.equals("take")
+                        ? dataset.take(selectors, columns)
+                        : dataset.takeRows(selectors, columns)) {
+                  fail("expected " + api + " to reject the projection path " + missingPath);
+                }
+              });
+      // A Java precondition failure is an IllegalArgumentException, and a native call that
+      // failed to throw would leave null Arrow data and surface as a NullPointerException.
+      assertEquals(RuntimeException.class, error.getClass(), error.toString());
+      String message = error.getMessage();
+      assertNotNull(message);
+      assertTrue(message.contains("Field '" + missingPath + "' not found"), message);
     }
   }
 
@@ -2647,6 +2708,103 @@ public class DatasetTest {
         }
       }
     }
+  }
+
+  private static Dataset createStructTakeDataset(BufferAllocator allocator, String path) {
+    Field structField =
+        new Field(
+            "s",
+            FieldType.nullable(new ArrowType.Struct()),
+            Collections.singletonList(Field.nullable("x", new ArrowType.Int(32, true))));
+    Schema schema =
+        new Schema(
+            Arrays.asList(Field.notNullable("id", new ArrowType.Int(32, true)), structField));
+    try (Dataset empty =
+            Dataset.write()
+                .allocator(allocator)
+                .uri(path)
+                .schema(schema)
+                .enableStableRowIds(true)
+                .execute();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector ids = (IntVector) root.getVector("id");
+      StructVector struct = (StructVector) root.getVector("s");
+      IntVector x = (IntVector) struct.getChild("x");
+      for (int i = 0; i < 6; i++) {
+        ids.setSafe(i, i);
+        if (i == 2) {
+          struct.setNull(i);
+        } else {
+          struct.setIndexDefined(i);
+          x.setSafe(i, i * 10);
+        }
+      }
+      root.setRowCount(6);
+      List<FragmentMetadata> fragments =
+          Fragment.create(
+              path,
+              allocator,
+              root,
+              new WriteParams.Builder()
+                  .withMode(WriteParams.WriteMode.APPEND)
+                  .withEnableStableRowIds(true)
+                  .withMaxRowsPerFile(3)
+                  .build());
+      try (Transaction transaction =
+          new Transaction.Builder()
+              .readVersion(empty.version())
+              .operation(Append.builder().fragments(fragments).build())
+              .build()) {
+        return new CommitBuilder(empty).execute(transaction);
+      }
+    }
+  }
+
+  private static List<Long> listRowIds(Dataset dataset) throws Exception {
+    List<Long> rowIds = new ArrayList<>();
+    Set<Long> fragmentIds = new HashSet<>();
+    try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .columns(List.of("id"))
+                    .withRowId(true)
+                    .withRowAddress(true)
+                    .build());
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        UInt8Vector ids = (UInt8Vector) root.getVector("_rowid");
+        UInt8Vector addresses = (UInt8Vector) root.getVector("_rowaddr");
+        for (int i = 0; i < root.getRowCount(); i++) {
+          rowIds.add(ids.get(i));
+          fragmentIds.add(addresses.get(i) >>> 32);
+        }
+      }
+    }
+    assertEquals(2, fragmentIds.size(), "expected row addresses in both fragments");
+    return rowIds;
+  }
+
+  private static Stream<Arguments> missingStructProjections() {
+    List<String> paths = Arrays.asList("missing", "s.missing", "id.child", "_rowid.child");
+    return Stream.of("take", "takeRows")
+        .flatMap(api -> paths.stream().map(path -> Arguments.of(api, path)));
+  }
+
+  private static void assertStructTakeResult(
+      ArrowReader reader, long[] expectedIds, Integer[] expectedX) throws IOException {
+    assertTrue(reader.loadNextBatch());
+    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+    assertEquals(expectedIds.length, root.getRowCount());
+    IntVector ids = (IntVector) root.getVector("id");
+    StructVector struct = (StructVector) root.getVector("s");
+    IntVector x = (IntVector) struct.getChild("x");
+    for (int i = 0; i < expectedIds.length; i++) {
+      assertEquals(expectedIds[i], ids.get(i));
+      assertEquals(expectedX[i], x.getObject(i));
+    }
+    assertFalse(reader.loadNextBatch());
   }
 
   @Test

@@ -1092,6 +1092,16 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+@pytest.mark.parametrize("columns", [["a", "nope"], ["s.nope"], ["a.b"]])
+def test_take_unknown_column(tmp_path: Path, columns):
+    table = pa.table({"a": [1, 10], "s": pa.array([{"x": 2}, {"x": 20}])})
+    dataset = lance.write_dataset(table, tmp_path)
+    with pytest.raises(ValueError, match="not found"):
+        dataset.take([0], columns=columns)
+    with pytest.raises(ValueError, match="not found"):
+        dataset._take_rows([0], columns=columns)
+
+
 @pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
 def test_slice(tmp_path: Path, data_storage_version: str):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})

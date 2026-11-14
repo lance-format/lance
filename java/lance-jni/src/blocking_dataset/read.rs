@@ -762,7 +762,7 @@ fn inner_take(
     let result = {
         let dataset = clone_dataset(env, &java_dataset)?.inner;
 
-        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let projection = ProjectionRequest::try_from_columns(columns, dataset.schema())?;
 
         match block_on(dataset.take(indices_slice, projection)) {
             Ok(res) => res,
@@ -812,7 +812,7 @@ fn inner_take_rows(
     let result = {
         let dataset = clone_dataset(env, &java_dataset)?.inner;
 
-        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let projection = ProjectionRequest::try_from_columns(columns, dataset.schema())?;
 
         match block_on(dataset.take_rows(&row_ids_u64, projection)) {
             Ok(res) => res,
