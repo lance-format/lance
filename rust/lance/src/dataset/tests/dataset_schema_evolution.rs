@@ -2,14 +2,21 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
+use crate::dataset::{
+    ColumnAlteration, MergeInsertBuilder, NewColumnTransform, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
+};
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, NullArray, RecordBatch,
+    Array, ArrayRef, FixedSizeListArray, Int32Array, Int64Array, ListArray, NullArray, RecordBatch,
     RecordBatchIterator, StringArray, StructArray,
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
 };
+use lance_core::datatypes::{
+    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+};
+use lance_core::utils::tempfile::TempStrDir;
 use lance_file::version::LanceFileVersion;
 use rstest::rstest;
 use std::collections::HashMap;
@@ -913,4 +920,313 @@ async fn test_add_nested_child_reads_null_then_round_trips(
     let expected =
         arrow_select::concat::concat_batches(&expected.schema(), &[source, kept]).unwrap();
     assert_reads(&dataset, &expected, new_leaf, old_leaf).await;
+}
+
+/// A cast changes a column's type, not its membership in the primary or
+/// clustering key: `merge_insert` takes its default join keys from the schema.
+///
+/// The fixture stores the keys in the three representations a manifest can
+/// have: `tenant` keeps both the field property and the metadata, `id` keeps
+/// only the property, and `region` keeps only the metadata.
+#[tokio::test]
+async fn test_alter_columns_cast_keeps_key_columns() -> crate::Result<()> {
+    let key =
+        |name: &str, position: &str| HashMap::from([(name.to_string(), position.to_string())]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("tenant", DataType::Int32, false)
+            .with_metadata(key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")),
+        ArrowField::new("id", DataType::Int32, false)
+            .with_metadata(key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "2")),
+        ArrowField::new("region", DataType::Int32, false)
+            .with_metadata(key(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1")),
+        ArrowField::new("value", DataType::Int32, true),
+    ]));
+    let int32 = |values| Arc::new(Int32Array::from(values)) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            int32(vec![1, 1]),
+            int32(vec![1, 2]),
+            int32(vec![10, 20]),
+            int32(vec![100, 200]),
+        ],
+    )?;
+    let test_dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // Keep `tenant` with both representations, drop the metadata from `id` so
+    // only the field property remains, and drop the property from `region` so
+    // only the metadata remains.
+    let fields = &mut Arc::make_mut(&mut dataset.manifest).schema.fields;
+    fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .unwrap()
+        .metadata
+        .clear();
+    fields
+        .iter_mut()
+        .find(|field| field.name == "region")
+        .unwrap()
+        .unenforced_clustering_key_position = None;
+    let schema = dataset.schema();
+    assert_eq!(
+        schema
+            .field("tenant")
+            .unwrap()
+            .unenforced_primary_key_position,
+        Some(1)
+    );
+    assert!(
+        schema
+            .field("tenant")
+            .unwrap()
+            .metadata
+            .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+    );
+    assert_eq!(
+        schema.field("id").unwrap().unenforced_primary_key_position,
+        Some(2)
+    );
+    assert!(
+        !schema
+            .field("id")
+            .unwrap()
+            .metadata
+            .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+    );
+    assert_eq!(
+        schema
+            .field("region")
+            .unwrap()
+            .unenforced_clustering_key_position,
+        None
+    );
+    assert_eq!(
+        schema
+            .field("region")
+            .unwrap()
+            .metadata
+            .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+            .map(String::as_str),
+        Some("1")
+    );
+
+    dataset
+        .alter_columns(&[
+            ColumnAlteration::new("tenant".into()).cast_to(DataType::Int64),
+            ColumnAlteration::new("id".into()).cast_to(DataType::Int64),
+            ColumnAlteration::new("region".into()).cast_to(DataType::Int64),
+        ])
+        .await?;
+    let reopened = Dataset::open(&test_dir).await?;
+
+    let names = |fields: Vec<&lance_core::datatypes::Field>| {
+        fields
+            .into_iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
+    };
+    for dataset in [&dataset, &reopened] {
+        let schema = dataset.schema();
+        for name in ["tenant", "id", "region"] {
+            assert_eq!(schema.field(name).unwrap().data_type(), DataType::Int64);
+        }
+        assert_eq!(
+            schema
+                .field("tenant")
+                .unwrap()
+                .unenforced_primary_key_position,
+            Some(1)
+        );
+        assert_eq!(
+            schema.field("id").unwrap().unenforced_primary_key_position,
+            Some(2)
+        );
+        assert_eq!(
+            schema
+                .field("region")
+                .unwrap()
+                .unenforced_clustering_key_position,
+            Some(1)
+        );
+        assert_eq!(names(schema.unenforced_primary_key()), ["tenant", "id"]);
+        assert_eq!(names(schema.unenforced_clustering_key()), ["region"]);
+        // The Arrow schema exposes the key to clients wherever the source
+        // carried the metadata; the property-only `id` still keeps its key
+        // through the field property asserted above.
+        let arrow_schema = ArrowSchema::from(schema);
+        for (name, key, position) in [
+            ("tenant", LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1"),
+            ("region", LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1"),
+        ] {
+            assert_eq!(
+                arrow_schema
+                    .field_with_name(name)?
+                    .metadata()
+                    .get(key)
+                    .map(String::as_str),
+                Some(position)
+            );
+        }
+        assert!(
+            !arrow_schema
+                .field_with_name("id")?
+                .metadata()
+                .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+        );
+    }
+
+    // The consumer oracle: `merge_insert` resolves an empty join-key list from
+    // the primary key. Match one `(tenant, id)` and prove the other row's
+    // values are untouched.
+    let merge_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("tenant", DataType::Int64, false),
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("region", DataType::Int64, false),
+        ArrowField::new("value", DataType::Int32, true),
+    ]));
+    let int64 = |value| Arc::new(Int64Array::from(vec![value])) as ArrayRef;
+    let source = RecordBatch::try_new(
+        merge_schema.clone(),
+        vec![int64(1), int64(1), int64(11), int32(vec![111])],
+    )?;
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(reopened), vec![])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let (merged, _) = merge_job
+        .execute_reader(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        ))
+        .await?;
+
+    let rows = |batch: &RecordBatch| {
+        let ids = batch["id"].as_any().downcast_ref::<Int64Array>().unwrap();
+        let regions = batch["region"]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let values = batch["value"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut rows = ids
+            .values()
+            .iter()
+            .zip(regions.values().iter())
+            .zip(values.values().iter())
+            .map(|((id, region), value)| (*id, *region, *value))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    let expected = [(1, 11, 111), (2, 20, 200)];
+    assert_eq!(rows(&merged.scan().try_into_batch().await?), expected);
+    assert_eq!(
+        rows(
+            &Dataset::open(&test_dir)
+                .await?
+                .scan()
+                .try_into_batch()
+                .await?
+        ),
+        expected
+    );
+    Ok(())
+}
+
+/// Filtering on a child added to a struct reads it from new fragments and as
+/// null from old ones, whatever else the scan projects.
+#[rstest]
+#[tokio::test]
+async fn test_filter_on_added_struct_child(
+    #[values(vec!["id"], vec!["id", "payload"])] columns: Vec<&str>,
+    #[values(
+        crate::dataset::scanner::MaterializationStyle::Heuristic,
+        crate::dataset::scanner::MaterializationStyle::AllEarly,
+        crate::dataset::scanner::MaterializationStyle::AllLate
+    )]
+    style: crate::dataset::scanner::MaterializationStyle,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("payload", st(vec![("existing", DataType::Utf8)]), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0])) as ArrayRef,
+            fill(&st(vec![("existing", DataType::Utf8)]), 1, 0, false),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let added = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "payload",
+        st(vec![("added", DataType::Utf8)]),
+        true,
+    )]));
+    dataset
+        .add_columns(NewColumnTransform::AllNulls(added), None, None)
+        .await
+        .unwrap();
+
+    let full = st(vec![
+        ("existing", DataType::Utf8),
+        ("added", DataType::Utf8),
+    ]);
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            fill(&full, 1, 0, false),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let predicate = "payload.added = 'v0'";
+    let mut scan = dataset.scan();
+    scan.project(&columns).unwrap();
+    scan.filter(predicate).unwrap();
+    scan.materialization_style(style);
+    let batch = scan.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(ids.values().as_ref(), &[1]);
+
+    assert_eq!(
+        dataset
+            .count_rows(Some(predicate.to_string()))
+            .await
+            .unwrap(),
+        1
+    );
 }

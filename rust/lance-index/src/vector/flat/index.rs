@@ -173,35 +173,31 @@ fn search_candidates_with_scratch(
             }
         }
     } else {
-        let row_addr_mask = prefilter.mask();
+        prefilter
+            .mask()
+            .selected_offsets_into(row_ids, &mut scratch.u32);
         if is_range_query {
             let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
             let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-            for (offset, &row_id) in row_ids.enumerate() {
-                if !row_addr_mask.selected(row_id) {
-                    continue;
-                }
-                let distance = dist_calc.distance(offset as u32).into();
+            for &offset in &scratch.u32 {
+                let distance = dist_calc.distance(offset).into();
                 if distance < lower_bound || distance >= upper_bound {
                     continue;
                 }
                 push_candidate_local(
                     &mut candidates,
                     candidate_limit,
-                    (offset as u32, row_id),
+                    (offset, storage.row_id(offset)),
                     distance,
                 );
             }
         } else {
-            for (offset, &row_id) in row_ids.enumerate() {
-                if !row_addr_mask.selected(row_id) {
-                    continue;
-                }
+            for &offset in &scratch.u32 {
                 push_candidate_local(
                     &mut candidates,
                     candidate_limit,
-                    (offset as u32, row_id),
-                    dist_calc.distance(offset as u32).into(),
+                    (offset, storage.row_id(offset)),
+                    dist_calc.distance(offset).into(),
                 );
             }
         }
@@ -328,29 +324,23 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                let row_addr_mask = prefilter.mask();
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
+                    for &id in &scratch.u32 {
+                        let dist = dist_calc.distance(id).into();
                         if dist < lower_bound || dist >= upper_bound {
                             continue;
                         }
-
-                        push_candidate_local(&mut res, k, row_addr, dist);
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
                     }
                 } else {
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-
-                        let dist = dist_calc.distance(id as u32).into();
-                        push_candidate_local(&mut res, k, row_addr, dist);
+                    for &id in &scratch.u32 {
+                        let dist = dist_calc.distance(id).into();
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
                     }
                 }
             }
@@ -486,19 +476,28 @@ impl IvfSubIndex for FlatIndex {
                 );
             }
             false => {
-                let row_addr_mask = prefilter.mask();
+                // The selection and the calculator's candidate buffer share the
+                // u32 scratch: take it for the selection and keep the larger of
+                // the two afterwards.
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
+                let selected = std::mem::take(&mut scratch.u32);
                 dist_calc.accumulate_filtered_topk_with_scratch(
                     k,
                     params.lower_bound,
                     params.upper_bound,
-                    row_ids.enumerate().map(|(id, &row_id)| (id as u32, row_id)),
-                    |row_id| row_addr_mask.selected(row_id),
+                    selected.iter().map(|&id| (id, storage.row_id(id))),
+                    |_| true,
                     res,
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
                     &mut scratch.u32,
                 );
+                if selected.capacity() > scratch.u32.capacity() {
+                    scratch.u32 = selected;
+                }
             }
         };
         drop(distance_timer);

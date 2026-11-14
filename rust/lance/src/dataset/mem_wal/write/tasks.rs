@@ -8,10 +8,10 @@ use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lance_core::utils::tokio::JoinHandle;
 use lance_core::{Error, Result};
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::{Interval, interval_at};
 use tokio_util::sync::CancellationToken;
 
@@ -162,7 +162,7 @@ impl TaskExecutor {
             name: name.clone(),
         };
 
-        let handle = tokio::spawn(async move { dispatcher.run().await });
+        let handle = lance_core::utils::tokio::spawn(async move { dispatcher.run().await });
         self.tasks.write().unwrap().push((name, handle));
         Ok(())
     }
@@ -188,7 +188,7 @@ impl TaskExecutor {
     {
         let cancellation_token = self.cancellation_token.clone();
         let task_name = name.clone();
-        let handle = tokio::spawn(async move {
+        let handle = lance_core::utils::tokio::spawn(async move {
             let mut interval = interval_at(tokio::time::Instant::now() + every, every);
             // Same reason as the dispatcher: `Burst` would replay every tick
             // missed while `work` ran, which for a slow `work` means the timer

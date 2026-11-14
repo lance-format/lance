@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 /// pulled from the posting file so we can assert that the stats path is
 /// O(1) in num_unique_tokens.
 #[derive(Debug, Default)]
-struct PostingMetadataCounter {
+pub(super) struct PostingMetadataCounter {
     rows_read: std::sync::atomic::AtomicUsize,
     metadata_rows_read: std::sync::atomic::AtomicUsize,
     posting_rows_read: std::sync::atomic::AtomicUsize,
@@ -29,7 +29,7 @@ impl PostingMetadataCounter {
         self.metadata_rows_read
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-    fn posting_rows_read(&self) -> usize {
+    pub(super) fn posting_rows_read(&self) -> usize {
         self.posting_rows_read
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -125,10 +125,10 @@ impl IndexReader for CountingPostingReader {
 }
 
 #[derive(Debug)]
-struct CountingStore {
-    inner: Arc<dyn IndexStore>,
-    posting_file: String,
-    counter: Arc<PostingMetadataCounter>,
+pub(super) struct CountingStore {
+    pub(super) inner: Arc<dyn IndexStore>,
+    pub(super) posting_file: String,
+    pub(super) counter: Arc<PostingMetadataCounter>,
 }
 
 impl DeepSizeOf for CountingStore {

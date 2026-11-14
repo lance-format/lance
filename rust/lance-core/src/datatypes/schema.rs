@@ -269,6 +269,7 @@ impl Schema {
         columns: &[T],
         err_on_missing: bool,
         preserve_system_columns: bool,
+        err_on_missing_nested: bool,
     ) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         // A linear scan of the fields per requested column is quadratic when
@@ -294,6 +295,10 @@ impl Schema {
             };
             if let Some(field_idx) = field_idx {
                 let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+                if err_on_missing_nested && self.fields[field_idx].sub_field(&split_refs).is_none()
+                {
+                    return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
+                }
                 let projected_field = self.fields[field_idx].project(&split_refs)?;
                 if let Some(&pos) = candidate_pos.get(&field_idx) {
                     candidates[pos].merge(&projected_field)?;
@@ -302,6 +307,9 @@ impl Schema {
                     candidates.push(projected_field);
                 }
             } else if crate::is_system_column(first) {
+                if err_on_missing_nested && split.len() > 1 {
+                    return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
+                }
                 if preserve_system_columns {
                     if first == ROW_ID {
                         candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
@@ -339,17 +347,21 @@ impl Schema {
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
     pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true, false)
+        self.do_project(columns, true, false, false)
     }
 
     /// Project the columns over the schema, dropping unrecognized columns
     pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, false, false)
+        self.do_project(columns, false, false, false)
     }
 
     /// Project the columns over the schema, preserving system columns.
+    ///
+    /// Unlike [`Self::project`], a nested path whose last field does not exist
+    /// is an error rather than a parent struct with no children, because the
+    /// columns usually come from a user.
     pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true, true)
+        self.do_project(columns, true, true, true)
     }
 
     /// Check field ids, sibling names, fixed-size-list dimensions, and top-level
@@ -421,6 +433,86 @@ impl Schema {
         }
 
         Ok(())
+    }
+
+    /// The blob fields nested in a Map or FixedSizeList: Blob v2 supports
+    /// nesting only under Struct, List and LargeList.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::HashMap, sync::Arc};
+    ///
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+    /// use lance_core::datatypes::Schema;
+    ///
+    /// let blob = Field::new("blob", DataType::Binary, true).with_metadata(HashMap::from([(
+    ///     ARROW_EXT_NAME_KEY.to_string(),
+    ///     BLOB_V2_EXT_NAME.to_string(),
+    /// )]));
+    /// let key = Field::new("key", DataType::Utf8, false);
+    /// let entries = Field::new("entries", DataType::Struct(vec![key, blob].into()), false);
+    /// let attrs = Field::new("attrs", DataType::Map(Arc::new(entries), false), true);
+    /// let schema = Schema::try_from(&ArrowSchema::new(vec![attrs]))?;
+    ///
+    /// let nested = schema
+    ///     .nested_blob_fields()
+    ///     .map(|field| field.name.as_str())
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(nested, ["blob"]);
+    /// let error = schema.check_blob_nesting(|field| field.is_blob_v2()).unwrap_err();
+    /// assert!(error.to_string().contains("nested in Map field 'attrs'"));
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn nested_blob_fields(&self) -> impl Iterator<Item = &Field> {
+        self.nested_blobs().into_iter().map(|(field, _, _)| field)
+    }
+
+    /// Reject the blob fields `rejects` selects among [`Self::nested_blob_fields`].
+    /// See [`Self::nested_blob_fields`] for an example that combines both checks.
+    pub fn check_blob_nesting(&self, rejects: impl Fn(&Field) -> bool) -> Result<()> {
+        for (field, kind, container_path) in self.nested_blobs() {
+            if rejects(field) {
+                return Err(Error::not_supported(format!(
+                    "Blob v2 fields nested in {kind} field '{container_path}' are not supported; Blob v2 can be nested only in Struct, List and LargeList"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each blob nested in a Map or FixedSizeList, with the kind and path of
+    /// the container, in schema order.
+    fn nested_blobs(&self) -> Vec<(&Field, &'static str, String)> {
+        fn collect<'a>(
+            field: &'a Field,
+            path: &str,
+            container: Option<(&'static str, &str)>,
+            out: &mut Vec<(&'a Field, &'static str, String)>,
+        ) {
+            if let Some((kind, container_path)) = container
+                && field.is_blob()
+            {
+                out.push((field, kind, container_path.to_string()));
+            }
+            // The logical type, not `data_type()`, which rebuilds the whole subtree.
+            let container = if field.logical_type.is_map() {
+                Some(("Map", path))
+            } else if field.logical_type.is_fixed_size_list_struct() {
+                Some(("FixedSizeList", path))
+            } else {
+                container
+            };
+            for child in &field.children {
+                collect(child, &format!("{path}.{}", child.name), container, out);
+            }
+        }
+        let mut out = Vec::new();
+        for field in &self.fields {
+            collect(field, &field.name, None, &mut out);
+        }
+        out
     }
 
     /// Validate a schema before storing it in a dataset manifest.
@@ -2458,6 +2550,32 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        // A missing nested field is an error, wherever the path stops resolving
+        // and whether or not another path under the same column comes first.
+        for missing in ["b.nope", "c.nope", "b.f1.nope", "nope", "_rowid.x"] {
+            for columns in [["a", missing], ["b.f1", missing]] {
+                let err = schema
+                    .project_preserve_system_columns(&columns)
+                    .unwrap_err();
+                assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+                assert!(err.to_string().contains(missing), "{err}");
+            }
+        }
+
+        // A list whose projection would have no item is not merged.
+        let list_schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "l",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            true,
+        )]))
+        .unwrap();
+        for columns in [["l.item", "l.nope"], ["l.nope", "l.item"]] {
+            let err = list_schema
+                .project_preserve_system_columns(&columns)
+                .unwrap_err();
+            assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+        }
     }
 
     #[test]

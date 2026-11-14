@@ -15,6 +15,7 @@ import pyarrow as pa
 import pytest
 from lance.lance import Compaction
 from lance.optimize import (
+    CompactionOptions,
     OptimizeIndexMerge,
     OptimizeIndexTask,
     OptimizeIndices,
@@ -46,6 +47,11 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_added == 1
 
     assert dataset.version == 3
+
+
+def test_compaction_options_keys_are_optional():
+    assert CompactionOptions.__required_keys__ == frozenset()
+    assert "source_budget_mode" in CompactionOptions.__optional_keys__
 
 
 @pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
@@ -141,8 +147,21 @@ def test_compact_files_source_budgets(tmp_path: Path):
     assert metrics.fragments_removed == 0
     assert dataset.version == version_before
 
+    # Soft mode admits one indivisible task even though it exceeds the byte
+    # budget, then stops before admitting another task.
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=200,
+        num_threads=1,
+        max_source_bytes=1,
+        source_budget_mode="soft",
+    )
+    assert metrics.fragments_removed == 2
+
     with pytest.raises(OSError, match="must be greater than 0"):
         dataset.optimize.compact_files(max_source_rows=0)
+
+    with pytest.raises(ValueError, match="Invalid source budget mode"):
+        dataset.optimize.compact_files(source_budget_mode="invalid")
 
 
 def test_compact_files_max_source_fragments(tmp_path: Path):
@@ -1224,8 +1243,6 @@ def test_remap_row_addrs(tmp_path: Path):
     before = ds.scanner(columns=["id"], with_row_address=True).to_table()
     old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
 
-    # A deferred-remap compaction records a fragment-reuse index only when it
-    # rewrites data an index covers, so index a column first.
     ds.create_scalar_index("id", "BTREE")
 
     ds.optimize.compact_files(
@@ -1334,6 +1351,8 @@ def test_optimize_indices_distributed(tmp_path: Path):
         ).get(timeout=300)
     assert {result.group for result in merged} == {merge.group for merge in plan.merges}
 
+    # The two-argument form is the original one: the commit takes the
+    # defaults, which is all a non-consolidating merge needs.
     OptimizeIndices.commit(dataset, merged)
     assert dataset.version == version + 2
     # The vector tasks appended a segment; the BTree merge absorbed the old one.
@@ -1362,3 +1381,53 @@ def test_optimize_indices_distributed(tmp_path: Path):
     # Only the fragment appended meanwhile is left to plan.
     plan = OptimizeIndices.plan(dataset, {"max_rows_per_task": 128})
     assert {tuple(task.fragments) for task in plan.tasks} == {(5,)}
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_optimize_indices_consolidate(tmp_path: Path, distributed: bool):
+    """A consolidation budget merges the newest vector segments that fit it,
+    in one process or as a plan committed with the same options."""
+
+    def table(start: int, rows: int) -> pa.Table:
+        vectors = np.random.default_rng(start).random((rows, 8), dtype=np.float32)
+        return vec_to_table(vectors).append_column(
+            "id", pa.array(range(start, start + rows))
+        )
+
+    # One segment per fragment: 100 rows over fragment 0, then 50 rows over
+    # each of fragments 1 and 2; fragment 3 (50 rows) stays unindexed.
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(table(0, 100), uri)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    for start in (100, 150):
+        dataset = lance.write_dataset(table(start, 50), uri, mode="append")
+        dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    dataset = lance.write_dataset(table(200, 50), uri, mode="append")
+    assert dataset.stats.index_stats("vector_idx")["num_indices"] == 3
+
+    options = {"max_rows_to_consolidate": 100}
+    if distributed:
+        plan = OptimizeIndices.plan(dataset, options)
+        assert plan.tasks == [] and len(plan.merges) == 1
+        merged = plan.merges[0].execute(dataset, [])
+        with pytest.raises(ValueError, match="replace a source twice"):
+            OptimizeIndices.commit(dataset, [merged, merged], options)
+        OptimizeIndices.commit(dataset, [merged], options)
+    else:
+        dataset.optimize.optimize_indices(**options)
+
+    # The two 50-row segments fit the budget and merge; the 100-row segment
+    # and the unindexed fragment are left alone.
+    (index,) = dataset.describe_indices()
+    assert {tuple(segment.fragment_ids) for segment in index.segments} == {
+        (0,),
+        (1, 2),
+    }
+    assert dataset.stats.index_stats("vector_idx")["num_unindexed_rows"] == 50
+    vector = dataset.to_table(columns=["vector"], filter="id = 175")["vector"][0]
+    nearest = dataset.to_table(
+        columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
+    )
+    assert nearest["id"].to_pylist() == [175]

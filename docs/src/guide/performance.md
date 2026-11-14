@@ -89,6 +89,24 @@ debugging query performance.
 | `lance::execution` | `indices_loaded`    | The number of indices loaded by the plan                       |
 | `lance::execution` | `parts_loaded`      | The number of index partitions loaded by the plan              |
 | `lance::execution` | `index_comparisons` | The number of comparisons performed inside the various indices |
+| `lance::execution` | `peak_reserved_bytes` | The most bytes the plan's operators held reserved at once in DataFusion's memory pool: sort, aggregation and join buffers, batches queued for repartitioning, and the merge headroom of a sort that may spill. Lance's own read buffers are not included |
+
+### Memory Events
+
+Memory events are emitted while `LANCE_MEMORY_OBSERVE` turns memory observation on, which works on Linux only; [Observability](observability.md#memory-metrics) describes the switch and the index builds it observes. Every stage of an observed build emits an event when it starts and another when it completes, and so does the whole build, which `create_index` completes only after its commit. All events of one build carry its `operation_id`, unique within the process, and the `pid` of the process, which together tell apart builds that run at the same time. Ids start from a random value in every process, so a process that restarts with the same pid, as in a container, does not repeat them. A start without a completion marks work that failed, was cancelled, or was still running when the process died, for example because it exceeded its memory limit. For most scalar indices the `load_data` stage completes before the index is sorted or trained, so a build that dies in that work leaves only the start of the build itself open. A field without a value, such as the cgroup fields of a process outside a memory cgroup, is left out. In `pylance`, `LANCE_MEMORY_OBSERVE=1 LANCE_LOG="warn,lance::events::memory=info"` logs these events and no other Lance events. Peaks are lower bounds and cover the whole process, like the memory metrics.
+
+| Event           | Parameter            | Description                                                                                        |
+| --------------- | -------------------- | -------------------------------------------------------------------------------------------------- |
+| `lance::memory` | `event`              | The event type (operation_start, operation_complete, stage_start, stage_complete)                  |
+| `lance::memory` | `pid`                | The id of the process that emitted the event                                                       |
+| `lance::memory` | `operation_id`       | An id unique within the process, shared by every event of one operation                            |
+| `lance::memory` | `operation`          | The observed operation (create_index, merge_index_metadata)                                        |
+| `lance::memory` | `index_type`         | The lowercase type of the index being built (btree, inverted, ivf_pq, ...)                         |
+| `lance::memory` | `stage`              | The stage of the build, on stage events                                                            |
+| `lance::memory` | `peak_bytes`         | The peak resident set size of the process while the stage or build ran, on completion events       |
+| `lance::memory` | `rss_bytes`          | The resident set size of the process when the event was emitted                                    |
+| `lance::memory` | `cgroup_bytes`       | The memory charged to the cgroup that sets the tightest limit on the process, or to its own cgroup |
+| `lance::memory` | `cgroup_limit_bytes` | The tightest memory limit over the process's cgroup and its ancestors, when one is set             |
 
 ## Threading Model
 
@@ -162,6 +180,11 @@ Use `dataset.session().cache_diagnostics()` to inspect the index and metadata ca
 
 The index cache is not shared between tables. For best performance you should create a single table and
 share it across your application.
+
+A session's cache capacities can be changed after construction with
+`session.set_index_cache_capacity(...)` and `session.set_metadata_cache_capacity(...)`. Shrinking a
+capacity evicts entries as needed, so an application that manages several sessions can bound their
+combined memory usage without dropping or recreating them.
 
 **Note**: `index_cache_size` (specified in entries) was deprecated since version 0.30.0. Use
 `index_cache_size_bytes` (specified in bytes) for new code.

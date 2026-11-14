@@ -32,6 +32,16 @@ fn is_chain_not_found(e: &lance_core::Error) -> bool {
     false
 }
 
+/// Whether `e` says the requested table version has no namespace record.
+fn is_version_not_found(e: &lance_core::Error) -> bool {
+    if let lance_core::Error::Namespace { source, .. } = e
+        && let Some(ns_err) = source.downcast_ref::<NamespaceError>()
+    {
+        return matches!(ns_err, NamespaceError::TableVersionNotFound { .. });
+    }
+    false
+}
+
 #[derive(Debug)]
 pub struct LanceNamespaceExternalManifestStore {
     namespace_client: Arc<dyn LanceNamespace>,
@@ -88,10 +98,17 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             ..Default::default()
         };
 
-        let response = self
-            .namespace_client
-            .describe_table_version(request)
-            .await?;
+        let response = match self.namespace_client.describe_table_version(request).await {
+            Ok(response) => response,
+            // ExternalManifestCommitHandler reads Error::NotFound from `get`
+            // as "no record" (version_exists, is_manifest_path_authoritative,
+            // the resolve_version_location fallback). Other errors pass
+            // through so an outage is not read as a missing record.
+            Err(e) if is_chain_not_found(&e) || is_version_not_found(&e) => {
+                return Err(lance_core::Error::not_found(e.to_string()));
+            }
+            Err(e) => return Err(e),
+        };
 
         // Namespace returns full path (relative to object store root)
         Ok(response.version.manifest_path)
@@ -213,10 +230,11 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_namespace::models::ListTableVersionsResponse;
+    use lance_namespace::models::{DescribeTableVersionResponse, ListTableVersionsResponse};
 
-    /// A namespace whose list_table_versions always fails with the configured
-    /// error, to pin how get_latest_version classifies failures.
+    /// A namespace whose list_table_versions and describe_table_version always
+    /// fail with the configured error, to pin how the store classifies
+    /// failures.
     #[derive(Debug)]
     struct FailingNamespace {
         error: fn() -> lance_core::Error,
@@ -234,6 +252,13 @@ mod tests {
         ) -> Result<ListTableVersionsResponse> {
             Err((self.error)())
         }
+
+        async fn describe_table_version(
+            &self,
+            _request: DescribeTableVersionRequest,
+        ) -> Result<DescribeTableVersionResponse> {
+            Err((self.error)())
+        }
     }
 
     fn store_with(error: fn() -> lance_core::Error) -> LanceNamespaceExternalManifestStore {
@@ -245,13 +270,12 @@ mod tests {
     }
 
     /// A chain that does not exist (missing table or branch) has no latest
-    /// version; everything else is a real failure and must propagate so an
-    /// outage is never mistaken for an absent dataset.
+    /// version and no record of any version, and a missing version has no
+    /// record. Everything else is a real failure and must propagate so an
+    /// outage is never mistaken for an absent dataset or version.
     #[tokio::test]
-    async fn test_get_latest_version_error_classification() {
-        use lance_namespace::error::NamespaceError;
-
-        let absent = [
+    async fn test_error_classification() {
+        let missing_chain = [
             store_with(|| {
                 NamespaceError::TableNotFound {
                     message: "missing table".to_string(),
@@ -265,37 +289,73 @@ mod tests {
                 .into()
             }),
         ];
-        for store in absent {
+        for store in missing_chain {
             let latest = store.get_latest_version("data/t.lance/tree/dev").await;
             assert!(
                 matches!(latest, Ok(None)),
                 "a missing chain must read as no latest version, got: {:?}",
                 latest
             );
+            let record = store.get("data/t.lance/tree/dev", 42).await;
+            assert!(
+                matches!(record, Err(lance_core::Error::NotFound { .. })),
+                "a missing chain must read as a missing record, got: {:?}",
+                record
+            );
         }
 
+        let missing_version = store_with(|| {
+            NamespaceError::TableVersionNotFound {
+                message: "missing version".to_string(),
+            }
+            .into()
+        });
+        let record = missing_version.get("data/t.lance", 42).await;
+        assert!(
+            matches!(record, Err(lance_core::Error::NotFound { .. })),
+            "a missing version must read as a missing record, got: {:?}",
+            record
+        );
+
+        let is_namespace: fn(&lance_core::Error) -> bool =
+            |e| matches!(e, lance_core::Error::Namespace { .. });
         let failures = [
-            store_with(|| {
-                NamespaceError::Internal {
-                    message: "server error".to_string(),
-                }
-                .into()
-            }),
-            store_with(|| {
-                NamespaceError::Throttling {
-                    message: "slow down".to_string(),
-                    retry_after: None,
-                }
-                .into()
-            }),
-            store_with(|| lance_core::Error::io("connection reset".to_string())),
+            (
+                store_with(|| {
+                    NamespaceError::Internal {
+                        message: "server error".to_string(),
+                    }
+                    .into()
+                }),
+                is_namespace,
+            ),
+            (
+                store_with(|| {
+                    NamespaceError::Throttling {
+                        message: "slow down".to_string(),
+                        retry_after: None,
+                    }
+                    .into()
+                }),
+                is_namespace,
+            ),
+            (
+                store_with(|| lance_core::Error::io("connection reset".to_string())),
+                |e| matches!(e, lance_core::Error::IO { .. }),
+            ),
         ];
-        for store in failures {
+        for (store, is_expected_error) in failures {
             let latest = store.get_latest_version("data/t.lance/tree/dev").await;
             assert!(
-                latest.is_err(),
+                latest.as_ref().is_err_and(is_expected_error),
                 "a real failure must propagate, got: {:?}",
                 latest
+            );
+            let record = store.get("data/t.lance", 42).await;
+            assert!(
+                record.as_ref().is_err_and(is_expected_error),
+                "a real failure must propagate, got: {:?}",
+                record
             );
         }
     }

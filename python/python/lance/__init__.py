@@ -28,6 +28,8 @@ from .blob import (
     PackedBlobWriter,
     blob_array,
     blob_field,
+    read_blob_file_ranges,
+    read_blob_files,
 )
 from .dataset import (
     LanceDataset,
@@ -89,6 +91,8 @@ __all__ = [
     "BlobDescriptor",
     "blob_array",
     "blob_field",
+    "read_blob_files",
+    "read_blob_file_ranges",
     "CleanupCandidateFile",
     "CleanupExplanation",
     "CleanupReferencedBranch",

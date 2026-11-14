@@ -10,10 +10,10 @@
 //! `dataset/tests/dataset_scanner_knn.rs` and
 //! `dataset/tests/dataset_scanner_segments.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, SortOptions};
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
@@ -37,6 +37,7 @@ use lance_core::error::LanceOptionExt;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DOC_INDEX_COL;
+use lance_index::vector::warp::DEFAULT_WARP_NPROBE;
 use lance_index::vector::{DIST_COL, Query};
 use lance_linalg::distance::MetricType;
 use lance_select::RowAddrMask;
@@ -49,15 +50,18 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::index::visibility::IndexVisibility;
+use crate::io::exec::knn::warp::{WarpExec, WarpParams, warp_supports_segments};
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
-    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
+    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec, new_knn_exec_with_refinement_cache,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{
     FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LanceFilterExec, Planner, PreFilterSource,
     RowAddrMaskFilterExec, project,
 };
+use crate::session::index_caches::QuantizedRefinementOptions;
 use crate::{Error, Result};
 
 use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
@@ -79,6 +83,13 @@ fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct VectorRefinement {
+    pub(super) column: String,
+    pub(super) key: ArrayRef,
+    pub(super) metric: MetricType,
+}
+
 impl Scanner {
     pub(super) async fn vector_search_source(
         &self,
@@ -98,7 +109,9 @@ impl Scanner {
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
                 Some(fts_query) => {
-                    let mut fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    let mut fts_plan = self
+                        .fts(&filter_plan.expr_filter_plan, fts_query, fts_query.params())
+                        .await?;
                     if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
                         fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
                     }
@@ -140,6 +153,15 @@ impl Scanner {
             return Err(Error::invalid_input(
                 "Quantized refine factor cannot be zero".to_string(),
             ));
+        }
+
+        if let Some(refine) = &self.nearest_refine {
+            if self.is_batch_nearest {
+                return self.batch_per_query_vector_search(filter_plan, &q).await;
+            }
+            return self
+                .cross_column_vector_search(filter_plan, &q, refine)
+                .await;
         }
 
         // Sanity check
@@ -379,7 +401,7 @@ impl Scanner {
             // fragment, so sparse overlays incur near-zero overhead.
             let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
-            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+            let overlay_block = stale_rows.block_mask().await?;
 
             let ann_query = if self.quantized_refine_factor.is_some() {
                 let exact_factor = q.refine_factor.unwrap_or(1) as usize;
@@ -427,8 +449,19 @@ impl Scanner {
                             "quantized refinement is not supported for multivector columns",
                         ));
                     }
-                    self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
+                    // XTR remains for the indices WARP cannot search.
+                    if warp_supports_segments(&self.dataset, &q.column, &index_segments).await? {
+                        self.multivec_warp_ann(
+                            &q,
+                            &index_segments,
+                            filter_plan,
+                            overlay_block.clone(),
+                        )
                         .await?
+                    } else {
+                        self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
+                            .await?
+                    }
                 }
                 _ => unreachable!(),
             };
@@ -518,30 +551,66 @@ impl Scanner {
         }
     }
 
+    async fn cross_column_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+        refine: &VectorRefinement,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let factor = q
+            .refine_factor
+            .filter(|factor| *factor > 0)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "refine_column requires an explicit positive refine_factor".to_string(),
+                )
+            })?;
+        let mut coarse = q.clone();
+        coarse.k = q.k.checked_mul(factor as usize).ok_or_else(|| {
+            Error::invalid_input("k * refine_factor overflows the candidate budget".to_string())
+        })?;
+        coarse.refine_factor = None;
+        // Bounds apply to the final distance space, not the coarse index.
+        coarse.lower_bound = None;
+        coarse.upper_bound = None;
+
+        let mut coarse_scanner = self.clone();
+        coarse_scanner.nearest_refine = None;
+        coarse_scanner.nearest = Some(coarse.clone());
+        // Merge indexed, appended, and updated rows before cross-column scoring.
+        let candidates = coarse_scanner.vector_search(filter_plan, &coarse).await?;
+        let projection = self
+            .dataset
+            .empty_projection()
+            .union_column(&refine.column, OnMissing::Error)?;
+        let candidates = self.take(candidates, projection)?;
+
+        let mut final_query = q.clone();
+        final_query.column = refine.column.clone();
+        final_query.key = refine.key.clone();
+        final_query.metric_type = Some(refine.metric);
+        final_query.refine_factor = None;
+        final_query.use_index = false;
+        self.flat_knn(candidates, &final_query).await
+    }
+
     /// Whether a batch (multi-query) vector search can use the shared-scan
     /// indexed fast path ([`new_knn_batch_exec`]) instead of running one indexed
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no quantized refine step (exact refinement is supported);
-    /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
+    /// - no quantized refine step; exact refinement requires fixed nprobes;
+    /// - a positive `minimum_nprobes`;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
     ///   `fast_search`, which searches only the selected segments anyway).
     ///
-    /// The fixed-nprobes requirement is a *correctness* gate, not just an
-    /// optimization. The shared-scan path searches exactly `minimum_nprobes`
-    /// partitions per query, but the single-query path is adaptive: it applies a
-    /// k-dependent `early_pruning` floor and then expands probes up to
-    /// `maximum_nprobes` (late search) when a query has fewer than `k` results.
-    /// When `minimum_nprobes == maximum_nprobes` neither adjustment can fire
-    /// (pruning is capped at the maximum, and the late-search range is empty), so
-    /// the batch result is provably identical to repeated single-query search.
-    /// With adaptive nprobes the two would diverge, so we fall back to the
-    /// per-query loop, which reuses the real adaptive search and stays exact.
-    ///
-    /// Extending the shared-scan path to adaptive nprobes (a batched early/late
-    /// search) is left as a follow-up.
+    /// Both fixed and adaptive nprobes are supported: the batch node applies the
+    /// same initial probe budget and sequential late-search cut. Across deltas
+    /// it consumes results round-robin, while single-query search follows their
+    /// nondeterministic completion order. Explicit parallel adaptive probing
+    /// falls back because it can search beyond the sequential cut. Adaptive RQ
+    /// also falls back until its scalar and batch scoring paths agree.
     async fn batch_index_search_supported(
         &self,
         index_name: &str,
@@ -553,17 +622,23 @@ impl Scanner {
         if self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
-        // Only fixed nprobes is provably equivalent to single-query search; see
-        // the method docs. Adaptive nprobes falls back to the per-query loop.
-        if q.maximum_nprobes != Some(q.minimum_nprobes) {
+        // `minimum_nprobes(0)` is not rejected by the query builder. The
+        // single-query path then probes nothing up front and leaves every probe
+        // to its late search; fall back so the per-query loop keeps defining
+        // those semantics rather than reproducing them in the batch node.
+        if q.minimum_nprobes == 0 {
             return Ok(false);
         }
-        // `nprobes(0)` is not rejected by the query builder, so `min == max == 0`
-        // slips past the fixed-nprobes check above. The single-query path probes
-        // nothing and returns an empty result, whereas the batch node would probe
-        // one partition's worth of neighbors — a silent divergence. Fall back so
-        // the per-query loop defines the semantics of `nprobes(0)`.
-        if q.minimum_nprobes == 0 {
+        // Parallel late search can admit more partitions before observing the
+        // shared stop count. Preserve that behavior for callers that requested it.
+        if q.maximum_nprobes != Some(q.minimum_nprobes)
+            && (q.query_parallelism == -1 || q.query_parallelism > 1)
+        {
+            return Ok(false);
+        }
+        // Batched refinement shares candidate reads across the batch for fixed
+        // nprobes. Keep exact refinement with adaptive nprobes on the per-query path.
+        if q.refine_factor.is_some() && q.maximum_nprobes != Some(q.minimum_nprobes) {
             return Ok(false);
         }
         // The per-query path threads a caller-supplied external row-address mask
@@ -578,10 +653,10 @@ impl Scanner {
         // to call `supports_batch_partition_search()`: this is a planning-time
         // gate and the single-query path likewise avoids opening the index here.
         // An IVF index with a flat-style sub-index (i.e. not HNSW) is exactly the
-        // set for which `supports_batch_partition_search()` is true; the exec
-        // re-checks that trait as a defensive invariant. Legacy segments without
-        // details fall back.
-        let all_ivf_flat_style = index_segments.iter().all(|index| {
+        // set for which `supports_batch_partition_search()` is true; adaptive RQ
+        // compatibility further restricts eligibility below. The exec re-checks
+        // the trait as a defensive invariant. Legacy segments without details fall back.
+        let all_support_batch_search = index_segments.iter().all(|index| {
             index
                 .index_details
                 .as_ref()
@@ -589,11 +664,17 @@ impl Scanner {
                 .map(|details| {
                     let index_type =
                         crate::index::vector::details::derive_vector_index_type(details);
-                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
+                    // RQ's filtered batch accumulator can differ from scalar
+                    // single-query scoring. Preserve the per-query adaptive path.
+                    let is_adaptive_rq =
+                        index_type == "IVF_RQ" && q.maximum_nprobes != Some(q.minimum_nprobes);
+                    index_type.starts_with("IVF_")
+                        && !index_type.contains("HNSW")
+                        && !is_adaptive_rq
                 })
                 .unwrap_or(false)
         });
-        if !all_ivf_flat_style {
+        if !all_support_batch_search {
             return Ok(false);
         }
         // The batch node searches only the index's own entries; unlike the
@@ -717,6 +798,14 @@ impl Scanner {
             };
         }
 
+        self.batch_per_query_vector_search(filter_plan, q).await
+    }
+
+    async fn batch_per_query_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let query_dim = q.key.len() / self.nearest_query_count;
         let mut query_plans = Vec::with_capacity(self.nearest_query_count);
 
@@ -728,6 +817,12 @@ impl Scanner {
             single_scanner.nearest_query_count = 1;
             single_scanner.is_batch_nearest = false;
             single_scanner.nearest = Some(single_query.clone());
+            if let Some(refine) = &self.nearest_refine {
+                let refine_dim = refine.key.len() / self.nearest_query_count;
+                let mut single_refine = refine.clone();
+                single_refine.key = refine.key.slice(query_index * refine_dim, refine_dim);
+                single_scanner.nearest_refine = Some(single_refine);
+            }
 
             let single_plan = single_scanner
                 .vector_search(filter_plan, &single_query)
@@ -798,7 +893,7 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
-        stale_rows: &HashMap<u32, RoaringBitmap>,
+        stale_rows: &IndexVisibility,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -901,7 +996,8 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
+            let mut stale_node =
+                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
@@ -1017,7 +1113,7 @@ impl Scanner {
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>, HashMap<u32, RoaringBitmap>)> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, IndexVisibility)> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let stale_rows = self
             .overlay_stale_index_rows(index_expr, &fragments)
@@ -1294,7 +1390,7 @@ impl Scanner {
         overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
-        let inner_fanout_search = new_knn_exec(
+        let inner_fanout_search = new_knn_exec_with_refinement_cache(
             self.dataset.clone(),
             index,
             q,
@@ -1302,6 +1398,21 @@ impl Scanner {
             overlay_block,
             self.external_row_mask.clone(),
             self.quantized_refine_factor,
+            self.nearest
+                .as_ref()
+                .filter(|_| {
+                    self.quantized_refine_factor.is_some()
+                        && self.filter.is_none()
+                        && filter_plan.is_empty()
+                        && self.fragments.is_none()
+                        && self.index_segments.is_none()
+                        && self.physical_row_addr_prefilter.is_none()
+                        && self.get_indexed_frags(index) == *self.dataset.fragment_bitmap
+                })
+                .map(|query| QuantizedRefinementOptions {
+                    result_count: query.k,
+                    exact_factor: query.refine_factor,
+                }),
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -1321,6 +1432,44 @@ impl Scanner {
             SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
+    }
+
+    /// Create an execution plan for WARP multivector search.
+    ///
+    /// Unlike XTR's independent per-token ANN searches, [`WarpExec`] scores
+    /// every query token against the IVF centroids once to choose its
+    /// partitions and missing-similarity estimate, scores every token of those
+    /// partitions, and merges the scores into the top k documents.
+    async fn multivec_warp_ann(
+        &self,
+        q: &Query,
+        index: &[IndexMetadata],
+        filter_plan: &ExprFilterPlan,
+        overlay_block: Option<RowAddrMask>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
+        let params = WarpParams {
+            // WARP probes a fixed count rather than expanding until k results
+            // are found, so an explicit ceiling is its default budget.
+            nprobe: q.maximum_nprobes.unwrap_or(DEFAULT_WARP_NPROBE),
+            minimum_nprobes: q.minimum_nprobes,
+            maximum_nprobes: q.maximum_nprobes,
+            search_effort: q.search_effort,
+            imputation_rank: self.warp_imputation_rank,
+            k: q.k,
+            approx_mode: q.approx_mode,
+        };
+        let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
+        Ok(Arc::new(WarpExec::new(
+            self.dataset.clone(),
+            index.to_vec(),
+            q.clone(),
+            dim,
+            params,
+            prefilter_source,
+            overlay_block,
+            self.external_row_mask.clone(),
+        )))
     }
 
     // Create an Execution plan to do ANN over multivectors
@@ -1451,30 +1600,24 @@ impl Scanner {
         // If explicitly specified fragments with .with_fragments(), intersect with those
         let fragments = Arc::new(self.retain_target_fragments(fragments));
 
-        // Can only use ScalarIndexExec when the scalar index is exact and we are not scanning
-        // a subset of the fragments.
-        //
-        // TODO: We could enhance ScalarIndexExec with a fragment bitmap to filter out rows that
-        // are not in the fragments we are scanning.
-        if filter_plan.is_exact_index_search() && self.fragments.is_none() {
+        let is_legacy = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format()
+            == lance_file::version::ConcreteFileVersion::V1;
+        // Keep the legacy storage planner's existing direct-mask eligibility.
+        if is_legacy && filter_plan.is_exact_index_search() && self.fragments.is_none() {
             let index_query = filter_plan.index_query.as_ref().expect_ok()?;
-            let (relevant_frags, missing_frags, stale_rows) = self
+            let (relevant, missing, stale_rows) = self
                 .partition_frags_by_coverage(index_query, fragments.clone())
                 .await?;
-
-            // Overlay-stale rows must never reach the direct ScalarIndexExec path: it would hand
-            // ANN/FTS a selection vector containing rows whose indexed values are now stale. When
-            // any exist, fall through to the filtered-read prefilter, which masks them.
-            if stale_rows.is_empty() && (missing_frags.is_empty() || self.fast_search) {
-                log::trace!("prefilter entirely satisfied by exact index search");
-                let result_format = self.index_expr_result_format();
-                // We can only avoid materializing the index for a prefilter if:
-                // 1. The search is indexed
-                // 2. The index search is an exact search with no recheck or refine
-                // 3. The indices cover at least the same fragments as the vector index,
-                //    unless fast_search allows skipping uncovered fragments.
-                let mut exec =
-                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format);
+            if stale_rows.is_empty() && (missing.is_empty() || self.fast_search) {
+                let mut exec = ScalarIndexExec::new(
+                    self.dataset.clone(),
+                    index_query.clone(),
+                    self.index_expr_result_format(),
+                );
                 if let Some(segment_uuids) = self
                     .scalar_index_selection
                     .as_ref()
@@ -1482,17 +1625,97 @@ impl Scanner {
                 {
                     exec = exec.with_segment_uuids(segment_uuids);
                 }
-                if missing_frags.is_empty() && !relevant_frags.is_empty() {
+                if missing.is_empty() && !relevant.is_empty() {
                     exec = exec.with_fragment_scope(
-                        relevant_frags
-                            .iter()
-                            .map(|fragment| fragment.id as u32)
-                            .collect(),
+                        relevant.iter().map(|fragment| fragment.id as u32).collect(),
                     );
                 }
                 return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(exec)));
-            } else {
-                log::trace!("exact index search did not cover all fragments");
+            }
+        }
+        if filter_plan.is_exact_index_search() && !is_legacy {
+            let index_query = filter_plan.index_query.as_ref().expect_ok()?;
+            let (relevant_frags, missing_frags, stale_rows) = self
+                .partition_frags_by_coverage(index_query, fragments.clone())
+                .await?;
+
+            // Stale index values require the existing re-evaluation path. Missing physical
+            // counts cannot be recovered from column data on an index-only prefilter path.
+            if stale_rows.is_empty()
+                && relevant_frags
+                    .iter()
+                    .all(|fragment| fragment.physical_rows.is_some())
+            {
+                let scope: RoaringBitmap = relevant_frags
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect();
+                let mut coverage = scope.clone();
+                let has_missing_fragments = !missing_frags.is_empty();
+                let missing = if !self.fast_search && !missing_frags.is_empty() {
+                    if filter_plan.full_expr.is_none() {
+                        return Err(Error::internal(format!(
+                            "exact scalar prefilter {index_query} has no full predicate to evaluate missing fragments"
+                        )));
+                    }
+                    coverage.extend(missing_frags.iter().map(|fragment| fragment.id as u32));
+                    let mut refine = filter_plan.clone();
+                    refine.make_refine_only();
+                    let PlannedFilteredScan { plan, .. } = self
+                        .filtered_read(
+                            &refine,
+                            self.dataset.empty_projection().with_row_id(),
+                            false,
+                            Some(Arc::new(missing_frags)),
+                            None,
+                            true,
+                            None,
+                        )
+                        .await?;
+                    Some(plan)
+                } else {
+                    None
+                };
+                if scope.is_empty() {
+                    if let Some(plan) = missing {
+                        return Ok(PreFilterSource::FilteredRowIds(plan));
+                    }
+                    let batch = lance_select::IndexExprResult::exact(
+                        lance_select::RowAddrMask::allow_nothing(),
+                    )
+                    .serialize(&coverage, self.index_expr_result_format())?;
+                    let plan = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                        &[vec![batch]],
+                        self.index_expr_result_format().schema().clone(),
+                        None,
+                    )?;
+                    return Ok(PreFilterSource::ScalarIndexQuery(plan));
+                }
+                let result_format = self.index_expr_result_format();
+                let mut exec =
+                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format)
+                        .with_fragment_scope(scope.clone());
+                if let Some(segment_uuids) = self
+                    .scalar_index_selection
+                    .as_ref()
+                    .and_then(|selection| selection.segment_uuids.clone())
+                {
+                    exec = exec.with_segment_uuids(segment_uuids);
+                }
+                // The consumer bounds hits to its own index fragments. A separate scope
+                // mask is needed only for explicit selections or skipped/missing coverage.
+                if self.fragments.is_none() && !has_missing_fragments {
+                    return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(exec)));
+                }
+                let plan = crate::io::exec::PrefilterUnionExec::new(
+                    self.dataset.clone(),
+                    Arc::new(exec),
+                    missing,
+                    scope,
+                    coverage,
+                    result_format,
+                );
+                return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(plan)));
             }
         }
 
