@@ -447,12 +447,15 @@ fn conflicts_with_unseen_schema_change(
                 latest_schema.field_ancestry_by_id(*field_id),
             ) {
                 // An overwrite can reuse an id for another column of the same
-                // type, so the leaf's whole path must still name the same field.
+                // type, or put the same path under another container kind, so
+                // every ancestor must keep its name and kind.
                 (Some(read_path), Some(latest_path)) => {
                     !read_path
                         .iter()
-                        .map(|field| &field.name)
-                        .eq(latest_path.iter().map(|field| &field.name))
+                        .map(|field| (&field.name, &field.logical_type))
+                        .eq(latest_path
+                            .iter()
+                            .map(|field| (&field.name, &field.logical_type)))
                         || read_path.last().map(|field| field.data_type())
                             != latest_path.last().map(|field| field.data_type())
                 }

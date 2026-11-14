@@ -2820,22 +2820,25 @@ mod tests {
     #[case::append_after_overwrite_reusing_field_ids("overwrite")]
     #[case::append_after_overwrite_swapping_same_type_columns("overwrite_swap")]
     #[case::append_after_overwrite_swapping_same_type_structs("overwrite_nested_swap")]
+    #[case::append_after_overwrite_struct_to_list("overwrite_struct_to_list")]
+    #[case::append_after_overwrite_list_to_struct("overwrite_list_to_struct")]
     #[tokio::test]
     async fn test_schema_dependent_commit_rejects_cleaned_history(#[case] concurrent: &str) {
-        let (initial, staged) = if concurrent == "overwrite_nested_swap" {
-            (
+        let (initial, staged) = match concurrent {
+            "overwrite_nested_swap" => (
                 struct_pair_batch(["a", "b"], [0, 1]),
                 struct_pair_batch(["a", "b"], [7, 70]),
-            )
-        } else {
-            (
+            ),
+            "overwrite_struct_to_list" => (container_batch(false, 1), container_batch(false, 7)),
+            "overwrite_list_to_struct" => (container_batch(true, 1), container_batch(true, 7)),
+            _ => (
                 arrow_array::record_batch!(
                     ("id", Int32, [0, 1, 2, 3]),
                     ("x", Int32, [Some(0), Some(1), Some(2), Some(3)])
                 )
                 .unwrap(),
                 arrow_array::record_batch!(("id", Int32, [4]), ("x", Int32, [None])).unwrap(),
-            )
+            ),
         };
         let stale = Arc::new(
             crate::dataset::InsertBuilder::new("memory://")
@@ -2914,6 +2917,20 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // The leaf keeps its path `a.item` and type under another container kind.
+            "overwrite_struct_to_list" | "overwrite_list_to_struct" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![container_batch(
+                        concurrent == "overwrite_struct_to_list",
+                        20,
+                    )])
+                    .await
+                    .unwrap();
+            }
             _ => unreachable!(),
         }
         let latest = CommitBuilder::new(Arc::new(latest))
@@ -2963,6 +2980,25 @@ mod tests {
         };
         RecordBatch::try_from_iter([(names[0], column(values[0])), (names[1], column(values[1]))])
             .unwrap()
+    }
+
+    /// One row with an `a` column that is either `list<item: int32>` or
+    /// `struct<item: int32>`.
+    fn container_batch(is_list: bool, value: i32) -> RecordBatch {
+        let column: arrow_array::ArrayRef = if is_list {
+            Arc::new(
+                arrow_array::ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![
+                    Some(value),
+                    Some(value + 1),
+                ])]),
+            )
+        } else {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+            )]))
+        };
+        RecordBatch::try_from_iter([("a", column)]).unwrap()
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
