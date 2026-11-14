@@ -3449,6 +3449,8 @@ fn phrase_search_tail(
             None => return Vec::new(),
         }
     }
+    // Constant per token; resolved once instead of once per matched document.
+    let query_weights: Vec<f32> = tokens.iter().map(|tok| scorer.query_weight(tok)).collect();
     // Drive the intersection from the rarest token to bound work.
     let smallest_idx = (0..per_token_chunks.len())
         .min_by_key(|&i| {
@@ -3497,10 +3499,10 @@ fn phrase_search_tail(
                 continue;
             }
             let dl = lookup_dl(snap, document_position).unwrap_or(1);
-            let score: f32 = tokens
+            let score: f32 = query_weights
                 .iter()
-                .enumerate()
-                .map(|(ti, tok)| scorer.query_weight(tok) * scorer.doc_weight(frequencies[ti], dl))
+                .zip(&frequencies)
+                .map(|(&qw, &f)| qw * scorer.doc_weight(f, dl))
                 .sum();
             if let Some(document) = lookup_document(snap, document_position) {
                 results.push(FtsEntry {
@@ -4848,9 +4850,14 @@ impl Partition {
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
         let mut term_ids: Vec<u32> = Vec::with_capacity(tokens.len());
+        // Constant per token; resolved once instead of once per matched document.
+        let mut query_weights: Vec<f32> = Vec::with_capacity(tokens.len());
         for token in tokens {
             match self.term_id(token) {
-                Some(id) => term_ids.push(id),
+                Some(id) => {
+                    term_ids.push(id);
+                    query_weights.push(scorer.query_weight(token));
+                }
                 // A phrase needs every token present in this partition.
                 None => return Vec::new(),
             }
@@ -4884,10 +4891,10 @@ impl Partition {
             }
             if present && phrase_matches(&all_positions, query_groups, slop) {
                 let dl = self.docs.num_tokens(doc);
-                let score: f32 = tokens
+                let score: f32 = query_weights
                     .iter()
                     .zip(&freqs)
-                    .map(|(t, &f)| scorer.query_weight(t) * scorer.doc_weight(f, dl))
+                    .map(|(&qw, &f)| qw * scorer.doc_weight(f, dl))
                     .sum();
                 let key = doc_set_key(&self.docs, doc);
                 results.push(FtsEntry {
@@ -7831,6 +7838,59 @@ mod tests {
         );
         // A phrase not present anywhere returns nothing.
         assert!(index.search_phrase("world hello", 0).is_empty());
+    }
+
+    /// Phrase scores are exact BM25 sums on both the partition and the tail
+    /// path. Row 1 has different frequencies for the two tokens, so pairing a
+    /// token's weight with the other token's frequency changes its score.
+    #[rstest]
+    #[case::partition(3, 1)]
+    #[case::tail(usize::MAX, 0)]
+    fn test_phrase_exact_bm25_scores(
+        #[case] freeze_threshold_rows: usize,
+        #[case] partitions: usize,
+    ) {
+        let schema = create_test_schema();
+        let index =
+            position_index(1, "description").with_freeze_threshold_rows(freeze_threshold_rows);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    "alpha beta",
+                    "beta alpha beta gamma delta epsilon omega",
+                    "alpha beta alpha beta",
+                    "alpha gamma delta alpha",
+                    "sigma tau omega",
+                ])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), partitions);
+
+        let entries = index.search_phrase("alpha beta", 0);
+        assert_eq!(rows(entries.clone()), vec![0, 1, 2]);
+
+        // Corpus stats the query scorer sees: 5 docs, 20 tokens total;
+        // "alpha" occurs in 4 docs, "beta" in 3.
+        let scorer = MemBM25Scorer::new(
+            20,
+            5,
+            HashMap::from([("alpha".to_string(), 4), ("beta".to_string(), 3)]),
+        );
+        // Bit-exact: query_weight(token) * doc_weight(freq, doc_length),
+        // summed over the tokens.
+        let expected = |fa: u32, fb: u32, dl: u32| {
+            scorer.query_weight("alpha") * scorer.doc_weight(fa, dl)
+                + scorer.query_weight("beta") * scorer.doc_weight(fb, dl)
+        };
+        let by_row: HashMap<u64, f32> = entries.iter().map(|e| (e.row_position, e.score)).collect();
+        assert_eq!(by_row[&0], expected(1, 1, 2));
+        assert_eq!(by_row[&1], expected(1, 2, 7));
+        assert_eq!(by_row[&2], expected(2, 2, 4));
     }
 
     #[test]
