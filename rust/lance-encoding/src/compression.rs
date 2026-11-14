@@ -1412,6 +1412,41 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Read one unsigned value without allocating decoded or alignment buffers.
+    /// Supported leaf codecs validate framing and use constant-time lookup;
+    /// unsupported codecs never scan or decompress the sequence as a fallback.
+    /// `index` must be less than the container's `num_values`.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 10, 3)).unwrap();
+    /// assert_eq!(codec.unsigned_value_at(None, 32, 4, 2).unwrap(), 16);
+    /// assert!(codec.unsigned_value_at(None, 32, 4, 4).is_err());
+    /// ```
+    fn unsigned_value_at(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        index: u64,
+    ) -> Result<u64> {
+        if index >= num_values {
+            return Err(Error::invalid_input(
+                "unsigned lookup index exceeds value count",
+            ));
+        }
+        if data.is_some() {
+            return Err(Error::not_supported("codec has no unsigned payload lookup"));
+        }
+        match self.plan_unsigned_metadata(bits_per_value, num_values)? {
+            SequenceMetadata::Empty => Err(Error::invalid_input("unsigned lookup has no values")),
+            SequenceMetadata::Constant(value) => Ok(value),
+            SequenceMetadata::Range { start, step } => Ok(start + index * step),
+        }
+    }
+
     /// Visit an unsigned sequence without allocating decoded or alignment buffers.
     /// The callback owns any allocations it makes. An error may follow a visited
     /// prefix: callers must discard partial work and validate before publishing.

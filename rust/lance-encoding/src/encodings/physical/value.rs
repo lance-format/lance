@@ -616,6 +616,23 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
+    fn unsigned_value_at(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        index: u64,
+    ) -> Result<u64> {
+        if bits != self.bits_per_value || !self.layers.is_empty() {
+            return Err(Error::invalid_input(
+                "unsigned Flat lookup width or layout mismatch",
+            ));
+        }
+        let data =
+            data.ok_or_else(|| Error::invalid_input("unsigned Flat lookup requires payload"))?;
+        crate::compression::unsigned::flat_at(data, bits, count, index)
+    }
+
     fn visit_unsigned(
         &self,
         data: Option<&LanceBuffer>,

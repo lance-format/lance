@@ -4,29 +4,59 @@
 use super::*;
 use crate::{
     compression::BlockCompressor,
-    encodings::physical::{rle::BlockRleEncoder, value::ValueEncoder},
+    encodings::physical::{
+        dictionary::BlockDictionaryEncoder, rle::BlockRleEncoder, value::ValueEncoder,
+    },
     format::{EncodingUtils, metadata::compressive_encoding::Compression},
 };
 
-fn payload_fixture(bits: u8, large: bool, nested: bool, available: usize, is_rle: bool) -> Fixture {
-    if is_rle {
+#[derive(Clone, Copy, Debug)]
+enum OffsetCodec {
+    Delta,
+    Rle,
+    Dictionary,
+}
+
+fn payload_fixture(
+    bits: u8,
+    large: bool,
+    nested: bool,
+    available: usize,
+    kind: OffsetCodec,
+) -> Fixture {
+    if !matches!(kind, OffsetCodec::Delta) {
         let mut values = Vec::new();
         for value in [0_u64, 1, 1, 3, 4] {
             values.extend_from_slice(&value.to_le_bytes()[..usize::from(bits / 8)]);
         }
-        let (payload, encoding) = BlockRleEncoder::try_new(
-            u64::from(bits),
-            Box::<ValueEncoder>::default(),
-            Box::<ValueEncoder>::default(),
-        )
-        .unwrap()
-        .compress(DataBlock::FixedWidth(crate::data::FixedWidthDataBlock {
-            bits_per_value: u64::from(bits),
-            num_values: 5,
-            data: LanceBuffer::from(values),
-            block_info: crate::data::BlockInfo::new(),
-        }))
-        .unwrap();
+        let compressor: Box<dyn BlockCompressor> = if matches!(kind, OffsetCodec::Rle) {
+            Box::new(
+                BlockRleEncoder::try_new(
+                    u64::from(bits),
+                    Box::<ValueEncoder>::default(),
+                    Box::<ValueEncoder>::default(),
+                )
+                .unwrap(),
+            )
+        } else {
+            Box::new(
+                BlockDictionaryEncoder::try_new(
+                    u64::from(bits),
+                    std::sync::Arc::from([4, 0, 1, 3]),
+                    Box::<ValueEncoder>::default(),
+                    Box::<ValueEncoder>::default(),
+                )
+                .unwrap(),
+            )
+        };
+        let (payload, encoding) = compressor
+            .compress(DataBlock::FixedWidth(crate::data::FixedWidthDataBlock {
+                bits_per_value: u64::from(bits),
+                num_values: 5,
+                data: LanceBuffer::from(values),
+                block_info: crate::data::BlockInfo::new(),
+            }))
+            .unwrap();
         let Some(Compression::Variable(variable)) =
             EncodingUtils::variable(encoding, None).compression
         else {
@@ -65,12 +95,15 @@ fn payload_fixture(bits: u8, large: bool, nested: bool, available: usize, is_rle
 }
 
 #[rstest]
+#[case::delta(OffsetCodec::Delta)]
+#[case::rle(OffsetCodec::Rle)]
+#[case::dictionary(OffsetCodec::Dictionary)]
 fn encoded_offsets_preserve_task_overlap(
+    #[case] kind: OffsetCodec,
     #[values(32, 64)] bits: u8,
     #[values(false, true)] large: bool,
     #[values(false, true)] multiple: bool,
     #[values(false, true)] nested: bool,
-    #[values(false, true)] is_rle: bool,
 ) {
     let width = usize::from(bits / 8);
     let selected: &[&[u8]] = if multiple || nested {
@@ -90,7 +123,7 @@ fn encoded_offsets_preserve_task_overlap(
         budget,
         mut work,
         physical,
-    } = payload_fixture(bits, large, nested, required, is_rle);
+    } = payload_fixture(bits, large, nested, required, kind);
     select(
         &mut task,
         if multiple {
@@ -144,7 +177,7 @@ fn later_encoded_offset_overflow_recycles_structural_scratch() {
         budget,
         mut work,
         ..
-    } = payload_fixture(32, false, true, 1024, false);
+    } = payload_fixture(32, false, true, 1024, OffsetCodec::Delta);
     select(&mut task, &[(0, 2), (2, 2)]);
     let mut bytes = task.instructions[1].1.data.to_vec();
     // 16-byte header, two padded 12-byte level streams, then four u32 deltas.

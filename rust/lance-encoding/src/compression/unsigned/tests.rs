@@ -39,6 +39,20 @@ fn flat_and_delta_visit_without_alignment_copies(
         })
         .unwrap();
     assert_eq!(actual, expected);
+    if !delta {
+        for index in (0..expected.len()).rev() {
+            assert_eq!(
+                codec
+                    .unsigned_value_at(Some(&input), bits, 5, index as u64)
+                    .unwrap(),
+                expected[index]
+            );
+        }
+        assert!(matches!(
+            codec.unsigned_value_at(Some(&input), bits, 5, 5),
+            Err(Error::InvalidInput { .. })
+        ));
+    }
     let mut calls = 0;
     let error = codec
         .visit_unsigned(Some(&input), bits, 5, &mut |_| {
@@ -182,6 +196,23 @@ fn bitpacked_visit_matches_encoder_at_every_width(
             })
             .unwrap();
         assert_eq!(index, expected.len());
+        for index in [0, 31, 127, 128, 511, 1023, 1024, expected.len() - 1] {
+            assert_eq!(
+                codec
+                    .unsigned_value_at(Some(&input), bits, expected.len() as u64, index as u64)
+                    .unwrap(),
+                expected[index]
+            );
+        }
+        assert!(matches!(
+            codec.unsigned_value_at(
+                Some(&input),
+                bits,
+                expected.len() as u64,
+                expected.len() as u64
+            ),
+            Err(Error::InvalidInput { .. })
+        ));
     }
 }
 
@@ -207,4 +238,82 @@ fn malformed_bitpacked_framing_precedes_visits(
         .unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert_eq!(calls, 0);
+    assert!(matches!(
+        OutOfLineBitpacking::new(3, bits).unsigned_value_at(
+            Some(&input),
+            bits,
+            expected.len() as u64,
+            0
+        ),
+        Err(Error::CorruptFile { .. })
+    ));
+}
+
+#[rstest]
+fn unsigned_metadata_lookup_checks_full_sequence(
+    #[values(32, 64)] bits: u64,
+    #[values(false, true)] is_constant: bool,
+) {
+    let encoding = if is_constant {
+        EncodingUtils::constant(Some(bytes::Bytes::copy_from_slice(
+            &7_u64.to_le_bytes()[..(bits / 8) as usize],
+        )))
+    } else {
+        EncodingUtils::range(bits, 7, 3)
+    };
+    let codec = create_fixed_width_block_decompressor(&encoding, bits).unwrap();
+    assert_eq!(
+        codec.unsigned_value_at(None, bits, 5, 4).unwrap(),
+        if is_constant { 7 } else { 19 }
+    );
+    assert!(matches!(
+        codec.unsigned_value_at(None, bits, 5, 5),
+        Err(Error::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        codec.unsigned_value_at(None, bits, 0, 0),
+        Err(Error::InvalidInput { .. })
+    ));
+    let max = if bits == 32 {
+        u32::MAX as u64
+    } else {
+        u64::MAX
+    };
+    let codec =
+        create_fixed_width_block_decompressor(&EncodingUtils::range(bits, max - 1, 2), bits)
+            .unwrap();
+    let error = codec.unsigned_value_at(None, bits, 2, 0).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("range") || error.to_string().contains("Range"));
+}
+
+#[rstest]
+#[case::truncated(0)]
+#[case::extra(1)]
+#[case::missing(2)]
+#[case::wrong_width(3)]
+#[case::count_overflow(4)]
+fn unsigned_lookup_rejects_invalid_flat_framing(#[case] fault: u8, #[values(32, 64)] bits: u64) {
+    let codec =
+        create_fixed_width_block_decompressor(&EncodingUtils::flat(bits, None), bits).unwrap();
+    let mut bytes = vec![0; (bits / 8 * 2) as usize];
+    if fault == 0 {
+        bytes.pop();
+    } else if fault == 1 {
+        bytes.push(0);
+    }
+    let input = LanceBuffer::from(bytes);
+    let error = codec
+        .unsigned_value_at(
+            if fault == 2 { None } else { Some(&input) },
+            if fault == 3 { 16 } else { bits },
+            if fault == 4 { u64::MAX } else { 2 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::InvalidInput { .. } | Error::CorruptFile { .. }
+    ));
+    assert!(error.to_string().contains("Flat"));
 }

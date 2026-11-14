@@ -20,6 +20,25 @@ pub fn flat(
     count: u64,
     visitor: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<()> {
+    let width = flat_width(data, bits, count)?;
+    for i in 0..data.len() / width {
+        visitor(word(data, i, width))?;
+    }
+    Ok(())
+}
+
+pub fn flat_at(data: &LanceBuffer, bits: u64, count: u64, index: u64) -> Result<u64> {
+    let width = flat_width(data, bits, count)?;
+    if index >= count {
+        return Err(Error::invalid_input(
+            "unsigned Flat lookup index exceeds value count",
+        ));
+    }
+    // Validated payload length makes the index addressable on this platform.
+    Ok(word(data, index as usize, width))
+}
+
+fn flat_width(data: &LanceBuffer, bits: u64, count: u64) -> Result<usize> {
     if !matches!(bits, 32 | 64) {
         return Err(Error::invalid_input(
             "unsigned Flat visitor requires 32 or 64 bits",
@@ -35,11 +54,7 @@ pub fn flat(
             "payload length disagrees with count",
         ));
     }
-    let width = (bits / 8) as usize;
-    for i in 0..bytes / width {
-        visitor(word(data, i, width))?;
-    }
-    Ok(())
+    Ok((bits / 8) as usize)
 }
 
 #[cfg(feature = "bitpacking")]
@@ -50,18 +65,7 @@ pub fn bitpacked(
     count: u64,
     visitor: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<()> {
-    if !matches!(bits, 32 | 64) || packed == 0 || packed >= bits {
-        return Err(Error::invalid_input(
-            "unsigned bitpacking visitor requires a narrower positive width",
-        ));
-    }
-    let [raw, padded] = out_of_line_payload_byte_lengths(count, bits, packed)?;
-    if data.len() as u64 != raw && data.len() as u64 != padded {
-        return Err(Error::corrupt_file_named(
-            "unsigned bitpacking",
-            "payload length disagrees with count",
-        ));
-    }
+    let raw = validate_bitpacked(data, bits, packed, count)?;
     let chunk_bytes = (1024 * packed / 8) as usize;
     let full_chunks = count / 1024;
     let tail = count % 1024;
@@ -86,6 +90,56 @@ pub fn bitpacked(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "bitpacking")]
+pub fn bitpacked_at(
+    data: &LanceBuffer,
+    bits: u64,
+    packed: u64,
+    count: u64,
+    index: u64,
+) -> Result<u64> {
+    let raw = validate_bitpacked(data, bits, packed, count)?;
+    if index >= count {
+        return Err(Error::invalid_input(
+            "unsigned bitpacking lookup index exceeds value count",
+        ));
+    }
+    let chunk = index / 1024;
+    let chunk_bytes = (1024 * packed / 8) as usize;
+    let start = usize::try_from(chunk)
+        .ok()
+        .and_then(|n| n.checked_mul(chunk_bytes))
+        .ok_or_else(|| Error::invalid_input("unsigned bitpacking chunk position overflows"))?;
+    let index = (index % 1024) as usize;
+    if chunk == count / 1024 && data.len() as u64 == raw {
+        Ok(word(&data[start..], index, (bits / 8) as usize))
+    } else {
+        Ok(packed_value(
+            &data[start..start + chunk_bytes],
+            bits as usize,
+            packed as usize,
+            index,
+        ))
+    }
+}
+
+#[cfg(feature = "bitpacking")]
+fn validate_bitpacked(data: &LanceBuffer, bits: u64, packed: u64, count: u64) -> Result<u64> {
+    if !matches!(bits, 32 | 64) || packed == 0 || packed >= bits {
+        return Err(Error::invalid_input(
+            "unsigned bitpacking visitor requires a narrower positive width",
+        ));
+    }
+    let [raw, padded] = out_of_line_payload_byte_lengths(count, bits, packed)?;
+    if data.len() as u64 != raw && data.len() as u64 != padded {
+        return Err(Error::corrupt_file_named(
+            "unsigned bitpacking",
+            "payload length disagrees with count",
+        ));
+    }
+    Ok(raw)
 }
 
 #[cfg(feature = "bitpacking")]

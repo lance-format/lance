@@ -21,20 +21,24 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Reuse unchanged Flat/bitpacked visitor evidence from 5e51b0eed and the
-      # visibility-only strict lint pass at 859387837. Cover RLE and the changed
-      # Binary non-affine metadata path plus its MiniBlock compositions here.
-      - name: Validate RLE unsigned traversal
-        run: cargo test --profile ci --locked -p lance-encoding --lib physical::rle::unsigned::tests -- --nocapture
+      # RLE/Binary composition passed at 8819c9e9d. Exercise new random unsigned
+      # lookup, dictionary traversal and their affected visitor/task composition.
+      - name: Validate unsigned lookup and dictionary traversal
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib physical::dictionary::unsigned::tests -- --nocapture
       - name: Validate Binary admission and composition
         run: |
           cargo test --profile ci --locked -p lance-encoding --lib physical::binary::admitted::tests -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests::binary -- --nocapture
-      - name: Validate RLE and Binary without optional codecs
+      - name: Validate dictionary and Binary without optional codecs
         run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::rle::unsigned::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::unsigned::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::dictionary::unsigned::tests -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::binary::admitted::tests -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::binary -- --nocapture
+      - name: Validate unsigned lookup API example
+        run: cargo test --profile ci --locked -p lance-encoding --doc unsigned_value_at -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
