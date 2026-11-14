@@ -23,6 +23,19 @@ pub(super) enum Levels {
 }
 
 impl Levels {
+    fn from_owned(storage: ReservedBuffer) -> Result<Self> {
+        let bytes = storage.as_ref().len();
+        if !bytes.is_multiple_of(2) {
+            return Err(Error::invalid_input(
+                "dense level storage has a partial u16",
+            ));
+        }
+        Ok(Self::Admitted {
+            storage,
+            len: bytes / 2,
+        })
+    }
+
     pub(super) fn truncate(&mut self, len: usize) {
         match self {
             Self::Ordinary(values) => values.truncate(len),
@@ -71,18 +84,11 @@ impl DerefMut for Levels {
 }
 
 impl RepDefUnraveler {
-    /// Copy both dense level arrays into one admitted workspace. Refusal preserves
-    /// the workspace and borrowed input. Input storage must already be accounted.
-    /// Charges remain until the unraveler drops, even after logical compaction.
-    /// Schema-sized metadata is excluded. Output bitmaps/offsets need separate
-    /// admission; this constructor does not make ordinary unravel methods bounded.
-    pub fn try_new_in(
+    pub(crate) fn validate_dense_levels(
         rep: Option<&[u16]>,
         def: Option<&[u16]>,
-        meanings: Arc<[DefinitionInterpretation]>,
-        num_items: u64,
-        workspace: &mut Reservation,
-    ) -> Result<Option<Self>> {
+        meanings: &[DefinitionInterpretation],
+    ) -> Result<()> {
         if meanings.is_empty() {
             return Err(Error::invalid_input(
                 "dense levels require a structural interpretation",
@@ -120,6 +126,22 @@ impl RepDefUnraveler {
                 "level exceeds its structural interpretation",
             ));
         }
+        Ok(())
+    }
+
+    /// Copy both dense level arrays into one admitted workspace. Refusal preserves
+    /// the workspace and borrowed input. Input storage must already be accounted.
+    /// Charges remain until the unraveler drops, even after logical compaction.
+    /// Schema-sized metadata is excluded. Output bitmaps/offsets need separate
+    /// admission; this constructor does not make ordinary unravel methods bounded.
+    pub fn try_new_in(
+        rep: Option<&[u16]>,
+        def: Option<&[u16]>,
+        meanings: Arc<[DefinitionInterpretation]>,
+        num_items: u64,
+        workspace: &mut Reservation,
+    ) -> Result<Option<Self>> {
+        Self::validate_dense_levels(rep, def, &meanings)?;
         let bytes = rep
             .map_or(0, std::mem::size_of_val)
             .checked_add(def.map_or(0, std::mem::size_of_val))
@@ -131,6 +153,23 @@ impl RepDefUnraveler {
         result.rep_levels = rep.map(|v| Levels::copy_in(v, workspace)).transpose()?;
         result.def_levels = def.map(|v| Levels::copy_in(v, workspace)).transpose()?;
         Ok(Some(result))
+    }
+
+    /// Adopt already admitted level allocations without copying them again.
+    /// Validation errors drop the supplied owners and release their charges.
+    pub(crate) fn from_admitted_levels(
+        rep: Option<ReservedBuffer>,
+        def: Option<ReservedBuffer>,
+        meanings: Arc<[DefinitionInterpretation]>,
+        num_items: u64,
+    ) -> Result<Self> {
+        let rep = rep.map(Levels::from_owned).transpose()?;
+        let def = def.map(Levels::from_owned).transpose()?;
+        Self::validate_dense_levels(rep.as_deref(), def.as_deref(), &meanings)?;
+        let mut result = Self::new(None, None, meanings, num_items);
+        result.rep_levels = rep;
+        result.def_levels = def;
+        Ok(result)
     }
 }
 

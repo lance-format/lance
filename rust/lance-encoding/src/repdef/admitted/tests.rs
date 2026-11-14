@@ -330,3 +330,32 @@ fn all_valid_comparison_does_not_need_bitmap_storage() {
     );
     assert_eq!(budget.reserved(), 0);
 }
+
+#[rstest]
+#[case::partial_value(vec![0,0,0], vec![], "partial u16")]
+#[case::different_lengths(vec![1,0], vec![0,0,0,0], "lengths differ")]
+#[case::invalid_level(vec![1,0], vec![3,0], "level exceeds")]
+fn adopting_invalid_owned_levels_releases_all_credit(
+    #[case] reps: Vec<u8>,
+    #[case] defs: Vec<u8>,
+    #[case] message: &str,
+) {
+    let bytes = reps.len() + defs.len();
+    let budget = AllocationBudget::new(bytes);
+    let mut work = budget.try_reserve(bytes).unwrap();
+    let mut rep = work.try_allocate(reps.len()).unwrap().unwrap();
+    rep.as_mut().copy_from_slice(&reps);
+    let mut def = work.try_allocate(defs.len()).unwrap().unwrap();
+    def.as_mut().copy_from_slice(&defs);
+    let error = RepDefUnraveler::from_admitted_levels(
+        Some(rep),
+        Some(def),
+        Arc::from([Meaning::NullableItem, Meaning::NullableList]),
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message));
+    assert!(work.is_empty());
+    assert_eq!(budget.reserved(), 0);
+}

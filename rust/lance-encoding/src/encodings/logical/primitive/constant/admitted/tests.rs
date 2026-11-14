@@ -271,7 +271,7 @@ fn offset_overflow_requests_a_smaller_batch_without_allocating() {
 }
 
 #[test]
-fn repdef_requires_its_own_admitted_path_and_keeps_ordinary_decode() {
+fn admitted_repdef_keeps_ordinary_decode_semantics() {
     let scalar = fixture(0);
     let task = DecodeConstantTask {
         scalar,
@@ -284,10 +284,22 @@ fn repdef_requires_its_own_admitted_path_and_keeps_ordinary_decode() {
     };
     let budget = AllocationBudget::new(64);
     let mut work = budget.try_reserve(64).unwrap();
-    let error = task.try_decode_in(&mut work).err().unwrap();
-    assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("rep/def reconstruction"));
-    assert_eq!(work.len(), 64);
+    let admitted = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(work.len(), 64 - 6 - 12);
+    let mut repdef = CompositeRepDefUnraveler::new(vec![admitted.repdef]);
+    let nulls = repdef
+        .try_unravel_validity_in(3, &mut work)
+        .unwrap()
+        .unwrap();
+    let actual = admitted
+        .data
+        .try_to_arrow_in(&DataType::Float32, &mut work)
+        .unwrap()
+        .unwrap()
+        .into_builder()
+        .nulls(nulls)
+        .build()
+        .unwrap();
     let output = Box::new(task)
         .decode()
         .unwrap()
@@ -298,6 +310,7 @@ fn repdef_requires_its_own_admitted_path_and_keeps_ordinary_decode() {
         output,
         Float32Array::from(vec![Some(3.5), None, Some(3.5)]).to_data()
     );
+    assert_eq!(actual, output);
 }
 
 #[test]
@@ -326,4 +339,400 @@ fn nonnull_complex_constant_requires_an_admitted_codec() {
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(error.to_string().contains("no admitted expansion"));
     assert_eq!(work.len(), 64);
+}
+
+// Both streams alias one larger physical owner, including alignment gaps and a
+// trailing region. Selecting a few levels must not refund that source early.
+fn owned_levels(
+    rep: Option<&[u16]>,
+    def: &[u16],
+    work: &mut Reservation,
+) -> (Option<ScalarBuffer<u16>>, ScalarBuffer<u16>, usize) {
+    let rep_bytes = rep.map_or(0, std::mem::size_of_val);
+    let def_start = (64 + rep_bytes).next_multiple_of(64);
+    let def_bytes = std::mem::size_of_val(def);
+    let physical = def_start + def_bytes + 31;
+    let mut data = work.try_allocate(physical).unwrap().unwrap();
+    if let Some(rep) = rep {
+        data.as_mut()[64..64 + rep_bytes].copy_from_slice(bytemuck::cast_slice(rep));
+    }
+    data.as_mut()[def_start..def_start + def_bytes].copy_from_slice(bytemuck::cast_slice(def));
+    let data = data.freeze();
+    let reps = rep
+        .map(|rep| ScalarBuffer::new(Buffer::from(data.slice(64..64 + rep_bytes)), 0, rep.len()));
+    let defs = ScalarBuffer::new(
+        Buffer::from(data.slice(def_start..def_start + def_bytes)),
+        0,
+        def.len(),
+    );
+    (reps, defs, physical)
+}
+
+#[rstest]
+#[case::float(0)]
+#[case::true_bits(1)]
+#[case::false_bits(2)]
+#[case::binary(3)]
+#[case::large_binary(4)]
+#[case::utf8(5)]
+#[case::large_utf8(6)]
+#[case::empty_binary(7)]
+#[case::null_float(8)]
+#[case::null_binary(9)]
+#[case::fixed_binary(10)]
+fn selected_structural_constants_compose_with_admission(
+    #[case] kind: usize,
+    #[values(false, true)] nested: bool,
+) {
+    let original = fixture(kind);
+    let (scalar, budget, mut work, scalar_input) = owned_scalar(&original, 4096);
+    let (rep, def, level_input, ranges, meanings, count, level_count, expected_valid) = if nested {
+        // Five rows: [v, null], null, [], [v], [null, v]. Select rows 0..3 and 4.
+        let (rep, def, physical) = owned_levels(
+            Some(&[1, 0, 1, 1, 1, 1, 0]),
+            &[0, 1, 2, 3, 0, 1, 0],
+            &mut work,
+        );
+        (
+            rep,
+            def,
+            physical,
+            vec![0..3, 4..5],
+            Arc::<[DefinitionInterpretation]>::from([
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::NullableAndEmptyableList,
+            ]),
+            4_usize,
+            6_usize,
+            vec![true, false, false, true],
+        )
+    } else {
+        let (rep, def, physical) = owned_levels(None, &[0, 0, 1, 0, 0, 0, 1, 0], &mut work);
+        (
+            rep,
+            def,
+            physical,
+            vec![1..4, 6..8],
+            Arc::<[DefinitionInterpretation]>::from([DefinitionInterpretation::NullableItem]),
+            5,
+            5,
+            vec![true, false, true, false, true],
+        )
+    };
+    let mut decoder = ConstantPageDecoder {
+        ranges: ranges.into(),
+        scalar: scalar.clone(),
+        rep,
+        def: Some(def),
+        def_meaning: meanings,
+        max_rep: u16::from(nested),
+        max_visible_def: 1,
+        cursor_row: 0,
+        cursor_level: 0,
+        num_rows: if nested { 4 } else { 5 },
+    };
+    let task = decoder.drain(decoder.num_rows).unwrap();
+    drop(decoder);
+    let valid = expected_valid.iter().filter(|v| **v).count();
+    let payload = match kind {
+        0 => count * 4,
+        1 | 2 => count.div_ceil(8),
+        3 => (count + 1) * 4 + valid * 3,
+        4 => (count + 1) * 8 + valid * 3,
+        5 => (count + 1) * 4 + valid * "a界".len(),
+        6 => (count + 1) * 8 + valid * "a界".len(),
+        7 => (count + 1) * 4,
+        8 | 9 => 0,
+        10 => count * 3,
+        _ => unreachable!(),
+    };
+    let typed = match kind {
+        8 => count * 4 + count.div_ceil(8),
+        9 => (count + 1) * 8 + count.div_ceil(8),
+        _ => 0,
+    };
+    let levels = level_count * 2 * if nested { 2 } else { 1 };
+    let required = levels + payload;
+    let mut short = work.try_split(required - 1).unwrap();
+    assert!(task.try_decode_in(&mut short).unwrap().is_none());
+    assert_eq!(short.len(), required - 1);
+    drop(short);
+    drop(work);
+    let mut work = budget
+        .try_reserve(required + typed + count.div_ceil(8))
+        .unwrap();
+    let decoded = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(decoded.data.num_values(), count as u64);
+    assert_eq!(work.len(), typed + count.div_ceil(8));
+    let mut repdef = CompositeRepDefUnraveler::new(vec![decoded.repdef]);
+    let validity = repdef
+        .try_unravel_validity_in(count, &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        validity.as_ref().unwrap().iter().collect::<Vec<_>>(),
+        expected_valid
+    );
+    let values = decoded
+        .data
+        .try_to_arrow_in(original.data_type(), &mut work)
+        .unwrap()
+        .unwrap();
+    let actual = if original.is_null(0) {
+        // The structural layer does not make an intrinsically-null scalar valid.
+        assert_eq!(values.null_count(), count);
+        values
+    } else {
+        values
+            .into_builder()
+            .nulls(validity.clone())
+            .build()
+            .unwrap()
+    };
+    let indices = UInt64Array::from(
+        expected_valid
+            .iter()
+            .map(|v| v.then_some(0_u64))
+            .collect::<Vec<_>>(),
+    );
+    let expected = arrow_select::take::take(original.as_ref(), &indices, None).unwrap();
+    assert_eq!(actual, expected.to_data());
+    assert!(work.is_empty());
+    assert_eq!(
+        budget.reserved(),
+        scalar_input + level_input + required + typed + count.div_ceil(8)
+    );
+    if nested {
+        // Compatibility check only: List offset reconstruction still needs its
+        // own admitted path; these ordinary offsets are not a bounded-memory proof.
+        let (offsets, nulls) = repdef.unravel_offsets::<i32>().unwrap();
+        assert_eq!(offsets.as_ref(), &[0, 2, 2, 2, 4]);
+        assert_eq!(
+            nulls.unwrap().iter().collect::<Vec<_>>(),
+            [true, false, true, true]
+        );
+    }
+    let last = actual.slice(0, 1);
+    drop(actual);
+    drop(validity);
+    drop(decoded.data);
+    drop(repdef);
+    drop(task);
+    drop(scalar);
+    drop(work);
+    assert_eq!(
+        budget.reserved(),
+        payload
+            + typed
+            + if original.is_null(0) {
+                0
+            } else {
+                count.div_ceil(8)
+            }
+    );
+    drop(last);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn nullable_binary_prices_valid_payload_before_offset_overflow() {
+    let bytes = vec![42_u8; 32768];
+    let original: ArrayRef = Arc::new(BinaryArray::from(vec![bytes.as_slice()]));
+    // A naive 65,536 * 32 KiB expansion overflows i32, although only one slot is valid.
+    let count = 65536;
+    let mut defs = vec![1_u16; count];
+    defs[32768] = 0;
+    let payload = bytes.len() + (count + 1) * 4;
+    let required = count * 2 + payload;
+    let (scalar, budget, mut work, _) = owned_scalar(&original, 1024 * 1024);
+    let (rep, def, _) = owned_levels(None, &defs, &mut work);
+    let mut decoder = ConstantPageDecoder {
+        ranges: VecDeque::from([0..count as u64]),
+        scalar,
+        rep,
+        def: Some(def),
+        def_meaning: Arc::from([DefinitionInterpretation::NullableItem]),
+        max_rep: 0,
+        max_visible_def: 1,
+        cursor_row: 0,
+        cursor_level: 0,
+        num_rows: count as u64,
+    };
+    let task = decoder.drain(count as u64).unwrap();
+    drop(decoder);
+    drop(work);
+    let mut work = budget.try_reserve(required + count.div_ceil(8)).unwrap();
+    let decoded = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(work.len(), count.div_ceil(8));
+    let mut repdef = CompositeRepDefUnraveler::new(vec![decoded.repdef]);
+    let nulls = repdef
+        .try_unravel_validity_in(count, &mut work)
+        .unwrap()
+        .unwrap();
+    let data = decoded
+        .data
+        .try_to_arrow_in(&DataType::Binary, &mut work)
+        .unwrap()
+        .unwrap()
+        .into_builder()
+        .nulls(nulls)
+        .build()
+        .unwrap();
+    let array = BinaryArray::from(data);
+    assert_eq!(array.len(), count);
+    assert_eq!(array.null_count(), count - 1);
+    assert_eq!(array.value(32768), bytes);
+    assert_eq!(array.value_data().len(), bytes.len());
+    assert!(work.is_empty());
+    drop(array);
+    drop(decoded.data);
+    drop(repdef);
+    drop(task);
+    drop(work);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[case::reversed(std::ops::Range { start: 3, end: 1 }, vec![0,1,0], 1, "reversed")]
+#[case::past_end(0..4, vec![0,1,0], 1, "exceeds its input")]
+#[case::invalid_level(0..3, vec![0,2,0], 1, "level exceeds")]
+#[case::wrong_visible(0..3, vec![0,1,0], 0, "visible level disagrees")]
+fn invalid_structural_selection_allocates_nothing(
+    #[case] range: std::ops::Range<usize>,
+    #[case] defs: Vec<u16>,
+    #[case] max_visible_def: u16,
+    #[case] message: &str,
+) {
+    let task = DecodeConstantTask {
+        scalar: fixture(0),
+        rep: None,
+        def: Some(ScalarBuffer::from(defs)),
+        level_slices: vec![range],
+        visible_items_total: 0,
+        def_meaning: Arc::from([DefinitionInterpretation::NullableItem]),
+        max_visible_def,
+    };
+    let budget = AllocationBudget::new(64);
+    let mut work = budget.try_reserve(64).unwrap();
+    let error = task.try_decode_in(&mut work).err().unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message));
+    assert_eq!(work.len(), 64);
+}
+
+#[test]
+fn repetition_only_constant_keeps_selected_list_coordinates() {
+    let original = fixture(3);
+    let (scalar, budget, mut work, _) = owned_scalar(&original, 512);
+    let (rep, empty_defs, _) = owned_levels(Some(&[1, 0, 1, 1, 0]), &[], &mut work);
+    drop(empty_defs);
+    let mut decoder = ConstantPageDecoder {
+        ranges: VecDeque::from([1..3]),
+        scalar: scalar.clone(),
+        rep,
+        def: None,
+        def_meaning: Arc::from([
+            DefinitionInterpretation::AllValidItem,
+            DefinitionInterpretation::AllValidList,
+        ]),
+        max_rep: 1,
+        max_visible_def: 0,
+        cursor_row: 0,
+        cursor_level: 0,
+        num_rows: 2,
+    };
+    let task = decoder.drain(2).unwrap();
+    drop(decoder);
+    drop(work);
+    let mut work = budget.try_reserve(6 + 25).unwrap();
+    let decoded = task.try_decode_in(&mut work).unwrap().unwrap();
+    let mut repdef = CompositeRepDefUnraveler::new(vec![decoded.repdef]);
+    assert!(
+        repdef
+            .try_unravel_validity_in(3, &mut work)
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    let actual = decoded
+        .data
+        .try_to_arrow_in(&DataType::Binary, &mut work)
+        .unwrap()
+        .unwrap();
+    let expected =
+        arrow_select::take::take(original.as_ref(), &UInt64Array::from(vec![0, 0, 0]), None)
+            .unwrap();
+    assert_eq!(actual, expected.to_data());
+    assert!(work.is_empty());
+    let (offsets, validity) = repdef.unravel_offsets::<i32>().unwrap();
+    assert_eq!(offsets.as_ref(), &[0, 1, 3]);
+    assert!(validity.is_none());
+    drop(repdef);
+    drop(decoded.data);
+    drop(task);
+    drop(scalar);
+    drop(work);
+    assert_eq!(budget.reserved(), 25);
+    drop(actual);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+fn empty_structural_constant_keeps_typed_empty_output(#[values(false, true)] has_rep: bool) {
+    let original = fixture(3);
+    let (scalar, budget, mut work, _) = owned_scalar(&original, 512);
+    let rep_values = [1_u16];
+    let (rep, def, _) = owned_levels(has_rep.then_some(rep_values.as_slice()), &[0], &mut work);
+    let meanings: Arc<[DefinitionInterpretation]> = if has_rep {
+        Arc::from([
+            DefinitionInterpretation::NullableItem,
+            DefinitionInterpretation::NullableList,
+        ])
+    } else {
+        Arc::from([DefinitionInterpretation::NullableItem])
+    };
+    let mut decoder = ConstantPageDecoder {
+        ranges: VecDeque::new(),
+        scalar: scalar.clone(),
+        rep,
+        def: Some(def),
+        def_meaning: meanings,
+        max_rep: u16::from(has_rep),
+        max_visible_def: 1,
+        cursor_row: 0,
+        cursor_level: 0,
+        num_rows: 0,
+    };
+    let task = decoder.drain(0).unwrap();
+    drop(decoder);
+    drop(work);
+    let mut work = budget.try_reserve(4).unwrap();
+    let decoded = task.try_decode_in(&mut work).unwrap().unwrap();
+    let mut repdef = CompositeRepDefUnraveler::new(vec![decoded.repdef]);
+    assert_eq!(
+        repdef
+            .try_unravel_validity_in(0, &mut work)
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .len(),
+        0
+    );
+    let actual = decoded
+        .data
+        .try_to_arrow_in(&DataType::Binary, &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual,
+        arrow_array::new_empty_array(&DataType::Binary).to_data()
+    );
+    assert!(work.is_empty());
+    drop(actual);
+    drop(decoded.data);
+    drop(repdef);
+    drop(task);
+    drop(scalar);
+    drop(work);
+    assert_eq!(budget.reserved(), 0);
 }

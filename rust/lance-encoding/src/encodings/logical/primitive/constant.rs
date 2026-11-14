@@ -519,25 +519,7 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
         &self,
         workspace: &mut lance_core::utils::allocation::Reservation,
     ) -> Result<Option<crate::decoder::DecodedPage>> {
-        if self.rep.is_some() || self.def.is_some() {
-            return Err(Error::not_supported(
-                "constant page rep/def reconstruction needs an admitted level workspace",
-            ));
-        }
-        let Some(data) =
-            admitted::repeat(self.scalar.as_ref(), self.visible_items_total, workspace)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(crate::decoder::DecodedPage {
-            data,
-            repdef: RepDefUnraveler::new(
-                None,
-                None,
-                self.def_meaning.clone(),
-                self.visible_items_total,
-            ),
-        }))
+        admitted::decode(self, workspace)
     }
 
     fn decode(self: Box<Self>) -> Result<crate::decoder::DecodedPage> {

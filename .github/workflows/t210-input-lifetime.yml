@@ -21,10 +21,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Constant-page expansion passed at da900dc2f (run 43589354880). Reuse that
-      # unchanged evidence; dense rep/def storage now changes shared unraveler internals.
-      - name: Validate admitted dense levels and existing repdef composition
+      # Dense storage passed at b71cfe788 (run 43591784167). The new constant task
+      # composes with owned levels, so validate both affected suites at this head.
+      - name: Validate owned structural level adoption
         run: >-
           cargo test --profile ci --locked -p lance-encoding --all-features --lib repdef:: -- --nocapture
+      - name: Validate structural constant task composition
+        run: >-
+          cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::constant:: -- --nocapture
       - name: Lint touched crate
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
