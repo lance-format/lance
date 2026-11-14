@@ -212,6 +212,20 @@ impl IndexVisibility {
             self.result_rows().await?.clone(),
         )))
     }
+
+    /// Like [`Self::block_mask`], but always address-domain (never stable ids,
+    /// regardless of `self`'s configured result domain) and synchronous, since
+    /// `physical_selection` needs no I/O. For blocking stale rows out of a
+    /// `ScalarIndexExec`-produced `IndexExprResult`, which is always
+    /// address-domain on the wire — unlike `MaterializeIndexExec`'s own
+    /// `overlay_block`, which stays in `self`'s configured domain (row-id,
+    /// matching that node's take-by-id contract) via [`Self::block_mask`].
+    pub(crate) fn block_mask_by_address(&self) -> Option<RowAddrMask> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(RowAddrMask::from_block(self.physical_selection()))
+    }
 }
 
 #[cfg(test)]

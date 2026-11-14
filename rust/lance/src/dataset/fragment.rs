@@ -8705,7 +8705,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn indexed_scan_still_maps_stable_ids() {
+        async fn indexed_scan_skips_stable_id_mapping_for_a_fresh_index() {
+            // A freshly built scalar index is always address-domain (#10960),
+            // even on a stable-row-id dataset, so the scalar-index scan path
+            // consumes its result directly — no per-fragment row-id-sequence
+            // read is needed to map it back to physical offsets.
             let (_dir, mut dataset) = fixture(true).await;
             dataset
                 .create_index(
@@ -8733,9 +8737,10 @@ mod tests {
             );
             let stats = dataset.object_store.io_stats_incremental();
             for fragment in dataset.get_fragments() {
-                assert!(
-                    lineage_reads(&stats, &fragment) > 0,
-                    "index results need stable-to-physical mapping: {stats:?}"
+                assert_eq!(
+                    lineage_reads(&stats, &fragment),
+                    0,
+                    "address-domain index results need no stable-to-physical mapping: {stats:?}"
                 );
             }
         }

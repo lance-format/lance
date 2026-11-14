@@ -24,4 +24,4 @@ pub use mask::{
     NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
     RowIdMask, RowIdSet, RowSetOps, bitmap_to_ranges, ranges_to_bitmap,
 };
-pub use result::{IndexExprResult, NullableIndexExprResult};
+pub use result::{IndexExprResult, MaskDomain, NullableIndexExprResult};

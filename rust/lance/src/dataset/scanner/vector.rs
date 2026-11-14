@@ -995,8 +995,9 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node =
-                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
+            let mut stale_node = self
+                .row_addrs_take(stale_rows.physical_selection(), take_proj)
+                .await?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
