@@ -38,8 +38,10 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+mod expiry;
 pub mod retention;
 
+use expiry::{ThinningAnchor, ThinningCandidate, ThinningSurvivors, Verdict, VersionExpiry};
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
@@ -432,8 +434,6 @@ struct CleanupTask<'a> {
     dataset: &'a Dataset,
     policy: CleanupPolicy,
     retention_policy: Option<Vec<CleanupRule>>,
-    thinning_rules: Vec<ThinningRule>,
-    thinning_version_floor: Option<u64>,
     action: CleanupAction,
     read_version: u64,
     ignored_manifests: HashSet<Path>,
@@ -471,7 +471,6 @@ struct CleanupInspection {
     // only whether they found owner paths, not another copy of all references.
     managed_scans: HashMap<ManagedScanKey, Arc<OnceCell<bool>>>,
     old_manifests: HashMap<Path, ExpiredManifest>,
-    bucket_survivors: HashMap<(usize, u128), (u128, ManifestLocation)>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
     retired_records: HashMap<u64, String>,
@@ -663,12 +662,6 @@ const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
 /// The operation's shared permits bound active scans across manifests and branches.
 const MANAGED_FRAGMENT_SCAN_CONCURRENCY: usize = 8;
 
-#[derive(Clone, Copy, Debug)]
-struct ThinningRule {
-    per_interval: Duration,
-    cutoff: DateTime<Utc>,
-}
-
 /// Builder-style cleanup operation.
 ///
 /// Call [`Self::explain`] for a read-only explanation of what cleanup would
@@ -841,26 +834,6 @@ impl<'a> CleanupOperation<'a> {
 }
 
 impl<'a> CleanupTask<'a> {
-    fn cleanup_candidates(&self, manifest: &Manifest) -> (bool, Option<usize>) {
-        if !self.policy.matches_version_filters(manifest) {
-            return (false, None);
-        }
-        let hard_expired = (self.retention_policy.is_none()
-            || self.policy.before_timestamp.is_some())
-            && self.policy.should_clean(manifest);
-        let tier = if self
-            .thinning_version_floor
-            .is_some_and(|floor| manifest.version < floor)
-        {
-            self.thinning_rules
-                .iter()
-                .rposition(|rule| manifest.timestamp() < rule.cutoff)
-        } else {
-            None
-        };
-        (hard_expired, tier)
-    }
-
     fn new(operation: &CleanupOperation<'a>, action: CleanupAction) -> Result<Self> {
         let track_removed_manifests = operation.policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
@@ -923,8 +896,6 @@ impl<'a> CleanupTask<'a> {
             dataset: operation.dataset,
             policy: operation.policy.clone(),
             retention_policy: operation.retention_policy.clone(),
-            thinning_rules: Vec::new(),
-            thinning_version_floor: None,
             action,
             read_version,
             ignored_manifests,
@@ -933,112 +904,76 @@ impl<'a> CleanupTask<'a> {
         })
     }
 
-    async fn run(mut self) -> Result<CleanupRunResult> {
-        if let Some(rules) = &self.retention_policy {
-            for rule in rules {
-                if let CleanupRule::RemoveAll { older_than } = rule {
-                    let delta = TimeDelta::from_std(*older_than).map_err(|_| {
-                        Error::invalid_input(format!(
-                            "remove_all.older_than is out of range: {older_than:?}"
-                        ))
-                    })?;
-                    let cutoff = utc_now().checked_sub_signed(delta).ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "remove_all.older_than={older_than:?} underflows current time"
-                        ))
-                    })?;
-                    self.policy.before_timestamp = Some(
-                        self.policy
-                            .before_timestamp
-                            .map_or(cutoff, |existing| existing.max(cutoff)),
-                    );
-                }
+    /// The commit `KeepOne` ages are measured from.
+    async fn resolve_thinning_anchor(&self) -> Result<ThinningAnchor> {
+        // Other readers can use a durable hint even when this process disables it.
+        let hinted_version = if !self.dataset.object_store.list_is_lexically_ordered {
+            read_version_hint(&self.dataset.object_store, &self.dataset.base).await?
+        } else {
+            None
+        };
+        let hinted_manifest = if let Some(version) = hinted_version {
+            let result = async {
+                let location = self
+                    .dataset
+                    .commit_handler
+                    .resolve_version_location(
+                        &self.dataset.base,
+                        version,
+                        self.dataset.object_store.inner.as_ref(),
+                    )
+                    .await?;
+                let manifest =
+                    read_manifest(&self.dataset.object_store, &location.path, location.size)
+                        .await?;
+                ensure_can_read_manifest(&manifest)?;
+                Ok::<_, Error>(manifest)
             }
-        }
-        if self.retention_policy.as_ref().is_some_and(|rules| {
+            .await;
+            match result {
+                Ok(manifest) => Some(manifest),
+                // Explicit expiration can remove an old hint target. Discovery
+                // also falls back to listing when that target no longer exists.
+                Err(error) if error.is_not_found() && version < self.read_version => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let manifest = hinted_manifest.as_ref().unwrap_or(&self.dataset.manifest);
+        Ok(ThinningAnchor {
+            timestamp: manifest.timestamp(),
+            version: manifest.version,
+        })
+    }
+
+    async fn run(self) -> Result<CleanupRunResult> {
+        let now = utc_now();
+        let has_keep_one = self.retention_policy.as_ref().is_some_and(|rules| {
             rules
                 .iter()
                 .any(|rule| matches!(rule, CleanupRule::KeepOne { .. }))
-        }) {
-            let anchor = {
-                // Other readers can use a durable hint even when this process disables it.
-                let hinted_version = if !self.dataset.object_store.list_is_lexically_ordered {
-                    read_version_hint(&self.dataset.object_store, &self.dataset.base).await?
-                } else {
-                    None
-                };
-                let hinted_manifest = if let Some(version) = hinted_version {
-                    let result = async {
-                        let location = self
-                            .dataset
-                            .commit_handler
-                            .resolve_version_location(
-                                &self.dataset.base,
-                                version,
-                                self.dataset.object_store.inner.as_ref(),
-                            )
-                            .await?;
-                        let manifest = read_manifest(
-                            &self.dataset.object_store,
-                            &location.path,
-                            location.size,
-                        )
-                        .await?;
-                        ensure_can_read_manifest(&manifest)?;
-                        Ok::<_, Error>(manifest)
-                    }
-                    .await;
-                    match result {
-                        Ok(manifest) => Some(manifest),
-                        // Explicit expiration can remove an old hint target. Discovery
-                        // also falls back to listing when that target no longer exists.
-                        Err(error) if error.is_not_found() && version < self.read_version => None,
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    None
-                };
-                self.thinning_version_floor = Some(
-                    hinted_manifest
-                        .as_ref()
-                        .map_or(self.read_version, |manifest| {
-                            manifest.version.min(self.read_version)
-                        }),
-                );
-                hinted_manifest
-                    .as_ref()
-                    .unwrap_or(&self.dataset.manifest)
-                    .timestamp()
-            };
-            if let Some(rules) = &self.retention_policy {
-                for rule in rules {
-                    if let CleanupRule::KeepOne {
-                        per_interval,
-                        older_than,
-                    } = rule
-                    {
-                        let delta = TimeDelta::from_std(*older_than).map_err(|_| {
-                            Error::invalid_input(format!(
-                                "keep_one.older_than is out of range: {older_than:?}"
-                            ))
-                        })?;
-                        let cutoff = anchor.checked_sub_signed(delta).ok_or_else(|| Error::invalid_input(
-                            format!("keep_one.older_than={older_than:?} underflows anchor timestamp {anchor}")))?;
-                        self.thinning_rules.push(ThinningRule {
-                            per_interval: *per_interval,
-                            cutoff,
-                        });
-                    }
-                }
-            }
-        }
+        });
+        let anchor = if has_keep_one {
+            Some(self.resolve_thinning_anchor().await?)
+        } else {
+            None
+        };
+        let expiry = VersionExpiry::new(
+            &self.policy,
+            self.retention_policy.as_deref(),
+            now,
+            anchor,
+            self.read_version,
+        )?;
         let mut final_result = CleanupRunResult::default();
         let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches
         // For cases that referenced branches never clean and the current cleanup cannot clean anything
         // This must happen before cleaning the current branch if the setting is enabled.
 
-        let referenced_branches: Vec<(String, u64)> = self.find_referenced_branches().await?;
+        let referenced_branches: Vec<(String, u64)> =
+            self.find_referenced_branches(&expiry).await?;
         if self.include_referenced_branches {
             final_result.referenced_branches = referenced_branches
                 .iter()
@@ -1091,7 +1026,11 @@ impl<'a> CleanupTask<'a> {
                 .retain_branch_lineage_files(inspection, &referenced_branches, &ignored_manifests)
                 .await?
         };
-        let inspection = self.process_manifests(&tagged_versions, inspection).await?;
+        let branch_held = std::mem::take(&mut inspection.branch_referenced_versions);
+        let expiry = expiry
+            .with_tagged(tagged_versions)
+            .with_branch_held(branch_held);
+        let inspection = self.process_manifests(&expiry, inspection).await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -1110,39 +1049,38 @@ impl<'a> CleanupTask<'a> {
     #[instrument(level = "debug", skip_all)]
     async fn process_manifests(
         &'a self,
-        tagged_versions: &HashSet<u64>,
+        expiry: &VersionExpiry,
         inspection: CleanupInspection,
     ) -> Result<CleanupInspection> {
-        let branch_versions = inspection.branch_referenced_versions.clone();
         let inspection = Mutex::new(inspection);
+        let survivors = Mutex::new(ThinningSurvivors::default());
         self.manifest_locations(&self.dataset.base)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(
-                    location,
-                    &inspection,
-                    tagged_versions,
-                    &branch_versions,
-                    false,
-                )
+                let (inspection, survivors) = (&inspection, &survivors);
+                async move {
+                    if let Some(candidate) = self
+                        .process_manifest_file(location.clone(), inspection, expiry, false)
+                        .await?
+                    {
+                        survivors.lock().unwrap().offer(candidate, location);
+                    }
+                    Ok(())
+                }
             })
             .await?;
-        let survivors = std::mem::take(&mut inspection.lock().unwrap().bucket_survivors);
-        // Re-read only one manifest per occupied bucket, keeping the planning pass
-        // bounded by bucket count rather than retaining large manifests in memory.
-        stream::iter(survivors.into_values().map(Ok))
-            .try_for_each_concurrent(
-                self.dataset.object_store.io_parallelism(),
-                |(_, location)| {
-                    self.process_manifest_file(
-                        location,
-                        &inspection,
-                        tagged_versions,
-                        &branch_versions,
-                        true,
-                    )
-                },
-            )
+        // Survivors are only known once every manifest has been seen. Re-read
+        // one manifest per occupied bucket, keeping the planning pass bounded by
+        // bucket count rather than retaining large manifests in memory.
+        stream::iter(survivors.into_inner().unwrap().into_survivors().map(Ok))
+            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                let inspection = &inspection;
+                async move {
+                    self.process_manifest_file(location, inspection, expiry, true)
+                        .await
+                        .map(|_| ())
+                }
+            })
             .await?;
         Ok(inspection.into_inner().unwrap())
     }
@@ -1346,14 +1284,15 @@ impl<'a> CleanupTask<'a> {
             .await
     }
 
+    /// Returns the thinning candidate when the manifest expires unless it
+    /// survives its bucket.
     async fn process_manifest_file(
         &self,
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
-        tagged_versions: &HashSet<u64>,
-        branch_versions: &HashSet<u64>,
+        expiry: &VersionExpiry,
         retain_bucket_survivor: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<ThinningCandidate>> {
         // Reading an expired manifest only ever produced `verified_files`, the evidence
         // that a file came from a version we are deleting. `delete_unverified` says that
         // evidence is not required, so there is nothing left to learn from the read: the
@@ -1362,13 +1301,7 @@ impl<'a> CleanupTask<'a> {
         // This is the whole cost on a table that has accumulated versions faster than it
         // cleaned them, where almost every manifest is expired. Retained branch roots
         // must also be read so all of their files join the working set.
-        if self.policy.delete_unverified
-            && self.retention_policy.is_none()
-            && !tagged_versions.contains(&location.version)
-            && !branch_versions.contains(&location.version)
-            && location.version < self.read_version
-            && self.policy.proven_expired(location.version)
-        {
+        if self.policy.delete_unverified && expiry.is_expired_by_version(location.version) {
             let mut inspection = inspection.lock().unwrap();
             inspection.old_manifests.insert(
                 location.path.clone(),
@@ -1386,7 +1319,7 @@ impl<'a> CleanupTask<'a> {
             // side, so give up the listing cutoff and scan the whole subtree. Missing a
             // file would orphan it permanently; an extra listing only costs time.
             inspection.skipped_expired_manifest_read = true;
-            return Ok(());
+            return Ok(None);
         }
 
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
@@ -1405,7 +1338,7 @@ impl<'a> CleanupTask<'a> {
                     manifest_path = %location.path,
                     "Skipping detached manifest removed after it was listed"
                 );
-                return Ok(());
+                return Ok(None);
             }
             Err(error) if location.version < self.read_version && error.is_not_found() => {
                 // Another cleanup may remove an old manifest after this cleanup lists it.
@@ -1424,24 +1357,13 @@ impl<'a> CleanupTask<'a> {
                         .retired_records
                         .insert(location.version, identity);
                 }
-                return Ok(());
+                return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        // Don't delete the latest version, even if it is old. Don't delete tagged versions,
-        // regardless of age. Don't delete manifests if their version is newer than the dataset
-        // version.  These are either in-progress or newly added since we started. Detached
-        // versions never expire.
         let is_detached = is_detached_version(manifest.version);
-        let is_latest = self.read_version <= manifest.version;
-        let (hard_expired, thinning_candidate) = self.cleanup_candidates(&manifest);
-        let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_detached
-            || retain_bucket_survivor
-            || is_latest
-            || !(hard_expired || thinning_candidate.is_some())
-            || is_tagged
-            || branch_versions.contains(&manifest.version);
+        let verdict = expiry.classify(manifest.version, manifest.timestamp());
+        let in_working_set = retain_bucket_survivor || verdict.is_retained();
         if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
@@ -1453,28 +1375,13 @@ impl<'a> CleanupTask<'a> {
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
-        // Only track tagged when it is old.
-        if is_tagged && !is_latest && (hard_expired || thinning_candidate.is_some()) {
+        if verdict == Verdict::TaggedOld {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         let commit_ts = manifest.timestamp();
         if !in_working_set {
-            if let Some(tier) = thinning_candidate.filter(|_| !hard_expired) {
-                let bucket = (
-                    tier,
-                    manifest.timestamp_nanos / self.thinning_rules[tier].per_interval.as_nanos(),
-                );
-                let candidate = (manifest.timestamp_nanos, manifest.version);
-                let survivor = inspection
-                    .bucket_survivors
-                    .entry(bucket)
-                    .or_insert_with(|| (manifest.timestamp_nanos, location.clone()));
-                if candidate > (survivor.0, survivor.1.version) {
-                    *survivor = (manifest.timestamp_nanos, location.clone());
-                }
-            }
             inspection.old_manifests.insert(
                 location.path.clone(),
                 ExpiredManifest {
@@ -1507,7 +1414,10 @@ impl<'a> CleanupTask<'a> {
                 }
             }
         }
-        Ok(())
+        Ok(match verdict {
+            Verdict::Thinned(candidate) if !in_working_set => Some(candidate),
+            _ => None,
+        })
     }
 
     fn process_manifest(
@@ -2589,7 +2499,7 @@ impl<'a> CleanupTask<'a> {
         }
     }
 
-    async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
+    async fn find_referenced_branches(&self, expiry: &VersionExpiry) -> Result<Vec<(String, u64)>> {
         let current_branch_id = self.dataset.branch_identifier().await?;
         let all_branches = self.dataset.branches().list().await?;
         let children = current_branch_id.collect_referenced_versions(&all_branches);
@@ -2626,9 +2536,7 @@ impl<'a> CleanupTask<'a> {
                         Ok(manifest) => {
                             ensure_can_read_manifest(&manifest)?;
                             ensure_can_write_manifest(&manifest)?;
-                            let (hard_expired, thinning_candidate) =
-                                self.cleanup_candidates(&manifest);
-                            if hard_expired || thinning_candidate.is_some() {
+                            if expiry.is_old(manifest.version, manifest.timestamp()) {
                                 referenced_branches.insert(branch_name.clone());
                             }
                         }
@@ -3110,45 +3018,18 @@ pub struct CleanupPolicy {
 }
 
 impl CleanupPolicy {
-    /// True only when the listing alone proves this manifest is expired.
-    ///
-    /// Timestamp policies require reading the logical commit time: storage clocks and
-    /// timestamp precision do not guarantee that object write time is an upper bound.
-    /// All version conditions must be satisfied, and at least one must be specified.
-    fn proven_expired(&self, version: u64) -> bool {
-        if self.before_timestamp.is_some()
-            || (self.before_version.is_none() && self.versions.is_none())
-        {
-            return false;
-        }
-        if let Some(before_version) = self.before_version
-            && version >= before_version
-        {
-            return false;
-        }
-        if let Some(versions) = self.versions.as_ref()
-            && !versions.contains(&version)
-        {
-            return false;
-        }
-        true
-    }
-
     pub fn should_clean(&self, manifest: &Manifest) -> bool {
         self.before_timestamp
             .is_none_or(|timestamp| manifest.timestamp() < timestamp)
-            && self.matches_version_filters(manifest)
+            && self.matches_version_filters(manifest.version)
     }
 
-    fn matches_version_filters(&self, manifest: &Manifest) -> bool {
-        let mut should_clean = true;
-        if let Some(before_version) = self.before_version {
-            should_clean &= manifest.version < before_version;
-        }
-        if let Some(versions) = self.versions.as_ref() {
-            should_clean &= versions.contains(&manifest.version);
-        }
-        should_clean
+    fn matches_version_filters(&self, version: u64) -> bool {
+        self.before_version.is_none_or(|before| version < before)
+            && self
+                .versions
+                .as_ref()
+                .is_none_or(|versions| versions.contains(&version))
     }
 }
 
@@ -4200,6 +4081,11 @@ mod tests {
         }
     }
 
+    /// Expiry for a task without retention rules, which needs no thinning anchor.
+    fn legacy_expiry(task: &CleanupTask<'_>) -> VersionExpiry {
+        VersionExpiry::new(&task.policy, None, utc_now(), None, task.read_version).unwrap()
+    }
+
     async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
         dataset
@@ -4674,7 +4560,10 @@ mod tests {
             ..Default::default()
         });
         let task = CleanupTask::new(&operation, action).unwrap();
-        let branches = task.find_referenced_branches().await.unwrap();
+        let branches = task
+            .find_referenced_branches(&legacy_expiry(&task))
+            .await
+            .unwrap();
         assert_eq!(branches.len(), 2);
         assert_ne!(branches[0].1, branches[1].1);
         // A closed parent budget must stop the actual cascade before any child
@@ -4928,8 +4817,7 @@ mod tests {
             .process_manifest_file(
                 old_manifest,
                 &Mutex::new(CleanupInspection::default()),
-                &HashSet::new(),
-                &HashSet::new(),
+                &legacy_expiry(&cleanup),
                 false,
             )
             .await
@@ -6519,7 +6407,10 @@ mod tests {
             CleanupAction::Execute,
         )
         .unwrap();
-        let referenced_branches = task.find_referenced_branches().await.unwrap();
+        let referenced_branches = task
+            .find_referenced_branches(&legacy_expiry(&task))
+            .await
+            .unwrap();
         let inspection = task
             .retain_branch_lineage_files(
                 CleanupInspection::default(),
@@ -6538,8 +6429,7 @@ mod tests {
         task.process_manifest_file(
             root_location,
             &inspection,
-            &HashSet::new(),
-            &branch_versions,
+            &legacy_expiry(&task).with_branch_held(branch_versions),
             false,
         )
         .await
@@ -6631,7 +6521,10 @@ mod tests {
                 .build(),
         );
         let task = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
-        let referenced_branches = task.find_referenced_branches().await.unwrap();
+        let referenced_branches = task
+            .find_referenced_branches(&legacy_expiry(&task))
+            .await
+            .unwrap();
         assert!(referenced_branches.iter().any(|(name, _)| name == "child"));
         let inspection = task
             .retain_branch_lineage_files(
@@ -6703,7 +6596,7 @@ mod tests {
         )
         .unwrap();
         let inspection = task
-            .process_manifests(&HashSet::new(), CleanupInspection::default())
+            .process_manifests(&legacy_expiry(&task), CleanupInspection::default())
             .await
             .unwrap();
         let kept: HashSet<&Path> = inspection
@@ -7992,43 +7885,6 @@ mod tests {
             read.lock().unwrap().contains(&2),
             "a tagged version must still be read, since its files are live"
         );
-    }
-
-    #[test]
-    fn proven_expired_refuses_to_guess() {
-        assert!(!CleanupPolicy::default().proven_expired(1));
-        let by_version = CleanupPolicy {
-            before_version: Some(10),
-            ..Default::default()
-        };
-        assert!(by_version.proven_expired(9));
-        assert!(!by_version.proven_expired(10));
-        assert!(!by_version.proven_expired(11));
-
-        let listed = CleanupPolicy {
-            versions: Some(HashSet::from([3, 4])),
-            ..Default::default()
-        };
-        assert!(listed.proven_expired(3));
-        assert!(!listed.proven_expired(5));
-        let combined = CleanupPolicy {
-            before_version: Some(4),
-            ..listed
-        };
-        assert!(combined.proven_expired(3));
-        assert!(!combined.proven_expired(4));
-        assert!(!combined.proven_expired(2));
-
-        let by_time = CleanupPolicy {
-            before_timestamp: Some(DateTime::from_timestamp(100, 0).unwrap()),
-            ..Default::default()
-        };
-        assert!(!by_time.proven_expired(1));
-        let combined = CleanupPolicy {
-            before_timestamp: by_time.before_timestamp,
-            ..combined
-        };
-        assert!(!combined.proven_expired(3));
     }
 
     #[rstest]
