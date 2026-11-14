@@ -14,16 +14,105 @@ use crate::{
 // This is an optional fast path. Wider offset tables keep the ordinary reader.
 const MAX_OFFSET_BYTES: u64 = 64 * 1024;
 
+/// A validated binary value located without loading its payload.
+///
+/// Preparation retains only its file range and I/O service. Repeated slices
+/// reuse the location instead of re-reading chunk metadata and offsets. Bind a
+/// handle to its request's I/O scope; it can contain a request-specific recorder.
+#[derive(Clone)]
+pub struct PreparedBinaryValue {
+    range: Range<u64>,
+    io: Arc<dyn EncodingsIo>,
+    priority: u64,
+}
+
+impl std::fmt::Debug for PreparedBinaryValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBinaryValue")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedBinaryValue {
+    /// Length of the binary value, available without reading its payload.
+    pub fn len(&self) -> u64 {
+        self.range.end - self.range.start
+    }
+
+    /// Whether this value has no payload bytes.
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
+    /// Read value-relative slices, preserving order, overlap and empty slices.
+    ///
+    /// Returned buffers can share coalesced I/O backing; visible byte lengths
+    /// are not retained-allocation bounds. Every requested slice is validated
+    /// before payload I/O, and short reads return a typed error.
+    ///
+    /// ```
+    /// # use lance_encoding::encodings::physical::binary::PreparedBinaryValue;
+    /// # async fn example(value: &PreparedBinaryValue) -> lance_core::Result<()> {
+    /// let tail = value.read_slices(&[value.len().saturating_sub(8)..value.len()]).await?;
+    /// assert!(tail[0].len() <= 8);
+    /// # Ok(()) }
+    /// ```
+    pub async fn read_slices(&self, slices: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        let corrupt = |message: &str| Error::corrupt_file_named("binary mini-block", message);
+        let value_len = self.len();
+        let mut requests = Vec::with_capacity(slices.len());
+        let mut result = vec![Bytes::new(); slices.len()];
+        for (index, slice) in slices.iter().enumerate() {
+            if slice.start > slice.end || slice.end > value_len {
+                return Err(Error::invalid_input(format!(
+                    "binary byte range {slice:?} exceeds {value_len} bytes"
+                )));
+            }
+            if !slice.is_empty() {
+                let start = self
+                    .range
+                    .start
+                    .checked_add(slice.start)
+                    .ok_or_else(|| corrupt("binary file offset overflow"))?;
+                let end = start
+                    .checked_add(slice.end - slice.start)
+                    .ok_or_else(|| corrupt("binary file range overflow"))?;
+                requests.push((index, start..end));
+            }
+        }
+        requests.sort_unstable_by_key(|(_, range)| (range.start, range.end));
+        if !requests.is_empty() {
+            let read = self
+                .io
+                .submit_request(
+                    requests.iter().map(|(_, range)| range.clone()).collect(),
+                    self.priority,
+                )
+                .await?;
+            if read.len() != requests.len() {
+                return Err(corrupt("binary range result count mismatch"));
+            }
+            for ((index, range), bytes) in requests.into_iter().zip(read) {
+                if bytes.len() as u64 != range.end - range.start {
+                    return Err(corrupt("truncated binary value range"));
+                }
+                result[index] = bytes;
+            }
+        }
+        Ok(result)
+    }
+}
+
 impl BinaryMiniBlockDecompressor {
-    pub(crate) async fn read_value_slices(
+    pub(crate) async fn prepare_value(
         &self,
         buffers: &[Range<u64>],
         num_values: u64,
         row: u64,
-        slices: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
         priority: u64,
-    ) -> Result<Option<Vec<Bytes>>> {
+    ) -> Result<Option<PreparedBinaryValue>> {
         let corrupt = |message: &str| Error::corrupt_file_named("binary mini-block", message);
         if buffers.len() != self.num_buffers() || row >= num_values {
             return Err(corrupt("invalid buffer count or selected value index"));
@@ -145,44 +234,17 @@ impl BinaryMiniBlockDecompressor {
         if (width == 32 && value_len > i32::MAX as u64) || value_len > i64::MAX as u64 {
             return Err(corrupt("binary value exceeds its signed offset limit"));
         }
-        let mut requests = Vec::with_capacity(slices.len());
-        let mut result = vec![Bytes::new(); slices.len()];
-        for (index, slice) in slices.iter().enumerate() {
-            if slice.start > slice.end || slice.end > value_len {
-                return Err(Error::invalid_input(format!(
-                    "binary byte range {slice:?} exceeds {value_len} bytes"
-                )));
-            }
-            if !slice.is_empty() {
-                let start = payload
-                    .start
-                    .checked_add(value_start)
-                    .and_then(|start| start.checked_add(slice.start))
-                    .ok_or_else(|| corrupt("binary file offset overflow"))?;
-                let end = start
-                    .checked_add(slice.end - slice.start)
-                    .ok_or_else(|| corrupt("binary file range overflow"))?;
-                requests.push((index, start..end));
-            }
-        }
-        requests.sort_unstable_by_key(|(_, range)| (range.start, range.end));
-        if !requests.is_empty() {
-            let read = io
-                .submit_request(
-                    requests.iter().map(|(_, range)| range.clone()).collect(),
-                    priority,
-                )
-                .await?;
-            if read.len() != requests.len() {
-                return Err(corrupt("binary range result count mismatch"));
-            }
-            for ((index, range), bytes) in requests.into_iter().zip(read) {
-                if bytes.len() as u64 != range.end - range.start {
-                    return Err(corrupt("truncated binary value range"));
-                }
-                result[index] = bytes;
-            }
-        }
-        Ok(Some(result))
+        let start = payload
+            .start
+            .checked_add(value_start)
+            .ok_or_else(|| corrupt("binary file offset overflow"))?;
+        let end = start
+            .checked_add(value_len)
+            .ok_or_else(|| corrupt("binary file range overflow"))?;
+        Ok(Some(PreparedBinaryValue {
+            range: start..end,
+            io: io.clone(),
+            priority,
+        }))
     }
 }

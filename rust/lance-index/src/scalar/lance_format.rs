@@ -3,7 +3,7 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use super::{IndexFile, IndexReader, IndexStore, IndexWriter};
+use super::{IndexBinaryReader, IndexFile, IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
@@ -280,6 +280,20 @@ impl IndexReader for V1IndexReader {
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
 struct CurrentIndexReader(CurrentFileReader);
 
+#[derive(Debug)]
+struct LanceBinaryReader(lance_encoding::encodings::physical::binary::PreparedBinaryValue);
+
+#[async_trait]
+impl IndexBinaryReader for LanceBinaryReader {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    async fn read_slices(&self, slices: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
+        self.0.read_slices(slices).await
+    }
+}
+
 impl CurrentIndexReader {
     /// Row range covered by batch `offset`, clamped to the end of the file.
     fn batch_bounds(&self, offset: u64, batch_size: u64) -> (usize, usize) {
@@ -292,12 +306,11 @@ impl CurrentIndexReader {
 
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
-    async fn try_read_binary_value_slices(
+    async fn try_prepare_binary_value(
         &self,
         column: &str,
         row: u64,
-        slices: &[std::ops::Range<u64>],
-    ) -> Result<Option<Vec<Bytes>>> {
+    ) -> Result<Option<Arc<dyn IndexBinaryReader>>> {
         let schema = self.0.schema();
         let field = schema.field(column).ok_or_else(|| {
             Error::invalid_input(format!("binary byte read column {column:?} is missing"))
@@ -313,9 +326,11 @@ impl IndexReader for CurrentIndexReader {
         let [column_index] = projection.column_indices.as_slice() else {
             return Ok(None);
         };
-        self.0
-            .try_read_binary_value_slices(*column_index as usize, row, slices)
-            .await
+        Ok(self
+            .0
+            .try_prepare_binary_value(*column_index as usize, row)
+            .await?
+            .map(|value| Arc::new(LanceBinaryReader(value)) as Arc<dyn IndexBinaryReader>))
     }
 
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
@@ -857,9 +872,16 @@ mod tests {
         let slices = [100..112, 0..0, 103..108];
         for row in [0, 2, 3] {
             let selected = reader
-                .try_read_binary_value_slices("payload", row, &slices)
+                .try_prepare_binary_value("payload", row)
                 .await?
                 .unwrap();
+            assert_eq!(selected.len(), payloads[row as usize].len() as u64);
+            assert!(!selected.is_empty());
+            let tail = selected
+                .read_slices(&[selected.len() - 1..selected.len()])
+                .await?;
+            assert_eq!(tail[0].as_ref(), &payloads[row as usize][8191..]);
+            let selected = selected.read_slices(&slices).await?;
             for (actual, slice) in selected.iter().zip(&slices) {
                 assert_eq!(
                     actual.as_ref(),
@@ -867,14 +889,9 @@ mod tests {
                 );
             }
         }
-        assert!(
-            reader
-                .try_read_binary_value_slices("id", 0, &slices)
-                .await?
-                .is_none()
-        );
+        assert!(reader.try_prepare_binary_value("id", 0).await?.is_none());
         let error = reader
-            .try_read_binary_value_slices("missing", 0, &slices)
+            .try_prepare_binary_value("missing", 0)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));

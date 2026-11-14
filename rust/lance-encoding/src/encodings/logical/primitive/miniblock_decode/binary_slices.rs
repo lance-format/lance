@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use bytes::Bytes;
 use lance_core::{Error, Result};
@@ -11,7 +11,7 @@ use crate::{
     EncodingsIo,
     compression::{DefaultDecompressionStrategy, MiniBlockDecompressor},
     decoder::{PageEncoding, PageInfo},
-    encodings::physical::binary::BinaryMiniBlockDecompressor,
+    encodings::physical::binary::{BinaryMiniBlockDecompressor, PreparedBinaryValue},
     format::metadata::{compressive_encoding::Compression, page_layout::Layout},
 };
 
@@ -20,34 +20,30 @@ use crate::{
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
 impl MiniBlockScheduler {
-    /// Read selected byte ranges of one flat binary value without reading its whole payload.
+    /// Locate one flat binary value without reading its payload.
     ///
-    /// Returns `None` for unsupported layouts or offset tables outside the bounded
-    /// metadata fast path. Callers must then use ordinary decoding. Ranges may
-    /// overlap or be unordered; output preserves their order, including empties.
-    /// Returned buffers can share backing storage, as with ordinary encoded I/O.
-    /// This does not change the persisted encoding.
+    /// Returns `None` for unsupported layouts or metadata outside the bounded
+    /// fast path. Callers must retain ordinary decoding as a fallback. The
+    /// handle exposes the value length and supports repeated byte-range reads
+    /// without reinitializing chunk metadata. No persisted encoding changes.
     ///
     /// ```
-    /// # use std::{borrow::Cow, ops::Range, sync::Arc};
+    /// # use std::sync::Arc;
     /// # use lance_encoding::{EncodingsIo, decoder::PageInfo, encodings::logical::primitive::MiniBlockScheduler};
     /// # async fn example(page: &PageInfo, io: &Arc<dyn EncodingsIo>) -> lance_core::Result<()> {
-    /// let selected = MiniBlockScheduler::try_read_binary_value_slices(page, 0, &[0..4], io).await?;
-    /// if let Some(selected) = selected {
-    ///     assert_eq!(selected[0].len(), 4);
+    /// if let Some(value) = MiniBlockScheduler::try_prepare_binary_value(page, 0, io).await? {
+    ///     let bytes = value.read_slices(&[0..value.len().min(4)]).await?;
+    ///     assert!(bytes[0].len() <= 4);
     /// }
     /// # Ok(()) }
     /// ```
-    pub async fn try_read_binary_value_slices(
+    pub async fn try_prepare_binary_value(
         page: &PageInfo,
         row: u64,
-        slices: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
-    ) -> Result<Option<Vec<Bytes>>> {
-        if row >= page.num_rows || slices.iter().any(|range| range.start > range.end) {
-            return Err(Error::invalid_input(
-                "invalid binary row or reversed byte range",
-            ));
+    ) -> Result<Option<PreparedBinaryValue>> {
+        if row >= page.num_rows {
+            return Err(Error::invalid_input("invalid binary row"));
         }
         let page_layout = match &page.encoding {
             PageEncoding::Structural(layout) => Cow::Borrowed(layout),
@@ -234,11 +230,10 @@ impl MiniBlockScheduler {
                 })?;
         }
         decoder
-            .read_value_slices(
+            .prepare_value(
                 &value_buffers,
                 index.items_in_chunk(instruction.chunk_idx),
                 instruction.rows_to_skip,
-                slices,
                 io,
                 page.priority,
             )
@@ -248,7 +243,7 @@ impl MiniBlockScheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{ops::Range, sync::Mutex};
 
     use futures::{FutureExt, future::BoxFuture};
     use rstest::rstest;
@@ -300,12 +295,29 @@ mod tests {
         }
     }
 
-    fn page_fixture(width: u8, wide: bool, generic: bool) -> (PageInfo, RecordedIo, Vec<Vec<u8>>) {
-        let values = vec![vec![b'a'; 8192], vec![b'b'; 8192]];
+    async fn read_selected(
+        page: &PageInfo,
+        row: u64,
+        slices: &[Range<u64>],
+        io: &Arc<dyn EncodingsIo>,
+    ) -> Result<Option<Vec<Bytes>>> {
+        match MiniBlockScheduler::try_prepare_binary_value(page, row, io).await? {
+            Some(value) => value.read_slices(slices).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn page_fixture(
+        width: u8,
+        wide: bool,
+        generic: bool,
+        payload_len: usize,
+    ) -> (PageInfo, RecordedIo, Vec<Vec<u8>>) {
+        let values = vec![vec![b'a'; payload_len], vec![b'b'; payload_len]];
         let offsets = if width == 32 {
-            LanceBuffer::reinterpret_vec(vec![0_i32, 8192, 16384])
+            LanceBuffer::reinterpret_vec(vec![0_i32, payload_len as i32, (payload_len * 2) as i32])
         } else {
-            LanceBuffer::reinterpret_vec(vec![0_i64, 8192, 16384])
+            LanceBuffer::reinterpret_vec(vec![0_i64, payload_len as i64, (payload_len * 2) as i64])
         };
         let block = DataBlock::VariableWidth(VariableWidthBlock {
             data: LanceBuffer::from(values.concat()),
@@ -383,16 +395,31 @@ mod tests {
         #[values(false, true)] wide: bool,
         #[values(false, true)] generic: bool,
         #[values(0, 1)] row: usize,
+        #[values(0, 8192)] payload_len: usize,
     ) {
-        let (page, recorded, values) = page_fixture(width, wide, generic);
+        let (page, recorded, values) = page_fixture(width, wide, generic, payload_len);
         let recorded = Arc::new(recorded);
         let io: Arc<dyn EncodingsIo> = recorded.clone();
-        let ranges = [100..200, 0..0, 50..80, 100..120];
-        let result =
-            MiniBlockScheduler::try_read_binary_value_slices(&page, row as u64, &ranges, &io)
-                .await
-                .unwrap()
-                .unwrap();
+        let ranges = if payload_len == 0 {
+            [0..0, 0..0, 0..0, 0..0]
+        } else {
+            [100..200, 0..0, 50..80, 100..120]
+        };
+        let value = MiniBlockScheduler::try_prepare_binary_value(&page, row as u64, &io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.len(), payload_len as u64);
+        assert_eq!(value.is_empty(), payload_len == 0);
+        let metadata_requests = recorded.requests.lock().unwrap().len();
+        let result = value.read_slices(&ranges).await.unwrap();
+        let tail_start = value.len().saturating_sub(1);
+        let tail = value
+            .clone()
+            .read_slices(&[tail_start..value.len()])
+            .await
+            .unwrap();
+        assert_eq!(tail[0].as_ref(), &values[row][tail_start as usize..]);
         assert_eq!(result.len(), ranges.len());
         for (bytes, range) in result.iter().zip(&ranges) {
             assert_eq!(
@@ -402,6 +429,13 @@ mod tests {
         }
         let requests = recorded.requests.lock().unwrap();
         assert!(requests.iter().all(|(_, priority)| *priority == 7));
+        let body_requests =
+            ranges.iter().filter(|range| !range.is_empty()).count() + usize::from(payload_len > 0);
+        assert_eq!(
+            requests.len(),
+            metadata_requests + body_requests,
+            "preparation metadata must be reused on every body read"
+        );
         let requested_bytes: u64 = requests
             .iter()
             .map(|(range, _)| range.end - range.start)
@@ -417,31 +451,78 @@ mod tests {
     async fn binary_slices_reject_bounds_and_short_reads(
         #[values(1, 2, 3, 4)] short_read_at: usize,
     ) {
-        let (page, mut recorded, _) = page_fixture(64, true, false);
+        let (page, mut recorded, _) = page_fixture(64, true, false, 8192);
         recorded.short_read_at = Some(short_read_at);
         let io: Arc<dyn EncodingsIo> = Arc::new(recorded);
-        let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 0, &[0..1], &io)
+        let error = read_selected(&page, 0, &[0..1], &io).await.unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("truncated"));
+        let error = read_selected(&page, 2, &[0..1], &io).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("invalid binary row"));
+    }
+
+    #[tokio::test]
+    async fn binary_slices_prepared_clone_owns_only_its_io_scope() {
+        let (page, recorded, values) = page_fixture(64, true, false, 8192);
+        let recorded = Arc::new(recorded);
+        let weak = Arc::downgrade(&recorded);
+        let io: Arc<dyn EncodingsIo> = recorded.clone();
+        let value = MiniBlockScheduler::try_prepare_binary_value(&page, 1, &io)
+            .await
+            .unwrap()
+            .unwrap();
+        let clone = value.clone();
+        drop(value);
+        drop(io);
+        drop(recorded);
+        let bytes = clone.read_slices(&[0..4]).await.unwrap();
+        assert_eq!(bytes[0].as_ref(), &values[1][..4]);
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        assert!(
+            weak.upgrade().is_none(),
+            "a completed read must not retain the handle's I/O scope"
+        );
+        assert_eq!(bytes[0].as_ref(), &values[1][..4]);
+    }
+
+    #[tokio::test]
+    async fn binary_slices_prepared_value_can_retry_payload_failure() {
+        let (page, mut recorded, values) = page_fixture(64, true, false, 8192);
+        recorded.short_read_at = Some(4);
+        let recorded = Arc::new(recorded);
+        let io: Arc<dyn EncodingsIo> = recorded.clone();
+        let value = MiniBlockScheduler::try_prepare_binary_value(&page, 1, &io)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = value
+            .read_slices(&[value.len() - 4..value.len()])
             .await
             .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("truncated"));
-        let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 2, &[0..1], &io)
+        assert!(error.to_string().contains("truncated binary value range"));
+        let bytes = value
+            .read_slices(&[value.len() - 4..value.len()])
             .await
-            .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("invalid binary row"));
+            .unwrap();
+        assert_eq!(bytes[0].as_ref(), &values[1][8188..]);
+        assert_eq!(
+            recorded.requests.lock().unwrap().len(),
+            5,
+            "retry must reuse the prepared metadata"
+        );
     }
 
     #[rstest]
     #[tokio::test]
     async fn binary_slices_reject_misaligned_metadata_before_io(#[values(false, true)] wide: bool) {
-        let (mut page, recorded, _) = page_fixture(64, wide, false);
+        let (mut page, recorded, _) = page_fixture(64, wide, false, 8192);
         let recorded = Arc::new(recorded);
         let io: Arc<dyn EncodingsIo> = recorded.clone();
         page.buffer_offsets_and_sizes = Arc::from([(32, if wide { 3 } else { 1 }), (128, 16416)]);
-        let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 0, &[0..1], &io)
-            .await
-            .unwrap_err();
+        let error = read_selected(&page, 0, &[0..1], &io).await.unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
         assert!(error.to_string().contains("metadata word length"));
         assert!(recorded.requests.lock().unwrap().is_empty());
@@ -452,11 +533,9 @@ mod tests {
     #[case::outside_value(8191..8193)]
     #[tokio::test]
     async fn binary_slices_reject_invalid_value_ranges(#[case] range: Range<u64>) {
-        let (page, recorded, _) = page_fixture(32, false, false);
+        let (page, recorded, _) = page_fixture(32, false, false, 8192);
         let io: Arc<dyn EncodingsIo> = Arc::new(recorded);
-        let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 0, &[range], &io)
-            .await
-            .unwrap_err();
+        let error = read_selected(&page, 0, &[range], &io).await.unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("range"));
     }
@@ -466,7 +545,7 @@ mod tests {
     async fn binary_slices_fallback_before_reading_unsupported_metadata(
         #[values("metadata", "nonflat", "codec")] unsupported: &str,
     ) {
-        let (mut page, recorded, _) = page_fixture(32, false, false);
+        let (mut page, recorded, _) = page_fixture(32, false, false, 8192);
         let recorded = Arc::new(recorded);
         let io: Arc<dyn EncodingsIo> = recorded.clone();
         match unsupported {
@@ -490,7 +569,7 @@ mod tests {
             _ => unreachable!(),
         }
         assert!(
-            MiniBlockScheduler::try_read_binary_value_slices(&page, 0, &[0..1], &io)
+            read_selected(&page, 0, &[0..1], &io)
                 .await
                 .unwrap()
                 .is_none()

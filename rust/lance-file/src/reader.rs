@@ -5326,12 +5326,16 @@ mod tests {
         fs.object_store.io_stats_incremental();
         let slices = [120..137, 0..0, 3..11, 5..9];
         for row in [0, 2, 5] {
-            let selected = reader
-                .try_read_binary_value_slices(1, row, &slices)
-                .await
-                .unwrap();
+            let selected = reader.try_prepare_binary_value(1, row).await.unwrap();
             if encoding == STRUCTURAL_ENCODING_MINIBLOCK && version != ConcreteFileVersion::V2_0 {
-                let selected = selected.expect("current binary mini-block must support byte reads");
+                let value = selected.expect("current binary mini-block must support byte reads");
+                assert_eq!(value.len(), values[row as usize].len() as u64);
+                let selected = value.read_slices(&slices).await.unwrap();
+                let tail = value
+                    .read_slices(&[value.len() - 1..value.len()])
+                    .await
+                    .unwrap();
+                assert_eq!(tail[0].as_ref(), &values[row as usize][8191..]);
                 for (bytes, slice) in selected.iter().zip(&slices) {
                     assert_eq!(
                         bytes.as_ref(),
@@ -5351,16 +5355,10 @@ mod tests {
             "byte selections must not read a complete value: {}",
             stats.read_bytes
         );
-        let error = reader
-            .try_read_binary_value_slices(2, 0, &slices)
-            .await
-            .unwrap_err();
+        let error = reader.try_prepare_binary_value(2, 0).await.unwrap_err();
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(error.to_string().contains("physical columns"));
-        let error = reader
-            .try_read_binary_value_slices(1, 6, &slices)
-            .await
-            .unwrap_err();
+        let error = reader.try_prepare_binary_value(1, 6).await.unwrap_err();
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(error.to_string().contains("outside physical column"));
         // The optional reader must leave ordinary scanning and unsupported
@@ -5425,22 +5423,18 @@ mod tests {
         .unwrap();
         assert_eq!(reader.column_num_rows(0).unwrap(), 1);
         assert_eq!(reader.column_num_rows(1).unwrap(), 3);
-        let error = reader
-            .try_read_binary_value_slices(0, 1, &[0..1])
-            .await
-            .unwrap_err();
+        let error = reader.try_prepare_binary_value(0, 1).await.unwrap_err();
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(error.to_string().contains("outside physical column"));
         let selected = reader
-            .try_read_binary_value_slices(1, 2, &[4..12])
+            .try_prepare_binary_value(1, 2)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(selected.len(), 1024);
+        let selected = selected.read_slices(&[4..12]).await.unwrap();
         assert_eq!(selected[0].as_ref(), &values[2][4..12]);
-        let error = reader
-            .try_read_binary_value_slices(1, 3, &[4..12])
-            .await
-            .unwrap_err();
+        let error = reader.try_prepare_binary_value(1, 3).await.unwrap_err();
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(error.to_string().contains("outside physical column"));
     }

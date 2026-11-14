@@ -1,42 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
-
-use bytes::Bytes;
 use lance_core::{Error, Result};
-use lance_encoding::encodings::logical::primitive::MiniBlockScheduler;
+use lance_encoding::encodings::{
+    logical::primitive::MiniBlockScheduler, physical::binary::PreparedBinaryValue,
+};
 
 use super::FileReader;
 
 impl FileReader {
-    /// Read selected byte ranges within one flat binary value.
+    /// Prepare byte reads for one flat binary value without loading its payload.
     ///
     /// `column_index` is a physical column index and `row` is relative to that
-    /// column, including for files whose columns have different lengths. Byte
-    /// ranges are relative to the value, may overlap, and preserve input order.
-    /// Empty ranges produce empty buffers. This optional path returns `None`
-    /// for unsupported encodings; callers must retain ordinary decoding as a
-    /// fallback. It does not change the stored format or initialize a scan.
-    ///
-    /// Returned bytes may share coalesced I/O backing. Their visible lengths
-    /// alone do not establish retained allocation sizes.
+    /// column, including ragged files. The handle exposes the exact value length
+    /// and reuses validated metadata for repeated byte reads. Unsupported
+    /// encodings return `None`, requesting ordinary decoding by the caller.
+    /// Handles retain this reader's I/O scope; do not share request-specific
+    /// handles through a global cache. No persisted format changes.
     ///
     /// ```
     /// # use lance_file::reader::FileReader;
     /// # async fn example(reader: &FileReader) -> lance_core::Result<()> {
-    /// let selected = reader.try_read_binary_value_slices(0, 2, &[4..12]).await?;
-    /// if let Some(selected) = selected {
-    ///     assert_eq!(selected[0].len(), 8);
+    /// if let Some(value) = reader.try_prepare_binary_value(0, 2).await? {
+    ///     let tail = value.read_slices(&[value.len().saturating_sub(8)..value.len()]).await?;
+    ///     assert!(tail[0].len() <= 8);
     /// }
     /// # Ok(()) }
     /// ```
-    pub async fn try_read_binary_value_slices(
+    pub async fn try_prepare_binary_value(
         &self,
         column_index: usize,
         row: u64,
-        slices: &[Range<u64>],
-    ) -> Result<Option<Vec<Bytes>>> {
+    ) -> Result<Option<PreparedBinaryValue>> {
         let column = self
             .metadata
             .column_infos
@@ -50,10 +45,9 @@ impl FileReader {
         let mut page_row = row;
         for page in column.page_infos.iter() {
             if page_row < page.num_rows {
-                return MiniBlockScheduler::try_read_binary_value_slices(
+                return MiniBlockScheduler::try_prepare_binary_value(
                     page,
                     page_row,
-                    slices,
                     &self.core.scheduler,
                 )
                 .await;

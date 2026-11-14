@@ -176,27 +176,45 @@ pub trait IndexWriter: Send {
     ) -> Result<IndexFile>;
 }
 
+/// Prepared byte-range access to one binary value in an immutable index file.
+#[async_trait]
+pub trait IndexBinaryReader: std::fmt::Debug + Send + Sync {
+    /// The exact payload length, available without reading the payload.
+    fn len(&self) -> u64;
+
+    /// Whether the value has no payload bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read value-relative ranges in input order, including overlaps/empties.
+    /// Returned buffers may share I/O backing; visible lengths are not retained
+    /// allocation bounds. Preparation metadata is reused between calls.
+    async fn read_slices(&self, slices: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>>;
+}
+
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
-    /// Optionally read byte ranges within one binary value, preserving range order.
+    /// Optionally prepare byte reads for one binary value without reading its payload.
     ///
-    /// `row` is relative to the named column. `None` requests ordinary decoding
-    /// by the caller; the default does not issue I/O or extend legacy readers.
-    /// Returned buffers can share I/O backing and are not a retained-memory bound.
+    /// `row` is relative to the named column. `None` requests ordinary decoding;
+    /// the default does not issue I/O. Handles retain the current I/O scope and
+    /// must not be cached across requests with different statistics/priority.
     ///
     /// ```
     /// # use lance_index_core::scalar::IndexReader;
     /// # async fn example(reader: &dyn IndexReader) -> lance_core::Result<()> {
-    /// let _selected = reader.try_read_binary_value_slices("positions", 0, &[4..12]).await?;
+    /// if let Some(value) = reader.try_prepare_binary_value("positions", 0).await? {
+    ///     let _tail = value.read_slices(&[value.len().saturating_sub(8)..value.len()]).await?;
+    /// }
     /// # Ok(()) }
     /// ```
-    async fn try_read_binary_value_slices(
+    async fn try_prepare_binary_value(
         &self,
         _column: &str,
         _row: u64,
-        _slices: &[std::ops::Range<u64>],
-    ) -> Result<Option<Vec<Bytes>>> {
+    ) -> Result<Option<Arc<dyn IndexBinaryReader>>> {
         Ok(None)
     }
 
