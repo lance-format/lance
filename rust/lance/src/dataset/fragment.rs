@@ -1301,14 +1301,25 @@ impl FileFragment {
         dataset_schema: &Schema,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<Vec<(u32, u64)>> {
+        let read_config = FragReadConfig::default().with_scan_scheduler(scan_scheduler);
         let mut stats = Vec::new();
         for reader in self
-            .open_readers_with_full_metadata(
-                dataset_schema,
-                &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
-            )
+            .open_readers_with_full_metadata(dataset_schema, &read_config)
             .await?
         {
+            stats.extend(reader.storage_stats()?);
+        }
+        // An overlay's values live outside the base data files, but they are
+        // bytes their fields occupy on disk all the same.
+        let overlay_readers = try_join_all(self.metadata.overlays.iter().map(|overlay| {
+            self.open_reader_with_full_metadata(
+                &overlay.data_file,
+                Some(dataset_schema),
+                &read_config,
+            )
+        }))
+        .await?;
+        for reader in overlay_readers.into_iter().flatten() {
             stats.extend(reader.storage_stats()?);
         }
         Ok(stats)

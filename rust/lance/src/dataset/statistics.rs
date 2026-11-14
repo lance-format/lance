@@ -306,12 +306,13 @@ impl<'a> DatasetStatistics<'a> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::transaction::Operation;
+    use crate::dataset::{WriteDestination, WriteParams};
 
     use super::*;
 
@@ -365,5 +366,46 @@ mod tests {
             stats.fields[0].bytes_on_disk > 0,
             "bytes_on_disk should include the remaining column after drop_columns"
         );
+    }
+
+    #[tokio::test]
+    async fn test_calculate_data_stats_counts_overlay_bytes() {
+        let batch =
+            record_batch!(("id", Int32, [0, 1, 2, 3]), ("val", Int32, [0, 10, 20, 30])).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+        let before = dataset.calculate_data_stats().await.unwrap();
+
+        // Overlay new values for `val` (field 1) on two rows of fragment 0.
+        let mut overlay = dataset
+            .get_fragment(0)
+            .unwrap()
+            .write_overlay(&dataset.schema().project_by_ids(&[1], true))
+            .await
+            .unwrap();
+        let values = record_batch!(("_rowaddr", UInt64, [0, 1]), ("val", Int32, [5, 15])).unwrap();
+        overlay.write_batch(&values).await.unwrap();
+        let group = overlay.finish().await.unwrap().unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let after = Arc::new(dataset).calculate_data_stats().await.unwrap();
+        assert_eq!(
+            after.fields[0].bytes_on_disk,
+            before.fields[0].bytes_on_disk
+        );
+        assert!(after.fields[1].bytes_on_disk > before.fields[1].bytes_on_disk);
     }
 }
