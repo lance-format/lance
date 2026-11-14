@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{Error, Result, RowAddress, RowIdIndex, SegmentLookup};
+use crate::rowids::encoded_array::EncodedU64Array;
 
 /// Independent searches to advance together, hiding dependent-load latency
 /// without the register pressure and long scalar tails of wider batches.
@@ -12,8 +13,9 @@ impl RowIdIndex {
         &self,
         queries: &[(u64, usize)],
         out: &mut [Option<RowAddress>],
+        is_visible: &impl Fn(RowAddress) -> bool,
     ) -> Result<()> {
-        self.probe_batch_node(1, 0, self.end_tree.len() / 2, queries, out)
+        self.probe_batch_node(1, 0, self.end_tree.len() / 2, queries, out, is_visible)
     }
 
     fn probe_batch_node(
@@ -23,6 +25,7 @@ impl RowIdIndex {
         width: usize,
         queries: &[(u64, usize)],
         out: &mut [Option<RowAddress>],
+        is_visible: &impl Fn(RowAddress) -> bool,
     ) -> Result<()> {
         let Some(probe) = self.probes.get(lo) else {
             return Ok(());
@@ -37,13 +40,23 @@ impl RowIdIndex {
             return Ok(());
         }
         if width > 1 {
-            self.probe_batch_node(node * 2, lo, width / 2, queries, out)?;
-            return self.probe_batch_node(node * 2 + 1, lo + width / 2, width / 2, queries, out);
+            self.probe_batch_node(node * 2, lo, width / 2, queries, out, is_visible)?;
+            return self.probe_batch_node(
+                node * 2 + 1,
+                lo + width / 2,
+                width / 2,
+                queries,
+                out,
+                is_visible,
+            );
         }
 
         let fragment = &self.fragments[probe.fragment as usize];
         let entry = &fragment.segments[probe.segment as usize];
         let mut store = |id, ordinal: usize, address| {
+            if !is_visible(address) {
+                return Ok(());
+            }
             // Keep probing after a hit: another live copy is corruption.
             if out[ordinal].is_some() {
                 return Err(Error::internal(format!(
@@ -76,12 +89,39 @@ impl RowIdIndex {
     }
 }
 
-pub(super) fn search_sorted(
+/// Dispatch once on the stored width rather than on every binary-search step.
+pub(super) fn search_encoded(
+    ids: &EncodedU64Array,
+    queries: &[(u64, usize)],
+    emit: &mut impl FnMut(u64, usize, usize) -> Result<()>,
+) -> Result<()> {
+    match ids {
+        EncodedU64Array::U16 { base, offsets } => search_sorted(
+            offsets.len(),
+            |i| *base + u64::from(offsets[i]),
+            |i| i,
+            queries,
+            emit,
+        ),
+        EncodedU64Array::U32 { base, offsets } => search_sorted(
+            offsets.len(),
+            |i| *base + u64::from(offsets[i]),
+            |i| i,
+            queries,
+            emit,
+        ),
+        EncodedU64Array::U64(values) => {
+            search_sorted(values.len(), |i| values[i], |i| i, queries, emit)
+        }
+    }
+}
+
+pub(super) fn search_sorted<T>(
     len: usize,
     key: impl Fn(usize) -> u64,
-    offset: impl Fn(usize) -> u32,
+    offset: impl Fn(usize) -> T,
     queries: &[(u64, usize)],
-    emit: &mut impl FnMut(u64, usize, u32) -> Result<()>,
+    emit: &mut impl FnMut(u64, usize, T) -> Result<()>,
 ) -> Result<()> {
     if len == 0 {
         return Ok(());
@@ -238,6 +278,53 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::u16(128, 1 << 50)]
+    #[case::u32(1 << 16, 1 << 50)]
+    #[case::u64(1 << 40, u64::MAX - (256 << 40))]
+    fn sparse_merged_batches_preserve_physical_offsets(#[case] stride: u64, #[case] base: u64) {
+        let ids: Vec<_> = (0..257).rev().map(|i| base + i * stride).collect();
+        let live: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| ![3, 100].contains(offset) && offset % 5 != 2)
+            .map(|(offset, &id)| (id, RowAddress::new_from_parts(7, offset as u32)))
+            .collect();
+        let index = RowIdIndex::new(&[fragment(
+            7,
+            vec![U64Segment::Array(ids.clone().into())],
+            &[3, 100],
+        )])
+        .unwrap();
+        let merged = index.merged.as_ref().unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(
+            merged.iter().next().unwrap().1.segments.0,
+            U64Segment::SortedArray(_)
+        ));
+        for count in [0, 1, 31, 32, 33, 63, 64, 65, 1000] {
+            let queries: Vec<_> = (0..count)
+                .rev()
+                .map(|i| match i % 9 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    2 => base + stride / 2,
+                    _ => ids[i * 17 % ids.len()],
+                })
+                .collect();
+            let expected: Vec<_> = queries
+                .iter()
+                .map(|id| live.iter().find(|row| row.0 == *id).map(|row| row.1))
+                .collect();
+            assert_eq!(
+                index
+                    .get_many_with_filter(&queries, |address| address.row_offset() % 5 != 2)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn mixed_segments_offsets_deletions_and_merged_fallback() {
         let far = 1 << 20;
@@ -324,6 +411,54 @@ mod tests {
                 error
                     .to_string()
                     .contains("stable row id 2 is live in multiple fragments")
+            );
+            let addresses = index
+                .get_many_with_filter(&queries, |address| {
+                    address != RowAddress::new_from_parts(1, 1)
+                })
+                .unwrap();
+            let expected = queries
+                .iter()
+                .map(|id| match id {
+                    8 => Some(RowAddress::new_from_parts(1, 0)),
+                    7 => Some(RowAddress::new_from_parts(2, 0)),
+                    2 => Some(RowAddress::new_from_parts(2, 1)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(addresses, expected);
+        }
+    }
+
+    #[test]
+    fn snapshot_filters_share_native_segments_without_hiding_a_live_copy() {
+        let source = fragment(
+            7,
+            vec![U64Segment::Range(10..14), U64Segment::Range(10..14)],
+            &[],
+        );
+        let index = RowIdIndex::probing(&[source]).unwrap();
+        for count in [3, 65] {
+            let queries: Vec<_> = (0..count).map(|i| [12, 99, 12][i % 3]).collect();
+            for visible_start in [0, 4] {
+                let expected: Vec<_> = queries
+                    .iter()
+                    .map(|&id| {
+                        (id == 12).then_some(RowAddress::new_from_parts(7, visible_start + 2))
+                    })
+                    .collect();
+                assert_eq!(
+                    index
+                        .get_many_with_filter(&queries, |address| {
+                            (visible_start..visible_start + 4).contains(&address.row_offset())
+                        })
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(
+                index.get_many_with_filter(&queries, |_| false).unwrap(),
+                vec![None; count]
             );
         }
     }
