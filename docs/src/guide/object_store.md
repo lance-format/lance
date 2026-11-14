@@ -396,6 +396,14 @@ This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environme
     writes, or configure a [custom distributed commit lock](#custom-commit-locks)
     shared by every writer. Reads do not require a commit lock.
 
+    The default native S3 `copy_if_not_exists` implementation uses multipart copy
+    and also requires `CompleteMultipartUpload` to enforce the destination
+    `If-None-Match: *` condition. Configurations using conditional `CopyObject`
+    require the same condition on that API. Support for conditional `PutObject`
+    does not imply support for either copy API. S3 namespace reservation and
+    deregistration markers use conditional `PutObject`, but other conditional-copy
+    consumers still depend on the configured copy API's enforcement.
+
 #### Custom commit locks
 
 In Python, pass `commit_lock` to `lance.write_dataset` when creating or appending

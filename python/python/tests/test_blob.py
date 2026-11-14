@@ -920,6 +920,185 @@ def test_read_blob_ranges_accepts_empty_batch(dataset_with_mixed_blob_v2):
     assert dataset.read_blob_ranges("blobs", [], selector="indices") == []
 
 
+def test_read_blob_files_preserves_handles_nulls_and_empty_values(
+    dataset_with_mixed_blob_v2,
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    selected_indices = [3, 1, 1, 0, 2, 4, 5]
+    handles = dataset.take_blobs("blobs", indices=selected_indices)
+
+    results = lance.read_blob_files(handles, io_buffer_size=1024)
+
+    assert results == [
+        (request_index, payloads[row_index])
+        for request_index, row_index in enumerate(selected_indices)
+    ]
+
+
+def test_read_blob_files_does_not_move_cursor(dataset_with_mixed_blob_v2):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    (handle,) = dataset.take_blobs("blobs", indices=[2])
+    assert handle.read(4) == payloads[2][:4]
+
+    assert lance.read_blob_files([handle]) == [(0, payloads[2])]
+    assert handle.read() == payloads[2][4:]
+
+
+def test_read_blob_files_without_preserve_order_keeps_request_identity(
+    dataset_with_mixed_blob_v2,
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    handles = dataset.take_blobs("blobs", indices=[2, 4, 0, 2])
+
+    results = lance.read_blob_files(handles, preserve_order=False)
+
+    assert sorted(results, key=lambda result: result[0]) == [
+        (0, payloads[2]),
+        (1, None),
+        (2, payloads[0]),
+        (3, payloads[2]),
+    ]
+
+
+def test_read_blob_files_reads_legacy_blob_columns(dataset_with_blobs):
+    handles = dataset_with_blobs.take_blobs("blobs", indices=[4, 0])
+
+    assert lance.read_blob_files(handles) == [(0, b"quux"), (1, b"foo")]
+
+
+def test_read_blob_files_skip_descriptor_reads(dataset_with_mixed_blob_v2):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    # Inline, packed and dedicated payloads across two fragments.
+    indices = [0, 1, 2]
+    handles = dataset.take_blobs("blobs", indices=indices)
+
+    dataset.io_stats_incremental()
+    by_handles = lance.read_blob_files(handles)
+    handle_reads = dataset.io_stats_incremental().read_iops
+    by_rows = dataset.read_blobs("blobs", indices=indices)
+    row_reads = dataset.io_stats_incremental().read_iops
+
+    expected = [payloads[index] for index in indices]
+    assert [data for _, data in by_handles] == expected
+    assert [data for _, data in by_rows] == expected
+    assert handle_reads == len(indices)
+    assert row_reads > handle_reads
+
+
+def test_read_blob_files_outlive_later_commits(dataset_with_mixed_blob_v2):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    handles = dataset.take_blobs("blobs", indices=[1, 2])
+
+    dataset.delete("true")
+    assert dataset.count_rows() == 0
+
+    assert lance.read_blob_files(handles) == [(0, payloads[1]), (1, payloads[2])]
+
+
+@pytest.mark.parametrize("preserve_order", [True, False])
+def test_read_blob_file_ranges_mixed_sources_preserves_request_identity(
+    dataset_with_mixed_blob_v2,
+    preserve_order,
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    selected_indices = [3, 1, 1, 0, 2, 4, 5]
+    ranges = [(1, 3), (2, 4), (0, 4), (1, 1), (5, 0), (0, 0), (0, 0)]
+    handles = dataset.take_blobs("blobs", indices=selected_indices)
+    requests = [
+        (handle, offset, length) for handle, (offset, length) in zip(handles, ranges)
+    ]
+
+    results = lance.read_blob_file_ranges(
+        requests, io_buffer_size=1024, io_parallelism=2, preserve_order=preserve_order
+    )
+    if not preserve_order:
+        results.sort(key=lambda result: result[0])
+
+    expected = []
+    for request_index, (row_index, (offset, length)) in enumerate(
+        zip(selected_indices, ranges)
+    ):
+        payload = payloads[row_index]
+        expected.append(
+            (
+                request_index,
+                None if payload is None else payload[offset : offset + length],
+            )
+        )
+    assert results == expected
+
+
+@pytest.mark.parametrize(
+    ("offset", "length", "message"),
+    [
+        (2**64 - 1, 2, "offset \\+ length overflowed"),
+        (0, 3, "request 0 is invalid: .*exceeds blob size"),
+    ],
+)
+def test_read_blob_file_ranges_rejects_invalid_ranges(
+    dataset_with_mixed_blob_v2, offset, length, message
+):
+    dataset, _ = dataset_with_mixed_blob_v2
+    (handle,) = dataset.take_blobs("blobs", indices=[0])
+
+    with pytest.raises(ValueError, match=message):
+        lance.read_blob_file_ranges([(handle, offset, length)])
+
+
+def test_read_blob_file_ranges_null_handle_skips_bounds():
+    assert lance.read_blob_file_ranges([(None, 10, 10)]) == [(0, None)]
+    with pytest.raises(ValueError, match=r"offset \+ length overflowed"):
+        lance.read_blob_file_ranges([(None, 2**64 - 1, 1)])
+
+
+def test_read_blob_files_rejects_closed_handle(dataset_with_mixed_blob_v2):
+    dataset, _ = dataset_with_mixed_blob_v2
+    (handle,) = dataset.take_blobs("blobs", indices=[1])
+    handle.close()
+
+    with pytest.raises(ValueError, match="already closed"):
+        lance.read_blob_files([handle])
+
+
+def test_read_blob_files_rejects_non_blob_file():
+    with pytest.raises(TypeError, match="Expected a lance.BlobFile or None, got int"):
+        lance.read_blob_files([0])
+    with pytest.raises(TypeError, match="Expected a lance.BlobFile or None, got int"):
+        lance.read_blob_file_ranges([(0, 0, 1)])
+
+
+def test_read_blob_files_accept_empty_batch():
+    assert lance.read_blob_files([]) == []
+    assert lance.read_blob_file_ranges([]) == []
+    assert lance.read_blob_files([None, None]) == [(0, None), (1, None)]
+
+
+@pytest.mark.parametrize("option", ["io_buffer_size", "io_parallelism"])
+def test_read_blob_files_reject_zero_io_options(option):
+    with pytest.raises(ValueError, match=f"{option} must be greater than 0"):
+        lance.read_blob_files([], **{option: 0})
+    with pytest.raises(ValueError, match=f"{option} must be greater than 0"):
+        lance.read_blob_file_ranges([], **{option: 0})
+
+
+def test_read_blob_files_mix_datasets(tmp_path):
+    handles = []
+    for name, payload in [("first", b"abc"), ("second", b"xyz")]:
+        table = pa.table(
+            {"blobs": lance.blob_array([payload])},
+            schema=pa.schema([lance.blob_field("blobs")]),
+        )
+        dataset = lance.write_dataset(
+            table, tmp_path / name, data_storage_version="2.2"
+        )
+        handles.extend(dataset.take_blobs("blobs", indices=[0]))
+    del dataset
+    assert lance.read_blob_files(handles[::-1]) == [(0, b"xyz"), (1, b"abc")]
+    assert lance.read_blob_file_ranges(
+        [(handles[1], 1, 2), (None, 0, 0), (handles[0], 0, 1)]
+    ) == [(0, b"yz"), (1, None), (2, b"a")]
+
+
 def test_blob_file_seek(tmp_path, dataset_with_blobs):
     row_ids = (
         dataset_with_blobs.to_table(columns=[], with_row_id=True)

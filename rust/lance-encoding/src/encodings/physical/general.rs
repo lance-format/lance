@@ -364,6 +364,10 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
         self.inner.num_buffers()
     }
 
+    fn allocates_output(&self) -> bool {
+        self.inner.allocates_output()
+    }
+
     fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         if data.len() != self.num_buffers() || data.is_empty() {
             return Err(Error::invalid_input(format!(
@@ -379,6 +383,27 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
         data[0] = LanceBuffer::from(decompressed_buffer);
 
         self.inner.decompress(data, num_values)
+    }
+
+    fn decompress_range(
+        &self,
+        mut data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        if data.len() != self.num_buffers() || data.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "General mini-block has {} buffers, expected {}",
+                data.len(),
+                self.num_buffers()
+            )));
+        }
+        let mut decompressed_buffer = Vec::new();
+        let decompressor = GeneralBufferCompressor::get_compressor(self.compression)?;
+        decompressor.decompress(&data[0], &mut decompressed_buffer)?;
+        data[0] = LanceBuffer::from(decompressed_buffer);
+
+        self.inner.decompress_range(data, num_values, range)
     }
 
     fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {

@@ -17,6 +17,7 @@ import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.merge.MergeInsertAnalysis;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 
@@ -40,9 +41,11 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -759,6 +762,110 @@ public class MergeInsertTest {
             e.getMessage().contains("RewriteColumns cannot express"),
             "expected the RewriteColumns rejection, got: " + e.getMessage());
       }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testAnalyzeMergeInsert(boolean indexed) throws Exception {
+    try (Dataset wide = createWideDataset()) {
+      if (indexed) {
+        createIdIndex(wide);
+      }
+      long version = wide.version();
+      String before = readWide(wide).toString();
+      try (VectorSchemaRoot source = buildPartialSource(1, 4);
+          ArrowArrayStream stream = convertToStream(source, allocator)) {
+        MergeInsertAnalysis report =
+            wide.analyzeMergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withWriteMode(MergeInsertParams.MergeWriteMode.RewriteColumns),
+                stream);
+        Assertions.assertEquals(
+            MergeInsertAnalysis.Outcome.COMPLETE, report.getExecution().getOutcome());
+        Assertions.assertEquals(Optional.of(indexed), report.getIndexUsed());
+        Assertions.assertEquals(indexed ? 1 : 0, report.getJoinIndexSegments().getAsLong());
+        Assertions.assertEquals(
+            MergeInsertAnalysis.WriteMode.REWRITE_COLUMNS, report.getWriteMode());
+        Assertions.assertEquals(2, report.getStats().get().getNumUpdatedRows());
+        Assertions.assertEquals(2, report.getFragmentsTouched().getAsLong());
+        Assertions.assertTrue(report.getReplaySpills().getBytesWritten().getAsLong() > 0);
+        Assertions.assertTrue(report.getReplaySpills().getBytesRead().getAsLong() > 0);
+        Assertions.assertFalse(report.getScratchSpills().isPresent());
+        Assertions.assertTrue(
+            report.getSubplans().stream()
+                .anyMatch(plan -> plan.getPurpose().equals("fragment_update_sort")));
+        Assertions.assertTrue(report.getJoinDurationNs().isPresent());
+        MergeInsertAnalysis decoded = new MergeInsertAnalysis(report.toBytes());
+        Assertions.assertEquals(report.getOperationId(), decoded.getOperationId());
+        Assertions.assertEquals(
+            report.getReplaySpills().getBytesWritten(),
+            decoded.getReplaySpills().getBytesWritten());
+      }
+      try (VectorSchemaRoot source = buildPartialSource(100);
+          ArrowArrayStream stream = convertToStream(source, allocator)) {
+        MergeInsertAnalysis insertReport =
+            wide.analyzeMergeInsert(
+                new MergeInsertParams(Collections.singletonList("id")).withMatchedDoNothing(),
+                stream);
+        Assertions.assertEquals(
+            MergeInsertAnalysis.Outcome.COMPLETE, insertReport.getExecution().getOutcome());
+        Assertions.assertEquals(Optional.of(indexed), insertReport.getIndexUsed());
+        Assertions.assertEquals(indexed ? 1 : 0, insertReport.getJoinIndexSegments().getAsLong());
+        Assertions.assertEquals(
+            MergeInsertAnalysis.WriteMode.REWRITE_ROWS, insertReport.getWriteMode());
+        Assertions.assertEquals(0, insertReport.getStats().get().getNumUpdatedRows());
+        Assertions.assertEquals(1, insertReport.getStats().get().getNumInsertedRows());
+        Assertions.assertEquals(0, insertReport.getFragmentsTouched().getAsLong());
+      }
+      Assertions.assertEquals(version, wide.version());
+      Assertions.assertEquals(before, readWide(wide).toString());
+    }
+  }
+
+  @Test
+  public void testAnalyzeMergeInsertSourceFailure() throws Exception {
+    try (Dataset wide = createWideDataset();
+        ArrowReader reader =
+            new ArrowReader(allocator) {
+              @Override
+              protected Schema readSchema() {
+                return PARTIAL_SOURCE_SCHEMA;
+              }
+
+              @Override
+              public boolean loadNextBatch() throws IOException {
+                throw new IOException("analysis source failed");
+              }
+
+              @Override
+              public long bytesRead() {
+                return 0;
+              }
+
+              @Override
+              protected void closeReadSource() {}
+            };
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+      long version = wide.version();
+      String before = readWide(wide).toString();
+      Data.exportArrayStream(allocator, reader, stream);
+      MergeInsertAnalysis report =
+          wide.analyzeMergeInsert(
+              new MergeInsertParams(Collections.singletonList("id"))
+                  .withMatchedUpdateAll()
+                  .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing),
+              stream);
+      Assertions.assertEquals(
+          MergeInsertAnalysis.Outcome.FAILED, report.getExecution().getOutcome());
+      Assertions.assertTrue(
+          report.getExecution().getError().get().contains("analysis source failed"));
+      Assertions.assertFalse(report.getStats().isPresent());
+      Assertions.assertFalse(report.getFragmentsTouched().isPresent());
+      Assertions.assertEquals(version, wide.version());
+      Assertions.assertEquals(before, readWide(wide).toString());
     }
   }
 

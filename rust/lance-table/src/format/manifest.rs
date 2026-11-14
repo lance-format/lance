@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
+use crate::feature_flags::{COVERING_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -316,16 +316,18 @@ impl Manifest {
             // wholesale -- `covering_fields` included -- a build that predates
             // covering could then open it and read carried columns as keyed ones.
             // Kept unconditionally rather than derived from the cloned indexes:
-            // over-fencing a clone is harmless, under-fencing one is not.
+            // over-fencing a clone is harmless, under-fencing one is not. The
+            // independent-layout bit goes with it, so the cloned entries are
+            // written back under the contract they were read with.
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them. So are stable row ids:
             // they are otherwise derived from the fragments, so a clone of a table
             // whose rows were all deleted would lose them and stop assigning ids
             // from `next_row_id`.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
+                & (COVERING_FLAGS | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
+                & (COVERING_FLAGS | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
@@ -1353,7 +1355,10 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::feature_flags::{
+        CoveringContract, FLAG_COVERED_INDEX_METADATA, FLAG_NON_REUSABLE_FIELD_IDS,
+        FLAG_USE_V2_FORMAT_DEPRECATED,
+    };
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;
@@ -2123,6 +2128,42 @@ mod tests {
         assert_eq!(cloned.max_allocated_field_id, Some(41));
         assert_eq!(cloned.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
         assert_ne!(cloned.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
+    }
+
+    /// The clone copies the index section as read, so it must keep the
+    /// contract that section was read with.
+    #[rstest::rstest]
+    #[case::suffix(FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(COVERING_FLAGS)]
+    fn shallow_clone_keeps_the_covering_contract(#[case] flags: u64) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = flags;
+        manifest.writer_feature_flags = flags;
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        assert_eq!(cloned.reader_feature_flags & COVERING_FLAGS, flags);
+        assert_eq!(cloned.writer_feature_flags & COVERING_FLAGS, flags);
+        assert_eq!(
+            CoveringContract::of(&cloned),
+            CoveringContract::of(&manifest)
+        );
     }
 
     #[test]

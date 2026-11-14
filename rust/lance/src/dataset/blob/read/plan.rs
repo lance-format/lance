@@ -15,7 +15,6 @@ use lance_core::{Error, Result};
 #[derive(Debug)]
 pub(in crate::dataset::blob) struct BlobEntry {
     pub(in crate::dataset::blob) selection_index: usize,
-    pub(in crate::dataset::blob) row_address: u64,
     pub(in crate::dataset::blob) file: BlobFile,
     pub(in crate::dataset::blob) requested_range: Option<BlobReadRange>,
 }
@@ -33,7 +32,6 @@ pub(super) struct ResolvedBlobSelection {
 #[derive(Debug)]
 pub(super) struct PlannedBlobRead {
     pub(super) selection_index: usize,
-    pub(super) row_address: u64,
     pub(super) requested_range: Option<BlobReadRange>,
     physical_range: Range<u64>,
 }
@@ -221,8 +219,8 @@ fn plan_blob_reads(entries: Vec<BlobEntry>) -> Result<Vec<SourcePlannedBlobRead>
         };
         let physical_range = entry.file.read_phys_range(logical_range).map_err(|err| {
             Error::invalid_input(format!(
-                "Blob range request {} for row address {} is invalid: {}",
-                entry.selection_index, entry.row_address, err
+                "Blob range request {} is invalid: {}",
+                entry.selection_index, err
             ))
         })?;
         let source_key = BlobSourceKey::new(&entry.file.source);
@@ -231,7 +229,6 @@ fn plan_blob_reads(entries: Vec<BlobEntry>) -> Result<Vec<SourcePlannedBlobRead>
             source: entry.file.source.clone(),
             read: PlannedBlobRead {
                 selection_index: entry.selection_index,
-                row_address: entry.row_address,
                 requested_range: entry.requested_range,
                 physical_range,
             },
@@ -271,8 +268,8 @@ fn group_blob_read_plans(planned_reads: Vec<SourcePlannedBlobRead>) -> Vec<BlobR
 
     plans.sort_by(|left, right| {
         left.source_key
-            .store_prefix
-            .cmp(&right.source_key.store_prefix)
+            .store_id
+            .cmp(&right.source_key.store_id)
             .then_with(|| left.source_key.path.cmp(&right.source_key.path))
     });
 
@@ -371,13 +368,11 @@ mod tests {
         let entries = vec![
             BlobEntry {
                 selection_index: 1,
-                row_address: 11,
                 file: BlobFile::with_source(source.clone(), 4, 6, BlobKind::Packed, None),
                 requested_range: Some(BlobReadRange::new(0, 5)),
             },
             BlobEntry {
                 selection_index: 0,
-                row_address: 10,
                 file: BlobFile::with_source(source, 1, 3, BlobKind::Packed, None),
                 requested_range: Some(BlobReadRange::new(0, 3)),
             },
@@ -415,7 +410,6 @@ mod tests {
         let entries = (0..REQUEST_COUNT)
             .map(|request_index| BlobEntry {
                 selection_index: request_index,
-                row_address: request_index as u64,
                 file: BlobFile::with_source(
                     source.clone(),
                     request_index as u64 * RANGE_GAP,

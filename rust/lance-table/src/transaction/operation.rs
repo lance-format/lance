@@ -339,19 +339,30 @@ pub struct TaggedRewriteAssembly {
     /// rewrite groups redistribute rows, so index bitmaps keep the retired
     /// source ids as provenance instead of following the rewrite.
     pub reordered_sources: RoaringBitmap,
+    /// The segments the commit layer classified as unable to translate their
+    /// stored addresses through this history, by uuid. Their coverage of the
+    /// rewritten sources is withdrawn in this same commit instead of being
+    /// left pointing at provenance they can never translate; every other
+    /// segment keeps its provenance and translates as usual. Established per
+    /// attempt against the manifest the attempt builds on, like the entry
+    /// itself, because a concurrent commit can add such a segment.
+    pub undeferrable_segments: Vec<uuid::Uuid>,
 }
 
 impl TaggedRewriteAssembly {
-    /// Bundle an assembled entry with the transitions it appended.
+    /// Bundle an assembled entry with the transitions it appended and the
+    /// segments whose coverage of their sources this rewrite withdraws.
     pub fn new(
         entry: IndexMetadata,
         base_entry_version: Option<u64>,
         transitions: &[crate::format::pb::fragment_reuse_index_details::Transition],
+        undeferrable_segments: Vec<uuid::Uuid>,
     ) -> lance_core::Result<Self> {
         Ok(Self {
             entry,
             base_entry_version,
             reordered_sources: reordered_sources(transitions)?,
+            undeferrable_segments,
         })
     }
 }
@@ -438,5 +449,17 @@ impl Operation {
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
         }
+    }
+
+    /// The fragment ids a `Rewrite` retires, in group order; empty for every
+    /// other operation.
+    pub fn rewritten_source_fragments(&self) -> impl Iterator<Item = u64> + '_ {
+        let groups = match self {
+            Self::Rewrite { groups, .. } => groups.as_slice(),
+            _ => &[],
+        };
+        groups
+            .iter()
+            .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
     }
 }

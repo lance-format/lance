@@ -20,7 +20,6 @@ use datafusion_physical_plan::{
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
-use tokio::task::spawn;
 
 pub mod background_iterator;
 
@@ -43,7 +42,7 @@ pub trait StreamingWriteSource: Send {
         Self: Sized,
     {
         let mut stream = self.into_stream();
-        let (stream, arrow_schema, schema) = spawn(async move {
+        let (stream, arrow_schema, schema) = lance_core::utils::tokio::spawn(async move {
             let arrow_schema = stream.schema();
             let mut schema: Schema = Schema::try_from(arrow_schema.as_ref())?;
             let first_batch = stream.try_next().await?;
@@ -244,6 +243,9 @@ pub const PARTITIONS_RANKED_METRIC: &str = "partitions_ranked";
 pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
 pub const INDEX_CACHE_HITS_METRIC: &str = "index_cache_hits";
 pub const INDEX_CACHE_MISSES_METRIC: &str = "index_cache_misses";
+/// Recorded by no operator: the summary of an execution reports it, see
+/// [`crate::exec::ExecutionSummaryCounts::peak_reserved_bytes`].
+pub const PEAK_RESERVED_BYTES_METRIC: &str = "peak_reserved_bytes";
 pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
 pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
 pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
