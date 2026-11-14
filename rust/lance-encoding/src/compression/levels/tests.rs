@@ -115,7 +115,6 @@ mod bitpacked {
     #[case::raw_tail(3, 1025)]
     #[case::padded_tail(3, 2047)]
     #[case::complete_chunks(7, 3072)]
-    #[case::full_width(16, 1031)]
     #[case::equal_tail_size(1, 1088)]
     fn writer_payloads(
         #[case] width: u64,
@@ -150,34 +149,41 @@ mod bitpacked {
 
     #[rstest]
     fn both_stable_tail_layouts(
+        #[values(3, 16)] width: usize,
         #[values(false, true)] raw: bool,
         #[values(false, true)] unaligned: bool,
     ) {
-        let values = (0..1500).map(|i| (i % 8) as u16).collect::<Vec<_>>();
+        let mask = ((1_u32 << width) - 1) as u16;
+        let values = (0..1500)
+            .map(|i| (i as u16).wrapping_mul(37) & mask)
+            .collect::<Vec<_>>();
         let mut padded = [0_u16; 2048];
         padded[..values.len()].copy_from_slice(&values);
         let chunks = if raw { 1 } else { 2 };
-        let mut input = vec![0_u16; chunks * 192];
+        let words_per_chunk = width * 64;
+        let mut input = vec![0_u16; chunks * words_per_chunk];
+        // Build both accepted reader layouts without invoking the writer's tail
+        // compression heuristic, which requires a width smaller than the word.
         for chunk in 0..chunks {
-            // SAFETY: 1024 u16 inputs fit in 3 bits; output has 1024*3/16 words.
+            // SAFETY: 1024 u16 inputs fit in width bits; output has 1024*width/16 words.
             unsafe {
                 u16::unchecked_pack(
-                    3,
+                    width,
                     &padded[chunk * 1024..(chunk + 1) * 1024],
-                    &mut input[chunk * 192..(chunk + 1) * 192],
+                    &mut input[chunk * words_per_chunk..(chunk + 1) * words_per_chunk],
                 );
             }
         }
         if raw {
             input.extend_from_slice(&values[1024..]);
         }
-        let codec = OutOfLineBitpacking::new(3, 16);
+        let codec = OutOfLineBitpacking::new(width as u64, 16);
         check(
             &codec,
             bytemuck::cast_slice(&input),
             &values,
             unaligned,
-            if raw { 0 } else { 2048 } + if unaligned { 384 } else { 0 },
+            if raw { 0 } else { 2048 } + if unaligned { words_per_chunk * 2 } else { 0 },
         );
     }
 
