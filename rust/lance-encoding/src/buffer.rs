@@ -488,7 +488,7 @@ impl IntoIterator for LanceBuffer {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, Float64Array};
+    use arrow_array::Float64Array;
     use arrow_buffer::{Buffer, ScalarBuffer};
     use lance_core::{Error, utils::allocation::AllocationBudget};
     use rstest::rstest;
