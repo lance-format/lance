@@ -16,34 +16,42 @@ struct PendingWindow<'a> {
     ready: Option<Result<PositionWindow>>,
 }
 
-/// At most one extra window per distinct term. The caller admits its bytes
-/// together with the term's current window before scheduling it.
+/// Request-owned windows per distinct term. The caller admits all their bytes
+/// together with the term's current window before scheduling them.
 pub(super) struct ReadAhead<'a> {
-    slots: Vec<Option<PendingWindow<'a>>>,
+    slots: Vec<Vec<PendingWindow<'a>>>,
 }
 
 impl<'a> ReadAhead<'a> {
     pub(super) fn new(terms: usize) -> Self {
         Self {
-            slots: (0..terms).map(|_| None).collect(),
+            slots: (0..terms).map(|_| Vec::new()).collect(),
         }
     }
 
-    pub(super) fn insert(
+    pub(super) fn schedule(
         &mut self,
         term: usize,
-        blocks: Range<usize>,
-        future: BoxFuture<'a, Result<PositionWindow>>,
+        predictions: impl IntoIterator<Item = (Range<usize>, BoxFuture<'a, Result<PositionWindow>>)>,
     ) -> Result<()> {
         let slot = self
             .slots
             .get_mut(term)
             .ok_or_else(|| Error::internal("read-ahead term has no prepared position stream"))?;
-        *slot = Some(PendingWindow {
-            blocks,
-            future: Some(future),
-            ready: None,
-        });
+        let mut previous = std::mem::take(slot);
+        // Advancing one window must not cancel and restart the remaining I/O.
+        // Drop predictions outside the new byte allowance before polling again.
+        for (blocks, future) in predictions {
+            let pending = match previous.iter().position(|pending| pending.blocks == blocks) {
+                Some(index) => previous.remove(index),
+                None => PendingWindow {
+                    blocks,
+                    future: Some(future),
+                    ready: None,
+                },
+            };
+            slot.push(pending);
+        }
         Ok(())
     }
 
@@ -54,10 +62,16 @@ impl<'a> ReadAhead<'a> {
         term: usize,
         block: usize,
     ) -> Option<BoxFuture<'a, Result<PositionWindow>>> {
-        let mut pending = self.slots.get_mut(term)?.take()?;
-        if !pending.blocks.contains(&block) {
+        let slot = self.slots.get_mut(term)?;
+        let Some(index) = slot
+            .iter()
+            .position(|pending| pending.blocks.contains(&block))
+        else {
+            slot.clear();
             return None;
-        }
+        };
+        drop(slot.drain(..index));
+        let mut pending = slot.remove(0);
         Some(
             async move {
                 match pending.ready.take() {
@@ -98,7 +112,7 @@ impl<'a> ReadAhead<'a> {
 
     pub(super) fn clear(&mut self) {
         for slot in &mut self.slots {
-            *slot = None;
+            slot.clear();
         }
     }
 }

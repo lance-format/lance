@@ -26,6 +26,9 @@ pub(super) fn enabled() -> bool {
 const MAX_LIVE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 // Search seed for the opt-in path, pending matched VM qualification.
 const POSITION_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+// Bound speculative request metadata even for arbitrarily small codec windows.
+// Encoded bytes have the stricter current-plus-predicted clause allowance.
+const MAX_PREDICTED_WINDOWS: usize = 7;
 const MAX_CLAUSES: usize = 16;
 const MAX_OFFSET_BYTES: usize = 1024 * 1024;
 
@@ -186,24 +189,34 @@ impl PreparedPositions {
         &self,
         current: &PositionWindow,
         clause_budget: u64,
-    ) -> Result<Option<Range<usize>>> {
+    ) -> Result<Vec<Range<usize>>> {
         if current.offsets.is_empty() {
             return Err(Error::index(
                 "cannot prefetch after an empty position window",
             ));
         }
-        let next = current
+        let mut next = current
             .first_block
             .checked_add(current.offsets.len())
             .ok_or_else(|| Error::index("position window block endpoint overflows"))?;
-        if next >= self.offsets.len() {
-            return Ok(None);
+        let mut retained = current.bytes.len() as u64;
+        let mut predictions = Vec::with_capacity(MAX_PREDICTED_WINDOWS);
+        for _ in 0..MAX_PREDICTED_WINDOWS {
+            if next >= self.offsets.len() {
+                break;
+            }
+            let (first, end, range) = self.window_bounds(next)?;
+            let Some(bytes) = retained.checked_add(range.end - range.start) else {
+                break;
+            };
+            if bytes > clause_budget {
+                break;
+            }
+            predictions.push(first..end);
+            retained = bytes;
+            next = end;
         }
-        let (first, end, range) = self.window_bounds(next)?;
-        let fits = (current.bytes.len() as u64)
-            .checked_add(range.end - range.start)
-            .is_some_and(|bytes| bytes <= clause_budget);
-        Ok(fits.then_some(first..end))
+        Ok(predictions)
     }
 
     async fn read(&self, index: usize, metrics: &dyn MetricsCollector) -> Result<PositionWindow> {
@@ -509,16 +522,17 @@ impl InvertedIndex {
                                         // Current plus speculative encoded bytes share the
                                         // original clause budget. Oversized neighbors skip
                                         // speculation; offsets/scratch/cache/I/O are separate.
-                                        if let Some(blocks) =
-                                            plan.read_ahead_blocks(&window, clause_budget)?
-                                        {
-                                            read_ahead.insert(
-                                                term,
-                                                blocks.clone(),
-                                                plan.read(blocks.start, request.metrics.as_ref())
-                                                    .boxed(),
-                                            )?;
-                                        }
+                                        let predictions =
+                                            plan.read_ahead_blocks(&window, clause_budget)?;
+                                        read_ahead.schedule(
+                                            term,
+                                            predictions.into_iter().map(|blocks| {
+                                                let future = plan
+                                                    .read(blocks.start, request.metrics.as_ref())
+                                                    .boxed();
+                                                (blocks, future)
+                                            }),
+                                        )?;
                                         search.supply(block_request, window)?;
                                     }
                                 }
@@ -770,13 +784,23 @@ mod tests {
             bytes: vec![9; 4].into(),
         };
         // The current four bytes and next eight bytes must both fit.
-        assert_eq!(plan.read_ahead_blocks(&current, 11).unwrap(), None);
-        assert_eq!(plan.read_ahead_blocks(&current, 12).unwrap(), Some(1..2));
+        assert!(plan.read_ahead_blocks(&current, 11).unwrap().is_empty());
+        let one = plan.read_ahead_blocks(&current, 12).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0], 1..2);
+        assert_eq!(
+            plan.read_ahead_blocks(&current, 16).unwrap(),
+            vec![1..2, 2..3]
+        );
         let final_window = PositionWindow {
             first_block: 2,
             ..current
         };
-        assert_eq!(plan.read_ahead_blocks(&final_window, 16).unwrap(), None);
+        assert!(
+            plan.read_ahead_blocks(&final_window, 16)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -786,13 +810,110 @@ mod tests {
         let plan = prepared(value.clone(), &cache);
         let metrics = NoOpMetricsCollector;
         let mut ahead = ReadAhead::new(1);
-        ahead.insert(0, 2..3, plan.read(2, &metrics).boxed())?;
+        ahead.schedule(0, [(2..3, plan.read(2, &metrics).boxed())])?;
         ahead.drive(value.started.notified()).await;
         let window = ahead.take(0, 2).unwrap().await?;
         assert_eq!(window.block(2)?, &[9; 4]);
         assert!(ahead.take(0, 2).is_none());
         assert_eq!(value.calls.load(Ordering::SeqCst), 1);
         assert_eq!(value.active.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn selective_phrase_read_ahead_limits_tiny_window_predictions() {
+        let cache = LanceCache::no_cache();
+        let mut plan = prepared(binary_value(false, false), &cache);
+        plan.offsets = vec![0; 100].into();
+        plan.window_ends = (1..=100).collect();
+        let current = PositionWindow {
+            first_block: 0,
+            codec: PositionStreamCodec::PackedDelta,
+            offsets: vec![0].into(),
+            bytes: Arc::from([]),
+        };
+        let predictions = plan.read_ahead_blocks(&current, 32 * 1024 * 1024).unwrap();
+        assert_eq!(predictions.len(), MAX_PREDICTED_WINDOWS);
+        assert_eq!(predictions.first(), Some(&(1..2)));
+        assert_eq!(predictions.last(), Some(&(7..8)));
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_read_ahead_preserves_remaining_windows() -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let predict = |block, calls: Arc<AtomicUsize>| {
+            (
+                block..block + 1,
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(PositionWindow {
+                        first_block: block,
+                        codec: PositionStreamCodec::PackedDelta,
+                        offsets: vec![0].into(),
+                        bytes: vec![block as u8].into(),
+                    })
+                }
+                .boxed(),
+            )
+        };
+        let mut ahead = ReadAhead::new(1);
+        ahead.schedule(0, [predict(1, calls.clone()), predict(2, calls.clone())])?;
+        // One pending essential poll allows both requests to complete.
+        let mut pending = true;
+        ahead
+            .drive(futures::future::poll_fn(|context| {
+                if std::mem::take(&mut pending) {
+                    context.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            }))
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ahead.take(0, 1).unwrap().await?.block(1)?, &[1]);
+        ahead.schedule(0, [predict(2, calls.clone()), predict(3, calls.clone())])?;
+        assert_eq!(ahead.take(0, 2).unwrap().await?.block(2)?, &[2]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A later skip discards the unused third prediction without polling it.
+        assert!(ahead.take(0, 4).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_read_ahead_retains_pending_io_across_admission() -> Result<()> {
+        let (started, accepted) = tokio::sync::oneshot::channel();
+        let (complete, receive) = tokio::sync::oneshot::channel();
+        let mut ahead = ReadAhead::new(1);
+        ahead.schedule(
+            0,
+            [(
+                2..3,
+                async move {
+                    started.send(()).unwrap();
+                    receive.await.unwrap();
+                    Ok(PositionWindow {
+                        first_block: 2,
+                        codec: PositionStreamCodec::PackedDelta,
+                        offsets: vec![0].into(),
+                        bytes: vec![2].into(),
+                    })
+                }
+                .boxed(),
+            )],
+        )?;
+        ahead.drive(accepted).await.unwrap();
+        ahead.schedule(
+            0,
+            [(
+                2..3,
+                async { Err(Error::index("replacement must not restart accepted I/O")) }.boxed(),
+            )],
+        )?;
+        assert!(!complete.is_closed());
+        complete.send(()).unwrap();
+        assert_eq!(ahead.take(0, 2).unwrap().await?.block(2)?, &[2]);
         Ok(())
     }
 
@@ -809,7 +930,7 @@ mod tests {
         let metrics = NoOpMetricsCollector;
         let mut ahead = ReadAhead::new(1);
         ahead
-            .insert(0, 2..3, plan.read(2, &metrics).boxed())
+            .schedule(0, [(2..3, plan.read(2, &metrics).boxed())])
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -822,7 +943,7 @@ mod tests {
         assert!(ahead.take(0, 0).is_none());
         assert_eq!(value.active.load(Ordering::SeqCst), 0);
         ahead
-            .insert(0, 2..3, plan.read(2, &metrics).boxed())
+            .schedule(0, [(2..3, plan.read(2, &metrics).boxed())])
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -844,7 +965,7 @@ mod tests {
         let metrics = NoOpMetricsCollector;
         let mut ahead = ReadAhead::new(1);
         ahead
-            .insert(0, 2..3, plan.read(2, &metrics).boxed())
+            .schedule(0, [(2..3, plan.read(2, &metrics).boxed())])
             .unwrap();
         assert_eq!(ahead.drive(futures::future::ready(7)).await, 7);
         ahead.clear();
@@ -855,14 +976,16 @@ mod tests {
     async fn selective_phrase_read_ahead_defers_an_unused_failure() -> Result<()> {
         let (send, receive) = tokio::sync::oneshot::channel();
         let mut ahead = ReadAhead::new(1);
-        ahead.insert(
+        ahead.schedule(
             0,
-            2..3,
-            async move {
-                send.send(()).unwrap();
-                Err(Error::index("speculative read unavailable"))
-            }
-            .boxed(),
+            [(
+                2..3,
+                async move {
+                    send.send(()).unwrap();
+                    Err(Error::index("speculative read unavailable"))
+                }
+                .boxed(),
+            )],
         )?;
         ahead.drive(receive).await.unwrap();
         let error = ahead.take(0, 2).unwrap().await.err().unwrap();
