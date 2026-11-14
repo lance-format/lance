@@ -506,19 +506,41 @@ pub enum ProjectionRequest {
 }
 
 impl ProjectionRequest {
+    /// Project `columns`, by name or nested path, out of `dataset_schema`.
+    ///
+    /// # Panics
+    ///
+    /// If a column, or a nested path below it, is not in the schema. Use
+    /// [`Self::try_from_columns`] for column names that come from a user.
     pub fn from_columns(
         columns: impl IntoIterator<Item = impl AsRef<str>>,
         dataset_schema: &Schema,
     ) -> Self {
+        Self::try_from_columns(columns, dataset_schema).unwrap()
+    }
+
+    /// Project `columns`, by name or nested path, out of `dataset_schema`, or
+    /// return [`Error::FieldNotFound`] for a column the schema does not have.
+    ///
+    /// ```
+    /// # use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// # use lance::dataset::ProjectionRequest;
+    /// # use lance_core::datatypes::Schema;
+    /// let schema = Schema::try_from(&ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]))?;
+    /// assert!(ProjectionRequest::try_from_columns(["id"], &schema).is_ok());
+    /// assert!(ProjectionRequest::try_from_columns(["missing"], &schema).is_err());
+    /// # Ok::<(), lance::Error>(())
+    /// ```
+    pub fn try_from_columns(
+        columns: impl IntoIterator<Item = impl AsRef<str>>,
+        dataset_schema: &Schema,
+    ) -> Result<Self> {
         let columns = columns
             .into_iter()
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
-
-        let schema = dataset_schema
-            .project_preserve_system_columns(&columns)
-            .unwrap();
-        Self::Schema(Arc::new(schema))
+        let schema = dataset_schema.project_preserve_system_columns(&columns)?;
+        Ok(Self::Schema(Arc::new(schema)))
     }
 
     pub fn from_schema(schema: Schema) -> Self {

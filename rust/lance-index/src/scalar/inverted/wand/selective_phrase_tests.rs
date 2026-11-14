@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::tests::{UnitScorer, generate_posting_list_with_positions, unit_length_docs};
+use super::tests::{UnitScorer, generate_posting_list_with_positions};
 use super::*;
 use crate::metrics::NoOpMetricsCollector;
 use crate::scalar::inverted::encoding::encode_position_stream_block_into;
+use crate::scalar::inverted::index::PositionStreamCodec;
 use crate::scalar::inverted::index::SharedPositionStream;
+use crate::scalar::inverted::{CompressedPositionStorage, DocSet};
+use lance_core::Error;
 use rstest::rstest;
+
+fn unit_length_docs(num_docs: usize) -> DocSet {
+    let mut docs = DocSet::default();
+    for doc_id in 0..num_docs {
+        docs.append(doc_id as u64, 1);
+    }
+    docs
+}
 
 #[rstest]
 #[case::packed(PositionStreamCodec::PackedDelta)]

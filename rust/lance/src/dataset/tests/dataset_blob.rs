@@ -5,7 +5,7 @@ use crate::dataset::blob::test_util::{
     BlobTestFixture, complete_blob_v2_array, complete_blob_v2_field,
     create_multi_base_blob_v2_fixture, managed_blob_schema, nested_blob_v2_batch,
 };
-use crate::dataset::blob::{BlobRangeRequest, BlobReadRange};
+use crate::dataset::blob::{BlobFile, BlobRangeRequest, BlobReadRange};
 use crate::{
     Dataset,
     blob::{
@@ -3005,6 +3005,44 @@ async fn test_blob_selection_apis_preserve_v2_nulls_and_empty_values() {
     assert!(results[2].data.is_none());
     assert_eq!(results[3].request_index, 3);
     assert_eq!(results[3].data.as_deref(), Some(b"b".as_slice()));
+
+    let blobs = crate::blob::read_blob_files(blob_files.iter().map(Option::as_ref))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        blobs
+            .iter()
+            .map(|blob| (blob.request_index, blob.data.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, Some(b"abc".as_slice())),
+            (1, None),
+            (2, Some(b"".as_slice())),
+        ]
+    );
+
+    let results = crate::blob::read_blob_file_ranges([
+        (blob_files[2].as_ref(), BlobReadRange::new(0, 0)),
+        (blob_files[1].as_ref(), BlobReadRange::new(0, 0)),
+        (blob_files[1].as_ref(), BlobReadRange::new(0, 1)),
+        (blob_files[0].as_ref(), BlobReadRange::new(1, 1)),
+    ])
+    .execute()
+    .await
+    .unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.request_index, result.data.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, Some(b"".as_slice())),
+            (1, None),
+            (2, None),
+            (3, Some(b"b".as_slice())),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -3043,6 +3081,325 @@ async fn test_read_blob_ranges_rejects_overflow_and_out_of_bounds() {
     assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(err.to_string().contains("exceeds blob size"));
     assert!(err.to_string().contains("request 0"));
+}
+
+/// Write `payloads` as a Blob v2 column whose thresholds store every value as
+/// `kind`, with `rows_per_file` rows per fragment.
+async fn write_blob_v2_payloads(
+    payloads: &[&[u8]],
+    kind: BlobKind,
+    rows_per_file: usize,
+) -> (TempStrDir, Arc<Dataset>) {
+    let (inline_threshold, dedicated_threshold) = match kind {
+        BlobKind::Packed => (0, 1024 * 1024),
+        BlobKind::Dedicated => (0, 1),
+        other => panic!("write_blob_v2_payloads does not support {other:?}"),
+    };
+    let test_dir = TempStrDir::default();
+    let mut blob_builder = BlobArrayBuilder::new(payloads.len());
+    for payload in payloads {
+        blob_builder.push_bytes(payload).unwrap();
+    }
+    let field = blob_field("blob", true);
+    let mut metadata = field.metadata().clone();
+    metadata.insert(
+        BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+        inline_threshold.to_string(),
+    );
+    metadata.insert(
+        BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+        dedicated_threshold.to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![field.with_metadata(metadata)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![blob_builder.finish().unwrap()]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: rows_per_file,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    (test_dir, Arc::new(dataset))
+}
+
+#[rstest]
+#[case::packed(BlobKind::Packed)]
+#[case::dedicated(BlobKind::Dedicated)]
+#[tokio::test]
+async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind) {
+    let payloads: [&[u8]; 4] = [b"zero", b"one!", b"two!!", b"three"];
+    let (_test_dir, dataset) = write_blob_v2_payloads(&payloads, kind, 2).await;
+    assert_eq!(dataset.get_fragments().len(), 2);
+    // Handles from separate takes still share I/O on the same backing object.
+    let mut handles = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    handles.extend(
+        dataset
+            .take_blobs_by_indices(&[2, 3], "blob")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        handles
+            .iter()
+            .all(|handle| handle.as_ref().unwrap().kind() == kind)
+    );
+    let payload_paths = handles
+        .iter()
+        .map(|handle| handle.as_ref().unwrap().data_path().clone())
+        .collect::<Vec<_>>();
+    let mut distinct_payload_paths = payload_paths.clone();
+    distinct_payload_paths.sort();
+    distinct_payload_paths.dedup();
+
+    let request_rows = [3_usize, 0, 1, 2, 0];
+    let mut requests = request_rows
+        .iter()
+        .map(|row| handles[*row].as_ref())
+        .collect::<Vec<_>>();
+    requests.insert(1, None);
+    let _ = dataset.object_store.io_stats_incremental();
+    let blobs = crate::blob::read_blob_files(requests)
+        .execute()
+        .await
+        .unwrap();
+    let handle_stats = dataset.object_store.io_stats_incremental();
+
+    let mut expected = request_rows
+        .iter()
+        .map(|row| Some(payloads[*row]))
+        .collect::<Vec<_>>();
+    expected.insert(1, None);
+    assert_eq!(
+        blobs
+            .iter()
+            .map(|blob| blob.data.as_deref())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        blobs
+            .iter()
+            .map(|blob| blob.request_index)
+            .collect::<Vec<_>>(),
+        (0..expected.len()).collect::<Vec<_>>()
+    );
+    // One coalesced request per backing object and nothing else: no
+    // descriptor read from the data files.
+    assert!(
+        handle_stats
+            .requests
+            .iter()
+            .all(|request| payload_paths.contains(&request.path)),
+        "{handle_stats:?}"
+    );
+    assert_eq!(
+        handle_stats.read_iops,
+        distinct_payload_paths.len() as u64,
+        "{handle_stats:?}"
+    );
+
+    let rows = dataset
+        .read_blobs("blob")
+        .unwrap()
+        .with_row_indices(request_rows.map(|row| row as u64))
+        .execute()
+        .await
+        .unwrap();
+    let row_stats = dataset.object_store.io_stats_incremental();
+    assert_eq!(
+        rows.iter()
+            .map(|blob| blob.data.as_deref())
+            .collect::<Vec<_>>(),
+        request_rows
+            .iter()
+            .map(|row| Some(payloads[*row]))
+            .collect::<Vec<_>>()
+    );
+    // The row selector reads descriptors from the data files first.
+    assert!(
+        row_stats
+            .requests
+            .iter()
+            .any(|request| !payload_paths.contains(&request.path)),
+        "{row_stats:?}"
+    );
+    assert!(
+        row_stats.read_iops > handle_stats.read_iops,
+        "{row_stats:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
+    let first = (0..64_u8).cycle().take(4096).collect::<Vec<_>>();
+    let second = (64..128_u8).cycle().take(4096).collect::<Vec<_>>();
+    let (_test_dir, dataset) =
+        write_blob_v2_payloads(&[&first, &second], BlobKind::Dedicated, 1).await;
+    let handles = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    let first_handle = handles[0].as_ref().unwrap();
+    let second_handle = handles[1].as_ref().unwrap();
+    let requests = [
+        (Some(second_handle), 100_u64, 100_u64),
+        (Some(first_handle), 1000, 500),
+        (None, 0, 10),
+        (Some(first_handle), 0, 1000),
+        (Some(first_handle), 500, 0),
+        (Some(first_handle), 0, 1000),
+    ];
+
+    let _ = dataset.object_store.io_stats_incremental();
+    let results = crate::blob::read_blob_file_ranges(
+        requests
+            .iter()
+            .map(|(handle, offset, length)| (*handle, BlobReadRange::new(*offset, *length))),
+    )
+    .execute()
+    .await
+    .unwrap();
+    let stats = dataset.object_store.io_stats_incremental();
+
+    let expected = requests
+        .iter()
+        .map(|(handle, offset, length)| {
+            handle.map(|handle| {
+                let payload = if std::ptr::eq(handle, first_handle) {
+                    &first
+                } else {
+                    &second
+                };
+                &payload[*offset as usize..(*offset + *length) as usize]
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.request_index, result.data.as_deref()))
+            .collect::<Vec<_>>(),
+        expected.into_iter().enumerate().collect::<Vec<_>>()
+    );
+    // Adjacent and duplicate ranges on the first blob become one request; the
+    // empty range and the null request issue none.
+    let mut requested = stats
+        .requests
+        .iter()
+        .map(|request| (request.path.clone(), request.range.clone()))
+        .collect::<Vec<_>>();
+    requested.sort_by_key(|(_, range)| range.as_ref().map(|range| range.start));
+    let first_start = first_handle.position();
+    let second_start = second_handle.position();
+    let mut expected_requests = vec![
+        (
+            first_handle.data_path().clone(),
+            Some(first_start..first_start + 1500),
+        ),
+        (
+            second_handle.data_path().clone(),
+            Some(second_start + 100..second_start + 200),
+        ),
+    ];
+    expected_requests.sort_by_key(|(_, range)| range.as_ref().map(|range| range.start));
+    assert_eq!(requested, expected_requests, "{stats:?}");
+    assert_eq!(stats.read_iops, 2, "{stats:?}");
+}
+
+#[tokio::test]
+async fn test_read_blob_file_ranges_rejects_invalid_requests() {
+    let (_test_dir, dataset) =
+        write_blob_v2_payloads(&[b"abcdef", b"ghijkl"], BlobKind::Packed, 2).await;
+    let handles = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    let handle = handles[0].as_ref();
+
+    for overflowing in [handle, None] {
+        let err =
+            crate::blob::read_blob_file_ranges([(overflowing, BlobReadRange::new(u64::MAX, 1))])
+                .execute()
+                .await
+                .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("offset + length overflowed"));
+    }
+
+    let err = crate::blob::read_blob_file_ranges([
+        (handle, BlobReadRange::new(0, 1)),
+        (handle, BlobReadRange::new(4, 3)),
+    ])
+    .execute()
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(err.to_string().contains("request 1"));
+    assert!(err.to_string().contains("exceeds blob size"));
+
+    // A null blob has no size to check a range against.
+    let results =
+        crate::blob::read_blob_file_ranges([(None::<&BlobFile>, BlobReadRange::new(4, 3))])
+            .execute()
+            .await
+            .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].data.is_none());
+
+    let err = crate::blob::read_blob_files([handle])
+        .with_io_buffer_size_bytes(0)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("io_buffer_size must be greater than 0")
+    );
+
+    // Closing the caller's handle after the read is built still rejects it.
+    let builder = crate::blob::read_blob_files([handles[1].as_ref()]);
+    handles[1].as_ref().unwrap().close().await.unwrap();
+    let err = builder.execute().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(err.to_string().contains("request 0 is already closed"));
+}
+
+#[tokio::test]
+async fn test_read_blob_files_outlive_later_commits() {
+    let (_test_dir, dataset) =
+        write_blob_v2_payloads(&[b"first", b"second"], BlobKind::Packed, 2).await;
+    let old_handles = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+
+    let mut dataset = (*dataset).clone();
+    dataset.delete("true").await.unwrap();
+    let dataset = Arc::new(dataset);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+    assert!(dataset.get_fragments().is_empty());
+
+    // Handles from an earlier version keep returning that version's bytes
+    // until cleanup removes its files.
+    let blobs = crate::blob::read_blob_files(old_handles.iter().rev().map(Option::as_ref))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        blobs
+            .iter()
+            .map(|blob| blob.data.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some(b"second".as_slice()), Some(b"first".as_slice())]
+    );
 }
 
 #[tokio::test]

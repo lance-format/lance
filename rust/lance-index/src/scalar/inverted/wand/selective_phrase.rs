@@ -4,6 +4,9 @@
 //! Owned conjunction state that can leave the CPU pool for position-block I/O.
 
 use super::*;
+use crate::scalar::inverted::DocInfo;
+use crate::scalar::inverted::index::PositionStreamCodec;
+use lance_core::Error;
 
 #[derive(Clone)]
 pub(in crate::scalar::inverted) struct PositionBlock {
@@ -35,6 +38,7 @@ pub(in crate::scalar::inverted) struct PhraseSearch {
     threshold: f32,
     pending: Option<(DocInfo, f32)>,
     collector: TopKCollector,
+    limit: usize,
 }
 
 impl PhraseSearch {
@@ -66,6 +70,7 @@ impl PhraseSearch {
             threshold: 0.0,
             pending: None,
             collector: TopKCollector::new(limit, limit.min(BLOCK_SIZE * 10)),
+            limit,
         })
     }
 
@@ -126,7 +131,7 @@ impl PhraseSearch {
         wand.score_first_and_enabled = false;
         let mut comparisons = 0;
         let progress = loop {
-            if self.collector.limit == 0 {
+            if self.limit == 0 {
                 break PhraseProgress::Done(Vec::new());
             }
             wand.raise_to_shared_floor(1.0);
@@ -141,6 +146,7 @@ impl PhraseSearch {
                 }
             };
             let Some((doc, _)) = candidate else {
+                self.limit = 0;
                 let collector = std::mem::replace(&mut self.collector, TopKCollector::new(0, 0));
                 break PhraseProgress::Done(
                     collector.into_candidates(|key| documents.candidate_from_key(key))?,

@@ -43,6 +43,7 @@ use crate::index::vector::details::{
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
+use crate::session::index_caches::{DerivedIndexListingKey, QueryIndexListingKey};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{
     Dataset,
@@ -8738,9 +8739,17 @@ async fn test_prewarm_and_query_with_serializing_backend(
         "prewarm should have serialized entries into the backend"
     );
     assert_eq!(
-        passthrough, 0,
-        "all index cache entries should have codecs (nothing in passthrough), \
-             but found {passthrough} passthrough entries"
+        passthrough, 1,
+        "only the reader-dependent query listing should remain in memory"
+    );
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    });
+    assert!(
+        dataset.index_cache.get_with_key(&query_key).await.is_some(),
+        "the in-memory entry must be the query listing"
     );
 
     drop(dataset);
