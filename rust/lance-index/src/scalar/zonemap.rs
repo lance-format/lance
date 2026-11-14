@@ -853,6 +853,23 @@ impl ZoneMapIndex {
     /// is not read and nothing is cached. The file is decoded and validated
     /// under `version` exactly as loading the index does, and the batch has
     /// the [`Self::zones_as_batch`] schema.
+    ///
+    /// `version` is the segment's own
+    /// [`IndexMetadata::index_version`](lance_table::format::IndexMetadata::index_version):
+    /// a file is only decoded under the version it was written with, and one
+    /// written at a version this build does not know is a `NotSupported`
+    /// error.
+    ///
+    /// ```
+    /// # use lance_index::scalar::IndexStore;
+    /// # use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
+    /// # use lance_core::Result;
+    /// # async fn zone_count(store: &dyn IndexStore, index_version: i32) -> Result<usize> {
+    /// let version = ZoneMapIndexVersion::from_metadata(index_version as u32)?;
+    /// let zones = ZoneMapIndex::load_zone_statistics(store, version).await?;
+    /// Ok(zones.num_rows())
+    /// # }
+    /// ```
     pub async fn load_zone_statistics(
         store: &dyn IndexStore,
         version: ZoneMapIndexVersion,
