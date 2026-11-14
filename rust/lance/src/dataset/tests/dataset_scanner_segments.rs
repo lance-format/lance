@@ -19,6 +19,9 @@ use lance_index::scalar::inverted::query::PhraseQuery;
 use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
+use lance_io::object_store::ObjectStoreParams;
+use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -27,7 +30,9 @@ use uuid::Uuid;
 
 use crate::Error;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::scanner::test_dataset::{TestVectorDataset, assert_query_index_field};
+use crate::dataset::scanner::test_dataset::{
+    TestVectorDataset, assert_query_index_field, batch_knn_two_queries,
+};
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap, Scanner};
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
@@ -533,6 +538,116 @@ async fn test_vector_search_fragment_filter_prunes_segment_fanout() {
 
 #[rstest]
 #[tokio::test]
+async fn test_hybrid_prefilter_consumers(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] fast_search: bool,
+    #[values("ann", "batch", "fts")] consumer: &str,
+) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+        .await
+        .unwrap();
+    fixture.make_scalar_index().await.unwrap();
+    fixture.append_data_with_range(400, 410).await.unwrap();
+    fixture
+        .dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    fixture.make_fts_index().await.unwrap();
+    let mut before_delete = fixture.dataset.scan();
+    before_delete.use_scalar_index(false).with_row_id();
+    before_delete.filter("i >= 250 AND i % 2 = 0").unwrap();
+    before_delete.with_fragments(fixture.dataset.fragments()[1..].to_vec());
+    let before_delete = before_delete.try_into_batch().await.unwrap();
+    let external = lance_select::RowAddrMask::from_allowed(
+        before_delete[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    fixture.dataset.delete("i = 252").await.unwrap();
+    let dataset = &fixture.dataset;
+    let mut oracle = dataset.scan();
+    oracle.use_scalar_index(false).with_row_id();
+    oracle
+        .filter(if consumer == "batch" {
+            "i >= 250"
+        } else {
+            "i >= 250 AND i % 2 = 0"
+        })
+        .unwrap();
+    oracle.with_fragments(dataset.fragments()[1..].to_vec());
+    let expected = oracle.try_into_batch().await.unwrap();
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(dataset.fragments()[1..].to_vec());
+    scanner.filter("i >= 250").unwrap().prefilter(true);
+    if consumer != "batch" {
+        scanner.with_row_id_prefilter(external);
+    }
+    scanner.project(&["i"]).unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    if consumer == "fts" {
+        scanner
+            .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+            .unwrap();
+    } else if consumer == "batch" {
+        scanner
+            .nearest("vec", &batch_knn_two_queries().0, 200)
+            .unwrap()
+            .nprobes(1);
+    } else {
+        scanner
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), 200)
+            .unwrap()
+            .nprobes(1);
+    }
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("PrefilterUnion:"), "{plan}");
+    if consumer == "batch" {
+        assert!(plan.contains("ANNIvfBatch:"), "{plan}");
+    }
+    assert_eq!(
+        plan.contains("projection=[], num_fragments=1"),
+        !fast_search,
+        "{plan}"
+    );
+    let actual = scanner.try_into_batch().await.unwrap();
+    let ids = |batch: &RecordBatch| {
+        batch["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    };
+    let expected: BTreeSet<_> = ids(&expected)
+        .into_iter()
+        .filter(|id| !fast_search || *id < 400)
+        .collect();
+    let actual_ids = ids(&actual);
+    assert_eq!(actual_ids, expected);
+    assert_eq!(
+        actual.num_rows(),
+        expected.len() * if consumer == "batch" { 2 } else { 1 }
+    );
+    assert_eq!(
+        actual_ids.intersection(&expected).count() as f64 / expected.len() as f64,
+        1.0
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_vector_prefilter_prunes_scalar_segments(
     #[values(false, true)] stable_row_ids: bool,
     #[values(false, true)] explicit_fragments: bool,
@@ -542,6 +657,28 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         .unwrap();
     let vector_segments = test_ds.make_segmented_vector_index().await.unwrap();
     test_ds.make_segmented_scalar_index().await.unwrap();
+    let excluded_segment = test_ds
+        .dataset
+        .load_indices_by_name("i_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+        .unwrap();
+    let excluded_path = test_ds
+        .dataset
+        .indices_dir()
+        .join(excluded_segment.uuid.to_string());
+    let tracker = Arc::new(IOTracker::default());
+    test_ds.dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_ds.tmp_dir.as_str())
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(tracker.clone()),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    tracker.incremental_stats();
     let fragments = test_ds.dataset.fragments();
     let query: Float32Array = (0..32).map(|value| value as f32).collect();
 
@@ -560,6 +697,15 @@ async fn test_vector_prefilter_prunes_scalar_segments(
     scanner.filter("NOT (i < 250)").unwrap();
 
     let analyzed = scanner.analyze_plan().await.unwrap();
+    let stats = tracker.incremental_stats();
+    assert!(
+        !stats
+            .requests
+            .iter()
+            .any(|request| request.path.as_ref().starts_with(excluded_path.as_ref())),
+        "excluded scalar segment was opened: {:?}",
+        stats.requests
+    );
     let scalar_index_node = analyzed
         .lines()
         .find(|line| line.trim_start().starts_with("ScalarIndexQuery:"))
@@ -568,12 +714,15 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         scalar_index_node.contains("indices_loaded=1,"),
         "expected one scalar segment to be loaded, plan was:\n{analyzed}"
     );
-    if explicit_fragments {
-        assert!(
-            analyzed.contains("projection=[], num_fragments=1"),
-            "segment pruning must preserve the FilteredRead row-ID path, plan was:\n{analyzed}"
-        );
-    }
+    assert_eq!(
+        analyzed.contains("PrefilterUnion:"),
+        explicit_fragments,
+        "{analyzed}"
+    );
+    assert!(
+        !analyzed.contains("projection=[], num_fragments=1"),
+        "{analyzed}"
+    );
 
     let actual = scanner.try_into_batch().await.unwrap();
     let actual = actual["i"]
@@ -1676,4 +1825,114 @@ impl FragmentVectorFixture {
         }
         actual["id"].as_primitive::<Int32Type>().values().to_vec()
     }
+}
+
+/// One supplied centroid: no IVF training, so no k-means randomness or minimum
+/// sample size.
+fn one_centroid() -> IvfBuildParams {
+    let centroids = Arc::new(
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 4]), 4).unwrap(),
+    );
+    IvfBuildParams::try_with_centroids(1, centroids).unwrap()
+}
+
+/// Segments of index `idx` on `vec` over fragments 0 and 1, the first an L2
+/// IVF_FLAT and the second built with `second`, published without the commit
+/// check, as an earlier release could have left them.
+async fn mixed_vector_segments(second: VectorIndexParams) -> (Dataset, Uuid, Uuid) {
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .into_ram_dataset_with_params(
+            FragmentCount::from(2),
+            FragmentRowCount::from(16),
+            Some(WriteParams {
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let first = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, one_centroid());
+    let mut segments = Vec::with_capacity(2);
+    for (params, fragment) in [(first, 0), (second, 1)] {
+        let segment = dataset
+            .create_index_builder(&["vec"], IndexType::Vector, &params)
+            .name("idx".to_owned())
+            .fragments(vec![fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        segments.push(segment);
+    }
+    let uuids = (segments[0].uuid, segments[1].uuid);
+    crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, segments).await;
+    (dataset, uuids.0, uuids.1)
+}
+
+/// Segments of one index that rank by different metrics or index types cannot
+/// answer one search: merging their distances would rank part of the data by
+/// the wrong one.
+#[rstest]
+#[case::metric(
+    VectorIndexParams::with_ivf_flat_params(DistanceType::Dot, one_centroid()),
+    "Dot"
+)]
+#[case::index_type(
+    VectorIndexParams::with_ivf_sq_params(
+        DistanceType::L2,
+        one_centroid(),
+        SQBuildParams::default()
+    ),
+    "IVF_SQ"
+)]
+#[tokio::test]
+async fn test_vector_search_refuses_segments_with_different_contracts(
+    #[case] second_params: VectorIndexParams,
+    #[case] mismatch: &str,
+    #[values(false, true)] batch: bool,
+) {
+    let (dataset, first, second) = mixed_vector_segments(second_params).await;
+    let query = Float32Array::from(vec![0.5; 4]);
+    let queries =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.5; 8]), 4).unwrap();
+
+    let mut scanner = dataset.scan();
+    if batch {
+        scanner
+            .nearest("vec", &queries, 5)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1);
+    } else {
+        scanner.nearest("vec", &query, 5).unwrap();
+    }
+    let plan = scanner.explain_plan(false).await.unwrap();
+    let node = if batch {
+        "ANNIvfBatch"
+    } else {
+        "ANNIvfPartition"
+    };
+    assert!(plan.contains(node), "{plan}");
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(
+        matches!(err, Error::Index { .. }),
+        "expected an index error, got {err:?}"
+    );
+    let message = err.to_string();
+    for expected in [first.to_string(), second.to_string(), mismatch.to_string()] {
+        assert!(
+            message.contains(&expected),
+            "the error should name {expected}: {message}"
+        );
+    }
+
+    // One segment alone ranks under one contract.
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &query, 5)
+        .unwrap()
+        .with_index_segments(vec![first])
+        .unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 5);
 }

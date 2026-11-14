@@ -12,8 +12,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::Array;
+use arrow_array::{Array, types::Float32Type};
 use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_select::concat::concat;
 use chrono::Utc;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{Expr, ScalarUDF, lit};
@@ -40,12 +41,13 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment_slice::FragmentSlice;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::vector::utils::{get_vector_dim, get_vector_type, validate_distance_type_for};
 use crate::io::exec::LANCE_RELATIONAL_ALGEBRA_VERSION;
 use crate::io::exec::knn::QUERY_INDEX_COL;
 use crate::{Error, Result};
 
 use super::aggregate::AggregateExpr;
+use super::vector::VectorRefinement;
 use super::{
     BATCH_SIZE_FALLBACK, ColumnOrdering, ExprFilter, LanceFilter, MaterializationStyle,
     QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
@@ -76,8 +78,10 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
+            nearest_refine: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
+            warp_imputation_rank: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -937,6 +941,7 @@ impl Scanner {
             approx_mode: Default::default(),
         });
         self.quantized_refine_factor = None;
+        self.nearest_refine = None;
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
         Ok(self)
@@ -1118,6 +1123,130 @@ impl Scanner {
         self
     }
 
+    /// Refine candidates using a separate Float32 fixed-size vector column.
+    ///
+    /// Call this after [`Self::nearest`] and set a positive [`Self::refine`]
+    /// factor before execution. The coarse search returns at most `k * factor`
+    /// candidates; their final `_distance` and [`Self::distance_range`] use
+    /// `metric` and `query`. This replaces same-column exact refinement,
+    /// including when a quantized index supplies the coarse candidates.
+    /// Without an index, coarse exact TopM still precedes cross-column refinement.
+    ///
+    /// Both columns must contain single Float32 vectors. Query dimensions may
+    /// differ, but batch queries must have matching counts and both queries must
+    /// be batches. Scalar prefilters apply before candidate selection, and
+    /// postfilters apply after the final TopK. Vector and full-text query filters
+    /// are not supported. Null or invalid refinement vectors can result in fewer
+    /// than `k` rows. Calling [`Self::nearest`] again clears this setting.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_linalg::distance::MetricType;
+    /// # async fn example(
+    /// #     dataset: &Dataset,
+    /// #     coarse: &Float32Array,
+    /// #     full: &Float32Array,
+    /// # ) -> Result<()> {
+    /// let mut scan = dataset.scan();
+    /// scan.nearest("short_vector", coarse, 10)?.refine(2);
+    /// scan.with_refine_column("full_vector", full, MetricType::Cosine)?;
+    /// let results = scan.try_into_batch().await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_refine_column(
+        &mut self,
+        column: impl AsRef<str>,
+        query: &dyn Array,
+        metric: MetricType,
+    ) -> Result<&mut Self> {
+        let column = column.as_ref();
+        let nearest = self.nearest.as_ref().ok_or_else(|| {
+            Error::invalid_input("nearest must be set before refine_column".to_string())
+        })?;
+        for name in [nearest.column.as_str(), column] {
+            let (vector_type, element_type) = get_vector_type(self.dataset.schema(), name)?;
+            if !matches!(vector_type, DataType::FixedSizeList(_, _))
+                || element_type != DataType::Float32
+            {
+                return Err(Error::not_supported(format!(
+                    "cross-column refinement requires Float32 fixed-size vectors; column {name} has type {vector_type}"
+                )));
+            }
+        }
+        validate_distance_type_for(metric, &DataType::Float32)?;
+        let query_element_type = match query.data_type() {
+            DataType::List(field) | DataType::FixedSizeList(field, _) => field.data_type(),
+            data_type => data_type,
+        };
+        if query_element_type != &DataType::Float32 {
+            return Err(Error::invalid_input(format!(
+                "refine_q must contain Float32 values, got {}",
+                query.data_type()
+            )));
+        }
+        if query.null_count() > 0 {
+            return Err(Error::invalid_input(
+                "refine_q must contain only finite, non-null values".to_string(),
+            ));
+        }
+
+        let mut validation = Self::new(self.dataset.clone());
+        validation.nearest(column, query, nearest.k)?;
+        if validation.nearest_query_count != self.nearest_query_count
+            || validation.is_batch_nearest != self.is_batch_nearest
+        {
+            return Err(Error::invalid_input(format!(
+                "refine_q batch shape must match q: expected {} queries (batch={}), got {} (batch={})",
+                self.nearest_query_count,
+                self.is_batch_nearest,
+                validation.nearest_query_count,
+                validation.is_batch_nearest
+            )));
+        }
+
+        // Respect offsets when a caller passes a slice of a batch query array.
+        let vectors = if let Some(list) = query.as_list_opt::<i32>() {
+            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
+        } else if let Some(list) = query.as_fixed_size_list_opt() {
+            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
+        } else {
+            vec![query.slice(0, query.len())]
+        };
+        let key = concat(
+            &vectors
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<_>>(),
+        )?;
+        let values = key.as_primitive::<Float32Type>();
+        if values.null_count() > 0 || values.values().iter().any(|value| !value.is_finite()) {
+            return Err(Error::invalid_input(
+                "refine_q must contain only finite, non-null values".to_string(),
+            ));
+        }
+        let dim = get_vector_dim(self.dataset.schema(), column)?;
+        if metric == MetricType::Cosine
+            && values
+                .values()
+                .chunks_exact(dim)
+                .any(|vector| vector.iter().all(|value| *value == 0.0))
+        {
+            return Err(Error::invalid_input(
+                "refine_q must have nonzero norm for cosine distance".to_string(),
+            ));
+        }
+
+        self.nearest_refine = Some(VectorRefinement {
+            column: column.to_string(),
+            key,
+            metric,
+        });
+        Ok(self)
+    }
+
     /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
     ///
     /// Unlike [`Self::refine`], indexed candidates are re-ranked without reading
@@ -1128,6 +1257,15 @@ impl Scanner {
     /// configured, the quantized stage emits enough candidates for that exact stage.
     /// When a distance range is set, the selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
+    ///
+    /// Completed partition results may be reused for identical queries in the
+    /// same snapshot, within the session index-cache budget. This memory-only
+    /// cache accepts fully indexed single-vector queries without filters,
+    /// fragment subsets, external masks, or stale vector overlays, and requires
+    /// a proven manifest identity. It stores row IDs and quantized distances;
+    /// exact refinement and projections still run independently. Immutable RQ
+    /// index data is cached separately and can remain reusable across queries
+    /// and snapshots even when completed results cannot be reused.
     ///
     /// ```
     /// # use arrow_array::Float32Array;
@@ -1144,6 +1282,50 @@ impl Scanner {
     /// ```
     pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
         self.quantized_refine_factor = Some(factor);
+        self
+    }
+
+    /// Set WARP's imputation rank `t'`; most callers should leave it unset.
+    ///
+    /// Indexed multivector search uses WARP (<https://arxiv.org/abs/2501.17788>)
+    /// when every index segment is IVF with a FLAT sub-index (IVF_FLAT, IVF_PQ,
+    /// IVF_SQ or IVF_RQ, but not the legacy IVF_PQ format), and XTR otherwise,
+    /// which ignores this setting.
+    ///
+    /// When none of a document's tokens is in the partitions a query token
+    /// probed, WARP cannot compute that token's similarity to the document,
+    /// so it imputes the similarity of roughly the `t'`-th most similar token
+    /// in the whole index, estimated from the centroids and partition sizes.
+    /// A `t'` of 0 imputes 0. The default follows the WARP reference
+    /// implementation; see
+    /// [`lance_index::vector::warp::default_imputation_rank`]. It is not a
+    /// latency knob: it reads no extra data. Larger values impute lower
+    /// similarities, so documents that only some query tokens observe rank
+    /// lower. Prefer more partitions to raise recall.
+    ///
+    /// WARP probes a fixed number of partitions per query token and segment,
+    /// [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`] by default. As for
+    /// IVF search, [`Self::nprobes`], [`Self::minimum_nprobes`],
+    /// [`Self::maximum_nprobes`] and [`Self::search_effort`] change it, except
+    /// that a maximum set alone is the count WARP probes, since it never
+    /// expands its search.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// // Two query tokens of dimension 128, flattened.
+    /// let query = Float32Array::from(vec![0.0_f32; 256]);
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .nearest("multivector", &query, 10)?
+    ///     .nprobes(32)
+    ///     .warp_imputation_rank(1000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn warp_imputation_rank(&mut self, imputation_rank: usize) -> &mut Self {
+        self.warp_imputation_rank = Some(imputation_rank);
         self
     }
 
@@ -1196,9 +1378,10 @@ impl Scanner {
 
     /// Configure the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This setting is currently used by RQ-quantized indexes (such as
-    /// IVF_RQ) and by prefiltered search on HNSW indexes, where `Fast`
-    /// enables the ACORN traversal. Other index types ignore this setting.
+    /// This setting currently affects RQ-quantized vector indexes (such as
+    /// IVF_RQ) and HNSW sub-index searches that exclude rows (for example
+    /// through a prefilter or deletions), where `Fast` enables the ACORN
+    /// traversal. Other index types ignore this setting.
     pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.approx_mode = approx_mode;

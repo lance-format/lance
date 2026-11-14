@@ -80,6 +80,16 @@ impl AllocationTracker for MemoryTracker {
 
 static INIT: Once = Once::new();
 
+/// Serializes allocation group registration.
+///
+/// `tracking-allocator` 0.4.0's `AllocationGroupToken::register` can spuriously return `None`
+/// when concurrent registrations interleave: it compares the id from its `fetch_add` against a
+/// highest-id counter that another registration may already have advanced
+/// (<https://github.com/tobz/tracking-allocator/issues/12>). Registration is only two atomic
+/// operations, so serialize just this call instead of the surrounding tracker setup. Remove this
+/// lock once the dependency is fixed.
+static REGISTER_LOCK: Mutex<()> = Mutex::new(());
+
 // The alloc tracker holds a span and an associated allocation group id.
 pub struct AllocTracker {
     group_id: AllocationGroupId,
@@ -94,7 +104,15 @@ impl AllocTracker {
     pub fn new() -> Self {
         Self::init();
 
-        let token = AllocationGroupToken::register().expect("failed to register token");
+        let token = {
+            // The lock only orders registrations and holds no state, so recover from poisoning
+            // rather than failing every later tracker with a poison panic.
+            let _guard = REGISTER_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            AllocationGroupToken::register()
+        }
+        .expect("failed to register token");
         let group_id = token.id();
 
         let span = tracing::span!(tracing::Level::INFO, "AllocTracker");

@@ -57,19 +57,34 @@ pub(super) fn restore_chunk32(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`.
+    assert!(
+        out.len() >= offsets.len() * 4,
+        "ALP restore of {} f32 values needs {} output bytes, got {}",
+        offsets.len(),
+        offsets.len() * 4,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F) {
+            // SAFETY: the host supports AVX-512F, and the assert above keeps the kernel's
+            // vector stores into `out` in bounds.
             return unsafe { restore_chunk32_avx512(offsets, base, div, e, f, out) };
         }
         if host.contains(CpuFeatures::AVX2) {
+            // SAFETY: the host supports AVX2, and the assert above keeps the kernel's vector
+            // stores into `out` in bounds.
             return unsafe { restore_chunk32_avx2(offsets, base, div, e, f, out) };
         }
         restore_chunk32_scalar(offsets, base, div, e, f, out)
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_chunk32_neon(offsets, base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -87,17 +102,36 @@ pub(super) fn restore_chunk64(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`.
+    assert!(
+        out.len() >= offsets.len() * 8,
+        "ALP restore of {} f64 values needs {} output bytes, got {}",
+        offsets.len(),
+        offsets.len() * 8,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
-        // `i64 -> f64` conversion needs AVX-512DQ as well as AVX-512F.
+        // Hardware `vcvtqq2pd` requires AVX-512DQ + AVX-512F; AVX2 uses a 4-lane
+        // exact magic-double conversion with a 4-lane scalar cast fallback for `|enc| >= 2^51`.
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
+            // SAFETY: the host supports AVX-512F and AVX-512DQ, and the assert above keeps
+            // the kernel's vector stores into `out` in bounds.
             return unsafe { restore_chunk64_avx512(offsets, base, div, e, f, out) };
+        }
+        if host.contains(CpuFeatures::AVX2) {
+            // SAFETY: the host supports AVX2, and the assert above keeps the kernel's vector
+            // stores into `out` in bounds.
+            return unsafe { restore_chunk64_avx2(offsets, base, div, e, f, out) };
         }
         restore_chunk64_scalar(offsets, base, div, e, f, out)
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_chunk64_neon(offsets, base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -168,15 +202,28 @@ pub(super) fn restore_delta_chunk32(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`; the safe scalar tail writes the last one.
+    assert!(
+        out.len() >= (offsets.len() + 1) * 4,
+        "ALP delta restore of {} f32 values needs {} output bytes, got {}",
+        offsets.len() + 1,
+        (offsets.len() + 1) * 4,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F) {
+            // SAFETY: the host supports AVX-512F, and the assert above keeps the kernel's
+            // vector stores into `out` in bounds.
             return unsafe {
                 restore_delta_chunk32_avx512(offsets, base, delta_base, div, e, f, out)
             };
         }
         if host.contains(CpuFeatures::AVX2) {
+            // SAFETY: the host supports AVX2, and the assert above keeps the kernel's vector
+            // stores into `out` in bounds.
             return unsafe {
                 restore_delta_chunk32_avx2(offsets, base, delta_base, div, e, f, out)
             };
@@ -185,6 +232,8 @@ pub(super) fn restore_delta_chunk32(
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_delta_chunk32_neon(offsets, base, delta_base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -203,19 +252,40 @@ pub(super) fn restore_delta_chunk64(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`; the safe scalar tail writes the last one.
+    assert!(
+        out.len() >= (offsets.len() + 1) * 8,
+        "ALP delta restore of {} f64 values needs {} output bytes, got {}",
+        offsets.len() + 1,
+        (offsets.len() + 1) * 8,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
-        // `i64 -> f64` conversion needs AVX-512DQ as well as AVX-512F.
+        // Hardware `vcvtqq2pd` requires AVX-512DQ + AVX-512F; AVX2 uses a 4-lane
+        // inclusive scan plus exact magic-double conversion.
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
+            // SAFETY: the host supports AVX-512F and AVX-512DQ, and the assert above keeps
+            // the kernel's vector stores into `out` in bounds.
             return unsafe {
                 restore_delta_chunk64_avx512(offsets, base, delta_base, div, e, f, out)
+            };
+        }
+        if host.contains(CpuFeatures::AVX2) {
+            // SAFETY: the host supports AVX2, and the assert above keeps the kernel's vector
+            // stores into `out` in bounds.
+            return unsafe {
+                restore_delta_chunk64_avx2(offsets, base, delta_base, div, e, f, out)
             };
         }
         restore_delta_chunk64_scalar(offsets, base, delta_base, div, e, f, out)
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_delta_chunk64_neon(offsets, base, delta_base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -855,6 +925,163 @@ unsafe fn restore_chunk64_avx512(
     restore_chunk64_scalar(&offsets[i..], base, div, e, f, &mut out[i * 8..]);
 }
 
+/// Convert 4 signed `i64` lanes to `f64` under AVX2 with exact IEEE-754 rounding.
+///
+/// For `-(1 << 51) <= enc < (1 << 51)` (tested across all 4 lanes in one `vptest`),
+/// `u = enc + 2^51` fits in `[0, 2^52)`, so `f64::from_bits(u | 0x4330_0000_0000_0000)`
+/// equals `(2^52 + 2^51) + enc` with zero rounding, and subtracting `2^52 + 2^51`
+/// yields `enc as f64` bit-for-bit (including `+0.0` for `0`). Lanes outside `[-2^51, 2^51)`
+/// fall back to scalar `as f64` casts before rejoining the 4-wide FP multiply/divide.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn cvtepi64_pd_avx2(enc: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256d {
+    use std::arch::x86_64::*;
+
+    let bias_int = _mm256_set1_epi64x(1i64 << 51);
+    let high12_mask = _mm256_set1_epi64x(-0x0010_0000_0000_0000_i64);
+    let u = _mm256_add_epi64(enc, bias_int);
+    if _mm256_testz_si256(u, high12_mask) != 0 {
+        let exp_bits = _mm256_set1_epi64x(0x4330_0000_0000_0000_u64 as i64);
+        let magic_bias = _mm256_set1_pd(f64::from_bits(0x4338_0000_0000_0000));
+        _mm256_sub_pd(
+            _mm256_castsi256_pd(_mm256_or_si256(u, exp_bits)),
+            magic_bias,
+        )
+    } else {
+        let mut lanes = [0i64; 4];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, enc);
+        _mm256_set_pd(
+            lanes[3] as f64,
+            lanes[2] as f64,
+            lanes[1] as f64,
+            lanes[0] as f64,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn restore_chunk64_avx2(
+    offsets: &[u64],
+    base: i64,
+    div: bool,
+    e: usize,
+    f: usize,
+    out: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+
+    let n = offsets.len();
+    let base_v = _mm256_set1_epi64x(base);
+    let mut i = 0;
+    if div {
+        let factor = _mm256_set1_pd(F10_F64[e]);
+        while i + 4 <= n {
+            let enc = _mm256_add_epi64(
+                _mm256_loadu_si256(offsets.as_ptr().add(i) as *const __m256i),
+                base_v,
+            );
+            let v = cvtepi64_pd_avx2(enc);
+            _mm256_storeu_si256(
+                out.as_mut_ptr().add(i * 8) as *mut __m256i,
+                _mm256_castpd_si256(_mm256_div_pd(v, factor)),
+            );
+            i += 4;
+        }
+    } else {
+        let factor = _mm256_set1_pd(F10_F64[f]);
+        let inv = _mm256_set1_pd(IF10_F64[e]);
+        while i + 4 <= n {
+            let enc = _mm256_add_epi64(
+                _mm256_loadu_si256(offsets.as_ptr().add(i) as *const __m256i),
+                base_v,
+            );
+            let v = cvtepi64_pd_avx2(enc);
+            _mm256_storeu_si256(
+                out.as_mut_ptr().add(i * 8) as *mut __m256i,
+                _mm256_castpd_si256(_mm256_mul_pd(_mm256_mul_pd(v, factor), inv)),
+            );
+            i += 4;
+        }
+    }
+    restore_chunk64_scalar(&offsets[i..], base, div, e, f, &mut out[i * 8..]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn restore_delta_chunk64_avx2(
+    offsets: &[u64],
+    base: i64,
+    delta_base: i64,
+    div: bool,
+    e: usize,
+    f: usize,
+    out: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+
+    let n = offsets.len();
+    let x_adj = _mm256_set1_epi64x(delta_base);
+    let zero = _mm256_setzero_si256();
+    let mut carry = base;
+    let mut i = 0;
+    if div {
+        let factor = _mm256_set1_pd(F10_F64[e]);
+        while i + 4 <= n {
+            let x = _mm256_add_epi64(
+                _mm256_loadu_si256(offsets.as_ptr().add(i) as *const __m256i),
+                x_adj,
+            );
+            let mut s = x;
+            let shifted1 = _mm256_permute4x64_epi64(s, 0b10_01_00_00);
+            s = _mm256_add_epi64(s, _mm256_blend_epi32(shifted1, zero, 0x03));
+            let shifted2 = _mm256_permute4x64_epi64(s, 0b01_00_00_00);
+            s = _mm256_add_epi64(s, _mm256_blend_epi32(shifted2, zero, 0x0F));
+            // `s - x` is the exclusive prefix; lane 3 holds the block total.
+            let enc = _mm256_add_epi64(_mm256_sub_epi64(s, x), _mm256_set1_epi64x(carry));
+            let v = cvtepi64_pd_avx2(enc);
+            _mm256_storeu_si256(
+                out.as_mut_ptr().add(i * 8) as *mut __m256i,
+                _mm256_castpd_si256(_mm256_div_pd(v, factor)),
+            );
+            carry = carry.wrapping_add(_mm256_extract_epi64(s, 3));
+            i += 4;
+        }
+    } else {
+        let factor = _mm256_set1_pd(F10_F64[f]);
+        let inv = _mm256_set1_pd(IF10_F64[e]);
+        while i + 4 <= n {
+            let x = _mm256_add_epi64(
+                _mm256_loadu_si256(offsets.as_ptr().add(i) as *const __m256i),
+                x_adj,
+            );
+            let mut s = x;
+            let shifted1 = _mm256_permute4x64_epi64(s, 0b10_01_00_00);
+            s = _mm256_add_epi64(s, _mm256_blend_epi32(shifted1, zero, 0x03));
+            let shifted2 = _mm256_permute4x64_epi64(s, 0b01_00_00_00);
+            s = _mm256_add_epi64(s, _mm256_blend_epi32(shifted2, zero, 0x0F));
+            let enc = _mm256_add_epi64(_mm256_sub_epi64(s, x), _mm256_set1_epi64x(carry));
+            let v = cvtepi64_pd_avx2(enc);
+            _mm256_storeu_si256(
+                out.as_mut_ptr().add(i * 8) as *mut __m256i,
+                _mm256_castpd_si256(_mm256_mul_pd(_mm256_mul_pd(v, factor), inv)),
+            );
+            carry = carry.wrapping_add(_mm256_extract_epi64(s, 3));
+            i += 4;
+        }
+    }
+    restore_delta_chunk64_scalar(
+        &offsets[i..],
+        carry,
+        delta_base,
+        div,
+        e,
+        f,
+        &mut out[i * 8..],
+    );
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn restore_chunk64_neon(
@@ -1294,6 +1521,8 @@ mod tests {
                         f,
                         &mut expected,
                     );
+                    // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                    // they have just detected, and `got` has room for every value it writes.
                     unsafe { kernel(&offsets, base, delta_base, div, e, f, &mut got) };
                     assert_eq!(
                         got, expected,
@@ -1336,6 +1565,8 @@ mod tests {
                         f,
                         &mut expected,
                     );
+                    // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                    // they have just detected, and `got` has room for every value it writes.
                     unsafe { kernel(&offsets, base, delta_base, div, e, f, &mut got) };
                     assert_eq!(
                         got, expected,
@@ -1362,6 +1593,8 @@ mod tests {
                 let mut expected = vec![0u8; n * 4];
                 let mut got = vec![0u8; n * 4];
                 restore_chunk32_scalar(&offsets, base, div, e, f, &mut expected);
+                // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                // they have just detected, and `got` has room for every value it writes.
                 unsafe { kernel(&offsets, base, div, e, f, &mut got) };
                 assert_eq!(
                     got, expected,
@@ -1387,6 +1620,8 @@ mod tests {
                 let mut expected = vec![0u8; n * 8];
                 let mut got = vec![0u8; n * 8];
                 restore_chunk64_scalar(&offsets, base, div, e, f, &mut expected);
+                // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                // they have just detected, and `got` has room for every value it writes.
                 unsafe { kernel(&offsets, base, div, e, f, &mut got) };
                 assert_eq!(
                     got, expected,
@@ -1413,7 +1648,55 @@ mod tests {
             return;
         }
         assert_restore32_equivalent(restore_chunk32_avx2);
-        assert_delta32_equivalent(restore_delta_chunk32_avx2);
+        assert_delta32_equivalent(restore_delta32_avx2_shim);
+        assert_restore64_equivalent(restore_chunk64_avx2);
+        assert_delta64_equivalent(restore_delta_chunk64_avx2);
+
+        // Exercise the exact `±2^51` magic-double fast-path boundary, `0` (`+0.0`),
+        // `±2^53` IEEE-754 rounding boundary, and `i64::MIN`/`i64::MAX` in mixed 4-lane groups.
+        let boundary_encs: [i64; 18] = [
+            0,
+            -1,
+            1,
+            -(1i64 << 51) - 2,
+            -(1i64 << 51) - 1,
+            -(1i64 << 51),
+            -(1i64 << 51) + 1,
+            (1i64 << 51) - 2,
+            (1i64 << 51) - 1,
+            1i64 << 51,
+            (1i64 << 51) + 1,
+            -(1i64 << 53) - 1,
+            -(1i64 << 53),
+            (1i64 << 53),
+            (1i64 << 53) + 1,
+            i64::MIN,
+            i64::MAX,
+            42,
+        ];
+        let offsets: Vec<u64> = boundary_encs.iter().map(|&v| v as u64).collect();
+        for &(div, e, f) in &[(true, 2, 0), (false, 5, 2)] {
+            let mut expected = vec![0u8; offsets.len() * 8];
+            let mut got = vec![0u8; offsets.len() * 8];
+            restore_chunk64_scalar(&offsets, 0, div, e, f, &mut expected);
+            // SAFETY: AVX2 availability was checked at the start of this test.
+            unsafe { restore_chunk64_avx2(&offsets, 0, div, e, f, &mut got) };
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn restore_delta32_avx2_shim(
+        offsets: &[u32],
+        base: i64,
+        delta_base: i64,
+        div: bool,
+        e: usize,
+        f: usize,
+        out: &mut [u8],
+    ) {
+        // SAFETY: Caller guarantees AVX2 is available on the running CPU.
+        unsafe { restore_delta_chunk32_avx2(offsets, base, delta_base, div, e, f, out) }
     }
 
     #[cfg(target_arch = "x86_64")]

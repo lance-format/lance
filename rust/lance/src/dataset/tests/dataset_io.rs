@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
@@ -18,7 +20,7 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    DatasetRuntimeConfig, ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
     parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
     write_manifest_file,
 };
@@ -42,11 +44,13 @@ use arrow_array::{
     types::{Float32Type, Int32Type},
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
-use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::{
     reader::FileReaderOptions,
     version::{ConcreteFileVersion, LanceFileVersion},
@@ -55,20 +59,28 @@ use lance_file::{
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
+use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
+use crate::index::vector::VectorIndexParams;
 use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptionsAccessor,
+    StorageOptionsProvider, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
-use lance_table::io::commit::write_manifest_file_to_path;
+use lance_linalg::distance::MetricType;
+use lance_table::io::commit::{ConditionalPutCommitHandler, write_manifest_file_to_path};
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
+use object_store::{
+    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+};
 use rand::{SeedableRng, rngs::StdRng};
 use rstest::rstest;
 
@@ -612,6 +624,152 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
     );
 }
 
+/// A replacement file must store each column's values as the dataset field's
+/// type: reads decode it as the dataset type, so `x: double` under `x: int64`
+/// returns the doubles' bit patterns. Nullability, list offset width and the
+/// name of a timestamp's time zone may differ.
+#[rstest::rstest]
+#[case::same_width(DataType::Int64, DataType::Float64, false)]
+#[case::narrower(DataType::Int64, DataType::Int32, false)]
+#[case::wider_string(DataType::Utf8, DataType::LargeUtf8, false)]
+#[case::other_timestamp_unit(
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    false
+)]
+#[case::list_item(
+    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    DataType::List(Arc::new(ArrowField::new("item", DataType::Float64, true))),
+    false
+)]
+#[case::timestamp_gains_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    false
+)]
+#[case::same_type(DataType::Int64, DataType::Int64, true)]
+#[case::list_offset_width(
+    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    DataType::List(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    true
+)]
+#[case::timestamp_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+    true
+)]
+#[tokio::test]
+async fn test_create_data_file_checks_column_types(
+    #[case] dataset_type: DataType,
+    #[case] file_type: DataType,
+    #[case] accepted: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("x", dataset_type.clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef,
+            column_of(&dataset_type, &[10, 11, 12]),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // A non-nullable column under the dataset's nullable `x` is still allowed.
+    let file_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x", file_type, false,
+    )]));
+    let values = column_of(file_schema.field(0).data_type(), &[20, 21, 22]);
+    let file_batch = RecordBatch::try_new(file_schema.clone(), vec![values]).unwrap();
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join("x.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        crate::datatypes::Schema::try_from(file_schema.as_ref()).unwrap(),
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&file_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let result = dataset.create_data_file("x.lance", None).await;
+    if accepted {
+        // The accepted file reads back as its own values, in the dataset type.
+        let data_file = result.unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![crate::dataset::transaction::DataReplacementGroup(
+                    0, data_file,
+                )],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["x"].as_ref(),
+            column_of(&dataset_type, &[20, 21, 22]).as_ref()
+        );
+    } else {
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("Schema mismatch: field 'x"),
+            "{err}"
+        );
+    }
+
+    fn column_of(data_type: &DataType, values: &[i64]) -> ArrayRef {
+        let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+        match data_type {
+            DataType::List(item) | DataType::LargeList(item) => {
+                let items = arrow::compute::cast(&values, item.data_type()).unwrap();
+                let offsets = arrow_buffer::OffsetBuffer::from_lengths(vec![1; values.len()]);
+                if matches!(data_type, DataType::List(_)) {
+                    Arc::new(arrow_array::ListArray::new(
+                        item.clone(),
+                        offsets,
+                        items,
+                        None,
+                    ))
+                } else {
+                    let offsets =
+                        arrow_buffer::OffsetBuffer::<i64>::from_lengths(vec![1; values.len()]);
+                    Arc::new(arrow_array::LargeListArray::new(
+                        item.clone(),
+                        offsets,
+                        items,
+                        None,
+                    ))
+                }
+            }
+            _ => arrow::compute::cast(&values, data_type).unwrap(),
+        }
+    }
+}
+
 async fn write_multi_fragment_source(uri: &str) -> Dataset {
     let batch = gen_batch()
         .col("id", array::step::<Int32Type>())
@@ -745,6 +903,193 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let _ = tracker.incremental_stats();
     cloned.index_statistics("id_idx").await.unwrap();
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+/// Counts and delays reads of deletion files. The delay keeps concurrent
+/// cold-cache loads of the same file open long enough that they overlap.
+/// `ThrottledStore` cannot be used instead: it does not support the local file
+/// store's `GetResultPayload::File`.
+#[derive(Debug, Default)]
+struct DelayedDeletionReads {
+    reads: Arc<AtomicUsize>,
+}
+
+impl DelayedDeletionReads {
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl WrappingObjectStore for DelayedDeletionReads {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(DelayedDeletionReadStore {
+            target: original,
+            reads: self.reads.clone(),
+        })
+    }
+
+    // Deletion-file loads never list, so the pushed-down listing path can stay.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct DelayedDeletionReadStore {
+    target: Arc<dyn object_store::ObjectStore>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl DelayedDeletionReadStore {
+    async fn count_and_delay(&self, location: &Path) {
+        if location.as_ref().contains(DELETIONS_DIR) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl std::fmt::Display for DelayedDeletionReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DelayedDeletionReadStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DelayedDeletionReadStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.count_and_delay(location).await;
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.count_and_delay(location).await;
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+/// A prefiltered vector search builds the deletion mask and runs the filter
+/// scan concurrently, and both load the deletion vector of every fragment. On a
+/// cold metadata cache the two loads of the same file must share one read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cold_prefiltered_vector_search_reads_each_deletion_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = file_object_store_uri(dir.path());
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+        .into_reader_rows(RowCount::from(800), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset.delete("id % 10 = 0").await.unwrap();
+    let deletion_files = dataset
+        .get_fragments()
+        .iter()
+        .filter(|fragment| fragment.metadata.deletion_file.is_some())
+        .count();
+    assert_eq!(deletion_files, 8);
+
+    // Re-open with a fresh session (cold metadata cache) on a store that counts
+    // and delays deletion-file reads.
+    let deletion_reads = Arc::new(DelayedDeletionReads::default());
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(deletion_reads.clone()),
+            ..Default::default()
+        })
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(deletion_reads.reads(), 0);
+
+    let query = arrow_array::Float32Array::from(vec![0.5f32; 16]);
+    let results = dataset
+        .scan()
+        .nearest("vec", &query, 10)
+        .unwrap()
+        .filter("id > 5")
+        .unwrap()
+        .prefilter(true)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 10);
+    assert_eq!(deletion_reads.reads(), deletion_files);
 }
 
 #[tokio::test]
@@ -905,8 +1250,11 @@ async fn test_base_files_share_one_scheduler_per_scan() {
     );
 }
 
+#[rstest]
+#[case::dataset_defaults(false)]
+#[case::source_bindings(true)]
 #[tokio::test]
-async fn test_base_object_store_cache_invalidation() {
+async fn test_base_object_store_cache_invalidation(#[case] has_source_bindings: bool) {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
     let extra_dir = tempfile::tempdir().unwrap();
@@ -914,7 +1262,17 @@ async fn test_base_object_store_cache_invalidation() {
     let clone_uri = file_object_store_uri(clone_dir.path());
 
     let mut source = write_multi_fragment_source(&source_uri).await;
-    let mut cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    // Reopening without runtime source bindings exercises dataset-level fallback params.
+    let mut cloned = if has_source_bindings {
+        cloned
+    } else {
+        DatasetBuilder::from_uri(&clone_uri)
+            .with_session(cloned.session.clone())
+            .load()
+            .await
+            .unwrap()
+    };
     let base_id = first_base_id(&cloned);
     let store = cloned.object_store(Some(base_id)).await.unwrap();
 
@@ -925,10 +1283,25 @@ async fn test_base_object_store_cache_invalidation() {
             ..Default::default()
         }),
     );
+    let attempts_before = registry_attempts(&rebound);
     let rebound_store = rebound.object_store(Some(base_id)).await.unwrap();
-    assert!(
-        !Arc::ptr_eq(&store, &rebound_store),
-        "changed store params must not serve the previously cached base store"
+    assert_eq!(
+        registry_attempts(&rebound) - attempts_before,
+        1,
+        "changed store params must invalidate the dataset's base store cache"
+    );
+    assert_eq!(
+        Arc::ptr_eq(&store, &rebound_store),
+        has_source_bindings,
+        "explicit source bindings must take precedence over changed dataset defaults"
+    );
+    assert_eq!(
+        rebound_store.block_size(),
+        if has_source_bindings {
+            store.block_size()
+        } else {
+            32 * 1024
+        }
     );
 
     cloned.delete("id = 0").await.unwrap();
@@ -2675,6 +3048,525 @@ async fn test_deep_clone_cross_store(
     assert_eq!(cloned_indices.len(), 1);
     assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
     assert!(cloned_indices.iter().all(|idx| idx.base_id.is_none()));
+}
+
+#[rstest]
+#[case::empty_target(false, false)]
+#[case::target_path_exists_only_in_source(true, false)]
+#[case::target_path_exists_only_in_target(false, true)]
+#[tokio::test]
+async fn test_shallow_clone_cross_store(
+    #[case] source_has_target: bool,
+    #[case] target_has_target: bool,
+) {
+    let source_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let source_uri = "memory:///source";
+    let target_uri = "memory:///target";
+    #[allow(deprecated)] // Exercise caller-supplied, independent object stores.
+    let store_params = |store: Arc<dyn object_store::ObjectStore>, uri: &str| ObjectStoreParams {
+        object_store: Some((store, url::Url::parse(uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(store_params(source_store.clone(), source_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.fragments().len(), 2);
+    let expected = source.scan().try_into_batch().await.unwrap();
+
+    for (store, has_target) in [
+        (&source_store, source_has_target),
+        (&target_store, target_has_target),
+    ] {
+        if has_target {
+            Dataset::write(
+                data(),
+                target_uri,
+                Some(WriteParams {
+                    store_params: Some(store_params(store.clone(), target_uri)),
+                    commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let source_before = source_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let target_before = target_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let result = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(store_params(target_store.clone(), target_uri)),
+        )
+        .await;
+
+    assert_eq!(
+        source_store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        source_before,
+        "cloning must not write anything to the source store"
+    );
+    if target_has_target {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::DatasetAlreadyExists { .. }));
+        assert!(error.to_string().contains(target_uri));
+        assert_eq!(
+            target_store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            target_before,
+            "rejecting an existing target must leave it unchanged"
+        );
+        return;
+    }
+
+    let cloned = result.unwrap();
+    assert_eq!(cloned.uri(), target_uri);
+    assert_eq!(cloned.version().version, 1);
+    target_store
+        .head(&cloned.manifest_location.path)
+        .await
+        .unwrap();
+    assert!(cloned.read_transaction().await.unwrap().is_some());
+    assert_eq!(
+        count_files(&cloned.object_store, &cloned.base, "data").await,
+        0
+    );
+    let base_id = first_base_id(&cloned);
+    assert_eq!(cloned.manifest().base_paths[&base_id].path, source_uri);
+    assert_eq!(cloned.scan().try_into_batch().await.unwrap(), expected);
+
+    // Omitting target params must keep supporting the source's custom store.
+    let inherited = source
+        .shallow_clone("memory:///same-store", source.version().version, None)
+        .await
+        .unwrap();
+    assert!(
+        inherited
+            .manifest_location
+            .path
+            .as_ref()
+            .starts_with("same-store/_versions/")
+    );
+    assert_eq!(inherited.scan().try_into_batch().await.unwrap(), expected);
+
+    let mut reopened = DatasetBuilder::from_uri(target_uri)
+        .with_read_params(ReadParams {
+            store_options: Some(store_params(target_store, target_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        })
+        .with_base_store_params(source_uri, store_params(source_store, source_uri))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+
+    let chained_uri = "memory:///chained";
+    let chained = reopened
+        .shallow_clone(
+            chained_uri,
+            reopened.version().version,
+            Some(store_params(
+                Arc::new(object_store::memory::InMemory::new()),
+                chained_uri,
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chained.scan().try_into_batch().await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_reconfigure_preserves_clone_bindings_and_read_options() {
+    let source_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let source_uri = "memory:///reconfigure-source";
+    let target_uri = "memory:///reconfigure-target";
+    #[allow(deprecated)] // Exercise caller-supplied, independent object stores.
+    let store_params = |store: Arc<dyn object_store::ObjectStore>, uri: &str| ObjectStoreParams {
+        object_store: Some((store, url::Url::parse(uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(store_params(source_store.clone(), source_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = source.scan().try_into_batch().await.unwrap();
+    let cloned = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(store_params(target_store, target_uri)),
+        )
+        .await
+        .unwrap();
+    let session = cloned.session();
+
+    let mut configured = cloned
+        .reconfigure(DatasetRuntimeConfig {
+            block_size: Some(1024),
+            base_store_params: HashMap::from([(
+                source_uri.to_string(),
+                store_params(source_store, source_uri),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&session, &configured.session()));
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+
+    configured = configured.with_file_reader_options(Some(FileReaderOptions {
+        decoder_config: lance_encoding::decoder::DecoderConfig {
+            cache_repetition_index: false,
+            validate_on_decode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let options = configured.file_reader_options().unwrap();
+    assert!(!options.decoder_config.cache_repetition_index);
+    assert!(options.decoder_config.validate_on_decode);
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+}
+
+/// Storage option carrying the credential the fixture backend authenticates with.
+const TEST_CREDENTIAL_KEY: &str = "test_credential";
+const EXPIRED_CREDENTIAL: &str = "expired-temporary";
+const REFRESHED_CREDENTIAL: &str = "refreshed-temporary";
+
+#[derive(Debug)]
+struct RotatingStorageOptionsProvider {
+    fetches: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StorageOptionsProvider for RotatingStorageOptionsProvider {
+    async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(HashMap::from([(
+            TEST_CREDENTIAL_KEY.to_string(),
+            REFRESHED_CREDENTIAL.to_string(),
+        )])))
+    }
+
+    fn provider_id(&self) -> String {
+        "shallow-clone-rotating-credentials".to_string()
+    }
+}
+
+/// Serves a shared in-memory backend through stores that reject I/O once the
+/// test marks credentials expired, unless the accessor captured when the store
+/// was built vends the refreshed credential.
+#[derive(Debug)]
+struct CredentialCheckingProvider {
+    backend: Arc<dyn object_store::ObjectStore>,
+    expired: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for CredentialCheckingProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore> {
+        ObjectStore::try_new(
+            Arc::new(CredentialCheckingStore {
+                backend: self.backend.clone(),
+                accessor: params.get_accessor(),
+                expired: self.expired.clone(),
+            }),
+            base_path,
+            params.block_size,
+            None,
+            false,
+            true,
+            64,
+            3,
+            params.storage_options(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CredentialCheckingStore {
+    backend: Arc<dyn object_store::ObjectStore>,
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl CredentialCheckingStore {
+    async fn require_fresh_credentials(&self) -> OSResult<()> {
+        if !self.expired.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let failure = |message: String| OSError::Generic {
+            store: "credential-test",
+            source: Box::new(std::io::Error::other(message)),
+        };
+        let Some(accessor) = self.accessor.as_ref() else {
+            return Err(failure("primary backend has no accessor".to_string()));
+        };
+        let options = accessor
+            .get_storage_options()
+            .await
+            .map_err(|source| OSError::Generic {
+                store: "credential-test",
+                source: Box::new(source),
+            })?;
+        match options.get(TEST_CREDENTIAL_KEY).map(String::as_str) {
+            Some(REFRESHED_CREDENTIAL) => Ok(()),
+            stale => Err(failure(format!(
+                "primary backend still authenticates with {stale:?}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialCheckingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CredentialCheckingStore({})", self.backend)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for CredentialCheckingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.require_fresh_credentials().await?;
+        self.backend.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.require_fresh_credentials().await?;
+        self.backend.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.require_fresh_credentials().await?;
+        self.backend.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.require_fresh_credentials().await?;
+        self.backend.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.backend.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.backend.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.backend.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.require_fresh_credentials().await?;
+        self.backend.copy_opts(from, to, opts).await
+    }
+}
+
+/// The accessor installed by `reconfigure` must reach the primary backend that
+/// was already built, not only the handle's params. The Python `shallow_clone`
+/// path builds the target store from static namespace credentials and only then
+/// installs the refreshable namespace accessor; updating params alone leaves the
+/// opened backend authenticating with the expired credentials.
+#[tokio::test]
+async fn test_reconfigure_installs_accessor_in_opened_primary_store() {
+    let source_backend: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_backend: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let expired = Arc::new(AtomicBool::new(false));
+    let fetches = Arc::new(AtomicUsize::new(0));
+
+    let source_uri = "memory:///accessor-refresh-source";
+    let target_uri = "credential-test:///accessor-refresh-target";
+    #[allow(deprecated)]
+    let source_params = ObjectStoreParams {
+        object_store: Some((source_backend, url::Url::parse(source_uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(source_params),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = source.scan().try_into_batch().await.unwrap();
+
+    source.session.store_registry().insert(
+        "credential-test",
+        Arc::new(CredentialCheckingProvider {
+            backend: target_backend,
+            expired: expired.clone(),
+        }),
+    );
+
+    // The public binding forwards the namespace's initial temporary credentials
+    // as a static accessor, so the clone's store is built from them.
+    let initial_options = HashMap::from([
+        (
+            TEST_CREDENTIAL_KEY.to_string(),
+            EXPIRED_CREDENTIAL.to_string(),
+        ),
+        ("expires_at_millis".to_string(), "0".to_string()),
+    ]);
+    let cloned = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(initial_options.clone()),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Credentials expire while the handle still holds the backend built above.
+    expired.store(true, Ordering::SeqCst);
+
+    let mut configured = cloned
+        .reconfigure(DatasetRuntimeConfig {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    initial_options,
+                    Arc::new(RotatingStorageOptionsProvider {
+                        fetches: fetches.clone(),
+                    }),
+                ),
+            )),
+            // The rebuild must keep the explicit block-size precedence too.
+            block_size: Some(1024),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        configured.storage_options_accessor().unwrap().accessor_id(),
+        "shallow-clone-rotating-credentials"
+    );
+    assert_eq!(configured.object_store.block_size(), 1024);
+
+    // A real metadata read through the primary backend must refresh credentials.
+    let versions = configured.versions().await.unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "primary metadata reads must consult the refreshed accessor exactly once"
+    );
+
+    // The primary backend itself was replaced, not only the handle's params.
+    assert!(
+        !Arc::ptr_eq(&cloned.object_store, &configured.object_store),
+        "reconfigure must replace the primary backend when the accessor changes"
+    );
+
+    // Shared source files keep their own bindings after the primary rebuild.
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+
+    // Commits and refs use the rebuilt backend too.
+    configured.delete("id < 2").await.unwrap();
+    configured
+        .tags()
+        .create("after-reconfigure", configured.version().version)
+        .await
+        .unwrap();
+    assert_eq!(
+        configured
+            .tags()
+            .get("after-reconfigure")
+            .await
+            .unwrap()
+            .version,
+        configured.version().version
+    );
+    assert_eq!(configured.count_rows(None).await.unwrap(), 6);
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)

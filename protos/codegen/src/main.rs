@@ -113,9 +113,19 @@ fn generate_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = temp_root.join("lance-table");
     let proto_dir = repo_root.join("protos");
-    let mut config = config(&out_dir)?;
-    config.extern_path(".lance.file", "::lance_file::format::pb");
-    config.enable_type_names();
+    let new_config = || -> io::Result<prost_build::Config> {
+        let mut config = config(&out_dir)?;
+        config.extern_path(".lance.file", "::lance_file::format::pb");
+        config.enable_type_names();
+        Ok(config)
+    };
+
+    // `lance.table` and `lance.transaction` reference each other. An extern
+    // path resolves each package to the module that includes its generated
+    // code, but it also stops prost from generating that package, hence one
+    // pass per package.
+    let mut config = new_config()?;
+    config.extern_path(".lance.transaction", "crate::format::pb_actions");
     config.bytes([
         ".lance.table.DataFragment.inline_row_ids",
         ".lance.table.DeletionFile.inline",
@@ -123,15 +133,26 @@ fn generate_table(
     config.compile_protos(
         &[
             proto_dir.join("table.proto"),
-            proto_dir.join("transaction.proto"),
+            proto_dir.join("transaction/transaction.proto"),
             proto_dir.join("rowids.proto"),
         ],
         &[&proto_dir],
     )?;
+
+    let mut config = new_config()?;
+    config.extern_path(".lance.table", "crate::format::pb");
+    config.compile_protos(
+        &[
+            proto_dir.join("transaction/common.proto"),
+            proto_dir.join("transaction/actions.proto"),
+        ],
+        &[&proto_dir],
+    )?;
+
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance-table/src/pb"),
-        &["lance.table.rs"],
+        &["lance.table.rs", "lance.transaction.rs"],
         check,
     )
 }
@@ -176,6 +197,10 @@ fn generate_datafusion(
     let proto_dir = repo_root.join("protos");
     let mut config = config(&out_dir)?;
     config.enable_type_names();
+    config.message_attribute(
+        ".lance.datafusion.FilteredReadExecV2Proto",
+        "#[non_exhaustive]",
+    );
     config.compile_protos(
         &[
             proto_dir.join("table_identifier.proto"),
@@ -208,6 +233,7 @@ fn generate_lance(
             proto_dir.join("ann.proto"),
             proto_dir.join("fts.proto"),
             proto_dir.join("cache_diagnostics.proto"),
+            proto_dir.join("merge_analysis.proto"),
         ],
         &[&proto_dir],
     )?;

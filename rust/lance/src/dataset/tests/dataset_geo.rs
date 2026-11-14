@@ -14,7 +14,7 @@ use crate::dataset::{
 };
 
 use crate::index::DatasetIndexExt;
-use crate::utils::test::geo;
+use crate::utils::test::{copy_test_data_to_tmp, geo};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::UInt32Array;
@@ -826,13 +826,17 @@ async fn test_geo_constant_first_merge_insert_delete_if(#[values(false, true)] h
 }
 
 #[rstest::rstest]
-#[case::row_addresses(false, false)]
-#[case::stable_row_ids(true, false)]
-#[case::fragment_reuse(false, true)]
+#[case::row_addresses(false, false, None)]
+#[case::stable_row_ids(true, false, None)]
+#[case::fragment_reuse(false, true, None)]
+#[case::split_row_addresses(false, false, Some(4))]
+#[case::split_stable_row_ids(true, false, Some(4))]
+#[case::split_fragment_reuse(false, true, Some(4))]
 #[tokio::test]
 async fn test_rtree_optimize_drops_rewritten_rows(
     #[case] enable_stable_row_ids: bool,
     #[case] compact: bool,
+    #[case] task_rows: Option<u64>,
 ) {
     let point_type = PointType::new(Dimension::XY, Default::default());
     let schema = Arc::new(Schema::new(vec![
@@ -911,11 +915,16 @@ async fn test_rtree_optimize_drops_rewritten_rows(
         .as_ref()
         .clone();
     dataset
-        .optimize_indices(&OptimizeOptions::merge(1))
+        .optimize_indices(&OptimizeOptions::merge(1).max_rows_per_task(task_rows))
         .await
         .unwrap();
     let indices = dataset.load_indices_by_name("rtree_index").await.unwrap();
-    assert_eq!(indices.len(), 1);
+    // Bounded optimize preserves a source with pending remapping, as it does for
+    // other scalar indices, and builds only the new fragments.
+    assert_eq!(
+        indices.len(),
+        if compact && task_rows.is_some() { 2 } else { 1 }
+    );
 
     for (predicate, expected) in [
         ("point IS NULL", vec![1, 2, 4, 6]),
@@ -951,5 +960,402 @@ async fn test_rtree_optimize_drops_rewritten_rows(
         scanned_ids.sort_unstable();
         assert_eq!(indexed_ids, expected, "indexed predicate: {predicate}");
         assert_eq!(indexed_ids, scanned_ids, "predicate: {predicate}");
+    }
+}
+
+#[rstest]
+#[case::task_merge(false, 8, None)]
+#[case::task_merge_stable_ids(true, 8, None)]
+#[case::driver_merge(false, 4, None)]
+#[case::driver_merge_stable_ids(true, 4, None)]
+#[case::bounded_segments(false, 4, Some(8))]
+#[tokio::test]
+async fn test_rtree_distributed_optimize(
+    #[case] enable_stable_row_ids: bool,
+    #[case] task_rows: u64,
+    #[case] segment_rows: Option<u64>,
+) {
+    let geometry_type = geo::line_string_type();
+    let mut geometries = LineStringBuilder::new(geometry_type.clone());
+    for id in 0..20 {
+        if (12..16).contains(&id) || id % 4 == 1 {
+            geometries
+                .push_line_string(None::<&geo_types::LineString>)
+                .unwrap();
+        } else if id % 4 == 2 {
+            geometries.push_empty();
+        } else {
+            let x = id as f64;
+            geometries
+                .push_line_string(Some(&line_string![(x: x, y: x), (x: x + 0.5, y: x + 0.5)]))
+                .unwrap();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            geometry_type.to_field("geometry", true),
+        ])),
+        vec![
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..20)),
+            geometries.finish().to_array_ref(),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.slice(0, 12))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let old_paths = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| {
+            fragment
+                .metadata()
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut sources = Vec::new();
+    for fragment in 0..3 {
+        // Page sizes are layout choices, not constraints on combining leaf entries.
+        let params = ScalarIndexParams::new("RTree".to_string())
+            .with_params(&serde_json::json!({"page_size": 2 + fragment}));
+        sources.push(
+            dataset
+                .create_index_builder(&["geometry"], IndexType::RTree, &params)
+                .name("geometry_idx".to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("geometry_idx", "geometry", sources.clone())
+        .await
+        .unwrap();
+    dataset.delete("id < 6").await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.slice(12, 8))], batch.schema()),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let options = OptimizeOptions::merge(3)
+        .max_rows_per_task(Some(task_rows))
+        .max_rows_per_segment(segment_rows);
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), (8 / task_rows) as usize);
+    assert_eq!(
+        plan.merges.len(),
+        if segment_rows.is_some() { 2 } else { 1 }
+    );
+    if task_rows == 8 {
+        assert_eq!(plan.tasks[0].old_segments.len(), 2);
+    } else {
+        assert!(plan.tasks.iter().all(|task| task.old_segments.is_empty()));
+        assert_eq!(
+            plan.merges
+                .iter()
+                .map(|merge| merge.old_segments.len())
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    dataset.object_store.io_stats_incremental();
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.push(task.execute(&dataset).await.unwrap().unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
+    }
+    let io = dataset.object_store.io_stats_incremental();
+    assert!(
+        io.requests
+            .iter()
+            .any(|request| request.path.prefix_matches(&dataset.data_dir()))
+    );
+    assert!(
+        io.requests.iter().all(|request| {
+            !old_paths
+                .iter()
+                .any(|path| request.path.as_ref().ends_with(path))
+        }),
+        "maintenance must reuse old bounding boxes without reading old data files"
+    );
+    crate::index::optimize::commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert!(
+        segments
+            .iter()
+            .all(|segment| !sources.iter().any(|old| old.uuid == segment.uuid))
+    );
+    let mut coverage = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    coverage.sort();
+    assert_eq!(
+        coverage,
+        if segment_rows.is_some() {
+            vec![vec![1, 2], vec![3, 4]]
+        } else {
+            vec![vec![1, 2, 3, 4]]
+        }
+    );
+
+    for (predicate, expected) in [
+        ("geometry IS NULL", vec![9, 12, 13, 14, 15, 17]),
+        (
+            "ST_Intersects(geometry, ST_GeomFromText('POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0))'))",
+            vec![7, 8, 11, 16, 19],
+        ),
+        (
+            "ST_Intersects(geometry, ST_GeomFromText('POINT (7 7)'))",
+            vec![7],
+        ),
+    ] {
+        for use_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.project(&["id"])
+                .unwrap()
+                .filter(predicate)
+                .unwrap()
+                .use_scalar_index(use_index);
+            if use_index {
+                assert_contains!(scan.explain_plan(false).await.unwrap(), "ScalarIndexQuery");
+            }
+            let result = scan.try_into_batch().await.unwrap();
+            let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "predicate: {predicate}, use_index: {use_index}"
+            );
+        }
+    }
+}
+
+/// Little-endian WKB for a 2D point, the layout geoarrow infers for a plain
+/// binary column.
+fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(21);
+    bytes.push(1);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes
+}
+
+/// The fixture's rows, with NULLs where `id % 5 == 3`.
+fn rtree_fixture_append_batch(
+    schema: arrow_schema::SchemaRef,
+    first_id: i32,
+    count: i32,
+) -> RecordBatch {
+    let ids: Vec<i32> = (first_id..first_id + count).collect();
+    let geometries: Vec<Option<Vec<u8>>> = ids
+        .iter()
+        .map(|id| (*id % 5 != 3).then(|| wkb_point(*id as f64, *id as f64)))
+        .collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int32Array::from(ids)),
+            Arc::new(arrow_array::BinaryArray::from_iter(
+                geometries.iter().map(|geometry| geometry.as_deref()),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// Bounded optimize must migrate a released RTree cohort as a whole.
+///
+/// Lance 14.0.2, a stable release from before RTree moved to the row-address
+/// domain, wrote format version 0, whose segments store logical row IDs. A
+/// split plan rebuilds only the segments it absorbs, so with the default
+/// `num_indices_to_merge` the older v0 segment would survive beside the
+/// address-domain result and the commit is rejected for mixing domains.
+/// The single-process migration folds every v0 segment into one rebuild;
+/// bounded optimize has to fall back to it, and must split normally once the
+/// index is migrated.
+#[tokio::test]
+async fn test_rtree_bounded_optimize_migrates_whole_legacy_cohort() {
+    let dir =
+        copy_test_data_to_tmp("v14.0.2/rtree_row_id_domain/rtree_row_id_domain.lance").unwrap();
+    let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+    assert!(dataset.manifest.uses_stable_row_ids());
+    let legacy = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(legacy.len(), 2);
+    assert!(
+        legacy
+            .iter()
+            .all(|segment| segment.index_version == 0 && !segment.results_are_row_addrs()),
+        "the fixture must be a released row-ID-domain cohort: {legacy:?}"
+    );
+
+    let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+    assert_eq!(
+        schema.fields().len(),
+        2,
+        "fixture schema changed: {schema:?}"
+    );
+    let appended = rtree_fixture_append_batch(schema.clone(), 16, 8);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema.clone()),
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    // Default `num_indices_to_merge` selects the trailing segment only; the
+    // single-process plan absorbs the whole legacy cohort into one rebuild.
+    let options = OptimizeOptions::default().max_rows_per_task(Some(4));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tasks.len(),
+        1,
+        "legacy cohort must rebuild in one task"
+    );
+    assert_eq!(plan.tasks[0].old_segments.len(), 2, "all v0 segments join");
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.push(task.execute(&dataset).await.unwrap().unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
+    }
+    crate::index::optimize::commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+    dataset.validate().await.unwrap();
+
+    let committed = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert!(committed[0].results_are_row_addrs());
+    assert_eq!(
+        committed[0].index_version,
+        lance_geo::rtree::RTREE_ROW_ADDR_DOMAIN_VERSION as i32
+    );
+    assert_eq!(committed[0].fragment_bitmap.as_ref().unwrap().len(), 3);
+
+    assert_rtree_scan_rows(&dataset, "geometry IS NULL", vec![3, 8, 13, 18, 23]).await;
+    assert_rtree_scan_rows(
+        &dataset,
+        "ST_Intersects(geometry, ST_GeomFromText('POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0))'))",
+        vec![0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20],
+    )
+    .await;
+    assert_rtree_scan_rows(
+        &dataset,
+        "ST_Intersects(geometry, ST_GeomFromText('POINT (20 20)'))",
+        vec![20],
+    )
+    .await;
+
+    // The migrated index is address-domain, so a later bounded optimize splits
+    // again instead of rebuilding everything in one task.
+    let appended = rtree_fixture_append_batch(schema.clone(), 24, 8);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 5);
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tasks.len(),
+        2,
+        "address-domain cohort splits: {plan:?}"
+    );
+    assert_eq!(plan.merges.len(), 1);
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.push(task.execute(&dataset).await.unwrap().unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
+    }
+    crate::index::optimize::commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+    dataset.validate().await.unwrap();
+    let committed = dataset.load_indices_by_name("geometry_idx").await.unwrap();
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert_eq!(committed[0].fragment_bitmap.as_ref().unwrap().len(), 5);
+    assert_rtree_scan_rows(&dataset, "geometry IS NULL", vec![3, 8, 13, 18, 23, 28]).await;
+    assert_rtree_scan_rows(
+        &dataset,
+        "ST_Intersects(geometry, ST_GeomFromText('POINT (30 30)'))",
+        vec![30],
+    )
+    .await;
+}
+
+/// Run `predicate` with and without the scalar index and compare both to the
+/// fixture rows, asserting the indexed plan really used the index.
+async fn assert_rtree_scan_rows(dataset: &Dataset, predicate: &str, expected: Vec<i32>) {
+    for use_index in [true, false] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .filter(predicate)
+            .unwrap()
+            .use_scalar_index(use_index);
+        if use_index {
+            assert_contains!(scan.explain_plan(false).await.unwrap(), "ScalarIndexQuery");
+        }
+        let result = scan.try_into_batch().await.unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(
+            ids, expected,
+            "predicate: {predicate}, use_index: {use_index}"
+        );
     }
 }

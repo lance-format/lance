@@ -49,6 +49,7 @@ pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
+mod local_staging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(any(
@@ -76,6 +77,7 @@ use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
+use local_staging::{LocalStagingPaths, remove_local_staging_file};
 
 // Local disks tend to do fine with a few threads
 // Note: the number of threads here also impacts the number of files
@@ -176,6 +178,7 @@ pub trait ObjectStoreExt {
 
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    fn directory_to_filesystem(&self, path: &Path) -> Result<PathBuf>;
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
     async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
 }
@@ -187,6 +190,22 @@ pub(crate) fn canonicalize_local_io_result(
         Ok(path) => Ok(Some(path)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Preserve "already gone" across the stream's error type.
+///
+/// An absent staging file is the outcome the caller wanted, but the generic
+/// [`Error`]-to-[`object_store::Error`] conversion erases that, so report it as
+/// [`object_store::Error::NotFound`] with the location the caller asked to delete.
+fn staging_delete_error(location: &Path, error: Error) -> object_store::Error {
+    if error.is_not_found() {
+        object_store::Error::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        }
+    } else {
+        error.into()
     }
 }
 
@@ -216,11 +235,36 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     }
 }
 
+struct ExternalBlobStore {
+    inner: Arc<dyn OSObjectStore>,
+    view: std::sync::Mutex<std::sync::Weak<ObjectStore>>,
+}
+
+impl ExternalBlobStore {
+    fn new(inner: Arc<dyn OSObjectStore>) -> Self {
+        Self {
+            inner,
+            view: Default::default(),
+        }
+    }
+}
+
+impl Clone for ExternalBlobStore {
+    fn clone(&self) -> Self {
+        // A cloned ObjectStore is a separate binding and must derive its own view.
+        Self::new(self.inner.clone())
+    }
+}
+
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // The same physical store with external-blob wrapping rules.
+    external_blob_inner: Option<ExternalBlobStore>,
+    // Keep the registry's weak binding alive while only an external view is held.
+    _external_blob_origin: Option<Arc<Self>>,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
@@ -296,6 +340,41 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 
+    /// Wrap a store used to read mutable, externally owned blob payloads.
+    ///
+    /// The default retains `wrapped`, including authorization and observation.
+    /// `original` is the external view before this wrapper; `wrapped` is after
+    /// applying the regular wrapper to that view. Immutable caches should return
+    /// `original`, or apply a cache with explicit freshness validation.
+    /// Managed payloads continue through [`Self::wrap`].
+    fn wrap_external_blob(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn OSObjectStore>,
+        wrapped: Arc<dyn OSObjectStore>,
+    ) -> Arc<dyn OSObjectStore> {
+        wrapped
+    }
+
+    /// Apply a wrapper to the regular and external views of one physical store.
+    /// Shared inputs are wrapped once. Chains preserve each component's policy.
+    #[doc(hidden)]
+    fn wrap_with_external_blobs(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn OSObjectStore>,
+        external: Arc<dyn OSObjectStore>,
+    ) -> (Arc<dyn OSObjectStore>, Arc<dyn OSObjectStore>) {
+        let wrapped = self.wrap(store_prefix, original.clone());
+        let external_wrapped = if Arc::ptr_eq(&original, &external) {
+            wrapped.clone()
+        } else {
+            self.wrap(store_prefix, external.clone())
+        };
+        let external = self.wrap_external_blob(store_prefix, external, external_wrapped);
+        (wrapped, external)
+    }
+
     /// Wrap the paginated listing API that goes with the store, if it has one.
     ///
     /// [`ObjectStore::read_dir_page`] pushes the page size and the resume position into
@@ -345,6 +424,19 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    fn wrap_with_external_blobs(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn OSObjectStore>,
+        external: Arc<dyn OSObjectStore>,
+    ) -> (Arc<dyn OSObjectStore>, Arc<dyn OSObjectStore>) {
+        self.wrappers
+            .iter()
+            .fold((original, external), |(original, external), wrapper| {
+                wrapper.wrap_with_external_blobs(store_prefix, original, external)
+            })
     }
 
     // One wrapper giving up the pushdown gives it up for the chain: the listing has to go
@@ -739,15 +831,22 @@ impl ObjectStore {
                 &metrics_base(&store_prefix, path),
             );
 
-            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(&store_prefix, inner);
-            }
+            let external_blob_inner = if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                let (wrapped, external) =
+                    wrapper.wrap_with_external_blobs(&store_prefix, inner.clone(), inner);
+                inner = wrapped;
+                Some(ExternalBlobStore::new(external))
+            } else {
+                None
+            };
 
             // Always wrap with IO tracking
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
                 inner: tracked_store,
+                external_blob_inner,
+                _external_blob_origin: None,
                 local_dir_operations: None,
                 local_fsync: false,
                 scheme: path.scheme().to_string(),
@@ -910,6 +1009,16 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// Return this store with a different block-size hint.
+    ///
+    /// The backing object store and I/O tracker are shared. Only the block size
+    /// used to plan reads changes.
+    pub fn with_block_size(&self, block_size: usize) -> Self {
+        let mut cloned = self.clone();
+        cloned.block_size = block_size;
+        cloned
+    }
+
     /// The amount of parallelism to use for I/O operations.
     ///
     /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
@@ -988,11 +1097,56 @@ impl ObjectStore {
     /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
     /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
-        self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        let external = self
+            .external_blob_inner
+            .as_ref()
+            .map(|external| &external.inner)
+            .unwrap_or(&self.inner)
+            .clone();
+        let (inner, external) =
+            wrapper.wrap_with_external_blobs(&self.store_prefix, self.inner.clone(), external);
+        self.inner = inner;
+        self.external_blob_inner = Some(ExternalBlobStore::new(external));
         self.paginated_lister = self
             .paginated_lister
             .take()
             .and_then(|lister| wrapper.wrap_paginated(&self.store_prefix, lister));
+    }
+
+    /// Derive an external-blob read view without reopening the provider.
+    ///
+    /// The physical store, credentials, endpoint, and connection pool are retained.
+    /// Only wrapper behavior changes through [`WrappingObjectStore::wrap_external_blob`].
+    /// Managed blobs must keep using the original store. Repeated calls reuse the
+    /// same view while it is held by a reader or scheduler. The cached reference
+    /// is weak so the view can retain this registry binding without a cycle.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_io::object_store::ObjectStore;
+    /// let store = Arc::new(ObjectStore::memory());
+    /// let external = store.for_external_blobs();
+    /// assert_eq!(external.store_prefix, store.store_prefix);
+    /// ```
+    pub fn for_external_blobs(self: &Arc<Self>) -> Arc<Self> {
+        let Some(external) = self.external_blob_inner.as_ref() else {
+            return self.clone();
+        };
+        let mut view = external
+            .view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(store) = view.upgrade() {
+            return store;
+        }
+        let mut store = self.as_ref().clone();
+        store.inner = self.io_tracker.wrap("", external.inner.clone());
+        store.paginated_lister = None;
+        store.external_blob_inner = None;
+        store._external_blob_origin = Some(self.clone());
+        let store = Arc::new(store);
+        *view = Arc::downgrade(&store);
+        store
     }
 
     /// Open a file for path.
@@ -1276,9 +1430,63 @@ impl ObjectStore {
         }
     }
 
+    /// Delete an object, including a local staging file hidden from normal listings.
+    ///
+    /// See [`Self::read_local_staging_files`] for an example of finding and removing
+    /// old staging files after an interrupted write.
     pub async fn delete(&self, path: &Path) -> Result<()> {
+        if let Some(local_path) = self.local_staging_path(path)? {
+            // LocalFileSystem rejects its reserved staging names, even for deletion.
+            return remove_local_staging_file(path, &local_path, &self.io_tracker).await;
+        }
         self.inner.delete(path).await?;
         Ok(())
+    }
+
+    /// Delete every location in `locations`, using the backend's bulk delete when it
+    /// has one.
+    ///
+    /// The returned stream reports locations the backend removed; order is not
+    /// preserved. A backend may coalesce paths into one request (S3: up to 1000 paths
+    /// per `DeleteObjects`), and some report a failed request as one error that ends
+    /// the stream, so inputs after it and inputs omitted from a partial response are
+    /// never reported. Callers must therefore treat an input without a reported
+    /// outcome as failed, and not as removed. Paths that were already absent are
+    /// reported as not-found errors.
+    ///
+    /// Hidden local staging files (see [`Self::read_local_staging_files`]) are removed
+    /// through the same local filesystem path as [`Self::delete`], because the backend
+    /// rejects their names. Those stores have no bulk request to coalesce into, so
+    /// every location is dispatched individually.
+    pub fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let Some(staging_paths) = LocalStagingPaths::for_store(self) else {
+            return self.inner.delete_stream(locations);
+        };
+        let inner = Arc::clone(&self.inner);
+        let io_tracker = self.io_tracker.clone();
+        locations
+            .map(move |location| {
+                let staging_paths = staging_paths.clone();
+                let inner = Arc::clone(&inner);
+                let io_tracker = io_tracker.clone();
+                async move {
+                    let location = location?;
+                    match staging_paths.resolve(&location)? {
+                        Some(local_path) => {
+                            remove_local_staging_file(&location, &local_path, &io_tracker)
+                                .await
+                                .map_err(|error| staging_delete_error(&location, error))?;
+                        }
+                        None => inner.delete(&location).await?,
+                    }
+                    Ok(location)
+                }
+            })
+            .buffer_unordered(self.io_parallelism())
+            .boxed()
     }
 
     /// AWS S3 and GCS reject a single-shot server-side copy whose source is
@@ -2330,9 +2538,13 @@ impl ObjectStore {
             &metrics_base(&store_prefix, &location),
         );
 
-        let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(&store_prefix, store),
-            None => store,
+        let (store, external_blob_inner) = match wrapper {
+            Some(wrapper) => {
+                let (store, external) =
+                    wrapper.wrap_with_external_blobs(&store_prefix, store.clone(), store);
+                (store, Some(ExternalBlobStore::new(external)))
+            }
+            None => (store, None),
         };
 
         // Always wrap with IO tracking
@@ -2340,6 +2552,8 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
+            external_blob_inner,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             scheme: scheme.into(),
@@ -3344,6 +3558,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_external_view_retains_the_registry_binding() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(IOTracker::default())),
+            ..Default::default()
+        };
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry.clone(), "memory://payload", &params)
+                .await
+                .unwrap();
+        store.put(&path, b"live").await.unwrap();
+        let weak = Arc::downgrade(&store);
+        let external = store.for_external_blobs();
+        assert!(Arc::ptr_eq(&external, &store.for_external_blobs()));
+        assert!(Arc::ptr_eq(&external, &external.for_external_blobs()));
+        let cloned = Arc::new(store.as_ref().clone());
+        assert!(!Arc::ptr_eq(&external, &cloned.for_external_blobs()));
+        drop(cloned);
+        drop(store);
+        let (reopened, _) = ObjectStore::from_uri_and_params(registry, "memory://payload", &params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&reopened, &weak.upgrade().unwrap()));
+        assert_eq!(
+            external
+                .open(&path)
+                .await
+                .unwrap()
+                .get_range(0..4)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"live"
+        );
+        drop(reopened);
+        drop(external);
+        assert!(
+            weak.upgrade().is_none(),
+            "derived views must not form an Arc cycle"
+        );
+    }
+
+    #[tokio::test]
     async fn test_wrapper_identity_is_stable_across_tasks() {
         let wrapper = Arc::new(TestWrapper {
             called: AtomicBool::new(false),
@@ -3374,8 +3631,11 @@ mod tests {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_wrapping_object_store_option_is_used() {
+    async fn test_wrapping_object_store_option_is_used(
+        #[values(false, true)] is_custom_store: bool,
+    ) {
         // Make a store for the inner store first
         let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
         let registry = Arc::new(ObjectStoreRegistry::default());
@@ -3387,8 +3647,15 @@ mod tests {
             return_value: mock_inner_store.clone(),
         });
 
+        #[allow(deprecated)]
         let params = ObjectStoreParams {
             object_store_wrapper: Some(wrapper.clone()),
+            object_store: is_custom_store.then(|| {
+                (
+                    Arc::new(InMemory::new()) as Arc<dyn OSObjectStore>,
+                    Url::parse("memory:///").unwrap(),
+                )
+            }),
             ..ObjectStoreParams::default()
         };
 
@@ -4018,6 +4285,31 @@ mod tests {
             observations.delete_max_in_flight.load(Ordering::SeqCst) > 1,
             "deletions ran one at a time; remove_stream must overlap them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_removes_every_path() {
+        let store = ObjectStore::memory();
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut reported = store
+            .delete_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Bulk deletion does not preserve order.
+        reported.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        for path in &paths {
+            assert!(!store.exists(path).await.unwrap(), "{path} still present");
+        }
     }
 
     #[tokio::test]
