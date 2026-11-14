@@ -3622,6 +3622,20 @@ pub struct DecodedPage {
 }
 
 pub trait DecodePageTask: Send + std::fmt::Debug {
+    /// Decode through an explicit workspace without consuming the task on refusal.
+    /// Inputs, including cached scalars, must already carry their physical charge.
+    /// `None` means insufficient credit or an oversized batch, never EOF. The caller
+    /// must replan the same selection; this method does not split a drained task.
+    /// The default rejects unsupported tasks;
+    /// it does not call the unaccounted decoder. Later typed/rep-def/builder stages
+    /// require their own admission; this opt-in API does not alter normal scans.
+    fn try_decode_in(
+        &self,
+        _workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DecodedPage>> {
+        Err(Error::not_supported("page task has no admitted decoder"))
+    }
+
     /// Decodes the data into an Arrow array
     fn decode(self: Box<Self>) -> Result<DecodedPage>;
 }
