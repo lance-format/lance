@@ -232,6 +232,9 @@ impl InvertedPartition {
             return Ok(None);
         }
         let reader = inverted.reader.get().await?;
+        let offset_cache = reader
+            .metadata_cache()
+            .unwrap_or_else(|| inverted.index_cache.clone());
         let mut prepared = Vec::with_capacity(tokens.len());
         // At most 16 clauses; preparation is sequential so metadata I/O is
         // bounded independently of an object store's potentially large limit.
@@ -253,10 +256,10 @@ impl InvertedPartition {
             else {
                 return Ok(None);
             };
-            // Only immutable offsets use the existing bounded index cache. The
-            // prepared value and its statistics-bound I/O scope stay local.
-            let offsets = inverted
-                .index_cache
+            // Keep small immutable offsets in the existing file metadata budget,
+            // independent of position payload churn. Readers without that tier
+            // retain the index-cache fallback. I/O scopes stay request-local.
+            let offsets = offset_cache
                 .get_or_insert_with_key(PositionOffsetsKey(token_id), || async {
                     let batch = reader
                         .read_range(
