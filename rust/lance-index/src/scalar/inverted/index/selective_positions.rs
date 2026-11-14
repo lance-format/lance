@@ -216,163 +216,180 @@ fn eligible(request: &ModernSearchRequest<'_>) -> bool {
 }
 
 impl InvertedIndex {
-    pub(super) async fn try_selective_phrase_search(
-        &self,
-        request: &ModernSearchRequest<'_>,
-    ) -> Result<Option<Vec<Reverse<ScoredPartitionDoc>>>> {
-        if !eligible(request) {
-            return Ok(None);
-        }
-        // Decide all encoding support before loading/consuming postings or
-        // publishing a competitive floor. A None cleanly selects ordinary search.
-        let preparations = self
-            .partitions
-            .iter()
-            .enumerate()
-            .filter(|(_, part)| part.may_match_tokens(&request.tokens, request.operator, true))
-            .map(|(ordinal, part)| async move {
-                if part.docs.modern().is_none() {
-                    return Ok(None);
+    pub(super) fn try_selective_phrase_search<'a>(
+        &'a self,
+        request: ModernSearchRequest<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Vec<Reverse<ScoredPartitionDoc>>>>> {
+        async move {
+            if !eligible(&request) {
+                return Ok(None);
+            }
+            // Decide all encoding support before loading/consuming postings or
+            // publishing a competitive floor. A None cleanly selects ordinary search.
+            let mut preparations = Vec::new();
+            for (ordinal, part) in self.partitions.iter().enumerate() {
+                if !part.may_match_tokens(&request.tokens, request.operator, true) {
+                    continue;
                 }
-                let ids = request.term_ids.map(|ids| ids.partition(ordinal));
-                Ok::<_, Error>(
-                    part.prepare_selective_positions(&request.tokens, ids)
-                        .await?
-                        .map(|positions| (ordinal, part.clone(), positions)),
-                )
-            });
-        let prepared = stream::iter(preparations)
-            .buffered(4)
-            .try_collect::<Vec<_>>()
-            .await?;
-        let Some(prepared) = prepared.into_iter().collect::<Option<Vec<_>>>() else {
-            return Ok(None);
-        };
-        let shared = Arc::new(AtomicU32::new(
-            request
-                .initial_score_floor
-                .unwrap_or(f32::NEG_INFINITY)
-                .to_bits(),
-        ));
-        let searches = prepared.into_iter().map(|(ordinal, part, positions)| {
-            let shared = shared.clone();
-            async move {
-                let documents = part
-                    .docs
-                    .modern()
-                    .ok_or_else(|| Error::internal("selective phrase partition became legacy"))?;
-                let visibility = documents.visibility(request.mask.clone(), false).await?;
-                if !visibility.may_match().await? {
-                    return Result::Ok((ordinal, Vec::new()));
-                }
-                let lengths = documents.lengths().await?;
-                let ids = request.term_ids.map(|ids| ids.partition(ordinal));
-                let Some(fetched) = part
-                    .fetch_posting_lists(
-                        &request.tokens,
-                        &request.params,
-                        request.operator,
-                        request.metrics.as_ref(),
-                        PostingLoadOptions::deferred_positions(),
-                        ids,
-                    )
-                    .await?
-                else {
-                    return Result::Ok((ordinal, Vec::new()));
-                };
+                let part = part.clone();
                 let tokens = request.tokens.clone();
-                let scorer = request.impact_scorer.clone();
-                let limit = request
-                    .params
-                    .limit
-                    .ok_or_else(|| Error::internal("selective phrase lost its finite limit"))?;
-                let (mut search, idf) = spawn_cpu(move || {
-                    let loaded = fetched.into_loaded(&tokens, scorer.as_ref())?;
-                    let idf = idf_by_position(&loaded.postings, scorer.as_ref());
-                    Ok::<_, Error>((PhraseSearch::new(loaded.postings, limit)?, idf))
-                })
+                let ids = request.term_ids.map(|ids| ids.partition(ordinal));
+                preparations.push(
+                    async move {
+                        if part.docs.modern().is_none() {
+                            return Ok(None);
+                        }
+                        Ok::<_, Error>(
+                            part.prepare_selective_positions(&tokens, ids)
+                                .await?
+                                .map(|positions| (ordinal, part.clone(), positions)),
+                        )
+                    }
+                    .boxed(),
+                );
+            }
+            let prepared = stream::iter(preparations)
+                .buffered(4)
+                .try_collect::<Vec<_>>()
                 .await?;
-                loop {
-                    let lengths = lengths.clone();
-                    let visibility = visibility.clone();
-                    let scorer = request.impact_scorer.clone();
+            let Some(prepared) = prepared.into_iter().collect::<Option<Vec<_>>>() else {
+                return Ok(None);
+            };
+            let shared = Arc::new(AtomicU32::new(
+                request
+                    .initial_score_floor
+                    .unwrap_or(f32::NEG_INFINITY)
+                    .to_bits(),
+            ));
+            let searches = prepared
+                .into_iter()
+                .map(|(ordinal, part, positions)| {
                     let shared = shared.clone();
-                    let metrics = request.metrics.clone();
-                    let (next, progress) = spawn_cpu(move || {
-                        let docs = ModernWandDocuments::filtered(&lengths, &visibility);
-                        let progress = search.advance(&docs, scorer, shared, metrics.as_ref())?;
-                        Ok::<_, Error>((search, progress))
-                    })
-                    .await?;
-                    search = next;
-                    match progress {
-                        PhraseProgress::Done(candidates) => {
+                    // Own the request across suspension; erase the future here
+                    // rather than borrowing through the outer stream closure.
+                    let request = request.clone();
+                    async move {
+                        let documents = part.docs.modern().ok_or_else(|| {
+                            Error::internal("selective phrase partition became legacy")
+                        })?;
+                        let visibility = documents.visibility(request.mask.clone(), false).await?;
+                        if !visibility.may_match().await? {
+                            return Result::Ok((ordinal, Vec::new()));
+                        }
+                        let lengths = documents.lengths().await?;
+                        let ids = request.term_ids.map(|ids| ids.partition(ordinal));
+                        let Some(fetched) = part
+                            .fetch_posting_lists(
+                                &request.tokens,
+                                &request.params,
+                                request.operator,
+                                request.metrics.as_ref(),
+                                PostingLoadOptions::deferred_positions(),
+                                ids,
+                            )
+                            .await?
+                        else {
+                            return Result::Ok((ordinal, Vec::new()));
+                        };
+                        let tokens = request.tokens.clone();
+                        let scorer = request.impact_scorer.clone();
+                        let limit = request.params.limit.ok_or_else(|| {
+                            Error::internal("selective phrase lost its finite limit")
+                        })?;
+                        let (mut search, idf) = spawn_cpu(move || {
+                            let loaded = fetched.into_loaded(&tokens, scorer.as_ref())?;
+                            let idf = idf_by_position(&loaded.postings, scorer.as_ref());
+                            Ok::<_, Error>((PhraseSearch::new(loaded.postings, limit)?, idf))
+                        })
+                        .await?;
+                        loop {
+                            let lengths = lengths.clone();
+                            let visibility = visibility.clone();
                             let scorer = request.impact_scorer.clone();
-                            let scored = spawn_cpu(move || {
-                                Ok::<_, Error>(rescore_partition_candidates(
-                                    PartitionCandidates {
-                                        idf_by_position: idf,
-                                        grouped_expansions: Vec::new(),
-                                        candidates,
-                                    },
-                                    scorer.as_ref(),
-                                ))
+                            let shared = shared.clone();
+                            let metrics = request.metrics.clone();
+                            let (next, progress) = spawn_cpu(move || {
+                                let docs = ModernWandDocuments::filtered(&lengths, &visibility);
+                                let progress =
+                                    search.advance(&docs, scorer, shared, metrics.as_ref())?;
+                                Ok::<_, Error>((search, progress))
                             })
                             .await?;
-                            return Result::Ok((ordinal, scored));
-                        }
-                        PhraseProgress::Read(requests) => {
-                            // One block per clause, at most 8 MiB in aggregate.
-                            // try_join_all cancellation drops accepted I/O futures;
-                            // no background tasks or parked CPU workers are spawned.
-                            let reads =
-                                requests
-                                    .into_iter()
-                                    .map(|block_request: PositionBlockRequest| {
-                                        let positions = &positions;
-                                        async move {
-                                            let plan = positions
-                                                .iter()
-                                                .find(|plan| {
-                                                    plan.token_id == block_request.token_id
-                                                })
-                                                .ok_or_else(|| {
-                                                    Error::internal(
-                                                        "position request has no prepared term",
+                            search = next;
+                            match progress {
+                                PhraseProgress::Done(candidates) => {
+                                    let scorer = request.impact_scorer.clone();
+                                    let scored = spawn_cpu(move || {
+                                        Ok::<_, Error>(rescore_partition_candidates(
+                                            PartitionCandidates {
+                                                idf_by_position: idf,
+                                                grouped_expansions: Vec::new(),
+                                                candidates,
+                                            },
+                                            scorer.as_ref(),
+                                        ))
+                                    })
+                                    .await?;
+                                    return Result::Ok((ordinal, scored));
+                                }
+                                PhraseProgress::Read(requests) => {
+                                    // One block per clause, at most 8 MiB in aggregate.
+                                    // try_join_all cancellation drops accepted I/O futures;
+                                    // no background tasks or parked CPU workers are spawned.
+                                    let reads = requests.into_iter().map(
+                                        |block_request: PositionBlockRequest| {
+                                            let positions = &positions;
+                                            let metrics = request.metrics.clone();
+                                            async move {
+                                                let plan = positions
+                                                    .iter()
+                                                    .find(|plan| {
+                                                        plan.token_id == block_request.token_id
+                                                    })
+                                                    .ok_or_else(|| {
+                                                        Error::internal(
+                                                            "position request has no prepared term",
+                                                        )
+                                                    })?;
+                                                Ok::<_, Error>((
+                                                    block_request,
+                                                    plan.read(
+                                                        block_request.index,
+                                                        metrics.as_ref(),
                                                     )
-                                                })?;
-                                            Ok::<_, Error>((
-                                                block_request,
-                                                plan.read(
-                                                    block_request.index,
-                                                    request.metrics.as_ref(),
-                                                )
-                                                .await?,
-                                            ))
-                                        }
-                                    });
-                            for (request, block) in futures::future::try_join_all(reads).await? {
-                                search.supply(request, block)?;
+                                                    .await?,
+                                                ))
+                                            }
+                                        },
+                                    );
+                                    for (request, block) in
+                                        futures::future::try_join_all(reads).await?
+                                    {
+                                        search.supply(request, block)?;
+                                    }
+                                }
                             }
                         }
                     }
+                    .boxed()
+                })
+                .collect::<Vec<_>>();
+            let mut results =
+                stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus().min(4));
+            let mut ranked = BinaryHeap::new();
+            while let Some((ordinal, scored)) = results.try_next().await? {
+                for (doc_id, score) in scored {
+                    push_scored_partition_doc(
+                        &mut ranked,
+                        request.limit,
+                        PartitionDocId::try_new(ordinal, doc_id)?,
+                        score,
+                    );
                 }
             }
-        });
-        let mut results =
-            stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus().min(4));
-        let mut ranked = BinaryHeap::new();
-        while let Some((ordinal, scored)) = results.try_next().await? {
-            for (doc_id, score) in scored {
-                push_scored_partition_doc(
-                    &mut ranked,
-                    request.limit,
-                    PartitionDocId::try_new(ordinal, doc_id)?,
-                    score,
-                );
-            }
+            Ok(Some(ranked.into_sorted_vec()))
         }
-        Ok(Some(ranked.into_sorted_vec()))
+        .boxed()
     }
 }
 

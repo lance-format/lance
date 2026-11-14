@@ -2320,7 +2320,7 @@ async fn selective_phrase_search_reads_committed_partitions(
         term_ids: None,
     };
     let selected = index
-        .try_selective_phrase_search(&request)
+        .try_selective_phrase_search(request.clone())
         .await?
         .expect("current-format fixture must select the new reader");
     let mut rows = Vec::new();
@@ -2346,7 +2346,7 @@ async fn selective_phrase_search_reads_committed_partitions(
     );
     assert!(
         index
-            .try_selective_phrase_search(&unsupported)
+            .try_selective_phrase_search(unsupported)
             .await?
             .is_none()
     );
