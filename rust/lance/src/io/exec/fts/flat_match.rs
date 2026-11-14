@@ -921,7 +921,8 @@ impl FlatMatchQueryExec {
     /// Tokenize with these params instead of opening the column's FTS index.
     ///
     /// They must match the params of the index whose statistics the base
-    /// scorer or scorer exchange provides.
+    /// scorer or scorer exchange provides. The params replace opening the index
+    /// only when a base scorer or scorer exchange supplies the statistics.
     pub fn with_tokenizer_params(mut self, params: InvertedIndexParams) -> Self {
         self.tokenizer_params = Some(params);
         self
@@ -1111,7 +1112,8 @@ impl ExecutionPlan for FlatMatchQueryExec {
             }
             producer => producer,
         };
-        let tokenizer_params = self.tokenizer_params.clone();
+        let stats_supplied = preset_base_scorer.is_some() || scorer_exchange.is_some();
+        let tokenizer_params = self.tokenizer_params.clone().filter(|_| stats_supplied);
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();

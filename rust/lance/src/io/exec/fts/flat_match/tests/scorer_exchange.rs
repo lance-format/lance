@@ -9,6 +9,7 @@ use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{RecordBatch, RecordBatchIterator, record_batch};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::TaskContext;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 
 const DOCS: [&str; 3] = ["alpha beta", "gamma delta", "alpha"];
 
@@ -25,21 +26,27 @@ fn input(batch: &RecordBatch) -> Arc<dyn ExecutionPlan> {
 }
 
 async fn flat_query_exec() -> FlatMatchQueryExec {
+    flat_query_exec_with("alpha beta", InvertedIndexParams::default().stem(false)).await
+}
+
+async fn flat_query_exec_with(terms: &str, params: InvertedIndexParams) -> FlatMatchQueryExec {
     let batch = corpus();
+    // `_rowid` is reserved in datasets; only the in-memory input carries it.
+    let text = batch.project(&[0]).unwrap();
     let dataset = Arc::new(
         Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            RecordBatchIterator::new(vec![Ok(text.clone())], text.schema()),
             "memory://",
             None,
         )
         .await
         .unwrap(),
     );
-    let mut query = MatchQuery::new("alpha beta".into()).with_column(Some("text".into()));
+    let mut query = MatchQuery::new(terms.into()).with_column(Some("text".into()));
     query.document_granularity = Some(DocumentGranularity::Row);
     FlatMatchQueryExec::new(dataset, query, FtsSearchParams::new(), input(&batch))
         .unwrap()
-        .with_tokenizer_params(InvertedIndexParams::default().stem(false))
+        .with_tokenizer_params(params)
 }
 
 async fn row_scores(exec: FlatMatchQueryExec) -> Vec<(u64, f32)> {
@@ -118,6 +125,23 @@ async fn flat_query_scores_with_exchanged_scorer() {
 }
 
 #[tokio::test]
+async fn flat_query_ignores_tokenizer_params_without_statistics() {
+    // These params drop "alpha" as too long; without statistics they are not used.
+    let exec = flat_query_exec_with(
+        "alpha",
+        InvertedIndexParams::default()
+            .stem(false)
+            .max_token_length(Some(3)),
+    )
+    .await;
+    let rows = row_scores(exec).await;
+    assert_eq!(
+        rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+}
+
+#[tokio::test]
 async fn flat_query_rejects_scorer_exchange_with_shared_scorer() {
     let exec = flat_query_exec()
         .await
@@ -150,7 +174,12 @@ async fn flat_query_rebuilds_preserve_scorer_settings() {
 
     let children = rebuilt.children().into_iter().cloned().collect::<Vec<_>>();
     let rebuilt: Arc<dyn ExecutionPlan> = Arc::new(rebuilt);
-    let rebuilt = rebuilt.with_new_children(children).unwrap();
+    let rebuilt = rebuilt
+        .replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .unwrap();
     let rebuilt = rebuilt.downcast_ref::<FlatMatchQueryExec>().unwrap();
     assert!(rebuilt.has_scorer_exchange());
     assert!(!rebuilt.has_shared_scorer());
