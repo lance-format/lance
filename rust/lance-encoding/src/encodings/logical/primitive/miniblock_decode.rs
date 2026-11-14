@@ -38,6 +38,7 @@ use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
+mod binary_slices;
 mod structure;
 
 use super::chunk_index::{

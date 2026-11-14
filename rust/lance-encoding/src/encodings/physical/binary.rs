@@ -642,6 +642,8 @@ enum BinaryMiniBlockLayout {
     },
 }
 
+mod range_read;
+
 impl BinaryMiniBlockDecompressor {
     pub fn new(bits_per_offset: u8) -> Result<Self> {
         if !matches!(bits_per_offset, 32 | 64) {
