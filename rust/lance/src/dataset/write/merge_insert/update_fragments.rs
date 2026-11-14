@@ -8,7 +8,9 @@ use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::write::cleanup_data_fragments;
 use crate::dataset::write::seeds::SeedCollector;
-use crate::dataset::write::{TargetBaseInfo, WriteParams, write_fragments_internal};
+use crate::dataset::write::{
+    TargetBaseInfo, WriteParams, write_fragments_internal, write_fragments_internal_impl,
+};
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
@@ -557,6 +559,7 @@ impl MergeInsertJob {
                 target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
                 write_version: ConcreteFileVersion,
                 write_params: Arc<WriteParams>,
+                diagnostics: Option<Arc<analysis::AnalysisScope>>,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -581,17 +584,37 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
-                let (fragments, _) = write_fragments_internal(
-                    write_version,
-                    Some(dataset.as_ref()),
-                    dataset.object_store.clone(),
-                    &dataset.base,
-                    write_schema,
-                    stream,
-                    write_params.as_ref().clone(),
-                    (*target_bases_info).clone(),
-                )
-                .await?;
+                let (fragments, _) = if let Some(scope) = diagnostics {
+                    write_fragments_internal_impl(
+                        write_version,
+                        Some(dataset.as_ref()),
+                        dataset.object_store.clone(),
+                        &dataset.base,
+                        write_schema,
+                        stream,
+                        write_params.as_ref().clone(),
+                        (*target_bases_info).clone(),
+                        None,
+                        None,
+                        false,
+                        false,
+                        Some(scope.blobs.clone()),
+                        None,
+                    )
+                    .await?
+                } else {
+                    write_fragments_internal(
+                        write_version,
+                        Some(dataset.as_ref()),
+                        dataset.object_store.clone(),
+                        &dataset.base,
+                        write_schema,
+                        stream,
+                        write_params.as_ref().clone(),
+                        (*target_bases_info).clone(),
+                    )
+                    .await?
+                };
 
                 new_fragments.lock().unwrap().extend(fragments);
                 Ok(reservation_size)
@@ -688,6 +711,7 @@ impl MergeInsertJob {
                         target_bases_info.clone(),
                         write_version,
                         write_params.clone(),
+                        diagnostics.clone(),
                     );
                     tasks.spawn(fut);
                 }

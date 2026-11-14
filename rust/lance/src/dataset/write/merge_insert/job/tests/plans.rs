@@ -1410,44 +1410,77 @@ async fn test_analyze_plan_removes_written_files(
     assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
 }
 
+/// The merge shape exercised by the blob-payload cleanup cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlobAnalysisMerge {
+    FullSchemaUpsert,
+    PartialIndexedInsert,
+}
+
 /// With managed blobs enabled, Blob v2 payloads above the inline threshold
 /// live in their own `_blobs/<uuid>.blob` objects rather than beside the
 /// data file, so removing the analyzed data files alone leaves them behind. Repeated
 /// analyses must not accumulate those objects, and the committed blobs the
 /// target rows still reference must stay readable.
 #[rstest::rstest]
-#[case::packed_text(65 * 1024, false, false)]
-#[case::packed_report(65 * 1024, true, false)]
-#[case::packed_indexed(65 * 1024, true, true)]
-#[case::dedicated_text(4 * 1024 * 1024 + 1, false, false)]
-#[case::dedicated_report(4 * 1024 * 1024 + 1, true, false)]
-#[case::dedicated_indexed(4 * 1024 * 1024 + 1, true, true)]
+#[case::packed_text(65 * 1024, false, false, BlobAnalysisMerge::FullSchemaUpsert)]
+#[case::packed_report(65 * 1024, true, false, BlobAnalysisMerge::FullSchemaUpsert)]
+#[case::packed_indexed(65 * 1024, true, true, BlobAnalysisMerge::FullSchemaUpsert)]
+#[case::packed_partial_indexed_report(65 * 1024, true, true, BlobAnalysisMerge::PartialIndexedInsert)]
+#[case::dedicated_text(4 * 1024 * 1024 + 1, false, false, BlobAnalysisMerge::FullSchemaUpsert)]
+#[case::dedicated_report(4 * 1024 * 1024 + 1, true, false, BlobAnalysisMerge::FullSchemaUpsert)]
+#[case::dedicated_indexed(4 * 1024 * 1024 + 1, true, true, BlobAnalysisMerge::FullSchemaUpsert)]
+#[case::dedicated_partial_indexed_report(
+    4 * 1024 * 1024 + 1,
+    true,
+    true,
+    BlobAnalysisMerge::PartialIndexedInsert
+)]
 #[tokio::test]
 async fn test_analyze_plan_removes_written_blob_payloads(
     #[case] payload_size: usize,
     #[case] structured: bool,
     #[case] indexed: bool,
+    #[case] merge: BlobAnalysisMerge,
 ) {
     let tempdir = TempStrDir::default();
-    let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
+    let target_schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(
+        match merge {
+            BlobAnalysisMerge::FullSchemaUpsert => vec![
+                Field::new("id", DataType::Int64, true),
+                crate::blob_field("payload", true),
+            ],
+            BlobAnalysisMerge::PartialIndexedInsert => vec![
+                Field::new("id", DataType::Int64, true),
+                crate::blob_field("payload", true),
+                Field::new("note", DataType::Utf8, true),
+            ],
+        },
+    ));
+    let source_schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
         Field::new("id", DataType::Int64, true),
         crate::blob_field("payload", true),
     ]));
-    let make_batch = |ids: Vec<i64>, value: u8| {
+    let make_batch = |schema: &Arc<Schema>, ids: Vec<i64>, value: u8| {
+        let row_count = ids.len();
         let payload = vec![value; payload_size];
-        let mut blobs = crate::BlobArrayBuilder::new(ids.len());
-        for _ in &ids {
+        let mut blobs = crate::BlobArrayBuilder::new(row_count);
+        for _ in 0..row_count {
             blobs.push_bytes(&payload).unwrap();
         }
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(ids)), blobs.finish().unwrap()],
-        )
-        .unwrap()
+        let mut columns: Vec<ArrayRef> =
+            vec![Arc::new(Int64Array::from(ids)), blobs.finish().unwrap()];
+        if schema.column_with_name("note").is_some() {
+            columns.push(Arc::new(StringArray::from(vec!["target"; row_count])) as ArrayRef);
+        }
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
     };
     let dataset = Arc::new(
         Dataset::write(
-            RecordBatchIterator::new(vec![Ok(make_batch(vec![0, 1], 1))], schema.clone()),
+            RecordBatchIterator::new(
+                vec![Ok(make_batch(&target_schema, vec![0, 1], 1))],
+                target_schema.clone(),
+            ),
             &tempdir,
             Some(WriteParams {
                 max_rows_per_file: 1,
@@ -1481,21 +1514,37 @@ async fn test_analyze_plan_removes_written_blob_payloads(
         "the fixture must store its payloads as managed objects: {files_before:?}"
     );
 
-    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-        .unwrap()
-        .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::InsertAll)
-        .try_build()
-        .unwrap();
+    let mut builder = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+    let job = match merge {
+        BlobAnalysisMerge::FullSchemaUpsert => builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll),
+        BlobAnalysisMerge::PartialIndexedInsert => builder
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll),
+    }
+    .try_build()
+    .unwrap();
     for _ in 0..2 {
-        let batches = vec![make_batch(vec![0, 2], 2)];
+        let batch = match merge {
+            BlobAnalysisMerge::FullSchemaUpsert => make_batch(&target_schema, vec![0, 2], 2),
+            BlobAnalysisMerge::PartialIndexedInsert => make_batch(&source_schema, vec![2], 2),
+        };
         let analysis = if structured {
-            let report = job.analyze_plan_report_batches(batches).await.unwrap();
+            let report = job.analyze_plan_report_batches(vec![batch]).await.unwrap();
             assert_eq!(report.execution.outcome, ExecutionOutcome::Complete);
             assert_eq!(report.index_used, Some(indexed));
+            if merge == BlobAnalysisMerge::PartialIndexedInsert {
+                assert_eq!(report.join_index_segments, Some(1));
+                assert_eq!(report.fragments_touched, Some(0));
+                let stats = report.stats.as_ref().unwrap();
+                assert_eq!(stats.num_updated_rows, 0);
+                assert_eq!(stats.num_inserted_rows, 1);
+                assert_eq!(report.write_mode, MergeInsertWriteStrategy::RewriteRows);
+            }
             report.execution.plan
         } else {
-            job.analyze_plan_batches(batches).await.unwrap()
+            job.analyze_plan_batches(vec![batch]).await.unwrap()
         };
         assert!(
             analysis
@@ -1507,6 +1556,7 @@ async fn test_analyze_plan_removes_written_blob_payloads(
 
     assert_eq!(list_dataset_files(&tempdir), files_before);
     assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
     for blob in dataset
         .take_blobs_by_indices(&[0, 1], "payload")
         .await
@@ -1517,6 +1567,129 @@ async fn test_analyze_plan_removes_written_blob_payloads(
             vec![1; payload_size]
         );
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PartialIndexedAnalysisCase {
+    InsertOnly,
+    Mixed,
+    NoOp,
+}
+
+/// The indexed partial-schema path always persists `RewriteColumns` for the
+/// transaction, but an insert-only execution updates no fragment. The report
+/// must name the sink that actually ran without changing the transaction.
+#[rstest::rstest]
+#[case::insert_only(
+    PartialIndexedAnalysisCase::InsertOnly,
+    MergeInsertWriteStrategy::RewriteRows,
+    0,
+    1,
+    0
+)]
+#[case::mixed(
+    PartialIndexedAnalysisCase::Mixed,
+    MergeInsertWriteStrategy::RewriteColumns,
+    1,
+    1,
+    1
+)]
+#[case::noop(
+    PartialIndexedAnalysisCase::NoOp,
+    MergeInsertWriteStrategy::RewriteColumns,
+    0,
+    0,
+    0
+)]
+#[tokio::test]
+async fn test_analyze_plan_reports_partial_indexed_write_strategy(
+    #[case] case: PartialIndexedAnalysisCase,
+    #[case] expected_mode: MergeInsertWriteStrategy,
+    #[case] expected_updated: u64,
+    #[case] expected_inserted: u64,
+    #[case] expected_touched: usize,
+) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, true),
+        Field::new("note", DataType::Utf8, true),
+    ]));
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(target)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let dataset = Arc::new(dataset);
+    let version = dataset.version().version;
+    let source = match case {
+        PartialIndexedAnalysisCase::InsertOnly => {
+            record_batch!(("id", Int64, [2]), ("value", Int64, [30])).unwrap()
+        }
+        PartialIndexedAnalysisCase::Mixed | PartialIndexedAnalysisCase::NoOp => {
+            record_batch!(("id", Int64, [0, 2]), ("value", Int64, [100, 30])).unwrap()
+        }
+    };
+    let source = match case {
+        PartialIndexedAnalysisCase::NoOp => source.slice(0, 1),
+        _ => source,
+    };
+    let mut builder = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+    let job = match case {
+        PartialIndexedAnalysisCase::Mixed => builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll),
+        PartialIndexedAnalysisCase::InsertOnly | PartialIndexedAnalysisCase::NoOp => builder
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll),
+    }
+    .try_build()
+    .unwrap();
+
+    let report = job
+        .analyze_plan_report_batches(vec![source.clone()])
+        .await
+        .unwrap();
+    assert_eq!(report.execution.outcome, ExecutionOutcome::Complete);
+    assert_eq!(report.index_used, Some(true));
+    assert_eq!(report.join_index_segments, Some(1));
+    assert_eq!(report.write_mode, expected_mode);
+    assert_eq!(report.fragments_touched, Some(expected_touched));
+    let stats = report.stats.unwrap();
+    assert_eq!(stats.num_updated_rows, expected_updated);
+    assert_eq!(stats.num_inserted_rows, expected_inserted);
+    assert_eq!(dataset.version().version, version);
+
+    let (executed, stats) = job.execute_batches(vec![source]).await.unwrap();
+    assert_eq!(stats.num_updated_rows, expected_updated);
+    assert_eq!(stats.num_inserted_rows, expected_inserted);
+    assert_eq!(
+        executed.count_rows(None).await.unwrap(),
+        2 + expected_inserted as usize
+    );
 }
 
 #[rstest::rstest]

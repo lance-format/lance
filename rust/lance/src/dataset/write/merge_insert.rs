@@ -927,7 +927,8 @@ pub struct MergeInsertAnalysis {
     pub execution: ExecutionAnalysis,
     /// Join strategy, type, and operator path from the physical plan that ran.
     pub joins: Vec<MergeInsertJoin>,
-    /// Actual physical write strategy, including the delete-only sink.
+    /// Actual physical write strategy, including the delete-only sink. An
+    /// insert-only merge reports [`MergeInsertWriteStrategy::RewriteRows`].
     pub write_mode: MergeInsertWriteStrategy,
     /// Complete logical change counts and data-file bytes, or `None` on failure.
     /// Bytes exclude deletion files, blob payloads, and scratch/replay/operator spills.
@@ -968,7 +969,8 @@ pub struct MergeInsertAnalysis {
 /// Resolved physical write behavior, distinct from the caller's rewrite policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeInsertWriteStrategy {
-    /// Tombstone matched rows and write replacement whole rows.
+    /// Write whole rows, replacing matched rows or appending unmatched inserts.
+    /// An insert-only merge also reports this strategy, even though it only appends.
     RewriteRows,
     /// Attach replacement column files to existing fragments.
     RewriteColumns,

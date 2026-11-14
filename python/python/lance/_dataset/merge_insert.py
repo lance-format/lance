@@ -114,7 +114,13 @@ class MergeSubplan(TypedDict):
 
 
 class MergeInsertAnalysis(TypedDict):
-    """Diagnostics from one uncommitted merge; unavailable statistics are None."""
+    """Diagnostics from one uncommitted merge; unavailable statistics are None.
+
+    ``write_mode`` names the sink that ran. ``rewrite_rows`` covers whole-row
+    replacement and pure insertion, ``rewrite_columns`` covers column patches
+    (including mixed updates and insertions), and ``delete_only`` writes only
+    deletion files.
+    """
 
     operation_id: str
     plan: str
@@ -631,7 +637,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         Analysis writes data and deletion files, then removes them without
         changing the dataset version. ``stats.bytes_written`` counts data files
         only, excluding deletion files, blob payloads, and spills. Cleanup failures
-        are logged and left for orphan cleanup.
+        are logged and left for orphan cleanup. ``write_mode`` reports the sink
+        that ran, so an insert-only merge is ``rewrite_rows`` even when the
+        source omits a column.
 
         ``elapsed_ns`` measures execution, excluding cleanup. The scalar-index
         route includes interleaved planning and replay staging. Join and inclusive

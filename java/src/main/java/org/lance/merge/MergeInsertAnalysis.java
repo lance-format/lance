@@ -47,7 +47,9 @@ public final class MergeInsertAnalysis {
 
   /** Physical writer selected by Rust, distinct from the caller's auto rewrite policy. */
   public enum WriteMode {
+    /** Write whole rows, replacing matched rows or appending unmatched inserts. */
     REWRITE_ROWS,
+    /** Patch columns into existing fragments, including mixed updates and inserts. */
     REWRITE_COLUMNS,
     DELETE_ONLY
   }

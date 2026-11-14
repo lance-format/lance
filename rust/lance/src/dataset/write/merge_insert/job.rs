@@ -2127,6 +2127,14 @@ impl MergeInsertJob {
                 Ok(result) => match &result.transaction.operation {
                     Operation::Update {
                         update_mode: Some(RewriteColumns),
+                        updated_fragments,
+                        new_fragments,
+                        ..
+                    } if updated_fragments.is_empty() && !new_fragments.is_empty() => {
+                        MergeInsertWriteStrategy::RewriteRows
+                    }
+                    Operation::Update {
+                        update_mode: Some(RewriteColumns),
                         ..
                     } => MergeInsertWriteStrategy::RewriteColumns,
                     _ if matches!(self.params.when_matched, WhenMatched::Delete)

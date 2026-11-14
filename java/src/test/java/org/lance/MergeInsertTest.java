@@ -787,6 +787,8 @@ public class MergeInsertTest {
             MergeInsertAnalysis.Outcome.COMPLETE, report.getExecution().getOutcome());
         Assertions.assertEquals(Optional.of(indexed), report.getIndexUsed());
         Assertions.assertEquals(indexed ? 1 : 0, report.getJoinIndexSegments().getAsLong());
+        Assertions.assertEquals(
+            MergeInsertAnalysis.WriteMode.REWRITE_COLUMNS, report.getWriteMode());
         Assertions.assertEquals(2, report.getStats().get().getNumUpdatedRows());
         Assertions.assertEquals(2, report.getFragmentsTouched().getAsLong());
         Assertions.assertTrue(report.getReplaySpills().getBytesWritten().getAsLong() > 0);
@@ -801,6 +803,22 @@ public class MergeInsertTest {
         Assertions.assertEquals(
             report.getReplaySpills().getBytesWritten(),
             decoded.getReplaySpills().getBytesWritten());
+      }
+      try (VectorSchemaRoot source = buildPartialSource(100);
+          ArrowArrayStream stream = convertToStream(source, allocator)) {
+        MergeInsertAnalysis insertReport =
+            wide.analyzeMergeInsert(
+                new MergeInsertParams(Collections.singletonList("id")).withMatchedDoNothing(),
+                stream);
+        Assertions.assertEquals(
+            MergeInsertAnalysis.Outcome.COMPLETE, insertReport.getExecution().getOutcome());
+        Assertions.assertEquals(Optional.of(indexed), insertReport.getIndexUsed());
+        Assertions.assertEquals(indexed ? 1 : 0, insertReport.getJoinIndexSegments().getAsLong());
+        Assertions.assertEquals(
+            MergeInsertAnalysis.WriteMode.REWRITE_ROWS, insertReport.getWriteMode());
+        Assertions.assertEquals(0, insertReport.getStats().get().getNumUpdatedRows());
+        Assertions.assertEquals(1, insertReport.getStats().get().getNumInsertedRows());
+        Assertions.assertEquals(0, insertReport.getFragmentsTouched().getAsLong());
       }
       Assertions.assertEquals(version, wide.version());
       Assertions.assertEquals(before, readWide(wide).toString());

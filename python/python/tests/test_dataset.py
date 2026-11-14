@@ -4868,6 +4868,35 @@ def test_merge_analysis_partial_index_coverage(filtered, tmp_path):
     assert result["num_updated_rows"] == (0 if filtered else 2)
 
 
+@pytest.mark.parametrize("indexed", [False, True])
+def test_merge_insert_structured_analysis_partial_indexed_insert(indexed, tmp_path):
+    data = pa.table({"id": [0, 1], "value": [10, 20], "note": ["a", "b"]})
+    ds = lance.write_dataset(
+        data, tmp_path / "partial-insert", max_rows_per_file=1, max_rows_per_group=1
+    )
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+    before = ds.to_table()
+    source = pa.table({"id": [2], "value": [30]})
+    builder = ds.merge_insert("id").when_not_matched_insert_all()
+    report = builder.analyze_plan_report(source)
+    assert report["outcome"] == "complete", report["error"]
+    assert report["index_used"] is indexed
+    assert report["join_index_segments"] == int(indexed)
+    assert report["write_mode"] == "rewrite_rows"
+    assert report["stats"]["num_updated_rows"] == 0
+    assert report["stats"]["num_inserted_rows"] == 1
+    assert report["fragments_touched"] == 0
+    assert ds.version == version
+    assert ds.to_table() == before
+
+    result = builder.execute(source)
+    assert result["num_updated_rows"] == 0
+    assert result["num_inserted_rows"] == 1
+    assert lance.dataset(ds.uri).count_rows() == 3
+
+
 def test_merge_insert_explain_analyze_plan():
     """Test that explain_plan and analyze_plan work on merge insert operations."""
     # Create a simple test dataset
