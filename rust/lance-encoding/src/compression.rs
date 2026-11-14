@@ -20,6 +20,7 @@ use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
 pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
+pub use crate::encodings::physical::sequence::SequenceMetadata;
 use crate::{
     buffer::LanceBuffer,
     compression_config::{AlpMode, BssMode, CompressionFieldParams},
@@ -1416,8 +1417,10 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     /// shapes return an error; this must never call ordinary allocating decode.
     ///
     /// ```
-    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
-    ///     encodings::physical::sequence::SequenceMetadata, format::EncodingUtils};
+    /// use lance_encoding::{
+    ///     compression::{DecompressionStrategy, DefaultDecompressionStrategy, SequenceMetadata},
+    ///     format::EncodingUtils,
+    /// };
     /// let codec = DefaultDecompressionStrategy::default()
     ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
     /// assert_eq!(codec.plan_unsigned_metadata(32, 4).unwrap(),
@@ -1427,7 +1430,7 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
         &self,
         _bits_per_value: u64,
         _num_values: u64,
-    ) -> Result<crate::encodings::physical::sequence::SequenceMetadata> {
+    ) -> Result<SequenceMetadata> {
         Err(Error::not_supported("codec has no unsigned metadata plan"))
     }
 
