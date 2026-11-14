@@ -179,6 +179,27 @@ pub trait IndexWriter: Send {
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
+    /// Optionally read byte ranges within one binary value, preserving range order.
+    ///
+    /// `row` is relative to the named column. `None` requests ordinary decoding
+    /// by the caller; the default does not issue I/O or extend legacy readers.
+    /// Returned buffers can share I/O backing and are not a retained-memory bound.
+    ///
+    /// ```
+    /// # use lance_index_core::scalar::IndexReader;
+    /// # async fn example(reader: &dyn IndexReader) -> lance_core::Result<()> {
+    /// let _selected = reader.try_read_binary_value_slices("positions", 0, &[4..12]).await?;
+    /// # Ok(()) }
+    /// ```
+    async fn try_read_binary_value_slices(
+        &self,
+        _column: &str,
+        _row: u64,
+        _slices: &[std::ops::Range<u64>],
+    ) -> Result<Option<Vec<Bytes>>> {
+        Ok(None)
+    }
+
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read several record batches, returning one batch per entry of

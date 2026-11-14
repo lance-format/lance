@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use lance_core::{Error, Result};
@@ -29,7 +29,7 @@ impl MiniBlockScheduler {
     /// This does not change the persisted encoding.
     ///
     /// ```
-    /// # use std::{ops::Range, sync::Arc};
+    /// # use std::{borrow::Cow, ops::Range, sync::Arc};
     /// # use lance_encoding::{EncodingsIo, decoder::PageInfo, encodings::logical::primitive::MiniBlockScheduler};
     /// # async fn example(page: &PageInfo, io: &Arc<dyn EncodingsIo>) -> lance_core::Result<()> {
     /// let selected = MiniBlockScheduler::try_read_binary_value_slices(page, 0, &[0..4], io).await?;
@@ -49,8 +49,21 @@ impl MiniBlockScheduler {
                 "invalid binary row or reversed byte range",
             ));
         }
-        let PageEncoding::Structural(page_layout) = &page.encoding else {
-            return Ok(None);
+        let page_layout = match &page.encoding {
+            PageEncoding::Structural(layout) => Cow::Borrowed(layout),
+            PageEncoding::Planar(layout) => {
+                if !matches!(
+                    layout
+                        .structure
+                        .as_ref()
+                        .and_then(|structure| structure.codec.as_ref()),
+                    Some(crate::format::pb23::structural_plane::Codec::Dense(_))
+                ) {
+                    return Ok(None);
+                }
+                Cow::Owned(layout.dense_execution_layout()?)
+            }
+            PageEncoding::Legacy(_) => return Ok(None),
         };
         let Some(Layout::MiniBlockLayout(layout)) = &page_layout.layout else {
             return Ok(None);
@@ -89,7 +102,7 @@ impl MiniBlockScheduler {
                 "page buffer range overflows u64",
             ));
         }
-        let mut scheduler = MiniBlockScheduler::try_new(
+        let mut scheduler = Self::try_new(
             &page.buffer_offsets_and_sizes,
             page.priority,
             page.num_rows,
