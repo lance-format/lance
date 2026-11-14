@@ -283,6 +283,29 @@ def test_convert_int_tensors(tmp_path: Path, dtype):
     assert first["vec"].shape == (4, 32)
 
 
+def test_blob_v2_api(tmp_path: Path):
+    payloads = [bytes([i]) * 64 for i in range(8)]
+    tbl = pa.Table.from_arrays(
+        [pa.array(range(8), pa.int64()), lance.blob_array(payloads)],
+        schema=pa.schema([pa.field("int", pa.int64()), lance.blob_field("val")]),
+    )
+    dataset = lance.write_dataset(
+        tbl, tmp_path / "data.lance", data_storage_version="2.2"
+    )
+
+    seen = []
+
+    def to_tensor_fn(batch, *args, **kwargs):
+        for blob in batch["val"]:
+            assert isinstance(blob, lance.BlobFile)
+            seen.append(blob.read())
+        return {"int": torch.tensor(batch["int"].to_numpy())}
+
+    torch_ds = LanceDataset(dataset, batch_size=4, to_tensor_fn=to_tensor_fn)
+    assert len(list(torch_ds)) == 2
+    assert seen == payloads
+
+
 def test_blob_api(tmp_path: Path):
     ints = pa.array(range(100), type=pa.int64())
     vals = pa.array([b"0" * 1024 for _ in range(100)], pa.large_binary())

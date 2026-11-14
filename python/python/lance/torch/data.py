@@ -52,6 +52,20 @@ class ToTensorFn(Protocol):
     ) -> Union[dict[str, torch.Tensor], torch.Tensor]: ...
 
 
+def _is_blob_column(field: pa.Field) -> bool:
+    """Check if a field is a Blob v1 (``large_binary``) or Blob v2 column."""
+    if (
+        isinstance(field.type, pa.ExtensionType)
+        and field.type.extension_name == "lance.blob.v2"
+    ):
+        return True
+    return (
+        field.type == pa.large_binary()
+        and field.metadata is not None
+        and field.metadata.get(b"lance-encoding:blob") == b"true"
+    )
+
+
 def _is_bfloat16_type(t: pa.DataType) -> bool:
     """Check if a PyArrow type is the lance bfloat16 extension type."""
     return isinstance(t, pa.ExtensionType) and t.extension_name == "lance.bfloat16"
@@ -450,19 +464,15 @@ class LanceDataset(torch.utils.data.IterableDataset):
             del batch
 
     def _blob_columns(self) -> List[str]:
-        """Returns True if one of the projected column is Large Blob encoded."""
+        """Returns the projected columns that are Blob (v1 or v2) encoded."""
         cols = self.columns
         if not cols:
             cols = self.dataset.schema.names
         blob_cols = []
         for col in cols:
             field = self.dataset.schema.field(col)
-            if (
-                field.type == pa.large_binary()
-                and field.metadata is not None
-                and field.metadata.get(b"lance-encoding:blob") == b"true"
-            ):
-                logging.debug("Column %s is a Large Blob column", col)
+            if _is_blob_column(field):
+                logging.debug("Column %s is a Blob column", col)
                 blob_cols.append(col)
         return blob_cols
 
