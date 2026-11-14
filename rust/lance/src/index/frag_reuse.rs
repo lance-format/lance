@@ -2768,10 +2768,19 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse_reader::tests as reader_tests;
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::{derive_vector_index_type, vector_index_details_default};
+    use crate::session::Session;
+    use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int32Type;
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Int32Array, RecordBatch};
+    use lance_datagen::Dimension;
+    use lance_index::INDEX_AUXILIARY_FILE_NAME;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     use lance_table::format::Fragment;
     use lance_table::format::pb::fragment_reuse_index_details::{
@@ -4034,12 +4043,11 @@ mod tests {
         assert_eq!(dataset.latest_version_id().await.unwrap(), version);
     }
 
-    /// Round 5 item 4: deferred compaction of fragments no index covers and
-    /// no lineage reaches commits a plain rewrite on a tagged table -- no
-    /// new transition, the entry untouched -- instead of growing the history
-    /// with records no reader ever has to translate.
+    /// Deferred compaction of fragments no index covers and no lineage reaches
+    /// still appends a transition on a tagged table (an index build in flight
+    /// may cover them), and trim releases it since no committed index needs it.
     #[tokio::test]
-    async fn uncovered_deferred_compaction_commits_plain_rewrite() {
+    async fn uncovered_deferred_compaction_appends_a_trimmable_transition() {
         let mut dataset = reader_tests::fixture().await;
         reserve_fragments(&mut dataset, 20).await;
         let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
@@ -4114,20 +4122,34 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
 
-        // The entry is byte-for-byte the one from before the compaction.
         let stored = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap();
         let entry = stored_fri(&stored);
-        assert_eq!(entry.uuid, entry_before.uuid);
+        assert_ne!(entry.uuid, entry_before.uuid);
         let ledger = decode_entry(&dataset, &entry).await;
-        assert_eq!(ledger.transitions().len(), 1);
+        assert_eq!(ledger.transitions().len(), 2);
         assert_eq!(sorted_values(&dataset).await, before);
         assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
         assert_eq!(
             filtered_values(&dataset, "i >= 100").await,
             (100..104).collect::<Vec<_>>()
         );
+
+        // Trim releases the uncovered transition and keeps the covered one.
+        let ledger_before = decode_entry(&dataset, &entry_before).await;
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
+        let trimmed = decode_entry(&dataset, &stored_fri(&stored)).await;
+        assert_eq!(
+            format!("{:?}", trimmed.transitions()),
+            format!("{:?}", ledger_before.transitions())
+        );
+        assert_eq!(sorted_values(&dataset).await, before);
     }
 
     /// Round 5 item 7: detached commits skip the rebase pipeline, so nothing
@@ -4440,6 +4462,100 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 9);
         assert_eq!(filtered_values(&dataset, "i = 8").await, vec![8]);
         assert_eq!(filtered_values(&dataset, "i >= 9").await, Vec::<i32>::new());
+    }
+
+    /// A legacy vector index whose details cannot be inferred yet must not pin
+    /// the uninferred entry in the tagged listing: once its files are readable
+    /// again, `load_indices` serves the inferred details.
+    #[tokio::test]
+    async fn tagged_listing_is_not_cached_before_inference_succeeds() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(8)),
+            )
+            .into_dataset(
+                test_dir.as_str(),
+                crate::utils::test::FragmentCount::from(2),
+                crate::utils::test::FragmentRowCount::from(64),
+            )
+            .await
+            .unwrap();
+        reserve_fragments(&mut dataset, 20).await;
+        let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        let mut dataset = shallow_clone::commit_stable_partition(dataset, &source_ids, 10).await;
+        dataset
+            .create_index(
+                &["vec"],
+                lance_index::IndexType::Vector,
+                Some("vec_idx".into()),
+                &VectorIndexParams::with_ivf_sq_params(
+                    MetricType::Cosine,
+                    IvfBuildParams::new(2),
+                    SQBuildParams::default(),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let vec_idx = |listing: &[IndexMetadata]| {
+            listing
+                .iter()
+                .find(|idx| idx.name == "vec_idx")
+                .cloned()
+                .unwrap()
+        };
+        let mut legacy = dataset.load_indices().await.unwrap().as_ref().clone();
+        // Inference reads the quantizer from the auxiliary file; hiding it fails
+        // inference without failing the listing.
+        let aux_file = std::path::Path::new(test_dir.as_str())
+            .join("_indices")
+            .join(vec_idx(&legacy).uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let hidden = aux_file.with_extension("hidden");
+        std::fs::rename(&aux_file, &hidden).unwrap();
+
+        // Store the index without vector details, as one built before they were
+        // recorded is. Inference fails, so the commit cannot migrate it.
+        for idx in legacy.iter_mut().filter(|idx| idx.name == "vec_idx") {
+            idx.index_details = Some(Arc::new(vector_index_details_default()));
+        }
+        let raw_key = IndexMetadataKey {
+            version: dataset.manifest.version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&raw_key, Arc::new(legacy))
+            .await;
+        dataset.delete("false").await.unwrap();
+
+        let dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let listing = dataset.load_indices().await.unwrap();
+        assert!(
+            vec_idx(&listing).index_details.unwrap().value.is_empty(),
+            "inference must fail while the auxiliary file is unreadable"
+        );
+
+        std::fs::rename(&hidden, &aux_file).unwrap();
+        let listing = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            derive_vector_index_type(&vec_idx(&listing).index_details.unwrap()),
+            "IVF_SQ",
+            "the tagged listing pinned the uninferred details"
+        );
+        assert!(Arc::ptr_eq(
+            &listing,
+            &dataset.load_indices().await.unwrap()
+        ));
     }
 
     /// Shallow-cloning tagged histories. All fixtures are on-disk: base-path

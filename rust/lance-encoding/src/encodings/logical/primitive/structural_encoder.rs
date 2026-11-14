@@ -1891,6 +1891,60 @@ impl PrimitiveStructuralEncoder {
     /// support dictionary encoding. Returns `None` for malformed data.
     fn sample_unique_ratio(data_block: &DataBlock, max_samples: usize) -> Option<Option<f64>> {
         use std::collections::HashSet;
+        use std::hash::{BuildHasherDefault, Hasher};
+
+        #[derive(Default)]
+        struct FastSampleHasher(u64);
+
+        impl Hasher for FastSampleHasher {
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                let mut x = i;
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                self.0 = x ^ (x >> 31);
+            }
+
+            #[inline]
+            fn write_u128(&mut self, i: u128) {
+                let lo = i as u64;
+                let hi = (i >> 64) as u64;
+                self.write_u64(lo ^ hi.wrapping_mul(0x9e3779b97f4a7c15));
+            }
+        }
+
+        #[derive(Default)]
+        struct IdentityU64Hasher(u64);
+
+        impl Hasher for IdentityU64Hasher {
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                self.0 = i;
+            }
+        }
+
+        type FastSampleSet<K> = HashSet<K, BuildHasherDefault<FastSampleHasher>>;
+        type PrehashedSet = HashSet<u64, BuildHasherDefault<IdentityU64Hasher>>;
 
         const NUM_SAMPLE_BLOCKS: usize = 32;
         const MIN_RELIABLE_SAMPLES: usize = 1024;
@@ -1907,87 +1961,129 @@ impl PrimitiveStructuralEncoder {
 
         let block_count = NUM_SAMPLE_BLOCKS.min(sample_count).min(num_values).max(1);
         let samples_per_block = (sample_count / block_count).max(1);
-        let mut indices = Vec::with_capacity(sample_count);
+
+        let mut total_samples = 0usize;
         for block_idx in 0..block_count {
             let block_start = block_idx * num_values / block_count;
             let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
             let block_len = next_block_start.saturating_sub(block_start);
-            let samples_in_block = samples_per_block.min(block_len);
-            indices.extend((0..samples_in_block).map(|offset| block_start + offset));
+            total_samples += samples_per_block.min(block_len);
         }
 
-        if indices.len() < MIN_RELIABLE_SAMPLES {
+        if total_samples < MIN_RELIABLE_SAMPLES {
             return Some(None);
         }
+
+        let for_each_block = |visit: &mut dyn FnMut(usize, usize) -> Option<()>| -> Option<()> {
+            for block_idx in 0..block_count {
+                let block_start = block_idx * num_values / block_count;
+                let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
+                let block_len = next_block_start.saturating_sub(block_start);
+                let count = samples_per_block.min(block_len);
+                if count > 0 {
+                    visit(block_start, block_start + count)?;
+                }
+            }
+            Some(())
+        };
 
         let ratio = match data_block {
             DataBlock::FixedWidth(fixed) => match fixed.bits_per_value {
                 64 => {
                     let values = fixed.data.borrow_to_typed_slice::<u64>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u64> =
-                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
-                    for idx in indices.iter().copied() {
-                        unique.insert(values.get(idx).copied()?);
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = FastSampleSet::<u64>::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let slice = values.get(start..end)?;
+                        for &v in slice {
+                            unique.insert(v);
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 128 => {
                     let values = fixed.data.borrow_to_typed_slice::<u128>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u128> =
-                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
-                    for idx in indices.iter().copied() {
-                        unique.insert(values.get(idx).copied()?);
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = FastSampleSet::<u128>::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let slice = values.get(start..end)?;
+                        for &v in slice {
+                            unique.insert(v);
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 bits if bits > 0 && bits.is_multiple_of(8) => {
                     let width = usize::try_from(bits / 8).ok()?;
-                    let mut unique = HashSet::with_capacity(indices.len());
-                    for &index in &indices {
-                        let start = index.checked_mul(width)?;
-                        let end = start.checked_add(width)?;
-                        unique.insert(xxhash_rust::xxh3::xxh3_64(fixed.data.get(start..end)?));
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = PrehashedSet::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let byte_start = start.checked_mul(width)?;
+                        let byte_end = end.checked_mul(width)?;
+                        let bytes = fixed.data.get(byte_start..byte_end)?;
+                        for chunk in bytes.chunks_exact(width) {
+                            unique.insert(xxhash_rust::xxh3::xxh3_64(chunk));
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 _ => return Some(None),
             },
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
-                // Hash variable-width slices instead of storing borrowed slice keys.
-                let mut unique: HashSet<u64> =
-                    HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                let mut unique = PrehashedSet::with_capacity_and_hasher(
+                    total_samples,
+                    BuildHasherDefault::default(),
+                );
+                let raw_data = var.data.as_ref();
                 match var.bits_per_offset {
                     32 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u32>();
                         let offsets: &[u32] = offsets_ref.as_ref();
-                        for i in indices.iter().copied() {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
+                        for_each_block(&mut |start, end| {
+                            let win_slice = offsets.get(start..=end)?;
+                            for win in win_slice.windows(2) {
+                                let s = usize::try_from(win[0]).ok()?;
+                                let e = usize::try_from(win[1]).ok()?;
+                                if s > e || e > raw_data.len() {
+                                    return None;
+                                }
+                                unique.insert(xxh3_64(&raw_data[s..e]));
                             }
-                            unique.insert(xxh3_64(&var.data[start..end]));
-                        }
+                            Some(())
+                        })?;
                     }
                     64 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u64>();
                         let offsets: &[u64] = offsets_ref.as_ref();
-                        for i in indices.iter().copied() {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
+                        for_each_block(&mut |start, end| {
+                            let win_slice = offsets.get(start..=end)?;
+                            for win in win_slice.windows(2) {
+                                let s = usize::try_from(win[0]).ok()?;
+                                let e = usize::try_from(win[1]).ok()?;
+                                if s > e || e > raw_data.len() {
+                                    return None;
+                                }
+                                unique.insert(xxh3_64(&raw_data[s..e]));
                             }
-                            unique.insert(xxh3_64(&var.data[start..end]));
-                        }
+                            Some(())
+                        })?;
                     }
                     _ => return Some(None),
                 }
-                unique.len() as f64 / indices.len() as f64
+                unique.len() as f64 / total_samples as f64
             }
             _ => return Some(None),
         };

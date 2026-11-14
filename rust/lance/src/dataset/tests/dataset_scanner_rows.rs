@@ -409,6 +409,40 @@ async fn row_addr_mask_plain_scan_rejected_on_legacy() {
 }
 
 #[rstest]
+#[case::row_addresses(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn row_addr_mask_empty_range(#[case] stable_row_ids: bool) {
+    let dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_ram_dataset_with_params(
+            FragmentCount::from(2),
+            FragmentRowCount::from(2),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let empty = RowAddrTreeMap::from(0..0);
+    let mut scan = dataset.scan();
+    scan.with_row_id_prefilter(RowAddrMask::from_allowed(empty.clone()));
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut scan = dataset.scan();
+    scan.with_row_id_prefilter(RowAddrMask::from_block(empty));
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["i"].as_primitive::<Int32Type>().values(),
+        &[0, 1, 2, 3]
+    );
+}
+
+#[rstest]
 #[case::without_stable_row_ids(false)]
 #[case::with_stable_row_ids(true)]
 #[tokio::test]

@@ -10,11 +10,12 @@ use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray};
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 
 use super::file::{BlobFile, BlobSource, BlobSourceKey, shared_blob_source};
 use crate::dataset::Dataset;
+use crate::session::UnregisteredExternalBlobPolicy;
 use lance_core::datatypes::{BLOB_DESC_FIELDS, BlobKind, BlobV2Layout, BlobVersion};
 use lance_core::utils::blob::{blob_path, validate_managed_reference};
 use lance_core::{Error, Result, utils::address::RowAddress};
@@ -274,6 +275,7 @@ pub(super) struct BlobLocator<'a> {
     fragments: HashMap<u32, BlobReadLocation>,
     base_roots: HashMap<u32, Path>,
     stores: HashMap<u32, Arc<ObjectStore>>,
+    external_stores: HashMap<u32, Arc<ObjectStore>>,
     sources: HashMap<BlobSourceKey, Arc<BlobSource>>,
     /// Object lengths of External blobs, keyed by `(base_id, uri)`, for
     /// descriptors that were written without a size.
@@ -288,6 +290,7 @@ impl<'a> BlobLocator<'a> {
             fragments: HashMap::new(),
             base_roots: HashMap::new(),
             stores: HashMap::new(),
+            external_stores: HashMap::new(),
             sources: HashMap::new(),
             external_sizes: HashMap::new(),
         }
@@ -339,17 +342,25 @@ impl<'a> BlobLocator<'a> {
         uri: &str,
     ) -> Result<(Arc<ObjectStore>, Path)> {
         if base_id == 0 {
+            if self.dataset.session.unregistered_external_blob_policy()
+                == UnregisteredExternalBlobPolicy::Deny
+            {
+                return Err(Error::invalid_input(
+                    "External blob with base_id=0 is not allowed by this session; external blobs must reference a registered storage base",
+                ));
+            }
             let registry = self.dataset.session.store_registry();
             let params = self
                 .dataset
                 .store_params
-                .as_ref()
-                .map(|p| Arc::new((**p).clone()))
-                .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-            return ObjectStore::from_uri_and_params(registry, uri, &params).await;
+                .as_deref()
+                .cloned()
+                .unwrap_or_default();
+            let (store, path) = ObjectStore::from_uri_and_params(registry, uri, &params).await?;
+            return Ok((store.for_external_blobs(), path));
         }
         let root = self.base_root(Some(base_id))?;
-        let store = self.store(Some(base_id)).await?;
+        let store = self.external_store(base_id).await?;
         Ok((store, join_base_and_relative_path(&root, uri)?))
     }
 
@@ -517,6 +528,17 @@ impl<'a> BlobLocator<'a> {
         Ok(root)
     }
 
+    async fn external_store(&mut self, base_id: u32) -> Result<Arc<ObjectStore>> {
+        if let Some(store) = self.external_stores.get(&base_id) {
+            return Ok(store.clone());
+        }
+        // Reuse the resolved base binding, including its credentials, endpoint,
+        // connection pool, and provider-local state. Only wrapping differs.
+        let store = self.store(Some(base_id)).await?.for_external_blobs();
+        self.external_stores.insert(base_id, store.clone());
+        Ok(store)
+    }
+
     async fn store(&mut self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
         let Some(base_id) = base_id else {
             return Ok(self.dataset.object_store.clone());
@@ -561,6 +583,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStdDir;
     use rstest::rstest;
     use std::sync::Arc;
+
+    mod policies;
 
     fn descriptor(
         kind: Option<BlobKind>,

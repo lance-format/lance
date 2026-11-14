@@ -147,9 +147,12 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
 
 /// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
 ///
-/// Address-domain index results are always positive allow-lists (`AtMost`), so
-/// a block-list here would mean a boolean op was applied before translation,
-/// which is unsupported.
+/// Address-domain index results are almost always positive allow-lists
+/// (`AtMost`); a non-empty block-list here would mean a boolean op was
+/// applied before translation, which is unsupported. The one exception is an
+/// empty block-list (`AtLeast(empty)`, e.g. NGram's "cannot tell, scan
+/// everything" result for an untokenizable query): blocking nothing is the
+/// same set of rows in either domain, so it needs no translation.
 async fn translate_addr_mask_to_row_ids(
     dataset: &Dataset,
     mask: NullableRowAddrMask,
@@ -158,6 +161,9 @@ async fn translate_addr_mask_to_row_ids(
         NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
             translate_addr_set_to_row_ids(dataset, set).await?,
         )),
+        NullableRowAddrMask::BlockList(set) if set.is_empty() => {
+            Ok(NullableRowAddrMask::BlockList(set))
+        }
         NullableRowAddrMask::BlockList(_) => Err(Error::internal(
             "cannot translate a block-list address mask to the row-id domain",
         )),
@@ -992,13 +998,20 @@ impl ExecutionPlan for MapIndexExec {
         // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
+        let mut metrics = IndexMetrics::new(&self.metrics, partition);
+        if let Some(scope) = context
+            .session_config()
+            .get_extension::<crate::dataset::write::merge_insert::analysis::AnalysisScope>(
+        ) {
+            metrics = metrics.with_segment_tracking(scope.segments.clone());
+        }
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
             partition,
             self.dataset.clone(),
             self.lookups.clone(),
-            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            Arc::new(metrics),
             self.metrics.clone(),
             candidate_reservation,
         );
@@ -1011,6 +1024,10 @@ impl ExecutionPlan for MapIndexExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -1673,6 +1690,52 @@ mod tests {
             .unwrap();
         assert!(scoped.is_exact());
         assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
+    }
+
+    /// An empty block-list (e.g. NGram's "cannot tell, scan everything" result
+    /// for an untokenizable query -- see `test_basic_ngram_index`'s "too short"
+    /// cases) blocks the same set of rows in either domain, so it passes
+    /// through unchanged; any other block-list is unsupported and must error.
+    #[tokio::test]
+    async fn test_translate_addr_mask_to_row_ids_block_list() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..4).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::empty());
+        let translated = super::translate_addr_mask_to_row_ids(&dataset, empty)
+            .await
+            .unwrap();
+        assert!(matches!(
+            translated,
+            NullableRowAddrMask::BlockList(set) if set.is_empty()
+        ));
+
+        let mut selected = RowAddrTreeMap::new();
+        selected.insert(RowAddress::new_from_parts(0, 0).into());
+        let non_empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::new(
+            selected,
+            RowAddrTreeMap::new(),
+        ));
+        let err = super::translate_addr_mask_to_row_ids(&dataset, non_empty)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot translate a block-list address mask"),
+            "{err}"
+        );
     }
 
     #[rstest]
