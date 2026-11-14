@@ -21,10 +21,10 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Typed/raw composition passed at d5354ac64 (run 43586027417); its strict lint
-      # repair passed at 88b1dd509 (run 43586371430). Reuse that unchanged evidence.
-      - name: Validate admitted constant-page expansion and finite progress
+      # Constant-page expansion passed at da900dc2f (run 43589354880). Reuse that
+      # unchanged evidence; dense rep/def storage now changes shared unraveler internals.
+      - name: Validate admitted dense levels and existing repdef composition
         run: >-
-          cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::constant:: -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --all-features --lib repdef:: -- --nocapture
       - name: Lint touched crate
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

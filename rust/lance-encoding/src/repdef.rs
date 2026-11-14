@@ -125,6 +125,9 @@ use crate::{
 
 pub type LevelBuffer = Vec<u16>;
 
+mod admitted;
+use admitted::Levels;
+
 /// A top-level-row range whose dense rep/def stream fits one mini-block page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MiniBlockRepDefSplit {
@@ -1917,8 +1920,8 @@ impl RepDefBuilder {
 #[derive(Debug)]
 pub struct RepDefUnraveler {
     sparse: Option<SparseStructuralUnraveler>,
-    rep_levels: Option<LevelBuffer>,
-    def_levels: Option<LevelBuffer>,
+    rep_levels: Option<Levels>,
+    def_levels: Option<Levels>,
     // Maps from definition level to the rep level at which that definition level is visible
     levels_to_rep: Vec<u16>,
     def_meaning: Arc<[DefinitionInterpretation]>,
@@ -1971,8 +1974,8 @@ impl RepDefUnraveler {
         }
         Self {
             sparse: None,
-            rep_levels,
-            def_levels,
+            rep_levels: rep_levels.map(Levels::Ordinary),
+            def_levels: def_levels.map(Levels::Ordinary),
             current_def_cmp: 0,
             current_rep_cmp: 0,
             levels_to_rep,
