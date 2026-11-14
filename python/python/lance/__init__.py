@@ -336,8 +336,17 @@ def dataset(
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
+        is_aware = ts_cutoff.tzinfo is not None
         ver_cutoff = max(
-            [v["version"] for v in ds.versions() if v["timestamp"] < ts_cutoff],
+            [
+                v["version"]
+                for v in ds.versions()
+                # Version timestamps are naive local times. An aware cutoff is
+                # compared as an instant, which their fold keeps exact even in a
+                # repeated local hour.
+                if (v["timestamp"].astimezone() if is_aware else v["timestamp"])
+                < ts_cutoff
+            ],
             default=None,
         )
         if ver_cutoff is None:

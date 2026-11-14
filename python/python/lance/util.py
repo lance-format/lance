@@ -60,10 +60,6 @@ def sanitize_ts(ts: ts_types) -> datetime:
         if isinstance(ts, pd.Timestamp):
             ts = ts.to_pydatetime()
     if isinstance(ts, datetime):
-        # Version timestamps are naive local times, so an aware cutoff is
-        # converted to local time before they are compared.
-        if ts.tzinfo is not None:
-            return ts.astimezone().replace(tzinfo=None)
         return ts
     raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
 

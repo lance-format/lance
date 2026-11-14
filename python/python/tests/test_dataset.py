@@ -36,6 +36,7 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.optimize import AutoCleanupConfig
+from lance._dataset.refs import _convert_version_timestamp
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
@@ -723,6 +724,37 @@ def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
         after_cleanup = lance.dataset(tmp_path, asof=cutoff)
         assert after_cleanup.version == 1
         assert after_cleanup.to_table()["x"].to_pylist() == [1]
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is Unix-only")
+def test_asof_aware_cutoff_in_repeated_local_hour(tmp_path: Path, monkeypatch):
+    # In New York, 05:30Z and 06:30Z are both 01:30 local time on 2026-11-01.
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+        for x in (2, 3):
+            lance.write_dataset(pa.table({"x": [x]}), tmp_path, mode="append")
+        versions = [
+            _convert_version_timestamp(
+                {"version": version, "timestamp": int(instant.timestamp()) * 10**9}
+            )
+            for version, instant in enumerate(
+                [
+                    datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                ],
+                start=1,
+            )
+        ]
+        monkeypatch.setattr(lance.LanceDataset, "versions", lambda self: versions)
+
+        cutoff = datetime(2026, 11, 1, 5, 45, tzinfo=timezone.utc)
+        assert lance.dataset(tmp_path, asof=cutoff).version == 2
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 @pytest.mark.parametrize(
