@@ -9,6 +9,7 @@ use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use arrow_array::RecordBatchIterator;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -615,4 +616,62 @@ async fn shared_corpus_binding_accepts_phrase_pair() {
     let owner =
         SharedFtsScorerExec::try_new(branches(vec![consumer, producer]), binding()).unwrap();
     assert_eq!(owner.binding().unwrap(), binding());
+}
+
+#[tokio::test]
+async fn shared_corpus_combined_rejects_different_statistics_domains() {
+    let native = combined_owner().await;
+    let owner = native.downcast_ref::<SharedFtsScorerExec>().unwrap();
+    let state = owner.binding().unwrap();
+    let input = owner.children()[0]
+        .clone()
+        .transform_up(|plan| {
+            if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>() {
+                let node = node
+                    .clone()
+                    .with_covered_fragments(roaring::RoaringBitmap::new())
+                    .with_statistics_fragments(roaring::RoaringBitmap::new())?;
+                return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+            }
+            Ok(Transformed::no(plan))
+        })
+        .unwrap()
+        .data;
+    assert_binding_error(
+        SharedFtsScorerExec::try_new(input, state),
+        "same BM25F statistics domain",
+    );
+}
+
+#[tokio::test]
+async fn shared_corpus_combined_rejects_domain_rewrite_at_execution() {
+    let native = combined_owner().await;
+    let input = native.children()[0]
+        .clone()
+        .transform_up(|plan| {
+            if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>() {
+                let node = node
+                    .clone()
+                    .with_covered_fragments(roaring::RoaringBitmap::new())
+                    .with_statistics_fragments(roaring::RoaringBitmap::new())?;
+                return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+            }
+            Ok(Transformed::no(plan))
+        })
+        .unwrap()
+        .data;
+    // Optimizer child rewrites preserve the owner's scorer identity. Both leaves
+    // remain valid individually, but their statistical domains no longer agree.
+    let rewritten = native
+        .replace_children(
+            vec![input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .unwrap();
+    let error = execute_results(rewritten.as_ref()).await.unwrap_err();
+    assert!(matches!(error, DataFusionError::Plan(_)), "{error}");
+    assert!(
+        error.to_string().contains("same BM25F statistics domain"),
+        "{error}"
+    );
 }

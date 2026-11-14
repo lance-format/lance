@@ -93,6 +93,64 @@ impl DeepSizeOf for Positions {
     }
 }
 
+/// Query-independent state uses the same immutable partition and FRI namespace
+/// as postings. Its retained buffers compete for the existing cache budget.
+pub(super) struct SelectedRowDomainKey {
+    pub selection: Vec<u8>,
+}
+
+impl CacheKey for SelectedRowDomainKey {
+    type ValueType = super::selected_stats::SelectedRowDomain;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("selected-row-domain-{:?}", self.selection).into()
+    }
+
+    fn type_name() -> &'static str {
+        "SelectedRowDomain"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.selected-row-domain", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_bytes(&self.selection);
+    }
+}
+
+/// Selected-row statistics are immutable within the existing index/partition
+/// and fragment-reuse namespace. Candidate filters and field weights are not
+/// statistics inputs. Keep exact selection bytes and ordered terms in the key.
+pub(super) struct SelectedRowStatsKey {
+    pub selection: Vec<u8>,
+    pub terms: Vec<String>,
+}
+
+impl CacheKey for SelectedRowStatsKey {
+    type ValueType = (u64, usize, Vec<usize>);
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("selected-row-stats-{:?}-{:?}", self.selection, self.terms).into()
+    }
+
+    fn type_name() -> &'static str {
+        "SelectedRowStats"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.selected-row-stats", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_bytes(&self.selection);
+        builder.write_u64(self.terms.len() as u64);
+        for term in &self.terms {
+            builder.write_str(term);
+        }
+    }
+}
+
 // Cache key implementations for type-safe cache access
 #[derive(Debug, Clone)]
 pub struct PostingListKey {

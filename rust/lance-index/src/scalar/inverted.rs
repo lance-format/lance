@@ -31,8 +31,9 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 pub use combined::{
-    CombinedCorpusStats, CombinedFieldColumn, FlatFieldStats, build_combined_bm25_scorer,
-    combined_fields_search, flat_combined_fields_search_stream, validate_combined_tokenizers,
+    CombinedCorpusStats, CombinedFieldColumn, CombinedFieldsSearch, FlatFieldStats,
+    build_combined_bm25_scorer, combined_fields_search, flat_combined_fields_search_stream,
+    validate_combined_tokenizers,
 };
 pub use compound::{
     PreparedFtsGlobalStatistics, PreparedFtsQueryLeaf, compound_search,

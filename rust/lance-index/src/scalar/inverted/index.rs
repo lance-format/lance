@@ -116,6 +116,7 @@ mod prewarm;
 mod scheduling;
 mod search;
 mod search_candidates;
+mod selected_stats;
 mod token_set;
 
 pub use cache::*;

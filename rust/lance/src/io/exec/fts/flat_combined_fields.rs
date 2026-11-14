@@ -31,7 +31,7 @@ use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsSearchParams};
 use lance_index::scalar::inverted::{
-    CombinedFieldsBM25Scorer, DocumentGranularity, FTS_SCHEMA, flat_combined_fields_search_stream,
+    CombinedFieldsBM25Scorer, CombinedFieldsSearch, DocumentGranularity, FTS_SCHEMA,
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use tracing::instrument;
@@ -93,17 +93,23 @@ pub enum FlatStatsScope {
 /// if exec.has_shared_scorer() {
 ///     return Err(Error::invalid_input("reconstruct the enclosing corpus owner"));
 /// }
-/// FlatCombinedFieldsExec::try_new(
+/// let rebuilt = FlatCombinedFieldsExec::try_new(
 ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
 ///     exec.children()[0].clone(), exec.scanned_fragments().clone(),
 ///     exec.stats_scope().clone(), exec.emit_prefilter().clone(),
-/// )
+/// )?;
+/// if let Some(domain) = exec.statistics_fragments() {
+///     Ok(rebuilt.with_statistics_fragments(domain.clone())?)
+/// } else {
+///     Ok(rebuilt)
+/// }
 /// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct FlatCombinedFieldsExec {
     dataset: Arc<Dataset>,
     query: CombinedFieldsQuery,
+    statistics_fragments: Option<roaring::RoaringBitmap>,
     /// Tokens `execute()` actually produced, for `analyze_plan`. Single snapshot
     /// for the same reason as [`super::CombinedFieldsQueryExec::tokenized_query`].
     tokenized_query: Arc<OnceLock<TokenizedQuery>>,
@@ -138,6 +144,57 @@ impl DisplayAs for FlatCombinedFieldsExec {
 }
 
 impl FlatCombinedFieldsExec {
+    /// Use the same fixed physical-fragment statistics domain as the indexed
+    /// sibling. The declared scanned fragments and per-column contributions must
+    /// stay inside it. Candidate prefilters do not narrow the statistics domain.
+    /// Stable row IDs and overlay-stale rows are not supported in this mode.
+    ///
+    /// ```
+    /// # use lance::io::exec::fts::FlatCombinedFieldsExec;
+    /// # use datafusion::error::Result;
+    /// # fn configure(exec: FlatCombinedFieldsExec) -> Result<FlatCombinedFieldsExec> {
+    /// exec.with_statistics_fragments(roaring::RoaringBitmap::from_iter([0, 1]))
+    /// # }
+    /// ```
+    pub fn with_statistics_fragments(
+        mut self,
+        fragments: roaring::RoaringBitmap,
+    ) -> DataFusionResult<Self> {
+        self.statistics_fragments = Some(fragments);
+        self.validate_statistics_scope()?;
+        Ok(self)
+    }
+
+    fn validate_statistics_scope(&self) -> DataFusionResult<()> {
+        let Some(scope) = &self.statistics_fragments else {
+            return Ok(());
+        };
+        if self.dataset.manifest().uses_stable_row_ids() {
+            return Err(DataFusionError::Plan(
+                "BM25F fragment statistics require physical row IDs".into(),
+            ));
+        }
+        if !self.scanned_fragments.is_subset(scope) {
+            return Err(DataFusionError::Plan(
+                "BM25F scanned fragments must be contained in the statistics domain".into(),
+            ));
+        }
+        if let FlatStatsScope::PerColumn(coverage) = &self.stats_scope
+            && coverage
+                .iter()
+                .any(|c| !c.stale_rows.is_empty() || !c.fragments.is_subset(scope))
+        {
+            return Err(DataFusionError::Plan("BM25F flat statistics coverage must stay inside the domain without overlay-stale rows".into()));
+        }
+        Ok(())
+    }
+
+    /// The fixed fragment statistics domain. `None` uses the complete corpus;
+    /// `Some(empty)` contributes no indexed rows.
+    pub fn statistics_fragments(&self) -> Option<&roaring::RoaringBitmap> {
+        self.statistics_fragments.as_ref()
+    }
+
     /// Reconstruct a flat BM25F scan with its native corpus and candidate scopes.
     ///
     /// `scanned_fragments` includes fragments read whole and those supplying
@@ -224,6 +281,7 @@ impl FlatCombinedFieldsExec {
         Ok(Self {
             dataset,
             query,
+            statistics_fragments: None,
             tokenized_query: Arc::new(OnceLock::new()),
             params,
             unindexed_input,
@@ -350,6 +408,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
             query: self.query.clone(),
+            statistics_fragments: self.statistics_fragments.clone(),
             tokenized_query: self.tokenized_query.clone(),
             params: self.params.clone(),
             unindexed_input,
@@ -369,7 +428,9 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        self.validate_statistics_scope()?;
         let query = self.query.clone();
+        let statistics_fragments = self.statistics_fragments.clone();
         let tokenized_query = self.tokenized_query.clone();
         let ds = self.dataset.clone();
         let stats_scope = self.stats_scope.clone();
@@ -408,12 +469,14 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             let result = async {
                 let CombinedFieldsScan {
                     columns,
+                    statistics_rows,
                     tokens,
                     tokenizer,
                     ..
                 } = open_combined_fields_scan(
                     &ds,
                     &query,
+                    statistics_fragments.as_ref(),
                     CombinedFieldsIndexRequirement::AtLeastOneColumn,
                     &stale_rows_per_column,
                     &tokenized_query,
@@ -481,21 +544,25 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                     pre_filter.mask()
                 };
 
-                flat_combined_fields_search_stream(
-                    input,
-                    &columns,
-                    doc_col_indices,
-                    &stats_masks,
-                    Some(emit_mask),
-                    matches!(stats_scope, FlatStatsScope::WholeCorpus),
-                    &tokens,
-                    tokenizer,
-                    query.operator(),
-                    target_batch_size,
-                    Some(elapsed_compute),
-                    Some(metrics.as_ref()),
-                )
-                .await
+                let mut search = CombinedFieldsSearch::new(&columns);
+                if let Some(rows) = &statistics_rows {
+                    search = search.with_statistics_rows(rows);
+                }
+                search
+                    .search_flat(
+                        input,
+                        doc_col_indices,
+                        &stats_masks,
+                        Some(emit_mask),
+                        matches!(stats_scope, FlatStatsScope::WholeCorpus),
+                        &tokens,
+                        tokenizer,
+                        query.operator(),
+                        target_batch_size,
+                        Some(elapsed_compute),
+                        Some(metrics.as_ref()),
+                    )
+                    .await
             }
             .await;
 

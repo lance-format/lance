@@ -257,6 +257,66 @@ impl InvertedIndex {
         ))
     }
 
+    /// Exact statistics for a physical-row selection, including whole
+    /// fragments that survive only in the committed index after deletion.
+    pub(crate) async fn selected_row_stats_for_terms(
+        &self,
+        terms: &[String],
+        selection: &RowAddrTreeMap,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        if self.is_legacy() {
+            return Err(Error::not_supported(
+                "selected BM25F statistics require modern DocId-keyed indices",
+            ));
+        }
+        let mut serialized = Vec::with_capacity(selection.serialized_size());
+        selection.serialize_into(&mut serialized)?;
+        let futures = self
+            .partitions
+            .iter()
+            .map(|partition| {
+                let partition = partition.clone();
+                let key = SelectedRowStatsKey {
+                    selection: serialized.clone(),
+                    terms: terms.to_vec(),
+                };
+                async move {
+                    let domain_selection = key.selection.clone();
+                    partition
+                        .inverted_list
+                        .index_cache
+                        .get_or_insert_with_key(key, || async {
+                            partition
+                                .selected_domain_stats_for_terms(
+                                    terms,
+                                    selection,
+                                    &domain_selection,
+                                    metrics,
+                                )
+                                .await
+                        })
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        let stats = stream::iter(futures)
+            .buffer_unordered(self.store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut total_tokens = 0;
+        let mut num_rows = 0;
+        let mut freqs = vec![0; terms.len()];
+        for stats in stats {
+            total_tokens += stats.0;
+            num_rows += stats.1;
+            for (total, part) in freqs.iter_mut().zip(&stats.2) {
+                *total += part;
+            }
+        }
+        Ok((total_tokens, num_rows, freqs))
+    }
+
     /// What the rows an overlay made stale still contribute to this index's
     /// statistics, for the caller to subtract.
     ///

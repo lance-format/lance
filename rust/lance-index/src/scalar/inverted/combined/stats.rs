@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_core::Result;
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowSetOps};
 
 use super::super::query::Tokens;
 use super::super::scorer::CombinedFieldsBM25Scorer;
-use super::{CombinedFieldColumn, unique_terms};
+use super::{CombinedFieldColumn, CombinedFieldsSearch, unique_terms};
 use crate::metrics::MetricsCollector;
 
 /// Per-column corpus contributions of the rows a `combined_fields` flat scan
@@ -166,64 +166,104 @@ pub async fn build_combined_bm25_scorer(
     corpus: CombinedCorpusStats<'_>,
     metrics: Option<&dyn MetricsCollector>,
 ) -> Result<CombinedFieldsBM25Scorer> {
-    let terms = unique_terms(tokens);
-    if let Some(flat) = corpus.flat() {
-        debug_assert_eq!(flat.doc_counts.len(), columns.len());
-        debug_assert!(flat.doc_freqs.iter().all(|df| df.len() == terms.len()));
-    }
-    let mut doc_count = 0usize;
-    let mut sum_total_term_freq = 0f64;
-    let mut doc_freq: HashMap<String, usize> = terms.iter().map(|t| (t.clone(), 0)).collect();
+    CombinedFieldsSearch::new(columns)
+        .build_scorer(tokens, corpus, metrics)
+        .await
+}
 
-    for (column_slot, column) in columns.iter().enumerate() {
-        let mut column_num_docs = 0usize;
-        let mut column_total_tokens = 0u64;
-        let mut column_doc_freq = vec![0usize; terms.len()];
-        if corpus.folds_index_stats() {
-            for index in &column.indices {
-                // Row granularity, not document granularity: `combined_fields_search`
-                // blends every posting a row owns into one `tf'` and every document
-                // length it owns into one `dl'`, and released V1/V2 indexes may hold
-                // one document per list element. See
-                // [`InvertedIndex::bm25_row_stats_for_terms`].
-                let (total_tokens, num_docs, token_docs) = index
-                    .bm25_row_stats_for_terms(&terms, column.stale_rows.as_deref(), metrics)
-                    .await?;
-                column_total_tokens += total_tokens;
-                column_num_docs += num_docs;
-                for (slot, df) in token_docs.into_iter().enumerate() {
+impl CombinedFieldsSearch<'_> {
+    /// Build a scorer for this search's statistics domain. Flat contributions
+    /// must describe the same domain and omit rows already counted by indices.
+    /// See [`build_combined_bm25_scorer`] for blending and metric semantics.
+    pub async fn build_scorer(
+        &self,
+        tokens: &Tokens,
+        corpus: CombinedCorpusStats<'_>,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<CombinedFieldsBM25Scorer> {
+        let columns = self.columns;
+        if self.statistics_rows.is_some()
+            && columns.iter().any(|column| {
+                column
+                    .stale_rows
+                    .as_ref()
+                    .is_some_and(|rows| !rows.is_empty())
+                    || column.indices.iter().any(|index| index.is_legacy())
+            })
+        {
+            return Err(lance_core::Error::not_supported(
+                "selected BM25F statistics require modern indices without overlay-stale rows",
+            ));
+        }
+        let terms = unique_terms(tokens);
+        if let Some(flat) = corpus.flat() {
+            debug_assert_eq!(flat.doc_counts.len(), columns.len());
+            debug_assert!(flat.doc_freqs.iter().all(|df| df.len() == terms.len()));
+        }
+        let mut doc_count = 0usize;
+        let mut sum_total_term_freq = 0f64;
+        let mut doc_freq: HashMap<String, usize> = terms.iter().map(|t| (t.clone(), 0)).collect();
+
+        for (column_slot, column) in columns.iter().enumerate() {
+            let mut column_num_docs = 0usize;
+            let mut column_total_tokens = 0u64;
+            let mut column_doc_freq = vec![0usize; terms.len()];
+            if corpus.folds_index_stats() {
+                for index in &column.indices {
+                    // Row granularity, not document granularity: `combined_fields_search`
+                    // blends every posting a row owns into one `tf'` and every document
+                    // length it owns into one `dl'`, and released V1/V2 indexes may hold
+                    // one document per list element. See
+                    // [`InvertedIndex::bm25_row_stats_for_terms`].
+                    let (total_tokens, num_docs, token_docs) = if let Some(rows) =
+                        self.statistics_rows
+                    {
+                        // Cache exact selected-row statistics in the index cache;
+                        // whole-segment statistics are not a substitute for a shard.
+                        index
+                            .selected_row_stats_for_terms(&terms, rows, metrics)
+                            .await?
+                    } else {
+                        index
+                            .bm25_row_stats_for_terms(&terms, column.stale_rows.as_deref(), metrics)
+                            .await?
+                    };
+                    column_total_tokens += total_tokens;
+                    column_num_docs += num_docs;
+                    for (slot, df) in token_docs.into_iter().enumerate() {
+                        column_doc_freq[slot] += df;
+                    }
+                }
+            }
+            if let Some(flat) = corpus.flat() {
+                column_num_docs += flat.doc_counts[column_slot];
+                column_total_tokens += flat.total_tokens[column_slot];
+                for (slot, df) in flat.doc_freqs[column_slot].iter().enumerate() {
                     column_doc_freq[slot] += df;
                 }
             }
-        }
-        if let Some(flat) = corpus.flat() {
-            column_num_docs += flat.doc_counts[column_slot];
-            column_total_tokens += flat.total_tokens[column_slot];
-            for (slot, df) in flat.doc_freqs[column_slot].iter().enumerate() {
-                column_doc_freq[slot] += df;
+
+            doc_count = doc_count.max(column_num_docs);
+            sum_total_term_freq += column.weight as f64 * column_total_tokens as f64;
+            for (term, df) in terms.iter().zip(column_doc_freq) {
+                let entry = doc_freq
+                    .get_mut(term)
+                    .expect("doc_freq initialized for every term");
+                *entry = (*entry).max(df);
             }
         }
 
-        doc_count = doc_count.max(column_num_docs);
-        sum_total_term_freq += column.weight as f64 * column_total_tokens as f64;
-        for (term, df) in terms.iter().zip(column_doc_freq) {
-            let entry = doc_freq
-                .get_mut(term)
-                .expect("doc_freq initialized for every term");
-            *entry = (*entry).max(df);
-        }
+        let avg_doc_length = if doc_count > 0 {
+            (sum_total_term_freq / doc_count as f64) as f32
+        } else {
+            0.0
+        };
+        Ok(CombinedFieldsBM25Scorer::new(
+            doc_count,
+            avg_doc_length,
+            doc_freq,
+        ))
     }
-
-    let avg_doc_length = if doc_count > 0 {
-        (sum_total_term_freq / doc_count as f64) as f32
-    } else {
-        0.0
-    };
-    Ok(CombinedFieldsBM25Scorer::new(
-        doc_count,
-        avg_doc_length,
-        doc_freq,
-    ))
 }
 
 #[cfg(test)]
@@ -424,6 +464,31 @@ mod tests {
             assert_eq!(docs.doc_length_at(unindexed), 0);
         }
 
+        // Every list element contributes length, but a term counts once per
+        // selected row. Null/empty rows contribute neither length nor count.
+        let selection = RowAddrTreeMap::from_iter([0, 1, 3]);
+        if index.is_legacy() {
+            let error = index
+                .selected_row_stats_for_terms(&["alpha".to_owned()], &selection, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+            assert!(error.to_string().contains("modern DocId-keyed"));
+        } else {
+            for (query, frequencies) in [
+                (vec!["alpha", "absent"], vec![1, 0]),
+                (vec!["beta", "alpha", "beta"], vec![1, 1, 1]),
+            ] {
+                let terms = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
+                assert_eq!(
+                    index
+                        .selected_row_stats_for_terms(&terms, &selection, None)
+                        .await
+                        .unwrap(),
+                    (3, 1, frequencies)
+                );
+            }
+        }
         let terms = ["alpha".to_owned(), "beta".to_owned()];
         assert_eq!(
             index.bm25_stats_for_terms(&terms, None).await.unwrap(),
