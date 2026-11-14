@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.13.0,<0.14"]
+dependencies = ["pyarrow>=18", "lance-namespace>=0.13.0,<0.14"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -47,6 +47,7 @@ requires = ["maturin>=1.4"]
 build-backend = "maturin"
 
 [project.optional-dependencies]
+numpy = ["numpy>=1.22"]
 tests = [
     "boto3",
     "datasets==4.4.0",
