@@ -946,10 +946,7 @@ impl Planner {
                 data_type, value, ..
             }) => {
                 let value = value.clone().into_string().expect_ok()?;
-                let data_type = self.parse_type(data_type)?;
-                if let Some(instant) = timestamp_with_offset(&value, &data_type) {
-                    return Ok(Expr::Literal(instant, None));
-                }
+                let data_type = with_utc_zone_if_offset(&value, self.parse_type(data_type)?);
                 Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
                     Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
                     data_type,
@@ -1386,32 +1383,24 @@ impl Planner {
     }
 }
 
-/// Parses a string with an explicit UTC offset, such as `2024-01-01T12:00:00Z`, into a
-/// UTC timestamp literal of the given zoneless type. Casting the string to that type
-/// instead keeps only its UTC wall time, which a column with a time zone then reads as
-/// local time in its own zone.
-fn timestamp_with_offset(value: &str, data_type: &ArrowDataType) -> Option<ScalarValue> {
+/// Gives a zoneless timestamp type the UTC zone when `value` has an explicit UTC offset,
+/// such as `2024-01-01T12:00:00Z`. Casting the string to the zoneless type keeps only its
+/// UTC wall time, which a column with a time zone then reads as local time in its own
+/// zone, while the zoned type keeps the instant. The result stays a cast rather than a
+/// literal so that DataFusion still coerces it against other column types, such as dates.
+fn with_utc_zone_if_offset(value: &str, data_type: ArrowDataType) -> ArrowDataType {
     let ArrowDataType::Timestamp(unit, None) = data_type else {
-        return None;
+        return data_type;
     };
-    let instant = string_to_datetime(&Utc, value).ok()?;
     // Only a string with its own offset parses to the same instant in every zone.
-    if string_to_datetime(&FixedOffset::east_opt(3600)?, value).ok()? != instant {
-        return None;
-    }
-    let tz = Some(Arc::from("+00:00"));
-    Some(match unit {
-        TimeUnit::Second => ScalarValue::TimestampSecond(Some(instant.timestamp()), tz),
-        TimeUnit::Millisecond => {
-            ScalarValue::TimestampMillisecond(Some(instant.timestamp_millis()), tz)
-        }
-        TimeUnit::Microsecond => {
-            ScalarValue::TimestampMicrosecond(Some(instant.timestamp_micros()), tz)
-        }
-        TimeUnit::Nanosecond => {
-            ScalarValue::TimestampNanosecond(Some(instant.timestamp_nanos_opt()?), tz)
-        }
-    })
+    let has_offset = match (
+        string_to_datetime(&Utc, value),
+        FixedOffset::east_opt(3600).map(|zone| string_to_datetime(&zone, value)),
+    ) {
+        (Ok(utc), Some(Ok(other))) => utc == other,
+        _ => false,
+    };
+    ArrowDataType::Timestamp(unit, has_offset.then(|| Arc::from("+00:00")))
 }
 
 #[cfg(test)]
@@ -2866,6 +2855,31 @@ mod tests {
                 Some(1_704_110_400_000_000),
                 column_tz.map(Arc::from)
             ))
+        );
+    }
+
+    #[rstest]
+    #[case::date32(Arc::new(arrow_array::Date32Array::from(vec![0, 1])) as ArrayRef)]
+    #[case::date64(Arc::new(arrow_array::Date64Array::from(vec![0, 86_400_000])) as ArrayRef)]
+    fn test_date_column_with_offset_timestamp(#[case] dates: ArrayRef) {
+        let batch = RecordBatch::try_from_iter(vec![("d", dates)]).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner
+            .parse_filter("d = TIMESTAMP '1970-01-01T00:00:00Z'")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+
+        assert_eq!(
+            result.as_ref(),
+            &BooleanArray::from(vec![Some(true), Some(false)])
         );
     }
 
