@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::sq_model::extract_sq_build_params;
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
@@ -18,7 +19,6 @@ use lance_index::IndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_index::vector::sq::builder::SQBuildParams;
 use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
@@ -539,15 +539,7 @@ pub fn get_vector_index_params(
             let sq_params = env.get_optional_from_method(
                 &vector_index_params_obj,
                 "getSqParams",
-                |env, sq_obj| {
-                    let num_bits = env.call_method(&sq_obj, "getNumBits", "()S", &[])?.s()? as u16;
-                    let sample_rate = env.get_int_as_usize_from_method(&sq_obj, "getSampleRate")?;
-
-                    Ok(SQBuildParams {
-                        num_bits,
-                        sample_rate,
-                    })
-                },
+                extract_sq_build_params,
             )?;
 
             if let Some(sq_params) = sq_params {

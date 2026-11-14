@@ -23,6 +23,7 @@ import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.RQModel;
 import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
+import org.lance.index.vector.SQModel;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
 import org.lance.ipc.AsyncScanner;
@@ -40,6 +41,8 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -49,6 +52,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -566,42 +570,78 @@ public class VectorIndexTest {
     }
   }
 
-  @Test
-  public void testIvfRqSharedModelEnablesPhysicalMerge(@TempDir Path tempDir) throws Exception {
+  @ParameterizedTest
+  @CsvSource({"IVF_RQ,L2", "IVF_SQ,L2", "IVF_SQ,Cosine", "IVF_SQ,Dot"})
+  public void testSharedModelEnablesPhysicalMerge(
+      IndexType indexType, DistanceType metric, @TempDir Path tempDir) throws Exception {
     try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("ivf_rq_shared_model"));
         Dataset dataset = fixture.create()) {
       List<Fragment> fragments = dataset.getFragments();
       IvfBuildParams training =
           new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(1).build();
       float[] centroids =
-          VectorTrainer.trainIvfCentroids(dataset, TestVectorDataset.vectorColumnName, training);
+          VectorTrainer.trainIvfCentroids(
+              dataset, TestVectorDataset.vectorColumnName, training, metric);
       IvfBuildParams ivf =
           new IvfBuildParams.Builder()
               .setNumPartitions(2)
               .setMaxIters(1)
               .setCentroids(centroids)
               .build();
-      RQModel model = RQModel.fromBytes(RQModel.build(32, (byte) 1).toBytes());
-      RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).setModel(model).build();
-      IndexParams params =
-          IndexParams.builder()
-              .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
-              .build();
+      VectorIndexParams.Builder vectorParams =
+          new VectorIndexParams.Builder(ivf).setDistanceType(metric);
+      if (indexType == IndexType.IVF_RQ) {
+        RQModel model = RQModel.fromBytes(RQModel.build(32, (byte) 1).toBytes());
+        vectorParams.setRqParams(
+            new RQBuildParams.Builder().setNumBits((byte) 1).setModel(model).build());
+      } else {
+        SQModel model =
+            VectorTrainer.trainSqModel(
+                dataset,
+                TestVectorDataset.vectorColumnName,
+                new SQBuildParams.Builder().build(),
+                metric);
+        byte[] bytes = model.toBytes();
+        SQModel restored = SQModel.fromBytes(bytes);
+        assertEquals(32, restored.getDimension());
+        assertEquals(8, restored.getNumBits());
+        assertArrayEquals(bytes, restored.toBytes());
+        Arrays.fill(bytes, (byte) 0);
+        assertArrayEquals(model.toBytes(), restored.toBytes());
+        // A worker with a model must not sample or retrain, even with sampleRate=0.
+        vectorParams.setSqParams(
+            new SQBuildParams.Builder().setSampleRate(0).setModel(restored).build());
+      }
+      IndexParams params = IndexParams.builder().setVectorIndexParams(vectorParams.build()).build();
 
       Index first =
           dataset.createIndex(
-              IndexOptions.builder(
-                      List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+              IndexOptions.builder(List.of(TestVectorDataset.vectorColumnName), indexType, params)
                   .withIndexName(TestVectorDataset.indexName)
                   .withFragmentIds(List.of(fragments.get(0).getId()))
                   .build());
       Index second =
           dataset.createIndex(
-              IndexOptions.builder(
-                      List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+              IndexOptions.builder(List.of(TestVectorDataset.vectorColumnName), indexType, params)
                   .withIndexName(TestVectorDataset.indexName)
                   .withFragmentIds(List.of(fragments.get(1).getId()))
                   .build());
+      float[] key = new float[32];
+      for (int i = 0; i < key.length; i++) {
+        key[i] = 32 + i;
+      }
+      Query query =
+          new Query.Builder()
+              .setColumn(TestVectorDataset.vectorColumnName)
+              .setKey(key)
+              .setDistanceType(metric)
+              .setK(2)
+              .setNprobes(2)
+              .build();
+      dataset.commitExistingIndexSegments(
+          TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, List.of(first, second));
+      Set<Integer> expected = metric == DistanceType.Dot ? Set.of(79, 159) : Set.of(1, 81);
+      assertSharedModelRecall(dataset, query, List.of(first.uuid(), second.uuid()), expected);
       Index merged = dataset.mergeExistingIndexSegments(List.of(first, second));
       assertEquals(
           Set.of(fragments.get(0).getId(), fragments.get(1).getId()),
@@ -613,32 +653,25 @@ public class VectorIndexTest {
                   TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, List.of(merged))
               .size());
 
-      float[] key = new float[32];
-      for (int i = 0; i < key.length; i++) {
-        key[i] = 32 + i;
-      }
-      Query query =
-          new Query.Builder()
-              .setColumn(TestVectorDataset.vectorColumnName)
-              .setKey(key)
-              .setK(2)
-              .setNprobes(2)
-              .build();
-      ScanOptions options =
-          new ScanOptions.Builder().nearest(query).indexSegments(List.of(merged.uuid())).build();
-      try (LanceScanner scanner = dataset.newScan(options);
-          ArrowReader reader = scanner.scanBatches()) {
-        Set<Integer> actual = new HashSet<>();
-        while (reader.loadNextBatch()) {
-          IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
-          for (int row = 0; row < ids.getValueCount(); row++) {
-            actual.add(ids.get(row));
-          }
+      assertSharedModelRecall(dataset, query, List.of(merged.uuid()), expected);
+    }
+  }
+
+  private static void assertSharedModelRecall(
+      Dataset dataset, Query query, List<UUID> segments, Set<Integer> expected) throws Exception {
+    ScanOptions options = new ScanOptions.Builder().nearest(query).indexSegments(segments).build();
+    try (LanceScanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      Set<Integer> actual = new HashSet<>();
+      while (reader.loadNextBatch()) {
+        IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+        for (int row = 0; row < ids.getValueCount(); row++) {
+          actual.add(ids.get(row));
         }
-        assertEquals(2, actual.size());
-        actual.retainAll(Set.of(1, 81));
-        assertTrue(actual.size() >= 1, "Expected Recall@2 >= 0.5, got " + actual.size() / 2.0);
       }
+      assertEquals(2, actual.size());
+      actual.retainAll(expected);
+      assertTrue(actual.size() >= 1, "Expected Recall@2 >= 0.5, got " + actual.size() / 2.0);
     }
   }
 
@@ -777,6 +810,66 @@ public class VectorIndexTest {
       }
     }
     return true;
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"IVF_SQ", "IVF_HNSW_SQ"})
+  public void testSqRejectsDifferentModelsAndInvalidSettings(
+      IndexType indexType, @TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("sq_model_validation"));
+        Dataset dataset = fixture.create()) {
+      String column = TestVectorDataset.vectorColumnName;
+      SQBuildParams defaults = new SQBuildParams.Builder().build();
+      SQModel raw = VectorTrainer.trainSqModel(dataset, column, defaults);
+      SQModel normalized =
+          VectorTrainer.trainSqModel(dataset, column, defaults, DistanceType.Cosine);
+      assertFalse(Arrays.equals(raw.toBytes(), normalized.toBytes()));
+      assertThrows(IllegalArgumentException.class, () -> SQModel.fromBytes(new byte[0]));
+      assertThrows(
+          IllegalArgumentException.class, () -> SQModel.fromBytes(new byte[] {(byte) 255}));
+      for (SQBuildParams invalid :
+          List.of(
+              new SQBuildParams.Builder().setNumBits((short) 4).setModel(raw).build(),
+              new SQBuildParams.Builder().setSampleRate(0).build())) {
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> VectorTrainer.trainSqModel(dataset, column, invalid));
+      }
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> VectorTrainer.trainSqModel(dataset, column, defaults, DistanceType.Hamming));
+      IvfBuildParams training =
+          new IvfBuildParams.Builder().setNumPartitions(1).setMaxIters(1).build();
+      IvfBuildParams ivf =
+          new IvfBuildParams.Builder()
+              .setNumPartitions(1)
+              .setCentroids(VectorTrainer.trainIvfCentroids(dataset, column, training))
+              .build();
+      List<Fragment> fragments = dataset.getFragments();
+      List<SQModel> models = List.of(raw, normalized);
+      List<Index> segments = new ArrayList<>();
+      for (int i = 0; i < 2; i++) {
+        VectorIndexParams.Builder vectorParams =
+            new VectorIndexParams.Builder(ivf)
+                .setSqParams(new SQBuildParams.Builder().setModel(models.get(i)).build());
+        if (indexType == IndexType.IVF_HNSW_SQ) {
+          vectorParams.setHnswParams(new HnswBuildParams.Builder().build());
+        }
+        IndexParams params =
+            IndexParams.builder().setVectorIndexParams(vectorParams.build()).build();
+        segments.add(
+            dataset.createIndex(
+                IndexOptions.builder(List.of(column), indexType, params)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(List.of(fragments.get(i).getId()))
+                    .build()));
+      }
+      RuntimeException error =
+          assertThrows(RuntimeException.class, () -> dataset.mergeExistingIndexSegments(segments));
+      assertTrue(causeChainContains(error, "quantizer"), error.toString());
+    }
   }
 
   private static boolean causeChainContains(Throwable failure, String expected) {
