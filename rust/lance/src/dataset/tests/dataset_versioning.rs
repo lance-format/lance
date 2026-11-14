@@ -2015,6 +2015,38 @@ async fn test_reserve_branch_pins_source_until_completion() {
 }
 
 #[tokio::test]
+async fn test_reserve_branch_pins_latest_version_of_source_branch() {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut dev = dataset.create_branch("dev", 1, None).await.unwrap();
+    dev.append(id_rows(10, 2), None).await.unwrap();
+    let expected = dev.scan().try_into_batch().await.unwrap();
+
+    let reservation = dataset
+        .reserve_branch("child", ("dev", None))
+        .await
+        .unwrap();
+    assert_eq!(reservation.source_branch(), Some("dev"));
+    assert_eq!(reservation.source_version(), 2);
+    dev.append(id_rows(20, 2), None).await.unwrap();
+
+    let child = dataset.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
+    let contents = dataset.branches().get("child").await.unwrap();
+    assert_eq!(contents.parent_branch.as_deref(), Some("dev"));
+    assert_eq!(contents.parent_version, 2);
+}
+
+#[tokio::test]
 async fn test_complete_branch_rejects_a_removed_or_replaced_reservation() {
     let tempdir = TempStrDir::default();
     let mut dataset = Dataset::write(

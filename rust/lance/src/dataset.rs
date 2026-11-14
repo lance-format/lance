@@ -726,6 +726,7 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let reservation = self.reserve_branch(branch, version).await?;
+        // The reservation was just written, so skip complete_branch's ref reread.
         self.clone_reserved_branch(reservation, store_params).await
     }
 
