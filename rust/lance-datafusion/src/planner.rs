@@ -17,6 +17,7 @@ use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::{OffsetBuffer, i256};
 use arrow_cast::cast_with_options;
+use arrow_cast::parse::string_to_datetime;
 use arrow_schema::{
     DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType as ArrowDataType, Field,
     SchemaRef, TimeUnit,
@@ -56,7 +57,7 @@ use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_core::datatypes::{Schema, parse_field_path};
 use lance_core::error::LanceOptionExt;
 
-use chrono::Utc;
+use chrono::{FixedOffset, Utc};
 use lance_core::{Error, Result};
 
 /// Encode a JSON string into a JSONB `LargeBinary` literal expression.
@@ -946,9 +947,13 @@ impl Planner {
                 data_type, value, ..
             }) => {
                 let value = value.clone().into_string().expect_ok()?;
+                let data_type = self.parse_type(data_type)?;
+                if let Some(instant) = timestamp_with_offset(&value, &data_type) {
+                    return Ok(Expr::Literal(instant, None));
+                }
                 Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
                     Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
-                    self.parse_type(data_type)?,
+                    data_type,
                 )))
             }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
@@ -1385,6 +1390,34 @@ impl Planner {
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
         lance_datafusion_exec::expr::column_names_in_expr(expr)
     }
+}
+
+/// Parses a string with an explicit UTC offset, such as `2024-01-01T12:00:00Z`, into a
+/// UTC timestamp literal of the given zoneless type. Casting the string to that type
+/// instead keeps only its UTC wall time, which a column with a time zone then reads as
+/// local time in its own zone.
+fn timestamp_with_offset(value: &str, data_type: &ArrowDataType) -> Option<ScalarValue> {
+    let ArrowDataType::Timestamp(unit, None) = data_type else {
+        return None;
+    };
+    let instant = string_to_datetime(&Utc, value).ok()?;
+    // Only a string with its own offset parses to the same instant in every zone.
+    if string_to_datetime(&FixedOffset::east_opt(3600)?, value).ok()? != instant {
+        return None;
+    }
+    let tz = Some(Arc::from("+00:00"));
+    Some(match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(Some(instant.timestamp()), tz),
+        TimeUnit::Millisecond => {
+            ScalarValue::TimestampMillisecond(Some(instant.timestamp_millis()), tz)
+        }
+        TimeUnit::Microsecond => {
+            ScalarValue::TimestampMicrosecond(Some(instant.timestamp_micros()), tz)
+        }
+        TimeUnit::Nanosecond => {
+            ScalarValue::TimestampNanosecond(Some(instant.timestamp_nanos_opt()?), tz)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2751,6 +2784,95 @@ mod tests {
             let result = result.into_array(batch.num_rows()).unwrap();
             assert_eq!(&expected, &result, "unexpected result for {}", expression);
         }
+    }
+
+    // 12:00:00 to 12:00:05 UTC, which is 07:00:00 to 07:00:05 in New York.
+    #[rstest]
+    #[case::utc_designator("ts >= TIMESTAMP '2024-01-01T12:00:03Z'", [3, 4, 5])]
+    #[case::numeric_offset("ts >= TIMESTAMP '2024-01-01 17:00:03+05:00'", [3, 4, 5])]
+    #[case::second_precision("ts = TIMESTAMP(0) '2024-01-01T12:00:02.9Z'", [2])]
+    #[case::in_list("ts IN (TIMESTAMP '2024-01-01T12:00:01Z', TIMESTAMP '2024-01-01T12:00:04Z')", [1, 4])]
+    #[case::between(
+        "ts BETWEEN TIMESTAMP '2024-01-01T11:00:00-01:00' AND TIMESTAMP '2024-01-01T12:00:01Z'",
+        [0, 1]
+    )]
+    #[case::no_offset_is_column_local_time("ts >= TIMESTAMP '2024-01-01 07:00:04'", [4, 5])]
+    fn test_sql_comparison_with_zoned_timestamp<const N: usize>(
+        #[case] filter: &str,
+        #[case] expected_rows: [usize; N],
+    ) {
+        let start = 1_704_110_400_000_000_i64;
+        let ts = TimestampMicrosecondArray::from_iter_values((0..6).map(|i| start + i * 1_000_000))
+            .with_timezone("America/New_York");
+        let batch = RecordBatch::try_from_iter(vec![("ts", Arc::new(ts) as ArrayRef)]).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+
+        let expected = BooleanArray::from_iter((0..6).map(|i| Some(expected_rows.contains(&i))));
+        assert_eq!(result.as_ref(), &expected, "unexpected result for {filter}");
+    }
+
+    #[test]
+    fn test_timestamp_with_offset_does_not_cast_zoned_column() {
+        let column_type =
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into()));
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            column_type,
+            true,
+        )])));
+
+        let expr = planner
+            .parse_filter("ts >= TIMESTAMP '2024-01-01T12:00:00Z'")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+
+        assert_eq!(
+            expr,
+            col("ts").gt_eq(lit(ScalarValue::TimestampMicrosecond(
+                Some(1_704_110_400_000_000),
+                Some("America/New_York".into())
+            )))
+        );
+    }
+
+    // How `UpdateBuilder::set` turns a value into a column's type.
+    #[rstest]
+    #[case::zoned_column(Some("America/New_York"))]
+    #[case::zoneless_column(None)]
+    fn test_timestamp_with_offset_cast_to_column(#[case] column_tz: Option<&str>) {
+        let column_type = DataType::Timestamp(TimeUnit::Microsecond, column_tz.map(Arc::from));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            column_type.clone(),
+            true,
+        )]));
+        let planner = Planner::new(schema.clone());
+        let df_schema = DFSchema::try_from(schema.as_ref().clone()).unwrap();
+
+        let expr = planner
+            .parse_expr("TIMESTAMP '2024-01-01T17:00:00+05:00'")
+            .unwrap()
+            .cast_to(&column_type, &df_schema)
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+
+        assert_eq!(
+            expr,
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(1_704_110_400_000_000),
+                column_tz.map(Arc::from)
+            ))
+        );
     }
 
     #[test]
