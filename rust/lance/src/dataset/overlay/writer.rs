@@ -614,6 +614,7 @@ mod tests {
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::Field as ArrowField;
+    use arrow_schema::Fields;
     use lance_file::version::LanceFileVersion;
     use rstest::rstest;
     use tempfile::{TempDir, tempdir};
@@ -1283,8 +1284,13 @@ mod tests {
         assert_eq!(rows[5], (5, Some(-6), Some(500)));
     }
 
-    fn nested_array_with_validity(a: Vec<i32>, b: Vec<i32>, nulls: Option<NullBuffer>) -> ArrayRef {
-        let field = |name| Arc::new(ArrowField::new(name, DataType::Int32, true));
+    fn nested_array_with_validity(
+        a: Vec<i32>,
+        b: Vec<i32>,
+        nulls: Option<NullBuffer>,
+        children_nullable: bool,
+    ) -> ArrayRef {
+        let field = |name| Arc::new(ArrowField::new(name, DataType::Int32, children_nullable));
         Arc::new(StructArray::new(
             vec![field("a"), field("b")].into(),
             vec![
@@ -1296,7 +1302,7 @@ mod tests {
     }
 
     fn nested_array(a: Vec<i32>, b: Vec<i32>) -> ArrayRef {
-        nested_array_with_validity(a, b, None)
+        nested_array_with_validity(a, b, None, true)
     }
 
     /// One four-row fragment of `val` = 0..4 and `nested: struct<a: i32, b: i32>`
@@ -1305,11 +1311,12 @@ mod tests {
     /// `nested` is non-nullable because these tests do not exercise struct
     /// validity replacement.
     async fn nested_dataset() -> (TempDir, Arc<Dataset>) {
-        nested_dataset_with_nullable_struct(false, None).await
+        nested_dataset_with_nullable_struct(false, true, None).await
     }
 
     async fn nested_dataset_with_nullable_struct(
         nullable: bool,
+        children_nullable: bool,
         data_storage_version: Option<LanceFileVersion>,
     ) -> (TempDir, Arc<Dataset>) {
         let test_dir = tempdir().unwrap();
@@ -1322,6 +1329,7 @@ mod tests {
                     (0..4).collect(),
                     (0..4).map(|v| v * 10).collect(),
                     nullable.then(|| NullBuffer::from(vec![false, true, true, true])),
+                    children_nullable,
                 ),
                 nullable,
             ),
@@ -1344,13 +1352,19 @@ mod tests {
         (test_dir, dataset)
     }
 
+    /// An overlay replaces a struct's validity, filling in row 0 (null in the
+    /// base) and nulling row 1. With required children, the null cell has to
+    /// mask the merged child values before the struct is rebuilt, or arrow
+    /// rejects it ("Found unmasked nulls for non-nullable StructArray field").
     #[rstest]
-    #[case::v2_1(LanceFileVersion::V2_1)]
-    #[case::v2_2(LanceFileVersion::V2_2)]
-    #[case::v2_3(LanceFileVersion::V2_3)]
     #[tokio::test]
-    async fn test_nullable_struct_validity_is_replaced(#[case] version: LanceFileVersion) {
-        let (_test_dir, dataset) = nested_dataset_with_nullable_struct(true, Some(version)).await;
+    async fn test_nullable_struct_validity_is_replaced(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+        #[values(true, false)] children_nullable: bool,
+    ) {
+        let (_test_dir, dataset) =
+            nested_dataset_with_nullable_struct(true, children_nullable, Some(version)).await;
         let nested_id = field_id(&dataset, "nested");
         let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
         writer
@@ -1363,6 +1377,7 @@ mod tests {
                         vec![-7, -8],
                         vec![-70, -80],
                         Some(NullBuffer::from(vec![true, false])),
+                        children_nullable,
                     ),
                 )],
             ))
@@ -1381,9 +1396,161 @@ mod tests {
         assert!(nested.is_valid(0));
         assert!(nested.is_null(1));
         assert!(nested.is_valid(2));
+        assert!(nested.is_valid(3));
         let a = nested.column(0).as_primitive::<Int32Type>();
         let b = nested.column(1).as_primitive::<Int32Type>();
         assert_eq!((a.value(0), b.value(0)), (-7, -70));
+        assert_eq!((a.value(2), b.value(2)), (2, 20));
+    }
+
+    /// `outer: struct<middle: struct<a: i32>>` where `outer` is nullable, `a` is
+    /// required, and `middle` is required unless `middle_nullable` is set.
+    fn double_nested_array(
+        a: Vec<i32>,
+        outer_nulls: Option<NullBuffer>,
+        middle_nulls: Option<NullBuffer>,
+        middle_nullable: bool,
+    ) -> ArrayRef {
+        let middle_fields =
+            Fields::from(vec![Arc::new(ArrowField::new("a", DataType::Int32, false))]);
+        let middle: ArrayRef = Arc::new(
+            StructArray::try_new(
+                middle_fields.clone(),
+                vec![Arc::new(Int32Array::from(a)) as ArrayRef],
+                middle_nulls,
+            )
+            .unwrap(),
+        );
+        let outer_fields = Fields::from(vec![Arc::new(ArrowField::new(
+            "middle",
+            DataType::Struct(middle_fields),
+            middle_nullable,
+        ))]);
+        Arc::new(StructArray::try_new(outer_fields, vec![middle], outer_nulls).unwrap())
+    }
+
+    /// Two four-row fragments of `id` and `outer: struct<middle: struct<a: i32>>`.
+    /// Row 0 of fragment 0 has `outer` NULL, so `middle` and `a` are NULL under it;
+    /// every other row is valid. Fragment 1 holds values 100.. so an overlay leaking
+    /// across fragments is caught.
+    async fn double_nested_dataset(
+        middle_nullable: bool,
+        data_storage_version: LanceFileVersion,
+    ) -> (TempDir, Arc<Dataset>) {
+        let test_dir = tempdir().unwrap();
+        let uri = test_dir.path().to_str().unwrap().to_string();
+        let mut a = (0..4).collect::<Vec<_>>();
+        a.extend(100..104);
+        let valid = || NullBuffer::from((0..8).map(|row| row != 0).collect::<Vec<_>>());
+        let base = RecordBatch::try_from_iter_with_nullable(vec![
+            ("id", int32((0..8).map(Some).collect()), true),
+            (
+                "outer",
+                double_nested_array(a, Some(valid()), Some(valid()), middle_nullable),
+                true,
+            ),
+        ])
+        .unwrap();
+        let arrow_schema = base.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(base)], arrow_schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &uri,
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    max_rows_per_group: 4,
+                    data_storage_version: Some(data_storage_version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        (test_dir, dataset)
+    }
+
+    /// Every row and validity bit the overlay in
+    /// `test_required_inner_struct_validity_is_replaced` can affect, read through
+    /// whichever handle is passed in.
+    async fn assert_double_nested_overlay_rows(dataset: &Dataset) {
+        let batch = dataset
+            .scan()
+            .project(&["id", "outer"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        assert_eq!(
+            (0..8).map(|row| ids.value(row)).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        let outer = batch["outer"].as_struct();
+        assert!(outer.is_valid(0));
+        assert!(outer.is_null(1));
+        assert!(outer.is_valid(2));
+        assert!(outer.is_valid(3));
+        let middle = outer.column(0).as_struct();
+        assert!(middle.is_valid(0));
+        assert!(middle.is_null(1));
+        assert!(middle.is_valid(2));
+        assert!(middle.is_valid(3));
+        let a = middle.column(0).as_primitive::<Int32Type>();
+        assert_eq!(a.value(0), -7);
+        assert_eq!(a.value(2), 2);
+        assert_eq!(a.value(3), 3);
+        // Fragment 1 is not covered by the overlay: values and validity stay unchanged.
+        for row in 4..8 {
+            assert!(outer.is_valid(row));
+            assert!(middle.is_valid(row));
+            assert!(a.is_valid(row));
+        }
+        assert_eq!(a.value(4), 100);
+        assert_eq!(a.value(5), 101);
+        assert_eq!(a.value(6), 102);
+        assert_eq!(a.value(7), 103);
+    }
+
+    /// An overlay replaces the validity of a struct whose required child is itself a
+    /// struct. Restoring the outer struct before the inner one would build an illegal
+    /// intermediate: the required `middle` still carries the base null on the row the
+    /// overlay makes valid, which arrow rejects. `middle_nullable = true` is the
+    /// control, since the required-child check does not apply to it.
+    #[rstest]
+    #[tokio::test]
+    async fn test_required_inner_struct_validity_is_replaced(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        version: LanceFileVersion,
+        #[values(false, true)] middle_nullable: bool,
+    ) {
+        let (_test_dir, dataset) = double_nested_dataset(middle_nullable, version).await;
+        let outer_id = field_id(&dataset, "outer");
+        let mut writer = open_writer_on(&dataset, 0, &[outer_id]).await;
+        writer
+            .write_batch(&batch(
+                0,
+                &[0, 1],
+                vec![(
+                    "outer",
+                    double_nested_array(
+                        vec![-7, 0],
+                        Some(NullBuffer::from(vec![true, false])),
+                        Some(NullBuffer::from(vec![true, false])),
+                        middle_nullable,
+                    ),
+                )],
+            ))
+            .await
+            .unwrap();
+        let committed = commit(dataset, writer.finish().await.unwrap().unwrap()).await;
+        // The commit handle may still serve readers from write-side state. Reopen the
+        // published version so the persisted struct columns go through the normal read
+        // path as well, and assert both handles against the same oracle.
+        let reopened = Dataset::open(committed.uri()).await.unwrap();
+        for dataset in [&committed, &reopened] {
+            assert_double_nested_overlay_rows(dataset).await;
+        }
     }
 
     #[tokio::test]

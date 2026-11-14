@@ -278,7 +278,7 @@ pub async fn spilling_table_provider_with_job_disk_manager(
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
     // while later readers replay the complete source.
-    let drain_handle = tokio::task::spawn(async move {
+    let drain_handle = lance_core::utils::tokio::spawn(async move {
         let mut errored = false;
         while let Some(res) = source.next().await {
             match res {
@@ -317,11 +317,11 @@ pub async fn spilling_table_provider_with_job_disk_manager(
 }
 
 struct AbortOnDropHandle<T> {
-    handle: tokio::task::JoinHandle<T>,
+    handle: lance_core::utils::tokio::JoinHandle<T>,
 }
 
 impl<T> AbortOnDropHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    fn new(handle: lance_core::utils::tokio::JoinHandle<T>) -> Self {
         Self { handle }
     }
 }
@@ -889,11 +889,12 @@ impl AsyncStreamReader {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Int32Array;
+    use arrow_array::{Int32Array, record_batch};
     use arrow_schema::{DataType, Field};
     use datafusion::execution::{disk_manager::DiskManagerBuilder, runtime_env::RuntimeEnvBuilder};
     use futures::{StreamExt, TryStreamExt, poll};
     use lance_core::utils::tempfile::{TempStdFile, TempStdPath};
+    use rstest::rstest;
     use tokio::sync::{Barrier, oneshot};
 
     use super::*;
@@ -1000,6 +1001,53 @@ mod tests {
             0
         );
         assert_eq!(stream.try_collect::<Vec<_>>().await.unwrap(), vec![batch]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_materialize_stream_shared_slices(#[values(false, true)] distinct: bool) {
+        let batch = record_batch!(("a", Int32, (0..128).collect::<Vec<_>>())).unwrap();
+        let memory_limit = batch["a"].to_data().buffers()[0].capacity();
+        let mut batches = (0..128)
+            .step_by(32)
+            .map(|offset| batch.slice(offset, 32))
+            .collect::<Vec<_>>();
+        if distinct {
+            batches.push(record_batch!(("a", Int32, (0..128).collect::<Vec<_>>())).unwrap());
+        }
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(batches.clone().into_iter().map(Ok)),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (materialized, _) =
+            materialize_replayable_stream(source, runtime.clone(), memory_limit, "shared slices")
+                .await
+                .unwrap();
+        assert_eq!(
+            matches!(
+                materialized.storage,
+                MaterializedStreamStorage::Spill { .. }
+            ),
+            distinct
+        );
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            usize::from(distinct)
+        );
+        assert_eq!(
+            materialized
+                .read()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            batches
+        );
     }
 
     #[tokio::test]

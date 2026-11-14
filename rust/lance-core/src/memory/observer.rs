@@ -16,9 +16,9 @@ use crate::{Error, Result};
 /// Environment variable that turns memory observation on.
 ///
 /// It takes a boolean such as `1`/`0`, `true`/`false`, `on`/`off` or
-/// `yes`/`no`, in any case; unset or empty means off. Any other value fails
-/// the operation that would be observed with an invalid-input error. The
-/// variable is read once per process, when Lance first needs it.
+/// `yes`/`no`, in any case; unset or empty means off. Any other value makes
+/// index builds fail with an invalid-input error, and no memory metric is
+/// reported. The variable is read once per process, when Lance first needs it.
 pub const OBSERVE_ENV_VAR: &str = "LANCE_MEMORY_OBSERVE";
 
 /// How often the process-wide sampler reads memory while a window is open.
@@ -50,14 +50,28 @@ pub(super) fn observe_flag() -> Result<bool> {
     OBSERVE_FLAG.clone().map_err(Error::invalid_input)
 }
 
-/// Logs once that the switch is on where observation cannot run.
+/// Whether [`OBSERVE_ENV_VAR`] turns observation on, without the error: cheap
+/// enough for paths that create many objects. An invalid value counts as off.
+#[cfg(feature = "metrics")]
+pub(super) fn observing() -> bool {
+    matches!(*OBSERVE_FLAG, Ok(true))
+}
+
+/// Logs once that the switch is on where the process cannot be read.
 pub(super) fn warn_unsupported() {
     static UNSUPPORTED: Once = Once::new();
     UNSUPPORTED.call_once(|| {
-        tracing::warn!(
-            "{OBSERVE_ENV_VAR} is set, but memory observation needs Linux and the `metrics` \
-             feature; it stays off"
-        );
+        if cfg!(feature = "metrics") {
+            tracing::warn!(
+                "{OBSERVE_ENV_VAR} is set, but the process gauges and the index build peaks \
+                 need Linux and stay off; lance_memory_component_bytes is still reported"
+            );
+        } else {
+            tracing::warn!(
+                "{OBSERVE_ENV_VAR} is set, but Lance is built without the `metrics` feature, \
+                 so no memory metric is reported"
+            );
+        }
     });
 }
 
@@ -178,9 +192,8 @@ impl MemoryObserver {
     /// The process-wide observer, or `None` unless [`OBSERVE_ENV_VAR`] turns
     /// observation on.
     ///
-    /// Observation also needs Linux and the `metrics` feature, the only
-    /// consumer so far; without them this logs a warning once and returns
-    /// `None`.
+    /// Observation also needs Linux; elsewhere this logs a warning once and
+    /// returns `None`.
     ///
     /// # Errors
     ///
@@ -199,7 +212,7 @@ impl MemoryObserver {
         if !observe_flag()? {
             return Ok(None);
         }
-        if !cfg!(all(feature = "metrics", target_os = "linux")) {
+        if !cfg!(target_os = "linux") {
             warn_unsupported();
             return Ok(None);
         }

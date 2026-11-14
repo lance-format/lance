@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Fields};
 use async_trait::async_trait;
 use datafusion_execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
@@ -19,7 +19,10 @@ use lance_core::{
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
-use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+use crate::scalar::{
+    CreatedIndex, IndexStore, ScalarIndex,
+    expression::{ScalarIndexPlanner, ScalarQueryParser},
+};
 use lance_index_core::remapping::BatchRowIdRemapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
@@ -230,6 +233,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_name: String,
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>>;
+
+    /// Returns a planner for an index keyed on more than one column
+    ///
+    /// `keys` holds the key columns in key order, each named by its field path. The
+    /// default returns None, so the index takes no part in query optimization. The
+    /// [`ScalarIndexPlanner`] docs have an example planner. Lance never calls this
+    /// method for a dataset on legacy V1 storage.
+    fn new_planner(
+        &self,
+        _index_name: String,
+        _index_details: &prost_types::Any,
+        _keys: &Fields,
+    ) -> Option<Box<dyn ScalarIndexPlanner>> {
+        None
+    }
 
     /// Load an index from storage
     ///

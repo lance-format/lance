@@ -25,20 +25,16 @@ use std::{
     time::Duration,
 };
 
-use common::{BATCH_SIZE, LOW_CARDINALITY_COUNT, NUM_BATCHES, TOTAL_ROWS};
+use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
-use arrow::datatypes::{Int64Type, UInt64Type};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Fields, SortOptions};
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{Expr, col, lit};
 use futures::TryStreamExt;
-use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
-use lance_datafusion_exec::datagen::DatafusionDatagenExt;
-use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
@@ -933,15 +929,8 @@ async fn ordered_first_k(
     rows.min(ORDERED_FIRST_K)
 }
 
-/// Training reads `_rowaddr`, which the generators in `common` do not write.
 async fn create_int_unique_row_addr_index(tempdir: &tempfile::TempDir) -> Arc<dyn ScalarIndex> {
-    let stream = gen_batch()
-        .col("value", array::step::<Int64Type>())
-        .col(ROW_ADDR, array::step::<UInt64Type>())
-        .into_df_stream(
-            RowCount::from(BATCH_SIZE),
-            BatchCount::from(NUM_BATCHES as u32),
-        );
+    let stream = common::generate_int_unique_stream();
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(ObjectStore::local()),
         Path::from_filesystem_path(tempdir.path()).unwrap(),

@@ -22,7 +22,10 @@ pub use clustering::{
     refuse_key_fields_that_changed_identity, same_field_identity, validate_clustering,
 };
 pub use fragment::*;
-pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
+pub use index::{
+    IndexFile, IndexMetadata, index_details_are_row_addrs, index_metadata_codec,
+    list_index_files_with_sizes,
+};
 
 pub(crate) use manifest::pb_manifest_without_fragments;
 pub use manifest::{
@@ -54,6 +57,20 @@ pub mod pb {
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
     include!("pb/lance.table.rs");
+}
+
+/// The `lance.transaction` package: the V2 action vocabulary and the building blocks it
+/// shares with legacy operations in `pb::transaction`.
+pub mod pb_actions {
+    #![allow(clippy::all)]
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(unused)]
+    #![allow(improper_ctypes)]
+    #![allow(clippy::upper_case_acronyms)]
+    #![allow(clippy::use_self)]
+    include!("pb/lance.transaction.rs");
 }
 
 /// These version/magic values are written at the end of manifest files (e.g. versions/1.version)
