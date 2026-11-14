@@ -48,6 +48,7 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+pub mod list_element;
 #[cfg(test)]
 pub(crate) mod lookup_test_util;
 pub mod minhash_lsh;
@@ -501,6 +502,13 @@ impl AnyQuery for TextQuery {
             Some(o) => self == o,
             None => false,
         }
+    }
+
+    fn reports_null_rows(&self) -> bool {
+        // The FM index skips NULL text rows at build time, so it answers
+        // `contains` on a NULL row with FALSE rather than NULL. N-gram searches
+        // are always rechecked, so they are never negated either way.
+        false
     }
 }
 

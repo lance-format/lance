@@ -313,6 +313,11 @@ pub async fn assert_merge_preserves_covering(
         "merge_segments must neither drop the covering declaration nor \
          produce an uncommittable one"
     );
+    assert!(
+        !merged.requires_independent_contract(),
+        "merge_segments must keep the suffix layout; a truncated `fields` \
+         would commit as keys-only and fence older readers out of the table"
+    );
 }
 
 pub fn all_fragment_ids(dataset: &Dataset) -> Vec<u32> {
@@ -695,6 +700,7 @@ pub fn two_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'stat
 pub enum UnreadableIndexKind {
     NewerVersion,
     UnknownType,
+    ReservedField,
 }
 
 /// Make `index_name` unreadable to this build, and give it the full fragment
@@ -723,6 +729,9 @@ pub async fn hide_index_as(dataset: &mut Dataset, index_name: &str, kind: Unread
                 type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
                 value: Vec::new(),
             }));
+        }
+        UnreadableIndexKind::ReservedField => {
+            unreadable[0].fields = vec![lance_table::format::ROW_ID_FIELD_ID];
         }
     }
     unreadable[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
@@ -895,4 +904,58 @@ impl WrappingObjectStore for RequestIndexStoreWrapper {
     ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
         None
     }
+}
+
+pub async fn write_btree_table(
+    uri: &str,
+    indexed: &[&str],
+    params: Option<WriteParams>,
+) -> Dataset {
+    let data = gen_batch()
+        .col("a", array::step::<Int32Type>())
+        .col("b", array::step::<Int32Type>())
+        .col("c", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, uri, params).await.unwrap();
+    for column in indexed {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+pub fn redeclare_covering(
+    dataset: &Dataset,
+    plain: &IndexMetadata,
+    fields: Vec<i32>,
+    covering_fields: Vec<i32>,
+) -> Transaction {
+    Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                fields,
+                covering_fields,
+                ..plain.clone()
+            }],
+            removed_indices: vec![plain.clone()],
+        },
+        None,
+    )
+}
+
+pub fn covering_bits(dataset: &Dataset) -> (u64, u64) {
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    (
+        dataset.manifest.reader_feature_flags & covering,
+        dataset.manifest.writer_feature_flags & covering,
+    )
 }

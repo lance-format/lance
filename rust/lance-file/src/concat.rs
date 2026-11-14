@@ -23,7 +23,7 @@ use lance_arrow::FieldExt;
 use lance_core::{
     Error, Result,
     cache::LanceCache,
-    datatypes::{BLOB_V2_DESC_LANCE_FIELD, BlobHandling, BlobKind, Field, Schema},
+    datatypes::{BlobHandling, BlobKind, Schema},
 };
 use lance_encoding::decoder::{ColumnInfo, DecoderPlugins, FilterExpression, PageInfo};
 use lance_io::{ReadBatchParams, scheduler::FileScheduler, traits::Writer as ObjectWriter};
@@ -157,7 +157,7 @@ impl DataFilePart {
     ) -> Result<Self> {
         validate_blob_id_range(blob_ids.as_ref())?;
         let metadata = Arc::new(FileReader::read_all_metadata(&input.scheduler()).await?);
-        let schema = Arc::new(normalize_blob_footer_schema(metadata.file_schema.as_ref()));
+        let schema = metadata.file_schema.clone();
         if let Some(expected_num_rows) = input.expected_num_rows
             && metadata.num_rows != expected_num_rows
         {
@@ -239,67 +239,6 @@ fn descriptor_projection_schema(schema: &Schema) -> Schema {
         .map(|field| BlobHandling::BlobsDescriptions.unload_if_needed(field))
         .collect();
     projected
-}
-
-fn descriptor_child_matches(field: &Field, expected: &Field) -> bool {
-    field.id == -1
-        && field.parent_id == -1
-        && field.name == expected.name
-        && field.logical_type == expected.logical_type
-        && field.children.is_empty()
-}
-
-fn attach_blob_descriptor_children(
-    fields: &mut [Field],
-    descriptor_children: &mut VecDeque<Vec<Field>>,
-) {
-    for field in fields {
-        if field.is_blob() && field.children.is_empty() {
-            if let Some(children) = descriptor_children.pop_front() {
-                field.children = children;
-            }
-        } else {
-            attach_blob_descriptor_children(&mut field.children, descriptor_children);
-        }
-    }
-}
-
-/// Blob descriptor children historically use anonymous field IDs in the file
-/// descriptor. Reconstruct their tree shape before applying ordinary schema
-/// projection rules. This interprets the existing footer representation and
-/// does not add persisted metadata or alter the file grammar.
-fn normalize_blob_footer_schema(schema: &Schema) -> Schema {
-    let expected = &BLOB_V2_DESC_LANCE_FIELD.children;
-    let missing_descriptor_count = schema
-        .fields_pre_order()
-        .filter(|field| field.is_blob() && field.children.is_empty())
-        .count();
-    if missing_descriptor_count == 0 {
-        return schema.clone();
-    }
-    let mut normalized = schema.clone();
-    let mut descriptor_children = VecDeque::new();
-    let mut field_index = 0;
-    while descriptor_children.len() < missing_descriptor_count
-        && field_index + expected.len() <= normalized.fields.len()
-    {
-        if normalized.fields[field_index..field_index + expected.len()]
-            .iter()
-            .zip(expected)
-            .all(|(field, expected)| descriptor_child_matches(field, expected))
-        {
-            descriptor_children.push_back(
-                normalized
-                    .fields
-                    .drain(field_index..field_index + expected.len())
-                    .collect(),
-            );
-        } else {
-            field_index += 1;
-        }
-    }
-    attach_blob_descriptor_children(&mut normalized.fields, &mut descriptor_children);
-    normalized
 }
 
 fn validate_blob_id_range(blob_ids: Option<&Range<u32>>) -> Result<()> {
