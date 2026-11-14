@@ -21,13 +21,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # At 456cb524d, 15 compressed-level cases and both API examples passed;
-      # 30 unchanged codec cases passed at b74fa2789. The no-default-features
-      # build then found missing existing bitpacking gates. Reuse those passes.
-      - name: Check capability without bitpacking
-        run: cargo check --profile ci --locked -p lance-encoding --no-default-features --lib
-      - name: Validate optional codec boundaries
-        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --test optional_bitpacking
+      # Reuse the completed Flat/bitpacked and optional ALP evidence. Exercise
+      # the new RLE framing, ownership and structural composition at this head.
+      - name: Validate admitted RLE structural levels
+        run: cargo test --profile ci --locked -p lance-encoding --lib admitted_rle -- --nocapture
+      - name: Validate RLE without optional codecs
+        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --test optional_bitpacking rle_level_admission_requires_no_optional_codec
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

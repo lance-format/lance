@@ -13,6 +13,8 @@ use crate::{
     encodings::physical::value::ValueDecompressor, format::metadata,
 };
 
+mod admitted_rle;
+
 fn owned_input(bytes: &[u8], unaligned: bool, work: &mut Reservation) -> (LanceBuffer, usize) {
     let start = if unaligned { 1 } else { 64 };
     let physical = start + bytes.len() + 37;

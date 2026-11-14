@@ -9,6 +9,10 @@ use lance_core::{
 };
 
 use crate::buffer::LanceBuffer;
+use crate::encodings::physical::rle::RunLengthWidth;
+
+mod rle;
+use rle::RleLevelPlan;
 
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{ELEMS_PER_CHUNK, out_of_line_payload_byte_lengths};
@@ -18,6 +22,7 @@ use lance_bitpacking::BitPacking;
 #[derive(Debug)]
 enum Layout {
     Flat,
+    Rle(RleLevelPlan),
     #[cfg(feature = "bitpacking")]
     Bitpacked {
         width: usize,
@@ -33,6 +38,9 @@ enum Layout {
 /// output keeps its reservation; alignment/tail scratch returns to the same
 /// workspace before the method returns. Metadata and allocator overhead are
 /// excluded. Planning never decompresses or allocates payload buffers.
+/// Flat-child RLE validates all run lengths before admission and expands directly
+/// into output, including when its frame is unaligned. Compressed RLE children
+/// remain unsupported; they must not use an unaccounted ordinary decoder.
 ///
 /// ```
 /// use lance_core::utils::allocation::AllocationBudget;
@@ -89,6 +97,21 @@ impl<'a> LevelDecodePlan<'a> {
             output_bytes,
             workspace_bytes: output_bytes,
             layout: Layout::Flat,
+        })
+    }
+
+    pub(crate) fn rle(
+        data: &'a LanceBuffer,
+        num_values: u64,
+        width: RunLengthWidth,
+    ) -> Result<Self> {
+        let output_bytes = Self::output_layout(num_values)?;
+        let layout = RleLevelPlan::new(data, num_values, width)?;
+        Ok(Self {
+            data,
+            output_bytes,
+            workspace_bytes: output_bytes,
+            layout: Layout::Rle(layout),
         })
     }
 
@@ -159,6 +182,9 @@ impl<'a> LevelDecodePlan<'a> {
         let mut output = allocate(workspace, self.output_bytes)?;
         match self.layout {
             Layout::Flat => output.as_mut().copy_from_slice(self.data),
+            Layout::Rle(ref plan) => {
+                plan.decode(self.data, bytemuck::cast_slice_mut(output.as_mut()));
+            }
             #[cfg(feature = "bitpacking")]
             Layout::Bitpacked {
                 width,

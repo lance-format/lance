@@ -95,3 +95,36 @@ fn flat_level_admission_remains_available_without_optional_codecs() {
     drop(output);
     assert_eq!(budget.reserved(), 0);
 }
+
+#[rstest]
+fn rle_level_admission_requires_no_optional_codec(#[values(8, 16, 32)] width: u64) {
+    let codec = DefaultDecompressionStrategy::default()
+        .create_block_decompressor(&EncodingUtils::rle(
+            EncodingUtils::flat(16, None),
+            EncodingUtils::flat(width, None),
+        ))
+        .unwrap();
+    let mut bytes = 4_u64.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[1, 0, 0, 0]);
+    for length in [2_u32, 1] {
+        bytes.extend_from_slice(&length.to_le_bytes()[..(width / 8) as usize]);
+    }
+    let budget = AllocationBudget::new(bytes.len() + 6);
+    let mut work = budget.try_reserve(bytes.len() + 6).unwrap();
+    let mut input = work.try_allocate(bytes.len()).unwrap().unwrap();
+    input.as_mut().copy_from_slice(&bytes);
+    let input = LanceBuffer::from(Buffer::from(input.freeze()));
+    let output = codec
+        .plan_levels(&input, 3)
+        .unwrap()
+        .try_decode_in(&mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytemuck::cast_slice::<u8, u16>(output.as_ref()), &[1, 1, 0]);
+    assert_eq!(work.len(), 0);
+    drop(input);
+    drop(work);
+    assert_eq!(budget.reserved(), 6);
+    drop(output);
+    assert_eq!(budget.reserved(), 0);
+}

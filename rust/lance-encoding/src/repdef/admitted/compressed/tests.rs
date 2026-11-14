@@ -18,6 +18,8 @@ use crate::{
     repdef::{CompositeRepDefUnraveler, DefinitionInterpretation as Meaning, RepDefUnraveler},
 };
 
+mod admitted_rle;
+
 fn own(bytes: &[u8], work: &mut Reservation) -> LanceBuffer {
     let mut owner = work.try_allocate(bytes.len() + 1).unwrap().unwrap();
     owner.as_mut()[1..].copy_from_slice(bytes);
