@@ -14,7 +14,7 @@ fn word(data: &[u8], index: usize, bytes: usize) -> u64 {
     u64::from_le_bytes(value)
 }
 
-pub(crate) fn flat(
+pub fn flat(
     data: &LanceBuffer,
     bits: u64,
     count: u64,
@@ -43,7 +43,7 @@ pub(crate) fn flat(
 }
 
 #[cfg(feature = "bitpacking")]
-pub(crate) fn bitpacked(
+pub fn bitpacked(
     data: &LanceBuffer,
     bits: u64,
     packed: u64,
