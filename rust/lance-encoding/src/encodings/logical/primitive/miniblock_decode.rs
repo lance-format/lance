@@ -935,7 +935,7 @@ impl DecodeMiniBlockTask {
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
-    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+    fn decode(mut self: Box<Self>) -> Result<DecodedPage> {
         #[cfg(feature = "bitpacking")]
         if self.rep_decompressor.is_none()
             && self.structural_projection.is_none()
@@ -1071,16 +1071,17 @@ impl DecodePageTask for DecodeMiniBlockTask {
             });
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
-            let mut group_start = 0usize;
-            while group_start < self.instructions.len() {
-                let chunk = &self.instructions[group_start].1;
-                let mut group_end = group_start + 1;
-                while group_end < self.instructions.len()
-                    && self.instructions[group_end].1.chunk_idx == chunk.chunk_idx
-                {
-                    group_end += 1;
-                }
-                let group = &self.instructions[group_start..group_end];
+            // Own the pending instructions so consumed groups stop pinning their physical
+            // input allocations while later groups allocate decoded output. Shared chunks
+            // (including slices retained by another batch) keep their existing owners.
+            let mut pending = std::mem::take(&mut self.instructions).into_iter();
+            while let Some((_, chunk)) = pending.as_slice().first() {
+                let group_len = pending
+                    .as_slice()
+                    .iter()
+                    .take_while(|(_, next)| next.chunk_idx == chunk.chunk_idx)
+                    .count();
+                let group = &pending.as_slice()[..group_len];
                 let (rep, def, value_buffers) = self.decode_chunk_sections(&chunk.data)?;
 
                 if group.len() == 1 {
@@ -1125,7 +1126,9 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     }
                 }
 
-                group_start = group_end;
+                // nth consumes and drops the preceding entries without moving the remaining
+                // instructions or allocating another group vector. Drop its last entry too.
+                drop(pending.nth(group_len - 1));
             }
 
             data_builder.finish()
@@ -2346,7 +2349,9 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use bytes::Bytes;
@@ -2387,12 +2392,12 @@ mod tests {
 
     struct TrackedInput {
         bytes: Vec<u8>,
-        live: Arc<std::sync::atomic::AtomicUsize>,
+        live: Arc<AtomicUsize>,
     }
 
     impl TrackedInput {
-        fn into_bytes(bytes: Vec<u8>, live: &Arc<std::sync::atomic::AtomicUsize>) -> Bytes {
-            live.fetch_add(bytes.capacity(), std::sync::atomic::Ordering::SeqCst);
+        fn track(bytes: Vec<u8>, live: &Arc<AtomicUsize>) -> Bytes {
+            live.fetch_add(bytes.capacity(), Ordering::SeqCst);
             Bytes::from_owner(Self {
                 bytes,
                 live: live.clone(),
@@ -2408,16 +2413,15 @@ mod tests {
 
     impl Drop for TrackedInput {
         fn drop(&mut self) {
-            self.live
-                .fetch_sub(self.bytes.capacity(), std::sync::atomic::Ordering::SeqCst);
+            self.live.fetch_sub(self.bytes.capacity(), Ordering::SeqCst);
         }
     }
 
     #[derive(Debug)]
     struct ObserveRangeDecode {
-        live: Arc<std::sync::atomic::AtomicUsize>,
-        scratch: Arc<std::sync::atomic::AtomicUsize>,
-        calls: std::sync::Mutex<Vec<(u8, std::ops::Range<u64>, usize)>>,
+        live: Arc<AtomicUsize>,
+        scratch: Arc<AtomicUsize>,
+        calls: Mutex<Vec<(u8, Range<u64>, usize)>>,
         fail_on: Option<u8>,
         allocate: bool,
     }
@@ -2431,9 +2435,8 @@ mod tests {
             &self,
             buffers: Vec<LanceBuffer>,
             num_values: u64,
-            range: std::ops::Range<u64>,
+            range: Range<u64>,
         ) -> crate::Result<DataBlock> {
-            use std::sync::atomic::Ordering;
             assert_eq!(num_values, 8);
             assert_eq!(
                 self.scratch.load(Ordering::SeqCst),
@@ -2456,10 +2459,7 @@ mod tests {
             let len = (range.end - range.start) as usize;
             let selected = input.slice_with_length(range.start as usize, len);
             let data = if self.allocate {
-                LanceBuffer::from_bytes(
-                    TrackedInput::into_bytes(selected.to_vec(), &self.scratch),
-                    1,
-                )
+                LanceBuffer::from_bytes(TrackedInput::track(selected.to_vec(), &self.scratch), 1)
             } else {
                 selected
             };
@@ -2495,7 +2495,6 @@ mod tests {
         #[values(false, true)] has_large_chunk: bool,
         #[values(false, true)] allocate: bool,
     ) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         const ALLOCATION: usize = 4096;
         let live = Arc::new(AtomicUsize::new(0));
         let scratch = Arc::new(AtomicUsize::new(0));
@@ -2517,7 +2516,7 @@ mod tests {
         let independent = |encoded: &[u8]| {
             let mut bytes = vec![0; ALLOCATION];
             bytes[..encoded.len()].copy_from_slice(encoded);
-            TrackedInput::into_bytes(bytes, &live).slice(..encoded.len())
+            TrackedInput::track(bytes, &live).slice(..encoded.len())
         };
         let (first, second, sibling) = match ownership {
             InputOwnership::Separate => (independent(&chunks[0]), independent(&chunks[1]), None),
@@ -2525,7 +2524,7 @@ mod tests {
                 let mut bytes = vec![0; ALLOCATION];
                 bytes[..chunks[0].len()].copy_from_slice(&chunks[0]);
                 bytes[64..64 + chunks[1].len()].copy_from_slice(&chunks[1]);
-                let bytes = TrackedInput::into_bytes(bytes, &live);
+                let bytes = TrackedInput::track(bytes, &live);
                 let sibling =
                     matches!(ownership, InputOwnership::CoalescedWithSibling).then(|| {
                         // Exercise the same custom-allocation bridge used by real decode output.
@@ -4008,7 +4007,7 @@ mod tests {
         }
 
         // Scheduler parity across scan / single-row / partial / scattered multi-range.
-        let range_sets: Vec<Vec<std::ops::Range<u64>>> = vec![
+        let range_sets: Vec<Vec<Range<u64>>> = vec![
             vec![0..15],
             vec![0..1],
             vec![7..8],

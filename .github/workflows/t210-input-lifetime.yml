@@ -21,5 +21,7 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Validate coalesced allocation lifetime
-        run: cargo test --profile ci --locked -p lance-encoding --lib miniblock_input_owner_lifetime -- --nocapture
+      - name: Validate MiniBlock range decode and input lifetime
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::miniblock_decode::tests -- --nocapture
+      - name: Lint touched crate
+        run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
