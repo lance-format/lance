@@ -503,7 +503,10 @@ impl InvertedIndex {
                 })
                 // Do not collect loaded partition payloads ahead of their slices.
                 .buffer_unordered(2)
-                .map_ok(|slices| stream::iter(slices.into_iter().map(Ok::<_, Error>)))
+                .map_ok(|slices| {
+                    let slices = slices.into_iter().map(Ok::<_, Error>).collect::<Vec<_>>();
+                    stream::iter(slices)
+                })
                 .try_flatten()
                 .map_ok(|slice| slice.run().boxed());
             // 8 active slices x 16MiB encoded payload preserves the 128MiB
