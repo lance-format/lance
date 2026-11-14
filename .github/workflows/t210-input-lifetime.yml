@@ -21,10 +21,21 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # 100 Binary and 71 task cases passed with/without default features at
-      # 8c748cac2. Only the public metadata type export and doctest changed.
-      - name: Validate metadata plan example
-        run: cargo test --profile ci --locked -p lance-encoding --doc plan_unsigned_metadata -- --nocapture
+      # Metadata admission passed at 8c748cac2 and its public API at 2d93f578f.
+      # Validate the payload visitor and affected Binary framing/composition.
+      - name: Validate borrowed unsigned traversal
+        run: cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned::tests -- --nocapture
+      - name: Validate Binary payload admission and composition
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib physical::binary::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests::binary -- --nocapture
+      - name: Validate payload admission without optional codecs
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::unsigned::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::binary::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::binary -- --nocapture
+      - name: Validate unsigned visitor example
+        run: cargo test --profile ci --locked -p lance-encoding --doc visit_unsigned -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

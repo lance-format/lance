@@ -16,23 +16,20 @@ use crate::{
     encodings::physical::{range::checked_range_last, sequence::SequenceMetadata},
 };
 
-fn width(codec: &BinaryMiniBlockDecompressor) -> Result<u8> {
+mod payload;
+
+fn width(codec: &BinaryMiniBlockDecompressor) -> u8 {
     match codec.layout {
-        BinaryMiniBlockLayout::Legacy { bits_per_offset } => Ok(bits_per_offset),
-        BinaryMiniBlockLayout::Generic {
-            bits_per_offset,
-            offsets_have_payload: false,
-            ..
-        } => Ok(bits_per_offset),
-        BinaryMiniBlockLayout::Generic { .. } => Err(Error::not_supported(
-            "admitted binary ranges require a separate compressed-offset plan",
-        )),
+        BinaryMiniBlockLayout::Legacy { bits_per_offset }
+        | BinaryMiniBlockLayout::Generic {
+            bits_per_offset, ..
+        } => bits_per_offset,
     }
 }
 
 pub(super) fn layout(codec: &BinaryMiniBlockDecompressor) -> Result<MiniBlockOutputLayout> {
     Ok(MiniBlockOutputLayout::VariableWidth {
-        bits_per_offset: width(codec)?,
+        bits_per_offset: width(codec),
     })
 }
 
@@ -51,6 +48,7 @@ pub(super) struct RangePlan {
     width: usize,
     // A validated arithmetic sequence; None means offsets reside in input bytes.
     metadata: Option<(u64, u64)>,
+    values_buffer: usize,
 }
 
 fn finish_plan(
@@ -59,7 +57,7 @@ fn finish_plan(
     values: Range<usize>,
     metadata: Option<(u64, u64)>,
 ) -> Result<RangePlan> {
-    let width = usize::from(width(codec)? / 8);
+    let width = usize::from(width(codec) / 8);
     let offset_bytes = (range.end - range.start)
         .checked_add(1)
         .and_then(|n| n.checked_mul(width as u64))
@@ -83,6 +81,13 @@ fn finish_plan(
         offset_bytes,
         width,
         metadata,
+        values_buffer: usize::from(matches!(
+            codec.layout,
+            BinaryMiniBlockLayout::Generic {
+                offsets_have_payload: true,
+                ..
+            }
+        )),
     })
 }
 
@@ -92,12 +97,21 @@ pub(super) fn plan(
     num_values: u64,
     range: Range<u64>,
 ) -> Result<RangePlan> {
-    let bits = width(codec)?;
+    let bits = width(codec);
     if range.start > range.end || range.end > num_values {
         return Err(Error::corrupt_file_named(
             "binary mini-block",
             "selected range exceeds value count",
         ));
+    }
+    if matches!(
+        codec.layout,
+        BinaryMiniBlockLayout::Generic {
+            offsets_have_payload: true,
+            ..
+        }
+    ) {
+        return payload::plan(codec, data, num_values, range);
     }
     if let BinaryMiniBlockLayout::Generic { offsets, .. } = &codec.layout {
         let [values] = data else {
@@ -199,19 +213,29 @@ pub(super) fn decode(
     let mut values = workspace
         .try_allocate(plan.values.len())?
         .ok_or_else(|| Error::internal("binary values exceeded complete admission"))?;
-    for (dst, i) in offsets
-        .as_mut()
-        .chunks_exact_mut(plan.width)
-        .zip(plan.offsets)
-    {
-        let original = match plan.metadata {
-            Some((start, step)) => start + step * i,
-            None => offset(&data[0], i as usize, plan.width),
-        };
-        let value = original - plan.values.start as u64;
-        dst.copy_from_slice(&value.to_le_bytes()[..plan.width]);
+    if plan.values_buffer == 1 {
+        if let Err(error) = payload::write(codec, &data[0], num_values, &plan, offsets.as_mut()) {
+            offsets.recycle(workspace)?;
+            values.recycle(workspace)?;
+            return Err(error);
+        }
+    } else {
+        for (dst, i) in offsets
+            .as_mut()
+            .chunks_exact_mut(plan.width)
+            .zip(plan.offsets)
+        {
+            let original = match plan.metadata {
+                Some((start, step)) => start + step * i,
+                None => offset(&data[0], i as usize, plan.width),
+            };
+            let value = original - plan.values.start as u64;
+            dst.copy_from_slice(&value.to_le_bytes()[..plan.width]);
+        }
     }
-    values.as_mut().copy_from_slice(&data[0][plan.values]);
+    values
+        .as_mut()
+        .copy_from_slice(&data[plan.values_buffer][plan.values]);
     Ok(Some(DataBlock::VariableWidth(VariableWidthBlock {
         data: LanceBuffer::from(Buffer::from(values.freeze())),
         offsets: LanceBuffer::from(Buffer::from(offsets.freeze())),

@@ -955,6 +955,29 @@ impl BlockCompressor for OutOfLineBitpacking {
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if bits != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(
+                "unsigned bitpacking visitor width mismatch",
+            ));
+        }
+        let data = data
+            .ok_or_else(|| Error::invalid_input("unsigned bitpacking visitor requires payload"))?;
+        crate::compression::unsigned::bitpacked(
+            data,
+            bits,
+            self.compressed_bit_width,
+            count,
+            visitor,
+        )
+    }
+
     fn plan_levels<'a>(
         &self,
         data: &'a LanceBuffer,

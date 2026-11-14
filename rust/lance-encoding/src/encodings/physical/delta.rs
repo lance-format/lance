@@ -139,6 +139,29 @@ impl DeltaDecompressor {
 }
 
 impl BlockDecompressor for DeltaDecompressor {
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if bits != self.bits_per_value {
+            return Err(Error::invalid_input("Delta visitor width mismatch"));
+        }
+        validate_delta_header(bits, self.base, count)?;
+        let mut value = self.base;
+        visitor(value)?;
+        self.child
+            .visit_unsigned(data, bits, count - 1, &mut |delta| {
+                value = value
+                    .checked_add(delta)
+                    .filter(|value| bits == 64 || *value <= u32::MAX as u64)
+                    .ok_or_else(|| Error::invalid_input("Delta visitor prefix sum overflows"))?;
+                visitor(value)
+            })
+    }
+
     fn plan_unsigned_metadata(
         &self,
         bits: u64,

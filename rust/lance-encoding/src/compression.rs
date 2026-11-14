@@ -91,6 +91,7 @@ use std::{ops::Range, str::FromStr, sync::Arc};
 
 mod layout;
 pub mod levels;
+pub(crate) mod unsigned;
 pub use layout::MiniBlockOutputLayout;
 
 /// Payload required by one validated MiniBlock range operation.
@@ -1410,6 +1411,49 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Visit an unsigned sequence without allocating decoded or alignment buffers.
+    /// The callback owns any allocations it makes. An error may follow a visited
+    /// prefix: callers must discard partial work and validate before publishing.
+    /// Unsupported codecs never fall back to ordinary allocating decompression.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
+    /// let mut sum = 0;
+    /// codec.visit_unsigned(None, 32, 4, &mut |value| { sum += value; Ok(()) }).unwrap();
+    /// assert_eq!(sum, 18);
+    /// ```
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if data.is_some() {
+            return Err(Error::not_supported(
+                "codec has no unsigned payload visitor",
+            ));
+        }
+        match self.plan_unsigned_metadata(bits_per_value, num_values)? {
+            SequenceMetadata::Empty => Ok(()),
+            SequenceMetadata::Constant(value) => {
+                for _ in 0..num_values {
+                    visitor(value)?;
+                }
+                Ok(())
+            }
+            SequenceMetadata::Range { start, step } => {
+                for i in 0..num_values {
+                    visitor(start + i * step)?;
+                }
+                Ok(())
+            }
+        }
+    }
 
     /// Validate an unsigned metadata-only sequence without expanding its values.
     /// Width, cardinality and arithmetic must match the ordinary decoder. Callers

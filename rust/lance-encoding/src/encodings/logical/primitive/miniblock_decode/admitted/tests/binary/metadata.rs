@@ -36,11 +36,11 @@ fn metadata_fixture(
         panic!("expected Variable")
     };
     framed_fixture(
-        if matches!(offsets, Offsets::Constant) {
+        &[if matches!(offsets, Offsets::Constant) {
             b""
         } else {
             b"abcdefghijkl"
-        },
+        }],
         BinaryMiniBlockDecompressor::from_variable(&variable).unwrap(),
         large,
         nested,

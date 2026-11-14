@@ -630,8 +630,10 @@ mod admitted;
 /// Binary MiniBlock decoder. Flat offsets, still emitted by the current writer,
 /// support admitted range decoding with copied values and normalized offsets.
 /// Metadata-only Range, Constant and Delta(Constant) offsets are evaluated without
-/// expanding the complete offset array. Input ownership is charged separately;
-/// payload-bearing offset codecs remain unsupported by the opt-in admission API.
+/// expanding the complete offset array. Flat and out-of-line bitpacked payloads,
+/// including their Delta composition, are visited without alignment or decoded
+/// offset buffers. Input ownership is charged separately. Other offset codecs
+/// remain unsupported by the opt-in admission API.
 /// Ordinary decoding is unchanged.
 #[derive(Debug)]
 pub struct BinaryMiniBlockDecompressor {

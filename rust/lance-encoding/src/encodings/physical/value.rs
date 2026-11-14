@@ -616,6 +616,23 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits: u64,
+        count: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        if bits != self.bits_per_value || !self.layers.is_empty() {
+            return Err(Error::invalid_input(
+                "unsigned Flat visitor width or layout mismatch",
+            ));
+        }
+        let data =
+            data.ok_or_else(|| Error::invalid_input("unsigned Flat visitor requires payload"))?;
+        crate::compression::unsigned::flat(data, bits, count, visitor)
+    }
+
     fn plan_levels<'a>(
         &self,
         data: &'a LanceBuffer,

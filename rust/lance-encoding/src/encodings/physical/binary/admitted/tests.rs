@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod metadata;
+mod payload;
 
 fn frame(values: &[&[u8]], width: usize) -> Vec<u8> {
     let mut pos = (values.len() + 1) * width;
@@ -229,7 +230,7 @@ impl BlockDecompressor for ForbiddenOffsets {
 }
 
 #[test]
-fn compressed_offsets_do_not_fall_back() {
+fn unsupported_offsets_do_not_fall_back() {
     let codec = BinaryMiniBlockDecompressor {
         layout: BinaryMiniBlockLayout::Generic {
             bits_per_offset: 32,
@@ -240,9 +241,14 @@ fn compressed_offsets_do_not_fall_back() {
     let pool = AllocationBudget::new(64);
     let mut work = pool.try_reserve(64).unwrap();
     let error = codec
-        .try_decompress_range_in(&[], 0, 0..0, &mut work)
+        .try_decompress_range_in(
+            &[LanceBuffer::empty(), LanceBuffer::empty()],
+            0,
+            0..0,
+            &mut work,
+        )
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("compressed-offset"));
+    assert!(error.to_string().contains("unsigned payload visitor"));
     assert_eq!(work.len(), 64);
 }

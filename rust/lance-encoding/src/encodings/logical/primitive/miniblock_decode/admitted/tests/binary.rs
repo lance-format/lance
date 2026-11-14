@@ -8,6 +8,7 @@ use super::*;
 use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 
 mod metadata;
+mod payload;
 
 fn binary_fixture(bits: u8, large: bool, nested: bool, available: usize) -> Fixture {
     let width = usize::from(bits / 8);
@@ -19,7 +20,7 @@ fn binary_fixture(bits: u8, large: bool, nested: bool, available: usize) -> Fixt
     payload.extend_from_slice(b"abcd");
     payload.resize(payload.len().next_multiple_of(width), 0);
     framed_fixture(
-        &payload,
+        &[&payload],
         BinaryMiniBlockDecompressor::new(bits).unwrap(),
         large,
         nested,
@@ -28,7 +29,7 @@ fn binary_fixture(bits: u8, large: bool, nested: bool, available: usize) -> Fixt
 }
 
 fn framed_fixture(
-    payload: &[u8],
+    payloads: &[&[u8]],
     decoder: BinaryMiniBlockDecompressor,
     large: bool,
     nested: bool,
@@ -49,18 +50,22 @@ fn framed_fixture(
         frame.extend_from_slice(&12_u16.to_le_bytes());
         frame.extend_from_slice(&12_u16.to_le_bytes());
     }
-    if large {
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    } else {
-        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    for payload in payloads {
+        if large {
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        } else {
+            frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        }
     }
     frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
     for levels in rep.iter().chain(def.iter()) {
         frame.extend_from_slice(bytemuck::cast_slice(levels));
         frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
     }
-    frame.extend_from_slice(payload);
-    frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    for payload in payloads {
+        frame.extend_from_slice(payload);
+        frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    }
     let physical = frame.len() + 41;
     let budget = AllocationBudget::new(physical + available);
     let mut work = budget.try_reserve(physical + available).unwrap();
@@ -70,6 +75,7 @@ fn framed_fixture(
         LanceBuffer::from(Buffer::from(input.freeze()).slice_with_length(1, frame.len()));
     task.instructions[0].1.byte_range = 0..frame.len() as u64;
     task.value_decompressor = Arc::new(decoder);
+    task.num_buffers = payloads.len() as u64;
     Fixture {
         task,
         budget,
