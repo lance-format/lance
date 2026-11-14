@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from datetime import date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -115,6 +116,46 @@ def test_from_pydantic_model(tmp_path: Path):
     assert table.schema.names == ["name", "score"]
     assert table.column("name").to_pylist() == ["alice", "bob"]
     assert table.column("score").to_pylist() == [0.9, 0.8]
+
+
+class _Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Priority(Enum):
+    LOW = 1
+    HIGH = 2
+
+
+class _Tag(BaseModel):
+    color: _Color
+
+
+class _EnumRecord(BaseModel):
+    color: _Color
+    priority: _Priority
+    tags: List[_Tag]
+
+
+@pytest.mark.parametrize("entry_point", ["write_dataset", "from_pydantic_model"])
+def test_pydantic_enum_fields_store_enum_values(tmp_path: Path, entry_point):
+    data = [
+        _EnumRecord(color=_Color.BLUE, priority=_Priority.HIGH, tags=[]),
+        _EnumRecord(
+            color=_Color.RED, priority=_Priority.LOW, tags=[_Tag(color=_Color.BLUE)]
+        ),
+    ]
+    uri = str(tmp_path / "enum_record")
+    if entry_point == "from_pydantic_model":
+        ds = lance.LanceDataset.from_pydantic_model(_EnumRecord, data, uri=uri)
+    else:
+        ds = lance.write_dataset(data, uri)
+
+    assert ds.to_table().to_pylist() == [
+        {"color": "blue", "priority": 2, "tags": []},
+        {"color": "red", "priority": 1, "tags": [{"color": "blue"}]},
+    ]
 
 
 def test_from_pydantic_model_rejects_non_model_class(tmp_path: Path):
