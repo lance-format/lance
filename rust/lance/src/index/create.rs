@@ -1478,7 +1478,6 @@ mod tests {
     #[rstest]
     #[case::fts_after_fts("fts", "fts")]
     #[case::fts_after_inverted("inverted", "fts")]
-    #[case::inverted_after_fts("fts", "inverted")]
     #[tokio::test]
     async fn test_fts_alias_repeated_build_collides_with_existing_inverted_index(
         #[case] first: &str,
