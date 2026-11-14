@@ -812,6 +812,7 @@ mod tests {
             index.index_version = 0;
         }
         index.covering_fields = vec![999, 999];
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,

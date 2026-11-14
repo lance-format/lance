@@ -55,7 +55,9 @@ use crate::index::statistics::{
 };
 use crate::index::vector;
 use crate::index::vector::details::needs_vector_details_inference;
-use crate::session::index_caches::DerivedIndexListingKey;
+use crate::session::index_caches::{
+    DerivedIndexListingKey, QueryIndexListing, QueryIndexListingKey,
+};
 use crate::{Dataset, Error, Result};
 
 pub(super) async fn build_index_metadata_from_segments(
@@ -611,46 +613,45 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = load_all_indices(self).await?;
-        // Only a tagged snapshot derives coverage, so only it has a derived
-        // listing to cache; an untagged snapshot must not even probe the
-        // cache, or every call takes a guaranteed miss.
-        let tagged = indices
-            .iter()
-            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 1);
-        if !tagged {
-            return Ok(self.derive_index_listing(indices).await?.indices);
-        }
-        // Cache the coverage-rewritten listing per snapshot identity:
-        // load_indices sits on the query-planning and merge_insert per-batch
-        // paths, and the derivation (segment_coverage plus the per-index
-        // bitmap rewrites) is otherwise redone on every call. The raw ledger
-        // and mapping readers are already cached by frag_reuse_reader; this
-        // caches its derived output.
-        let derived_key = DerivedIndexListingKey {
+        let derive = || async {
+            let indices = load_all_indices(self).await?;
+            // Best-effort inference and unreadable format markers must be
+            // retried on later calls instead of freezing an incomplete listing.
+            let retry_inference = indices
+                .iter()
+                .any(|idx| needs_vector_details_inference(idx, self.schema()));
+            let listing = self.derive_index_listing(indices).await?;
+            Ok(QueryIndexListing {
+                indices: listing.indices,
+                retry_derivation: retry_inference || !listing.unverifiable.is_empty(),
+            })
+        };
+        // The key's e-tag is its generation token. Without one, a dataset
+        // dropped and recreated at this URI restarts its version history, so a
+        // version-only key could serve the previous incarnation's listing from
+        // this cache, which is shared by every dataset opened at the URI.
+        // `None` is not proof that two observations share an incarnation (see
+        // `ManifestLocation::e_tag`), so derive privately and never publish.
+        let Some(e_tag) = self.manifest_location.e_tag.as_deref() else {
+            return Ok(derive().await?.indices);
+        };
+        let derived_key = QueryIndexListingKey(DerivedIndexListingKey {
             version: self.manifest.version,
             store_identity: &self.object_store.store_prefix,
-            e_tag: self.manifest_location.e_tag.as_deref(),
-        };
-        if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {
-            return Ok(cached);
-        }
-        // A later call may still infer the missing details; don't pin a
-        // listing derived without them.
-        let details_pending = indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, self.schema()));
-        let listing = self.derive_index_listing(indices).await?;
-        // A listing that excludes a segment only because its format marker
-        // could not be read is valid for this call alone; caching it would
-        // keep the segment excluded for the whole snapshot. Return it
-        // uncached so the next call re-probes.
-        if listing.unverifiable.is_empty() && !details_pending {
+            e_tag: Some(e_tag),
+        });
+        let (listing, was_cached) = self
+            .index_cache
+            .get_or_insert_with_key_hit(derived_key, derive)
+            .await?;
+        if was_cached && listing.retry_derivation {
+            let refreshed = Arc::new(derive().await?);
             self.index_cache
-                .insert_with_key(&derived_key, listing.indices.clone())
+                .insert_with_key(&derived_key, refreshed.clone())
                 .await;
+            return Ok(refreshed.indices.clone());
         }
-        Ok(listing.indices)
+        Ok(listing.indices.clone())
     }
 
     async fn merge_existing_index_segments(
