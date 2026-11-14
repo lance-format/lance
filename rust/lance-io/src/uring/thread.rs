@@ -10,6 +10,7 @@
 use super::DEFAULT_URING_QUEUE_DEPTH;
 use super::requests::{IoRequest, PendingRequests};
 use io_uring::{IoUring, opcode, types};
+use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,7 +28,7 @@ pub(super) struct UringThreadHandle {
 
 /// Owns the obligation to fail a request until a worker accepts it.
 ///
-/// Dropping the receiver also drops every queued item. Keeping the failure
+/// Dropping the receiver or retry queue also drops every queued item. Keeping the failure
 /// obligation with the queued item guarantees that a request accepted during
 /// worker shutdown cannot be abandoned without waking its future.
 pub(super) struct QueuedRequest {
@@ -130,9 +131,9 @@ pub(super) static THREAD_SELECTOR: AtomicU64 = AtomicU64::new(0);
 /// with their corresponding requests.
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Counter for requests that have been submitted to the thread but not yet received.
+/// Counter for requests waiting to be accepted by the worker.
 ///
-/// This tracks requests sitting in the channel queue waiting to be received by the thread.
+/// This includes requests in the channel and short reads waiting for resubmission.
 pub(super) static SUBMITTED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Default batch size for submission - how many requests to batch before calling submit().
@@ -197,6 +198,7 @@ fn run_uring_thread(
     let mut completed_iops = 0usize;
     let mut completed_sectors = 0usize;
     let mut min_in_flight = usize::MAX;
+    let mut retries = VecDeque::new();
 
     loop {
         // Track minimum in-flight count
@@ -223,33 +225,31 @@ fn run_uring_thread(
         }
 
         // Process all available completions first
-        let mut needs_submit = false;
         let completions = process_completions(&mut ring, &mut pending);
         match completions {
             Ok(result) => {
                 completed_iops += result.iops;
                 completed_sectors += result.sectors;
 
-                // Resubmit any short-read retries
-                for request in result.retries {
-                    if let Err(e) = push_to_sq(&mut ring, &mut pending, request) {
-                        log::error!("Failed to resubmit short read: {}", e);
-                    } else {
-                        needs_submit = true;
-                    }
-                }
+                retries.extend(result.retries.into_iter().map(QueuedRequest::new));
             }
             Err(e) => {
                 log::error!("Error processing io_uring completions: {}", e);
             }
         }
 
+        let needs_submit = push_retries_to_sq(&mut ring, &mut pending, &mut retries);
         min_in_flight = min_in_flight.min(pending.len());
 
         // Batch submit requests - keep pulling from channel and pushing to SQ
-        // until we hit batch size or channel is empty
+        // until we hit batch size, the SQ is full, or the channel is empty.
         let mut batch_count = 0;
         loop {
+            // Leave excess reads in the bounded channel to apply backpressure to senders.
+            if ring.submission().is_full() {
+                break;
+            }
+
             // Try to receive new request
             // Use recv_timeout only when pending is empty, otherwise use try_recv
             let recv_result = if pending.is_empty() && batch_count == 0 {
@@ -317,6 +317,26 @@ fn run_uring_thread(
             }
         }
     }
+}
+
+/// Prioritize short reads, retaining any that cannot fit until the next submission batch.
+fn push_retries_to_sq(
+    ring: &mut IoUring,
+    pending: &mut PendingRequests,
+    retries: &mut VecDeque<QueuedRequest>,
+) -> bool {
+    let mut needs_submit = false;
+    while !ring.submission().is_full() {
+        let Some(request) = retries.pop_front() else {
+            break;
+        };
+        if let Err(error) = push_to_sq(ring, pending, request.into_request()) {
+            log::error!("Failed to resubmit short read: {}", error);
+        } else {
+            needs_submit = true;
+        }
+    }
+    needs_submit
 }
 
 /// Submit every entry currently published to the submission queue.
@@ -525,31 +545,143 @@ fn process_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueuedRequest, shutdown_with_error, start_uring_thread, submit_all};
+    use super::{
+        QueuedRequest, process_completions, push_retries_to_sq, push_to_sq, run_uring_thread,
+        shutdown_with_error, start_uring_thread, submit_all,
+    };
     use crate::uring::requests::{IoRequest, PendingRequests, RequestState};
     use bytes::BytesMut;
     use io_uring::IoUring;
     use std::collections::VecDeque;
-    use std::io;
+    use std::fs::File;
+    use std::io::{self, Write};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn new_request() -> Arc<IoRequest> {
+        read_request(Arc::new(tempfile::tempfile().unwrap()), 0, 1)
+    }
+
+    fn read_request(file: Arc<File>, offset: u64, length: usize) -> Arc<IoRequest> {
         Arc::new(IoRequest {
-            file: Arc::new(tempfile::tempfile().unwrap()),
-            offset: 0,
-            length: 1,
+            file,
+            offset,
+            length,
             thread_id: thread::current().id(),
             state: Mutex::new(RequestState {
                 completed: false,
                 waker: None,
                 err: None,
-                buffer: BytesMut::zeroed(1),
+                buffer: BytesMut::zeroed(length),
                 bytes_read: 0,
             }),
         })
+    }
+
+    #[rstest::rstest]
+    #[case::single_entry(1)]
+    #[case::two_entries(2)]
+    fn test_worker_queues_reads_beyond_sq_capacity(#[case] queue_depth: u32) {
+        let Ok(ring) = IoUring::new(queue_depth) else {
+            // io_uring is unavailable on some CI hosts.
+            return;
+        };
+        let data: Vec<u8> = (0..64).collect();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&data).unwrap();
+        let file = Arc::new(file);
+        let requests: Vec<_> = (0..data.len())
+            .map(|offset| read_request(Arc::clone(&file), offset as u64, 1))
+            .collect();
+        // Preload the channel so the worker deterministically receives more than fits in its SQ.
+        let (request_tx, request_rx) = sync_channel(requests.len());
+        for request in &requests {
+            request_tx
+                .send(QueuedRequest::new(Arc::clone(request)))
+                .unwrap();
+        }
+        let worker = thread::spawn(move || {
+            run_uring_thread(ring, request_rx, Arc::new(AtomicBool::new(true)), 0)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !requests
+            .iter()
+            .all(|request| request.state.lock().unwrap().completed)
+        {
+            assert!(Instant::now() < deadline, "reads did not complete");
+            thread::yield_now();
+        }
+        drop(request_tx);
+        worker.join().unwrap();
+
+        for request in requests {
+            let state = request.state.lock().unwrap();
+            assert!(state.err.is_none(), "{:?}", state.err);
+            assert_eq!(state.buffer.as_ref(), &data[request.offset as usize..][..1]);
+        }
+    }
+
+    #[test]
+    fn test_short_read_retries_wait_for_sq_capacity() {
+        let Ok(mut ring) = IoUring::new(1) else {
+            // io_uring is unavailable on some CI hosts.
+            return;
+        };
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[11]).unwrap();
+        let file = Arc::new(file);
+        let requests: Vec<_> = (0..3)
+            .map(|_| read_request(Arc::clone(&file), 0, 2))
+            .collect();
+        let mut pending = PendingRequests::default();
+        let mut retries = VecDeque::new();
+        // Reading past the current EOF produces real short-read completions.
+        for request in &requests {
+            push_to_sq(&mut ring, &mut pending, Arc::clone(request)).unwrap();
+            ring.submit_and_wait(1).unwrap();
+            let result = process_completions(&mut ring, &mut pending).unwrap();
+            assert_eq!(result.retries.len(), 1);
+            retries.extend(result.retries.into_iter().map(QueuedRequest::new));
+        }
+        // Supply the missing byte before allowing any retries to run.
+        (&*file).write_all(&[22]).unwrap();
+        push_to_sq(
+            &mut ring,
+            &mut pending,
+            read_request(Arc::clone(&file), 0, 1),
+        )
+        .unwrap();
+
+        assert!(!push_retries_to_sq(&mut ring, &mut pending, &mut retries));
+        assert_eq!(retries.len(), requests.len());
+        for request in &requests {
+            let state = request.state.lock().unwrap();
+            assert!(!state.completed);
+            assert!(state.err.is_none());
+            assert_eq!(state.bytes_read, 1);
+        }
+        ring.submit_and_wait(1).unwrap();
+        process_completions(&mut ring, &mut pending).unwrap();
+
+        for remaining in (0..requests.len()).rev() {
+            assert!(push_retries_to_sq(&mut ring, &mut pending, &mut retries));
+            assert_eq!(retries.len(), remaining);
+            ring.submit_and_wait(1).unwrap();
+            let result = process_completions(&mut ring, &mut pending).unwrap();
+            assert!(result.retries.is_empty());
+        }
+        assert!(pending.is_empty());
+        for request in requests {
+            let state = request.state.lock().unwrap();
+            assert!(state.completed);
+            assert!(state.err.is_none(), "{:?}", state.err);
+            assert_eq!(state.bytes_read, 2);
+            assert_eq!(state.buffer.as_ref(), &[11, 22]);
+        }
     }
 
     #[test]
