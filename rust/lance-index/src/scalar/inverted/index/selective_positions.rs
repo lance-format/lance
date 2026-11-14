@@ -499,7 +499,7 @@ mod tests {
             if self.pending {
                 return futures::future::pending().await;
             }
-            assert_eq!(slices, &[self.expected_range.clone()]);
+            assert_eq!(slices, std::slice::from_ref(&self.expected_range));
             let lifetime = Arc::new(());
             *self.backing.lock().unwrap() = Some(Arc::downgrade(&lifetime));
             let bytes = bytes::Bytes::from_owner(Backing {
