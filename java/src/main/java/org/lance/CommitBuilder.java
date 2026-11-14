@@ -73,6 +73,7 @@ public class CommitBuilder {
   private Boolean useStableRowIds;
   private String storageFormat;
   private int maxRetries = 0;
+  private Long expectedLatestVersion;
   private boolean skipAutoCleanup = false;
   // -1 disables the timeout; any positive value is the timeout in nanoseconds.
   private long commitTimeoutNanos = Duration.ofMinutes(30).toNanos();
@@ -236,6 +237,21 @@ public class CommitBuilder {
   }
 
   /**
+   * Require the current dataset head to be exactly this version.
+   *
+   * <p>The transaction's read version must match. A changed head fails with a retryable commit
+   * conflict; strict commits do not rebase or retry. Only existing, non-detached datasets and
+   * conflict-safe commit handlers are supported.
+   *
+   * @param expectedLatestVersion the exact expected latest version
+   * @return this builder instance
+   */
+  public CommitBuilder expectedLatestVersion(long expectedLatestVersion) {
+    this.expectedLatestVersion = expectedLatestVersion;
+    return this;
+  }
+
+  /**
    * Set whether to skip automatic cleanup after commit.
    *
    * <p>Default is false.
@@ -294,6 +310,7 @@ public class CommitBuilder {
                 useStableRowIds,
                 storageFormat,
                 maxRetries,
+                expectedLatestVersion,
                 skipAutoCleanup,
                 namespaceClient,
                 tableId,
@@ -317,6 +334,7 @@ public class CommitBuilder {
               useStableRowIds,
               storageFormat,
               maxRetries,
+              expectedLatestVersion,
               skipAutoCleanup,
               namespaceClientManagedVersioning,
               commitTimeoutNanos);
@@ -335,6 +353,7 @@ public class CommitBuilder {
       Boolean useStableRowIds,
       String storageFormat,
       int maxRetries,
+      Long expectedLatestVersion,
       boolean skipAutoCleanup,
       Object namespace,
       Object tableId,
@@ -353,6 +372,7 @@ public class CommitBuilder {
       Boolean useStableRowIds,
       String storageFormat,
       int maxRetries,
+      Long expectedLatestVersion,
       boolean skipAutoCleanup,
       boolean namespaceClientManagedVersioning,
       long commitTimeoutNanos);

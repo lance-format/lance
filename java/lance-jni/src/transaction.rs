@@ -1321,6 +1321,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     use_stable_row_ids_obj: JObject,
     storage_format_obj: JObject,
     max_retries: jint,
+    expected_latest_version_obj: JObject,
     skip_auto_cleanup: jboolean,
     namespace_obj: JObject,
     table_id_obj: JObject,
@@ -1339,6 +1340,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             use_stable_row_ids_obj,
             storage_format_obj,
             max_retries as u32,
+            expected_latest_version_obj,
             skip_auto_cleanup != 0,
             namespace_obj,
             table_id_obj,
@@ -1359,6 +1361,7 @@ fn inner_commit_to_dataset<'local>(
     use_stable_row_ids_obj: JObject,
     storage_format_obj: JObject,
     max_retries: u32,
+    expected_latest_version_obj: JObject,
     skip_auto_cleanup: bool,
     namespace_obj: JObject,
     table_id_obj: JObject,
@@ -1389,6 +1392,21 @@ fn inner_commit_to_dataset<'local>(
     } else {
         let format_str: String = JString::from(storage_format_obj).extract(env)?;
         Some(parse_storage_format(&format_str)?)
+    };
+
+    let expected_latest_version = if expected_latest_version_obj.is_null() {
+        None
+    } else {
+        Some(nonnegative_jlong_to_u64(
+            "expectedLatestVersion",
+            env.call_method(
+                &expected_latest_version_obj,
+                "longValue",
+                "()J",
+                &[],
+            )?
+            .j()?,
+        )?)
     };
 
     // Get the Dataset's storage_options_accessor and merge with write_param
@@ -1487,6 +1505,7 @@ fn inner_commit_to_dataset<'local>(
             use_stable_row_ids,
             storage_format,
             max_retries,
+            expected_latest_version,
             skip_auto_cleanup,
             commit_handler,
             commit_timeout,
@@ -2309,6 +2328,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     use_stable_row_ids_obj: JObject,
     storage_format_obj: JObject,
     max_retries: jint,
+    expected_latest_version_obj: JObject,
     skip_auto_cleanup: jboolean,
     namespace_client_managed_versioning: jboolean,
     commit_timeout_nanos: jlong,
@@ -2328,6 +2348,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             use_stable_row_ids_obj,
             storage_format_obj,
             max_retries as u32,
+            expected_latest_version_obj,
             skip_auto_cleanup != 0,
             namespace_client_managed_versioning != 0,
             commit_timeout_nanos,
@@ -2349,6 +2370,7 @@ fn inner_commit_to_uri<'local>(
     use_stable_row_ids_obj: JObject,
     storage_format_obj: JObject,
     max_retries: u32,
+    expected_latest_version_obj: JObject,
     skip_auto_cleanup: bool,
     namespace_client_managed_versioning: bool,
     commit_timeout_nanos: jlong,
@@ -2380,6 +2402,21 @@ fn inner_commit_to_uri<'local>(
     } else {
         let format_str: String = JString::from(storage_format_obj).extract(env)?;
         Some(parse_storage_format(&format_str)?)
+    };
+
+    let expected_latest_version = if expected_latest_version_obj.is_null() {
+        None
+    } else {
+        Some(nonnegative_jlong_to_u64(
+            "expectedLatestVersion",
+            env.call_method(
+                &expected_latest_version_obj,
+                "longValue",
+                "()J",
+                &[],
+            )?
+            .j()?,
+        )?)
     };
 
     // Extract namespace info and create storage options provider if namespace is provided
@@ -2463,6 +2500,9 @@ fn inner_commit_to_uri<'local>(
     }
     if max_retries > 0 {
         builder = builder.with_max_retries(max_retries);
+    }
+    if let Some(expected_latest_version) = expected_latest_version {
+        builder = builder.with_expected_latest_version(expected_latest_version);
     }
     if skip_auto_cleanup {
         builder = builder.with_skip_auto_cleanup(true);

@@ -1772,6 +1772,58 @@ async fn record_successful_commit(
     dataset.ensure_branch_exists().await
 }
 
+/// Confirm that the manifest this strict attempt wrote is still the dataset
+/// head after publication.
+///
+/// The target manifest slot is not durable: cleanup can remove a historical
+/// version and make an old slot writable again. The latest manifest is durable,
+/// so a strict commit must not report success if a newer version became the
+/// head while the handler was publishing.
+async fn strict_head_is_published(dataset: &Dataset, target_version: u64) -> Result<bool> {
+    let (latest_manifest, _) = dataset.latest_manifest().await?;
+    Ok(latest_manifest.version == target_version)
+}
+
+fn strict_head_conflict(expected_version: u64, target_version: u64) -> Error {
+    Error::retryable_commit_conflict_source(
+        expected_version,
+        format!("strict commit wrote version {target_version}, but a newer dataset head won")
+            .into(),
+    )
+}
+
+/// Remove a strict attempt's manifest when a newer head was already published
+/// while the handler was writing it. The target path is historical in that
+/// case, not the dataset head.
+async fn rollback_unpublished_manifest(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base: &Path,
+    location: &ManifestLocation,
+) {
+    if let Some(identity) = location.identity.as_deref()
+        && let Err(error) = commit_handler
+            .forget_version(base, location.version, identity)
+            .await
+    {
+        log::warn!(
+            "failed to retire a strict commit manifest record for {} version {}: {}",
+            location.path,
+            location.version,
+            error
+        );
+    }
+    match object_store.delete(&location.path).await {
+        Ok(()) => {}
+        Err(error) if error.is_not_found() => {}
+        Err(error) => log::warn!(
+            "failed to remove a superseded strict commit manifest {}: {}",
+            location.path,
+            error
+        ),
+    }
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1800,6 +1852,13 @@ pub(crate) async fn commit_transaction(
             "expected latest version {expected} does not match the transaction read version \
              {read_version}"
         )));
+    }
+    if conditional_commit && !commit_handler.supports_expected_head_commit() {
+        return Err(Error::not_supported_source(
+            "strict expected-head commits require a commit handler that rejects a concurrent \
+             write for the same manifest version"
+                .into(),
+        ));
     }
 
     // read_version sometimes defaults to zero for overwrite.
@@ -2091,6 +2150,37 @@ pub(crate) async fn commit_transaction(
             return Err(error);
         }
 
+        if let Some(expected_version) = expected_latest_version {
+            // The target version can be freed by cleanup while this attempt is
+            // being built. The latest manifest is the durable head witness;
+            // never write a historical version just because its path is free.
+            let latest_manifest = match dataset.latest_manifest().await {
+                Ok((manifest, _)) => manifest,
+                Err(error) => {
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.base,
+                        &current_transaction_file,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if latest_manifest.version != expected_version {
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
+                return Err(Error::retryable_commit_conflict_source(
+                    expected_version,
+                    format!(
+                        "latest version advanced from the expected {expected_version} to {} \
+                         before publication",
+                        latest_manifest.version
+                    )
+                    .into(),
+                ));
+            }
+        }
+
         // Try to commit the manifest
         original_dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
@@ -2115,6 +2205,36 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(manifest_location) => {
+                if let Some(expected_version) = expected_latest_version {
+                    match strict_head_is_published(&dataset, target_version).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            rollback_unpublished_manifest(
+                                object_store,
+                                commit_handler,
+                                &dataset.base,
+                                &manifest_location,
+                            )
+                            .await;
+                            cleanup_transaction_file(
+                                object_store,
+                                &dataset.base,
+                                &current_transaction_file,
+                            )
+                            .await;
+                            return Err(strict_head_conflict(expected_version, target_version));
+                        }
+                        Err(error) => {
+                            cleanup_transaction_file(
+                                object_store,
+                                &dataset.base,
+                                &current_transaction_file,
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                }
                 record_successful_commit(
                     &dataset,
                     &attempt_transaction,
@@ -2147,6 +2267,39 @@ pub(crate) async fn commit_transaction(
                         location,
                     } => {
                         let committed_manifest = *committed_manifest;
+                        if let Some(expected_version) = expected_latest_version {
+                            match strict_head_is_published(&dataset, target_version).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    rollback_unpublished_manifest(
+                                        object_store,
+                                        commit_handler,
+                                        &dataset.base,
+                                        &location,
+                                    )
+                                    .await;
+                                    cleanup_transaction_file(
+                                        object_store,
+                                        &dataset.base,
+                                        &current_transaction_file,
+                                    )
+                                    .await;
+                                    return Err(strict_head_conflict(
+                                        expected_version,
+                                        target_version,
+                                    ));
+                                }
+                                Err(error) => {
+                                    cleanup_transaction_file(
+                                        object_store,
+                                        &dataset.base,
+                                        &current_transaction_file,
+                                    )
+                                    .await;
+                                    return Err(error);
+                                }
+                            }
+                        }
                         record_successful_commit(
                             &dataset,
                             &attempt_transaction,
@@ -2282,6 +2435,7 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::{collections::HashMap, sync::Mutex};
 
     use arrow_array::types::Int32Type;
@@ -2932,11 +3086,16 @@ mod tests {
     #[derive(Debug)]
     struct InjectForeignCommitHandler {
         foreign: Mutex<Option<(Manifest, lance_table::format::Transaction)>>,
+        attempts: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl CommitHandler for InjectForeignCommitHandler {
         fn is_version_not_found_definitive(&self) -> bool {
+            true
+        }
+
+        fn supports_expected_head_commit(&self) -> bool {
             true
         }
 
@@ -2950,6 +3109,7 @@ mod tests {
             naming_scheme: ManifestNamingScheme,
             transaction: Option<lance_table::format::Transaction>,
         ) -> std::result::Result<ManifestLocation, CommitError> {
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
             let foreign = self.foreign.lock().unwrap().take();
             if let Some((mut foreign_manifest, foreign_transaction)) = foreign {
                 foreign_manifest.version = manifest.version;
@@ -2984,10 +3144,11 @@ mod tests {
     fn inject_foreign_commit_handler(
         manifest: Manifest,
         transaction: &Transaction,
-    ) -> Arc<dyn CommitHandler> {
+    ) -> Arc<InjectForeignCommitHandler> {
         let transaction = pb::Transaction::try_from(transaction).unwrap().into();
         Arc::new(InjectForeignCommitHandler {
             foreign: Mutex::new(Some((manifest, transaction))),
+            attempts: AtomicUsize::new(0),
         })
     }
 
@@ -5224,5 +5385,213 @@ mod tests {
         assert_committed_manifest_matches(&dataset).await;
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
+    }
+
+    fn empty_append(read_version: u64) -> Transaction {
+        Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
+    }
+
+    async fn strict_dataset(uri: &str) -> Dataset {
+        let schema = simple_schema();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(simple_batch(&schema, vec![1, 2, 3]))], schema),
+            uri,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_commits_when_unchanged() {
+        let uri = "memory://strict-expected-head-unchanged";
+        let dataset = strict_dataset(uri).await;
+        let expected = dataset.version().version;
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .with_expected_latest_version(expected)
+            .execute(empty_append(expected))
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, expected + 1);
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_supports_rename_handler() {
+        let uri = "memory://strict-expected-head-rename";
+        let dataset = strict_dataset(uri).await;
+        let expected = dataset.version().version;
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(Arc::new(RenameCommitHandler))
+            .with_expected_latest_version(expected)
+            .execute(empty_append(expected))
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, expected + 1);
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_rejects_changed_head() {
+        let tmp = TempStrDir::default();
+        let dataset = strict_dataset(tmp.as_str()).await;
+        let expected = dataset.version().version;
+        let advanced = CommitBuilder::new(Arc::new(dataset))
+            .execute(empty_append(expected))
+            .await
+            .unwrap();
+        assert_eq!(advanced.version().version, expected + 1);
+
+        let error = CommitBuilder::new(Arc::new(advanced.clone()))
+            .with_expected_latest_version(expected)
+            .execute(empty_append(expected))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { version, .. } if version == expected),
+            "{error}"
+        );
+        assert_eq!(advanced.version().version, expected + 1);
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_does_not_retry_after_concurrent_commit() {
+        let tmp = TempStrDir::default();
+        let dataset = strict_dataset(tmp.as_str()).await;
+        let expected = dataset.version().version;
+        let foreign_manifest = dataset.manifest.as_ref().clone();
+        let foreign_transaction = Transaction::new(
+            expected,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        let handler = inject_foreign_commit_handler(foreign_manifest, &foreign_transaction);
+
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(handler.clone())
+            .with_expected_latest_version(expected)
+            .with_max_retries(10)
+            .execute(empty_append(expected))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert_eq!(handler.attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            Dataset::open(tmp.as_str()).await.unwrap().version().version,
+            expected + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_requires_a_conflict_safe_handler() {
+        let uri = "memory://strict-expected-head-unsafe";
+        let dataset = strict_dataset(uri).await;
+        let expected = dataset.version().version;
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(Arc::new(UnsafeCommitHandler))
+            .with_expected_latest_version(expected)
+            .execute(empty_append(expected))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    }
+
+    #[derive(Debug)]
+    struct GateCleanupRaceHandler {
+        advanced: Mutex<Option<Dataset>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for GateCleanupRaceHandler {
+        fn supports_expected_head_commit(&self) -> bool {
+            true
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let mut advanced = self
+                .advanced
+                .lock()
+                .unwrap()
+                .take()
+                .expect("advanced dataset is available once");
+            for _ in 0..2 {
+                let read_version = advanced.version_id();
+                advanced = CommitBuilder::new(Arc::new(advanced))
+                    .execute(empty_append(read_version))
+                    .await
+                    .map_err(CommitError::OtherError)?;
+            }
+            let policy = CleanupPolicyBuilder::default()
+                .versions(vec![manifest.version])
+                .map_err(CommitError::OtherError)?
+                .build();
+            crate::dataset::cleanup::cleanup_old_versions(&advanced, policy)
+                .await
+                .map_err(CommitError::OtherError)?;
+            assert_eq!(advanced.latest_version_id().await?, manifest.version + 1);
+            assert!(
+                object_store
+                    .inner
+                    .head(&naming_scheme.manifest_path(base_path, manifest.version))
+                    .await
+                    .is_err()
+            );
+            RenameCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_survives_cleanup_removing_target() {
+        let tmp = TempStrDir::default();
+        let dataset = strict_dataset(tmp.as_str()).await;
+        let expected = dataset.version_id();
+        let handler = Arc::new(GateCleanupRaceHandler {
+            advanced: Mutex::new(Some(dataset.clone())),
+        });
+        let result = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(handler)
+            .with_expected_latest_version(expected)
+            .execute(empty_append(expected))
+            .await;
+        let actual_head = Dataset::open(tmp.as_str()).await.unwrap().version_id();
+        assert_eq!(actual_head, expected + 2);
+        assert!(
+            result.is_err(),
+            "strict commit returned success at {:?} after head advanced to {actual_head}",
+            result.as_ref().map(|ds| ds.version_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_expected_head_requires_matching_read_version() {
+        let uri = "memory://strict-expected-head-read-version";
+        let dataset = strict_dataset(uri).await;
+        let expected = dataset.version().version;
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .with_expected_latest_version(expected + 1)
+            .execute(empty_append(expected))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 }

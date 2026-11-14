@@ -944,6 +944,16 @@ pub trait CommitHandler: Debug + Send + Sync {
         false
     }
 
+    /// Whether this handler can reject a write that races with another writer
+    /// for the same manifest version.
+    ///
+    /// Strict expected-head commits require this. A handler that blindly
+    /// overwrites the target manifest cannot uphold that contract even if the
+    /// latest version was checked immediately before the write.
+    fn supports_expected_head_commit(&self) -> bool {
+        false
+    }
+
     /// Whether an error should still be returned after readback proves that
     /// the manifest from the current commit attempt landed.
     ///
@@ -1401,6 +1411,12 @@ impl CommitHandler for UnsafeCommitHandler {
         true
     }
 
+    // Deliberately false: the handler cannot reject a concurrent write for the
+    // same manifest version.
+    fn supports_expected_head_commit(&self) -> bool {
+        false
+    }
+
     fn propagate_commit_error_after_success(&self) -> bool {
         false
     }
@@ -1538,6 +1554,10 @@ where
         true
     }
 
+    fn supports_expected_head_commit(&self) -> bool {
+        true
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1603,6 +1623,10 @@ where
         self.as_ref().is_version_not_found_definitive()
     }
 
+    fn supports_expected_head_commit(&self) -> bool {
+        self.as_ref().supports_expected_head_commit()
+    }
+
     fn propagate_commit_error_after_success(&self) -> bool {
         self.as_ref().propagate_commit_error_after_success()
     }
@@ -1639,6 +1663,10 @@ pub struct RenameCommitHandler;
 #[async_trait::async_trait]
 impl CommitHandler for RenameCommitHandler {
     fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn supports_expected_head_commit(&self) -> bool {
         true
     }
 
@@ -1708,6 +1736,10 @@ pub struct ConditionalPutCommitHandler;
 #[async_trait::async_trait]
 impl CommitHandler for ConditionalPutCommitHandler {
     fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn supports_expected_head_commit(&self) -> bool {
         true
     }
 

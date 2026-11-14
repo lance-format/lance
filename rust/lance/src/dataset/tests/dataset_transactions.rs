@@ -1564,6 +1564,10 @@ impl CommitHandler for GateNextCommitHandler {
         self.inner.is_version_not_found_definitive()
     }
 
+    fn supports_expected_head_commit(&self) -> bool {
+        self.inner.supports_expected_head_commit()
+    }
+
     fn propagate_commit_error_after_success(&self) -> bool {
         self.inner.propagate_commit_error_after_success()
     }
