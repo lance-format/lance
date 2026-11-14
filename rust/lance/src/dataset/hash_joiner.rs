@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::{Dataset, Error, Result};
 use arrow_array::ArrayRef;
 use arrow_array::{Array, RecordBatch, RecordBatchReader, new_null_array};
+use arrow_buffer::NullBuffer;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
@@ -26,6 +27,42 @@ pub struct HashJoiner {
     batches: Vec<RecordBatch>,
 
     out_schema: SchemaRef,
+
+    /// Right-hand null masks per output column, computed once by [`Self::with_skip_null`].
+    /// Empty when nulls overwrite left values; otherwise `None` for a column without
+    /// right-hand nulls, else one entry per right batch (`None` if that batch has no nulls).
+    skip_null_masks: Vec<Option<Arc<[Option<NullBuffer>]>>>,
+}
+
+/// Returns the top-level (logical) null mask of `array`, or `None` if it has no nulls.
+pub(super) fn null_mask(array: &dyn Array) -> Option<NullBuffer> {
+    array.logical_nulls().filter(|nulls| nulls.null_count() > 0)
+}
+
+/// Redirects every interleave index that selects a null source value to the same output row of
+/// the fallback source, which must hold one row per output row.
+///
+/// `null_masks` holds one entry per source; the fallback source's entry is ignored.
+pub(super) fn skip_null_indices(
+    indices: &[(usize, usize)],
+    fallback_index: usize,
+    null_masks: &[Option<NullBuffer>],
+) -> Vec<(usize, usize)> {
+    indices
+        .iter()
+        .enumerate()
+        .map(|(output_row, &(source_i, row_i))| {
+            let is_null = source_i != fallback_index
+                && null_masks[source_i]
+                    .as_ref()
+                    .is_some_and(|nulls| nulls.is_null(row_i));
+            if is_null {
+                (fallback_index, output_row)
+            } else {
+                (source_i, row_i)
+            }
+        })
+        .collect()
 }
 
 fn column_to_rows(column: ArrayRef) -> Result<Rows> {
@@ -151,7 +188,29 @@ impl HashJoiner {
             index_type,
             batches: right_batches,
             out_schema,
+            skip_null_masks: Vec::new(),
         })
+    }
+
+    /// Makes [`Self::collect_with_fallback`] keep the left value for a matched row whose
+    /// right-hand value is null. Only top-level (logical) nulls are considered.
+    pub(super) fn with_skip_null(mut self, skip_null: bool) -> Self {
+        // The right side never changes, so the masks are computed once instead of per left batch.
+        self.skip_null_masks = if skip_null {
+            (0..self.out_schema.fields().len())
+                .map(|column_i| {
+                    let masks = self
+                        .batches
+                        .iter()
+                        .map(|batch| null_mask(batch.column(column_i)))
+                        .collect::<Arc<[_]>>();
+                    masks.iter().any(Option::is_some).then_some(masks)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self
     }
 
     /// Returns the schema of data yielded by `collect()`.
@@ -251,6 +310,9 @@ impl HashJoiner {
     /// Collecting the data using the index column from left table,
     /// invalid join column values in left table will be filled with origin values in left table
     ///
+    /// With [`Self::with_skip_null`], a matched row whose right-hand value is null also keeps
+    /// the left value.
+    ///
     /// Will run in parallel over columns using all available cores.
     pub(super) async fn collect_with_fallback(
         &self,
@@ -292,13 +354,23 @@ impl HashJoiner {
                 }
                 arrays.push(left_batch.column(column_i).clone());
                 let column_name = self.batches[0].schema().field(column_i).name().clone();
+                // Only columns with right-hand nulls need their own indices; the rest share `indices`.
+                let null_masks = self.skip_null_masks.get(column_i).cloned().flatten();
                 // Clone of indices we can send to a new thread
                 let indices = indices.clone();
                 async move {
                     let task_result = task::spawn_blocking(move || {
+                        // Selecting the left row in the indices materializes each column once,
+                        // instead of interleaving nulls and patching them afterwards.
+                        let column_indices = null_masks.map(|null_masks| {
+                            skip_null_indices(&indices, left_batch_index, &null_masks)
+                        });
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
-                        interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::invalid_input(format!("HashJoiner: {}", err)))
+                        interleave(
+                            array_refs.as_ref(),
+                            column_indices.as_deref().unwrap_or(&indices),
+                        )
+                        .map_err(|err| Error::invalid_input(format!("HashJoiner: {}", err)))
                     })
                     .await;
                     match task_result {

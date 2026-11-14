@@ -508,7 +508,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(reader, left_on, right_on, with_offsets=false, strategy="auto", max_hash_rows=None, max_hash_bytes=None, external_memory_pool_bytes=None, max_temp_directory_bytes=None))]
+    #[pyo3(signature=(reader, left_on, right_on, with_offsets=false, strategy="auto", max_hash_rows=None, max_hash_bytes=None, external_memory_pool_bytes=None, max_temp_directory_bytes=None, skip_null=false))]
     fn update_columns(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
@@ -520,6 +520,7 @@ impl FileFragment {
         max_hash_bytes: Option<usize>,
         external_memory_pool_bytes: Option<u64>,
         max_temp_directory_bytes: Option<u64>,
+        skip_null: bool,
     ) -> PyResult<UpdateColumnsResult> {
         let strategy = match strategy {
             "auto" => UpdateJoinStrategy::Auto,
@@ -531,7 +532,9 @@ impl FileFragment {
                 )));
             }
         };
-        let mut options = UpdateJoinOptions::default().with_strategy(strategy);
+        let mut options = UpdateJoinOptions::default()
+            .with_strategy(strategy)
+            .with_skip_null(skip_null);
         match (max_hash_rows, max_hash_bytes) {
             (Some(max_rows), Some(max_bytes)) => {
                 options = options.with_hash_thresholds(max_rows, max_bytes);

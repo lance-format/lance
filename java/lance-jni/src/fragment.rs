@@ -9,7 +9,7 @@ use jni::objects::{JByteArray, JIntArray, JMap, JValue, JValueGen};
 use jni::{
     JNIEnv,
     objects::{JClass, JLongArray, JObject, JString},
-    sys::{jint, jlong, jstring},
+    sys::{JNI_TRUE, jboolean, jint, jlong, jstring},
 };
 use lance::datatypes::Schema;
 use lance::table::format::{
@@ -21,8 +21,8 @@ use std::iter::once;
 
 use roaring::RoaringBitmap;
 
-use lance::dataset::NewColumnTransform;
 use lance::dataset::fragment::write::FragmentCreateBuilder;
+use lance::dataset::{NewColumnTransform, UpdateJoinOptions};
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -520,6 +520,7 @@ pub extern "system" fn Java_org_lance_Fragment_nativeUpdateColumns<'a>(
     arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
     left_on: JString,               // left column name to join on
     right_on: JString,              // right column name to join on
+    skip_null: jboolean,            // keep old values where the new value is null
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -529,7 +530,8 @@ pub extern "system" fn Java_org_lance_Fragment_nativeUpdateColumns<'a>(
             fragment_id,
             arrow_array_stream_addr,
             left_on,
-            right_on
+            right_on,
+            skip_null == JNI_TRUE
         ),
         JObject::null()
     )
@@ -542,6 +544,7 @@ fn inner_update_column<'local>(
     arrow_array_stream_addr: jlong,
     left_on: JString,
     right_on: JString,
+    skip_null: bool,
 ) -> Result<JObject<'local>> {
     let fragment_opt = {
         let dataset =
@@ -560,7 +563,13 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let r = block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
+    let options = UpdateJoinOptions::default().with_skip_null(skip_null);
+    let r = block_on(fragment.update_columns_with_options(
+        reader,
+        &left_on_str,
+        &right_on_str,
+        options,
+    ))?;
     let updated_row_offset_bytes = serialize_matched_offsets(&r.matched_offsets)?;
     let result = FragmentUpdateResult {
         updated_fragment: r.fragment,
