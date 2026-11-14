@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import random
+from collections import Counter
+from itertools import permutations, product
 from pathlib import Path
 
 import lance
@@ -314,7 +317,7 @@ def _assert_numpy_state(actual, expected):
 
 
 def _current_stratified_batches(rows, n, batch_size, max_takes):
-    """Reference current main's ceil-sized strata and proportional row counts."""
+    """Reference proportional counts with all legal stratum windows reachable."""
     chunk_size = (rows + max_takes - 1) // max_takes
     pending, batches, states = [], [], []
     for start in range(0, rows, chunk_size):
@@ -326,7 +329,9 @@ def _current_stratified_batches(rows, n, batch_size, max_takes):
 
         offset = start
         if local_sample_size < local_size:
-            offset += int(np.random.randint(0, local_size - local_sample_size))
+            offset += int(
+                np.random.randint(0, local_size - local_sample_size + 1, dtype=np.int64)
+            )
         pending.extend(range(offset, offset + local_sample_size))
         if len(pending) >= batch_size:
             batches.append(pending)
@@ -357,6 +362,58 @@ def write_multifragment_dataset(tmp_path):
     return write
 
 
+@pytest.mark.parametrize("max_takes", [1, 4, 9])
+@pytest.mark.parametrize(
+    "n,valid_every",
+    [(40, 1), (40, 2), (40, 3), (37, 1), (7, 1), (40, None), (0, 1)],
+    ids=[
+        "quota-met",
+        "exhausted-partial-batch",
+        "exhausted-sparse",
+        "quota-partial-batch",
+        "smaller-than-batch",
+        "no-matches",
+        "zero-requested",
+    ],
+)
+def test_maybe_sample_filtered(
+    write_multifragment_dataset, monkeypatch, max_takes, n, valid_every
+):
+    values = [
+        i if valid_every is not None and i % valid_every == 0 else None
+        for i in range(50)
+    ]
+    dataset = write_multifragment_dataset(
+        pa.table({"value": pa.array(values, type=pa.int64())}),
+        "filtered.lance",
+        max_rows_per_file=10,
+    )
+    monkeypatch.setattr("lance.sampler.random.shuffle", random.Random(0).shuffle)
+    batches = list(
+        maybe_sample(
+            dataset,
+            n,
+            ["value"],
+            batch_size=10,
+            max_takes=max_takes,
+            filt="value is not null",
+        )
+    )
+
+    eligible = {value for value in values if value is not None}
+    expected_count = min(n, len(eligible))
+    expected_batch_sizes = [10] * (expected_count // 10)
+    if expected_count % 10:
+        expected_batch_sizes.append(expected_count % 10)
+    assert all(isinstance(batch, pa.RecordBatch) for batch in batches)
+    assert [batch.num_rows for batch in batches] == expected_batch_sizes
+    sampled = [value for batch in batches for value in batch["value"].to_pylist()]
+    assert len(sampled) == len(set(sampled)) == expected_count
+    assert set(sampled) <= eligible
+    if len(eligible) <= n:
+        assert set(sampled) == eligible
+
+
 def _patch_small_torch_sampler(monkeypatch, max_takes):
     import lance.torch.data as torch_data
 
@@ -366,6 +423,35 @@ def _patch_small_torch_sampler(monkeypatch, max_takes):
         )
 
     monkeypatch.setattr(torch_data, "maybe_sample", sample)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 10])
+@pytest.mark.parametrize(
+    "n,expected",
+    [
+        (10, [2, 4, 5, 8, 10, 11, 14, 16, 17, 19]),
+        (19, list(range(1, 20))),
+    ],
+    ids=["partial-strata-and-tail", "fully-sampled-strata"],
+)
+def test_maybe_sample_reaches_final_stratum_rows(
+    write_multifragment_dataset, monkeypatch, n, expected, batch_size
+):
+    dataset = write_multifragment_dataset(
+        pa.table({"id": range(20)}), "final_windows.lance", max_rows_per_file=5
+    )
+
+    def highest_offset(low, high, dtype):
+        assert low == 0
+        assert dtype == np.int64
+        return high - 1
+
+    monkeypatch.setattr(np.random, "randint", highest_offset)
+    batches = list(maybe_sample(dataset, n, ["id"], batch_size=batch_size, max_takes=9))
+    sampled = [row for batch in batches for row in batch["id"].to_pylist()]
+    assert sampled == expected
+    assert len(sampled) == len(set(sampled)) == n
+    assert sampled[-1] == 19
 
 
 @pytest.mark.parametrize("stop_early", [False, True], ids=["full", "early-stop"])
@@ -592,15 +678,92 @@ def test_maybe_sample_keeps_small_sample_path_when_max_takes_exceeds_rows(
         )
     )
     np.random.seed(seed)
-    expected = np.random.choice(rows, n, replace=False).tolist()
+    expected = list(maybe_sample(dataset, n, ["id"], batch_size=n, max_takes=max_takes))
     expected_state = _copy_numpy_state()
     np.random.seed(seed)
 
     actual = list(maybe_sample(dataset, n, ["id"], batch_size=n, max_takes=max_takes))
 
-    assert [batch["id"].to_pylist() for batch in actual] == [expected]
-    assert dataset.take_sizes == [n]
+    assert actual == expected
+    ids = actual[0]["id"].to_pylist()
+    assert len(ids) == len(set(ids)) == n
+    assert all(0 <= row < rows for row in ids)
+    assert dataset.take_sizes == [n, n]
     _assert_numpy_state(np.random.get_state(), expected_state)
+
+
+class _VirtualDataset:
+    def __init__(self, rows):
+        self.rows = rows
+        self.take_sizes = []
+
+    def __len__(self):
+        return self.rows
+
+    def take(self, indices, columns=None):
+        assert columns == ["id"]
+        self.take_sizes.append(len(indices))
+        return pa.table({"id": pa.array(indices, type=pa.int64())})
+
+
+@pytest.mark.parametrize(
+    "rows", [100, 10_000_000, 2**31 - 1, 2**31, 2**31 + 1, 2**31 + 2]
+)
+@pytest.mark.parametrize("n,max_takes", [(0, 32), (1, 32), (32, 32), (2, 1)])
+def test_maybe_sample_virtual_dataset_windows_width(
+    rows, n, max_takes, preserve_numpy_state, monkeypatch
+):
+    original_randint = np.random.randint
+
+    # Emulate Windows' default integer width on every platform.
+    def randint(low, high, dtype=np.int32):
+        return original_randint(low, high, dtype=dtype)
+
+    monkeypatch.setattr(np.random, "randint", randint)
+    dataset = _VirtualDataset(rows)
+    np.random.seed(1618)
+    batches = list(maybe_sample(dataset, n, "id", batch_size=7, max_takes=max_takes))
+    state = _copy_numpy_state()
+    np.random.seed(1618)
+    assert (
+        list(maybe_sample(dataset, n, "id", batch_size=7, max_takes=max_takes))
+        == batches
+    )
+    _assert_numpy_state(np.random.get_state(), state)
+
+    ids = [row for batch in batches for row in batch["id"].to_pylist()]
+    assert len(ids) == len(set(ids)) == n
+    assert all(0 <= row < rows for row in ids)
+    expected_sizes = [min(7, n - start) for start in range(0, n, 7)]
+    assert [batch.num_rows for batch in batches] == expected_sizes
+    assert dataset.take_sizes == expected_sizes * 2
+
+
+def test_maybe_sample_small_uniform_samples(monkeypatch):
+    dataset = _VirtualDataset(4)
+    counts = Counter()
+    # Enumerate every draw, collision, and output order for a two-row sample.
+    for first, second, reverse in product(range(3), range(4), (False, True)):
+        steps = iter(zip((first, second), (3, 4)))
+
+        def randint(low, high, dtype):
+            draw, expected_high = next(steps)
+            assert (low, high) == (0, expected_high)
+            assert dtype == np.int64
+            return draw
+
+        monkeypatch.setattr(np.random, "randint", randint)
+        monkeypatch.setattr(
+            np.random, "shuffle", lambda values: values.reverse() if reverse else None
+        )
+        batch = list(maybe_sample(dataset, 2, "id", batch_size=2))[0]
+        counts[tuple(batch["id"].to_pylist())] += 1
+    assert counts == Counter({sample: 2 for sample in permutations(range(4), 2)})
+
+
+def test_maybe_sample_rejects_negative_sample_size():
+    with pytest.raises(ValueError, match="n must be non-negative, got -1"):
+        list(maybe_sample(_VirtualDataset(10), -1, "id"))
 
 
 @pytest.mark.parametrize("n", [100, 3000, 4095])
