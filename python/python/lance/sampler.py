@@ -449,7 +449,11 @@ class ShardedBatchSampler(Sampler):
             filter=filter,
             scan_in_order=True,
         ).to_batches():
-            batch = batch.slice(rows_to_skip, batch.num_rows - rows_to_skip)
+            if rows_to_skip >= batch.num_rows:
+                # This batch ends before this rank's next row.
+                rows_to_skip -= batch.num_rows
+                continue
+            batch = batch.slice(rows_to_skip)
             # Take every Nth row
             indices = list(range(0, batch.num_rows, self._world_size))
             rows_to_skip = (
@@ -478,10 +482,13 @@ class ShardedBatchSampler(Sampler):
                     accumulated_batches.append(big_batch)
         # deliver any batches left over, they will be <= batch
         # size but that is ok because we are done
-        last_batch = (
-            pa.Table.from_batches(accumulated_batches).combine_chunks().to_batches()[0]
-        )
-        yield last_batch
+        if accumulated_batches:
+            last_batch = (
+                pa.Table.from_batches(accumulated_batches)
+                .combine_chunks()
+                .to_batches()[0]
+            )
+            yield last_batch
 
     def _sample_filtered(
         self,
