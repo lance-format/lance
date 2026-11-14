@@ -263,7 +263,7 @@ impl InvertedIndex {
                     .ok_or_else(|| Error::internal("selective phrase partition became legacy"))?;
                 let visibility = documents.visibility(request.mask.clone(), false).await?;
                 if !visibility.may_match().await? {
-                    return Ok((ordinal, Vec::new()));
+                    return Result::Ok((ordinal, Vec::new()));
                 }
                 let lengths = documents.lengths().await?;
                 let ids = request.term_ids.map(|ids| ids.partition(ordinal));
@@ -278,7 +278,7 @@ impl InvertedIndex {
                     )
                     .await?
                 else {
-                    return Ok((ordinal, Vec::new()));
+                    return Result::Ok((ordinal, Vec::new()));
                 };
                 let tokens = request.tokens.clone();
                 let scorer = request.impact_scorer.clone();
@@ -319,7 +319,7 @@ impl InvertedIndex {
                                 ))
                             })
                             .await?;
-                            return Ok((ordinal, scored));
+                            return Result::Ok((ordinal, scored));
                         }
                         PhraseProgress::Read(requests) => {
                             // One block per clause, at most 8 MiB in aggregate.

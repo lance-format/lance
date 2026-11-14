@@ -2237,7 +2237,7 @@ async fn selective_phrase_search_reads_committed_partitions(
     let dir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::with_format_version(
         ObjectStore::local().into(),
-        dir,
+        dir.clone(),
         Arc::new(LanceCache::no_cache()),
         lance_file::version::ConcreteFileVersion::V2_2,
     ));

@@ -976,7 +976,7 @@ impl InvertedPartition {
         })
     }
 
-    fn map(&self, token: &str) -> Option<u32> {
+    pub(super) fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
     }
 
