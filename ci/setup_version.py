@@ -3,7 +3,7 @@
 This script is used to set the pre-release version for beta releases
 (e.g. 0.10.17-beta.1) when the tag indicates a beta release.
 
-With the new automated release process, stable versions are already 
+With the new automated release process, stable versions are already
 updated by bump-my-version during the release workflow.
 """
 
@@ -38,9 +38,9 @@ def main():
         print(f"Setting beta version: {current_version} -> {args.version[1:]}")
     else:
         # For stable releases, version should already match
-        assert (
-            parsed_version.release == current_version_parsed.release
-        ), f"Version mismatch for stable release: {parsed_version.release} != {current_version_parsed.release}"
+        assert parsed_version.release == current_version_parsed.release, (
+            f"Version mismatch for stable release: {parsed_version.release} != {current_version_parsed.release}"
+        )
 
     with open("python/Cargo.toml", "w") as f:
         f.writelines(lines)

@@ -2,7 +2,7 @@ use libc::{c_void, size_t};
 use std::ptr;
 
 // Import from the library we're testing
-use memtest::{memtest_get_stats, memtest_reset_stats, MemtestStats};
+use memtest::{MemtestStats, memtest_get_stats, memtest_reset_stats};
 
 extern "C" {
     fn malloc(size: size_t) -> *mut c_void;
