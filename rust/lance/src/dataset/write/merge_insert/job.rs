@@ -7,23 +7,25 @@ use super::assign_action::{
 use super::inserted_rows::{KeyExistenceFilter, KeyExistenceFilterBuilder};
 
 use super::merger::Merger;
-use super::row_ids;
 use super::{
     DeduplicatingSourcePartitionStream, INDEXED_JOIN_BATCH_ROWS, MAX_FRAGMENT_UPDATE_BATCH_BYTES,
-    MAX_INDEXED_JOIN_BATCH_BYTES, MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertJob,
-    MergeInsertWriteMode, MergeStats, PatchedFragments, SchemaComparison, SourceDedupeBehavior,
-    UncommittedMergeInsert, WhenMatched, WhenNotMatchedBySource, canonical_source_schema,
-    check_source_schema, created_blob_payloads, exec, fill_missing_target_columns, logical_plan,
-    one_shot_provider, resolve_target_bases, target_blob_handling, uncommitted_transaction,
+    MAX_INDEXED_JOIN_BATCH_BYTES, MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertAnalysis,
+    MergeInsertJob, MergeInsertWriteMode, MergeInsertWriteStrategy, MergeStats, PatchedFragments,
+    SchemaComparison, SourceDedupeBehavior, UncommittedMergeInsert, WhenMatched,
+    WhenNotMatchedBySource, canonical_source_schema, check_source_schema, collect_merge_joins,
+    created_blob_payloads, exec, fill_missing_target_columns, logical_plan, one_shot_provider,
+    resolve_target_bases, target_blob_handling, uncommitted_transaction,
 };
-use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
-use crate::dataset::rowids::{get_row_id_index, translate_addr_treemap_to_row_ids};
+use super::{analysis, row_ids};
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::write::cleanup_data_fragments;
 use crate::dataset::write::retry::{RetryConfig, RetryExecutor, execute_with_retry};
-use crate::dataset::write::{CommitBuilder, write_fragments_internal};
+use crate::dataset::write::{
+    CommitBuilder, write_fragments_internal, write_fragments_internal_impl,
+};
 use crate::index::DatasetIndexExt;
-use crate::index::scalar_logical::load_named_scalar_segments;
+use crate::index::visibility::IndexVisibility;
 use crate::{
     Dataset,
     datafusion::dataframe::{LanceTableProvider, SessionContextExt},
@@ -70,14 +72,16 @@ use lance_core::{
 };
 use lance_datafusion::{
     exec::{
-        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan,
-        execute_plan_with_session_context, new_session_context, provider_to_stream,
+        ExecutionAnalysis, ExecutionOutcome, HardCapBatchSizeExec, LanceExecutionOptions,
+        OneShotExec, analyze_plan, analyze_plan_report_with_context, new_session_context,
+        new_session_context_with_memory_tracking, provider_to_stream,
     },
     spill::{materialize_stream, spilling_table_provider_with_job_disk_manager},
     utils::StreamingWriteSource,
 };
+use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexCriteria;
-use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
 use log::info;
@@ -88,7 +92,10 @@ use std::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
+    time::Duration,
 };
+use tracing::Instrument;
+use uuid::Uuid;
 
 /// Whether `field` is a blob or has one anywhere beneath it.
 ///
@@ -192,32 +199,21 @@ impl MergeInsertJob {
         Ok(unindexed.into_values().collect())
     }
 
-    /// Physical rows whose join-key index entries may be stale due to newer overlays.
+    /// Resolve stale join keys using the same segment policy as scalar filtering.
     async fn overlay_stale_rows_for_keys(
         &self,
         indexed_keys: &[(String, IndexMetadata)],
-    ) -> Result<RowAddrTreeMap> {
-        let overlaid_frags = overlaid_fragments(self.dataset.fragments());
-        if overlaid_frags.is_empty() {
-            return Ok(RowAddrTreeMap::new());
-        }
-        let mut stale = HashMap::new();
-        for (column, index) in indexed_keys {
-            let segments = load_named_scalar_segments(&self.dataset, column, &index.name).await?;
-            for segment in &segments {
-                collect_overlay_stale_rows_for_segment(
-                    segment,
-                    &overlaid_frags,
-                    &mut stale,
-                    self.dataset.schema(),
-                )?;
-            }
-        }
-        let mut rows = RowAddrTreeMap::new();
-        for (fragment_id, offsets) in stale {
-            rows.insert_bitmap(fragment_id, offsets);
-        }
-        Ok(rows)
+    ) -> Result<IndexVisibility> {
+        IndexVisibility::for_scalar_indices(
+            self.dataset.clone(),
+            &indexed_keys
+                .iter()
+                .map(|(column, index)| (column.as_str(), index.name.as_str()))
+                .collect::<Vec<_>>(),
+            self.dataset.fragments(),
+            None,
+        )
+        .await
     }
 
     async fn create_indexed_scan_joined_stream(
@@ -256,7 +252,6 @@ impl MergeInsertJob {
         let max_batch_bytes = ((execution_options.mem_pool_size() as usize) / 8)
             .clamp(1, MAX_INDEXED_JOIN_BATCH_BYTES);
         let session_ctx = &self.spill_session_context;
-        let disk_manager = session_ctx.runtime_env().disk_manager.clone();
         let ordinal_field = source_ordinal_column
             .as_ref()
             .map(|name| Field::new(name, DataType::UInt64, false));
@@ -296,12 +291,7 @@ impl MergeInsertJob {
             )
             .await?;
             let source = provider_to_stream(normalized_source).await?;
-            let replayable_source = spilling_table_provider_with_job_disk_manager(
-                source,
-                max_batch_bytes,
-                disk_manager.clone(),
-            )
-            .await?;
+            let replayable_source = analysis::replay(source, max_batch_bytes, session_ctx).await?;
             (
                 replayable_source
                     .scan(&session_ctx.state(), None, &[], None)
@@ -336,11 +326,7 @@ impl MergeInsertJob {
         if !overlay_stale_rows.is_empty() {
             // The fallback scan below reads these rows using their current keys. Block
             // old index hits so a row cannot enter the target side of the join twice.
-            let stale_row_ids = if self.dataset.manifest().uses_stable_row_ids() {
-                translate_addr_treemap_to_row_ids(&self.dataset, &overlay_stale_rows).await?
-            } else {
-                overlay_stale_rows.clone()
-            };
+            let stale_row_ids = overlay_stale_rows.result_rows().await?.clone();
             index_mapper = Arc::new(RowAddrMaskFilterExec::new(
                 index_mapper,
                 Arc::new(RowAddrMask::from_block(stale_row_ids)),
@@ -351,17 +337,13 @@ impl MergeInsertJob {
         // rows. Otherwise its retained candidate set competes with both sorts
         // for the same pool. Replaying these row addresses is inexpensive and
         // spills when needed.
-        let mapped_rows = execute_plan_with_session_context(
+        let mapped_rows = analysis::execute(
+            "index_probe",
             index_mapper,
             execution_options.clone(),
             session_ctx,
         )?;
-        let mapped_rows = spilling_table_provider_with_job_disk_manager(
-            mapped_rows,
-            max_batch_bytes,
-            disk_manager,
-        )
-        .await?;
+        let mapped_rows = analysis::replay(mapped_rows, max_batch_bytes, session_ctx).await?;
         let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
         while initial_scan.try_next().await?.is_some() {}
         drop(initial_scan);
@@ -422,7 +404,7 @@ impl MergeInsertJob {
             if overlay_stale_rows.is_empty() {
                 builder.with_fragments(unindexed_fragments);
             } else {
-                let mut fallback_rows = overlay_stale_rows;
+                let mut fallback_rows = overlay_stale_rows.physical_selection();
                 for fragment in unindexed_fragments {
                     fallback_rows.insert_fragment(fragment.id as u32);
                 }
@@ -509,18 +491,26 @@ impl MergeInsertJob {
         // A sort spilled to several runs keeps a merge reservation until its output is read,
         // and that reservation grows with the number of runs, up to the whole pool. Finish
         // the source sort first, so that each sort has the pool to itself.
-        let sorted_source = execute_plan_with_session_context(
+        let sorted_source = analysis::execute(
+            "indexed_source_sort",
             Arc::new(SortExec::new(source_ordering, source_input)),
             execution_options.clone(),
             session_ctx,
         )?;
-        let (sorted_source, _) = materialize_stream(
+        let (sorted_source, materialization_metrics) = materialize_stream(
             sorted_source,
             session_ctx.runtime_env(),
             execution_options.mem_pool_size() as usize / 8,
             "materializing sorted merge insert source",
         )
         .await?;
+        if let Some(scope) = analysis::scope(session_ctx) {
+            scope
+                .materializations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(materialization_metrics);
+        }
         let source_input = Arc::new(OneShotExec::new(sorted_source));
         let target = Arc::new(SortExec::new(target_ordering, target));
         let joined: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
@@ -541,7 +531,7 @@ impl MergeInsertJob {
         } else {
             joined
         };
-        execute_plan_with_session_context(joined, execution_options, session_ctx)
+        analysis::execute("indexed_join", joined, execution_options, session_ctx)
     }
 
     fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
@@ -1547,14 +1537,7 @@ impl MergeInsertJob {
         let stream: SendableRecordBatchStream =
             Box::pin(RecordBatchStreamAdapter::new(merger_schema, stream));
         let stream = if order_updates_first {
-            row_ids::updates_before_inserts(
-                stream,
-                self.spill_session_context
-                    .runtime_env()
-                    .disk_manager
-                    .clone(),
-            )
-            .await?
+            row_ids::updates_before_inserts(stream, &self.spill_session_context).await?
         } else {
             stream
         };
@@ -1676,17 +1659,42 @@ impl MergeInsertJob {
             (operation, None, inserted_rows_filter)
         } else {
             let cleanup_bases = target_bases_info.clone();
-            let (mut new_fragments, _) = write_fragments_internal(
-                self.params.write_version(&self.dataset),
-                Some(&self.dataset),
-                self.dataset.object_store.clone(),
-                &self.dataset.base,
-                self.dataset.schema().clone(),
-                stream,
-                self.write_params.as_ref().clone(),
-                target_bases_info,
-            )
+            // Bound the merge future's size as diagnostic writing adds another writer state.
+            let written = Box::pin(async {
+                if let Some(scope) = analysis::scope(&self.spill_session_context) {
+                    write_fragments_internal_impl(
+                        self.params.write_version(&self.dataset),
+                        Some(&self.dataset),
+                        self.dataset.object_store.clone(),
+                        &self.dataset.base,
+                        self.dataset.schema().clone(),
+                        stream,
+                        self.write_params.as_ref().clone(),
+                        target_bases_info,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Some(scope.blobs.clone()),
+                        None,
+                    )
+                    .await
+                } else {
+                    write_fragments_internal(
+                        self.params.write_version(&self.dataset),
+                        Some(&self.dataset),
+                        self.dataset.object_store.clone(),
+                        &self.dataset.base,
+                        self.dataset.schema().clone(),
+                        stream,
+                        self.write_params.as_ref().clone(),
+                        target_bases_info,
+                    )
+                    .await
+                }
+            })
             .await?;
+            let (mut new_fragments, _) = written;
 
             // The new data files exist but are not committed yet; clean them up
             // (including files routed to target bases) if any later step fails.
@@ -1954,6 +1962,344 @@ impl MergeInsertJob {
             .await
     }
 
+    /// Analyze a streaming merge without committing, returning typed diagnostics.
+    ///
+    /// Like [`Self::analyze_plan`], this writes temporary data/deletion files and
+    /// removes them after execution. Execution failures return a partial report;
+    /// planning failures return an error. Dropping the future can interrupt cleanup,
+    /// leaving unreferenced files for orphan cleanup. Source statistics and
+    /// deduplication follow [`Self::execute`].
+    ///
+    /// ```
+    /// # use lance::{dataset::MergeInsertJob, Result};
+    /// # use datafusion::physical_plan::SendableRecordBatchStream;
+    /// # async fn example(job: &MergeInsertJob, source: SendableRecordBatchStream) -> Result<()> {
+    /// let report = job.analyze_plan_report(source).await?;
+    /// assert!(report.execution.error.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn analyze_plan_report(
+        &self,
+        source: SendableRecordBatchStream,
+    ) -> Result<MergeInsertAnalysis> {
+        self.analyze_report(one_shot_provider(source)?, SourceProviderMode::OneShot)
+            .await
+    }
+
+    /// [`Self::analyze_plan_report`] for materialized input, preserving its statistics.
+    pub async fn analyze_plan_report_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<MergeInsertAnalysis> {
+        self.analyze_report(
+            self.batches_to_provider(batches)?,
+            SourceProviderMode::StableSnapshot,
+        )
+        .await
+    }
+
+    /// [`Self::analyze_plan_report`] for a re-scannable provider.
+    ///
+    /// Supports current-format plan execution and scalar-index joins with all join
+    /// columns indexed and `when_not_matched_by_source=Keep`. Existing text analysis
+    /// retains its narrower plan-only eligibility.
+    /// The report describes the execution that produced its formatted plan. Logical
+    /// row changes and data bytes come from the write sink, never bitmap payload rows.
+    pub async fn analyze_plan_report_provider(
+        &self,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<MergeInsertAnalysis> {
+        self.analyze_report(provider, SourceProviderMode::Rescannable)
+            .await
+    }
+
+    /// [`Self::analyze_plan_report_provider`] for a native Lance dataset source.
+    ///
+    /// Preserves the source's native scan and statistics, as [`Self::execute_dataset`] does.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result, dataset::MergeInsertJob};
+    /// # async fn example(job: &MergeInsertJob, source: Arc<Dataset>) -> Result<()> {
+    /// let report = job.analyze_plan_report_dataset(source).await?;
+    /// assert!(report.execution.error.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn analyze_plan_report_dataset(
+        &self,
+        source: Arc<Dataset>,
+    ) -> Result<MergeInsertAnalysis> {
+        self.analyze_plan_report_provider(Self::dataset_source_provider(source))
+            .await
+    }
+
+    async fn analyze_report(
+        &self,
+        provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
+    ) -> Result<MergeInsertAnalysis> {
+        let operation_id = Uuid::new_v4();
+        let scope = Arc::new(analysis::AnalysisScope::new(self.dataset.uri()));
+        let mut job = self.clone();
+        let session = new_session_context_with_memory_tracking(&job.spill_execution_options)?;
+        let config = session.copied_config().with_extension(scope.clone());
+        job.spill_session_context =
+            SessionContext::new_with_config_rt(config, session.runtime_env());
+        let can_plan = job.can_use_create_plan(provider.schema().as_ref()).await?;
+        let indexed = !can_plan;
+        if indexed {
+            job.check_compatible_schema(provider.schema().as_ref())?;
+            if job.dataset.manifest.data_storage_format.lance_file_format()
+                == ConcreteFileVersion::V1
+                || !job.params.use_index
+                || job.indexed_join_keys().await?.len() != job.params.on.len()
+                || !matches!(
+                    job.params.delete_not_matched_by_source,
+                    WhenNotMatchedBySource::Keep
+                )
+            {
+                return Err(Error::not_supported_source("Structured merge analysis requires a supported current-format plan or a fully indexed scalar join with when_not_matched_by_source=Keep".into()));
+            }
+        }
+        let options = job.spill_execution_options.clone();
+        let context = job.spill_session_context.task_ctx();
+        let memory_pool = context.memory_pool().clone();
+        let started = std::time::Instant::now();
+        let span = tracing::info_span!("merge_insert_analysis", operation_id = %operation_id);
+        let (mut execution, mut stats, transaction, write_mode, mut joins) = if can_plan {
+            let plan = job.create_plan(provider).instrument(span.clone()).await?;
+            let mode = if plan.is::<exec::DeleteOnlyMergeInsertExec>() {
+                MergeInsertWriteStrategy::DeleteOnly
+            } else if plan.is::<exec::InPlaceMergeInsertExec>() {
+                MergeInsertWriteStrategy::RewriteColumns
+            } else {
+                MergeInsertWriteStrategy::RewriteRows
+            };
+            let joins = collect_merge_joins(plan.as_ref());
+            let execution = analyze_plan_report_with_context(plan.clone(), options, context)
+                .instrument(span.clone())
+                .await?;
+            scope.record_target_reads(plan.as_ref());
+            let stats = if let Some(node) = plan.downcast_ref::<exec::FullSchemaMergeInsertExec>() {
+                node.merge_stats()
+            } else if let Some(node) = plan.downcast_ref::<exec::InPlaceMergeInsertExec>() {
+                node.merge_stats()
+            } else {
+                plan.downcast_ref::<exec::DeleteOnlyMergeInsertExec>()
+                    .and_then(|node| node.merge_stats())
+            };
+            let transaction = uncommitted_transaction(plan.as_ref());
+            if let Some(payloads) = created_blob_payloads(plan.as_ref()) {
+                payloads.delete_all().instrument(span.clone()).await;
+            }
+            (execution, stats, transaction, mode, joins)
+        } else {
+            // Reuse the current indexed writer and its uncommitted transaction machinery.
+            // No alternate join, retries, or commits are introduced for diagnostics.
+            let failed_mode = if matches!(self.params.when_matched, WhenMatched::Delete)
+                && !self.params.insert_not_matched
+            {
+                MergeInsertWriteStrategy::DeleteOnly
+            } else if matches!(
+                self.check_compatible_schema(provider.schema().as_ref())?,
+                SchemaComparison::Subschema
+            ) {
+                MergeInsertWriteStrategy::RewriteColumns
+            } else {
+                MergeInsertWriteStrategy::RewriteRows
+            };
+            let result = job
+                .execute_uncommitted_impl(provider, source_mode)
+                .instrument(span.clone())
+                .await;
+            let mut execution = ExecutionAnalysis {
+                plan: "Indexed merge execution (see subplans)".to_owned(),
+                outcome: ExecutionOutcome::Complete,
+                error: None,
+                elapsed: started.elapsed(),
+                pool_peak_reserved_bytes: None,
+                summary: Default::default(),
+                operators: Vec::new(),
+            };
+            let mode = match &result {
+                Ok(result) => match &result.transaction.operation {
+                    Operation::Update {
+                        update_mode: Some(RewriteColumns),
+                        updated_fragments,
+                        new_fragments,
+                        ..
+                    } if updated_fragments.is_empty() && !new_fragments.is_empty() => {
+                        MergeInsertWriteStrategy::RewriteRows
+                    }
+                    Operation::Update {
+                        update_mode: Some(RewriteColumns),
+                        ..
+                    } => MergeInsertWriteStrategy::RewriteColumns,
+                    _ if matches!(self.params.when_matched, WhenMatched::Delete)
+                        && !self.params.insert_not_matched =>
+                    {
+                        MergeInsertWriteStrategy::DeleteOnly
+                    }
+                    _ => MergeInsertWriteStrategy::RewriteRows,
+                },
+                Err(_) => failed_mode,
+            };
+            let (stats, transaction) = match result {
+                Ok(result) => (Some(result.stats), Some(result.transaction)),
+                Err(error) => {
+                    execution.outcome = ExecutionOutcome::Failed;
+                    execution.error = Some(error.to_string());
+                    (None, None)
+                }
+            };
+            (execution, stats, transaction, mode, Vec::new())
+        };
+        let fragments_touched = transaction.as_ref().and_then(|transaction| {
+            if let Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                ..
+            } = &transaction.operation
+            {
+                Some(updated_fragments.len() + removed_fragment_ids.len())
+            } else {
+                None
+            }
+        });
+        if indexed
+            && let (Some(stats), Some(transaction)) = (&mut stats, &transaction)
+            && let Operation::Update {
+                updated_fragments,
+                new_fragments,
+                ..
+            } = &transaction.operation
+        {
+            stats.bytes_written = 0;
+            stats.num_files_written = 0;
+            let original: std::collections::BTreeSet<_> = self
+                .dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(|fragment| &fragment.files)
+                .map(|file| &file.path)
+                .collect();
+            for file in updated_fragments
+                .iter()
+                .chain(new_fragments)
+                .flat_map(|fragment| &fragment.files)
+                .filter(|file| !original.contains(&file.path))
+            {
+                if let Some(bytes) = file.file_size_bytes.get() {
+                    stats.bytes_written += u64::from(bytes);
+                }
+                stats.num_files_written += 1;
+            }
+        }
+        scope.blobs.delete_all().instrument(span.clone()).await;
+        if let Some(transaction) = &transaction {
+            self.cleanup_uncommitted_files(transaction)
+                .instrument(span)
+                .await;
+        } else {
+            let patches = scope
+                .patches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            self.cleanup_uncommitted_fragments(&[], &patches)
+                .instrument(span)
+                .await;
+        }
+        execution.pool_peak_reserved_bytes =
+            datafusion::execution::memory_pool::PeakRecordingPool::from_pool(memory_pool.as_ref())
+                .map(|pool| pool.max_reserved());
+        let subplans = scope.plans();
+        if indexed {
+            execution.summary.all_times.insert(
+                "merge_write_time".to_owned(),
+                execution.elapsed.as_nanos() as usize,
+            );
+            execution.plan = subplans
+                .iter()
+                .map(|plan| {
+                    format!(
+                        "Subplan {} ({}):\n{}",
+                        plan.id, plan.purpose, plan.execution.plan
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            joins = subplans
+                .iter()
+                .flat_map(|plan| plan.joins.iter().cloned())
+                .collect();
+        }
+        let executions =
+            || std::iter::once(&execution).chain(subplans.iter().map(|plan| &plan.execution));
+        let materializations = scope.materialization_summaries();
+        let operator_spills = analysis::operator_spills(
+            executions()
+                .map(|execution| &execution.summary)
+                .chain(materializations.iter()),
+        );
+        let (target_rows_read, fragments_read) = scope.target_reads();
+        let (join_duration, joined_rows) = analysis::join_measurements(executions());
+        let merge_write_duration = execution
+            .summary
+            .all_times
+            .get("merge_write_time")
+            .map(|value| Duration::from_nanos(*value as u64));
+        let mapped_target_rows = subplans
+            .iter()
+            .filter(|plan| plan.purpose == "index_probe")
+            .flat_map(|plan| &plan.execution.operators)
+            .filter(|node| node.name == "MapIndexExec")
+            .flat_map(|node| &node.metrics)
+            .filter_map(|metric| match (&*metric.name, &metric.value) {
+                ("output_rows", lance_datafusion::exec::ExecutionMetricValue::Count(count)) => {
+                    Some(*count)
+                }
+                _ => None,
+            })
+            .reduce(|a, b| a + b);
+        let complete = execution.outcome == ExecutionOutcome::Complete;
+        let observed_probe = subplans.iter().any(|plan| plan.purpose == "index_probe");
+        let index_used = if complete || observed_probe {
+            Some(observed_probe)
+        } else {
+            None
+        };
+        Ok(MergeInsertAnalysis {
+            operation_id,
+            execution,
+            joins,
+            write_mode,
+            stats: if complete { stats } else { None },
+            fragments_touched: if complete { fragments_touched } else { None },
+            subplans,
+            operator_spills,
+            replay_spills: scope.replay.snapshot(),
+            scratch_spills: None,
+            target_rows_read,
+            fragments_read,
+            index_used,
+            join_index_segments: index_used.map(|_| {
+                scope
+                    .segments
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len()
+            }),
+            join_duration,
+            merge_write_duration,
+            joined_rows,
+            mapped_target_rows,
+        })
+    }
+
     /// [`Self::analyze_plan`] from a re-scannable [`TableProvider`].
     ///
     /// Mirrors [`Self::execute_provider`]. Under
@@ -2042,6 +2388,15 @@ impl MergeInsertJob {
             return;
         };
 
+        self.cleanup_uncommitted_fragments(new_fragments, updated_fragments)
+            .await;
+    }
+
+    async fn cleanup_uncommitted_fragments(
+        &self,
+        new_fragments: &[Fragment],
+        updated_fragments: &[Fragment],
+    ) {
         let original_fragments: HashMap<u64, &Fragment> = self
             .dataset
             .manifest
@@ -2050,7 +2405,7 @@ impl MergeInsertJob {
             .map(|fragment| (fragment.id, fragment))
             .collect();
 
-        let mut written_fragments = new_fragments.clone();
+        let mut written_fragments = new_fragments.to_vec();
         let mut written_deletion_files = Vec::new();
         for updated in updated_fragments {
             let original = original_fragments.get(&updated.id);

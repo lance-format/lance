@@ -43,6 +43,26 @@ env:
   CACHE_PREFIX: "2"
 
 jobs:
+  # Rust-only PRs run a reduced set; pushes to main/release run everything.
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      bindings: ${{ github.event_name != 'pull_request' || steps.filter.outputs.bindings == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            bindings:
+              - python/**
+              - .github/workflows/python.yml
+              - .github/workflows/build_*_wheel/**
+              - .github/workflows/run_tests/**
+
   lint:
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
@@ -98,6 +118,8 @@ jobs:
           pytest --doctest-modules python/lance
 
   python-rust-test:
+    needs: changes
+    if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 30
     name: pylance crate Rust tests
     runs-on: "ubuntu-24.04-4x"
@@ -184,11 +206,11 @@ jobs:
           if-no-files-found: error
 
   linux:
-    needs: [linux-wheel, linux-memtest]
+    needs: [changes, linux-wheel, linux-memtest]
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["10", "13", "14"]
+        python-minor-version: ${{ fromJSON(needs.changes.outputs.bindings == 'true' && '["10", "13", "14"]' || '["14"]') }}
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04-4x"
     defaults:
@@ -255,6 +277,8 @@ jobs:
           make compattest PYTEST_WORKERS=$(( $(nproc) * 2 ))
 
   linux-arm:
+    needs: changes
+    if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 45
     runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.14 ARM
@@ -286,7 +310,8 @@ jobs:
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
   aws-integtest:
-    needs: linux-wheel
+    needs: [changes, linux-wheel]
+    if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
     defaults:

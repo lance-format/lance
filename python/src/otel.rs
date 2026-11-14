@@ -273,6 +273,7 @@ fn describe_all() {
     lance_io::object_store::metrics::describe_metrics();
     lance_core::cache::describe_metrics();
     lance_core::memory::describe_metrics();
+    lance_io::spill::describe_metrics();
 }
 
 enum MetricValue {
@@ -438,7 +439,83 @@ pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_io::spill::{LocalSpillStore, SpillStore};
     use metrics::HistogramFn;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn scratch_traffic_is_exported() {
+        // The recorder is process-global; isolate it from every other bridge test.
+        if std::env::var_os("LANCE_SPILL_EXPORT_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "otel::tests::scratch_traffic_is_exported"])
+                .env("LANCE_SPILL_EXPORT_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let registry = Arc::new(Registry::new(LanceStorage));
+        assert!(
+            metrics::set_global_recorder(LanceRecorder {
+                registry: registry.clone()
+            })
+            .is_ok()
+        );
+        describe_all();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = LocalSpillStore::with_cap(6).unwrap();
+                let (mut writer, spill) = store.new_spill().await.unwrap();
+                writer.write_all(b"hello").await.unwrap();
+                writer.flush().await.unwrap();
+                let error = writer.write_all(b"xx").await.unwrap_err();
+                assert!(matches!(
+                    lance_core::Error::from(error),
+                    lance_core::Error::DiskCapExceeded { .. }
+                ));
+                writer.shutdown().await.unwrap();
+                drop(writer);
+                let reader = spill.reader().await.unwrap();
+                assert_eq!(reader.get_all().await.unwrap().as_ref(), b"hello");
+                assert_eq!(reader.get_all().await.unwrap().as_ref(), b"hello");
+                drop(reader);
+                drop(spill);
+                assert_eq!(store.metrics().snapshot().charged_bytes, 0);
+            });
+        let points = collect_points(&registry);
+        for (name, expected) in [
+            ("lance_spill_accepted_bytes_total", 5.0),
+            ("lance_spill_write_bytes_total", 5.0),
+            ("lance_spill_read_bytes_total", 10.0),
+            ("lance_spill_quota_failures_total", 1.0),
+            ("lance_spill_charged_bytes", 0.0),
+            ("lance_spill_live_files", 0.0),
+        ] {
+            let point = points.iter().find(|point| point.name == name).unwrap();
+            assert!(
+                matches!(point.value, MetricValue::Scalar(value) if value == expected),
+                "{name}"
+            );
+            assert!(point.attributes.is_empty());
+        }
+        let histograms: Vec<_> = points
+            .iter()
+            .filter(|point| point.name == "lance_spill_io_duration_seconds")
+            .collect();
+        assert_eq!(histograms.len(), 2);
+        for point in histograms {
+            assert_eq!(point.attributes.len(), 1);
+            assert!(matches!(
+                point.attributes["operation"].as_str(),
+                "read" | "write"
+            ));
+            assert!(matches!(point.value, MetricValue::Histogram { count, .. } if count > 0));
+        }
+    }
 
     fn bucket_count(buckets: &[(String, u64)], le: &str) -> u64 {
         buckets
@@ -650,6 +727,18 @@ mod tests {
         assert!(matches!(kind(os::METRIC_RETRYABLE), MetricKind::Counter));
         assert!(matches!(kind(os::METRIC_IN_FLIGHT), MetricKind::Gauge));
         assert!(matches!(kind(os::METRIC_DURATION), MetricKind::Histogram));
+        assert!(matches!(
+            kind("lance_spill_write_bytes_total"),
+            MetricKind::Counter
+        ));
+        assert!(matches!(
+            kind("lance_spill_charged_bytes"),
+            MetricKind::Gauge
+        ));
+        assert_eq!(
+            catalog["lance_spill_charged_bytes"].unit.as_deref(),
+            Some("B")
+        );
         assert!(matches!(kind(cache::METRIC_LOOKUPS), MetricKind::Counter));
         assert!(matches!(kind(cache::METRIC_LOADS), MetricKind::Counter));
         assert!(matches!(

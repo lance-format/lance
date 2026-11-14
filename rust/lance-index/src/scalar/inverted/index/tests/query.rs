@@ -36,12 +36,240 @@ struct OffsetBatchRemapper {
     calls: AtomicU32,
 }
 
+struct MaskFilter(RowAddrMask);
+
+#[async_trait]
+impl PreFilter for MaskFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_select_all()
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        Arc::new(self.0.clone())
+    }
+
+    fn filter_row_ids<'a>(&self, rows: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        rows.enumerate()
+            .filter_map(|(position, row)| self.0.selected(*row).then_some(position as u64))
+            .collect()
+    }
+}
+
+#[rstest::rstest]
+#[case::sparse(1, false)]
+#[case::broad(32, false)]
+#[case::translated(32, true)]
+#[case::full_bucket(64, false)]
+#[tokio::test]
+async fn test_prefilter_skips_excluded_partition_postings(
+    #[case] selected_rows: u64,
+    #[case] translated: bool,
+) {
+    let object_store = ObjectStore::memory();
+    let directory = object_store::path::Path::from("index");
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(object_store.clone()),
+        directory.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    for partition in 0..2 {
+        let rows = (0..64)
+            .rev()
+            .map(|row| {
+                (
+                    "alpha",
+                    if row % 2 == 0 { "beta" } else { "gamma" },
+                    (partition << 32) + row,
+                )
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition(&store, partition, &rows).await;
+    }
+    write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+    let remapper =
+        translated.then(|| Arc::new(OffsetBatchRemapper::default()) as Arc<dyn BatchRowIdRemapper>);
+    let reference =
+        InvertedIndex::load_with_remapping(store, remapper.clone(), &LanceCache::no_cache())
+            .await
+            .unwrap();
+    let tokens = Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text);
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(128)));
+    let prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&reference),
+            tokens,
+            &params,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let all = reference
+        .bm25_search_prepared_documents(
+            prepared.clone(),
+            params.clone(),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    let offset = if translated { 1000 } else { 0 };
+    let mask = if selected_rows == 64 {
+        let mut allowed = RowAddrTreeMap::default();
+        allowed.insert_fragment(0);
+        RowAddrMask::from_allowed(allowed)
+    } else {
+        RowAddrMask::from_allowed((offset..offset + selected_rows).collect())
+    };
+    let mut expected = all
+        .into_iter()
+        .filter(|doc| mask.selected(doc.row_id))
+        .map(|doc| (doc.row_id, doc.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(expected.len(), selected_rows as usize);
+
+    let counter = Arc::new(super::stats::PostingMetadataCounter::default());
+    let store = Arc::new(super::stats::CountingStore {
+        inner: Arc::new(LanceIndexStore::new(
+            Arc::new(object_store),
+            directory,
+            Arc::new(LanceCache::no_cache()),
+        )),
+        posting_file: posting_file_path(1),
+        counter: counter.clone(),
+    });
+    let index = InvertedIndex::load_with_remapping(store, remapper, &LanceCache::no_cache())
+        .await
+        .unwrap();
+    // Statistics still cover both partitions. Only candidate posting reads may be skipped.
+    let prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            prepared.tokens().as_ref().clone(),
+            &params,
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(counter.posting_rows_read(), 0);
+    let actual = index
+        .bm25_search_prepared_documents(
+            prepared,
+            params,
+            Operator::Or,
+            Arc::new(MaskFilter(mask)),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    let mut actual = actual
+        .into_iter()
+        .map(|doc| (doc.row_id, doc.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        counter.posting_rows_read(),
+        0,
+        "excluded partition posting payload must not be read"
+    );
+}
+
 #[async_trait]
 impl BatchRowIdRemapper for OffsetBatchRemapper {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(row_ids.iter().map(|row_id| Some(row_id + 1000)).collect())
     }
+}
+
+#[rstest::rstest]
+#[case::plain_unfiltered(false, None)]
+#[case::plain_kept(false, Some(true))]
+#[case::plain_removed(false, Some(false))]
+#[case::translated_unfiltered(true, None)]
+#[case::translated_kept(true, Some(true))]
+#[case::translated_removed(true, Some(false))]
+#[tokio::test]
+async fn test_single_partition_merge_preserves_remapping_and_filtering(
+    #[case] translated: bool,
+    #[case] keep_old: Option<bool>,
+) -> Result<()> {
+    let object_store = Arc::new(ObjectStore::memory());
+    let source = Arc::new(LanceIndexStore::new(
+        object_store.clone(),
+        "source".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let dest = Arc::new(LanceIndexStore::new(
+        object_store,
+        "dest".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_single_partition_index(
+        source.clone(),
+        InvertedIndexParams::default(),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await?;
+    let remapper =
+        translated.then(|| Arc::new(OffsetBatchRemapper::default()) as Arc<dyn BatchRowIdRemapper>);
+    let index =
+        InvertedIndex::load_with_remapping(source, remapper, &LanceCache::no_cache()).await?;
+    let old_row = if translated { 1100 } else { 100 };
+    let filter = keep_old.map(|keep| {
+        crate::scalar::OldIndexDataFilter::RowIds(if keep {
+            RowAddrTreeMap::from_iter([old_row])
+        } else {
+            RowAddrTreeMap::new()
+        })
+    });
+    let batch = arrow_array::record_batch!(("doc", Utf8, ["hit"]), ("_rowid", UInt64, [200]))?;
+    let input = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter([Ok(batch)]),
+    ));
+    InvertedIndex::merge_segments(
+        std::slice::from_ref(&index),
+        input,
+        dest.as_ref(),
+        &[filter],
+        crate::progress::noop_progress(),
+    )
+    .await?;
+    // Reload without any translator: maintenance must have persisted the
+    // current old address, while leaving the newly appended address alone.
+    let updated = InvertedIndex::load(dest, None, &LanceCache::no_cache()).await?;
+    let (mut row_ids, _) = updated
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await?;
+    row_ids.sort_unstable();
+    let mut expected = vec![200];
+    if keep_old != Some(false) {
+        expected.push(old_row);
+    }
+    expected.sort_unstable();
+    assert_eq!(row_ids, expected);
+    assert_eq!(updated.partition_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]

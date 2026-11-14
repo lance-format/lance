@@ -46,6 +46,7 @@ pub mod storage;
 pub mod transform;
 pub mod utils;
 pub mod v3;
+pub mod warp;
 
 use super::pb;
 use crate::metrics::MetricsCollector;
@@ -92,8 +93,9 @@ pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 /// Controls the speed / accuracy tradeoff for approximate vector search.
 ///
 /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
-/// prefiltered search on HNSW sub-indexes, where `Fast` enables the ACORN
-/// traversal. Other index types ignore this setting.
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where `Fast` enables the ACORN traversal. Other index types
+/// ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
     /// Prefer lower query latency, which can reduce recall.
@@ -226,8 +228,10 @@ pub struct Query {
 
     /// Controls the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-    /// Other index types ignore this setting.
+    /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+    /// HNSW sub-index searches that exclude rows (for example through a
+    /// prefilter or deletions), where `Fast` enables the ACORN traversal. Other
+    /// index types ignore this setting.
     pub approx_mode: ApproxMode,
 }
 
@@ -292,6 +296,36 @@ impl From<DistanceType> for pb::VectorMetricType {
 ///
 /// We use one trait for both the top-level and the sub-indices.  Typically the top-level
 /// search is a partition-aware search and all sub-indices are whole-index searches.
+/// A partition prepared by [`VectorIndex::prepare_partition_rows`].
+pub struct PreparedPartitionRows {
+    /// Bytes of partition storage the preparation keeps alive until it is
+    /// scored, so callers can bound how much they hold at once.
+    pub size_bytes: usize,
+    /// Index-specific state consumed by
+    /// [`VectorIndex::score_prepared_partition_rows`].
+    pub handle: PreparedPartitionSearchHandle,
+}
+
+impl std::fmt::Debug for PreparedPartitionRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedPartitionRows")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Every row of one partition scored against several queries, see
+/// [`VectorIndex::score_prepared_partition_rows`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PartitionRowDistances {
+    /// Rows with at least one vector in the partition that passes the
+    /// pre-filter, strictly ascending.
+    pub row_ids: Arc<[u64]>,
+    /// `distances[j][r]` is the smallest distance between query `j` and the
+    /// vectors of row `row_ids[r]` in the partition.
+    pub distances: Vec<Vec<f32>>,
+}
+
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
 pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
@@ -372,6 +406,43 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         _metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         Err(Error::not_supported("score_partition_candidates"))
+    }
+
+    /// Prepare scoring every vector of one partition against each of
+    /// `queries`: load the partition and wait for the pre-filter, leaving only
+    /// CPU work for [`VectorIndex::score_prepared_partition_rows`].
+    ///
+    /// Unlike [`VectorIndex::search_in_partition`], the scoring ignores `k`,
+    /// `ef`, `refine_factor` and distance bounds and needs no heap or sort by
+    /// distance: it is for callers that consume every row of a partition, such
+    /// as WARP multivector search, and can batch many prepared partitions into
+    /// one CPU task.
+    ///
+    /// The default implementation rejects the operation.
+    async fn prepare_partition_rows(
+        &self,
+        _partition_id: usize,
+        _queries: &[Query],
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionRows> {
+        Err(Error::not_supported(
+            "scoring every row of a partition is not supported for this index",
+        ))
+    }
+
+    /// Score a partition prepared by [`VectorIndex::prepare_partition_rows`]:
+    /// every vector against each query, reduced to the closest vector of each
+    /// row. Rows the pre-filter removes are omitted. Runs synchronously, so
+    /// call it from a CPU task.
+    fn score_prepared_partition_rows(
+        &self,
+        _prepared: PreparedPartitionRows,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<PartitionRowDistances> {
+        Err(Error::not_supported(
+            "scoring every row of a partition is not supported for this index",
+        ))
     }
 
     /// Asynchronously prepare a single-partition search so the CPU-heavy portion
@@ -585,6 +656,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
         unimplemented!("only for IVF")
+    }
+
+    /// A partition's stored rows, read without caching the partition.
+    async fn partition_storage_batches(&self, _partition_id: usize) -> Result<Vec<RecordBatch>> {
+        Err(Error::not_supported(
+            "partition_storage_batches is only supported by IVF indices",
+        ))
     }
 
     /// Whether bounded native code-to-code scoring is available (current format).
