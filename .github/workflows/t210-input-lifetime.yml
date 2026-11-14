@@ -21,7 +21,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Validate MiniBlock range decode and input lifetime
-        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::miniblock_decode::tests -- --nocapture
-      - name: Lint touched crate
-        run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
+      - name: Validate physical allocation admission
+        run: cargo test --profile ci --locked -p lance-core --lib utils::allocation::tests -- --nocapture
+      - name: Validate admitted reads and finite concurrency
+        run: cargo test --profile ci --locked -p lance-io --lib reserved_read::tests -- --nocapture
+      - name: Validate allocation API examples
+        run: cargo test --profile ci --locked -p lance-core --doc utils::allocation
+      - name: Validate reserved read API example
+        run: cargo test --profile ci --locked -p lance-io --doc reserved_read
+      - name: Lint touched crates
+        run: cargo clippy --profile ci --locked -p lance-core -p lance-io --all-targets --no-deps -- -D warnings
