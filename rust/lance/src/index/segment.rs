@@ -125,13 +125,14 @@ pub(crate) fn validate_segment_index_details(
 
 /// Whether optimize can fold several segments of this kind into one without
 /// rescanning the table: the kinds the single-process optimize merges rather
-/// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
+/// than rebuilds, vector, BTree, Bitmap, NGram and RTree (`merge_scalar_indices`) and
 /// Inverted (`InvertedIndex::merge_segments`).
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
     segment_has_vector_details(segment)
         || segment_has_btree_details(segment)
         || segment_has_bitmap_details(segment)
         || segment_has_ngram_details(segment)
+        || (cfg!(feature = "geo") && segment_has_rtree_details(segment))
         || segment_has_inverted_details(segment)
 }
 
@@ -266,7 +267,15 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
 ///
 /// System indices have dedicated readers rather than scalar plugins. Ordinary
 /// indices need both a reader for their exact declared type and a supported
-/// format version.
+/// format version. Their field dependencies must belong to the user schema:
+/// reserved negative IDs require dedicated support, not schema lookups.
 pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
-    index_type_is_known(index) && unsupported_index_version(index).is_none()
+    index_type_is_known(index)
+        && unsupported_index_version(index).is_none()
+        && (is_system_index(index)
+            || index
+                .fields
+                .iter()
+                .chain(&index.covering_fields)
+                .all(|field_id| *field_id >= 0))
 }

@@ -323,7 +323,7 @@ impl LanceStream {
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
-                > = tokio::spawn(
+                > = lance_core::utils::tokio::spawn(
                     (async move {
                         let mut frag_config = FragReadConfig::default()
                             .with_row_id(config.with_row_id)

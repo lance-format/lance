@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
-use arrow_array::{RecordBatch, RecordBatchReader, make_array};
+use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, make_array};
 use arrow_cast::cast_with_options;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder, parse_cleanup_policy};
 use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, RowAddrMask,
@@ -45,7 +46,8 @@ use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
 use lance::dataset::{CommitBuilder, NewColumnTransform, WriteDestination};
 use lance::dataset::{
-    Dataset as LanceDataset, DeleteBuilder, ReadParams, UpdateBuilder, Version, VersionRef,
+    Dataset as LanceDataset, DatasetRuntimeConfig, DeleteBuilder, ReadParams, UpdateBuilder,
+    Version, VersionRef,
     fragment::FileFragment as LanceFileFragment,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
@@ -499,6 +501,34 @@ fn tag_to_py(py: Python<'_>, tag: TagContents) -> PyResult<Py<PyAny>> {
     dict.into_py_any(py)
 }
 
+fn file_reader_options_from_read_params(
+    read_params: Option<&Bound<PyDict>>,
+) -> Option<FileReaderOptions> {
+    let read_params_dict = read_params?;
+    let mut decoder_config = DecoderConfig::default();
+
+    if let Some(cache_repetition_index) = read_params_dict
+        .get_item("cache_repetition_index")
+        .unwrap_or(None)
+        .and_then(|v| v.extract::<bool>().ok())
+    {
+        decoder_config.cache_repetition_index = cache_repetition_index;
+    }
+
+    if let Some(validate_on_decode) = read_params_dict
+        .get_item("validate_on_decode")
+        .unwrap_or(None)
+        .and_then(|v| v.extract::<bool>().ok())
+    {
+        decoder_config.validate_on_decode = validate_on_decode;
+    }
+
+    Some(FileReaderOptions {
+        decoder_config,
+        ..Default::default()
+    })
+}
+
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
@@ -551,31 +581,7 @@ impl Dataset {
         }
 
         // Handle read_params dict
-        if let Some(read_params_dict) = read_params {
-            let mut decoder_config = DecoderConfig::default();
-
-            if let Some(cache_repetition_index) = read_params_dict
-                .get_item("cache_repetition_index")
-                .unwrap_or(None)
-                .and_then(|v| v.extract::<bool>().ok())
-            {
-                decoder_config.cache_repetition_index = cache_repetition_index;
-            }
-
-            if let Some(validate_on_decode) = read_params_dict
-                .get_item("validate_on_decode")
-                .unwrap_or(None)
-                .and_then(|v| v.extract::<bool>().ok())
-            {
-                decoder_config.validate_on_decode = validate_on_decode;
-            }
-
-            let file_reader_options = FileReaderOptions {
-                decoder_config,
-                ..Default::default()
-            };
-            params.file_reader_options = Some(file_reader_options);
-        }
+        params.file_reader_options = file_reader_options_from_read_params(read_params);
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
 
@@ -675,6 +681,106 @@ impl Dataset {
 
     pub fn __copy__(&self) -> Self {
         self.clone()
+    }
+
+    /// Internal: apply dataset-level file reader defaults to this handle.
+    ///
+    /// Used by Python wrapper methods that derive a handle from an existing
+    /// native dataset without reopening it.
+    #[pyo3(signature = (read_params=None))]
+    fn _with_read_params(&self, read_params: Option<&Bound<PyDict>>) -> Self {
+        Self {
+            ds: Arc::new(
+                self.ds
+                    .with_file_reader_options(file_reader_options_from_read_params(read_params)),
+            ),
+            uri: self.uri.clone(),
+        }
+    }
+
+    /// Internal: apply constructor-only configuration to this native handle.
+    ///
+    /// The manifest, object stores, session, and inherited base bindings are kept
+    /// unless the corresponding argument explicitly replaces them.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
+    #[pyo3(signature = (block_size=None, index_cache_size_bytes=None, metadata_cache_size_bytes=None, commit_lock=None, session=None, namespace_client=None, table_id=None, namespace_client_managed_versioning=false, base_store_params=None, storage_options=None))]
+    fn _reconfigure(
+        &self,
+        py: Python,
+        block_size: Option<usize>,
+        index_cache_size_bytes: Option<usize>,
+        metadata_cache_size_bytes: Option<usize>,
+        commit_lock: Option<Py<PyAny>>,
+        session: Option<Session>,
+        namespace_client: Option<&Bound<'_, PyAny>>,
+        table_id: Option<Vec<String>>,
+        namespace_client_managed_versioning: bool,
+        base_store_params: Option<HashMap<String, HashMap<String, String>>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let mut config = DatasetRuntimeConfig {
+            block_size,
+            index_cache_size_bytes,
+            metadata_cache_size_bytes,
+            session: session.map(|session| session.inner),
+            ..Default::default()
+        };
+
+        if let Some(commit_handler) = commit_lock {
+            config.commit_handler = Some(Arc::new(PyCommitLock::new(commit_handler)));
+        }
+
+        if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
+            let ns_client = extract_namespace_arc(py, ns_client)?;
+
+            // Mirror the open path: create a refreshable accessor only when the
+            // caller supplied initial storage options.
+            if let Some(storage_options) = storage_options.as_ref() {
+                let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
+                    LanceNamespaceStorageOptionsProvider::new(ns_client.clone(), tid.clone()),
+                );
+                config.storage_options_accessor =
+                    Some(Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        storage_options.clone(),
+                        provider,
+                    )));
+            }
+
+            if namespace_client_managed_versioning {
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid.clone(),
+                    &self.uri,
+                )
+                .infer_error()?;
+                config.commit_handler = Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }));
+            }
+        }
+
+        if let Some(base_store_params) = base_store_params {
+            for (base_path, opts) in base_store_params {
+                config.base_store_params.insert(
+                    base_path,
+                    ObjectStoreParams {
+                        storage_options_accessor: Some(Arc::new(
+                            StorageOptionsAccessor::with_static_options(opts),
+                        )),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let ds = rt()
+            .block_on(Some(py), self.ds.reconfigure(config))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(Self {
+            uri: ds.uri().to_string(),
+            ds: Arc::new(ds),
+        })
     }
 
     #[getter(max_field_id)]
@@ -783,6 +889,33 @@ impl Dataset {
             })?;
 
         Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
+    }
+
+    /// Look up the current row address of each row id. Null ids and ids that
+    /// aren't live in this version come back as null. Without stable row ids,
+    /// row ids are row addresses, so non-null ids are returned unchanged.
+    fn row_ids_to_row_addrs(
+        &self,
+        py: Python,
+        row_ids: PyArrowType<ArrayData>,
+    ) -> PyResult<PyArrowType<ArrayData>> {
+        let array = make_array(row_ids.0);
+        let row_ids = array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("row ids must be uint64, got {}", array.data_type()))
+            })?;
+        let valid: Vec<u64> = row_ids.iter().flatten().collect();
+        let mut addrs = rt()
+            .block_on(Some(py), row_ids_to_row_addrs(self.ds.as_ref(), &valid))?
+            .infer_error()?
+            .into_iter();
+        let result: UInt64Array = row_ids
+            .iter()
+            .map(|id| id.and_then(|_| addrs.next().flatten()))
+            .collect();
+        Ok(PyArrowType(result.to_data()))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
@@ -1179,7 +1312,13 @@ impl Dataset {
                     None
                 };
 
-            scanner
+            let warp_imputation_rank: Option<usize> =
+                match nearest.get_item("warp_imputation_rank")? {
+                    Some(rank) if !rank.is_none() => Some(rank.extract()?),
+                    _ => None,
+                };
+
+            let scanner = scanner
                 .and_then(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
                     if let Some(maximum_nprobes) = maximum_nprobes {
@@ -1200,6 +1339,9 @@ impl Dataset {
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
                     s = s.search_effort(search_effort)?;
+                    if let Some(rank) = warp_imputation_rank {
+                        s = s.warp_imputation_rank(rank);
+                    }
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -1207,6 +1349,27 @@ impl Dataset {
                     Ok(s)
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            let refine_column = nearest.get_item("refine_column")?.filter(|v| !v.is_none());
+            let refine_q = nearest.get_item("refine_q")?.filter(|v| !v.is_none());
+            let refine_metric = nearest.get_item("refine_metric")?.filter(|v| !v.is_none());
+            match (refine_column, refine_q, refine_metric) {
+                (None, None, None) => {}
+                (Some(column), Some(query), Some(metric)) => {
+                    let column: String = column.extract()?;
+                    let key = make_array(ArrayData::from_pyarrow_bound(&query)?);
+                    let metric: String = metric.extract()?;
+                    let metric = MetricType::try_from(metric.to_lowercase().as_str())
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    scanner
+                        .with_refine_column(&column, key.as_ref(), metric)
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                }
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "refine_column, refine_q, and refine_metric must be provided together",
+                    ));
+                }
+            }
         }
         if let Some(orderings) = order_by {
             scanner
@@ -1261,12 +1424,12 @@ impl Dataset {
                 ));
             }
             (Some(columns), None) => {
-                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+                ProjectionRequest::try_from_columns(columns, self_.ds.schema())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
             }
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
-        }
-        .infer_error()?;
+        }?;
         let batch = rt()
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -1289,12 +1452,12 @@ impl Dataset {
                 ));
             }
             (Some(columns), None) => {
-                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+                ProjectionRequest::try_from_columns(columns, self_.ds.schema())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
             }
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
-        }
-        .infer_error()?;
+        }?;
 
         let builder = self_
             .ds
@@ -1732,14 +1895,30 @@ impl Dataset {
         Ok(())
     }
 
-    fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+    #[pyo3(signature = (offset = 0, limit = None, descending = false))]
+    fn versions(
+        self_: PyRef<'_, Self>,
+        offset: usize,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> PyResult<Vec<Py<PyAny>>> {
         let py = self_.py();
-        let versions = self_.list_versions()?;
+        let versions = rt()
+            .block_on(
+                Some(py),
+                self_.ds.versions_with_options(offset, limit, descending),
+            )?
+            .infer_error()?;
         let pyvers: Vec<Py<PyAny>> = versions
             .iter()
             .map(|v| version_to_py(py, v))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    fn count_versions(self_: PyRef<'_, Self>) -> PyResult<u64> {
+        rt().block_on(Some(self_.py()), self_.ds.count_versions())?
+            .infer_error()
     }
 
     /// Fetches the currently checked out version of the dataset, with its
@@ -4220,10 +4399,6 @@ impl Dataset {
         })
     }
 
-    fn list_versions(&self) -> PyResult<Vec<Version>> {
-        rt().block_on(None, self.ds.versions())?.infer_error()
-    }
-
     fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {
         rt().block_on(None, self.ds.version_refs())?.infer_error()
     }
@@ -4586,4 +4761,26 @@ fn prepare_vector_index_params(
             .insert("lancedb.accelerator".to_string(), acc.to_string());
     }
     Ok(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDictMethods;
+
+    #[test]
+    fn test_read_params_are_parsed_into_native_file_reader_options() {
+        Python::initialize();
+        let options = Python::attach(|py| {
+            let read_params = PyDict::new(py);
+            read_params
+                .set_item("cache_repetition_index", false)
+                .unwrap();
+            read_params.set_item("validate_on_decode", true).unwrap();
+            file_reader_options_from_read_params(Some(&read_params)).unwrap()
+        });
+
+        assert!(!options.decoder_config.cache_repetition_index);
+        assert!(options.decoder_config.validate_on_decode);
+    }
 }
