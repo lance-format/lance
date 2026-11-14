@@ -3,7 +3,6 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use bytes::Bytes;
 use lance_core::{Error, Result};
 
 use super::{ChunkInstructions, MINIBLOCK_ALIGNMENT, MiniBlockScheduler, StructuralPageScheduler};
@@ -245,6 +244,7 @@ impl MiniBlockScheduler {
 mod tests {
     use std::{ops::Range, sync::Mutex};
 
+    use bytes::Bytes;
     use futures::{FutureExt, future::BoxFuture};
     use rstest::rstest;
 
