@@ -488,6 +488,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_slices_detached_location_binds_current_io_and_priority() {
+        let (page, recorded, values) = page_fixture(64, true, false, 8192);
+        let recorded = Arc::new(recorded);
+        let weak = Arc::downgrade(&recorded);
+        let io: Arc<dyn EncodingsIo> = recorded.clone();
+        let value = MiniBlockScheduler::try_prepare_binary_value(&page, 1, &io)
+            .await
+            .unwrap()
+            .unwrap();
+        let location = value.location();
+        drop(value);
+        drop(io);
+        drop(recorded);
+        assert!(
+            weak.upgrade().is_none(),
+            "a location must not retain its producer's I/O scope"
+        );
+
+        let (_, next, _) = page_fixture(64, true, false, 8192);
+        let next = Arc::new(next);
+        let io: Arc<dyn EncodingsIo> = next.clone();
+        let value = location.with_io(io, 73);
+        let bytes = value.read_slices(&[9..17]).await.unwrap();
+        assert_eq!(bytes[0].as_ref(), &values[1][9..17]);
+        let requests = next.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "rebinding must not prepare metadata again"
+        );
+        assert_eq!(requests[0].0.end - requests[0].0.start, 8);
+        assert_eq!(
+            requests[0].1, 73,
+            "the previous request's priority must not survive"
+        );
+    }
+
+    #[tokio::test]
     async fn binary_slices_prepared_value_can_retry_payload_failure() {
         let (page, mut recorded, values) = page_fixture(64, true, false, 8192);
         recorded.short_read_at = Some(4);

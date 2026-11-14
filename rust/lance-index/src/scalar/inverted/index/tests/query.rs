@@ -2235,8 +2235,9 @@ async fn selective_phrase_search_reads_committed_partitions(
     #[case] expected_rows: Vec<u64>,
 ) -> Result<()> {
     let dir = TempObjDir::default();
+    let object_store = Arc::new(ObjectStore::local());
     let store = Arc::new(LanceIndexStore::with_format_version(
-        ObjectStore::local().into(),
+        object_store.clone(),
         dir.clone(),
         Arc::new(LanceCache::no_cache()),
         lance_file::version::ConcreteFileVersion::V2_2,
@@ -2287,6 +2288,14 @@ async fn selective_phrase_search_reads_committed_partitions(
         writer.write_record_batch(batch).await?;
         writer.finish_with_metadata(metadata).await?;
     }
+    // Fixture construction above rewrites files. Start metadata caching only
+    // once their immutable contents have been finalized.
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        Arc::new(LanceCache::with_capacity(1024 * 1024)),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
     let (index, _cache) = load_prewarmed_index(
         store,
         vec![0, 1, 2],
@@ -2323,6 +2332,26 @@ async fn selective_phrase_search_reads_committed_partitions(
         .try_selective_phrase_search(request.clone())
         .await?
         .expect("current-format fixture must select the new reader");
+    let before = object_store.io_stats_snapshot();
+    let repeated = index
+        .try_selective_phrase_search(request.clone())
+        .await?
+        .expect("repeated search must use the same supported reader");
+    let after = object_store.io_stats_snapshot();
+    assert_eq!(selected.len(), repeated.len());
+    for (first, second) in selected.iter().zip(&repeated) {
+        assert_eq!(
+            first.0.document.partition_ordinal(),
+            second.0.document.partition_ordinal()
+        );
+        assert_eq!(first.0.document.doc_id(), second.0.document.doc_id());
+        assert_eq!(first.0.score, second.0.score);
+    }
+    assert_eq!(
+        before.read_iops, after.read_iops,
+        "warm selective search must reuse locations, offsets and payloads"
+    );
+    assert_eq!(before.read_bytes, after.read_bytes);
     let mut rows = Vec::new();
     for Reverse(hit) in selected {
         let documents = index.partitions[hit.document.partition_ordinal()]

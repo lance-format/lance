@@ -643,7 +643,7 @@ enum BinaryMiniBlockLayout {
 }
 
 mod range_read;
-pub use range_read::PreparedBinaryValue;
+pub use range_read::{BinaryValueLocation, PreparedBinaryValue};
 
 impl BinaryMiniBlockDecompressor {
     pub fn new(bits_per_offset: u8) -> Result<Self> {

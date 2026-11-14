@@ -26,6 +26,38 @@ const POSITION_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUSES: usize = 16;
 const MAX_OFFSET_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug)]
+struct PositionOffsets(Arc<[u32]>);
+
+impl DeepSizeOf for PositionOffsets {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        std::mem::size_of_val(self.0.as_ref()) + 2 * std::mem::size_of::<usize>()
+    }
+}
+
+#[derive(Debug)]
+struct PositionOffsetsKey(u32);
+
+impl CacheKey for PositionOffsetsKey {
+    type ValueType = Option<PositionOffsets>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("position-offsets-{}", self.0).into()
+    }
+
+    fn type_name() -> &'static str {
+        "PositionOffsets"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.position-offsets", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.0);
+    }
+}
+
 impl DeepSizeOf for PositionWindow {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.bytes.len()
@@ -104,7 +136,7 @@ fn position_window_ends(
 struct PreparedPositions {
     token_id: u32,
     codec: PositionStreamCodec,
-    offsets: Vec<u32>,
+    offsets: Arc<[u32]>,
     window_ends: Vec<usize>,
     value: Arc<dyn IndexBinaryReader>,
     cache: WeakLanceCache,
@@ -221,26 +253,39 @@ impl InvertedPartition {
             else {
                 return Ok(None);
             };
-            let batch = reader
-                .read_range(
-                    token_id as usize..token_id as usize + 1,
-                    Some(&[POSITION_BLOCK_OFFSET_COL]),
-                )
+            // Only immutable offsets use the existing bounded index cache. The
+            // prepared value and its statistics-bound I/O scope stay local.
+            let offsets = inverted
+                .index_cache
+                .get_or_insert_with_key(PositionOffsetsKey(token_id), || async {
+                    let batch = reader
+                        .read_range(
+                            token_id as usize..token_id as usize + 1,
+                            Some(&[POSITION_BLOCK_OFFSET_COL]),
+                        )
+                        .await?;
+                    let offsets = batch[POSITION_BLOCK_OFFSET_COL].as_list::<i32>().value(0);
+                    let offsets = offsets.as_primitive::<UInt32Type>().values();
+                    if offsets.len() > MAX_OFFSET_BYTES / std::mem::size_of::<u32>() {
+                        return Ok(None);
+                    }
+                    if offsets.first().is_some_and(|start| *start != 0)
+                        || offsets.windows(2).any(|pair| pair[0] > pair[1])
+                    {
+                        return Err(Error::index(
+                            "selective position block offsets are not monotonic from zero",
+                        ));
+                    }
+                    Ok(Some(PositionOffsets(Arc::from(
+                        offsets.to_vec().into_boxed_slice(),
+                    ))))
+                })
                 .await?;
-            let offsets = batch[POSITION_BLOCK_OFFSET_COL].as_list::<i32>().value(0);
-            let offsets = offsets.as_primitive::<UInt32Type>().values();
-            if offsets.len() > MAX_OFFSET_BYTES / std::mem::size_of::<u32>() {
+            let Some(offsets) = offsets.as_ref() else {
                 return Ok(None);
-            }
-            if offsets.first().is_some_and(|start| *start != 0)
-                || offsets.windows(2).any(|pair| pair[0] > pair[1])
-            {
-                return Err(Error::index(
-                    "selective position block offsets are not monotonic from zero",
-                ));
-            }
+            };
             let Some(window_ends) = position_window_ends(
-                offsets,
+                &offsets.0,
                 value.len(),
                 POSITION_WINDOW_BYTES,
                 MAX_LIVE_WINDOW_BYTES / tokens.len() as u64,
@@ -251,7 +296,7 @@ impl InvertedPartition {
             let plan = PreparedPositions {
                 token_id,
                 codec,
-                offsets: offsets.to_vec(),
+                offsets: offsets.0.clone(),
                 window_ends,
                 value,
                 cache: inverted.index_cache.clone(),
@@ -467,6 +512,7 @@ mod tests {
         expected_range: Range<u64>,
         pending: bool,
         active: Arc<AtomicUsize>,
+        started: tokio::sync::Notify,
         backing: std::sync::Mutex<Option<std::sync::Weak<()>>>,
     }
 
@@ -496,6 +542,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.active.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveRead(self.active.clone());
+            self.started.notify_one();
             if self.pending {
                 return futures::future::pending().await;
             }
@@ -519,6 +566,7 @@ mod tests {
             expected_range: 12..16,
             pending,
             active: Arc::new(AtomicUsize::new(0)),
+            started: tokio::sync::Notify::new(),
             backing: std::sync::Mutex::new(None),
         })
     }
@@ -527,7 +575,7 @@ mod tests {
         PreparedPositions {
             token_id: 7,
             codec: PositionStreamCodec::PackedDelta,
-            offsets: vec![0, 4, 12],
+            offsets: vec![0, 4, 12].into(),
             window_ends: vec![1, 2, 3],
             value,
             cache: WeakLanceCache::from(cache),
@@ -638,14 +686,26 @@ mod tests {
         assert_eq!(value.active.load(Ordering::SeqCst), 0);
     }
 
+    #[rstest::rstest]
+    #[case::moka(LanceCache::with_capacity(4096))]
+    #[case::quick(LanceCache::with_backend(Arc::new(
+        lance_core::cache::QuickCacheBackend::with_capacity(4096)
+    )))]
+    #[case::disabled(LanceCache::no_cache())]
     #[tokio::test]
-    async fn selective_phrase_cancellation_drops_pending_io() {
-        let cache = LanceCache::no_cache();
+    async fn selective_phrase_cancellation_drops_pending_io(#[case] cache: LanceCache) {
         let value = binary_value(false, true);
         let plan = prepared(value.clone(), &cache);
         let metrics = NoOpMetricsCollector;
         let mut read = Box::pin(plan.read(2, &metrics));
-        assert!(futures::poll!(&mut read).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut read => panic!("pending I/O completed before cancellation"),
+                _ = value.started.notified() => {}
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(value.active.load(Ordering::SeqCst), 1);
         drop(read);
         assert_eq!(value.active.load(Ordering::SeqCst), 0);

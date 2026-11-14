@@ -14,6 +14,35 @@ use crate::{
 // This is an optional fast path. Wider offset tables keep the ordinary reader.
 const MAX_OFFSET_BYTES: u64 = 64 * 1024;
 
+/// An immutable binary value's validated file range, without an I/O scope.
+///
+/// A location may be cached with metadata for the same immutable file. It does
+/// not retain a reader, request recorder, payload buffer or I/O priority.
+#[derive(Clone, Debug)]
+pub struct BinaryValueLocation {
+    range: Range<u64>,
+}
+
+impl BinaryValueLocation {
+    /// Bind the location to the same file in the current request's I/O scope.
+    /// The supplied priority applies only to reads through the returned handle.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_encoding::{EncodingsIo, encodings::physical::binary::{BinaryValueLocation, PreparedBinaryValue}};
+    /// fn bind(location: &BinaryValueLocation, io: Arc<dyn EncodingsIo>) -> PreparedBinaryValue {
+    ///     location.with_io(io, 0)
+    /// }
+    /// ```
+    pub fn with_io(&self, io: Arc<dyn EncodingsIo>, priority: u64) -> PreparedBinaryValue {
+        PreparedBinaryValue {
+            range: self.range.clone(),
+            io,
+            priority,
+        }
+    }
+}
+
 /// A validated binary value located without loading its payload.
 ///
 /// Preparation retains only its file range and I/O service. Repeated slices
@@ -43,6 +72,23 @@ impl PreparedBinaryValue {
     /// Whether this value has no payload bytes.
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
+    }
+
+    /// Copy only the immutable file range, releasing this handle's I/O scope
+    /// independently of the returned location's lifetime.
+    ///
+    /// ```
+    /// # use lance_encoding::encodings::physical::binary::{BinaryValueLocation, PreparedBinaryValue};
+    /// fn detach(value: PreparedBinaryValue) -> BinaryValueLocation {
+    ///     let location = value.location();
+    ///     drop(value);
+    ///     location
+    /// }
+    /// ```
+    pub fn location(&self) -> BinaryValueLocation {
+        BinaryValueLocation {
+            range: self.range.clone(),
+        }
     }
 
     /// Read value-relative slices, preserving order, overlap and empty slices.

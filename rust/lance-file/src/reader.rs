@@ -5330,6 +5330,19 @@ mod tests {
             if encoding == STRUCTURAL_ENCODING_MINIBLOCK && version != ConcreteFileVersion::V2_0 {
                 let value = selected.expect("current binary mini-block must support byte reads");
                 assert_eq!(value.len(), values[row as usize].len() as u64);
+                let before = fs.object_store.io_stats_snapshot();
+                let again = reader
+                    .try_prepare_binary_value(1, row)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let after = fs.object_store.io_stats_snapshot();
+                assert_eq!(again.len(), value.len());
+                assert_eq!(
+                    before.read_iops, after.read_iops,
+                    "cached preparation must not issue metadata reads"
+                );
+                assert_eq!(before.read_bytes, after.read_bytes);
                 let selected = value.read_slices(&slices).await.unwrap();
                 let tail = value
                     .read_slices(&[value.len() - 1..value.len()])
