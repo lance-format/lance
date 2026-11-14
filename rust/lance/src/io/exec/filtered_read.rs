@@ -896,7 +896,8 @@ impl FilteredReadStream {
     // If the scan range is ignoring the filters we can push it down here.
     // If the scan range is not ignoring the filters we can only push it down if:
     // 1. The index result is an exact match (we know exactly which rows will be in the result)
-    // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
+    // 2. The index result is AtLeast and its guaranteed matches fill the range before the first
+    //    row that still needs a recheck
     // Returns: FilteredReadInternalPlan
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
@@ -1207,12 +1208,24 @@ impl FilteredReadStream {
                         &index_result.lower,
                         None,
                     );
+                    // Rows outside the lower bound may match as well, so the
+                    // guaranteed matches serve the requested range only before
+                    // the first such candidate; past it, a guaranteed row could
+                    // take the place of a matching candidate.
+                    let first_candidate = Self::first_uncovered_row(&to_read, &guaranteed_ranges);
+                    if let Some(first_candidate) = first_candidate {
+                        guaranteed_ranges.retain(|range| range.end <= first_candidate);
+                    }
                     // Candidates outside the lower bound still need a recheck if
                     // the guaranteed matches cannot satisfy the requested limit.
                     fragments_to_read.insert(fragment_id, to_read);
 
                     Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-                    scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                    // A fragment left without a mirror keeps the regular plan,
+                    // which rechecks the candidates in scan order.
+                    if first_candidate.is_none() || *to_take == 0 {
+                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                    }
                 } else {
                     // AtMost or true Refined: read everything in `upper`
                     // and rely on the full-filter recheck for survivors.
@@ -1315,6 +1328,21 @@ impl FilteredReadStream {
         }
 
         result
+    }
+
+    /// The first row of `ranges` missing from `covered`, a sorted subset of `ranges`.
+    fn first_uncovered_row(ranges: &[Range<u64>], covered: &[Range<u64>]) -> Option<u64> {
+        let mut covered = covered.iter().peekable();
+        for range in ranges {
+            let mut row = range.start;
+            while row < range.end {
+                let Some(next) = covered.next_if(|next| next.start == row) else {
+                    return Some(row);
+                };
+                row = next.end;
+            }
+        }
+        None
     }
 
     fn intersect_index_ranges(
