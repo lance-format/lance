@@ -1739,6 +1739,70 @@ mod tests {
     }
 
     #[rstest]
+    #[case::deleted_offset(false, &[0, 1, 3], Ok(vec![0, 3]))]
+    #[case::fragmented_sequence(true, &[0, 1, 2, 5, 9], Ok(vec![0, 3, 7, 11]))]
+    #[case::offset_past_fragment(false, &[0, 4], Err("no entry for 1 of 2 selected offsets"))]
+    #[case::offset_past_fragmented_sequence(
+        true,
+        &[0, 1, 10, 11],
+        Err("no entry for 2 of 3 selected offsets")
+    )]
+    #[tokio::test]
+    async fn test_translate_partial_addrs_with_deletions(
+        #[case] compact: bool,
+        #[case] offsets: &[u32],
+        #[case] expected: std::result::Result<Vec<u32>, &str>,
+    ) {
+        let batch = record_batch!(("id", Int32, (0..12).collect::<Vec<_>>())).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (1, 6)").await.unwrap();
+        if compact {
+            // The compacted fragment keeps ids 0, 2..=5 and 7..=11, so its sequence has gaps.
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+            assert_eq!(dataset.fragments().len(), 1);
+            let sequences = super::load_row_id_sequences(&dataset, dataset.fragments())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(sequences[0].1.segments().len() > 1);
+        }
+        // Leaves a deleted row inside the selected fragment in both layouts.
+        dataset.delete("id = 2").await.unwrap();
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+
+        let mut partial_fragment = RowAddrTreeMap::new();
+        for offset in offsets {
+            partial_fragment.insert(RowAddress::new_from_parts(fragment_id, *offset).into());
+        }
+        let translated =
+            super::translate_addr_treemap_to_row_ids(&dataset, &partial_fragment).await;
+
+        match expected {
+            Ok(row_ids) => {
+                let translated = translated.unwrap();
+                let bitmap = translated.get_fragment_bitmap(0).unwrap();
+                assert_eq!(bitmap.iter().collect::<Vec<_>>(), row_ids);
+            }
+            Err(message) => {
+                let error = translated.unwrap_err().to_string();
+                assert!(error.contains(message), "{error}");
+            }
+        }
+    }
+
+    #[rstest]
     #[case::deleted(false)]
     #[case::compacted(true)]
     #[tokio::test]
