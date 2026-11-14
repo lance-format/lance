@@ -24,7 +24,7 @@ pub struct PreparedMiniBlockRange<'a> {
     execution: Box<dyn PreparedExecution + 'a>,
 }
 
-pub(crate) trait PreparedExecution: Send {
+pub trait PreparedExecution: Send {
     fn decode(self: Box<Self>, workspace: &mut Reservation) -> Result<Option<DataBlock>>;
     fn recycle(self: Box<Self>, workspace: &mut Reservation) -> Result<()>;
 }
