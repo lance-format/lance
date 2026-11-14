@@ -2606,7 +2606,7 @@ mod tests {
             };
             assert!(updated_fragments.is_empty());
             assert!(removed_fragment_ids.is_empty());
-            assert_eq!(inserted_rows_filter.is_some(), on == "id");
+            assert!(inserted_rows_filter.is_some());
             Some(staged)
         } else {
             None
@@ -2644,31 +2644,33 @@ mod tests {
             if let Some(affected_rows) = staged.affected_rows {
                 builder = builder.with_affected_rows(affected_rows);
             }
-            let result = builder.execute(staged.transaction).await;
-            if on == "id" {
-                let error = result.unwrap_err();
-                assert!(
-                    matches!(error, Error::RetryableCommitConflict { .. }),
-                    "{error}"
-                );
-                let message = if cleaned_versions.is_empty() {
-                    "preempted by concurrent transaction"
-                } else {
-                    "inserted keys"
-                };
-                assert!(error.to_string().contains(message), "{error}");
-                if !cleaned_versions.is_empty() {
-                    assert!(error.to_string().contains("versions [2]"), "{error}");
-                }
-                assert_eq!(latest.latest_version_id().await.unwrap(), 3);
-                assert_eq!(latest.count_rows(None).await.unwrap(), 5);
-                assert_eq!(latest.count_rows(Some("id = 100".into())).await.unwrap(), 1);
-                return;
+            let error = builder.execute(staged.transaction).await.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            let message = if cleaned_versions.is_empty() {
+                "preempted by concurrent transaction"
+            } else {
+                "inserted keys"
+            };
+            assert!(error.to_string().contains(message), "{error}");
+            if !cleaned_versions.is_empty() {
+                assert!(error.to_string().contains("versions [2]"), "{error}");
             }
-            result.unwrap()
+            assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+            assert_eq!(latest.count_rows(None).await.unwrap(), 5);
+            assert_eq!(
+                latest
+                    .count_rows(Some(format!("{on} = 100")))
+                    .await
+                    .unwrap(),
+                1
+            );
+            return;
         } else {
             let (result, stats) = upsert(stale).execute_batches(vec![batch]).await.unwrap();
-            assert_eq!(stats.num_attempts, if on == "id" { 2 } else { 1 });
+            assert_eq!(stats.num_attempts, 2);
             result.as_ref().clone()
         };
         assert_eq!(result.version().version, 4);
@@ -2677,7 +2679,7 @@ mod tests {
                 .count_rows(Some(format!("{on} = 100")))
                 .await
                 .unwrap(),
-            if on == "id" { 1 } else { 2 }
+            1
         );
         assert_eq!(
             result
@@ -2690,10 +2692,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(
-            result.count_rows(None).await.unwrap(),
-            if on == "id" { 5 } else { 6 }
-        );
+        assert_eq!(result.count_rows(None).await.unwrap(), 5);
     }
 
     #[rstest::rstest]

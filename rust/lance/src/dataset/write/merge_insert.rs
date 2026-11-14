@@ -491,19 +491,18 @@ struct MergeInsertParams {
 }
 
 impl MergeInsertParams {
-    /// Return ON field IDs only when they match the declared primary key.
-    fn primary_key_field_ids(&self, schema: &lance_core::datatypes::Schema) -> Option<Vec<i32>> {
-        let field_ids: Vec<i32> = self
-            .on
+    /// Return the merge's ON field IDs for inserted-key conflict detection.
+    fn on_field_ids(&self, schema: &lance_core::datatypes::Schema) -> Result<Vec<i32>> {
+        self.on
             .iter()
-            .filter_map(|name| schema.field(name).map(|field| field.id))
-            .collect();
-        let pk_field_ids: Vec<i32> = schema
-            .unenforced_primary_key()
-            .iter()
-            .map(|field| field.id)
-            .collect();
-        (!pk_field_ids.is_empty() && field_ids == pk_field_ids).then_some(field_ids)
+            .map(|name| {
+                schema.field(name).map(|field| field.id).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Merge key column '{name}' is missing from the dataset"
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
@@ -568,6 +567,12 @@ pub struct MergeInsertJob {
 ///
 /// This operation is similar to SQL's MERGE statement. It allows you to merge
 /// new data with existing data.
+///
+/// Concurrent inserts with overlapping non-null `on` keys conflict at commit
+/// time, even without a declared primary key. A conflict retries the complete
+/// merge against the latest dataset; exhausting the retry budget returns an
+/// error. This does not enforce uniqueness for other writes or remove existing
+/// duplicates. All concurrent merge writers must support this conflict check.
 ///
 /// Use the [MergeInsertBuilder] to construct an merge insert job.
 ///
