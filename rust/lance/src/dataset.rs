@@ -741,6 +741,12 @@ impl Dataset {
     /// cannot be checked out. To abandon the reservation, delete the branch with
     /// [`Self::delete_branch`].
     ///
+    /// A pending reservation does not keep [`Self::cleanup_old_versions`] from removing its
+    /// source version: cleanup finds the versions a branch depends on through the branch's
+    /// manifests, and a reservation has none yet. If cleanup can run before the reservation
+    /// is completed, tag the source version until then, or completion can fail because the
+    /// source manifest was removed.
+    ///
     /// ```
     /// # use lance::{Dataset, Result};
     /// # async fn example(dataset: &Dataset) -> Result<()> {
