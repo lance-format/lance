@@ -2732,6 +2732,88 @@ mod tests {
         }
     }
 
+    #[rstest]
+    fn test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input(
+        #[values(32, 64)] bits_per_offset: u8,
+        #[values(false, true)] large_header: bool,
+        #[values(0, 128)] other_len: usize,
+        #[values("first", "last", "partial")] selection: &str,
+    ) {
+        let expected = vec![b'x'; 1024];
+        let other = vec![b'y'; other_len];
+        let values = if selection == "last" {
+            [other.as_slice(), expected.as_slice()]
+        } else {
+            [expected.as_slice(), other.as_slice()]
+        };
+        let chunk = miniblock_chunk(&binary_value_buffer(&values, bits_per_offset), large_header);
+        let input_ptr = chunk.as_ptr();
+        let selected_rows = if selection == "partial" { 2 } else { 1 };
+        let mut decoder = MiniBlockDecoder {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(
+                BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap(),
+            ),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::from([LoadedChunk {
+                byte_range: 0..chunk.len() as u64,
+                data: chunk,
+                items_in_chunk: 2,
+                chunk_idx: 0,
+            }]),
+            instructions: VecDeque::from([ChunkInstructions {
+                chunk_idx: 0,
+                preamble: PreambleAction::Absent,
+                rows_to_skip: u64::from(selection == "last"),
+                rows_to_take: selected_rows,
+                take_trailer: false,
+            }]),
+            offset_in_current_chunk: 0,
+            num_rows: selected_rows,
+            num_buffers: 1,
+            dictionary: None,
+            has_large_chunk: large_header,
+        };
+
+        let decoded = decoder.drain(1).unwrap().decode().unwrap();
+        let data = decoded.data.as_variable_width_ref().unwrap();
+        assert_eq!(data.num_values, 1);
+        assert_eq!(data.data.as_ref(), expected.as_slice());
+        let offsets = if bits_per_offset == 32 {
+            data.offsets
+                .borrow_to_typed_view::<u32>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect::<Vec<_>>()
+        } else {
+            data.offsets.borrow_to_typed_view::<u64>().to_vec()
+        };
+        assert_eq!(offsets, [0, expected.len() as u64]);
+        assert!(data.data.clone().into_buffer().capacity() <= expected.len() + 64);
+        if selection != "partial" && other_len == 0 {
+            // The other value and headers fit inside the retained-byte bound.
+            // Selecting one row must not force a second payload allocation.
+            assert_eq!(
+                data.data.as_ptr(),
+                input_ptr,
+                "reuse exhausted compact input"
+            );
+        } else {
+            assert_ne!(data.data.as_ptr(), input_ptr);
+        }
+        if selection == "partial" {
+            // A live parent still owns the same input. Reusing it above would
+            // corrupt the later row, even when its payload is empty.
+            let remaining = decoder.drain(1).unwrap().decode().unwrap();
+            let remaining = remaining.data.as_variable_width_ref().unwrap();
+            assert_eq!(remaining.num_values, 1);
+            assert_eq!(remaining.data.as_ref(), other.as_slice());
+            assert!(remaining.data.clone().into_buffer().capacity() <= other_len + 64);
+        }
+    }
+
     #[rstest::rstest]
     fn test_miniblock_planned_binary_bytes_match_partial_drain(
         #[values(32, 64)] bits_per_offset: u8,

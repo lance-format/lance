@@ -313,7 +313,7 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}" \
-            -E '(package(lance-encoding) & (test(test_empty_fixed_width_builder_preserves_arrow_alignment) | test(test_miniblock_planned_binary_bytes_match_partial_drain) | test(test_miniblock_cancelled_tasks_release_exhausted_input) | test(test_miniblock_single_binary_value_retains_only_compact_owned_input))) | (package(lance) & test(test_filtered_scan_preserves_nullable_struct_validity))'
+            -E '(package(lance-encoding) & (test(test_empty_fixed_width_builder_preserves_arrow_alignment) | test(test_miniblock_planned_binary_bytes_match_partial_drain) | test(test_miniblock_cancelled_tasks_release_exhausted_input) | test(test_miniblock_single_binary_value_retains_only_compact_owned_input) | test(test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input))) | (package(lance) & test(test_filtered_scan_preserves_nullable_struct_validity))'
       - name: Run tests
         run: |
           ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
