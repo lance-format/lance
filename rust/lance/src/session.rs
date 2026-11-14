@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::execution::context::SessionContext;
+
 use lance_core::cache::{
     CacheBackend, CacheDiagnostics, CacheMetricsKind, CacheSnapshotMode, LanceCache,
     QuickCacheBackend, QuickCacheShardPolicy,
@@ -60,6 +62,20 @@ pub struct SessionCacheDiagnostics {
     pub metadata: CacheDiagnostics,
 }
 
+/// Access policy for external blob descriptors that do not name a registered base.
+///
+/// This policy also prevents dataset writers from accepting unregistered URI
+/// references and gives controlled services an error without local opt-in advice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnregisteredExternalBlobPolicy {
+    /// Resolve absolute URIs using this session's providers and credentials.
+    #[default]
+    Allow,
+    /// Reject `base_id == 0` before parsing its URI or accessing storage.
+    /// Registered bases remain available under their configured credentials.
+    Deny,
+}
+
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
 /// A session will be created automatically when a Dataset is opened.  However, you
@@ -94,6 +110,8 @@ pub struct Session {
 
     store_registry: Arc<ObjectStoreRegistry>,
 
+    unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
+
     spill_store: Arc<dyn SpillStore>,
 
     /// The origin latency class the process declares for the IVF_RQ indexes
@@ -107,6 +125,9 @@ pub struct Session {
 
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
+
+    /// See [`Self::with_datafusion_session`].
+    datafusion_session: Option<SessionContext>,
 }
 
 impl DeepSizeOf for Session {
@@ -137,9 +158,14 @@ impl std::fmt::Debug for Session {
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field(
+                "unregistered_external_blob_policy",
+                &self.unregistered_external_blob_policy,
+            )
             .field("index_origin_latency", &self.index_origin_latency)
             .field("index_resident_columns", &self.index_resident_columns)
             .field("has_rabit_scan_factory", &self.rabit_scan_factory.is_some())
+            .field("has_datafusion_session", &self.datafusion_session.is_some())
             .finish()
     }
 }
@@ -175,10 +201,12 @@ impl Session {
             )),
             index_extensions: HashMap::new(),
             store_registry,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -207,7 +235,39 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
         }
+    }
+
+    /// Set the policy for external blobs without a registered storage base.
+    ///
+    /// The default is [`UnregisteredExternalBlobPolicy::Allow`] for embedded use.
+    /// Servers should use [`UnregisteredExternalBlobPolicy::Deny`] before opening
+    /// datasets, including datasets written by other clients. This does not
+    /// restrict registered bases or remove file providers from the registry.
+    ///
+    /// ```
+    /// use lance::session::{Session, UnregisteredExternalBlobPolicy};
+    /// let session = Session::default()
+    ///     .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
+    /// assert_eq!(session.unregistered_external_blob_policy(), UnregisteredExternalBlobPolicy::Deny);
+    /// ```
+    pub fn with_unregistered_external_blob_policy(
+        mut self,
+        policy: UnregisteredExternalBlobPolicy,
+    ) -> Self {
+        self.unregistered_external_blob_policy = policy;
+        self
+    }
+
+    /// The policy applied before resolving an unregistered external blob URI.
+    ///
+    /// When rebuilding a session with different caches, pass this value to
+    /// [`Self::with_unregistered_external_blob_policy`] on the replacement.
+    /// New sessions default to allowing unregistered references.
+    pub fn unregistered_external_blob_policy(&self) -> UnregisteredExternalBlobPolicy {
+        self.unregistered_external_blob_policy
     }
 
     /// Replace the spill store used by this session.
@@ -323,6 +383,19 @@ impl Session {
         self.rabit_scan_factory.clone()
     }
 
+    /// Attach a DataFusion session for planning expressions over this
+    /// session's datasets, e.g. with
+    /// [`lance_datafusion::planner::Planner::new_with_session`].
+    pub fn with_datafusion_session(mut self, session: SessionContext) -> Self {
+        self.datafusion_session = Some(session);
+        self
+    }
+
+    /// The session set by [`Self::with_datafusion_session`], if any.
+    pub fn datafusion_session(&self) -> Option<&SessionContext> {
+        self.datafusion_session.as_ref()
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -383,10 +456,12 @@ impl Session {
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_extensions: HashMap::new(),
             store_registry,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -556,6 +631,26 @@ impl Session {
             self.metadata_cache.0.diagnostics_by_type(mode),
         );
         SessionCacheDiagnostics { index, metadata }
+    }
+
+    /// Resize the index cache, evicting entries as needed to fit the new
+    /// weighted capacity.
+    ///
+    /// This lets a caller that manages several sessions bound their combined
+    /// memory without dropping or recreating them. Growing the capacity only
+    /// raises the budget; evicted entries are reloaded on demand. Clones of
+    /// this session share the cache, so they all observe the new capacity.
+    ///
+    /// Returns an error when the index cache backend cannot resize after
+    /// construction.
+    pub fn set_index_cache_capacity(&self, capacity: usize) -> Result<()> {
+        self.index_cache.0.set_capacity(capacity)
+    }
+
+    /// Resize the metadata cache, evicting entries as needed to fit the new
+    /// weighted capacity; see [`Self::set_index_cache_capacity`].
+    pub fn set_metadata_cache_capacity(&self, capacity: usize) -> Result<()> {
+        self.metadata_cache.0.set_capacity(capacity)
     }
 }
 
@@ -969,6 +1064,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_cache_capacity_resizes_both_caches() {
+        let session = Session::new(1 << 20, 1 << 20, Default::default());
+        for index in 0..4u64 {
+            session
+                .index_cache
+                .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
+                .await;
+            session
+                .metadata_cache
+                .0
+                .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
+                .await;
+        }
+        let entry_bytes = session.index_cache.size_bytes().await / 4;
+        assert!(entry_bytes > 0);
+        assert_eq!(session.metadata_cache.0.size_bytes().await, 4 * entry_bytes);
+
+        // Clones share the cache, so every handle observes the new capacity.
+        let clone = session.clone();
+        session.set_index_cache_capacity(2 * entry_bytes).unwrap();
+        session
+            .set_metadata_cache_capacity(2 * entry_bytes)
+            .unwrap();
+        for cache in [&session.index_cache, &clone.index_cache] {
+            assert_eq!(cache.capacity_bytes(), Some(2 * entry_bytes));
+            assert!(cache.size_bytes().await <= 2 * entry_bytes);
+            assert!(cache.size().await <= 2);
+        }
+        assert_eq!(
+            session.metadata_cache.0.capacity_bytes(),
+            Some(2 * entry_bytes)
+        );
+        assert!(session.metadata_cache.0.size_bytes().await <= 2 * entry_bytes);
+    }
+
+    #[tokio::test]
+    async fn set_cache_capacity_reports_unsupported_backends() {
+        use lance_core::cache::build_from_uri;
+
+        let backend = build_from_uri("moka://?capacity=1048576").unwrap();
+        let session = Session::with_cache_backends(
+            CacheSpec::Backend(backend),
+            CacheSpec::Default,
+            Default::default(),
+        );
+        let err = session.set_index_cache_capacity(1024).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+        // The default metadata backend supports resizing.
+        session.set_metadata_cache_capacity(1024).unwrap();
+        assert_eq!(session.metadata_cache.0.capacity_bytes(), Some(1024));
+    }
+
+    #[tokio::test]
     async fn test_custom_spill_store_injected() {
         let capped = Arc::new(LocalSpillStore::with_cap(50).unwrap());
         let session = Session::default().with_spill_store(capped);
@@ -985,5 +1134,19 @@ mod tests {
             ),
             "expected DiskCapExceeded, got {err}"
         );
+    }
+
+    #[test]
+    fn test_datafusion_session_is_shared_with_clones() {
+        assert!(Session::default().datafusion_session().is_none());
+
+        let datafusion_session = SessionContext::new();
+        let session = Session::default().with_datafusion_session(datafusion_session.clone());
+        for session in [&session, &session.clone()] {
+            assert_eq!(
+                session.datafusion_session().unwrap().session_id(),
+                datafusion_session.session_id()
+            );
+        }
     }
 }

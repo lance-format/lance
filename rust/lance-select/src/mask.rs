@@ -94,17 +94,114 @@ impl RowAddrMask {
     }
 
     /// Return the indices of the input row ids that were valid
+    ///
+    /// Rows are grouped into runs that share a fragment, so the fragment's
+    /// selection is looked up once per run instead of once per row, and an
+    /// ascending run of 64 or more rows is intersected with the fragment bitmap
+    /// in bulk instead of probed row by row. Vector search filters whole index
+    /// partitions through this, where per-row [`Self::selected`] dominated the
+    /// query.
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
-        row_ids
-            .enumerate()
-            .filter_map(|(idx, row_id)| {
-                if self.selected(*row_id) {
-                    Some(idx as u64)
-                } else {
-                    None
+        let mut out = Vec::new();
+        self.for_each_selected(row_ids, |offset| out.push(offset as u64));
+        out
+    }
+
+    /// [`Self::selected_indices`] as `u32` offsets into `out`, cleared first,
+    /// so a scan over many partitions reuses one buffer.
+    ///
+    /// Callers must pass fewer than `u32::MAX` rows; an index partition always
+    /// does. Use [`Self::selected_indices`] when the row count is unbounded.
+    pub fn selected_offsets_into<'a>(
+        &self,
+        row_ids: impl Iterator<Item = &'a u64> + 'a,
+        out: &mut Vec<u32>,
+    ) {
+        out.clear();
+        self.for_each_selected(row_ids, |offset| out.push(offset as u32));
+    }
+
+    /// Calls `emit` with the position of every selected row id. Positions stay
+    /// `usize` here, so no caller's offset goes through `u32` and then back out.
+    fn for_each_selected<'a>(
+        &self,
+        row_ids: impl Iterator<Item = &'a u64> + 'a,
+        mut emit: impl FnMut(usize),
+    ) {
+        // Bulk intersection beats per-row probes only once a run amortizes
+        // building its own bitmap.
+        const BULK_RUN_MIN: usize = 64;
+        let (tree, allow) = match self {
+            Self::AllowList(tree) => (tree, true),
+            Self::BlockList(tree) => (tree, false),
+        };
+        let mut run: Vec<u32> = Vec::new();
+        let mut run_fragment = None;
+        let mut run_start = 0;
+        let mut ascending = true;
+        let mut flush = |fragment: Option<u32>, start: usize, run: &[u32], ascending: bool| {
+            let Some(fragment) = fragment else {
+                return;
+            };
+            let all = start..start + run.len();
+            match tree.inner.get(&fragment) {
+                None => {
+                    if !allow {
+                        for offset in all {
+                            emit(offset);
+                        }
+                    }
                 }
-            })
-            .collect()
+                Some(RowAddrSelection::Full) => {
+                    if allow {
+                        for offset in all {
+                            emit(offset);
+                        }
+                    }
+                }
+                Some(RowAddrSelection::Partial(bitmap)) => {
+                    if ascending && run.len() >= BULK_RUN_MIN {
+                        let run_set = RoaringBitmap::from_sorted_iter(run.iter().copied())
+                            .expect("run checked ascending");
+                        let hits = if allow {
+                            run_set & bitmap
+                        } else {
+                            run_set - bitmap
+                        };
+                        let mut hits = hits.iter();
+                        let mut next = hits.next();
+                        for (offset, &row) in run.iter().enumerate() {
+                            if next == Some(row) {
+                                emit(start + offset);
+                                next = hits.next();
+                            }
+                        }
+                    } else {
+                        for (offset, &row) in run.iter().enumerate() {
+                            if bitmap.contains(row) == allow {
+                                emit(start + offset);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        for (idx, &row_id) in row_ids.enumerate() {
+            let fragment = (row_id >> 32) as u32;
+            if run_fragment != Some(fragment) {
+                flush(run_fragment, run_start, &run, ascending);
+                run.clear();
+                run_fragment = Some(fragment);
+                run_start = idx;
+                ascending = true;
+            }
+            let row = row_id as u32;
+            if ascending && run.last().is_some_and(|&last| last >= row) {
+                ascending = false;
+            }
+            run.push(row);
+        }
+        flush(run_fragment, run_start, &run, ascending);
     }
 
     /// Also block the given addrs
@@ -598,37 +695,41 @@ impl RowAddrTreeMap {
         }
     }
 
-    /// Insert a range of values into the set
+    /// Insert a range of values into the set, returning the number of new values.
+    /// Empty ranges leave the set unchanged.
     pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
-        // Separate the start and end into high and low bits.
-        let (mut start_high, mut start_low) = match range.start_bound() {
-            std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
-            std::ops::Bound::Excluded(&start) => {
-                let start = start.saturating_add(1);
-                ((start >> 32) as u32, start as u32)
-            }
-            std::ops::Bound::Unbounded => (0, 0),
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&start) => start,
+            std::ops::Bound::Excluded(&start) => match start.checked_add(1) {
+                Some(start) => start,
+                None => return 0,
+            },
+            std::ops::Bound::Unbounded => 0,
         };
 
-        let (end_high, end_low) = match range.end_bound() {
-            std::ops::Bound::Included(&end) => ((end >> 32) as u32, end as u32),
-            std::ops::Bound::Excluded(&end) => {
-                let end = end.saturating_sub(1);
-                ((end >> 32) as u32, end as u32)
-            }
-            std::ops::Bound::Unbounded => (u32::MAX, u32::MAX),
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&end) => end,
+            std::ops::Bound::Excluded(&end) => match end.checked_sub(1) {
+                Some(end) => end,
+                None => return 0,
+            },
+            std::ops::Bound::Unbounded => u64::MAX,
         };
+        if start > end {
+            return 0;
+        }
 
+        let (start_high, start_low) = ((start >> 32) as u32, start as u32);
+        let (end_high, end_low) = ((end >> 32) as u32, end as u32);
         let mut count = 0;
 
-        while start_high <= end_high {
-            let start = start_low;
-            let end = if start_high == end_high {
+        for fragment in start_high..=end_high {
+            let start = if fragment == start_high { start_low } else { 0 };
+            let end = if fragment == end_high {
                 end_low
             } else {
                 u32::MAX
             };
-            let fragment = start_high;
             match self.inner.get_mut(&fragment) {
                 None => {
                     let mut set = RoaringBitmap::new();
@@ -640,8 +741,6 @@ impl RowAddrTreeMap {
                     count += set.insert_range(start..=end);
                 }
             }
-            start_high += 1;
-            start_low = 0;
         }
 
         count
@@ -1393,8 +1492,11 @@ impl RowIdMask {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound::{self, Excluded, Included, Unbounded};
+
     use super::*;
     use proptest::{prop_assert, prop_assert_eq};
+    use rstest::rstest;
 
     fn rows(ids: &[u64]) -> RowAddrTreeMap {
         RowAddrTreeMap::from_iter(ids)
@@ -1411,6 +1513,49 @@ mod tests {
 
     fn selected_in_range(mask: &RowAddrMask, range: std::ops::Range<u64>) -> Vec<u64> {
         range.filter(|val| mask.selected(*val)).collect()
+    }
+
+    /// `selected_indices` intersects ascending runs of at least 64 rows in
+    /// bulk and probes shorter, unsorted or duplicated runs row by row; every
+    /// path must agree with `selected`, for allow and block lists alike.
+    #[test]
+    fn test_selected_indices_bulk_matches_per_row() {
+        let mut tree = RowAddrTreeMap::new();
+        tree.insert_fragment(2);
+        for row in (0..20_000u64).step_by(2) {
+            tree.insert(1 << 32 | row);
+        }
+        let frag1 = |row: u64| 1_u64 << 32 | row;
+        let mut ids: Vec<u64> = (0..5_000).map(|r| frag1(r * 3)).collect();
+        ids.extend((0..5).map(|r| 2_u64 << 32 | r));
+        ids.extend((0..10).map(|r| frag1(100 + r)));
+        ids.extend((0..5).map(|r| 3_u64 << 32 | r));
+        ids.extend((0..200).rev().map(frag1));
+        ids.extend((0..100).map(|r| frag1(r / 2)));
+        for mask in [
+            RowAddrMask::from_allowed(tree.clone()),
+            RowAddrMask::from_block(tree.clone()),
+        ] {
+            let expected: Vec<u64> = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| mask.selected(**id))
+                .map(|(idx, _)| idx as u64)
+                .collect();
+            assert!(expected.len() > 1_000 && expected.len() < ids.len());
+            assert_eq!(mask.selected_indices(ids.iter()), expected);
+            let mut reused = vec![u32::MAX; 3];
+            mask.selected_offsets_into(ids.iter(), &mut reused);
+            assert_eq!(
+                reused.iter().map(|&i| u64::from(i)).collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(
+            RowAddrMask::from_allowed(tree)
+                .selected_indices([].iter())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1970,6 +2115,37 @@ mod tests {
         mask.insert_fragment(0);
         let count = mask.insert_range(100..200);
         assert_eq!(count, 0);
+    }
+
+    #[rstest]
+    #[case::zero(Included(0), Excluded(0))]
+    #[case::before_zero(Unbounded, Excluded(0))]
+    #[case::equal(Included(5), Excluded(5))]
+    #[case::reversed(Included(7), Included(3))]
+    #[case::fragment_boundary(Included(1 << 32), Excluded(1 << 32))]
+    #[case::after_max(Excluded(u64::MAX), Unbounded)]
+    #[case::excluded_max(Excluded(u64::MAX), Included(u64::MAX))]
+    fn test_map_insert_range_empty(#[case] start: Bound<u64>, #[case] end: Bound<u64>) {
+        let mut map = RowAddrTreeMap::new();
+        assert_eq!(map.insert_range((start, end)), 0);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), Some(0));
+
+        map.insert(1);
+        map.insert(1 << 32);
+        let original = map.clone();
+        assert_eq!(map.insert_range((start, end)), 0);
+        assert_eq!(map, original);
+    }
+
+    #[rstest]
+    #[case::inclusive(Included(u64::MAX))]
+    #[case::unbounded(Unbounded)]
+    fn test_map_insert_range_terminal(#[case] end: Bound<u64>) {
+        let mut map = RowAddrTreeMap::new();
+        assert_eq!(map.insert_range((Included(u64::MAX - 2), end)), 3);
+        assert_eq!(map, RowAddrTreeMap::from_iter(u64::MAX - 2..=u64::MAX));
+        assert_eq!(map.insert_range((Included(u64::MAX - 2), end)), 0);
     }
 
     #[test]

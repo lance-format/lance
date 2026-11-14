@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::as_primitive_array;
 use arrow::datatypes::Int32Type;
@@ -10,17 +10,21 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, ListArray,
-    RecordBatch, RecordBatchIterator, StructArray, UInt8Array, UInt32Array,
+    RecordBatch, RecordBatchIterator, StructArray, UInt8Array, UInt32Array, UInt64Array,
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::TryStreamExt;
 use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+use lance_core::cache::{CacheActivity, CacheSnapshotMode, LanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
+use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
@@ -36,16 +40,21 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use crate::Error;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, assert_query_index_field, batch_knn_two_queries, batch_row_ids,
     make_binary_vector_dataset,
 };
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap, Scanner};
 use crate::dataset::tests::dataset_scanner_segments::FragmentVectorFixture;
-use crate::dataset::{Dataset, WriteParams};
+use crate::dataset::transaction::Operation;
+use crate::dataset::{Dataset, UpdateBuilder, WriteDestination, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::io::exec::PreFilterSource;
+use crate::session::index_caches::{
+    DSIndexCache, QuantizedRefinementCache, QuantizedRefinementOptions,
+};
 // Imported through the public `io::exec` re-export rather than the crate-private
 // `knn` module, so the tests below cover that surface too.
 use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
@@ -101,6 +110,248 @@ async fn test_knn_nodes(
         .copied()
         .collect();
     assert_eq!(expected_i, actual_i);
+}
+
+#[rstest]
+#[case::flat(None)]
+#[case::ivf_flat(Some(VectorIndexParams::with_ivf_flat_params(
+    MetricType::L2,
+    IvfBuildParams::new(2)
+)))]
+#[case::ivf_pq(Some(VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2)))]
+#[tokio::test]
+async fn test_cross_column_refinement_candidates(
+    #[case] index_params: Option<VectorIndexParams>,
+    #[values(MetricType::L2, MetricType::Cosine, MetricType::Dot)] metric: MetricType,
+) {
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(32))
+        .await
+        .unwrap();
+    if let Some(params) = &index_params {
+        dataset
+            .create_index(&["coarse"], IndexType::Vector, None, params, false)
+            .await
+            .unwrap();
+    }
+    let coarse_query = Float32Array::from(vec![0.1, 0.2, 0.3, 0.4]);
+    let full_query = Float32Array::from(vec![0.4, 0.3, 0.2, 0.1, 0.5, 0.6, 0.7, 0.8]);
+    let candidates = dataset
+        .scan()
+        .nearest("coarse", &coarse_query, 12)
+        .unwrap()
+        .distance_metric(MetricType::L2)
+        .nprobes(2)
+        .project(&["id", "full"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(candidates.num_rows(), 12);
+
+    let vectors = candidates["full"].as_fixed_size_list();
+    let ids = candidates["id"].as_primitive::<Int32Type>();
+    let mut expected = (0..candidates.num_rows())
+        .map(|i| {
+            let vector = vectors.value(i);
+            let vector = vector.as_primitive::<Float32Type>();
+            let pairs = vector.values().iter().zip(full_query.values().iter());
+            let dot = pairs
+                .clone()
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum::<f64>();
+            let distance = match metric {
+                MetricType::L2 => pairs
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum(),
+                MetricType::Cosine => {
+                    let norm = vector
+                        .values()
+                        .iter()
+                        .map(|&value| f64::from(value).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    let query_norm = full_query
+                        .values()
+                        .iter()
+                        .map(|&value| f64::from(value).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    1.0 - dot / (norm * query_norm)
+                }
+                MetricType::Dot => 1.0 - dot,
+                _ => unreachable!(),
+            };
+            (ids.value(i), distance as f32)
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+    expected.truncate(6);
+
+    let mut scan = dataset.scan();
+    scan.nearest("coarse", &coarse_query, 6)
+        .unwrap()
+        .distance_metric(MetricType::L2)
+        .nprobes(2)
+        .refine(2)
+        .with_refine_column("full", &full_query, metric)
+        .unwrap()
+        .project(&["id", DIST_COL])
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    if index_params.is_some() {
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
+        // Quantized candidates go directly to final-space scoring.
+        assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+    }
+
+    let result = scan.try_into_batch().await.unwrap();
+    let actual_ids = result["id"].as_primitive::<Int32Type>();
+    let actual_distances = result[DIST_COL].as_primitive::<Float32Type>();
+    assert_eq!(result.num_rows(), expected.len());
+    for (i, (id, distance)) in expected.iter().enumerate() {
+        assert_eq!(actual_ids.value(i), *id);
+        assert!((actual_distances.value(i) - distance).abs() < 1e-5);
+    }
+    assert!(result.schema().column_with_name("full").is_none());
+    assert!(result.schema().column_with_name("coarse").is_none());
+}
+
+#[tokio::test]
+async fn test_cross_column_refinement_validation_and_reset() {
+    let dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    let coarse = Float32Array::from(vec![0.1; 4]);
+    let full = Float32Array::from(vec![0.1; 8]);
+
+    let mut scan = dataset.scan();
+    let error = scan
+        .with_refine_column("full", &full, MetricType::Cosine)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("nearest must be set"));
+
+    scan.nearest("coarse", &coarse, 2).unwrap();
+    let error = scan
+        .with_refine_column("id", &full, MetricType::Cosine)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("vector"));
+
+    let wrong_type = arrow_array::Float64Array::from(vec![0.1; 8]);
+    let error = scan
+        .with_refine_column("full", &wrong_type, MetricType::Cosine)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("Float32"));
+
+    scan.with_refine_column("full", &full, MetricType::Cosine)
+        .unwrap();
+    let error = scan.explain_plan(false).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("positive refine_factor"));
+
+    scan.refine(0);
+    let error = scan.explain_plan(false).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("positive refine_factor"));
+
+    let mut overflow = dataset.scan();
+    overflow
+        .nearest("coarse", &coarse, usize::MAX)
+        .unwrap()
+        .refine(2)
+        .with_refine_column("full", &full, MetricType::Cosine)
+        .unwrap();
+    let error = overflow.explain_plan(false).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("overflows"));
+
+    scan.nearest("coarse", &coarse, 2).unwrap();
+    scan.explain_plan(false).await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cross_column_refinement_sliced_batch_query(#[values(false, true)] build_index: bool) {
+    let mut dataset = gen_batch()
+        .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    if build_index {
+        dataset
+            .create_index(
+                &["coarse"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(2, MetricType::L2),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let coarse_values =
+        Float32Array::from((1..9).map(|value| value as f32 / 10.0).collect::<Vec<_>>());
+    let coarse = FixedSizeListArray::try_new_from_values(coarse_values, 4).unwrap();
+    let full_values = Float32Array::from((0..32).map(|value| value as f32).collect::<Vec<_>>());
+    let full = FixedSizeListArray::try_new_from_values(full_values, 8)
+        .unwrap()
+        .slice(1, 2);
+
+    let mut scan = dataset.scan();
+    scan.nearest("coarse", &coarse, 2)
+        .unwrap()
+        .nprobes(2)
+        .refine(2)
+        .with_refine_column("full", &full, MetricType::L2)
+        .unwrap()
+        .project(&[DIST_COL])
+        .unwrap()
+        .with_row_id();
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(
+        batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
+        &[0, 0, 1, 1]
+    );
+
+    for query_index in 0..coarse.len() {
+        let mut single = dataset.scan();
+        single
+            .nearest("coarse", coarse.value(query_index).as_ref(), 2)
+            .unwrap()
+            .nprobes(2)
+            .refine(2)
+            .with_refine_column("full", full.value(query_index).as_ref(), MetricType::L2)
+            .unwrap()
+            .project(&[DIST_COL])
+            .unwrap()
+            .with_row_id();
+        let single = single.try_into_batch().await.unwrap();
+        let query_batch = batch.slice(query_index * 2, 2);
+        assert_eq!(
+            query_batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+            single[ROW_ID].as_primitive::<UInt64Type>().values()
+        );
+        assert_eq!(
+            query_batch[DIST_COL].as_primitive::<Float32Type>().values(),
+            single[DIST_COL].as_primitive::<Float32Type>().values()
+        );
+    }
 }
 
 async fn nested_vector_test_dataset(dim: u32) -> (TempStrDir, Dataset) {
@@ -1136,13 +1387,10 @@ async fn test_batch_knn_indexed_refine_zero(#[case] fixed_probes: bool) {
     assert!(error.to_string().contains("Refine factor cannot be zero"));
 }
 
-/// Without pinned nprobes the shared-scan fast path is not equivalent to
-/// single-query search (the single-query path applies an adaptive
-/// `early_pruning` floor and late-search expansion that the batch path does
-/// not), so the scanner must fall back to the per-query loop, which reuses
-/// the real adaptive search and stays exact.
+/// Adaptive nprobes (no `nprobes()` call) uses the shared-scan batch node,
+/// which applies the same probe budget as the single-query path.
 #[tokio::test]
-async fn test_batch_knn_indexed_adaptive_nprobes_falls_back() {
+async fn test_batch_knn_indexed_adaptive_nprobes() {
     let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
         .await
         .unwrap();
@@ -1158,20 +1406,12 @@ async fn test_batch_knn_indexed_adaptive_nprobes_falls_back() {
 
     let plan = scan.explain_plan(false).await.unwrap();
     assert!(
-        !plan.contains("ANNIvfBatch"),
-        "adaptive nprobes must not use the shared-scan batch node, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("ANNSubIndex"),
-        "adaptive nprobes batch search should fall back to the per-query loop, got:\n{}",
-        plan
+        plan.contains("ANNIvfBatch"),
+        "adaptive nprobes should use the shared-scan batch node, got:\n{plan}"
     );
 
     let batch = scan.try_into_batch().await.unwrap();
     assert_query_index_field(&batch);
-    // The fallback runs real single-query searches, so it stays exact even
-    // with adaptive nprobes.
     assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, None).await;
 }
 
@@ -2419,6 +2659,7 @@ async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
 /// each segment's ownership so the stale copy is neither returned nor counted.
 #[rstest]
 #[case::fixed_nprobes(Some(2))]
+#[case::adaptive_nprobes(None)]
 #[tokio::test]
 async fn test_batch_knn_skips_rows_owned_by_newer_delta(
     #[case] nprobes: Option<usize>,
@@ -2824,6 +3065,678 @@ async fn test_nearest_rejects_query_type_mismatch(#[case] has_fragments: bool) {
             .contains("Column bin has element type UInt8 and the query vector is Float32"),
         "unexpected error: {err}"
     );
+}
+
+async fn refinement_cache_activity(dataset: &Dataset) -> CacheActivity {
+    dataset
+        .index_cache
+        .diagnostics_by_type(CacheSnapshotMode::Refreshed)
+        .await
+        .by_type
+        .unwrap()
+        .activity
+        .into_iter()
+        .find(|entry| entry.type_name == "QuantizedRefinementResult")
+        .map(|entry| entry.activity)
+        .unwrap_or_default()
+}
+
+fn refinement_scan(dataset: &Dataset) -> Scanner {
+    let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query, 10)
+        .unwrap()
+        .nprobes(2)
+        .quantized_refine(40)
+        .with_row_id()
+        .project(&[ROW_ID])
+        .unwrap();
+    scan
+}
+
+const CROSS_COLUMN_CACHE_K: usize = 4;
+const CROSS_COLUMN_CACHE_REFINE_FACTOR: u32 = 2;
+const CROSS_COLUMN_CACHE_QUANTIZED_REFINE: u32 = 4;
+
+/// Cross-column refinement reranks the coarse candidates with its own key,
+/// metric and final-space bounds, so one coarse entry serves every key.
+async fn cross_column_refinement_scan(
+    dataset: &Dataset,
+    coarse: &FixedSizeListArray,
+    refine: &dyn Array,
+    batch: bool,
+    bounds: (Option<f32>, Option<f32>),
+) -> RecordBatch {
+    let mut scan = dataset.scan();
+    if batch {
+        scan.nearest("coarse", coarse, CROSS_COLUMN_CACHE_K)
+            .unwrap();
+    } else {
+        scan.nearest("coarse", coarse.value(0).as_ref(), CROSS_COLUMN_CACHE_K)
+            .unwrap();
+    }
+    scan.distance_metric(MetricType::L2)
+        .nprobes(2)
+        .refine(CROSS_COLUMN_CACHE_REFINE_FACTOR)
+        .quantized_refine(CROSS_COLUMN_CACHE_QUANTIZED_REFINE)
+        .with_refine_column("full", refine, MetricType::L2)
+        .unwrap()
+        .distance_range(bounds.0, bounds.1)
+        .with_row_id()
+        .project(&[ROW_ID, DIST_COL])
+        .unwrap();
+    scan.try_into_batch().await.unwrap()
+}
+
+// Compare the actual rows and distance bits against the same snapshot with its
+// result cache disabled. Counters alone cannot detect stale rankings.
+async fn assert_refinement_cache(dataset: &Dataset, expect_hit: bool) -> RecordBatch {
+    let before = refinement_cache_activity(dataset).await;
+    let result = refinement_scan(dataset).try_into_batch().await.unwrap();
+    let after = refinement_cache_activity(dataset).await;
+    if expect_hit {
+        assert!(after.hits > before.hits);
+        assert_eq!(after.loads_started, before.loads_started);
+    } else {
+        assert_eq!(after.hits, before.hits);
+        assert!(after.loads_succeeded > before.loads_succeeded);
+    }
+    let mut uncached = dataset.clone();
+    uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+    let reference = refinement_scan(&uncached).try_into_batch().await.unwrap();
+    assert_eq!(result, reference);
+    result
+}
+
+#[rstest]
+#[case::branch(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).branch = Some("other".to_string()))]
+#[case::incarnation(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).transaction_file = Some("new-transaction.txn".to_string()))]
+#[case::version(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).version += 1)]
+#[case::manifest_generation(|ds: &mut Dataset| ds.manifest_location.e_tag = Some("new-etag".to_string()))]
+#[case::manifest_path(|ds: &mut Dataset| ds.manifest_location.path = ds.manifest_location.path.clone().join("other"))]
+#[tokio::test]
+async fn test_quantized_refinement_cache_snapshot_identity(#[case] change: fn(&mut Dataset)) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(8).await.unwrap();
+    let index = fixture
+        .dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|idx| idx.name == "idx")
+        .unwrap()
+        .clone();
+    let query = lance_index::vector::Query {
+        column: "vec".to_string(),
+        key: Arc::new(Float32Array::from(vec![0.0; 32])),
+        k: 10,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 2,
+        maximum_nprobes: Some(2),
+        search_effort: 0.5,
+        ef: None,
+        refine_factor: None,
+        metric_type: Some(DistanceType::L2),
+        use_index: true,
+        query_parallelism: 0,
+        dist_q_c: 0.0,
+        approx_mode: ApproxMode::Normal,
+    };
+    let options = QuantizedRefinementOptions {
+        result_count: 10,
+        exact_factor: None,
+    };
+    let first = QuantizedRefinementCache::for_segment(&fixture.dataset, &index, &query, options)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut changed = fixture.dataset.clone();
+    change(&mut changed);
+    let second = QuantizedRefinementCache::for_segment(&changed, &index, &query, options)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.identity, second.identity);
+    let exact = QuantizedRefinementCache::for_segment(
+        &fixture.dataset,
+        &index,
+        &query,
+        QuantizedRefinementOptions {
+            exact_factor: Some(1),
+            ..options
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(first.identity, exact.identity);
+}
+
+#[rstest]
+#[case::rq4(4)]
+#[case::rq8(8)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_queries(#[case] num_bits: u8) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(num_bits).await.unwrap();
+    let dataset = &fixture.dataset;
+    let first = assert_refinement_cache(dataset, false).await;
+    assert_eq!(assert_refinement_cache(dataset, true).await, first);
+
+    let before = refinement_cache_activity(dataset).await;
+    // Projection and exact refinement are outside the entry. An exact stage
+    // changes the quantized result budget and must get its own entry.
+    let mut projected = refinement_scan(dataset);
+    projected.project(&["i"]).unwrap();
+    let projected = projected.try_into_batch().await.unwrap();
+    assert_eq!(batch_row_ids(&projected), batch_row_ids(&first));
+    assert!(refinement_cache_activity(dataset).await.hits > before.hits);
+
+    let mut exact = dataset.scan();
+    let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+    exact
+        .nearest("vec", &query, 10)
+        .unwrap()
+        .use_index(false)
+        .with_row_id()
+        .project(&[ROW_ID])
+        .unwrap();
+    let exact = exact.try_into_batch().await.unwrap();
+    let recall = batch_row_ids(&first)
+        .iter()
+        .filter(|id| batch_row_ids(&exact).contains(id))
+        .count() as f64
+        / 10.0;
+    assert!(recall >= 0.5, "recall={recall}");
+
+    for _ in 0..2 {
+        let mut scan = refinement_scan(dataset);
+        scan.refine(2);
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result, exact);
+    }
+
+    let before = refinement_cache_activity(dataset).await;
+    let mut changed_query = refinement_scan(dataset);
+    changed_query
+        .nearest("vec", &Float32Array::from(vec![1000.0; 32]), 10)
+        .unwrap()
+        .nprobes(2)
+        .quantized_refine(40);
+    let changed = changed_query.try_into_batch().await.unwrap();
+    let mut changed_uncached = changed_query.clone();
+    changed_uncached.with_fragments(dataset.fragments().to_vec());
+    assert_eq!(changed, changed_uncached.try_into_batch().await.unwrap());
+    assert_ne!(batch_row_ids(&changed), batch_row_ids(&first));
+    assert_eq!(refinement_cache_activity(dataset).await.hits, before.hits);
+}
+
+#[rstest]
+#[case::row_addresses(false, false)]
+#[case::stable_row_ids(true, false)]
+#[case::deferred_row_addresses(false, true)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_snapshot_lifecycle(
+    #[case] stable_row_ids: bool,
+    #[case] defer_remap: bool,
+) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(8).await.unwrap();
+    let original_version = fixture.dataset.version().version;
+    let original = assert_refinement_cache(&fixture.dataset, false).await;
+    assert_refinement_cache(&fixture.dataset, true).await;
+
+    fixture.dataset.delete("i = 0").await.unwrap();
+    let deleted = assert_refinement_cache(&fixture.dataset, false).await;
+    assert!(!batch_row_ids(&deleted).contains(&0));
+    assert_refinement_cache(&fixture.dataset, true).await;
+
+    for target_rows_per_fragment in [150, 500] {
+        let version = fixture.dataset.version().version;
+        compact_files(
+            &mut fixture.dataset,
+            CompactionOptions {
+                target_rows_per_fragment,
+                defer_index_remap: defer_remap,
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            fixture.dataset.version().version > version,
+            "compaction must commit a new snapshot"
+        );
+        assert_refinement_cache(&fixture.dataset, false).await;
+        assert_refinement_cache(&fixture.dataset, true).await;
+    }
+
+    fixture.append_new_data().await.unwrap();
+    let before = refinement_cache_activity(&fixture.dataset).await;
+    let appended = refinement_scan(&fixture.dataset)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut uncached = fixture.dataset.clone();
+    uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+    assert_eq!(
+        appended,
+        refinement_scan(&uncached).try_into_batch().await.unwrap()
+    );
+    assert_eq!(
+        refinement_cache_activity(&fixture.dataset)
+            .await
+            .loads_started,
+        before.loads_started
+    );
+    fixture
+        .dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_refinement_cache(&fixture.dataset, false).await;
+
+    fixture.make_rq_vector_index(8).await.unwrap();
+    assert_refinement_cache(&fixture.dataset, false).await;
+    let old = fixture
+        .dataset
+        .checkout_version(original_version)
+        .await
+        .unwrap();
+    assert_eq!(assert_refinement_cache(&old, true).await, original);
+}
+
+#[rstest]
+#[case::filter(0)]
+#[case::fragment_subset(1)]
+#[case::external_mask(2)]
+#[case::unproven_manifest(3)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_bypass(#[case] restriction: u8) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(8).await.unwrap();
+    assert_refinement_cache(&fixture.dataset, false).await;
+    if restriction == 3 {
+        Arc::make_mut(&mut fixture.dataset.manifest).transaction_file = None;
+        fixture.dataset.manifest_location.e_tag = None;
+    }
+    let dataset = &fixture.dataset;
+    let before = refinement_cache_activity(dataset).await;
+    for _ in 0..2 {
+        let mut scan = refinement_scan(dataset);
+        match restriction {
+            0 => {
+                scan.prefilter(true).filter("i >= 1").unwrap();
+            }
+            1 => {
+                scan.with_fragments(vec![dataset.fragments()[0].clone()]);
+            }
+            2 => {
+                scan.with_row_id_prefilter(RowAddrMask::default());
+            }
+            _ => {}
+        }
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 10);
+    }
+    let after = refinement_cache_activity(dataset).await;
+    assert_eq!(after.hits, before.hits);
+    assert_eq!(after.loads_started, before.loads_started);
+}
+
+// The cached entry is the coarse partition batch, so a different refinement
+// key must legitimately reuse it and still rerank in its own final space.
+#[rstest]
+#[case::single(false)]
+#[case::batch(true)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_cross_column_refinement(#[case] batch: bool) {
+    const COARSE_DIM: u32 = 8;
+    const FULL_DIM: u32 = 16;
+
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "coarse",
+            array::rand_vec::<Float32Type>(Dimension::from(COARSE_DIM)),
+        )
+        .col(
+            "full",
+            array::rand_vec::<Float32Type>(Dimension::from(FULL_DIM)),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(32))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["coarse"],
+            IndexType::Vector,
+            Some("rq".to_string()),
+            &VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                RQBuildParams::with_rotation_type(8, RQRotationType::Fast),
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let keys = |dim: u32, seed: f32| {
+        let rows = if batch { 2 } else { 1 };
+        let values = (0..rows * dim as usize)
+            .map(|index| seed + index as f32 / 64.0)
+            .collect::<Vec<_>>();
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
+    };
+    let coarse = keys(COARSE_DIM, 0.1);
+    let first_keys = keys(FULL_DIM, 0.2);
+    let second_keys = keys(FULL_DIM, 0.9);
+    let refine = |keys: &FixedSizeListArray| -> ArrayRef {
+        if batch {
+            Arc::new(keys.clone())
+        } else {
+            keys.value(0)
+        }
+    };
+    let first_refine = refine(&first_keys);
+    let second_refine = refine(&second_keys);
+
+    let mut uncached = dataset.clone();
+    uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+    let unbounded = cross_column_refinement_scan(
+        &uncached,
+        &coarse,
+        first_refine.as_ref(),
+        batch,
+        (None, None),
+    )
+    .await;
+    // Bound the refinement space around its median so the range rejects rows.
+    // The filter sees every coarse candidate, so the bound must come from the
+    // refined output rather than the candidate budget.
+    let mut distances = unbounded[DIST_COL]
+        .as_primitive::<Float32Type>()
+        .values()
+        .to_vec();
+    distances.sort_by(f32::total_cmp);
+    let bounds = (Some(distances[0]), Some(distances[distances.len() / 2]));
+    let first_reference =
+        cross_column_refinement_scan(&uncached, &coarse, first_refine.as_ref(), batch, bounds)
+            .await;
+    let second_reference =
+        cross_column_refinement_scan(&uncached, &coarse, second_refine.as_ref(), batch, bounds)
+            .await;
+    assert!(first_reference.num_rows() < unbounded.num_rows());
+
+    let before = refinement_cache_activity(&dataset).await;
+    let first =
+        cross_column_refinement_scan(&dataset, &coarse, first_refine.as_ref(), batch, bounds).await;
+    let missed = refinement_cache_activity(&dataset).await;
+    assert_eq!(missed.hits, before.hits);
+    assert!(missed.loads_succeeded > before.loads_succeeded);
+
+    let warm =
+        cross_column_refinement_scan(&dataset, &coarse, first_refine.as_ref(), batch, bounds).await;
+    let warmed = refinement_cache_activity(&dataset).await;
+    assert!(warmed.hits > missed.hits);
+    assert_eq!(warmed.loads_started, missed.loads_started);
+
+    // A different refinement key reuses the coarse candidates but must not
+    // reuse its predecessor's final distances.
+    let second =
+        cross_column_refinement_scan(&dataset, &coarse, second_refine.as_ref(), batch, bounds)
+            .await;
+    let reused = refinement_cache_activity(&dataset).await;
+    assert!(reused.hits > warmed.hits);
+    assert_eq!(reused.loads_started, missed.loads_started);
+
+    assert_eq!(first, first_reference);
+    assert_eq!(warm, first_reference);
+    assert_eq!(second, second_reference);
+    assert_ne!(
+        first_reference[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values(),
+        second_reference[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+    );
+    for result in [&first, &second] {
+        assert!(
+            result[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| *distance >= bounds.0.unwrap() && *distance <= bounds.1.unwrap()),
+            "final-space bounds must apply to cached coarse candidates"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_quantized_refinement_cache_shallow_clone_divergence() {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(8).await.unwrap();
+    let original = assert_refinement_cache(&fixture.dataset, false).await;
+    let clone_uri = TempStrDir::default();
+    let mut cloned = fixture
+        .dataset
+        .shallow_clone(clone_uri.as_str(), fixture.dataset.version().version, None)
+        .await
+        .unwrap();
+    assert_refinement_cache(&cloned, false).await;
+    cloned.delete("i < 20").await.unwrap();
+    let changed = assert_refinement_cache(&cloned, false).await;
+    assert_ne!(batch_row_ids(&changed), batch_row_ids(&original));
+    assert_eq!(
+        assert_refinement_cache(&fixture.dataset, true).await,
+        original
+    );
+}
+
+#[rstest]
+#[case::rq4(4)]
+#[case::rq8(8)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_saves_scoring_without_vector_reads(#[case] num_bits: u8) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(num_bits).await.unwrap();
+    // Delete only this test's temporary data files. A fully indexed row-ID-only
+    // query must work on both misses and hits without those original vectors.
+    for fragment in fixture.dataset.fragments().iter() {
+        for file in &fragment.files {
+            fixture
+                .dataset
+                .object_store
+                .delete(&fixture.dataset.data_dir().join(file.path.as_str()))
+                .await
+                .unwrap();
+        }
+    }
+    let stats = Arc::new(Mutex::new(ExecutionSummaryCounts::default()));
+    let mut results = Vec::with_capacity(2);
+    let mut comparisons = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let mut scan = refinement_scan(&fixture.dataset);
+        let captured = stats.clone();
+        scan.scan_stats_callback(Arc::new(move |summary| {
+            *captured.lock().unwrap() = summary.clone()
+        }));
+        results.push(scan.try_into_batch().await.unwrap());
+        comparisons.push(stats.lock().unwrap().index_comparisons);
+    }
+    assert_eq!(results[0], results[1]);
+    // Centroid ranking still executes on a hit; partition candidate discovery
+    // and selected scoring must not be counted again.
+    assert!(
+        comparisons[0] > comparisons[1],
+        "comparisons={comparisons:?}"
+    );
+    assert_eq!(stats.lock().unwrap().bytes_read, 0);
+    let mut exact = refinement_scan(&fixture.dataset);
+    exact.refine(2);
+    let error = exact.try_into_batch().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::IO { .. } | Error::NotFound { .. } | Error::Execution { .. }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().to_lowercase().contains("not found")
+            || error.to_string().contains("No such file"),
+        "{error}"
+    );
+
+    // Flat fallback may read the newly appended vectors, while the old indexed
+    // candidates still work with their original data files absent.
+    fixture.append_new_data().await.unwrap();
+    let appended = refinement_scan(&fixture.dataset)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut uncached = fixture.dataset.clone();
+    uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+    assert_eq!(
+        appended,
+        refinement_scan(&uncached).try_into_batch().await.unwrap()
+    );
+    for file in &fixture.dataset.fragments().last().unwrap().files {
+        fixture
+            .dataset
+            .object_store
+            .delete(&fixture.dataset.data_dir().join(file.path.as_str()))
+            .await
+            .unwrap();
+    }
+    let error = refinement_scan(&fixture.dataset)
+        .try_into_batch()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::IO { .. } | Error::NotFound { .. } | Error::Execution { .. }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().to_lowercase().contains("not found")
+            || error.to_string().contains("No such file"),
+        "{error}"
+    );
+}
+
+#[rstest]
+#[case::row_addresses(false, false)]
+#[case::stable_row_ids(true, false)]
+#[case::overlay(false, true)]
+#[case::stable_overlay(true, true)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_vector_update(
+    #[case] stable_row_ids: bool,
+    #[case] is_overlay: bool,
+) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+        .await
+        .unwrap();
+    fixture.make_rq_vector_index(8).await.unwrap();
+    let original = assert_refinement_cache(&fixture.dataset, false).await;
+    if is_overlay {
+        let field_id = fixture.dataset.schema().field("vec").unwrap().id;
+        let fragment = fixture.dataset.get_fragment(0).unwrap();
+        let mut writer = fragment
+            .write_overlay(&fixture.dataset.schema().project_by_ids(&[field_id], true))
+            .await
+            .unwrap();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![100000.0; 32]), 32)
+                .unwrap();
+        let update = RecordBatch::try_from_iter([
+            (ROW_ADDR, Arc::new(UInt64Array::from(vec![0])) as ArrayRef),
+            ("vec", Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+        writer.write_batch(&update).await.unwrap();
+        let group = writer.finish().await.unwrap().unwrap();
+        fixture.dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(fixture.dataset.clone())),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(fixture.dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!fixture.dataset.fragments()[0].overlays.is_empty());
+    } else {
+        let literal = format!("array[{}]", vec!["100000.0"; 32].join(","));
+        let updated = UpdateBuilder::new(Arc::new(fixture.dataset.clone()))
+            .update_where("i < 10")
+            .unwrap()
+            .set("vec", &literal)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        fixture.dataset = updated.new_dataset.as_ref().clone();
+    }
+    let before = refinement_cache_activity(&fixture.dataset).await;
+    let result = refinement_scan(&fixture.dataset)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut uncached = fixture.dataset.clone();
+    uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+    assert_eq!(
+        result,
+        refinement_scan(&uncached).try_into_batch().await.unwrap()
+    );
+    assert_ne!(batch_row_ids(&result), batch_row_ids(&original));
+    // Updated vector rows take the flat/overlay path, so no completed result
+    // from the old indexed snapshot is eligible.
+    assert_eq!(
+        refinement_cache_activity(&fixture.dataset)
+            .await
+            .loads_started,
+        before.loads_started
+    );
+    fixture
+        .dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    if is_overlay {
+        // Appending segments does not consume overlays of already indexed rows.
+        // A replacement index incorporates their current vector values.
+        fixture.make_rq_vector_index(8).await.unwrap();
+    }
+    assert_refinement_cache(&fixture.dataset, false).await;
+    assert_refinement_cache(&fixture.dataset, true).await;
 }
 
 #[rstest]
@@ -3261,4 +4174,173 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
     assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
     assert_eq!(quantized.num_rows(), 1);
     assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
+}
+
+/// A query whose probed partitions hold at least two scoring tasks' worth of
+/// bytes (`SCORING_TASK_BYTES`) is scored by concurrent CPU tasks that merge
+/// their heaps, unless the query asks for a single worker (#6475) or the
+/// compute pool has only one worker; either way the result must be the exact
+/// top-k, here checked against a flat scan over the same rows.
+#[rstest]
+#[case::automatic(0)]
+#[case::single_worker(1)]
+#[tokio::test]
+async fn test_knn_scores_large_chunk_on_concurrent_tasks(#[case] query_parallelism: i32) {
+    use crate::index::vector::ivf::v2::{PARALLEL_SCORING_CHUNKS, SCORING_TASK_BYTES};
+    use rand::{Rng, SeedableRng};
+    use std::sync::atomic::Ordering;
+
+    // An automatic query follows the pool size; an explicit count of one pins
+    // the chunk to a single task whatever the pool offers.
+    let splits = query_parallelism != 1 && get_num_compute_intensive_cpus() >= 2;
+
+    // The split counter is process-wide, so the cases must not interleave.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serial = SERIAL.lock().await;
+
+    const DIM: usize = 1024;
+    // Two exact (flat) partitions holding three tasks' worth of vectors in
+    // all, so the split happens however unevenly k-means divides them.
+    let rows = 3 * SCORING_TASK_BYTES.div_ceil(DIM * 4);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1024);
+    let vectors = Float32Array::from_iter_values((0..rows * DIM).map(|_| rng.random::<f32>()));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+            Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()),
+        ],
+    )
+    .unwrap();
+    let test_dir = TempStrDir::default();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = Float32Array::from_iter_values((0..DIM).map(|_| rng.random::<f32>()));
+    let k = 5;
+    let results = |use_index: bool| {
+        let dataset = dataset.clone();
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, k).unwrap();
+            scan.minimum_nprobes(2).maximum_nprobes(2);
+            scan.use_index(use_index);
+            scan.query_parallelism(query_parallelism);
+            scan.project(&["id"]).unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            let dists = batch[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            (ids, dists)
+        }
+    };
+    let before = PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed);
+    let indexed = results(true).await;
+    assert_eq!(
+        PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed) > before,
+        splits,
+        "query_parallelism={query_parallelism} should {}split the chunk",
+        if splits { "" } else { "not " }
+    );
+    let flat = results(false).await;
+    assert_eq!(indexed.0, flat.0);
+    assert_eq!(indexed.0.len(), k);
+    // The exact index and the flat scan take different L2 kernels, which
+    // round differently in the last bits.
+    for (indexed, flat) in indexed.1.iter().zip(&flat.1) {
+        assert!((indexed - flat).abs() <= 1e-4 * flat, "{indexed} vs {flat}");
+    }
+}
+
+/// A multivector query must score each row the same whatever the execution
+/// batch size. Each query vector's top-k sort emits its output in batches of
+/// that size, and one row id can appear in several of them because the index
+/// stores one entry per sub-vector.
+#[tokio::test]
+async fn test_multivector_scores_do_not_depend_on_batch_size() {
+    const DIM: i32 = 8;
+    const SUB_VECTORS: usize = 8;
+    const ROWS: usize = 200;
+    let values = (0..ROWS * SUB_VECTORS * DIM as usize)
+        .map(|i| ((i * 7919) % 1009) as f32 / 1009.0)
+        .collect::<Vec<_>>();
+    let sub_vectors =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM).unwrap();
+    let item = ArrowField::new("item", sub_vectors.data_type().clone(), true);
+    let offsets = OffsetBuffer::from_lengths(vec![SUB_VECTORS; ROWS]);
+    let vectors = ListArray::new(Arc::new(item), offsets, Arc::new(sub_vectors), None);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        vectors.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors.clone())]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::Cosine),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = vectors.value(0);
+    let search = |batch_size: Option<usize>| {
+        let dataset = &dataset;
+        let query = &query;
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", query.as_ref(), 10)
+                .unwrap()
+                .minimum_nprobes(2)
+                .with_row_id()
+                .project::<&str>(&[])
+                .unwrap();
+            if let Some(batch_size) = batch_size {
+                scan.batch_size(batch_size);
+            }
+            let batch = scan.try_into_batch().await.unwrap();
+            batch_row_ids(&batch)
+                .into_iter()
+                .zip(
+                    batch[DIST_COL]
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .to_vec(),
+                )
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let expected = search(None).await;
+    assert_eq!(expected.len(), 10);
+    assert_eq!(search(Some(8)).await, expected);
 }

@@ -1754,6 +1754,11 @@ async fn build_external_base_resolver(
     .await?;
 
     let mut resolver = ExternalBaseResolver::new(candidates, store_registry);
+    resolver.unregistered_external_blob_policy = dataset
+        .map(|dataset| dataset.session.as_ref())
+        .or(params.session.as_deref())
+        .map(|session| session.unregistered_external_blob_policy())
+        .unwrap_or_default();
     resolver.registered_base_ids = dataset
         .into_iter()
         .flat_map(|dataset| dataset.manifest.base_paths.keys().copied())
@@ -2134,7 +2139,7 @@ where
 /// Every current-format data file a dataset writes goes through this type, so
 /// it is the single write boundary: each batch is converted from the
 /// representation the caller supplied to the one Lance stores (Arrow JSON to
-/// Lance JSONB, top-level view arrays to offset arrays) before blob
+/// Lance JSONB, view arrays to offset arrays) before blob
 /// preprocessing and encoding. The file writer then rejects any array that
 /// still differs from the file schema.
 pub(in crate::dataset) struct V2WriterAdapter {
@@ -2707,6 +2712,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
         StringViewArray, StructArray, UInt64Array,
@@ -2726,6 +2732,9 @@ mod tests {
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
+    use parquet_variant_compute::{
+        VariantArray, json_to_variant, shred_variant, unshred_variant, variant_to_json,
+    };
     use rstest::rstest;
 
     async fn open_v2_1_test_writer(
@@ -6353,6 +6362,132 @@ mod tests {
             1
         );
         assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+    }
+
+    #[rstest]
+    #[case::unshredded(false)]
+    #[case::shredded(true)]
+    #[tokio::test]
+    async fn test_variant_storage(#[case] is_shredded: bool) {
+        let documents = vec![
+            None,
+            Some("null"),
+            Some("{}"),
+            Some(
+                r#"{"id":42,"name":"a long string stored outside a view","items":[1,null,3],"other":{"keep":true}}"#,
+            ),
+            Some(r#"{"id":"not an integer","name":false,"items":["mixed",2]}"#),
+            Some(r#"{"id":null,"items":[]}"#),
+            Some(r#"[1,{"nested":true},null]"#),
+            Some("[]"),
+            Some("17"),
+        ];
+        let input: ArrayRef = Arc::new(StringArray::from(documents.clone()));
+        let variant = json_to_variant(&input).unwrap();
+        let variant = if is_shredded {
+            shred_variant(
+                &variant,
+                &DataType::Struct(
+                    vec![
+                        ArrowField::new("id", DataType::Int64, true),
+                        ArrowField::new("name", DataType::Utf8View, true),
+                        ArrowField::new(
+                            "items",
+                            DataType::List(Arc::new(ArrowField::new(
+                                "item",
+                                DataType::Int64,
+                                true,
+                            ))),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+            )
+            .unwrap()
+        } else {
+            variant
+        };
+        let field = variant.field("event");
+        let schema = Arc::new(ArrowSchema::new(vec![field.clone()]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(variant.into_inner())]).unwrap();
+        // The second batch has a nonzero offset, and the first fragment contains
+        // only SQL null, Variant null and an empty object.
+        let reader =
+            RecordBatchIterator::new([Ok(batch.slice(0, 3)), Ok(batch.slice(3, 6))], schema);
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                max_rows_per_group: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(result.schema().field(0).metadata(), field.metadata());
+        let stored = VariantArray::try_new(result["event"].as_ref()).unwrap();
+        assert_eq!(stored.metadata_column().data_type(), &DataType::Binary);
+        assert_eq!(stored.value_column().data_type(), &DataType::Binary);
+        assert!(stored.is_null(0));
+        assert!(stored.is_valid(1), "Variant null is not SQL null");
+
+        // Reassemble with the upstream kernel, then compare JSON values so
+        // object key order and integer widths do not affect the assertion.
+        let unshredded = unshred_variant(&stored).unwrap();
+        let binary_type = DataType::Struct(
+            vec![
+                ArrowField::new("metadata", DataType::Binary, false),
+                ArrowField::new("value", DataType::Binary, true),
+            ]
+            .into(),
+        );
+        let unshredded = arrow_cast::cast(unshredded.inner(), &binary_type).unwrap();
+        let json = variant_to_json(&unshredded).unwrap();
+        for (actual, expected) in json.iter().zip(documents) {
+            assert_eq!(
+                actual.map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap()),
+                expected.map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap()),
+            );
+        }
+
+        if is_shredded {
+            let typed_value = stored.typed_value_column().unwrap().as_struct();
+            let name = typed_value.column_by_name("name").unwrap().as_struct();
+            assert_eq!(
+                name.column_by_name("typed_value").unwrap().data_type(),
+                &DataType::Utf8
+            );
+            let projected = dataset
+                .scan()
+                .project(&["event.typed_value.id.typed_value"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(projected.num_columns(), 1);
+            let values = projected["event.typed_value.id.typed_value"]
+                .as_primitive::<arrow_array::types::Int64Type>();
+            assert_eq!(
+                values,
+                &arrow_array::Int64Array::from(vec![
+                    None,
+                    None,
+                    None,
+                    Some(42),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]),
+            );
+        }
     }
 
     /// A covered scalar index must still get a seed writer. The loop skipped any

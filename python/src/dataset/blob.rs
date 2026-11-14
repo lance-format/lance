@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use pyo3::{
-    Bound, PyResult, Python,
+    Bound, Py, PyRef, PyResult, Python,
     exceptions::PyValueError,
-    pyclass, pymethods,
+    pyclass, pyfunction, pymethods,
     types::{PyByteArray, PyByteArrayMethods, PyBytes},
 };
 
@@ -27,7 +27,99 @@ use crate::{error::PythonErrorExt, rt};
 
 #[pyclass]
 pub struct LanceBlobFile {
-    inner: Arc<InnerBlobFile>,
+    pub(super) inner: Arc<InnerBlobFile>,
+}
+
+type PyReadBlobFile = (usize, Option<Py<PyBytes>>);
+
+fn read_blob_files_to_python(
+    py: Python<'_>,
+    blobs: Vec<lance::blob::ReadBlobFile>,
+) -> Vec<PyReadBlobFile> {
+    blobs
+        .into_iter()
+        .map(|blob| {
+            (
+                blob.request_index,
+                blob.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
+        .collect()
+}
+
+fn configure_read_blob_files_builder(
+    mut builder: lance::blob::ReadBlobFilesBuilder,
+    io_buffer_size: Option<u64>,
+    io_parallelism: Option<usize>,
+    preserve_order: Option<bool>,
+) -> lance::blob::ReadBlobFilesBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(parallelism) = io_parallelism {
+        builder = builder.with_io_parallelism(parallelism);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
+#[pyfunction(signature=(
+    blob_files,
+    *,
+    io_buffer_size=None,
+    io_parallelism=None,
+    preserve_order=None
+))]
+pub(crate) fn read_blob_files(
+    py: Python<'_>,
+    blob_files: Vec<Option<PyRef<'_, LanceBlobFile>>>,
+    io_buffer_size: Option<u64>,
+    io_parallelism: Option<usize>,
+    preserve_order: Option<bool>,
+) -> PyResult<Vec<PyReadBlobFile>> {
+    let builder = configure_read_blob_files_builder(
+        lance::blob::read_blob_files(
+            blob_files
+                .iter()
+                .map(|blob_file| blob_file.as_ref().map(|blob_file| blob_file.inner.as_ref())),
+        ),
+        io_buffer_size,
+        io_parallelism,
+        preserve_order,
+    );
+    let blobs = rt().block_on(Some(py), builder.execute())?.infer_error()?;
+    Ok(read_blob_files_to_python(py, blobs))
+}
+
+#[pyfunction(signature=(
+    requests,
+    *,
+    io_buffer_size=None,
+    io_parallelism=None,
+    preserve_order=None
+))]
+pub(crate) fn read_blob_file_ranges(
+    py: Python<'_>,
+    requests: Vec<(Option<PyRef<'_, LanceBlobFile>>, u64, u64)>,
+    io_buffer_size: Option<u64>,
+    io_parallelism: Option<usize>,
+    preserve_order: Option<bool>,
+) -> PyResult<Vec<PyReadBlobFile>> {
+    let builder = configure_read_blob_files_builder(
+        lance::blob::read_blob_file_ranges(requests.iter().map(|(blob_file, offset, length)| {
+            (
+                blob_file.as_ref().map(|blob_file| blob_file.inner.as_ref()),
+                lance::blob::BlobReadRange::new(*offset, *length),
+            )
+        })),
+        io_buffer_size,
+        io_parallelism,
+        preserve_order,
+    );
+    let blobs = rt().block_on(Some(py), builder.execute())?.infer_error()?;
+    Ok(read_blob_files_to_python(py, blobs))
 }
 
 #[pymethods]

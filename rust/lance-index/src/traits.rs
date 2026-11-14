@@ -401,6 +401,9 @@ pub trait IndexDescription: Send + Sync {
     ///
     /// See individual index plugins for more description of the expected format.
     ///
+    /// System indices return `{}` because their internal metadata is not
+    /// serialized through scalar index plugins.
+    ///
     /// The conversion from Any to JSON is controlled by the index
     /// plugin.  As a result, this method may fail if there is no plugin
     /// available for the index.
