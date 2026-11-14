@@ -2004,6 +2004,10 @@ public class Dataset implements Closeable {
    * non-null value is NaN. A zone is known to be all null only when its null count equals its zone
    * length.
    *
+   * <p>String bounds follow Arrow's UTF-8 byte ordering, which is not the same as {@link
+   * String#compareTo(String)}: that method compares UTF-16 code units and orders some supplementary
+   * characters differently.
+   *
    * <p>The zonemap index file is typically small (one row per zone), so this is a lightweight
    * metadata-only operation suitable for calling on the driver during scan planning.
    *

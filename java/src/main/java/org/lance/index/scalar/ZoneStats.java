@@ -24,6 +24,10 @@ import java.io.Serializable;
  * all, so a null min or max always means the zone has no comparable value: every value is null or,
  * for a floating-point column, every non-null value is NaN.
  *
+ * <p>String min/max values follow Arrow's UTF-8 byte ordering, which is not the same as {@link
+ * String#compareTo(String)}: that method compares UTF-16 code units and orders some supplementary
+ * characters differently.
+ *
  * <p>A zone never spans fragment boundaries: if a fragment has more rows than the zone size,
  * multiple zones are created within that fragment.
  *
