@@ -322,11 +322,13 @@ impl<'a> BlobLocator<'a> {
                 continue;
             }
             let (store, path) = self.external_target(base_id, uri).await?;
-            pending.push((key, store, path));
+            // Keep weak registry bindings alive until the prefetched blobs are located.
+            let source = shared_blob_source(&mut self.sources, store, &path);
+            pending.push((key, source));
         }
         let sizes: Vec<_> = stream::iter(pending)
-            .map(|(key, store, path)| async move {
-                let size = store.size(&path).await?;
+            .map(|(key, source)| async move {
+                let size = source.object_store.size(&source.path).await?;
                 Ok::<_, Error>((key, size))
             })
             .buffer_unordered(self.dataset.object_store.io_parallelism())
