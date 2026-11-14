@@ -59,8 +59,9 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin,
+            TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+            single_flight_open,
         },
     },
 };
@@ -70,9 +71,6 @@ pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
 const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
-
-const EXPLICIT_SHARD_ID_TAG: u64 = 0;
-const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 
 /// Maximum bytes a [`BitmapBatchWriter`] buffers before flushing a record
 /// batch.
@@ -106,7 +104,7 @@ const MERGE_ROWS_PER_CHUNK: usize = 512;
 /// A row id and a row address are the same value on a dataset that does not
 /// use stable row ids, so a freshly built index is still labeled this version
 /// there even though training always scans addresses -- see
-/// `build_scalar_index`'s and `build_bitmap_index_segment`'s Bitmap-specific
+/// `build_scalar_index`'s Bitmap-specific
 /// override of the trained version. That keeps a user who never turns on
 /// stable row ids from seeing any forward-compatibility impact from the
 /// address-domain migration: old builds already understand this version.
@@ -905,35 +903,9 @@ struct BitmapStatistics {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BitmapParameters {
-    /// Optional shard identifier for distributed bitmap builds spanning
-    /// multiple fragments.
+    /// Legacy shard identifier. Supplying a value is rejected: Bitmap builds
+    /// produce independent index segments and no longer support shard files.
     pub shard_id: Option<u32>,
-}
-
-struct BitmapTrainingRequest {
-    parameters: BitmapParameters,
-    criteria: TrainingCriteria,
-}
-
-impl BitmapTrainingRequest {
-    fn new(parameters: BitmapParameters) -> Self {
-        Self {
-            parameters,
-            // Bitmap indexes store physical row addresses rather than row
-            // ids, so an FRI can repair them after a rewrite.
-            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
-        }
-    }
-}
-
-impl TrainingRequest for BitmapTrainingRequest {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn criteria(&self) -> &TrainingCriteria {
-        &self.criteria
-    }
 }
 
 #[async_trait]
@@ -1496,41 +1468,6 @@ impl BitmapBatchWriter {
     }
 }
 
-fn bitmap_shard_file_name(partition_id: u64) -> String {
-    format!("{BITMAP_PART_LOOKUP_PREFIX}{partition_id}{BITMAP_PART_LOOKUP_SUFFIX}")
-}
-
-fn tagged_bitmap_partition_id(id: u32, tag: u64) -> u64 {
-    ((id as u64) << 32) | tag
-}
-
-fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Result<u64> {
-    if fragment_ids.is_empty() {
-        return Err(Error::invalid_input(
-            "Bitmap shard build requires at least one fragment id".to_string(),
-        ));
-    }
-
-    if let Some(shard_id) = shard_id {
-        return Ok(tagged_bitmap_partition_id(shard_id, EXPLICIT_SHARD_ID_TAG));
-    }
-
-    let [fragment_id] = fragment_ids else {
-        return Err(Error::invalid_input(format!(
-            "Bitmap distributed build over multiple fragments requires an explicit shard_id. \
-             Received {} fragment ids: {:?}. Please assign mutually exclusive shard_id values \
-             to disjoint fragment groups.",
-            fragment_ids.len(),
-            fragment_ids
-        )));
-    };
-
-    Ok(tagged_bitmap_partition_id(
-        *fragment_id,
-        IMPLICIT_FRAGMENT_ID_TAG,
-    ))
-}
-
 fn extract_bitmap_shard_id(filename: &str) -> Result<u64> {
     let partition_id = filename
         .strip_prefix(BITMAP_PART_LOOKUP_PREFIX)
@@ -1969,24 +1906,6 @@ impl BitmapIndexPlugin {
         index_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
         Self::streaming_build_and_write(data, Vec::new(), index_store, BITMAP_LOOKUP_NAME).await
-    }
-
-    async fn train_bitmap_shard(
-        data: SendableRecordBatchStream,
-        index_store: &dyn IndexStore,
-        fragment_ids: &[u32],
-        shard_id: Option<u32>,
-        progress: Arc<dyn crate::progress::IndexBuildProgress>,
-    ) -> Result<IndexFile> {
-        let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
-        let file_name = bitmap_shard_file_name(partition_id);
-        progress
-            .stage_start("build_bitmap_shard", None, "rows")
-            .await?;
-        let file =
-            Self::streaming_build_and_write(data, Vec::new(), index_store, &file_name).await?;
-        progress.stage_complete("build_bitmap_shard").await?;
-        Ok(file)
     }
 
     /// Builds and writes a bitmap index in a streaming fashion from value-sorted
@@ -2619,43 +2538,26 @@ impl BasicTrainer for BitmapIndexPlugin {
         } else {
             serde_json::from_str::<BitmapParameters>(params)?
         };
-        Ok(Box::new(BitmapTrainingRequest::new(params)))
+        if let Some(shard_id) = params.shard_id {
+            return Err(Error::invalid_input(format!(
+                "Bitmap shard_id={shard_id} is no longer supported; build independent index \
+                 segments with create_index_uncommitted instead"
+            )));
+        }
+        Ok(Box::new(DefaultTrainingRequest::new(
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )))
     }
 
     async fn train_index(
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
-        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        _request: Box<dyn TrainingRequest>,
+        _fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        let request = request
-            .as_any()
-            .downcast_ref::<BitmapTrainingRequest>()
-            .ok_or_else(|| {
-                Error::internal(
-                    "BitmapIndexPlugin::train_index received a non-bitmap training request"
-                        .to_string(),
-                )
-            })?;
-        let file = if let Some(fragment_ids) = fragment_ids.as_ref() {
-            Self::train_bitmap_shard(
-                data,
-                index_store,
-                fragment_ids,
-                request.parameters.shard_id,
-                progress,
-            )
-            .await?
-        } else if request.parameters.shard_id.is_some() {
-            return Err(Error::invalid_input(
-                "Bitmap shard_id requires fragment_ids and is only supported for distributed shard builds"
-                    .to_string(),
-            ));
-        } else {
-            Self::train_bitmap_index(data, index_store).await?
-        };
+        let file = Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),

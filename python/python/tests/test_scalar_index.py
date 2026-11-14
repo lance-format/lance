@@ -5650,7 +5650,8 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
-def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
+@pytest.mark.parametrize("index_type", ["BITMAP", IndexConfig("bitmap", {})])
+def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path, index_type):
     dataset_path = tmp_path / "bitmap_segments.lance"
     ds = generate_multi_fragment_bitmap_dataset(
         dataset_path, num_fragments=4, rows_per_fragment=40
@@ -5666,7 +5667,7 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     staged_segments = [
         ds.create_index_uncommitted(
             column="category",
-            index_type="BITMAP",
+            index_type=index_type,
             name=index_name,
             fragment_ids=fragment_group,
         )
@@ -5708,6 +5709,34 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
     )
+
+
+@pytest.mark.parametrize(
+    "request_kind,legacy_option",
+    [
+        ("builtin", "shard_id"),
+        ("config", "shard_id"),
+        ("config_kwargs", "shard_id"),
+        ("builtin", "index_uuid"),
+        ("config", "index_uuid"),
+    ],
+)
+def test_bitmap_legacy_build_options_rejected(tmp_path, request_kind, legacy_option):
+    ds = lance.write_dataset(
+        pa.table({"value": [1, None, 2, 3]}), tmp_path, max_rows_per_file=2
+    )
+    kwargs = {legacy_option: 0 if legacy_option == "shard_id" else str(uuid.uuid4())}
+    index_type = "BITMAP"
+    if request_kind != "builtin":
+        params = (
+            {"shard_id": kwargs.pop("shard_id")}
+            if request_kind == "config" and "shard_id" in kwargs
+            else {}
+        )
+        index_type = IndexConfig("bitmap", params)
+    with pytest.raises(ValueError, match=f"{legacy_option}.*no longer"):
+        ds.create_index_uncommitted("value", index_type, fragment_ids=[0, 1], **kwargs)
+    assert not list((tmp_path / "_indices").rglob("*.lance"))
 
 
 def test_ngram_segment_merge_and_commit_from_python(tmp_path):
