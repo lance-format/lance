@@ -21,14 +21,8 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Reuse the completed MiniBlock/codec suites. Exercise complete output
-      # admission and physical ownership across nested concatenation boundaries.
-      - name: Validate admitted DataBlock concatenation
-        run: cargo test --profile ci --locked -p lance-encoding --lib data::concat::tests -- --nocapture
-      - name: Validate concatenation API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc data::concat::DataBlock::try_concat_in
-      - name: Check concatenation without optional codecs
-        run: cargo check --profile ci --locked -p lance-encoding --no-default-features --lib
+      # Reuse the 28 concat cases, API example and no-default build at83bd8ada9
+      # (run43610825102). This repair changes only recursive type spelling.
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

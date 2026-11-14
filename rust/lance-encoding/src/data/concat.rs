@@ -101,11 +101,11 @@ enum Plan<'a> {
     },
     Nullable {
         parts: Vec<(Option<&'a [u8]>, usize)>,
-        child: Box<Plan<'a>>,
+        child: Box<Self>,
         rows: usize,
     },
     List {
-        child: Box<Plan<'a>>,
+        child: Box<Self>,
         dimension: u64,
     },
 }
