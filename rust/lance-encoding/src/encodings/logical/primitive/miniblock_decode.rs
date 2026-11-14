@@ -108,22 +108,12 @@ impl DecodeMiniBlockTask {
         values.offsets = values.offsets.deep_copy();
         values.data = LanceBuffer::empty();
         let payload = match input.into_buffer().into_vec::<u8>() {
-            Ok(mut input) => {
+            Ok(mut input) if input.capacity() <= payload_len.saturating_add(64) => {
                 input.copy_within(payload_range, 0);
                 input.truncate(payload_len);
-                if input.capacity() > payload_len.saturating_add(64) {
-                    // Shrinking a unique allocation can release its excess
-                    // without overlapping a second payload-sized allocation.
-                    // Vec does not promise an exact shrink, so keep the bound
-                    // check and compact-copy fallback.
-                    input.shrink_to_fit();
-                }
-                if input.capacity() <= payload_len.saturating_add(64) {
-                    input
-                } else {
-                    input.to_vec()
-                }
+                input
             }
+            Ok(input) => input[payload_range].to_vec(),
             Err(input) => input.as_slice()[payload_range].to_vec(),
         };
         values.data = LanceBuffer::from(payload);
