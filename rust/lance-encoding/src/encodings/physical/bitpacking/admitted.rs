@@ -147,10 +147,7 @@ mod tests {
     use lance_core::utils::allocation::AllocationBudget;
     use rstest::rstest;
 
-    use crate::{
-        compression::MiniBlockDecompressor, encodings::physical::value::ValueDecompressor,
-        format::metadata,
-    };
+    use crate::compression::MiniBlockDecompressor;
 
     fn check_admitted_range<T: ArrowNativeType + BitPackingUninit + Pod>(
         stored: u64,
@@ -303,10 +300,14 @@ mod tests {
 
     #[test]
     fn unsupported_codec_never_falls_back_to_unaccounted_decode() {
-        let codec = ValueDecompressor::from_flat(&metadata::Flat {
-            bits_per_value: 8,
-            ..Default::default()
-        });
+        #[derive(Debug)]
+        struct Unsupported;
+        impl MiniBlockDecompressor for Unsupported {
+            fn decompress(&self, _: Vec<LanceBuffer>, _: u64) -> Result<DataBlock> {
+                panic!("unadmitted fallback must not run")
+            }
+        }
+        let codec = Unsupported;
         let budget = AllocationBudget::new(1);
         let mut workspace = budget.try_reserve(1).unwrap();
         let error = codec

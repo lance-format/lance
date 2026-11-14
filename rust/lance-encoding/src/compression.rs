@@ -1148,6 +1148,8 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     ///
     /// The default returns `NotSupported`, never calls an unaccounted decoder. This
     /// opt-in capability does not change existing scan paths or bound other stages.
+    /// Later typed Arrow conversion, rep/def reconstruction and builder allocations
+    /// need their own admission; for example, expanded byte booleans need a new bitmap.
     ///
     /// ```
     /// # #[cfg(feature = "bitpacking")]

@@ -23,6 +23,8 @@ use crate::format::metadata::{self, CompressiveEncoding};
 
 use lance_core::{Error, Result};
 
+mod admitted;
+
 /// A compression strategy that writes fixed-width data as-is (no compression)
 #[derive(Debug, Default)]
 pub struct ValueEncoder {}
@@ -645,6 +647,16 @@ impl BlockDecompressor for ValueDecompressor {
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         1 + self
             .layers
