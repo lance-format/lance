@@ -324,7 +324,7 @@ jobs:
             --features "${ALL_FEATURES}"
       # Keep the full merge-tree integration pass above, then pin the focused
       # regressions to the task head even if main advanced during validation.
-      - name: Check out exact PR head for focused FTS regressions
+      - name: Check out exact PR head for focused decode and FTS regressions
         if: github.event_name == 'pull_request'
         env:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -332,7 +332,7 @@ jobs:
           git fetch --no-tags --depth=1 origin "${PR_HEAD}"
           git checkout --detach "${PR_HEAD}"
           test "$(git rev-parse HEAD)" = "${PR_HEAD}"
-      - name: Run FTS queries and pipeline drain with one compute worker
+      - name: Run compact decode and FTS regressions with one compute worker
         env:
           LANCE_CPU_THREADS: "1"
           TOKIO_WORKER_THREADS: "2"
@@ -343,7 +343,7 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}" \
-            -E 'package(lance-index) & (test(scalar::inverted::index) | (test(scalar::inverted::builder) & test(pipeline)))'
+            -E '(package(lance-encoding) & (test(test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input) | test(test_miniblock_single_binary_value_retains_only_compact_owned_input) | test(test_miniblock_cancelled_tasks_release_exhausted_input) | test(test_miniblock_planned_binary_bytes_match_partial_drain))) | (package(lance-index) & (test(scalar::inverted::index) | (test(scalar::inverted::builder) & test(pipeline))))'
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x

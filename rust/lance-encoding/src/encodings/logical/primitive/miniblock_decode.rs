@@ -1065,13 +1065,15 @@ impl DecodePageTask for DecodeMiniBlockTask {
             )?;
             if self.value_decompressor.allocates_output() {
                 decoded
-            } else if chunk.items_in_chunk == 1
-                && num_values == 1
+            } else if num_values == 1
                 && rep.is_none()
                 && def.is_none()
                 && self.dictionary_data.is_none()
                 && let DataBlock::VariableWidth(values) = decoded
             {
+                // A selected value may dominate a multi-value chunk. Reuse is
+                // safe only when the helper proves unique ownership and its
+                // retained-byte bound, regardless of the other values.
                 DataBlock::VariableWidth(Self::compact_single_binary_value(values, chunk.data))
             } else {
                 // A codec view must not pin its input chunk. Size its compact
