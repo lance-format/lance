@@ -337,6 +337,12 @@ impl SharedPositionStream {
 
     pub fn block(&self, index: usize) -> &[u8] {
         let range = self.block_range(index);
+        #[cfg(feature = "fts-format-research")]
+        super::research_positions::trace_block(
+            self.bytes.as_ptr() as usize,
+            range.start,
+            range.end,
+        );
         &self.bytes[range]
     }
 

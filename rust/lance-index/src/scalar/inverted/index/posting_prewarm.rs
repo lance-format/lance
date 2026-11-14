@@ -989,6 +989,12 @@ impl PostingListReader {
                     )
                 }
                 PositionsLayout::SharedStream(codec) => {
+                    #[cfg(feature = "fts-format-research")]
+                    if let Some(stream) = super::research_positions::read_mapped(
+                        self.research_path.as_deref(), token_id, codec,
+                    ).await? {
+                        return Ok(Positions(CompressedPositionStorage::SharedStream(stream)));
+                    }
                     let batch = self
                         .reader
                         .get().await?
@@ -1001,18 +1007,29 @@ impl PostingListReader {
                             Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                             e => e,
                         })?;
-                    let bytes = bytes::Bytes::from(
-                        batch[COMPRESSED_POSITION_COL]
-                            .as_binary::<i64>()
-                            .value(0)
-                            .to_vec(),
-                    );
+                    let values = batch[COMPRESSED_POSITION_COL].as_binary::<i64>();
+                    #[cfg(feature = "fts-format-research")]
+                    let bytes = if std::env::var("FTS_RESEARCH_POSITIONS_MODE").is_ok_and(|m| m == "zero-copy") {
+                        let offsets = values.value_offsets();
+                        super::research_positions::owned_buffer(values.values().clone())
+                            .slice(offsets[0] as usize..offsets[1] as usize)
+                    } else {
+                        bytes::Bytes::copy_from_slice(values.value(0))
+                    };
+                    #[cfg(not(feature = "fts-format-research"))]
+                    let bytes = bytes::Bytes::copy_from_slice(values.value(0));
                     let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
                         .as_list::<i32>()
                         .value(0)
                         .as_primitive::<UInt32Type>()
                         .values()
                         .to_vec();
+                    #[cfg(feature = "fts-format-research")]
+                    super::research_positions::export(
+                        self.research_path.as_deref(), token_id, &block_offsets, &bytes, codec,
+                    )?;
+                    #[cfg(feature = "fts-format-research")]
+                    super::research_positions::trace_term(&bytes, self.research_path.as_deref().unwrap_or("unknown"), token_id);
                     CompressedPositionStorage::SharedStream(SharedPositionStream::new(
                         codec,
                         block_offsets,

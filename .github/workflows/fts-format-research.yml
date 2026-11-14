@@ -1,0 +1,47 @@
+name: FTS format research correctness
+
+on:
+  push:
+    branches: [codex/research-fts-format-20261114]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fts-format-research-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  range-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Check range planning
+        run: |
+          c++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread research/fts-format/block_io.cpp -o /tmp/block-io
+          /tmp/block-io --self-check
+          python3 research/fts-format/check_block_io.py /tmp/block-io
+  native-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+      - name: Check native research contracts
+        run: cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research
+      - name: Check mapped region lifetime and invalid directories
+        run: cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --lib research_positions::tests
+      - name: Check sidecar queries against independent raw-text BM25 reference
+        run: |
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=export cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=map cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_MODE=zero-copy cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=map-normal cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=map-sequential cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=export-cache cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=map-cache cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
+          FTS_RESEARCH_POSITIONS_ROOT=/tmp/fts-research-ci FTS_RESEARCH_POSITIONS_MODE=cache-whole cargo test --locked --profile ci -p lance-index --features lance-io/aws,fts-format-research --example fts_format_research native_query_matches_raw_text_reference
