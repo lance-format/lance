@@ -527,6 +527,12 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
     u64::try_from(estimated_bytes).ok()
 }
 
+#[cfg(not(feature = "bitpacking"))]
+fn try_bitpack_for_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
+    None
+}
+
+#[cfg(feature = "bitpacking")]
 fn try_bitpack_for_block(data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -1707,9 +1713,16 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Error::invalid_input("Block encoding is missing its compression variant")
         })?;
         match compression {
+            #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(inline_bitpacking) => Ok(Box::new(
                 InlineBitpacking::from_description(inline_bitpacking),
             )),
+            #[cfg(not(feature = "bitpacking"))]
+            Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
+                Err(Error::not_supported_source(
+                    "this runtime was not built with bitpacking support".into(),
+                ))
+            }
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
                 let scalar = constant
@@ -1722,6 +1735,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
+            #[cfg(feature = "bitpacking")]
             Compression::OutOfLineBitpacking(out_of_line) => {
                 let values = out_of_line.values.as_ref().ok_or_else(|| {
                     Error::invalid_input("OutOfLineBitpacking is missing its values encoding")

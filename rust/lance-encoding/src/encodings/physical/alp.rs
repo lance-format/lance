@@ -26,7 +26,7 @@
 //! # Buffer layout
 //!
 //! Each mini-block chunk uses four value buffers (see
-//! [`MiniBlockChunk::buffer_sizes`]).
+//! [`MiniBlockChunk::buffer_sizes`](crate::encodings::logical::primitive::miniblock::MiniBlockChunk::buffer_sizes)).
 //!
 //! - **Buffer 0 (payload):** bitpacked offsets, `enc - min` for FOR mode or
 //!   `delta - min_delta` for Delta mode, using the same layout as
@@ -53,9 +53,10 @@ use crate::buffer::LanceBuffer;
 use crate::compression::MiniBlockDecompressor;
 use crate::compression_config::AlpMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+#[cfg(feature = "bitpacking")]
+use crate::encodings::logical::primitive::miniblock::{MAX_MINIBLOCK_BYTES, MiniBlockChunk};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_BYTES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
-    MiniBlockCompressor,
+    MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
 #[cfg(all(test, feature = "bitpacking"))]
 use crate::encodings::physical::bitpacking::bitpack_out_of_line_vec;

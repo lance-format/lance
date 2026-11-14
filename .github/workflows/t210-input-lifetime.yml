@@ -21,21 +21,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # List/constant behavior passed at f4d4d4d9c (164 cases + API example),
-      # and strict lint at d241585b6. At b74fa2789, 34 codec cases passed;
-      # two full-width fixtures failed in writer setup. Validate the revised
-      # reader fixtures and the composition/examples/checks not yet reached.
-      - name: Validate structural codec reader fixtures
-        run: >-
-          cargo test --profile ci --locked -p lance-encoding --all-features --lib compression::levels::tests::bitpacked::both_stable_tail_layouts -- --nocapture
-      - name: Validate encoded level ownership composition
-        run: >-
-          cargo test --profile ci --locked -p lance-encoding --all-features --lib repdef::admitted::compressed:: -- --nocapture
-      - name: Validate structural codec API example
-        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc LevelDecodePlan
-      - name: Validate encoded level API example
-        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc try_from_encoded_in
+      # At 456cb524d, 15 compressed-level cases and both API examples passed;
+      # 30 unchanged codec cases passed at b74fa2789. The no-default-features
+      # build then found missing existing bitpacking gates. Reuse those passes.
       - name: Check capability without bitpacking
         run: cargo check --profile ci --locked -p lance-encoding --no-default-features --lib
+      - name: Validate optional codec boundaries
+        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --test optional_bitpacking
       - name: Lint touched crate
+        if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

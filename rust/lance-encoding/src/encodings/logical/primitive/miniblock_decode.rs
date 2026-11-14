@@ -248,6 +248,7 @@ impl DecodeMiniBlockTask {
         Ok(DecodedPage { data, repdef })
     }
 
+    #[cfg(feature = "bitpacking")]
     fn decode_inline_bitpacking_nullable<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
         &self,
         def_decompressor: &dyn BlockDecompressor,
