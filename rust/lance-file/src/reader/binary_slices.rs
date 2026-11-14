@@ -127,7 +127,7 @@ mod tests {
         },
     };
 
-    use arrow_array::{LargeBinaryArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use futures::future::BoxFuture;
@@ -181,12 +181,19 @@ mod tests {
         let cache = LanceCache::with_capacity(1024 * 1024);
         for file in 0_u8..2 {
             let fs = FsFixture::default();
-            let schema = Arc::new(Schema::new(["left", "right"].map(|name| {
-                Field::new(name, DataType::LargeBinary, false).with_metadata(HashMap::from([(
-                    STRUCTURAL_ENCODING_META_KEY.to_owned(),
-                    STRUCTURAL_ENCODING_MINIBLOCK.to_owned(),
-                )]))
-            })));
+            let schema = Arc::new(Schema::new(
+                ["left", "right"]
+                    .into_iter()
+                    .map(|name| {
+                        Field::new(name, DataType::LargeBinary, false).with_metadata(HashMap::from(
+                            [(
+                                STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                                STRUCTURAL_ENCODING_MINIBLOCK.to_owned(),
+                            )],
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            ));
             let values = [
                 [
                     vec![b'a' + file; 8192 + usize::from(file) * 257],
@@ -201,7 +208,7 @@ mod tests {
                 schema.clone(),
                 values
                     .iter()
-                    .map(|column| Arc::new(LargeBinaryArray::from_iter_values(column)) as _)
+                    .map(|column| Arc::new(LargeBinaryArray::from_iter_values(column)) as ArrayRef)
                     .collect(),
             )
             .unwrap();

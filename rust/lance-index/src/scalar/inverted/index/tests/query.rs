@@ -2338,15 +2338,30 @@ async fn selective_phrase_search_reads_committed_partitions(
         .await?
         .expect("repeated search must use the same supported reader");
     let after = object_store.io_stats_snapshot();
-    assert_eq!(selected.len(), repeated.len());
-    for (first, second) in selected.iter().zip(&repeated) {
-        assert_eq!(
-            first.0.document.partition_ordinal(),
-            second.0.document.partition_ordinal()
-        );
-        assert_eq!(first.0.document.doc_id(), second.0.document.doc_id());
-        assert_eq!(first.0.score, second.0.score);
-    }
+    // Equal scores need not have the same asynchronous completion order.
+    let mut first_hits = selected
+        .iter()
+        .map(|Reverse(hit)| {
+            (
+                hit.document.partition_ordinal(),
+                hit.document.doc_id(),
+                hit.score,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut repeated_hits = repeated
+        .iter()
+        .map(|Reverse(hit)| {
+            (
+                hit.document.partition_ordinal(),
+                hit.document.doc_id(),
+                hit.score,
+            )
+        })
+        .collect::<Vec<_>>();
+    first_hits.sort_unstable();
+    repeated_hits.sort_unstable();
+    assert_eq!(first_hits, repeated_hits);
     assert_eq!(
         before.read_iops, after.read_iops,
         "warm selective search must reuse locations, offsets and payloads"
