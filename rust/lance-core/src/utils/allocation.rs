@@ -7,9 +7,11 @@
 //! admission returns immediately so the caller can drain/replan instead of waiting
 //! while holding the input needed to release the same budget.
 
+use std::alloc::Layout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arrow_buffer::{MutableBuffer, alloc::ALIGNMENT};
 use bytes::Bytes;
 
 use crate::{Error, Result};
@@ -89,27 +91,32 @@ impl Reservation {
         })
     }
 
+    /// Split credit and allocate an Arrow-aligned payload, or return `None` without
+    /// changing this workspace. Invalid allocation layouts also leave it unchanged.
+    pub fn try_allocate(&mut self, bytes: usize) -> Result<Option<ReservedBuffer>> {
+        validate_layout(bytes)?;
+        self.try_split(bytes).map(Self::allocate).transpose()
+    }
+
     /// Allocate and initialize exactly this payload layout after admission.
+    /// The pointer has Arrow's native alignment, including for an empty buffer.
     /// The charge travels with the buffer, including after conversion to shared `Bytes`.
     pub fn allocate(self) -> Result<ReservedBuffer> {
-        if self.bytes > isize::MAX as usize {
-            return Err(Error::invalid_input(
-                "reserved payload exceeds addressable allocation size",
-            ));
-        }
-        // Box fixes the allocation layout to the requested length, with no Vec growth
-        // or shrink reallocation hidden between admission and ownership transfer.
-        let mut data = Box::<[u8]>::new_uninit_slice(self.bytes);
-        for byte in &mut data {
-            byte.write(0);
-        }
-        // SAFETY: every element was initialized above; the Box keeps the same layout.
-        let data = unsafe { data.assume_init() };
+        validate_layout(self.bytes)?;
+        // Unlike MutableBuffer::with_capacity, from_len_zeroed uses an exact-sized
+        // allocation layout. Keep it private so no unadmitted reserve/growth is possible.
+        let data = MutableBuffer::from_len_zeroed(self.bytes);
         Ok(ReservedBuffer {
             data,
             reservation: self,
         })
     }
+}
+
+fn validate_layout(bytes: usize) -> Result<()> {
+    Layout::from_size_align(bytes, ALIGNMENT)
+        .map(|_| ())
+        .map_err(|_| Error::invalid_input("reserved payload exceeds addressable allocation size"))
 }
 
 impl Drop for Reservation {
@@ -122,7 +129,7 @@ impl Drop for Reservation {
 #[derive(Debug)]
 pub struct ReservedBuffer {
     // Field order matters: release the physical payload before refunding its credit.
-    data: Box<[u8]>,
+    data: MutableBuffer,
     reservation: Reservation,
 }
 
@@ -140,11 +147,7 @@ impl ReservedBuffer {
         if len == self.data.len() {
             return Ok(true);
         }
-        if len > isize::MAX as usize {
-            return Err(Error::invalid_input(
-                "reserved payload exceeds addressable allocation size",
-            ));
-        }
+        validate_layout(len)?;
         if len > workspace.bytes {
             return Ok(false);
         }
@@ -156,7 +159,7 @@ impl ReservedBuffer {
         };
         let mut replacement = credit.allocate()?;
         let copy_len = len.min(self.data.len());
-        replacement.data[..copy_len].copy_from_slice(&self.data[..copy_len]);
+        replacement.data.as_slice_mut()[..copy_len].copy_from_slice(&self.data[..copy_len]);
         let Self {
             data,
             mut reservation,
@@ -180,19 +183,51 @@ impl ReservedBuffer {
 
 impl AsRef<[u8]> for ReservedBuffer {
     fn as_ref(&self) -> &[u8] {
-        &self.data
+        self.data.as_slice()
     }
 }
 
 impl AsMut<[u8]> for ReservedBuffer {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        self.data.as_slice_mut()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::single_byte(1)]
+    #[case::unaligned_length(63)]
+    #[case::beyond_cache_line(65)]
+    fn admitted_layout_is_exact_and_arrow_aligned(#[case] len: usize) {
+        let budget = AllocationBudget::new(len);
+        let mut workspace = budget.try_reserve(len).unwrap();
+        let output = workspace.try_allocate(len).unwrap().unwrap();
+        assert_eq!(output.data.capacity(), len);
+        assert_eq!(output.as_ref(), vec![0; len]);
+        assert_eq!(output.as_ref().as_ptr().align_offset(ALIGNMENT), 0);
+        assert_eq!(budget.reserved(), len);
+        assert!(workspace.try_allocate(1).unwrap().is_none());
+        let last = output.freeze();
+        assert_eq!(last.as_ptr().align_offset(ALIGNMENT), 0);
+        drop(last);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn invalid_layout_does_not_consume_workspace() {
+        let budget = AllocationBudget::new(8);
+        let mut workspace = budget.try_reserve(8).unwrap();
+        let error = workspace.try_allocate(usize::MAX).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("addressable allocation size"));
+        assert_eq!(workspace.len(), 8);
+        assert_eq!(budget.reserved(), 8);
+    }
 
     #[test]
     fn whole_workspaces_are_atomic_under_contention() {
