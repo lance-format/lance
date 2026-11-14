@@ -258,7 +258,10 @@ mod tests {
     #[tokio::test]
     async fn test_write_batch_snapshots_foreign_values() {
         let owner = Arc::new((0..4096).map(AtomicU64::new).collect::<Vec<_>>());
-        // SAFETY: AtomicU64 has u64's layout and owner keeps the allocation alive.
+        // SAFETY: `owner` holds 4096 initialized `AtomicU64`s, which have u64's size and
+        // bit validity, so the pointer is valid for 4096 * 8 bytes, and the clone passed
+        // as the allocation keeps them alive. The test stores into them only after
+        // checking that no `Buffer` over them is left.
         let buffer = unsafe {
             Buffer::from_custom_allocation(
                 NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
@@ -285,6 +288,11 @@ mod tests {
 
         writer.write_batch(&batch).await.unwrap();
         drop(batch);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the writer kept the foreign buffer"
+        );
         owner[17].store(999, Ordering::Relaxed);
         writer.add_schema_metadata("foo", "bar");
         writer.finish().await.unwrap();
@@ -2035,6 +2043,34 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_max_page_bytes_env_var() {
+        // `set_var` is unsound while other test threads may read the environment,
+        // so instead the test re-runs itself in a child process that starts with
+        // the variable set. libtest names the thread after the running test, so
+        // the child's filter cannot drift from this test's name.
+        const CHILD_ENV: &str = "LANCE_TEST_MAX_PAGE_BYTES_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                // 2MiB
+                .env(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "child test failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // libtest also exits 0 when the filter matches no test.
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+
         let arrow_field = Field::new("data", DataType::UInt64, false);
         let arrow_schema = Schema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -2044,11 +2080,6 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
-        // 2MiB
-        unsafe {
-            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
-        }
-
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
             ..Default::default()
@@ -2056,10 +2087,11 @@ mod tests {
 
         let path = TempObjFile::default();
         let object_store = ObjectStore::local();
+        // Only the 2.0 encoder splits pages by `max_page_bytes`.
         let mut writer = create_writer(
             object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
-            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_0,
             options,
         )
         .unwrap();
@@ -2084,6 +2116,8 @@ mod tests {
         .unwrap();
 
         for col_metadata in file_reader.metadata().column_metadatas.iter() {
+            // Without the variable, the 4MB of values stay in one page.
+            assert_eq!(col_metadata.pages.len(), 2);
             for page in col_metadata.pages.iter() {
                 let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
@@ -2092,10 +2126,6 @@ mod tests {
                     total_size
                 );
             }
-        }
-
-        unsafe {
-            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
         }
     }
 
