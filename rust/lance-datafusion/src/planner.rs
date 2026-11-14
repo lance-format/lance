@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::numeric_coercion::unwrap_widening_casts;
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
@@ -472,7 +473,7 @@ impl Planner {
         leaves
     }
 
-    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+    pub(crate) fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
         if exprs.is_empty() {
             return Err(Error::invalid_input("Binary expression has no operands"));
         }
@@ -1326,6 +1327,11 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // After coercion, which is what casts a `Float32` column compared with a
+        // `Float64` literal, and before the float comparison rewrite, which would
+        // otherwise turn a comparison on the cast into ranges on the cast.
+        let expr = unwrap_widening_casts(expr, &df_schema)?;
 
         // Fold each comparison's own operands and rewrite it before anything above
         // it folds. `simplify` folds an operand and everything above it in one
