@@ -32,7 +32,7 @@ runs:
         rm -f python/target/wheels/pylance-*.whl || true
     - name: Build x86_64 Manylinux2014 wheel
       if: ${{ inputs.arm-build == 'false' && inputs.manylinux == '2_17' }}
-      uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+      uses: wombatu-kun/maturin-action@02537cfe78a26716296c7c04d2f32466b355b8cc # v1.50.1 + pull retry (PyO3/maturin-action#489)
       with:
         command: build
         working-directory: python
@@ -46,7 +46,7 @@ runs:
           bash "${GITHUB_WORKSPACE}/.github/workflows/build_linux_wheel/install-protoc.sh"
     - name: Build x86_64 Manylinux {manylinux} wheel
       if: ${{ inputs.arm-build == 'false' && inputs.manylinux != '2_17' }}
-      uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+      uses: wombatu-kun/maturin-action@02537cfe78a26716296c7c04d2f32466b355b8cc # v1.50.1 + pull retry (PyO3/maturin-action#489)
       with:
         command: build
         working-directory: python
@@ -63,7 +63,7 @@ runs:
           bash "${GITHUB_WORKSPACE}/.github/workflows/build_linux_wheel/install-protoc.sh"
     - name: Build Arm Manylinux Wheel
       if: ${{ inputs.arm-build == 'true' }}
-      uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+      uses: wombatu-kun/maturin-action@02537cfe78a26716296c7c04d2f32466b355b8cc # v1.50.1 + pull retry (PyO3/maturin-action#489)
       with:
         command: build
         working-directory: python

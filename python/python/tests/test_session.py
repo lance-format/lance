@@ -222,3 +222,38 @@ def test_cache_backend_rejects_moka_without_capacity():
 def test_cache_backend_rejects_moka_empty_capacity():
     with pytest.raises(ValueError, match="capacity must not be empty"):
         lance.Session(index_cache_backend="moka://?capacity=")
+
+
+def test_set_cache_capacity_evicts_resident_entries(tmp_path: Path):
+    data = pa.table({"a": range(1000)})
+    lance.write_dataset(data, tmp_path, max_rows_per_file=250)
+    session = lance.Session(
+        index_cache_size_bytes=1 << 20, metadata_cache_size_bytes=1 << 20
+    )
+    ds = lance.dataset(tmp_path, session=session)
+    ds.scanner().to_table()
+
+    # An empty session reports only its own size, so counts above that are
+    # resident cache entries.
+    empty_bytes = lance.Session().size_bytes()
+    assert session.size_bytes() > empty_bytes
+
+    # Shrinking to zero evicts everything from both caches.
+    session.set_index_cache_capacity(0)
+    session.set_metadata_cache_capacity(0)
+    assert session.index_cache_size_bytes() == 0
+    assert session.size_bytes() == empty_bytes
+
+    # Growing the budget again lets new entries be cached once more.
+    session.set_index_cache_capacity(1 << 20)
+    session.set_metadata_cache_capacity(1 << 20)
+    ds.scanner().to_table()
+    assert session.size_bytes() > empty_bytes
+
+
+def test_set_cache_capacity_rejects_unsupported_backend():
+    session = lance.Session(index_cache_backend="moka://?capacity=1048576")
+    with pytest.raises(ValueError, match="does not support resizing"):
+        session.set_index_cache_capacity(1024)
+    # The default metadata backend still supports resizing.
+    session.set_metadata_cache_capacity(1024)
