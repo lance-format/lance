@@ -20,7 +20,13 @@ import java.io.Serializable;
  *
  * <p>Each zone covers a contiguous range of row offsets within a single fragment. The min/max
  * values are represented as {@link Comparable} objects (Long, Double, String, etc.) matching the
- * column's data type.
+ * column's data type. Columns whose type has no such representation yield no {@code ZoneStats} at
+ * all, so a null min or max always means the zone has no comparable value: every value is null or,
+ * for a floating-point column, every non-null value is NaN.
+ *
+ * <p>String min/max values follow Arrow's UTF-8 byte ordering, which is not the same as {@link
+ * String#compareTo(String)}: that method compares UTF-16 code units and orders some supplementary
+ * characters differently.
  *
  * <p>A zone never spans fragment boundaries: if a fragment has more rows than the zone size,
  * multiple zones are created within that fragment.
