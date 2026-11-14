@@ -22,9 +22,11 @@ fn check_owned_output(scheme: CompressionScheme, len: usize, displacement: usize
     let mut input_work = budget.try_reserve(physical).unwrap();
     let mut input = input_work.try_allocate(physical).unwrap().unwrap();
     input.as_mut()[displacement..displacement + encoded.len()].copy_from_slice(&encoded);
-    let input = input.freeze();
-    let sibling = input.slice(physical - 1..);
-    let input = input.slice(displacement..displacement + encoded.len());
+    let backing = input.freeze();
+    let sibling = backing.slice(physical - 1..);
+    let input = backing.slice(displacement..displacement + encoded.len());
+    // Retain only the two slices; shadowing the root would keep its owner alive.
+    drop(backing);
     drop(input_work);
     if len > 0 {
         let mut short = budget.try_reserve(len - 1).unwrap();
