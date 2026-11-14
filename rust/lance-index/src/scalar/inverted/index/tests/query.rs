@@ -2227,11 +2227,17 @@ async fn test_exact_single_term_phrase_still_requires_positional_index() {
 }
 
 #[rstest::rstest]
-#[case::all(false, vec![0_u64, 4])]
-#[case::filtered(true, vec![4_u64])]
+#[case::all(false, false, true, vec![0_u64, 4])]
+#[case::filtered(true, false, true, vec![4_u64])]
+#[case::payload_evicted(false, true, true, vec![0_u64, 4])]
+#[case::filtered_payload_evicted(true, true, true, vec![4_u64])]
+#[case::metadata_disabled(false, true, false, vec![0_u64, 4])]
+#[case::filtered_metadata_disabled(true, true, false, vec![4_u64])]
 #[tokio::test]
 async fn selective_phrase_search_reads_committed_partitions(
     #[case] filtered: bool,
+    #[case] evict_payload: bool,
+    #[case] cache_metadata: bool,
     #[case] expected_rows: Vec<u64>,
 ) -> Result<()> {
     let dir = TempObjDir::default();
@@ -2290,13 +2296,18 @@ async fn selective_phrase_search_reads_committed_partitions(
     }
     // Fixture construction above rewrites files. Start metadata caching only
     // once their immutable contents have been finalized.
+    let metadata_cache = Arc::new(if cache_metadata {
+        LanceCache::with_capacity(1024 * 1024)
+    } else {
+        LanceCache::no_cache()
+    });
     let store = Arc::new(LanceIndexStore::with_format_version(
         object_store.clone(),
         dir.clone(),
-        Arc::new(LanceCache::with_capacity(1024 * 1024)),
+        metadata_cache.clone(),
         lance_file::version::ConcreteFileVersion::V2_2,
     ));
-    let (index, _cache) = load_prewarmed_index(
+    let (index, payload_cache) = load_prewarmed_index(
         store,
         vec![0, 1, 2],
         InvertedIndexParams::default().with_position(true),
@@ -2332,6 +2343,17 @@ async fn selective_phrase_search_reads_committed_partitions(
         .try_selective_phrase_search(request.clone())
         .await?
         .expect("current-format fixture must select the new reader");
+    let offset_activity_before = metadata_cache
+        .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+        .await
+        .by_type
+        .unwrap()
+        .activity
+        .into_iter()
+        .find(|entry| entry.type_name == "PositionOffsets");
+    if evict_payload {
+        payload_cache.clear().await;
+    }
     let before = object_store.io_stats_snapshot();
     let repeated = index
         .try_selective_phrase_search(request.clone())
@@ -2362,11 +2384,35 @@ async fn selective_phrase_search_reads_committed_partitions(
     first_hits.sort_unstable();
     repeated_hits.sort_unstable();
     assert_eq!(first_hits, repeated_hits);
-    assert_eq!(
-        before.read_iops, after.read_iops,
-        "warm selective search must reuse locations, offsets and payloads"
-    );
-    assert_eq!(before.read_bytes, after.read_bytes);
+    if evict_payload && cache_metadata {
+        let before = offset_activity_before
+            .expect("small immutable position offsets must use the file metadata budget")
+            .activity;
+        let after = metadata_cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+            .await
+            .by_type
+            .unwrap()
+            .activity
+            .into_iter()
+            .find(|entry| entry.type_name == "PositionOffsets")
+            .unwrap()
+            .activity;
+        assert!(before.loads_succeeded > 0);
+        assert_eq!(
+            before.loads_started, after.loads_started,
+            "evicting index payloads must not reload surviving position offsets"
+        );
+        assert!(after.hits > before.hits);
+    } else if cache_metadata {
+        assert_eq!(
+            before.read_iops, after.read_iops,
+            "warm selective search must reuse locations, offsets and payloads"
+        );
+        assert_eq!(before.read_bytes, after.read_bytes);
+    } else {
+        assert_eq!(metadata_cache.size_bytes().await, 0);
+    }
     let mut rows = Vec::new();
     for Reverse(hit) in selected {
         let documents = index.partitions[hit.document.partition_ordinal()]

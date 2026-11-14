@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -306,6 +306,10 @@ impl CurrentIndexReader {
 
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
+    fn metadata_cache(&self) -> Option<WeakLanceCache> {
+        Some(self.0.metadata_cache())
+    }
+
     async fn try_prepare_binary_value(
         &self,
         column: &str,

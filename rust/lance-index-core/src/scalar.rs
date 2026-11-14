@@ -13,6 +13,7 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::Expr;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::cache::WeakLanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -196,6 +197,26 @@ pub trait IndexBinaryReader: std::fmt::Debug + Send + Sync {
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
+    /// Return this immutable file's optional, bounded metadata cache namespace.
+    ///
+    /// Auxiliary metadata can use this tier independently of index payload
+    /// eviction. The weak handle must not retain a request's I/O scope. Readers
+    /// without a separate metadata tier return `None`; callers keep their normal
+    /// fallback. A disabled cache is still a supported tier, without retention.
+    ///
+    /// ```
+    /// # use lance_index_core::scalar::IndexReader;
+    /// # fn example(reader: &dyn IndexReader) {
+    /// if let Some(file_metadata) = reader.metadata_cache() {
+    ///     // Reuse the existing file namespace for immutable metadata loaders.
+    ///     # drop(file_metadata);
+    /// }
+    /// # }
+    /// ```
+    fn metadata_cache(&self) -> Option<WeakLanceCache> {
+        None
+    }
+
     /// Optionally prepare byte reads for one binary value without reading its payload.
     ///
     /// `row` is relative to the named column. `None` requests ordinary decoding;

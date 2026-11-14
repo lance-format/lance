@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use lance_core::{
     Error, Result,
-    cache::{CacheKey, CacheKeySchema, KeyBuilder},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache},
     deepsize::{Context, DeepSizeOf},
 };
 use lance_encoding::encodings::{
@@ -53,6 +53,25 @@ impl CacheKey for BinaryLocationKey {
 }
 
 impl FileReader {
+    /// Return a weak handle to this file's existing metadata cache namespace.
+    ///
+    /// Immutable auxiliary metadata can share the file's bounded metadata budget
+    /// without competing with index payloads. This handle retains neither the
+    /// cache backend nor this reader's request-specific I/O scope. Disabled
+    /// metadata caches remain disabled. Do not cache I/O handles or recorders.
+    ///
+    /// ```
+    /// # use lance_file::reader::FileReader;
+    /// # fn example(reader: &FileReader) {
+    /// let file_metadata = reader.metadata_cache();
+    /// // Pass this weak, file-scoped handle to immutable metadata loaders.
+    /// # drop(file_metadata);
+    /// # }
+    /// ```
+    pub fn metadata_cache(&self) -> WeakLanceCache {
+        WeakLanceCache::from(self.core.cache.as_ref())
+    }
+
     /// Prepare byte reads for one flat binary value without loading its payload.
     ///
     /// `column_index` is a physical column index and `row` is relative to that
