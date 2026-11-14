@@ -21,18 +21,14 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Earlier dictionary/Binary and pcodec evidence is retained at c13ea7e5b,
-      # 100c52c09 and 0bef7ca30. Exercise the new borrowed RLE child traversal,
-      # narrow packed widths and affected task composition at this exact head.
-      - name: Validate borrowed packed traversal and RLE admission
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib physical::rle::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib rle_values_compose_with_task_admission -- --nocapture
-      - name: Validate RLE without optional codecs
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::rle::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib rle_values_compose_with_task_admission -- --nocapture
+      # RLE child traversal passed at ed5ea6bc6. Exercise the new admitted buffer
+      # API and its shared-owner, overlap, refusal and corrupt-frame boundaries.
+      - name: Validate admitted general buffer output
+        run: cargo test --profile ci --locked -p lance-encoding --lib physical::block::admitted::tests -- --nocapture
+      - name: Validate buffer API without optional codecs
+        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::block::admitted::tests -- --nocapture
+      - name: Validate public buffer API example
+        run: cargo test --profile ci --locked -p lance-encoding --doc try_decompress_exact_in -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
