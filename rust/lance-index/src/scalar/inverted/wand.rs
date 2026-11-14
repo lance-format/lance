@@ -26,6 +26,10 @@ use crate::metrics::MetricsCollector;
 mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
+pub(super) mod selective_phrase;
+#[cfg(test)]
+#[path = "wand/selective_phrase_tests.rs"]
+mod selective_phrase_tests;
 
 use super::{
     CompressedPositionStorage,
@@ -483,6 +487,8 @@ pub struct PostingIterator {
     // keeps repeated cursor creation allocation-free without lending a slice
     // out of the interior-mutable compressed state.
     position_scratch: RefCell<Option<Vec<u32>>>,
+    // Query-local compact block supplied by the async selective phrase reader.
+    selected_position_block: Option<selective_phrase::PositionBlock>,
 
     // for compressed posting list
     compressed: Option<UnsafeCell<CompressedState>>,
@@ -1003,6 +1009,7 @@ impl PostingIterator {
             use_scorer_upper_bound: false,
             grouped_terms: None,
             position_scratch: RefCell::new(Some(Vec::new())),
+            selected_position_block: None,
             compressed,
         };
         posting.refresh_current_doc();
@@ -1051,6 +1058,7 @@ impl PostingIterator {
             use_scorer_upper_bound: self.use_scorer_upper_bound,
             grouped_terms: self.grouped_terms.clone(),
             position_scratch: RefCell::new(Some(Vec::new())),
+            selected_position_block: None,
             compressed,
         };
         posting.refresh_current_doc();
@@ -1243,6 +1251,20 @@ impl PostingIterator {
                     self.position as i32,
                 ))
             }
+            PostingList::Compressed(ref list) if self.selected_position_block.is_some() => {
+                let block = self
+                    .selected_position_block
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("selected position block disappeared"))?;
+                let block_idx = self.index >> list.block_shift();
+                if block.index != block_idx {
+                    return Err(Error::index(format!(
+                        "selected position block {} does not contain posting block {block_idx}",
+                        block.index
+                    )));
+                }
+                self.shared_position_cursor(list, block.codec, block.bytes.as_ref())
+            }
             PostingList::Compressed(ref list) => match list.positions.as_ref().ok_or_else(|| {
                 Error::index(format!(
                     "positions are missing for token {:?} (token id {}, query position {})",
@@ -1257,76 +1279,89 @@ impl PostingIterator {
                         self.position as i32,
                     ))
                 }
-                CompressedPositionStorage::SharedStream(stream) => {
-                    let block_idx = self.index >> list.block_shift();
-                    let block_offset = self.index & list.block_mask();
-                    let compressed =
-                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
-                    match stream.codec() {
-                        PositionStreamCodec::PackedDelta => {
-                            // Seekable layout: decode only the candidate doc's
-                            // positions. Per-block seek state resets when the
-                            // block cursor moves; the group header index and
-                            // varint tail fill in lazily as candidates touch
-                            // them.
-                            if compressed.position_block_idx != Some(block_idx) {
-                                compressed.position_group_offsets.clear();
-                                compressed.position_group_offsets.push(0);
-                                compressed.position_tail.clear();
-                                compressed.position_unpacked_group_idx = None;
-                                compressed.position_offsets.clear();
-                                compressed
-                                    .position_offsets
-                                    .reserve(compressed.freqs.len() + 1);
-                                compressed.position_offsets.push(0);
-                                let mut offset = 0usize;
-                                for &freq in &compressed.freqs {
-                                    offset += freq as usize;
-                                    compressed.position_offsets.push(offset);
-                                }
-                                compressed.position_total_deltas = offset;
-                                compressed.position_block_idx = Some(block_idx);
-                            }
-                            let delta_start = compressed.position_offsets[block_offset];
-                            let delta_end = compressed.position_offsets[block_offset + 1];
-                            let mut position_values = self
-                                .position_scratch
-                                .borrow_mut()
-                                .take()
-                                .unwrap_or_default();
-                            if let Err(error) = seek_packed_doc_positions(
-                                stream.block(block_idx),
-                                compressed.position_total_deltas,
-                                delta_start..delta_end,
-                                &mut compressed.position_group_offsets,
-                                compressed
-                                    .position_unpacked_group
-                                    .get_or_insert_with(|| Box::new([0; BLOCK_SIZE])),
-                                &mut compressed.position_unpacked_group_idx,
-                                &mut compressed.position_tail,
-                                &mut position_values,
-                            ) {
-                                *self.position_scratch.borrow_mut() = Some(position_values);
-                                return Err(Error::index(format!(
-                                    "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {}: {error}",
-                                    self.token, self.token_id, self.position, self.index
-                                )));
-                            }
-                            Ok(PositionCursor::new(
-                                PositionValues::Recycled(RecycledPositionValues::new(
-                                    position_values,
-                                    &self.position_scratch,
-                                )),
-                                self.position as i32,
-                            ))
-                        }
-                        PositionStreamCodec::VarintDocDelta => {
-                            if compressed.position_block_idx != Some(block_idx) {
-                                compressed.position_values.clear();
-                                decode_position_stream_block(
-                                    stream.block(block_idx),
+                CompressedPositionStorage::SharedStream(stream) => self.shared_position_cursor(
+                    list,
+                    stream.codec(),
+                    stream.block(self.index >> list.block_shift()),
+                ),
+            },
+        }
+    }
+
+    fn shared_position_cursor(
+        &self,
+        list: &CompressedPostingList,
+        codec: PositionStreamCodec,
+        block: &[u8],
+    ) -> Result<PositionCursor<'_>> {
+        let block_idx = self.index >> list.block_shift();
+        let block_offset = self.index & list.block_mask();
+        let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+        match codec {
+            PositionStreamCodec::PackedDelta => {
+                // Seekable layout: decode only the candidate doc's
+                // positions. Per-block seek state resets when the
+                // block cursor moves; the group header index and
+                // varint tail fill in lazily as candidates touch
+                // them.
+                if compressed.position_block_idx != Some(block_idx) {
+                    compressed.position_group_offsets.clear();
+                    compressed.position_group_offsets.push(0);
+                    compressed.position_tail.clear();
+                    compressed.position_unpacked_group_idx = None;
+                    compressed.position_offsets.clear();
+                    compressed
+                        .position_offsets
+                        .reserve(compressed.freqs.len() + 1);
+                    compressed.position_offsets.push(0);
+                    let mut offset = 0usize;
+                    for &freq in &compressed.freqs {
+                        offset += freq as usize;
+                        compressed.position_offsets.push(offset);
+                    }
+                    compressed.position_total_deltas = offset;
+                    compressed.position_block_idx = Some(block_idx);
+                }
+                let delta_start = compressed.position_offsets[block_offset];
+                let delta_end = compressed.position_offsets[block_offset + 1];
+                let mut position_values = self
+                    .position_scratch
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_default();
+                if let Err(error) = seek_packed_doc_positions(
+                    block,
+                    compressed.position_total_deltas,
+                    delta_start..delta_end,
+                    &mut compressed.position_group_offsets,
+                    compressed
+                        .position_unpacked_group
+                        .get_or_insert_with(|| Box::new([0; BLOCK_SIZE])),
+                    &mut compressed.position_unpacked_group_idx,
+                    &mut compressed.position_tail,
+                    &mut position_values,
+                ) {
+                    *self.position_scratch.borrow_mut() = Some(position_values);
+                    return Err(Error::index(format!(
+                        "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {}: {error}",
+                        self.token, self.token_id, self.position, self.index
+                    )));
+                }
+                Ok(PositionCursor::new(
+                    PositionValues::Recycled(RecycledPositionValues::new(
+                        position_values,
+                        &self.position_scratch,
+                    )),
+                    self.position as i32,
+                ))
+            }
+            PositionStreamCodec::VarintDocDelta => {
+                if compressed.position_block_idx != Some(block_idx) {
+                    compressed.position_values.clear();
+                    decode_position_stream_block(
+                                    block,
                                     compressed.freqs.as_slice(),
-                                    stream.codec(),
+                                    codec,
                                     &mut compressed.position_values,
                                 )
                                 .map_err(|error| {
@@ -1335,39 +1370,35 @@ impl PostingIterator {
                                         self.token, self.token_id, self.position
                                     ))
                                 })?;
-                                compressed.position_offsets.clear();
-                                compressed
-                                    .position_offsets
-                                    .reserve(compressed.freqs.len() + 1);
-                                compressed.position_offsets.push(0);
-                                let mut offset = 0usize;
-                                for &freq in &compressed.freqs {
-                                    offset += freq as usize;
-                                    compressed.position_offsets.push(offset);
-                                }
-                                compressed.position_block_idx = Some(block_idx);
-                            }
-                            let start = compressed.position_offsets[block_offset];
-                            let end = compressed.position_offsets[block_offset + 1];
-                            let mut position_values = self
-                                .position_scratch
-                                .borrow_mut()
-                                .take()
-                                .unwrap_or_default();
-                            position_values.clear();
-                            position_values
-                                .extend_from_slice(&compressed.position_values[start..end]);
-                            Ok(PositionCursor::new(
-                                PositionValues::Recycled(RecycledPositionValues::new(
-                                    position_values,
-                                    &self.position_scratch,
-                                )),
-                                self.position as i32,
-                            ))
-                        }
+                    compressed.position_offsets.clear();
+                    compressed
+                        .position_offsets
+                        .reserve(compressed.freqs.len() + 1);
+                    compressed.position_offsets.push(0);
+                    let mut offset = 0usize;
+                    for &freq in &compressed.freqs {
+                        offset += freq as usize;
+                        compressed.position_offsets.push(offset);
                     }
+                    compressed.position_block_idx = Some(block_idx);
                 }
-            },
+                let start = compressed.position_offsets[block_offset];
+                let end = compressed.position_offsets[block_offset + 1];
+                let mut position_values = self
+                    .position_scratch
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_default();
+                position_values.clear();
+                position_values.extend_from_slice(&compressed.position_values[start..end]);
+                Ok(PositionCursor::new(
+                    PositionValues::Recycled(RecycledPositionValues::new(
+                        position_values,
+                        &self.position_scratch,
+                    )),
+                    self.position as i32,
+                ))
+            }
         }
     }
 
@@ -6438,6 +6469,7 @@ mod tests {
     /// for every f32 partial score: scores at or below the limit are rejected,
     /// scores above it compete. Sweeps ULP neighbourhoods of the boundary plus
     /// coarse samples, over floors, remaining bounds and clause counts.
+
     #[test]
     fn exclusive_partial_score_limit_matches_predicate() {
         let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
@@ -6775,7 +6807,7 @@ mod tests {
         ));
     }
 
-    struct UnitScorer;
+    pub(super) struct UnitScorer;
 
     impl Scorer for UnitScorer {
         fn query_weight(&self, _token: &str) -> f32 {
@@ -8338,7 +8370,7 @@ mod tests {
     }
 
     #[cfg_attr(coverage, coverage(off))]
-    fn unit_length_docs(num_docs: usize) -> DocSet {
+    pub(super) fn unit_length_docs(num_docs: usize) -> DocSet {
         let mut docs = DocSet::default();
         for doc_id in 0..num_docs {
             docs.append(doc_id as u64, 1);
@@ -8484,7 +8516,7 @@ mod tests {
         )
     }
 
-    fn generate_posting_list_with_positions(
+    pub(super) fn generate_posting_list_with_positions(
         doc_ids: Vec<u32>,
         positions_by_doc: Vec<Vec<u32>>,
         max_score: f32,

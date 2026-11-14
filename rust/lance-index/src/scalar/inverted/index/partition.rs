@@ -481,18 +481,34 @@ struct PositionMatchSummary {
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
     read_policy: PostingReadPolicy,
+    positions: PositionReadPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PositionReadPolicy {
+    Required,
+    Deferred,
 }
 
 impl PostingLoadOptions {
     pub(super) const fn read_ahead() -> Self {
         Self {
             read_policy: PostingReadPolicy::ReadAhead,
+            positions: PositionReadPolicy::Required,
         }
     }
 
     pub(in super::super) const fn cache_aware_exact() -> Self {
         Self {
             read_policy: PostingReadPolicy::CacheAwareExact,
+            positions: PositionReadPolicy::Required,
+        }
+    }
+
+    pub(super) const fn deferred_positions() -> Self {
+        Self {
+            read_policy: PostingReadPolicy::CacheAwareExact,
+            positions: PositionReadPolicy::Deferred,
         }
     }
 }
@@ -1405,8 +1421,10 @@ impl InvertedPartition {
     ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
             read_policy: requested_read_policy,
+            positions,
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
+        let read_positions = is_phrase_query && matches!(positions, PositionReadPolicy::Required);
         let is_and_query = operator == Operator::And;
         // The caller passes final tokens after any fuzzy expansion. Query groups
         // identify alternatives that must share one posting iterator,
@@ -1460,14 +1478,14 @@ impl InvertedPartition {
                     let posting = match read_policy {
                         PostingReadPolicy::ReadAhead => {
                             self.inverted_list
-                                .posting_list(token_id, is_phrase_query, metrics)
+                                .posting_list(token_id, read_positions, metrics)
                                 .await?
                         }
                         PostingReadPolicy::CacheAwareExact => {
                             self.inverted_list
                                 .posting_list_with_policy(
                                     token_id,
-                                    is_phrase_query,
+                                    read_positions,
                                     metrics,
                                     read_policy,
                                 )

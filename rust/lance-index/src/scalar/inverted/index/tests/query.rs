@@ -2225,3 +2225,130 @@ async fn test_exact_single_term_phrase_still_requires_positional_index() {
         "{error}"
     );
 }
+
+#[rstest::rstest]
+#[case::all(false, vec![0_u64, 4])]
+#[case::filtered(true, vec![4_u64])]
+#[tokio::test]
+async fn selective_phrase_search_reads_committed_partitions(
+    #[case] filtered: bool,
+    #[case] expected_rows: Vec<u64>,
+) -> Result<()> {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        ObjectStore::local().into(),
+        dir,
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    write_pair_partition_with_position(
+        &store,
+        0,
+        &[("alpha", "beta", 0), ("beta", "alpha", 1)],
+        true,
+    )
+    .await;
+    write_pair_partition_with_position(&store, 1, &[("alpha", "gamma", 2)], true).await;
+    write_pair_partition_with_position(
+        &store,
+        2,
+        &[("alpha", "beta", 4), ("beta", "alpha", 5)],
+        true,
+    )
+    .await;
+    // Construct the same current mini-block positions encoding as final
+    // pipeline outputs. Ordinary FullZip and frozen file 2.0 use fallback.
+    for partition_id in 0..3 {
+        let path = posting_file_path(partition_id);
+        let reader = store.open_index_file(&path).await?;
+        let metadata = reader.schema().metadata.clone();
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let schema = batch.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == COMPRESSED_POSITION_COL {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert(
+                        lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.into(),
+                        lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                    );
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        drop(reader);
+        let mut writer = store.new_index_file(&path, schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish_with_metadata(metadata).await?;
+    }
+    let (index, _cache) = load_prewarmed_index(
+        store,
+        vec![0, 1, 2],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".into(), "beta".into()],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(10))
+            .with_phrase_slop(Some(0)),
+    );
+    let scorer = Arc::new(index.bm25_base_scorer(&tokens, &params, None).await?);
+    let mask = if filtered {
+        RowAddrMask::from_allowed([4_u64, 5].into_iter().collect())
+    } else {
+        RowAddrMask::default()
+    };
+    let request = ModernSearchRequest {
+        tokens,
+        params,
+        operator: Operator::And,
+        mask: Arc::new(mask),
+        metrics: Arc::new(NoOpMetricsCollector),
+        impact_scorer: scorer,
+        limit: 10,
+        initial_score_floor: None,
+        term_ids: None,
+    };
+    let selected = index
+        .try_selective_phrase_search(&request)
+        .await?
+        .expect("current-format fixture must select the new reader");
+    let mut rows = Vec::new();
+    for Reverse(hit) in selected {
+        let documents = index.partitions[hit.document.partition_ordinal()]
+            .docs
+            .modern()
+            .unwrap();
+        rows.push(
+            documents
+                .resolve_document_keys(&[hit.document.doc_id])
+                .await?[0]
+                .0,
+        );
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, expected_rows);
+    let mut unsupported = request;
+    unsupported.params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(10))
+            .with_phrase_slop(Some(1)),
+    );
+    assert!(
+        index
+            .try_selective_phrase_search(&unsupported)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}

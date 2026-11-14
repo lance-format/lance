@@ -1042,6 +1042,11 @@ impl InvertedIndex {
         &self,
         request: ModernSearchRequest<'_>,
     ) -> Result<Vec<Reverse<ScoredPartitionDoc>>> {
+        if selective_positions::enabled()
+            && let Some(results) = self.try_selective_phrase_search(&request).await?
+        {
+            return Ok(results);
+        }
         let ModernSearchRequest {
             tokens,
             params,
