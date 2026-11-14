@@ -227,8 +227,8 @@ async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<Pendin
 
 /// Cache key for sharing one [`BlobSource`] across multiple blob descriptors.
 ///
-/// Store allocation identity keeps wrappers and credentials isolated even when
-/// two stores have the same prefix and physical path.
+/// Store instance identity keeps credentials, endpoints, and wrappers isolated
+/// even when two stores use the same prefix and path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BlobSourceKey {
     pub(super) store_id: usize,
@@ -395,6 +395,20 @@ impl BlobFile {
             BlobKind::External,
             Some(uri),
         )
+    }
+
+    /// Another handle on the same blob that shares this handle's cursor and
+    /// open state, so a planned read can hold a caller's handle without taking
+    /// ownership and still observe it being closed.
+    pub(super) fn share(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            state: self.state.clone(),
+            position: self.position,
+            size: self.size,
+            kind: self.kind,
+            uri: self.uri.clone(),
+        }
     }
 
     /// Close the blob file, releasing any associated resources
@@ -865,7 +879,6 @@ mod tests {
         let error = execute_blob_entries(
             vec![BlobEntry {
                 selection_index: 0,
-                row_address: 0,
                 file: blob,
                 requested_range: Some(BlobReadRange::new(0, 4)),
             }],

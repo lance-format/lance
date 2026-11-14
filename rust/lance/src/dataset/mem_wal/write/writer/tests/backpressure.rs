@@ -147,7 +147,16 @@ async fn test_memory_snapshot_never_drifts_from_writer_state(#[case] grace: Dura
             after_drain.frozen_count > 0,
             "long grace must retain flushed handles in the read view"
         );
+        assert!(writer.memory().retained_bytes() > writer.memory().unflushed_bytes());
     }
+    // The memory gauges read what the writer retains, grace included.
+    let WriterMode::MemTable { writer_state, .. } = &writer.mode else {
+        panic!("the writer has memtables");
+    };
+    assert_eq!(
+        memtable_retained_bytes(&writer_state.memory),
+        writer.memory().retained_bytes() as u64
+    );
 
     for i in 24..32 {
         writer

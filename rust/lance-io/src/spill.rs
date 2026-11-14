@@ -37,7 +37,7 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::ops::Range;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, FileExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, PermissionsExt};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -207,34 +207,77 @@ impl Writer for SpillWriter {
 /// By default there is no disk cap. Use [`LocalSpillStore::with_cap`] to
 /// configure one shared across every handle this store produces.
 ///
+/// By default the scratch directory is in the OS temp directory. Use
+/// [`LocalSpillStore::with_parent_dir`] to choose another one.
+///
 /// The scratch directory is created on the first [`SpillStore::new_spill`]
 /// call, not at construction, so opening a dataset does not require a writable
-/// temp directory. It is deleted when the store is dropped, cleaning up any
-/// files whose handles have already been dropped.
+/// temp directory. Cleanup of the scratch directory and any remaining files is
+/// attempted after the store and all backing owners are dropped.
 pub struct LocalSpillStore {
-    /// Created on first spill. Backstop cleanup removes the directory on drop.
+    /// Created on first spill. Backstop cleanup is attempted on the last drop.
     temp_dir: Mutex<Option<Arc<SpillDirectory>>>,
     file_counter: Arc<AtomicU64>,
     /// Byte budget shared across every handle, enforced while writing.
     quota: Option<DiskQuota>,
+    /// Directory the scratch directory is created in; `None` is the OS temp
+    /// directory.
+    parent_dir: Option<PathBuf>,
 }
 
-/// Create a unique scratch directory, retrying `PermissionDenied`.
-///
-/// Windows GitHub runners (and machines with antivirus) can reject a newly
-/// created `%TEMP%` subdirectory with `ERROR_ACCESS_DENIED`. Each attempt uses
-/// a fresh random name, so a short retry loop is the usual workaround.
-fn create_temp_dir() -> Result<tempfile::TempDir> {
+/// Create `path` without creating its parents. On Unix, request mode `0o700`,
+/// subject to the process umask. Existing directory permissions are unchanged.
+fn create_private_dir(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let created = std::fs::DirBuilder::new().mode(0o700).create(path);
+    #[cfg(not(unix))]
+    let created = std::fs::create_dir(path);
+    match created {
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        created => created,
+    }
+}
+
+/// Create a unique scratch directory in `parent_dir` (or the OS temp directory).
+/// Retry scratch-directory creation with a fresh name on `PermissionDenied`.
+fn create_temp_dir(parent_dir: Option<&std::path::Path>) -> Result<tempfile::TempDir> {
     const ATTEMPTS: u32 = 5;
+    let with_context = |err: io::Error| {
+        let Some(parent_dir) = parent_dir else {
+            return err;
+        };
+        io::Error::new(
+            err.kind(),
+            format!(
+                "failed to create spill directory in {}: {err}",
+                parent_dir.display()
+            ),
+        )
+    };
+    // object_store rejects `..` segments in spill file paths.
+    let resolved_parent_dir = parent_dir
+        .map(|dir| create_private_dir(dir).and_then(|()| std::fs::canonicalize(dir)))
+        .transpose()
+        .map_err(with_context)?;
+    #[cfg(unix)]
+    let builder = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .clone();
+    #[cfg(not(unix))]
+    let builder = tempfile::Builder::new();
     let mut attempt = 0;
     loop {
-        match tempfile::tempdir() {
+        let created = match &resolved_parent_dir {
+            Some(dir) => builder.tempdir_in(dir),
+            None => builder.tempdir(),
+        };
+        match created {
             Ok(dir) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied && attempt + 1 < ATTEMPTS => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(10 * attempt as u64));
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(with_context(err).into()),
         }
     }
 }
@@ -257,15 +300,41 @@ impl LocalSpillStore {
         })
     }
 
+    /// Choose `parent_dir` instead of the OS temp directory for scratch storage.
+    ///
+    /// Call this before the first [`SpillStore::new_spill`]; an existing scratch
+    /// directory is not moved. Spilling creates `parent_dir` if it is missing,
+    /// but requires its immediate parent to exist. For a volume, use
+    /// `mount_point.join("lance")` so spilling fails when the mount-point
+    /// directory is absent. This does not check whether a volume is mounted.
+    /// On Unix, newly created directories request mode `0o700`, subject to the
+    /// process umask; existing parent permissions are unchanged. Scratch
+    /// directory cleanup is attempted after the store and all backing owners
+    /// are dropped, and leaves `parent_dir` in place.
+    ///
+    /// ```
+    /// # use lance_io::spill::LocalSpillStore;
+    /// # fn build(spill_volume: &std::path::Path) -> lance_core::Result<LocalSpillStore> {
+    /// let store = LocalSpillStore::with_cap(1 << 30)?.with_parent_dir(spill_volume.join("lance"));
+    /// # Ok(store)
+    /// # }
+    /// ```
+    pub fn with_parent_dir(self, parent_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            parent_dir: Some(parent_dir.into()),
+            ..self
+        }
+    }
+
     fn ensure_temp_dir(&self) -> Result<Arc<SpillDirectory>> {
-        // The lock is held only for init (and the rare PermissionDenied retry)
-        // and never across an `.await`.
+        // Serialize initialization and pending cleanup without holding the lock
+        // across an `.await`.
         let mut slot = self.temp_dir.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(dir) = slot.as_ref() {
             dir.retry_cleanup();
             return Ok(dir.clone());
         }
-        let directory = create_temp_dir()?;
+        let directory = create_temp_dir(self.parent_dir.as_deref())?;
         let dir = Arc::new(SpillDirectory {
             path: directory.path().to_owned(),
             directory: Some(directory),
@@ -282,6 +351,7 @@ impl Default for LocalSpillStore {
             temp_dir: Mutex::new(None),
             file_counter: Arc::new(AtomicU64::new(0)),
             quota: None,
+            parent_dir: None,
         }
     }
 }
@@ -307,15 +377,14 @@ impl SpillStore for LocalSpillStore {
         });
         let write_backing = backing.clone();
         let inner = tokio::task::spawn_blocking(move || {
-            // Recover if external temporary-directory cleanup removed the cached directory.
+            // Recreate the scratch directory and its immediate parent after
+            // external cleanup, requiring higher ancestors to still exist.
             let directory_path = write_backing.directory.path();
-            #[cfg(unix)]
-            let create_directory = std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(directory_path);
-            #[cfg(not(unix))]
-            let create_directory = std::fs::create_dir_all(directory_path);
+            let create_directory = directory_path
+                .parent()
+                .into_iter()
+                .chain([directory_path])
+                .try_for_each(create_private_dir);
             create_directory.map_err(|err| {
                 io::Error::new(
                     err.kind(),
@@ -650,8 +719,6 @@ mod tests {
     use super::*;
     use crate::object_store::ObjectStore;
     use rstest::rstest;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
 
     /// Write `data` to a fresh writer and shut it down.
@@ -802,20 +869,36 @@ mod tests {
     }
 
     #[rstest]
-    #[case::uncapped(false)]
-    #[case::capped(true)]
+    #[case::uncapped(false, false)]
+    #[case::capped(true, false)]
+    #[case::parent_removed(false, true)]
     #[tokio::test]
-    async fn test_new_spill_recreates_missing_directory(#[case] is_capped: bool) {
+    async fn test_new_spill_recreates_missing_directory(
+        #[case] is_capped: bool,
+        #[case] is_parent_removed: bool,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let parent_dir = root.path().join("lance");
         let store = if is_capped {
             LocalSpillStore::with_cap(100).unwrap()
         } else {
             LocalSpillStore::new().unwrap()
         };
+        let store = if is_parent_removed {
+            store.with_parent_dir(&parent_dir)
+        } else {
+            store
+        };
         let (writer, spill) = store.new_spill().await.unwrap();
         finish_writer(writer, b"initial").await.unwrap();
         drop(spill);
         let directory = store.ensure_temp_dir().unwrap().path().to_owned();
-        std::fs::remove_dir(&directory).unwrap();
+        let removed = if is_parent_removed {
+            &parent_dir
+        } else {
+            &directory
+        };
+        std::fs::remove_dir_all(removed).unwrap();
         assert!(!directory.exists());
 
         let (writer, spill) = store.new_spill().await.unwrap();
@@ -826,6 +909,13 @@ mod tests {
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        #[cfg(unix)]
+        if is_parent_removed {
+            assert_eq!(
+                std::fs::metadata(&parent_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         finish_writer(writer, b"recovered").await.unwrap();
         let reader = spill.reader().await.unwrap();
         assert_eq!(reader.get_all().await.unwrap().as_ref(), b"recovered");
@@ -900,6 +990,89 @@ mod tests {
             matches!(err, Error::DiskCapExceeded { cap_bytes: 100, .. }),
             "expected DiskCapExceeded, got {err:?}"
         );
+    }
+
+    #[rstest]
+    #[case::created(false)]
+    #[case::existing(true)]
+    #[tokio::test]
+    async fn test_parent_dir_lifecycle(#[case] is_existing: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        // object_store rejects `..`, so the store must resolve it.
+        let parent_dir = volume.join("..").join("lance");
+        if is_existing {
+            std::fs::create_dir(&parent_dir).unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&parent_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let store = LocalSpillStore::new().unwrap().with_parent_dir(&parent_dir);
+        assert_eq!(
+            parent_dir.exists(),
+            is_existing,
+            "the parent directory is created lazily"
+        );
+
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, &[7u8; 60]).await.unwrap();
+        let directory = store.ensure_temp_dir().unwrap().path().to_owned();
+        let parent_dir = std::fs::canonicalize(&parent_dir).unwrap();
+        assert_eq!(directory.parent(), Some(parent_dir.as_path()));
+        #[cfg(unix)]
+        {
+            let mode = |dir: &std::path::Path| {
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&directory), 0o700);
+            assert_eq!(mode(&parent_dir), if is_existing { 0o750 } else { 0o700 });
+        }
+
+        let reader = spill.reader().await.unwrap();
+        drop((spill, store));
+        assert!(directory.is_dir(), "the reader keeps the directory alive");
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), &[7u8; 60]);
+
+        drop(reader);
+        assert!(
+            !directory.exists(),
+            "the last owner removes the scratch directory"
+        );
+        assert!(parent_dir.is_dir(), "cleanup keeps the parent directory");
+    }
+
+    #[rstest]
+    #[case::first_spill(false)]
+    #[case::after_cleanup(true)]
+    #[tokio::test]
+    async fn test_missing_parent_ancestor_error_includes_path(#[case] has_spilled: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("volume");
+        let parent_dir = volume.join("lance");
+        let store = LocalSpillStore::new().unwrap().with_parent_dir(&parent_dir);
+        let failed_path = if has_spilled {
+            std::fs::create_dir(&volume).unwrap();
+            let (writer, spill) = store.new_spill().await.unwrap();
+            finish_writer(writer, b"initial").await.unwrap();
+            drop(spill);
+            let directory = store.ensure_temp_dir().unwrap().path().to_owned();
+            std::fs::remove_dir_all(&volume).unwrap();
+            directory
+        } else {
+            parent_dir
+        };
+
+        let Err(err) = store.new_spill().await else {
+            panic!("spill allocation should fail when a parent ancestor is missing");
+        };
+        assert!(matches!(err, Error::IO { .. }), "expected IO, got {err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to create spill directory"),
+            "{message}"
+        );
+        assert!(message.contains(failed_path.to_str().unwrap()), "{message}");
+        assert!(!volume.exists(), "missing ancestors are not created");
     }
 
     #[tokio::test]

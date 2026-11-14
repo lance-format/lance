@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use crate::{TextAnalyzer, TextAnalyzerBuilder, Token, TokenStream, Tokenizer};
 
+/// Shares one dictionary between clones: the index hands every query its own tokenizer
+/// clone, and copying the whole dictionary (about 350k words) cost each query and each
+/// opened segment hundreds of milliseconds.
 #[derive(Clone)]
 pub struct JiebaTokenizer {
-    jieba: jieba_rs::Jieba,
+    jieba: Arc<jieba_rs::Jieba>,
 }
 
 impl JiebaTokenizer {
     pub fn new(jieba: jieba_rs::Jieba) -> Self {
-        Self { jieba }
+        Self {
+            jieba: Arc::new(jieba),
+        }
     }
 
     pub fn analyzer(self) -> TextAnalyzer {
@@ -66,5 +73,28 @@ impl Tokenizer for JiebaTokenizer {
             })
             .collect();
         JiebaTokenStream { tokens, index: 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clones_share_the_dictionary() {
+        let mut jieba = jieba_rs::Jieba::empty();
+        jieba.add_word("蓝天", Some(10), None);
+        jieba.add_word("白云", Some(10), None);
+        let tokenizer = JiebaTokenizer::new(jieba);
+        let clone = tokenizer.clone();
+        assert!(Arc::ptr_eq(&tokenizer.jieba, &clone.jieba));
+
+        let mut clone = clone;
+        let mut stream = clone.token_stream("蓝天白云");
+        let mut texts = Vec::new();
+        while stream.advance() {
+            texts.push(stream.token().text.clone());
+        }
+        assert_eq!(texts, ["蓝天", "白云"]);
     }
 }
