@@ -125,7 +125,7 @@ impl Fixture {
             .await
             .unwrap();
         file_sizes.insert(file.path, file.size_bytes);
-        let index = InvertedIndex::load(store.clone(), None, &index_cache)
+        let index = InvertedIndex::load(store.clone(), None, &index_cache, true)
             .await
             .unwrap();
         index.prewarm().await.unwrap();

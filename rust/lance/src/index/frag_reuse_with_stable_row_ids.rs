@@ -316,7 +316,7 @@ mod tests {
     use lance_datagen::{Dimension, array, gen_batch};
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_index::{IndexType, pb, pbold};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::{FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS};
@@ -404,6 +404,7 @@ mod tests {
     #[case::rtree(details(&pb::RTreeIndexDetails::default()), 0, false)]
     #[case::rtree_address_domain(details(&pb::RTreeIndexDetails::default()), 1, true)]
     #[case::inverted(details(&pbold::InvertedIndexDetails::default()), 0, false)]
+    #[case::inverted_address_domain(details(&pbold::InvertedIndexDetails::default()), 4, true)]
     #[case::vector(details(&pb::VectorIndexDetails::default()), 0, false)]
     #[case::fm(details(&pb::FmIndexDetails::default()), 0, false)]
     #[case::min_hash(details(&pb::MinHashLshIndexDetails::default()), 0, false)]
@@ -780,7 +781,12 @@ mod tests {
     #[tokio::test]
     async fn test_publication_rejects_an_incompatible_index(#[case] publication: Publication) {
         let mut dataset = stable_row_id_dataset("memory://").await;
-        dataset
+        // A fresh Inverted index always trains in row-address domain, so a
+        // row-id-domain one (the incompatible case this test exercises) is
+        // simulated by relabeling a freshly built segment's `index_version`
+        // down -- the same trick `results_are_row_addrs` itself relies on to
+        // tell the two apart.
+        let segment = dataset
             .create_index_builder(
                 &["category"],
                 IndexType::Inverted,
@@ -788,6 +794,15 @@ mod tests {
             )
             .name("category_idx".to_string())
             .train(false)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("category_idx", "category", vec![legacy_segment])
             .await
             .unwrap();
         let version = dataset.version().version;
@@ -853,6 +868,14 @@ mod tests {
     // NGram also stores row addresses now; it needs a text column, hence the
     // different column here.
     #[case::typed_ngram("category", IndexType::NGram, ScalarIndexParams::default(), None)]
+    // Inverted also always stores row addresses now, so it is no longer
+    // rejected here either -- see the generic_default_btree case above.
+    #[case::typed_inverted(
+        "category",
+        IndexType::Inverted,
+        ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
+        None
+    )]
     // MinHash LSH stores row addresses but does not apply the fragment reuse
     // index when it is loaded.
     #[case::typed_minhash_lsh(
@@ -891,32 +914,17 @@ mod tests {
         }
     }
 
-    fn generic_full_text_params() -> ScalarIndexParams {
-        ScalarIndexParams {
-            index_type: "inverted".to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// Only the refusal before training names the index kind.
+    /// Only the refusal before training names the index kind. Vector is the
+    /// only kind still refused this way: every scalar index type, Inverted
+    /// included, now trains in row-address domain (see
+    /// `INVERTED_ROW_ADDR_DOMAIN_VERSION`), so none of them can be known to
+    /// be incompatible before training runs.
     #[rstest]
     #[case::vector(
         "vec",
         IndexType::IvfFlat,
         Box::new(VectorIndexParams::ivf_flat(1, MetricType::L2)),
         "Cannot create a vector index on column `vec`"
-    )]
-    #[case::full_text(
-        "category",
-        IndexType::Inverted,
-        Box::new(InvertedIndexParams::default()),
-        "Cannot create a full-text index on column `category`"
-    )]
-    #[case::generic_full_text(
-        "category",
-        IndexType::Scalar,
-        Box::new(generic_full_text_params()),
-        "Cannot create a full-text index on column `category`"
     )]
     #[tokio::test]
     async fn test_row_id_index_kinds_are_refused_before_training(
@@ -964,7 +972,12 @@ mod tests {
         let dir = TempStrDir::default();
         let uri = format!("{}/source", dir.as_str());
         let mut dataset = stable_row_id_dataset(&uri).await;
-        dataset
+        // A fresh Inverted index always trains in row-address domain, so a
+        // row-id-domain one (the incompatible case this test plants) is
+        // simulated by relabeling a freshly built segment's `index_version`
+        // down -- the same trick `results_are_row_addrs` itself relies on to
+        // tell the two apart.
+        let segment = dataset
             .create_index_builder(
                 &["category"],
                 IndexType::Inverted,
@@ -972,6 +985,15 @@ mod tests {
             )
             .name("category_idx".to_string())
             .train(false)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("category_idx", "category", vec![legacy_segment])
             .await
             .unwrap();
         let mut indices = load_all_indices(&dataset).await.unwrap().as_ref().clone();
@@ -1069,14 +1091,28 @@ mod tests {
     #[tokio::test]
     async fn test_incompatible_indices_are_hidden_from_readers() {
         let mut dataset = stable_row_id_dataset("memory://").await;
-        create_index(
-            &mut dataset,
-            "category",
-            IndexType::Inverted,
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
-        )
-        .await
-        .unwrap();
+        // A fresh Inverted index always trains in row-address domain, so the
+        // collision this test demonstrates is simulated by relabeling a
+        // freshly built segment's `index_version` down -- the same trick
+        // `results_are_row_addrs` itself relies on to tell the two apart.
+        let segment = dataset
+            .create_index_builder(
+                &["category"],
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
+            )
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
+        let name = legacy_segment.name.clone();
+        dataset
+            .commit_existing_index_segments(&name, "category", vec![legacy_segment])
+            .await
+            .unwrap();
         create_index(
             &mut dataset,
             "vec",
@@ -1264,15 +1300,18 @@ mod tests {
             addresses
         );
 
+        // Vector is the only kind still refused this way: every scalar index
+        // type, Inverted included, now trains in row-address domain (see
+        // `INVERTED_ROW_ADDR_DOMAIN_VERSION`).
         assert_rejected(
             create_index(
                 &mut dataset,
-                "category",
-                IndexType::Inverted,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
+                "vec",
+                IndexType::IvfFlat,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
             )
             .await,
-            "Cannot create a full-text index on column `category`",
+            "Cannot create a vector index on column `vec`",
         );
         let bitmap = index_with(
             "category_idx",
@@ -1302,6 +1341,11 @@ mod tests {
         let mut dataset = stable_row_id_dataset(dir.as_str()).await;
         let mut other = Dataset::open(dir.as_str()).await.unwrap();
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
+        // A fresh Inverted index always trains in row-address domain, so the
+        // race this test exercises (a row-id-domain index and an FRI racing
+        // each other) is simulated by relabeling a freshly built segment's
+        // `index_version` down -- the same trick `results_are_row_addrs`
+        // itself relies on to tell the two apart.
         let inverted_index = other
             .create_index_builder(
                 &["category"],
@@ -1313,6 +1357,10 @@ mod tests {
             .execute_uncommitted()
             .await
             .unwrap();
+        let inverted_index = IndexMetadata {
+            index_version: 0,
+            ..inverted_index
+        };
 
         let result = if frag_reuse_first {
             commit_new_indices(&mut dataset, vec![frag_reuse])

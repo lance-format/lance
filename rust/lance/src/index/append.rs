@@ -1354,9 +1354,12 @@ async fn merge_scalar_indices<'a>(
 /// domain store row ids, so a stable-row-id dataset must rebuild rather than
 /// merge them with newly scanned (address-domain) data.
 fn has_legacy_row_id_domain(index_type: IndexType) -> bool {
-    // MinHash LSH moved too, but it never writes its row-id-domain layout, so
-    // it has no `row_id_domain_version` to relabel a new segment with.
-    index_type == IndexType::MinHashLsh
+    // MinHash LSH and Inverted moved too, but neither has a single constant
+    // `row_id_domain_version` to relabel a new segment with: MinHash LSH
+    // never writes its row-id-domain layout at all, and Inverted's legacy
+    // version depends on posting format and document granularity (see
+    // `InvertedIndexPlugin::relabel_as_row_id_domain`).
+    matches!(index_type, IndexType::MinHashLsh | IndexType::Inverted)
         || super::scalar::row_id_domain_version(&index_type.to_string()).is_some()
 }
 
@@ -2120,7 +2123,21 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .ok_or_else(|| {
                             Error::index("expected inverted index training parameters")
                         })?;
-                    if update_criteria.requires_old_data {
+                    // A segment persisted before `INVERTED_ROW_ADDR_DOMAIN_VERSION`
+                    // stores row ids directly. On a stable-row-id dataset those
+                    // differ from the row addresses a fresh scan now yields, so
+                    // such a segment cannot be merged with (or sit alongside) one
+                    // that stores addresses -- checked across every segment of
+                    // this named index, not just the ones `select_segments_to_merge`
+                    // selected, so a stray legacy segment outside that window still
+                    // forces the full rebuild below instead of silently coexisting
+                    // with the fresh segment it produces. Harmless without stable
+                    // row ids, where the two domains coincide.
+                    let legacy_domain_mismatch = dataset.manifest.uses_stable_row_ids()
+                        && old_indices
+                            .iter()
+                            .any(|segment| !segment.results_are_row_addrs());
+                    if update_criteria.requires_old_data || legacy_domain_mismatch {
                         let params = reference_index.derive_index_params()?;
                         let resolved = resolved_fts.as_ref().ok_or_else(|| {
                             Error::internal(
@@ -2180,10 +2197,15 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let mut frag_bitmap = base_unindexed_bitmap;
                     let mut selected_indices = Vec::with_capacity(selected_old_indices.len());
                     // Each segment keeps only its old rows still stored in the
-                    // fragments it covers. Under stable row ids a rewritten row
-                    // keeps its row id while it moves into a fragment a sibling
-                    // covers, so a filter over the union of all coverage would
-                    // keep the old segment's stale posting for it.
+                    // fragments it covers. A row-id-domain segment (legacy,
+                    // predating `INVERTED_ROW_ADDR_DOMAIN_VERSION`) needs this:
+                    // under stable row ids a rewritten row keeps its row id
+                    // while it moves into a fragment a sibling covers, so a
+                    // filter over the union of all coverage would keep the old
+                    // segment's stale posting for it. An address-domain
+                    // segment's own stored addresses already stop being live
+                    // when a row moves, so its filter is fragment/deletion
+                    // based instead (see `build_old_data_filter`).
                     let mut old_data_filters = Vec::with_capacity(selected_old_indices.len());
                     // On a tagged table a selected segment's old data is the
                     // coverage the reader derives for it (translated, live)
@@ -2209,15 +2231,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 effective
                             }
                         };
-                        old_data_filters.push(
-                            build_old_data_filter(
-                                dataset.as_ref(),
-                                &effective_old_frags,
-                                &RoaringBitmap::new(),
-                                false,
-                            )
-                            .await?,
-                        );
+                        let filter = build_old_data_filter(
+                            dataset.as_ref(),
+                            &effective_old_frags,
+                            &RoaringBitmap::new(),
+                            idx.results_are_row_addrs(),
+                        )
+                        .await?;
+                        old_data_filters.push(filter);
                         let scalar_index = dataset
                             .open_scalar_index_for_maintenance(
                                 &field_path,
@@ -6524,16 +6545,41 @@ mod tests {
 
         // Exercise the stable-row-id allow-list and address-domain deletion
         // filtering paths. Both must propagate unreadable deletion vectors.
-        dataset
-            .create_index(
+        if index_type == IndexType::Inverted {
+            // A fresh Inverted index always trains in row-address domain, so
+            // the row-id-domain allow-list path is simulated by relabeling a
+            // freshly built segment's `index_version` down -- the same trick
+            // `results_are_row_addrs` itself relies on to tell the two apart.
+            let segment = CreateIndexBuilder::new(
+                &mut dataset,
                 &["cat"],
                 index_type,
-                None,
                 &ScalarIndexParams::for_builtin(builtin),
-                true,
             )
+            .execute_uncommitted()
             .await
             .unwrap();
+            let legacy_segment = IndexMetadata {
+                index_version: 0,
+                ..segment
+            };
+            let name = legacy_segment.name.clone();
+            dataset
+                .commit_existing_index_segments(&name, "cat", vec![legacy_segment])
+                .await
+                .unwrap();
+        } else {
+            dataset
+                .create_index(
+                    &["cat"],
+                    index_type,
+                    None,
+                    &ScalarIndexParams::for_builtin(builtin),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
 
         // Update rewrites the first 25 rows under the same stable row ids,
         // leaving a deletion vector on the original fragment. Changes the

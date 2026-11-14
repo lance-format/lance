@@ -983,6 +983,7 @@ mod tests {
         read_spilled_row_ids, read_spilled_versions,
     };
     use crate::dataset::{NewColumnTransform, WriteDestination, WriteMode};
+    use crate::index::CreateIndexBuilder;
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
@@ -1010,7 +1011,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
-    use lance_table::format::ROW_CREATED_AT_VERSION_FIELD_ID;
+    use lance_table::format::{IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID};
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
@@ -1866,16 +1867,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Need to use a row-id-domain index (while we still have one)
+        // A fresh Inverted index always trains in row-address domain, so a
+        // row-id-domain one is simulated by relabeling a freshly built
+        // segment's `index_version` down -- the same trick
+        // `results_are_row_addrs` itself relies on to tell the two apart.
         let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["str"], IndexType::Inverted, &scalar_params)
+                .name("str_idx".to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
         dataset
-            .create_index(
-                &["str"],
-                IndexType::Inverted,
-                Some("str_idx".to_string()),
-                &scalar_params,
-                true,
-            )
+            .commit_existing_index_segments("str_idx", "str", vec![legacy_segment])
             .await
             .unwrap();
 

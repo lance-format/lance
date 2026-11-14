@@ -51,6 +51,7 @@ use tracing::Instrument;
 
 use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
+use crate::dataset::rowids::row_ids_to_row_addrs;
 use crate::index::prefilter::DatasetPreFilter;
 
 /// Open fragments on cancellation-safe tasks while preserving the stream's
@@ -485,6 +486,126 @@ pub(crate) fn build_prefilter(
     Ok(Arc::new(prefilter))
 }
 
+/// Translates one treemap's entries from row-id domain to row-address
+/// domain. A "whole fragment" entry can't be enumerated one id at a time; it
+/// is vanishingly unlikely to appear in a row-id-domain mask (it would
+/// require 2^32 contiguous ids), so it is left untranslated rather than
+/// failing the query.
+pub(crate) async fn translate_treemap_to_row_addr_domain(
+    dataset: &Dataset,
+    treemap: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let Some(row_ids) = treemap.row_addrs() else {
+        return Ok(treemap.clone());
+    };
+    let row_ids: Vec<u64> = row_ids.map(u64::from).collect();
+    let addrs = row_ids_to_row_addrs(dataset, &row_ids).await?;
+    Ok(addrs.into_iter().flatten().collect())
+}
+
+/// Translates a row-id-domain mask into row-address domain. Every prefilter
+/// source and external mask is expressed in row-id domain by convention (see
+/// `ScalarIndexExec`), but the deletion mask FTS ANDs it against is forced to
+/// physical addresses by `build_prefilter_in_domain`/
+/// `build_prefilter_restricted_to_fragments_in_domain`. Combining the two
+/// without this translation compares unrelated numeric domains wherever a
+/// row's address differs from its id (e.g. any fragment beyond the first,
+/// under stable row ids).
+async fn row_id_mask_to_row_addr_domain(
+    dataset: &Dataset,
+    mask: Arc<RowAddrMask>,
+) -> Result<Arc<RowAddrMask>> {
+    let translated = match mask.as_ref() {
+        RowAddrMask::AllowList(allow) => {
+            RowAddrMask::AllowList(translate_treemap_to_row_addr_domain(dataset, allow).await?)
+        }
+        RowAddrMask::BlockList(block) => {
+            RowAddrMask::BlockList(translate_treemap_to_row_addr_domain(dataset, block).await?)
+        }
+    };
+    Ok(Arc::new(translated))
+}
+
+/// Wraps `filter` to translate its resolved mask into row-address domain
+/// (see [`row_id_mask_to_row_addr_domain`]) whenever `address_domain` is set.
+fn translate_filter_in_domain(
+    filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
+    ds: Arc<Dataset>,
+    address_domain: bool,
+) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+    if !address_domain {
+        return filter;
+    }
+    filter.map(|filter| {
+        async move {
+            let mask = filter.await?;
+            row_id_mask_to_row_addr_domain(&ds, mask).await
+        }
+        .boxed()
+    })
+}
+
+/// Translates `overlay_block` into row-address domain (see
+/// [`row_id_mask_to_row_addr_domain`]) whenever `address_domain` is set. The
+/// overlay block follows the same row-id-domain convention as any prefilter
+/// source and external mask, so it needs the same translation those get via
+/// `translate_filter_in_domain` before it is combined (logical AND) into an
+/// address-domain-forced deletion mask.
+async fn translate_overlay_block_in_domain(
+    overlay_block: Option<RowAddrMask>,
+    ds: &Dataset,
+    address_domain: bool,
+) -> Result<Option<RowAddrMask>> {
+    let Some(overlay_block) = overlay_block else {
+        return Ok(None);
+    };
+    if !address_domain {
+        return Ok(Some(overlay_block));
+    }
+    let translated = row_id_mask_to_row_addr_domain(ds, Arc::new(overlay_block)).await?;
+    Ok(Some(translated.as_ref().clone()))
+}
+
+/// Like [`build_prefilter`], but the deletion mask is kept in physical row
+/// address domain even on a stable-row-id dataset -- see
+/// [`DatasetPreFilter::new_with_filter_future_in_domain`]. FTS needs this: it
+/// consults the prefilter mask directly against its own stored addresses
+/// while scoring, before any row-id translation happens, so the mask must
+/// already be in that same domain whenever the segments it is built for are
+/// address-domain (an address-domain segment is the only kind a fresh build
+/// now produces; see `INVERTED_ROW_ADDR_DOMAIN_VERSION`). The externally
+/// supplied `filter` (any prefilter source and external mask, row-id domain
+/// by convention) is translated into the same address domain so ANDing it
+/// into the deletion mask compares like with like, and so is `overlay_block`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_prefilter_in_domain(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[IndexMetadata],
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
+    address_domain: bool,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+    )?;
+    let filter = translate_filter_in_domain(filter, ds.clone(), address_domain);
+    let overlay_block =
+        translate_overlay_block_in_domain(masks.overlay_block, &ds, address_domain).await?;
+    let mut prefilter =
+        DatasetPreFilter::new_with_filter_future_in_domain(ds, index_meta, filter, address_domain);
+    if let Some(overlay_block) = overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
+}
+
 /// Build a prefilter restricted to `fragments` rather than to the union of
 /// `index_meta`'s fragment bitmaps. See
 /// [`DatasetPreFilter::new_restricted_to_fragments`].
@@ -506,6 +627,41 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
     )?;
     let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
     if let Some(overlay_block) = masks.overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
+}
+
+/// Like [`build_prefilter_restricted_to_fragments`], with the same
+/// `address_domain` meaning as [`build_prefilter_in_domain`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_prefilter_restricted_to_fragments_in_domain(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    fragments: RoaringBitmap,
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
+    address_domain: bool,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+    )?;
+    let filter = translate_filter_in_domain(filter, ds.clone(), address_domain);
+    let overlay_block =
+        translate_overlay_block_in_domain(masks.overlay_block, &ds, address_domain).await?;
+    let mut prefilter = DatasetPreFilter::new_restricted_to_fragments_in_domain(
+        ds,
+        fragments,
+        filter,
+        address_domain,
+    );
+    if let Some(overlay_block) = overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))

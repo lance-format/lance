@@ -136,7 +136,7 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
         QuickCacheBackend::with_capacity(4096),
     )));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -257,7 +257,7 @@ async fn test_best_effort_prewarm_reports_missing_requested_positions() {
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
         RejectPositionsCacheBackend::new(1 << 20),
     )));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load(store, None, cache.as_ref(), true)
         .await
         .unwrap();
 
@@ -342,7 +342,7 @@ async fn test_prewarm_with_v2_positions_preserves_shared_stream_codec() {
     writer.finish_with_metadata(metadata).await.unwrap();
 
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load(store, None, cache.as_ref(), true)
         .await
         .unwrap();
     index

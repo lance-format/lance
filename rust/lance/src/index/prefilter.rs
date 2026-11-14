@@ -92,6 +92,32 @@ impl DatasetPreFilter {
         indices: &[IndexMetadata],
         filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
     ) -> Self {
+        Self::new_with_filter_future_in_domain(dataset, indices, filter, false)
+    }
+
+    /// Like [`Self::new_with_filter_future`], but `force_address_domain` lets
+    /// the caller request a deletion mask keyed by physical row address even
+    /// on a stable-row-id dataset, instead of the stable-row-id allow-list
+    /// [`Self::new_with_filter_future`] would otherwise build.
+    ///
+    /// Most consumers want the stable-row-id mask: it is what
+    /// `ScalarIndexExec` et al. translate an address-domain index's own
+    /// result into before intersecting (see `row_addr_result_to_row_ids`),
+    /// so the two agree. FTS instead pushes this mask straight into its
+    /// index's own search as a live [`PreFilter`], consulted per physical
+    /// posting before any row-id translation happens -- so for an
+    /// address-domain FTS segment (the only kind a fresh build produces; see
+    /// `INVERTED_ROW_ADDR_DOMAIN_VERSION`) it needs the mask in that same
+    /// domain, or a row whose stable id coincidentally collides with another
+    /// row's physical address (or vice versa) is wrongly admitted or
+    /// excluded. A legacy row-id-domain segment still wants the stable-row-id
+    /// mask, which is exactly what its own stored values already are.
+    pub(crate) fn new_with_filter_future_in_domain(
+        dataset: Arc<Dataset>,
+        indices: &[IndexMetadata],
+        filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
+        force_address_domain: bool,
+    ) -> Self {
         let mut fragments = RoaringBitmap::new();
         let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
         if !all_have_bitmaps {
@@ -104,9 +130,9 @@ impl DatasetPreFilter {
             });
         }
         let deleted_ids = if all_have_bitmaps {
-            Self::create_restricted_deletion_mask(dataset, fragments)
+            Self::create_deletion_mask_impl(dataset, fragments, true, force_address_domain)
         } else {
-            Self::create_deletion_mask(dataset, fragments)
+            Self::create_deletion_mask_impl(dataset, fragments, false, force_address_domain)
         }
         .map(SharedPrerequisite::spawn);
         let filtered_ids = filter.map(SharedPrerequisite::spawn);
@@ -134,8 +160,21 @@ impl DatasetPreFilter {
         fragments: RoaringBitmap,
         filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
     ) -> Self {
-        let deleted_ids = Self::create_restricted_deletion_mask(dataset, fragments)
-            .map(SharedPrerequisite::spawn);
+        Self::new_restricted_to_fragments_in_domain(dataset, fragments, filter, false)
+    }
+
+    /// Like [`Self::new_restricted_to_fragments`], with the same
+    /// `force_address_domain` meaning as
+    /// [`Self::new_with_filter_future_in_domain`].
+    pub(crate) fn new_restricted_to_fragments_in_domain(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
+        force_address_domain: bool,
+    ) -> Self {
+        let deleted_ids =
+            Self::create_deletion_mask_impl(dataset, fragments, true, force_address_domain)
+                .map(SharedPrerequisite::spawn);
         let filtered_ids = filter.map(SharedPrerequisite::spawn);
         Self {
             deleted_ids,
@@ -353,7 +392,7 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
-        Self::create_deletion_mask_impl(dataset, fragments, false)
+        Self::create_deletion_mask_impl(dataset, fragments, false, false)
     }
 
     /// Like [`Self::create_deletion_mask`] but also restricts results to the given
@@ -362,13 +401,15 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
-        Self::create_deletion_mask_impl(dataset, fragments, true)
+        Self::create_deletion_mask_impl(dataset, fragments, true, false)
     }
 
+    /// `force_address_domain`: see [`Self::new_with_filter_future_in_domain`].
     fn create_deletion_mask_impl(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
         restrict_to_fragments: bool,
+        force_address_domain: bool,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
@@ -402,7 +443,7 @@ impl DatasetPreFilter {
         }
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() && !needs_restriction {
             None
-        } else if dataset.manifest.uses_stable_row_ids() {
+        } else if dataset.manifest.uses_stable_row_ids() && !force_address_domain {
             let restrict_to = if restrict_to_fragments {
                 Some(fragments)
             } else {
@@ -1055,6 +1096,7 @@ mod test {
                     dataset.clone(),
                     covered.clone(),
                     restrict_to_fragments,
+                    false,
                 )
                 .expect("deletion mask")
             };
@@ -1097,11 +1139,15 @@ mod test {
         // the same version under a different e-tag must not be reused.
         let mut other_generation = (*dataset).clone();
         other_generation.manifest_location.e_tag = Some("second-generation".to_string());
-        let other_generation_mask =
-            DatasetPreFilter::create_deletion_mask_impl(Arc::new(other_generation), covered, false)
-                .expect("deletion mask")
-                .await
-                .unwrap();
+        let other_generation_mask = DatasetPreFilter::create_deletion_mask_impl(
+            Arc::new(other_generation),
+            covered,
+            false,
+            false,
+        )
+        .expect("deletion mask")
+        .await
+        .unwrap();
         assert!(!Arc::ptr_eq(&other_generation_mask, &cached[0]));
         assert!(other_generation_mask.selected(0));
 

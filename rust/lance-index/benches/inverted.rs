@@ -14,7 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::ROW_ID;
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::document_tokenizer::DocType;
@@ -82,7 +82,7 @@ fn bench_inverted(c: &mut Criterion) {
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
-            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
         ])
         .into(),
         vec![doc_col.clone(), row_id_col],
@@ -146,6 +146,7 @@ fn bench_inverted(c: &mut Criterion) {
             phrase_search_store,
             None,
             &LanceCache::no_cache(),
+            true,
         ))
         .unwrap();
 

@@ -4,6 +4,7 @@
 use crate::scalar::inverted::document_tokenizer::DocType;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
+use lance_core::ROW_ADDR;
 use lance_core::cache::{LanceCache, QuickCacheBackend};
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
@@ -48,6 +49,7 @@ async fn write_single_partition_index(
     token_set_format: TokenSetFormat,
     token: &str,
     row_id: u64,
+    results_are_row_addresses: bool,
 ) -> Result<Arc<InvertedIndex>> {
     let block_size = params.posting_block_size();
     let format_version = params.resolved_format_version();
@@ -94,13 +96,19 @@ async fn write_single_partition_index(
         .await?;
     writer.finish_with_metadata(metadata).await?;
 
-    InvertedIndex::load(store, None, &LanceCache::no_cache()).await
+    InvertedIndex::load(
+        store,
+        None,
+        &LanceCache::no_cache(),
+        results_are_row_addresses,
+    )
+    .await
 }
 
 fn empty_doc_stream() -> SendableRecordBatchStream {
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc", DataType::Utf8, true),
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     Box::pin(RecordBatchStreamAdapter::new(
         schema,

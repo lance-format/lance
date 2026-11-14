@@ -15,6 +15,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
+use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
 use lance_index::scalar::inverted::{CombinedFieldColumn, InvertedIndex, MemBM25Scorer};
@@ -23,9 +24,41 @@ use lance_table::format::IndexMetadata;
 use super::matches::PreparedMatch;
 use super::selection::FtsIndexMetrics;
 use crate::Dataset;
+use crate::dataset::rowids::live_row_addr_to_row_id_lookup;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::prefilter_may_match_segment;
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
+
+/// The translation from a stored physical row address to its row id.
+pub(super) type RowAddrToRowId = dyn Fn(u64) -> Option<u64> + Send + Sync;
+
+/// Whether `segments`' own stored identifiers are physical row addresses, for
+/// code that must pick between an address-domain and a row-id-domain
+/// representation of the same restriction (a `PreFilter` mask, a prefilter's
+/// per-segment coverage check -- see `fts_row_addr_to_row_id`'s doc for why
+/// FTS cannot just translate its result afterward the way `ScalarIndexExec`
+/// does).
+///
+/// True whenever the two domains coincide regardless of what a segment's own
+/// `results_are_row_addrs()` reports: without stable row ids a row id and a
+/// row address are the same value, and `build_scalar_index` relabels a fresh
+/// build's segment to a pre-`INVERTED_ROW_ADDR_DOMAIN_VERSION` version in
+/// that case specifically so an old reader still understands it -- not
+/// because its stored values differ in kind. With stable row ids the two
+/// domains genuinely can differ, and then this defers to the first segment's
+/// own `results_are_row_addrs()` (uniform across a committed named index; see
+/// `append.rs`'s `legacy_domain_mismatch`), true unless it is a legacy
+/// segment predating that version.
+pub(super) fn fts_segments_are_address_domain(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+) -> bool {
+    !dataset.manifest.uses_stable_row_ids()
+        || segments
+            .first()
+            .map(|segment| segment.results_are_row_addrs())
+            .unwrap_or(true)
+}
 
 /// Open one FTS segment as an [`InvertedIndex`].
 ///
@@ -60,10 +93,11 @@ pub(super) async fn open_fts_segment(
         }
     };
     let (inverted, allowed_rows) = futures::try_join!(open, allowed_rows)?;
-    Ok(Arc::new(match allowed_rows {
+    let result = Arc::new(match allowed_rows {
         Some(allowed_rows) => inverted.with_allowed_rows(allowed_rows),
         None => inverted,
-    }))
+    });
+    Ok(result)
 }
 
 /// Open all committed FTS segments for a column.
@@ -82,13 +116,76 @@ pub(super) async fn open_fts_segments(
     metrics: &dyn MetricsCollector,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
     let segment_refs = segments.iter().collect::<Vec<_>>();
-    let coverage =
-        SegmentCoverage::resolve(dataset, &segment_refs, SegmentRowDomain::RowId).await?;
+    // A segment persisted before `INVERTED_ROW_ADDR_DOMAIN_VERSION` stores row
+    // ids, which can remain live in a sibling segment after a stable-row-id
+    // row moves; a segment built since stores row addresses, which do not
+    // (see `SegmentRowDomain`). `results_are_row_addrs` is uniform across a
+    // named index's segments (`append.rs` rebuilds rather than mixes them),
+    // so the first segment's domain speaks for all of them.
+    let row_domain = match segments.first() {
+        Some(first) if first.results_are_row_addrs() => SegmentRowDomain::RowAddress,
+        _ => SegmentRowDomain::RowId,
+    };
+    let coverage = SegmentCoverage::resolve(dataset, &segment_refs, row_domain).await?;
     try_join_all(segments.iter().enumerate().map(|(index, segment)| {
         let coverage = coverage.as_ref().map(|coverage| (coverage, index));
         open_fts_segment(dataset, column, segment, coverage, metrics)
     }))
     .await
+}
+
+/// Build the row-address-to-row-id translation this query's final output
+/// needs, from `representative`'s domain -- every segment of a committed
+/// named index shares one domain (`append.rs`'s `legacy_domain_mismatch`
+/// forces a rebuild rather than letting them disagree).
+///
+/// `None` (a no-op) when the two coincide: no stable row ids, or a
+/// row-id-domain segment. The latter is a transient state right after a
+/// dataset turns stable row ids on, before its existing segments are next
+/// rebuilt or merged -- that does not happen eagerly, so a query can still
+/// land here with a row-id-domain segment under stable row ids, and the
+/// segment's own values are already row ids needing no translation.
+///
+/// Unlike MinHash's per-segment lookup (`live_row_addr_to_row_id_lookup`
+/// scoped to one segment's own fragments), FTS merges per-segment top-k hits
+/// into one global ranking before this can run, so it must already cover
+/// every fragment any segment of the index could answer from; this uses the
+/// dataset's whole current fragment set rather than tracking each query's
+/// narrower per-segment union.
+pub(super) async fn fts_row_addr_to_row_id(
+    dataset: &Dataset,
+    representative: Option<&Arc<InvertedIndex>>,
+) -> Result<Option<Arc<RowAddrToRowId>>> {
+    if !dataset.manifest.uses_stable_row_ids()
+        || !representative.is_some_and(|index| index.results_are_row_addresses())
+    {
+        return Ok(None);
+    }
+    let fragment_ids = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<Vec<_>>();
+    let lookup = live_row_addr_to_row_id_lookup(dataset, fragment_ids).await?;
+    Ok(Some(Arc::new(lookup)))
+}
+
+/// Translate and drop unresolvable rows from a final `(row_ids, scores)`
+/// result pair, keeping the two aligned. A `None` translator is a no-op.
+pub(super) fn translate_row_ids_and_scores(
+    row_ids: Vec<u64>,
+    scores: Vec<f32>,
+    row_addr_to_row_id: Option<&RowAddrToRowId>,
+) -> (Vec<u64>, Vec<f32>) {
+    let Some(translate) = row_addr_to_row_id else {
+        return (row_ids, scores);
+    };
+    row_ids
+        .into_iter()
+        .zip(scores)
+        .filter_map(|(row_id, score)| translate(row_id).map(|row_id| (row_id, score)))
+        .unzip()
 }
 
 /// Open all committed FTS segments without resolving live-row coverage.

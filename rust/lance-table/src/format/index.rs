@@ -148,6 +148,7 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
     let is_ngram_addr_domain = IndexMetadata::is_ngram_addr_domain(details, index_version);
     let is_rtree_addr_domain = IndexMetadata::is_rtree_addr_domain(details, index_version);
     let is_minhash_addr_domain = IndexMetadata::is_minhash_addr_domain(details, index_version);
+    let is_inverted_addr_domain = IndexMetadata::is_inverted_addr_domain(details, index_version);
     // A JSON index takes its domain from the target index it wraps. It is
     // stamped with format version 1
     // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
@@ -164,6 +165,7 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
         || is_ngram_addr_domain
         || is_rtree_addr_domain
         || is_minhash_addr_domain
+        || is_inverted_addr_domain
         || is_json_addr_domain
 }
 
@@ -263,7 +265,7 @@ impl IndexMetadata {
             ("lance.table" | "lance.index.pb", "bitmapindexdetails") => self.index_version < 1,
             ("lance.table" | "lance.index.pb", "labellistindexdetails") => self.index_version < 2,
             ("lance.table" | "lance.index.pb", "ngramindexdetails") => self.index_version < 1,
-            ("lance.table" | "lance.index.pb", "invertedindexdetails") => true,
+            ("lance.table" | "lance.index.pb", "invertedindexdetails") => self.index_version < 4,
             ("lance.index.pb", "rtreeindexdetails") => self.index_version < 1,
             ("lance.index.pb", "minhashlshindexdetails") => self.index_version < 1,
             ("lance.index.pb", "vectorindexdetails" | "jsonindexdetails") => true,
@@ -321,12 +323,19 @@ impl IndexMetadata {
         details.type_url.ends_with("MinHashLshIndexDetails") && index_version >= 1
     }
 
+    // An Inverted (FTS) segment stores row addresses only from format version 4
+    // onward (`lance_index::scalar::inverted::INVERTED_ROW_ADDR_DOMAIN_VERSION`).
+    // Versions 1-3 are posting-list format capability bumps unrelated to domain.
+    fn is_inverted_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("InvertedIndexDetails") && index_version >= 4
+    }
+
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram and
-    /// MinHash LSH's indexes support this today (`ScalarIndexPlugin::can_remap`);
+    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram,
+    /// MinHash LSH, and Inverted's indexes support this today (`ScalarIndexPlugin::can_remap`);
     /// ZoneMap, BloomFilter, FM and RTree cannot remap. This gate recognizes the
     /// supported built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
@@ -337,6 +346,7 @@ impl IndexMetadata {
                 || Self::is_list_element(details)
                 || Self::is_ngram_addr_domain(details, self.index_version)
                 || Self::is_minhash_addr_domain(details, self.index_version)
+                || Self::is_inverted_addr_domain(details, self.index_version)
         })
     }
 
@@ -1360,7 +1370,6 @@ mod tests {
     #[case::bitmap_alias("type.googleapis.com/LANCE.INDEX.PB.BITMAPINDEXDETAILS", false, true)]
     #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", false, true)]
     #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", false, true)]
-    #[case::inverted("type.googleapis.com/lance.table.InvertedIndexDetails", false, true)]
     #[case::vector("type.googleapis.com/lance.index.pb.VectorIndexDetails", false, true)]
     #[case::vector_legacy("type.googleapis.com/lance.index.VectorIndexDetails", false, true)]
     #[case::json("type.googleapis.com/lance.index.pb.JsonIndexDetails", false, true)]
@@ -1398,6 +1407,7 @@ mod tests {
     #[case::minhash_lsh("type.googleapis.com/lance.index.pb.MinHashLshIndexDetails", 1, true)]
     #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", 1, true)]
     #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", 2, true)]
+    #[case::inverted("type.googleapis.com/lance.table.InvertedIndexDetails", 4, true)]
     fn test_results_are_row_addrs_is_version_gated(
         #[case] type_url: &str,
         #[case] addr_domain_version: i32,

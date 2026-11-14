@@ -8,9 +8,20 @@ use super::*;
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
 // Version 3: Reader capability for configurable posting blocks, analyzer
 // metadata, and element-document coordinates.
+// Version 4: `docs.lance`'s identity column holds physical row addresses
+// instead of row ids. Independent of the posting-list format above (still
+// read from file metadata, not from this version): a V4 segment can pair
+// with any posting format, since training always scans row addresses now
+// and this version is only overridden back to one of V1-V3 on a dataset
+// without stable row ids, where a row id and a row address are the same
+// value. See `ngram_index_version`/`BTREE_ROW_ADDR_DOMAIN_VERSION` for the
+// same pattern on other scalar index types.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
 pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
+/// A freshly trained segment stores physical row addresses (`_rowaddr`-domain
+/// values) in `docs.lance`'s identity column instead of row ids.
+pub const INVERTED_ROW_ADDR_DOMAIN_VERSION: u32 = 4;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
