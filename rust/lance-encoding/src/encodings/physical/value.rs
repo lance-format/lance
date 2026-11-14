@@ -23,6 +23,8 @@ use crate::format::metadata::{self, CompressiveEncoding};
 
 use lance_core::{Error, Result};
 
+mod admitted;
+
 /// A compression strategy that writes fixed-width data as-is (no compression)
 #[derive(Debug, Default)]
 pub struct ValueEncoder {}
@@ -614,6 +616,19 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<crate::compression::levels::LevelDecodePlan<'a>> {
+        if self.bits_per_value != 16 || !self.layers.is_empty() {
+            return Err(Error::invalid_input(
+                "structural levels require flat u16 values",
+            ));
+        }
+        crate::compression::levels::LevelDecodePlan::flat(data, num_values)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Flat block")?;
         if !self.layers.is_empty() {
@@ -645,6 +660,25 @@ impl BlockDecompressor for ValueDecompressor {
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self, data, num_values, range).map(|plan| plan.budget)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         1 + self
             .layers

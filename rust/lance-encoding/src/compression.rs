@@ -79,11 +79,29 @@ use crate::{
     statistics::{GetStat, Stat},
 };
 
-use arrow_array::{cast::AsArray, types::UInt64Type};
+#[cfg(feature = "bitpacking")]
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
+use lance_core::utils::allocation::Reservation;
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use std::{ops::Range, str::FromStr, sync::Arc};
+
+pub mod levels;
+
+/// Payload required by one validated MiniBlock range operation.
+///
+/// Input owners are excluded and must already be charged. These sizes exclude
+/// allocator/plan metadata and later typed or structural reconstruction. A plan
+/// applies only to the codec, immutable input buffers and range it validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiniBlockDecodeBudget {
+    /// Bytes retained by the result after codec scratch is recycled.
+    pub output_bytes: usize,
+    /// Maximum additional bytes simultaneously needed, including output and scratch.
+    pub workspace_bytes: usize,
+}
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
 ///
@@ -289,6 +307,8 @@ fn rle_beats_raw_and_bitpacking(
         return false;
     }
 
+    #[cfg(not(feature = "bitpacking"))]
+    let _ = data;
     #[cfg(feature = "bitpacking")]
     {
         if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data).map(u128::from)
@@ -524,6 +544,12 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
     u64::try_from(estimated_bytes).ok()
 }
 
+#[cfg(not(feature = "bitpacking"))]
+fn try_bitpack_for_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
+    None
+}
+
+#[cfg(feature = "bitpacking")]
 fn try_bitpack_for_block(data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -1139,6 +1165,78 @@ pub fn try_fixed_size_list_block(
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Validate a range and price its complete output/scratch without allocating
+    /// payload. This is the same preflight used by [`Self::try_decompress_range_in`].
+    /// Unsupported codecs return an error rather than an estimate or an ordinary
+    /// decode fallback. No credit is consumed by planning.
+    ///
+    /// For a sequence, keep earlier output charges while admitting each next
+    /// `workspace_bytes`. Concatenation needs its own output allocation while the
+    /// decoded inputs are still alive. Structural levels and input owners also
+    /// need separate admission; summing only the retained outputs is insufficient.
+    ///
+    /// ```
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::value::ValueDecompressor, format::metadata};
+    /// let codec = ValueDecompressor::from_flat(&metadata::Flat {
+    ///     bits_per_value: 32, data: None,
+    /// });
+    /// let input = [LanceBuffer::from(vec![0_u8; 16])];
+    /// let plan = codec.plan_range(&input, 4, 1..3).unwrap();
+    /// assert_eq!(plan.output_bytes, 8);
+    /// assert_eq!(plan.workspace_bytes, 8); // Raw extraction needs no scratch.
+    /// ```
+    fn plan_range(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _range: Range<u64>,
+    ) -> Result<MiniBlockDecodeBudget> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted range plan",
+        ))
+    }
+
+    /// Decode a selected range only after all output and codec scratch fit in the
+    /// supplied workspace. Inputs must already carry their physical allocation charge.
+    /// `Ok(None)` refuses admission without allocating or changing the workspace;
+    /// the caller must drain/replan rather than treat refusal as EOF or a result cap.
+    /// Completed scratch is recycled to the workspace and output retains its credit.
+    ///
+    /// The default returns `NotSupported`, never calls an unaccounted decoder. This
+    /// opt-in capability does not change existing scan paths or bound other stages.
+    /// Later typed Arrow conversion, rep/def reconstruction and builder allocations
+    /// need their own admission; for example, expanded byte booleans need a new bitmap.
+    ///
+    /// ```
+    /// # #[cfg(feature = "bitpacking")]
+    /// # fn example() -> lance_core::Result<()> {
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::bitpacking::InlineBitpacking};
+    /// let budget = AllocationBudget::new(12);
+    /// let mut workspace = budget.try_reserve(12).unwrap();
+    /// // A zero-width u32 chunk has only its four-byte zero header.
+    /// let input = workspace.try_allocate(4)?.unwrap().freeze();
+    /// let buffers = [LanceBuffer::from_bytes(input, 4)];
+    /// let output = InlineBitpacking::new(32)
+    ///     .try_decompress_range_in(&buffers, 1024, 3..5, &mut workspace)?.unwrap();
+    /// assert_eq!(output.num_values(), 2);
+    /// assert_eq!(budget.reserved(), 12);
+    /// # Ok(()) }
+    /// ```
+    fn try_decompress_range_in(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _range: Range<u64>,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted range decoder",
+        ))
+    }
+
     /// Decompress only `range` (`0 <= range.start <= range.end <= num_values`) from a mini-block
     /// chunk containing `num_values` items.
     ///
@@ -1297,6 +1395,20 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Validate a dense u16 structural stream and plan all decoded payload/scratch
+    /// before allocation. The input owner must already be charged. Unsupported
+    /// codecs return an error instead of invoking ordinary, unaccounted decode.
+    /// See [`levels::LevelDecodePlan`] and its admission example.
+    fn plan_levels<'a>(
+        &self,
+        _data: &'a LanceBuffer,
+        _num_values: u64,
+    ) -> Result<levels::LevelDecodePlan<'a>> {
+        Err(Error::not_supported(
+            "codec has no admitted structural-level decoder",
+        ))
+    }
 
     /// Whether this codec consumes one payload buffer.
     fn requires_payload(&self) -> bool {
@@ -1650,9 +1762,16 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Error::invalid_input("Block encoding is missing its compression variant")
         })?;
         match compression {
+            #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(inline_bitpacking) => Ok(Box::new(
                 InlineBitpacking::from_description(inline_bitpacking),
             )),
+            #[cfg(not(feature = "bitpacking"))]
+            Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
+                Err(Error::not_supported_source(
+                    "this runtime was not built with bitpacking support".into(),
+                ))
+            }
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
                 let scalar = constant
@@ -1665,6 +1784,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
+            #[cfg(feature = "bitpacking")]
             Compression::OutOfLineBitpacking(out_of_line) => {
                 let values = out_of_line.values.as_ref().ok_or_else(|| {
                     Error::invalid_input("OutOfLineBitpacking is missing its values encoding")

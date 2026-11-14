@@ -26,7 +26,7 @@
 //! # Buffer layout
 //!
 //! Each mini-block chunk uses four value buffers (see
-//! [`MiniBlockChunk::buffer_sizes`]).
+//! [`MiniBlockChunk::buffer_sizes`](crate::encodings::logical::primitive::miniblock::MiniBlockChunk::buffer_sizes)).
 //!
 //! - **Buffer 0 (payload):** bitpacked offsets, `enc - min` for FOR mode or
 //!   `delta - min_delta` for Delta mode, using the same layout as
@@ -45,6 +45,7 @@
 //! or above the raw size, or any chunk exceeding `MAX_MINIBLOCK_BYTES`) falls
 //! back to the flat [`ValueEncoder`], guaranteeing ALP never enlarges data.
 
+#[cfg(feature = "bitpacking")]
 mod restore;
 
 use std::fmt::Debug;
@@ -53,9 +54,10 @@ use crate::buffer::LanceBuffer;
 use crate::compression::MiniBlockDecompressor;
 use crate::compression_config::AlpMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+#[cfg(feature = "bitpacking")]
+use crate::encodings::logical::primitive::miniblock::{MAX_MINIBLOCK_BYTES, MiniBlockChunk};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_BYTES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
-    MiniBlockCompressor,
+    MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
 #[cfg(all(test, feature = "bitpacking"))]
 use crate::encodings::physical::bitpacking::bitpack_out_of_line_vec;
@@ -74,18 +76,25 @@ use arrow_array::cast::AsArray;
 use lance_core::utils::cpu::CpuFeatures;
 use lance_core::{Error, Result};
 
+#[cfg(feature = "bitpacking")]
 const MODE_DELTA: u8 = 0b0000_0001;
+#[cfg(feature = "bitpacking")]
 const MODE_DIV: u8 = 0b0000_0010;
 /// ALP-RD splits values into a dictionary-coded left part (high bits) and a
 /// bit-packed right part (low bits). See [`encode_chunk_f64_rd`].
+#[cfg(feature = "bitpacking")]
 const MODE_RD: u8 = 0b0000_0100;
 
 /// Candidate right-part widths for the ALP-RD split.
+#[cfg(feature = "bitpacking")]
 const RD_SWEEP: [u8; 7] = [8, 16, 24, 32, 40, 48, 56];
 
+#[cfg(feature = "bitpacking")]
 const MAX_EXP_F32: u8 = 10;
+#[cfg(feature = "bitpacking")]
 const MAX_EXP_F64: u8 = 18;
 
+#[cfg(feature = "bitpacking")]
 const F10_F32: [f32; MAX_EXP_F32 as usize + 1] = [
     1.0,
     10.0,
@@ -99,6 +108,7 @@ const F10_F32: [f32; MAX_EXP_F32 as usize + 1] = [
     1000000000.0,
     10000000000.0,
 ];
+#[cfg(feature = "bitpacking")]
 const IF10_F32: [f32; MAX_EXP_F32 as usize + 1] = [
     1.0,
     0.1,
@@ -113,6 +123,7 @@ const IF10_F32: [f32; MAX_EXP_F32 as usize + 1] = [
     0.0000000001,
 ];
 
+#[cfg(feature = "bitpacking")]
 const F10_F64: [f64; MAX_EXP_F64 as usize + 1] = [
     1.0,
     10.0,
@@ -134,6 +145,7 @@ const F10_F64: [f64; MAX_EXP_F64 as usize + 1] = [
     100000000000000000.0,
     1000000000000000000.0,
 ];
+#[cfg(feature = "bitpacking")]
 const IF10_F64: [f64; MAX_EXP_F64 as usize + 1] = [
     1.0,
     0.1,
@@ -158,6 +170,7 @@ const IF10_F64: [f64; MAX_EXP_F64 as usize + 1] = [
 
 /// Chunk-level ALP transform parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "bitpacking")]
 struct AlpParams {
     e: u8,
     f: u8,
@@ -165,6 +178,7 @@ struct AlpParams {
 }
 
 #[inline]
+#[cfg(feature = "bitpacking")]
 fn bits_required_u128(v: u128) -> u8 {
     if v == 0 {
         0
@@ -174,6 +188,7 @@ fn bits_required_u128(v: u128) -> u8 {
 }
 
 /// Multiply `(e, f)` pairs plus the `use_div` pure-exponent candidates.
+#[cfg(feature = "bitpacking")]
 fn candidate_params(max_exp: u8) -> impl Iterator<Item = AlpParams> {
     let multiply = (1..=max_exp).flat_map(move |e| {
         (0..e).map(move |f| AlpParams {
@@ -190,6 +205,7 @@ fn candidate_params(max_exp: u8) -> impl Iterator<Item = AlpParams> {
     multiply.chain(divide)
 }
 
+#[cfg(feature = "bitpacking")]
 const SAMPLE_SIZE: usize = 32;
 
 /// Copy a strided sample of `words` into `out`, returning the sample length.
@@ -197,6 +213,7 @@ const SAMPLE_SIZE: usize = 32;
 /// Pages smaller than the sample size are copied in full so the estimator
 /// sees every value; larger pages are sampled at a fixed stride.
 #[inline]
+#[cfg(feature = "bitpacking")]
 fn fill_sample<T: Copy>(words: &[T], out: &mut [T; SAMPLE_SIZE]) -> usize {
     let n = words.len();
     if n <= SAMPLE_SIZE {
@@ -212,6 +229,7 @@ fn fill_sample<T: Copy>(words: &[T], out: &mut [T; SAMPLE_SIZE]) -> usize {
 }
 
 #[inline]
+#[cfg(feature = "bitpacking")]
 fn try_encode_f32(v: f32, params: AlpParams) -> Option<i32> {
     let bits = v.to_bits();
     if !v.is_finite() || bits == 0x8000_0000 {
@@ -239,6 +257,7 @@ fn try_encode_f32(v: f32, params: AlpParams) -> Option<i32> {
 }
 
 #[inline]
+#[cfg(feature = "bitpacking")]
 fn try_encode_f64(v: f64, params: AlpParams) -> Option<i64> {
     let bits = v.to_bits();
     if !v.is_finite() || bits == 0x8000_0000_0000_0000 {
@@ -271,6 +290,7 @@ fn try_encode_f64(v: f64, params: AlpParams) -> Option<i64> {
 /// equal-cost ties resolve identically. A candidate is pruned as soon as its
 /// exception cost alone reaches the current best: the full-page estimate is a
 /// superset of the partial one, so the pruned candidate cannot win.
+#[cfg(feature = "bitpacking")]
 fn select_params_f32(words: &[u32]) -> Option<AlpParams> {
     let mut sample_buf = [0u32; SAMPLE_SIZE];
     let sample_len = fill_sample(words, &mut sample_buf);
@@ -289,6 +309,7 @@ fn select_params_f32(words: &[u32]) -> Option<AlpParams> {
     best
 }
 
+#[cfg(feature = "bitpacking")]
 fn select_params_f64(words: &[u64]) -> Option<AlpParams> {
     let mut sample_buf = [0u64; SAMPLE_SIZE];
     let sample_len = fill_sample(words, &mut sample_buf);
@@ -309,6 +330,7 @@ fn select_params_f64(words: &[u64]) -> Option<AlpParams> {
 
 /// Estimated candidate cost on a small sample, or `None` when the candidate
 /// cannot beat `cutoff` (already provably worse than the current best).
+#[cfg(feature = "bitpacking")]
 fn sample_cost_f32(words: &[u32], params: AlpParams, cutoff: usize) -> Option<usize> {
     const EXCEPTION_COST: usize = 2 + 4;
     let mut exceptions = 0usize;
@@ -351,6 +373,7 @@ fn sample_cost_f32(words: &[u32], params: AlpParams, cutoff: usize) -> Option<us
 
 /// Estimated candidate cost on a small sample, or `None` when the candidate
 /// cannot beat `cutoff` (already provably worse than the current best).
+#[cfg(feature = "bitpacking")]
 fn sample_cost_f64(words: &[u64], params: AlpParams, cutoff: usize) -> Option<usize> {
     const EXCEPTION_COST: usize = 2 + 8;
     let mut exceptions = 0usize;
@@ -1797,15 +1820,6 @@ fn encode_chunk_f64_rd(
     Some([right_len as u32, 8, dict_bytes_len as u32, index_len as u32])
 }
 
-#[cfg(not(feature = "bitpacking"))]
-fn encode_page_f64_rd(
-    _words: &[u64],
-    _max_chunk: usize,
-    _raw_size: usize,
-) -> Result<Option<(MiniBlockCompressed, CompressiveEncoding)>> {
-    Ok(None)
-}
-
 /// Number of payload bytes `bitpack_out_of_line_slice_into` produces for `num_items`
 /// values at `bit_width`. Mirrors its tail padding decisions exactly.
 #[cfg(feature = "bitpacking")]
@@ -1845,6 +1859,7 @@ impl AlpMiniBlockDecompressor {
 }
 
 /// Header parsed from buffer 1. The two base values are interpreted by mode.
+#[cfg(feature = "bitpacking")]
 struct ChunkHeader {
     mode: u8,
     e: u8,
@@ -1854,6 +1869,7 @@ struct ChunkHeader {
     delta_base: i64,
 }
 
+#[cfg(feature = "bitpacking")]
 fn parse_header(header: &[u8], bits_per_value: u64) -> Result<ChunkHeader> {
     let value_bytes = (bits_per_value / 8) as usize;
     let (fixed_parts, var_parts) = match bits_per_value {
@@ -1952,6 +1968,26 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
         4
     }
 
+    #[cfg(not(feature = "bitpacking"))]
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        if num_values == 0 {
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::empty(),
+                bits_per_value: self.bits_per_value,
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }));
+        }
+        if data.len() != 4 {
+            return Err(Error::invalid_input(format!(
+                "ALP decompression expects 4 buffers, got {}",
+                data.len()
+            )));
+        }
+        Err(Error::not_supported("ALP requires bitpacking support"))
+    }
+
+    #[cfg(feature = "bitpacking")]
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         if num_values == 0 {
             return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
@@ -2049,12 +2085,14 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
 }
 
 /// ALP-RD chunk header: `[mode][d][index_bits][0][dict_len u32]`.
+#[cfg(feature = "bitpacking")]
 struct RdHeader {
     d: u8,
     index_bits: u8,
     dict_len: usize,
 }
 
+#[cfg(feature = "bitpacking")]
 fn parse_rd_header(header: &[u8]) -> Result<RdHeader> {
     if header.len() != 8 {
         return Err(Error::invalid_input(format!(
@@ -2281,6 +2319,7 @@ impl AlpMiniBlockDecompressor {
     }
 }
 
+#[cfg(feature = "bitpacking")]
 fn apply_exceptions(
     bits_per_value: u64,
     exception_positions: &LanceBuffer,

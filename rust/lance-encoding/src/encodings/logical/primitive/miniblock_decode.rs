@@ -38,6 +38,7 @@ use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
+mod admitted;
 mod structure;
 
 use super::chunk_index::{
@@ -248,6 +249,7 @@ impl DecodeMiniBlockTask {
         Ok(DecodedPage { data, repdef })
     }
 
+    #[cfg(feature = "bitpacking")]
     fn decode_inline_bitpacking_nullable<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
         &self,
         def_decompressor: &dyn BlockDecompressor,
@@ -935,7 +937,14 @@ impl DecodeMiniBlockTask {
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
-    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+    fn try_decode_in(
+        &self,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DecodedPage>> {
+        admitted::decode(self, workspace)
+    }
+
+    fn decode(mut self: Box<Self>) -> Result<DecodedPage> {
         #[cfg(feature = "bitpacking")]
         if self.rep_decompressor.is_none()
             && self.structural_projection.is_none()
@@ -1071,16 +1080,17 @@ impl DecodePageTask for DecodeMiniBlockTask {
             });
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
-            let mut group_start = 0usize;
-            while group_start < self.instructions.len() {
-                let chunk = &self.instructions[group_start].1;
-                let mut group_end = group_start + 1;
-                while group_end < self.instructions.len()
-                    && self.instructions[group_end].1.chunk_idx == chunk.chunk_idx
-                {
-                    group_end += 1;
-                }
-                let group = &self.instructions[group_start..group_end];
+            // Own the pending instructions so consumed groups stop pinning their physical
+            // input allocations while later groups allocate decoded output. Shared chunks
+            // (including slices retained by another batch) keep their existing owners.
+            let mut pending = std::mem::take(&mut self.instructions).into_iter();
+            while let Some((_, chunk)) = pending.as_slice().first() {
+                let group_len = pending
+                    .as_slice()
+                    .iter()
+                    .take_while(|(_, next)| next.chunk_idx == chunk.chunk_idx)
+                    .count();
+                let group = &pending.as_slice()[..group_len];
                 let (rep, def, value_buffers) = self.decode_chunk_sections(&chunk.data)?;
 
                 if group.len() == 1 {
@@ -1125,7 +1135,9 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     }
                 }
 
-                group_start = group_end;
+                // nth consumes and drops the preceding entries without moving the remaining
+                // instructions or allocating another group vector. Drop its last entry too.
+                drop(pending.nth(group_len - 1));
             }
 
             data_builder.finish()
@@ -2346,7 +2358,9 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Arc;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use bytes::Bytes;
@@ -2377,6 +2391,253 @@ mod tests {
         ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, MiniBlockDecoder,
         PreambleAction, Words, build_chunk_index,
     };
+
+    #[derive(Clone, Copy, Debug)]
+    enum InputOwnership {
+        Separate,
+        Coalesced,
+        CoalescedWithSibling,
+    }
+
+    struct TrackedInput {
+        bytes: Vec<u8>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl TrackedInput {
+        fn track(bytes: Vec<u8>, live: &Arc<AtomicUsize>) -> Bytes {
+            live.fetch_add(bytes.capacity(), Ordering::SeqCst);
+            Bytes::from_owner(Self {
+                bytes,
+                live: live.clone(),
+            })
+        }
+    }
+
+    impl AsRef<[u8]> for TrackedInput {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for TrackedInput {
+        fn drop(&mut self) {
+            self.live.fetch_sub(self.bytes.capacity(), Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObserveRangeDecode {
+        live: Arc<AtomicUsize>,
+        scratch: Arc<AtomicUsize>,
+        calls: Mutex<Vec<(u8, Range<u64>, usize)>>,
+        fail_on: Option<u8>,
+        allocate: bool,
+    }
+
+    impl MiniBlockDecompressor for ObserveRangeDecode {
+        fn decompress(&self, _: Vec<LanceBuffer>, _: u64) -> crate::Result<DataBlock> {
+            panic!("range selection must reach decompress_range");
+        }
+
+        fn decompress_range(
+            &self,
+            buffers: Vec<LanceBuffer>,
+            num_values: u64,
+            range: Range<u64>,
+        ) -> crate::Result<DataBlock> {
+            assert_eq!(num_values, 8);
+            assert_eq!(
+                self.scratch.load(Ordering::SeqCst),
+                0,
+                "previous decoded scratch is still live"
+            );
+            let input = buffers.into_iter().next().unwrap();
+            let marker = input[0];
+            self.calls.lock().unwrap().push((
+                marker,
+                range.clone(),
+                self.live.load(Ordering::SeqCst),
+            ));
+            if self.fail_on == Some(marker) {
+                return Err(lance_core::Error::corrupt_file_named(
+                    "lifetime-fixture",
+                    "injected range decode failure",
+                ));
+            }
+            let len = (range.end - range.start) as usize;
+            let selected = input.slice_with_length(range.start as usize, len);
+            let data = if self.allocate {
+                LanceBuffer::from_bytes(TrackedInput::track(selected.to_vec(), &self.scratch), 1)
+            } else {
+                selected
+            };
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data,
+                bits_per_value: 8,
+                num_values: len as u64,
+                block_info: BlockInfo::new(),
+            }))
+        }
+
+        fn allocates_output(&self) -> bool {
+            self.allocate
+        }
+
+        fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+            Some(num_values)
+        }
+    }
+
+    // Count the physical owner, not the small slices exposed by Bytes/Arrow. Two chunks
+    // can share one allocation; an unrelated consumer can also keep that owner alive.
+    #[rstest]
+    #[case::separate(InputOwnership::Separate, None)]
+    #[case::coalesced(InputOwnership::Coalesced, None)]
+    #[case::sibling(InputOwnership::CoalescedWithSibling, None)]
+    #[case::error(InputOwnership::Separate, Some(20))]
+    #[case::coalesced_error(InputOwnership::Coalesced, Some(20))]
+    #[case::sibling_error(InputOwnership::CoalescedWithSibling, Some(20))]
+    fn miniblock_input_owner_lifetime(
+        #[case] ownership: InputOwnership,
+        #[case] fail_on: Option<u8>,
+        #[values(false, true)] has_large_chunk: bool,
+        #[values(false, true)] allocate: bool,
+    ) {
+        const ALLOCATION: usize = 4096;
+        let live = Arc::new(AtomicUsize::new(0));
+        let scratch = Arc::new(AtomicUsize::new(0));
+        let encode = |marker: u8| {
+            let mut bytes = vec![0, 0];
+            if has_large_chunk {
+                bytes.extend_from_slice(&8_u32.to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&8_u16.to_le_bytes());
+            }
+            bytes.resize(
+                bytes.len() + lance_core::utils::bit::pad_bytes::<MINIBLOCK_ALIGNMENT>(bytes.len()),
+                0,
+            );
+            bytes.extend(marker..marker + 8);
+            bytes
+        };
+        let chunks = [encode(10), encode(20), encode(30)];
+        let independent = |encoded: &[u8]| {
+            let mut bytes = vec![0; ALLOCATION];
+            bytes[..encoded.len()].copy_from_slice(encoded);
+            TrackedInput::track(bytes, &live).slice(..encoded.len())
+        };
+        let (first, second, sibling) = match ownership {
+            InputOwnership::Separate => (independent(&chunks[0]), independent(&chunks[1]), None),
+            _ => {
+                let mut bytes = vec![0; ALLOCATION];
+                bytes[..chunks[0].len()].copy_from_slice(&chunks[0]);
+                bytes[64..64 + chunks[1].len()].copy_from_slice(&chunks[1]);
+                let bytes = TrackedInput::track(bytes, &live);
+                let sibling =
+                    matches!(ownership, InputOwnership::CoalescedWithSibling).then(|| {
+                        // Exercise the same custom-allocation bridge used by real decode output.
+                        LanceBuffer::from_bytes(bytes.slice(128..129), 1).into_buffer()
+                    });
+                (
+                    bytes.slice(..chunks[0].len()),
+                    bytes.slice(64..64 + chunks[1].len()),
+                    sibling,
+                )
+            }
+        };
+        let third = independent(&chunks[2]);
+        let instruction = |index, data: Bytes, start, count| {
+            (
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx: index,
+                        preamble: PreambleAction::Absent,
+                        rows_to_skip: 0,
+                        rows_to_take: 8,
+                        take_trailer: false,
+                    },
+                    rows_to_skip: start,
+                    rows_to_take: count,
+                    preamble_action: PreambleAction::Absent,
+                },
+                LoadedChunk {
+                    byte_range: 0..data.len() as u64,
+                    data: LanceBuffer::from_bytes(data, 1),
+                    items_in_chunk: 8,
+                    chunk_idx: index,
+                },
+            )
+        };
+        let decoder = Arc::new(ObserveRangeDecode {
+            live: live.clone(),
+            scratch: scratch.clone(),
+            calls: Default::default(),
+            fail_on,
+            allocate,
+        });
+        let task = Box::new(DecodeMiniBlockTask {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: decoder.clone(),
+            dictionary_data: None,
+            def_meaning: Arc::from([]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: vec![
+                instruction(0, first.clone(), 1, 1),
+                instruction(0, first, 3, 1),
+                instruction(1, second, 2, 1),
+                instruction(2, third, 0, 1),
+            ],
+            has_large_chunk,
+        });
+        let result = task.decode();
+        if fail_on.is_some() {
+            let error = result.err().unwrap();
+            assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("injected range decode failure"));
+        } else {
+            let result = result.unwrap();
+            assert_eq!(
+                result.data.as_fixed_width_ref().unwrap().data.as_ref(),
+                &[11, 13, 22, 30]
+            );
+        }
+        let live_after = if sibling.is_some() { ALLOCATION } else { 0 };
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            live_after,
+            "error/EOF must drop owned input"
+        );
+        assert_eq!(scratch.load(Ordering::SeqCst), 0);
+        drop(sibling);
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "last shared consumer releases allocation"
+        );
+
+        let allocations = match ownership {
+            InputOwnership::Separate => [3, 2, 1],
+            InputOwnership::Coalesced => [2, 2, 1],
+            InputOwnership::CoalescedWithSibling => [2, 2, 2],
+        };
+        let mut expected = vec![
+            (10, 1..4, allocations[0] * ALLOCATION),
+            (20, 2..3, allocations[1] * ALLOCATION),
+            (30, 0..1, allocations[2] * ALLOCATION),
+        ];
+        if fail_on.is_some() {
+            expected.truncate(2);
+        }
+        assert_eq!(
+            *decoder.calls.lock().unwrap(),
+            expected,
+            "consumed physical input remained live before the next range decode"
+        );
+    }
 
     #[test]
     fn test_miniblock_decode_uses_exact_fixed_width_output_size() {
@@ -3755,7 +4016,7 @@ mod tests {
         }
 
         // Scheduler parity across scan / single-row / partial / scattered multi-range.
-        let range_sets: Vec<Vec<std::ops::Range<u64>>> = vec![
+        let range_sets: Vec<Vec<Range<u64>>> = vec![
             vec![0..15],
             vec![0..1],
             vec![7..8],

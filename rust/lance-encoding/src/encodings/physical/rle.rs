@@ -60,7 +60,8 @@ use log::trace;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{
-    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, levels::LevelDecodePlan,
+    require_block_payload,
 };
 use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
@@ -2143,6 +2144,25 @@ impl MiniBlockDecompressor for RleDecompressor {
 }
 
 impl BlockDecompressor for RleDecompressor {
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<LevelDecodePlan<'a>> {
+        if self.bits_per_value != 16 {
+            return Err(Error::invalid_input(format!(
+                "RLE structural levels require 16-bit values, got {}",
+                self.bits_per_value
+            )));
+        }
+        if !self.values.is_identity() || !self.run_lengths.is_identity() {
+            return Err(Error::not_supported_source(
+                "Admitted RLE structural levels require flat value and run-length children".into(),
+            ));
+        }
+        LevelDecodePlan::rle(data, num_values, self.run_length_width)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "RLE")?;
         let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;

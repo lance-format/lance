@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod aimd;
+pub mod allocation;
 pub mod assume;
 pub mod backoff;
 pub mod bit;
