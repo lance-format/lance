@@ -261,9 +261,12 @@ use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
 mod late_reads;
+mod progress;
 
 pub(crate) use late_reads::LateReadGuard;
 use late_reads::{Charge, LateWindow};
+pub use progress::DrainLimit;
+use progress::{DecodeProgress, DrainPlan};
 
 /// Candidate batch sizes evaluated during byte-budget planning.
 /// Powers of 4, covering 1–16Ki rows in 8 probes.
@@ -351,47 +354,11 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
     fn data_type(&self) -> &DataType;
 }
 
-/// Result of limiting a drain request to one output array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DrainLimit {
-    /// How many requested rows fit the byte-based i32 offset budget.
-    pub rows: u64,
-    /// The variable-width bytes (at the most constrained i32-offset nesting level)
-    /// those rows consume from the caller's budget.
-    pub bytes: u64,
-    /// An independent batch-level row limit imposed by dictionary key capacity.
-    /// Unlike `rows`, this limit does not accumulate across pages.
-    /// Composites that change row coordinates must translate this limit rather
-    /// than forwarding it.
-    pub dictionary_rows: Option<u64>,
-}
-
 /// The byte budget applied to each output batch of an i32-offset column.
 ///
 /// Concatenating decoded pages into one Arrow array fails when a variable-width
 /// buffer's offsets exceed `i32::MAX`, so batches are split before that point.
 pub(crate) const I32_OFFSET_BYTE_BUDGET: u64 = i32::MAX as u64;
-
-/// Apply a plan to the requested batch size and reserve the selected rows.
-///
-/// A batch always advances by at least one row: a first row whose (possibly
-/// over-estimated) size exceeds the whole budget, or whose nested child cannot fit
-/// a declared dictionary key type, is emitted alone. A genuinely oversized value
-/// or dictionary then surfaces the same decoding error it always did, while an
-/// over-estimated value decodes fine.
-fn apply_drain_limit(limit: DrainLimit, requested_rows: u64, rows_remaining: &mut u64) -> u64 {
-    if requested_rows == 0 {
-        return 0;
-    }
-    let planned_rows = limit
-        .dictionary_rows
-        .map(|dictionary_rows| limit.rows.min(dictionary_rows))
-        .unwrap_or(limit.rows);
-    let rows = planned_rows.clamp(1, requested_rows);
-    debug_assert!(rows <= *rows_remaining);
-    *rows_remaining -= rows;
-    rows
-}
 
 /// Returns whether concatenating arrays of this type can overflow an i32 offset buffer.
 pub(crate) fn has_i32_offsets(data_type: &DataType) -> bool {
@@ -1656,10 +1623,8 @@ pub struct ReadBatchTask {
 pub struct BatchDecodeStream {
     context: DecoderContext,
     root_decoder: SimpleStructDecoder,
-    rows_remaining: u64,
+    progress: DecodeProgress,
     rows_per_batch: u32,
-    rows_scheduled: u64,
-    rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
     limit_i32_offset_batch_size: bool,
@@ -1694,10 +1659,8 @@ impl BatchDecodeStream {
         Self {
             context: DecoderContext::new(scheduled),
             root_decoder,
-            rows_remaining: num_rows,
+            progress: DecodeProgress::new(num_rows),
             rows_per_batch,
-            rows_scheduled: 0,
-            rows_drained: 0,
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
             limit_i32_offset_batch_size,
@@ -1716,14 +1679,14 @@ impl BatchDecodeStream {
     #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
-            return Ok(self.rows_scheduled);
+            return Ok(self.progress.rows_scheduled());
         }
-        while self.rows_scheduled < scheduled_need {
+        while self.progress.rows_scheduled() < scheduled_need {
             let next_message = self.context.source.recv().await;
             match next_message {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
-                    self.rows_scheduled = scan_line.scheduled_so_far;
+                    self.progress.set_rows_scheduled(scan_line.scheduled_so_far);
                     for message in scan_line.decoders {
                         self.accept_decoder(message.into_array())?;
                     }
@@ -1733,7 +1696,7 @@ impl BatchDecodeStream {
                     // means some kind of pushdown filter was applied and we didn't load as
                     // much data as we thought we would.
                     self.scheduler_exhausted = true;
-                    return Ok(self.rows_scheduled);
+                    return Ok(self.progress.rows_scheduled());
                 }
             }
         }
@@ -1742,45 +1705,22 @@ impl BatchDecodeStream {
 
     #[instrument(level = "debug", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
-        trace!(
-            "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining, self.rows_drained, self.rows_scheduled,
-        );
-        if self.rows_remaining == 0 {
+        let Some(plan) = self.progress.plan_batch(self.rows_per_batch as u64) else {
             return Ok(None);
-        }
-
-        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
-
-        let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!(
-            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
-            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
-        );
-        if scheduled_need > 0 {
-            let desired_scheduled = scheduled_need + self.rows_scheduled;
-            trace!(
-                "Draining from scheduler (desire at least {} scheduled rows)",
-                desired_scheduled
-            );
-            let actually_scheduled = self.wait_for_scheduled(desired_scheduled).await?;
-            if actually_scheduled < desired_scheduled {
-                let under_scheduled = desired_scheduled - actually_scheduled;
-                to_take -= under_scheduled;
-            }
-        }
+        };
+        let actually_scheduled = self.wait_for_scheduled(plan.end).await?;
+        let to_take = plan.rows_to_drain(actually_scheduled);
 
         if to_take == 0 {
             return Ok(None);
         }
 
-        // wait_for_loaded waits for *>* loaded_need (not >=) so we do a -1 here
-        let loaded_need = self.rows_drained + to_take - 1;
+        let last_row_needed = plan.last_row_needed(to_take);
         trace!(
-            "Waiting for I/O (desire at least {} fully loaded rows)",
-            loaded_need
+            "Waiting for I/O through row {} (inclusive)",
+            last_row_needed
         );
-        self.root_decoder.wait_for_loaded(loaded_need).await?;
+        self.root_decoder.wait_for_loaded(last_row_needed).await?;
 
         let byte_budget =
             if self.limit_i32_offset_batch_size && has_i32_offsets(self.root_decoder.data_type()) {
@@ -1790,10 +1730,9 @@ impl BatchDecodeStream {
             };
         let limit =
             LogicalPageDecoder::max_rows_to_drain(&self.root_decoder, to_take, byte_budget)?;
-        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
+        let to_take = self.progress.reserve_drain(limit, to_take);
 
         let next_task = self.root_decoder.drain(to_take)?;
-        self.rows_drained += to_take;
         Ok(Some(next_task))
     }
 
@@ -1803,7 +1742,7 @@ impl BatchDecodeStream {
                 Ok(Some(next_task)) => next_task,
                 Ok(None) => return None,
                 Err(err) => {
-                    slf.rows_remaining = 0;
+                    slf.progress.fuse_after_error();
                     return Some((
                         ReadBatchTask {
                             task: async move { Err(err) }.boxed(),
@@ -1893,10 +1832,8 @@ impl RootDecoderType for SimpleStructDecoder {
 struct BatchDecodeIterator<T: RootDecoderType> {
     messages: VecDeque<Result<DecoderMessage>>,
     root_decoder: T,
-    rows_remaining: u64,
+    progress: DecodeProgress,
     rows_per_batch: u32,
-    rows_scheduled: u64,
-    rows_drained: u64,
     emitted_batch_size_warning: Arc<Once>,
     // Note: this is not the runtime on which I/O happens.
     // That's always in the scheduler.  This is just a runtime we use to
@@ -1917,10 +1854,8 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         Self {
             messages,
             root_decoder,
-            rows_remaining: num_rows,
+            progress: DecodeProgress::new(num_rows),
             rows_per_batch,
-            rows_scheduled: 0,
-            rows_drained: 0,
             wait_for_io_runtime: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap(),
@@ -1943,15 +1878,15 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         }
     }
 
-    /// Waits for I/O until `scheduled_need` rows have been loaded
+    /// Waits for I/O until the rows in `plan` have been loaded
     ///
-    /// Note that `scheduled_need` is cumulative.  E.g. this method
+    /// Note that the plan's target is cumulative.  E.g. this method
     /// should be called with 5, 10, 15 and not 5, 5, 5
     #[instrument(level = "debug", skip_all)]
-    fn wait_for_io(&mut self, scheduled_need: u64, to_take: u64) -> Result<u64> {
-        while self.rows_scheduled < scheduled_need && !self.messages.is_empty() {
+    fn wait_for_io(&mut self, plan: DrainPlan) -> Result<u64> {
+        while self.progress.rows_scheduled() < plan.end && !self.messages.is_empty() {
             let message = self.messages.pop_front().unwrap()?;
-            self.rows_scheduled = message.scheduled_so_far;
+            self.progress.set_rows_scheduled(message.scheduled_so_far);
             for decoder_message in message.decoders {
                 match decoder_message {
                     MessageType::UnloadedPage(unloaded_page) => {
@@ -1970,42 +1905,24 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             }
         }
 
-        let loaded_need = self.rows_drained + to_take.min(self.rows_per_batch as u64) - 1;
+        let last_row_needed = plan.last_row_needed(plan.requested_rows());
 
         self.root_decoder
-            .wait(loaded_need, &self.wait_for_io_runtime)?;
-        Ok(self.rows_scheduled)
+            .wait(last_row_needed, &self.wait_for_io_runtime)?;
+        Ok(self.progress.rows_scheduled())
     }
 
     #[instrument(level = "debug", skip_all)]
     fn next_batch_task(&mut self) -> Result<Option<RecordBatch>> {
-        trace!(
-            "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining, self.rows_drained, self.rows_scheduled,
-        );
-        if self.rows_remaining == 0 {
+        let Some(plan) = self.progress.plan_batch(self.rows_per_batch as u64) else {
             return Ok(None);
-        }
-
-        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
-
-        let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!(
-            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
-            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
-        );
-        if scheduled_need > 0 {
-            let desired_scheduled = scheduled_need + self.rows_scheduled;
-            trace!(
-                "Draining from scheduler (desire at least {} scheduled rows)",
-                desired_scheduled
-            );
-            let actually_scheduled = self.wait_for_io(desired_scheduled, to_take)?;
-            if actually_scheduled < desired_scheduled {
-                let under_scheduled = desired_scheduled - actually_scheduled;
-                to_take -= under_scheduled;
-            }
-        }
+        };
+        let actually_scheduled = if self.progress.rows_scheduled() < plan.end {
+            self.wait_for_io(plan)?
+        } else {
+            self.progress.rows_scheduled()
+        };
+        let to_take = plan.rows_to_drain(actually_scheduled);
 
         if to_take == 0 {
             return Ok(None);
@@ -2014,11 +1931,9 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         let limit = self
             .root_decoder
             .max_rows_to_drain(to_take, I32_OFFSET_BYTE_BUDGET)?;
-        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
+        let to_take = self.progress.reserve_drain(limit, to_take);
 
         let next_task = self.root_decoder.drain_batch(to_take)?;
-
-        self.rows_drained += to_take;
 
         let (batch, _data_size) = next_task.into_batch(self.emitted_batch_size_warning.clone())?;
 
@@ -2033,7 +1948,7 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
         let next = self.next_batch_task().transpose();
         if let Some(Err(_)) = &next {
             // Fuse after an error instead of re-attempting every remaining batch
-            self.rows_remaining = 0;
+            self.progress.fuse_after_error();
         }
         next.map(|r| r.map_err(ArrowError::from))
     }
@@ -2107,10 +2022,8 @@ const PAGE_LOAD_CONCURRENCY: usize = 16;
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
     root_decoder: StructuralStructDecoder,
-    rows_remaining: u64,
+    progress: DecodeProgress,
     rows_per_batch: u32,
-    rows_scheduled: u64,
-    rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
     // Decode scheduling policy selected at planning time.
@@ -2162,10 +2075,8 @@ impl StructuralBatchDecodeStream {
         Self {
             context: DecoderContext::new(scheduled),
             root_decoder,
-            rows_remaining: num_rows,
+            progress: DecodeProgress::new(num_rows),
             rows_per_batch,
-            rows_scheduled: 0,
-            rows_drained: 0,
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
             spawn_batch_decode_tasks,
@@ -2179,15 +2090,15 @@ impl StructuralBatchDecodeStream {
     #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
-            return Ok(self.rows_scheduled);
+            return Ok(self.progress.rows_scheduled());
         }
         let mut pages = Vec::new();
         let mut scheduling_error = None;
-        while self.rows_scheduled < scheduled_need {
+        while self.progress.rows_scheduled() < scheduled_need {
             let next_message = self.context.source.recv().await;
             match next_message {
                 Some(Ok(scan_line)) => {
-                    self.rows_scheduled = scan_line.scheduled_so_far;
+                    self.progress.set_rows_scheduled(scan_line.scheduled_so_far);
                     pages.extend(
                         scan_line
                             .decoders
@@ -2218,21 +2129,13 @@ impl StructuralBatchDecodeStream {
         if let Some(error) = scheduling_error {
             return Err(error);
         }
-        Ok(scheduled_need.min(self.rows_scheduled))
+        Ok(scheduled_need.min(self.progress.rows_scheduled()))
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn next_batch_task(&mut self) -> Result<Option<NextDecodeTask>> {
-        trace!(
-            "Draining batch task (rows_remaining={} rows_drained={} rows_scheduled={})",
-            self.rows_remaining, self.rows_drained, self.rows_scheduled,
-        );
-        if self.rows_remaining == 0 {
-            return Ok(None);
-        }
-
-        let row_limit = self.rows_remaining.min(self.rows_per_batch as u64);
-        let mut to_take = if let Some(batch_size_bytes) = self.batch_size_bytes {
+        let row_limit = self.rows_per_batch as u64;
+        let row_limit = if let Some(batch_size_bytes) = self.batch_size_bytes {
             let feedback = self.bytes_per_row_feedback.load(Ordering::Relaxed);
             let bpr = if feedback > 0 {
                 feedback as f64
@@ -2249,23 +2152,11 @@ impl StructuralBatchDecodeStream {
         } else {
             row_limit
         };
-        let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
-        trace!(
-            "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
-            scheduled_need, self.rows_drained, to_take, self.rows_scheduled
-        );
-        if scheduled_need > 0 {
-            let desired_scheduled = scheduled_need + self.rows_scheduled;
-            trace!(
-                "Draining from scheduler (desire at least {} scheduled rows)",
-                desired_scheduled
-            );
-            let actually_scheduled = self.wait_for_scheduled(desired_scheduled).await?;
-            if actually_scheduled < desired_scheduled {
-                let under_scheduled = desired_scheduled - actually_scheduled;
-                to_take -= under_scheduled;
-            }
-        }
+        let Some(plan) = self.progress.plan_batch(row_limit) else {
+            return Ok(None);
+        };
+        let actually_scheduled = self.wait_for_scheduled(plan.end).await?;
+        let to_take = plan.rows_to_drain(actually_scheduled);
 
         if to_take == 0 {
             return Ok(None);
@@ -2276,9 +2167,8 @@ impl StructuralBatchDecodeStream {
             to_take,
             I32_OFFSET_BYTE_BUDGET,
         )?;
-        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
+        let to_take = self.progress.reserve_drain(limit, to_take);
         let next_task = self.root_decoder.drain_batch_task(to_take)?;
-        self.rows_drained += to_take;
         Ok(Some(next_task))
     }
 
@@ -2288,7 +2178,7 @@ impl StructuralBatchDecodeStream {
                 Ok(Some(next_task)) => next_task,
                 Ok(None) => return None,
                 Err(err) => {
-                    slf.rows_remaining = 0;
+                    slf.progress.fuse_after_error();
                     return Some((
                         ReadBatchTask {
                             task: async move { Err(err) }.boxed(),
@@ -4489,7 +4379,57 @@ mod tests {
         let task = stream.next_batch_task().await.unwrap().unwrap();
 
         assert_eq!(task.num_rows, 16);
-        assert_eq!(stream.rows_remaining, 284);
+        assert_eq!(stream.progress.num_rows - stream.progress.rows_drained, 284);
+    }
+
+    #[rstest::rstest]
+    #[case::scheduler_shortfall(2, 2, 10, 4, vec![2])]
+    #[case::scheduler_overshoot(100, 10, 10, 4, vec![4, 4, 2])]
+    #[case::tail_overshoot(100, 3, 3, 8, vec![3])]
+    #[tokio::test]
+    async fn test_structural_stream_clamps_to_scheduled_and_remaining(
+        #[case] scheduled_so_far: u64,
+        #[case] page_rows: u64,
+        #[case] total_rows: u64,
+        #[case] rows_per_batch: u32,
+        #[case] expected_batch_sizes: Vec<usize>,
+    ) {
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::UInt32, false)]);
+        let root_decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap();
+        let (tx, rx) = unbounded_channel();
+        let loaded_page = async move {
+            Ok(LoadedPageShard {
+                decoder: Box::new(StaticStructuralPageDecoder {
+                    num_rows: page_rows,
+                    dictionary_len: None,
+                }),
+                path: VecDeque::from([0]),
+            })
+        }
+        .boxed();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far,
+            decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(loaded_page))],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream = StructuralBatchDecodeStream::new(
+            rx,
+            rows_per_batch,
+            total_rows,
+            root_decoder,
+            /*spawn_batch_decode_tasks=*/ false,
+            None,
+        );
+        let mut batch_sizes = Vec::new();
+        while let Some(task) = stream.next_batch_task().await.unwrap() {
+            batch_sizes.push(task.num_rows as usize);
+        }
+        assert_eq!(batch_sizes, expected_batch_sizes);
     }
 
     #[test]
@@ -4709,6 +4649,35 @@ mod tests {
         let batches = decode_batches_with_byte_limit(&input_batch, 100, Some(10_000), 1).await;
         assert_eq!(batches.len(), 10);
         assert!(batches.iter().all(|batch| batch.num_rows() == 100));
+    }
+
+    #[rstest::rstest]
+    #[case::row_limit_only(None)]
+    #[case::byte_budget(Some(10_000))]
+    #[tokio::test]
+    async fn test_structural_batches_clamp_tail_to_rows_remaining(
+        #[case] batch_size_bytes: Option<u64>,
+    ) {
+        use arrow_array::Int32Array;
+
+        let num_rows: i32 = 3;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+
+        // The byte estimate clamps only the batch-size bound; `plan_batch` still
+        // clamps the request to the rows remaining, so a short tail stays one batch
+        // whether or not a byte budget is configured.
+        let batches = decode_batches_with_byte_limit(&input_batch, 8, batch_size_bytes, 1).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), num_rows as usize);
     }
 
     #[tokio::test]
