@@ -46,12 +46,13 @@ def test_dataset_initialization(temp_lance_dataset):
     assert {"id", "embedding"}.issubset(sample.keys()), "Missing required fields"
 
 
-def test_multiprocess_loading(temp_lance_dataset, capsys):
-    """Verify multi-worker data loading"""
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_multiprocess_loading(temp_lance_dataset, capsys, num_workers):
+    """Verify single- and multi-worker data loading"""
     dataset = SafeLanceDataset(temp_lance_dataset)
     loader = get_safe_loader(
         dataset,
-        num_workers=2,
+        num_workers=num_workers,
         batch_size=16,
         drop_last=False,  # Ensure full batches
     )

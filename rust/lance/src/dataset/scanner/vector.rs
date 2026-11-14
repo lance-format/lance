@@ -37,6 +37,7 @@ use lance_core::error::LanceOptionExt;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DOC_INDEX_COL;
+use lance_index::vector::warp::DEFAULT_WARP_NPROBE;
 use lance_index::vector::{DIST_COL, Query};
 use lance_linalg::distance::MetricType;
 use lance_select::RowAddrMask;
@@ -50,15 +51,17 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::index::visibility::IndexVisibility;
+use crate::io::exec::knn::warp::{WarpExec, WarpParams, warp_supports_segments};
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
-    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
+    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec, new_knn_exec_with_refinement_cache,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{
     FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LanceFilterExec, Planner, PreFilterSource,
     RowAddrMaskFilterExec, project,
 };
+use crate::session::index_caches::QuantizedRefinementOptions;
 use crate::{Error, Result};
 
 use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
@@ -446,8 +449,19 @@ impl Scanner {
                             "quantized refinement is not supported for multivector columns",
                         ));
                     }
-                    self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
+                    // XTR remains for the indices WARP cannot search.
+                    if warp_supports_segments(&self.dataset, &q.column, &index_segments).await? {
+                        self.multivec_warp_ann(
+                            &q,
+                            &index_segments,
+                            filter_plan,
+                            overlay_block.clone(),
+                        )
                         .await?
+                    } else {
+                        self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
+                            .await?
+                    }
                 }
                 _ => unreachable!(),
             };
@@ -1376,7 +1390,7 @@ impl Scanner {
         overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
-        let inner_fanout_search = new_knn_exec(
+        let inner_fanout_search = new_knn_exec_with_refinement_cache(
             self.dataset.clone(),
             index,
             q,
@@ -1384,6 +1398,21 @@ impl Scanner {
             overlay_block,
             self.external_row_mask.clone(),
             self.quantized_refine_factor,
+            self.nearest
+                .as_ref()
+                .filter(|_| {
+                    self.quantized_refine_factor.is_some()
+                        && self.filter.is_none()
+                        && filter_plan.is_empty()
+                        && self.fragments.is_none()
+                        && self.index_segments.is_none()
+                        && self.physical_row_addr_prefilter.is_none()
+                        && self.get_indexed_frags(index) == *self.dataset.fragment_bitmap
+                })
+                .map(|query| QuantizedRefinementOptions {
+                    result_count: query.k,
+                    exact_factor: query.refine_factor,
+                }),
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -1403,6 +1432,44 @@ impl Scanner {
             SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
+    }
+
+    /// Create an execution plan for WARP multivector search.
+    ///
+    /// Unlike XTR's independent per-token ANN searches, [`WarpExec`] scores
+    /// every query token against the IVF centroids once to choose its
+    /// partitions and missing-similarity estimate, scores every token of those
+    /// partitions, and merges the scores into the top k documents.
+    async fn multivec_warp_ann(
+        &self,
+        q: &Query,
+        index: &[IndexMetadata],
+        filter_plan: &ExprFilterPlan,
+        overlay_block: Option<RowAddrMask>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
+        let params = WarpParams {
+            // WARP probes a fixed count rather than expanding until k results
+            // are found, so an explicit ceiling is its default budget.
+            nprobe: q.maximum_nprobes.unwrap_or(DEFAULT_WARP_NPROBE),
+            minimum_nprobes: q.minimum_nprobes,
+            maximum_nprobes: q.maximum_nprobes,
+            search_effort: q.search_effort,
+            imputation_rank: self.warp_imputation_rank,
+            k: q.k,
+            approx_mode: q.approx_mode,
+        };
+        let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
+        Ok(Arc::new(WarpExec::new(
+            self.dataset.clone(),
+            index.to_vec(),
+            q.clone(),
+            dim,
+            params,
+            prefilter_source,
+            overlay_block,
+            self.external_row_mask.clone(),
+        )))
     }
 
     // Create an Execution plan to do ANN over multivectors

@@ -3,12 +3,13 @@
 
 """Generate the Lance 14.0.2 fixtures.
 
-Two independent sets share this directory: a branch name above the local
-atomic-creation filename budget, and the stable-row-ID layouts, which cover the
+Three independent sets share this directory: a branch name above the local
+atomic-creation filename budget, the stable-row-ID layouts, which cover the
 adaptive RowIdSequence encodings, inline row-ID metadata, and row version
-sequences.
+sequences, and a raw Blob v2 file whose footer keeps anonymous descriptor
+children as root fields.
 
-Run with: uv run --no-project --with pylance==14.0.2 datagen.py
+Run with: uv run --no-project --with pylance==14.0.2 --with pyarrow==26.0.1 datagen.py
 """
 
 import json
@@ -18,6 +19,7 @@ from tempfile import TemporaryDirectory
 
 import lance
 import pyarrow as pa
+from lance.file import LanceFileReader, LanceFileWriter
 
 EXPECTED_LANCE_VERSION = "14.0.2"
 assert lance.__version__ == EXPECTED_LANCE_VERSION, (
@@ -158,3 +160,117 @@ with open(ROOT / "expected.json", "w", encoding="utf-8") as out:
 print(
     f"Generated {len(expected)} stable-row-ID fixtures with Lance {lance.__version__}"
 )
+
+# A raw v2.2 file, not a dataset, with two top-level Blob v2 columns and one
+# nested Blob v2 column. Lance 14.0.2's raw file writer persists the anonymous
+# descriptor children as top-level footer fields, which is the historical shape
+# the raw file reader must reconstruct.
+BLOB_PREPARED_FIELDS = [
+    pa.field("kind", pa.uint8(), nullable=True),
+    pa.field("data", pa.large_binary(), nullable=True),
+    pa.field("uri", pa.utf8(), nullable=True),
+    pa.field("blob_id", pa.uint32(), nullable=True),
+    pa.field("blob_size", pa.uint64(), nullable=True),
+    pa.field("position", pa.uint64(), nullable=True),
+]
+BLOB_METADATA = {
+    "lance-encoding:blob": "true",
+    "lance-encoding:packed": "true",
+    "ARROW:extension:name": "lance.blob.v2",
+}
+
+
+def prepared_blob(rows):
+    kind, data, blob_id, blob_size, position, valid = zip(*rows)
+    return pa.StructArray.from_arrays(
+        [
+            pa.array(kind, pa.uint8()),
+            pa.array(data, pa.large_binary()),
+            pa.array([None] * len(rows), pa.utf8()),
+            pa.array(blob_id, pa.uint32()),
+            pa.array(blob_size, pa.uint64()),
+            pa.array(position, pa.uint64()),
+        ],
+        names=[field.name for field in BLOB_PREPARED_FIELDS],
+        mask=pa.array([not value for value in valid], pa.bool_()),
+    )
+
+
+raw_path = ROOT / "blob_v2_raw_reader" / "blob_v2_raw.lance"
+shutil.rmtree(raw_path.parent, ignore_errors=True)
+raw_path.parent.mkdir()
+raw_schema = pa.schema(
+    [
+        pa.field("id", pa.int32(), nullable=False),
+        pa.field(
+            "blob_a",
+            pa.struct(BLOB_PREPARED_FIELDS),
+            nullable=True,
+            metadata=BLOB_METADATA,
+        ),
+        pa.field(
+            "blob_b",
+            pa.struct(BLOB_PREPARED_FIELDS),
+            nullable=True,
+            metadata=BLOB_METADATA,
+        ),
+        pa.field(
+            "info",
+            pa.struct(
+                [
+                    pa.field(
+                        "payload",
+                        pa.struct(BLOB_PREPARED_FIELDS),
+                        nullable=True,
+                        metadata=BLOB_METADATA,
+                    )
+                ]
+            ),
+            nullable=True,
+        ),
+    ]
+)
+raw_batch = pa.RecordBatch.from_arrays(
+    [
+        pa.array([10, 20, 30], pa.int32()),
+        prepared_blob(
+            [
+                (0, b"alpha", 0, 0, 0, True),
+                (0, None, 0, 0, 0, False),
+                (0, b"", 0, 0, 0, True),
+            ]
+        ),
+        prepared_blob(
+            [
+                (0, b"red", 0, 0, 0, True),
+                (0, b"green", 0, 0, 0, True),
+                (0, None, 0, 0, 0, False),
+            ]
+        ),
+        pa.StructArray.from_arrays(
+            [
+                prepared_blob(
+                    [
+                        (0, b"nested-0", 0, 0, 0, True),
+                        (0, None, 0, 0, 0, False),
+                        (0, b"nested-2", 0, 0, 0, True),
+                    ]
+                )
+            ],
+            names=["payload"],
+        ),
+    ],
+    schema=raw_schema,
+)
+raw_writer = LanceFileWriter(str(raw_path), raw_schema, version="2.2")
+raw_writer.write_batch(raw_batch)
+assert raw_writer.close() == 3, "raw Blob v2 fixture must contain three rows"
+
+# The released reader reproduces the historical failure on this footer: it sees
+# each anonymous descriptor group as three or more extra root fields.
+try:
+    LanceFileReader(str(raw_path)).read_all().to_table()
+except ValueError as error:
+    assert "column index" in str(error), error
+else:
+    raise RuntimeError("fixture no longer reproduces the anonymous Blob v2 footer")

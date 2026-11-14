@@ -125,13 +125,14 @@ pub(crate) fn validate_segment_index_details(
 
 /// Whether optimize can fold several segments of this kind into one without
 /// rescanning the table: the kinds the single-process optimize merges rather
-/// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
+/// than rebuilds, vector, BTree, Bitmap, NGram and RTree (`merge_scalar_indices`) and
 /// Inverted (`InvertedIndex::merge_segments`).
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
     segment_has_vector_details(segment)
         || segment_has_btree_details(segment)
         || segment_has_bitmap_details(segment)
         || segment_has_ngram_details(segment)
+        || (cfg!(feature = "geo") && segment_has_rtree_details(segment))
         || segment_has_inverted_details(segment)
 }
 

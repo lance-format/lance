@@ -345,9 +345,15 @@ pub(super) async fn validate_commit(
                     "consolidation source {uuid} was replaced; replan before committing"
                 )));
             };
+            // A commit can cache the original timestamp, while a manifest read
+            // only recovers milliseconds. Compare at the persisted precision.
+            let same_created_at = source.created_at.map(|time| time.timestamp_millis())
+                == now.created_at.map(|time| time.timestamp_millis());
             let mut expected_metadata = source.clone();
             expected_metadata.fragment_bitmap = now.fragment_bitmap.clone();
-            if &expected_metadata != now
+            expected_metadata.created_at = now.created_at;
+            if !same_created_at
+                || &expected_metadata != now
                 || now.effective_fragment_bitmap(&dataset.fragment_bitmap) != Some(live.clone())
             {
                 return Err(Error::invalid_input(format!(

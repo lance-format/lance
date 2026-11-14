@@ -4,6 +4,182 @@ application and Lance will emit into it; when no recorder is installed, emission
 is a cheap no-op. Metrics are only emitted when Lance is built with the
 `metrics` feature.
 
+## Execution diagnostics
+
+Execution summaries and structured reports do not require the `metrics` feature
+or an installed process recorder. `ExecutionSummaryCounts` keeps its existing
+fields, count/time maps, and callback contract. The additive `spill_count()`,
+`spilled_bytes()`, and `spilled_rows()` accessors return `None` when no operator
+registered that measurement and `Some(0)` for a registered zero.
+
+`lance_datafusion::exec::analyze_plan_report` drains an execution batch by batch
+and returns its formatted plan, independent execution wall time, outcome, summary,
+and detailed operator measurements. Execution failures produce a partial report
+with error text. Planning/configuration errors return an error. The caller owns
+any write side effects and transaction cleanup. Do not execute the same physical
+plan again to compare reports: nodes can be one-shot or retain cumulative metrics.
+
+Detailed measurements retain the operator name, child-index path from the root,
+partition, labels, and metric kind. Counts are additive only when their producers
+describe the same quantity. Gauges remain separate. `PeakMemoryUsage` is exposed
+as an operator peak in bytes; summing operator or partition peaks does not produce
+a query peak. Custom nonnumeric metrics, timestamps, and unsupported readings are
+omitted, not replaced by zero.
+
+| Measurement | Unit | Scope and aggregation |
+| --- | --- | --- |
+| `iops`, `requests`, `bytes_read` | operations, requests, bytes | Existing attributed query I/O; sums instrumented producers. Separate from process object-store totals. |
+| `index_cache_hits`, `index_cache_misses` | page lookups | Query boundaries already instrumented. A hit includes sharing a successful in-flight load; streaming bypasses count as misses. |
+| ANN/FTS stage timers and operator `elapsed_compute` | nanoseconds in maps | Stage/operator sums can overlap and include waits; never sum these into query latency. |
+| `spill_count`, `spilled_bytes`, `spilled_rows` | files, bytes, rows | DataFusion operator spill variants, summed once. Excludes scratch and replay producers. |
+| `current_mem_used`, operator peak memory | bytes | Individual producer gauges/peaks, preserved without aggregation. Names depend on the operator. |
+| `pool_peak_reserved_bytes` | bytes | Fresh operation pool's maximum simultaneous DataFusion reservations. Not RSS, cache policy weight, allocator retention, or all Arrow allocations. |
+| `merge_write_time` | nanoseconds | Inclusive lazy merge sink execution, including upstream waits and writes. On the imperative scalar-index route, inclusive orchestration including interleaved planning/staging. Overlaps join timers. |
+
+The default structured analyzer creates a fresh `PeakRecordingPool` around the
+configured DataFusion pool. It preserves memory limits and starts no process
+sampler. The context-taking analyzer reports the supplied pool's lifetime peak
+when it is a `PeakRecordingPool`; otherwise the reading is absent. That reading
+is exclusive to an operation only when its context is operation-owned.
+
+`execute_plan_with_diagnostics` provides an opt-in terminal callback: once on
+successful exhaustion, first stream error, or early drop. Error and cancellation
+snapshots are partial and can precede background task shutdown. The existing scan
+statistics callback still runs only on exhaustion. Callback code must not panic.
+
+For cold/warm query diagnosis, compare separate executions under the same session:
+check attributed I/O and page cache lookups, then inspect operator stage times.
+HNSW graph/codebook lookups remain outside the existing cache counters. Physical
+bitmap batch `output_rows` is not a logical candidate count. Search-specific
+comparisons retain their producer-specific meaning; no per-document FTS counters
+are added.
+
+## Merge-insert analysis
+
+`MergeInsertJob::analyze_plan_report`, `analyze_plan_report_batches`, and
+`analyze_plan_report_provider` return `MergeInsertAnalysis`. The Python
+`MergeInsertBuilder.analyze_plan_report` returns a typed dictionary with the same
+units and availability. Java's `Dataset.analyzeMergeInsert` accepts an Arrow stream
+and returns a protobuf-backed `MergeInsertAnalysis` with typed accessors. The wire
+message is runtime transport and is never stored in a dataset. Existing text APIs
+retain their signatures and plan-only eligibility.
+Materialized input retains its statistics; streaming and deduplicated input use
+their actual execution routes. Join strategy, partition mode, and physical join
+type come from the physical nodes, without parsing plan text.
+The report's `operation_id` is also attached to the `merge_insert_analysis`
+tracing span. It is never exported as a process metric label.
+
+Analysis executes writes without committing a dataset version, then deletes
+uncommitted data/deletion files and managed blob payloads. Cleanup failures are
+logged and left for orphan cleanup. Dropping the analysis future can interrupt
+cleanup. Logical change statistics are absent after failed execution. Data-file
+bytes exclude deletion files, blob payloads, and all spill producers. Touched
+fragments count existing fragments modified or removed, excluding new fragments.
+Structured reporting also supports the current scalar-index writer when every
+join column is indexed and `when_not_matched_by_source=Keep`. It runs the existing
+uncommitted writer, preserving source routing, first-seen deduplication, and
+resource limits. Legacy writers and unsupported configurations return
+`NotSupported`.
+
+The root plan has identity zero. `subplans` captures separately executed plans
+before releasing them: `index_probe`, `indexed_source_sort`, `indexed_join`, and
+`fragment_update_sort`.
+Each has an operation-local nonzero `id`, purpose, execution snapshot, and joins.
+Operator child paths are local to that identity; a join's `subplan_id` resolves
+its path. Indexed orchestration has no root operator tree; its physical nodes
+live in subplans. Completed, failed, and dropped streams each finalize once.
+
+| Report field | Meaning and availability |
+| --- | --- |
+| `operator_spills` | Root/nested operators and the indexed-source materialization barrier's DataFusion spill counts, rows, and bytes, each producer counted once. Read bytes/times are absent unless registered. |
+| `replay_spills` | Operation-owned Arrow replay files for source normalization, mapped targets, and fragment-update staging; includes IPC metadata and repeated reads. An entirely buffered operation reports zero. |
+| `scratch_spills` | Absent for current merge routes, which allocate no scratch-store files. Other scratch users require an allocation-owner scope; session snapshot subtraction is never used. |
+| `target_rows_read`, `fragments_read` | Logical target-scan visits, excluding native source scans, including self-merges. Repeated reads count again; these are not unique target/fragment cardinalities. Absent without an attributable producer. |
+| `index_used` | True when the scalar probe ran, false for an observed non-indexed execution, absent when failure prevented observation. |
+| `join_index_segments` | Distinct segment UUIDs selected for opening by actual probes, including cache-served opens. Zero for a measured non-indexed execution; absent when index use is unavailable. |
+| `join_duration` / `join_duration_ns` | Actual join-node times. Overlap the inclusive `merge_write_duration` / `merge_write_duration_ns`; neither is an exclusive phase measurement. |
+| `joined_rows` | Join output before merge actions, including repeated matches, when registered. |
+| `mapped_target_rows` | Distinct target addresses emitted by index mapping; an upper bound on matching rows, absent without a mapper. Bitmap payload batch rows are never substituted. |
+
+Rust durations are `Duration`; Python and Java durations use integer nanoseconds.
+Byte fields are integer bytes. Optional fields preserve absent versus measured
+zero. Replay and nested measurements are operation-owned even when executions
+share caches and disk quotas. Snapshots follow stream finalization and best-effort
+uncommitted-file cleanup; outstanding I/O and delayed reclamation may advance
+lifetime counters after a failed or cancelled snapshot. Pool peaks measure only
+DataFusion reservations and must not be interpreted as process memory.
+
+```python
+report = dataset.merge_insert("id").when_matched_update_all().analyze_plan_report(source)
+if report["outcome"] == "complete":
+    print(report["write_mode"], report["stats"], report["fragments_touched"])
+    print(report["replay_spills"]["bytes_written"], report["operator_spills"]["bytes_written"])
+else:
+    print(report["error"])
+    # Complete change statistics are unavailable; partial producer readings remain useful.
+    print(report["replay_spills"], report["subplans"])
+```
+
+```java
+MergeInsertAnalysis report = dataset.analyzeMergeInsert(params, sourceStream);
+if (report.getExecution().getOutcome() == MergeInsertAnalysis.Outcome.FAILED) {
+  report.getExecution().getError().ifPresent(System.err::println);
+}
+report.getReplaySpills().getBytesWritten().ifPresent(System.out::println);
+```
+
+For index maintenance, use the existing stage progress callbacks and traces
+alongside scratch usage. Progress totals keep their original units. Process
+RSS/cgroup observation and session cache diagnostics remain owned by their
+existing upstream projects; these diagnostics introduce no competing sampler.
+
+## Scratch spills
+
+`LocalSpillStore::metrics().snapshot()` reports cumulative traffic and physical
+lifetime accounting, with measured zero before the first spill. To attribute
+concurrent jobs sharing a store, allocate a `LocalSpillStore::scope()` per job.
+Scopes share the directory, unique file allocator, and authoritative quota, but
+have independent accounting. Parent metrics cover only allocations through that
+parent; subtracting snapshots of a session-shared store is not attribution.
+
+Accepted bytes include buffered writes. Successfully transferred write/read
+bytes are separate; repeated replay of scratch readers counts repeated reads.
+Charged bytes include accepted writes that fail or are aborted, and are released
+only after successful deletion (or confirmed absence). Failed cleanup retains
+both the charge and live-file count through retries and directory cleanup.
+Retain the metrics handle after the operation to observe delayed reclamation.
+Snapshots are observational and not atomic across fields. Peak charged bytes
+measure retained accepted storage, excluding transient unaccepted reservations.
+
+With the `metrics` feature and a recorder, the following bounded process
+aggregates are exported. Python/Java OpenTelemetry bridges register their units.
+They have no operation/dataset labels. The duration histogram has only the
+bounded `operation=read|write` label.
+
+| Metric | Type | Unit |
+| --- | --- | --- |
+| `lance_spill_accepted_bytes_total` | counter | bytes |
+| `lance_spill_write_bytes_total` | counter | bytes |
+| `lance_spill_read_bytes_total` | counter | bytes |
+| `lance_spill_files_created_total` | counter | paths allocated |
+| `lance_spill_charged_bytes` | gauge | bytes retained |
+| `lance_spill_live_files` | gauge | paths not yet reclaimed |
+| `lance_spill_quota_failures_total` | counter | quota rejections |
+| `lance_spill_cleanup_failures_total` | counter | deletion attempts failed |
+| `lance_spill_io_duration_seconds` | histogram | seconds of local I/O, excluding blocking-pool queue wait |
+
+Call `lance_io::spill::describe_metrics()` after installing a Rust recorder.
+These scratch metrics exclude DataFusion operator spills and Arrow replay
+spills. `SpillReceiver::metrics()` and `spilling_table_provider_with_metrics`
+expose a separate `ReplaySpillUsage` scope for Arrow replay files. It measures
+successful underlying read/write bytes (including IPC metadata and read-ahead),
+spill file count, and I/O durations. An entirely buffered source reports measured
+zero; repeated scans count repeated reads. Replay storage shares the job's disk
+manager/quota where configured, without duplicating its physical quota accounting.
+Do not add dataset object-store
+snapshots, scratch totals, and operator counters as if they were one exact query
+I/O total.
+
 ## Object store metrics
 
 These track I/O against the underlying object store. The `base` label

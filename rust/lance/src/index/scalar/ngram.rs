@@ -47,7 +47,7 @@ pub(in crate::index) async fn merge_segments(
     // All source segments must belong to the same column.
     let reference_fields = segments[0].fields.as_slice();
     for segment in segments.iter().skip(1) {
-        if segment.fields.as_slice() != reference_fields {
+        if !segment.declares_same_fields(&segments[0]) {
             return Err(Error::invalid_input(format!(
                 "NGram merge_segments: segment {} has fields {:?}, expected {:?}",
                 segment.uuid, segment.fields, reference_fields,
