@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::metrics::reserve_index_load;
+use lance_core::cache::CacheTier;
 
 pub(super) struct PostingFileMetadata {
     schema: lance_core::datatypes::Schema,
@@ -728,17 +730,30 @@ impl PostingListReader {
         end: u32,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
+        let key = posting_list_group_cache_key(start, end, self.has_impacts);
+        let reservation = reserve_index_load(metrics, || async {
+            if self.index_cache.peek_tier_with_key(&key).await != CacheTier::Absent {
+                return Ok(0);
+            }
+            self.reader
+                .get()
+                .await?
+                .estimate_read(
+                    &[start as usize..end as usize],
+                    Some(&self.posting_group_columns()),
+                )
+                .await
+        })
+        .await?;
         let result = self
             .index_cache
-            .get_or_insert_with_key_hit(
-                posting_list_group_cache_key(start, end, self.has_impacts),
-                || async move {
-                    metrics.record_part_load();
-                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
-                    self.load_posting_list_group(start, end).await
-                },
-            )
+            .get_or_insert_with_key_hit(key, || async move {
+                metrics.record_part_load();
+                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
+                self.load_posting_list_group(start, end).await
+            })
             .await;
+        drop(reservation);
         match &result {
             Ok((_, true)) => metrics.record_index_cache_hit(),
             _ => metrics.record_index_cache_miss(),
@@ -861,19 +876,27 @@ impl PostingListReader {
         self.grouping.range_for_token(token_id, self.len())
     }
 
-    /// Read rows `[start, end)` into one compact Arrow-backed cache value.
-    /// Positions are excluded; phrase queries load them on demand via
-    /// [`Self::read_positions`].
-    async fn load_posting_list_group(&self, start: u32, end: u32) -> Result<PostingListGroup> {
+    /// The columns a posting group holds.
+    fn posting_group_columns(&self) -> Vec<&'static str> {
         let mut columns = vec![POSTING_COL, MAX_SCORE_COL, LENGTH_COL];
         if self.has_impacts {
             columns.push(IMPACT_COL);
         }
+        columns
+    }
+
+    /// Read rows `[start, end)` into one compact Arrow-backed cache value.
+    /// Positions are excluded; phrase queries load them on demand via
+    /// [`Self::read_positions`].
+    async fn load_posting_list_group(&self, start: u32, end: u32) -> Result<PostingListGroup> {
         let batch = self
             .reader
             .get()
             .await?
-            .read_range(start as usize..end as usize, Some(&columns))
+            .read_range(
+                start as usize..end as usize,
+                Some(&self.posting_group_columns()),
+            )
             .await?;
         PostingListGroup::new_packed_with_block_size(
             batch.shrink_to_fit()?,

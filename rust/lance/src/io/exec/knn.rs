@@ -72,6 +72,7 @@ use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, mask_selects_nothing};
 use crate::index::vector::ivf::VectorQueryContract;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
+use crate::session::Session;
 use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
 use lance_arrow::*;
@@ -133,6 +134,17 @@ impl AnnIndexMetrics {
             segments_skipped: metrics.new_count(INDEX_SEGMENTS_SKIPPED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
+    }
+
+    /// Loads index data under the session's read memory budget; see
+    /// [`IndexMetrics::with_read_budget`].
+    pub fn with_read_budget(
+        mut self,
+        session: &Session,
+        context: &Arc<datafusion::execution::TaskContext>,
+    ) -> Self {
+        self.index_metrics = self.index_metrics.with_read_budget(session, context);
+        self
     }
 }
 
@@ -2545,7 +2557,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 HashSet::new()
             });
         let prefilter_source = self.prefilter_source.clone();
-        let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            AnnIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
 

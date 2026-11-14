@@ -21,6 +21,7 @@ ignored = ["tracing-chrome"]
 
 [dependencies]
 arc-swap = { workspace = true }
+async-channel.workspace = true
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }

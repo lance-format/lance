@@ -514,7 +514,10 @@ impl ExecutionPlan for PhraseQueryExec {
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
         let metrics_set = self.metrics.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let column = query.column.ok_or(DataFusionError::Execution(format!(

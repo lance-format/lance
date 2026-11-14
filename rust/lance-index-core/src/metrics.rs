@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use lance_core::Result;
+use lance_io::read_budget::{BudgetReader, Reservation};
 
 /// Coarse ANN stage timings. Durations are cumulative wall times, including waits.
 /// Nested stages and concurrent partitions overlap; these are not additive query latency.
@@ -197,6 +201,38 @@ pub trait MetricsCollector: Send + Sync {
     /// normal, uninstrumented read path).
     fn io_stats(&self) -> Option<lance_io::scheduler::IoStats> {
         None
+    }
+
+    /// A reader of the query's read memory budget for loading index data.
+    /// Each call may return a fresh reader of the same query. The default
+    /// returns `None`: index loads are not budgeted.
+    fn read_budget(&self) -> Option<BudgetReader> {
+        None
+    }
+}
+
+/// Waits for the query's read memory budget to admit an index load, before the
+/// load starts, and returns the reservation to hold until it finishes.
+///
+/// `estimate` gives the bytes the load reads and decodes, or 0 when there is
+/// nothing to load (for example because the data is cached); it only runs
+/// when `metrics` has a budget. Never call this from inside a cache's
+/// single-flight loader: other queries waiting on that loader could hold the
+/// memory this one waits for.
+pub async fn reserve_index_load<F, Fut>(
+    metrics: &dyn MetricsCollector,
+    estimate: F,
+) -> Result<Option<Reservation>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<u64>>,
+{
+    let Some(reader) = metrics.read_budget() else {
+        return Ok(None);
+    };
+    match estimate().await? {
+        0 => Ok(None),
+        bytes => Ok(Some(reader.admission().reserve(bytes).await)),
     }
 }
 

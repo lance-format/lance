@@ -12,7 +12,7 @@ use std::{
 };
 
 use arrow_array::RecordBatchReader;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
@@ -21,8 +21,9 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
+        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, ListReadMode, PageEncoding,
+        PageInfo, ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
+        schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
 };
@@ -35,6 +36,7 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{BLOB_V2_DESC_LANCE_FIELD, Field, Schema},
 };
+use lance_encoding::format::metadata::page_layout;
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
 use lance_io::{
@@ -1964,7 +1966,95 @@ impl FileMetadataProvider {
     }
 }
 
+/// What reading some rows of a file loads, estimated from its metadata.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReadEstimate {
+    /// Bytes on disk.
+    pub bytes: u64,
+    /// Bytes the rows take once decoded. Fixed-width values take their width,
+    /// and dictionary pages their average item per value; other pages count
+    /// their bytes on disk.
+    pub decoded_bytes: u64,
+    /// The part of `bytes` whose decoded size the metadata does not give, such
+    /// as compressed strings, counted at its size on disk in `decoded_bytes`.
+    pub unknown_bytes: u64,
+}
+
+impl std::ops::Add for ReadEstimate {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes + other.bytes,
+            decoded_bytes: self.decoded_bytes + other.decoded_bytes,
+            unknown_bytes: self.unknown_bytes + other.unknown_bytes,
+        }
+    }
+}
+
+impl std::iter::Sum for ReadEstimate {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |sum, estimate| sum + estimate)
+    }
+}
+
 impl DecodeEngine {
+    /// What reading `ranges` of `projection` loads. A page that a range covers
+    /// only in part is read only in part, so each overlapping page counts in
+    /// proportion to the rows read from it.
+    async fn estimate_read(
+        &self,
+        ranges: &[Range<u64>],
+        projection: &ReaderProjection,
+    ) -> Result<ReadEstimate> {
+        let (prepared, read_len) = self
+            .read_projection
+            .prepare(
+                &self.metadata_provider,
+                projection,
+                &self.scheduler,
+                &self.cache,
+            )
+            .await?;
+        let projection = &prepared.decoder_projection;
+        let mut leaves = Vec::new();
+        leaf_columns(
+            &projection.schema.fields,
+            &self.options.decoder_config.list_structure,
+            LeafColumn {
+                structure_only: false,
+                row_width: Some(1.0),
+            },
+            &mut leaves,
+        );
+        // 2.0 files with nested fields do not have one column per leaf, so
+        // their columns get no per-leaf facts.
+        if leaves.len() != projection.column_indices.len() {
+            leaves.clear();
+        }
+        // With full metadata the prepared columns are every column of the file;
+        // the projection's column indices are the ones read.
+        let columns =
+            projection
+                .column_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(position, index)| {
+                    let leaf = leaves.get(position);
+                    if leaf.is_some_and(|leaf| leaf.structure_only) {
+                        return None;
+                    }
+                    let row_width = leaf.and_then(|leaf| leaf.row_width);
+                    Some((prepared.column_infos.get(*index as usize)?, row_width))
+                });
+        Ok(estimate_read_in_ranges(
+            columns,
+            ranges,
+            read_len,
+            self.scheduler.coalesce_gap(),
+        ))
+    }
+
     pub(crate) fn try_new(
         scheduler: Arc<dyn EncodingsIo>,
         base_projection: ReaderProjection,
@@ -2389,6 +2479,17 @@ impl FileReader {
             .await
     }
 
+    /// Estimates what reading `ranges` (sorted and disjoint) of `projection`
+    /// loads.
+    pub async fn estimate_read(
+        &self,
+        ranges: &[Range<u64>],
+        projection: Option<ReaderProjection>,
+    ) -> Result<ReadEstimate> {
+        let projection = projection.unwrap_or_else(|| self.base_projection().clone());
+        self.core.estimate_read(ranges, &projection).await
+    }
+
     pub async fn read_tasks(
         &self,
         params: ReadBatchParams,
@@ -2561,6 +2662,17 @@ impl ProjectedFileReader {
         self.core.metadata_provider.version()
     }
 
+    /// Estimates what reading `ranges` (sorted and disjoint) of `projection`
+    /// loads.
+    pub async fn estimate_read(
+        &self,
+        ranges: &[Range<u64>],
+        projection: Option<ReaderProjection>,
+    ) -> Result<ReadEstimate> {
+        let projection = projection.unwrap_or_else(|| self.base_projection().clone());
+        self.core.estimate_read(ranges, &projection).await
+    }
+
     pub async fn read_tasks(
         &self,
         params: ReadBatchParams,
@@ -2582,6 +2694,232 @@ impl ProjectedFileReader {
         self.read_prepared_tasks(params, batch_size, prepared, read_len, filter)
             .await
     }
+}
+
+/// What the estimate needs to know about one leaf column.
+#[derive(Clone, Copy)]
+struct LeafColumn {
+    /// Read for list structure only, so its values' pages are skipped.
+    structure_only: bool,
+    /// Decoded bytes per row, where the type fixes it.
+    row_width: Option<f64>,
+}
+
+/// Each leaf column of `fields`, in column order. `parent` carries what the
+/// enclosing fields pass down: a list's read mode, and the values per row of
+/// fixed-size lists (as `row_width`).
+fn leaf_columns(
+    fields: &[lance_core::datatypes::Field],
+    list_structure: &BTreeMap<i32, ListReadMode>,
+    parent: LeafColumn,
+    columns: &mut Vec<LeafColumn>,
+) {
+    for field in fields {
+        let data_type = field.data_type();
+        let structure_only = parent.structure_only || list_structure.contains_key(&field.id);
+        if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
+            let width = (field.children.is_empty() && !field.is_blob())
+                .then(|| fixed_width(&data_type))
+                .flatten();
+            columns.push(LeafColumn {
+                structure_only,
+                row_width: parent.row_width.zip(width).map(|(n, width)| n * width),
+            });
+        } else {
+            let values_per_row = match data_type {
+                DataType::FixedSizeList(_, size) => parent.row_width.map(|n| n * size as f64),
+                DataType::Struct(_) => parent.row_width,
+                _ => None,
+            };
+            let parent = LeafColumn {
+                structure_only,
+                row_width: values_per_row,
+            };
+            leaf_columns(&field.children, list_structure, parent, columns);
+        }
+    }
+}
+
+/// The decoded bytes of one value of `data_type`, if every value takes the same.
+fn fixed_width(data_type: &DataType) -> Option<f64> {
+    match data_type {
+        DataType::Boolean => Some(0.125),
+        DataType::FixedSizeList(item, size) => {
+            fixed_width(item.data_type()).map(|width| width * *size as f64)
+        }
+        _ => data_type.primitive_width().map(|width| width as f64),
+    }
+}
+
+/// What reading `ranges` (sorted and disjoint) of `columns` loads, walking
+/// each column's pages and the ranges together.
+///
+/// A range loads the encoded units holding its rows: whole chunks of a
+/// mini-block page, after the page's chunk metadata, repetition index and
+/// dictionary; a proportional share of other pages. Parts at most
+/// `coalesce_gap` bytes apart are read together with the bytes between them.
+fn estimate_read_in_ranges<'a>(
+    columns: impl Iterator<Item = (&'a Arc<ColumnInfo>, Option<f64>)>,
+    ranges: &[Range<u64>],
+    num_rows: u64,
+    coalesce_gap: u64,
+) -> ReadEstimate {
+    debug_assert!(
+        ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+        "ranges must be sorted and disjoint: {ranges:?}"
+    );
+    let mut bytes = 0.0;
+    let mut decoded_bytes = 0.0;
+    let mut unknown_bytes = 0.0;
+    for (column, row_width) in columns {
+        // Pages count their column's own values, such as a fixed-size list's
+        // items, so scale them to the file's rows; a page's starting row (its
+        // priority) is already in rows.
+        let column_rows: u64 = column.page_infos.iter().map(|page| page.num_rows).sum();
+        if column_rows == 0 || num_rows == 0 {
+            continue;
+        }
+        let values_per_row = column_rows as f64 / num_rows as f64;
+        // Older files leave the priority at zero, so fall back to counting rows
+        // from the first page.
+        let mut next_start = 0.0;
+        // The first range that may overlap the current page or a later one.
+        let mut first_range = 0;
+        for page in column.page_infos.iter() {
+            let page_rows = page.num_rows as f64 / values_per_row;
+            let start = if page.priority > 0 {
+                page.priority as f64
+            } else {
+                next_start
+            };
+            let end = start + page_rows;
+            next_start = end;
+            // Pages are in row order: none past the last range is read.
+            if ranges.last().is_none_or(|last| last.end as f64 <= start) {
+                break;
+            }
+            if page.num_rows == 0 {
+                continue;
+            }
+            while first_range < ranges.len() && ranges[first_range].end as f64 <= start {
+                first_range += 1;
+            }
+            let overlapping: Vec<(f64, f64)> = ranges[first_range..]
+                .iter()
+                .take_while(|range| (range.start as f64) < end)
+                .map(|range| ((range.start as f64).max(start), (range.end as f64).min(end)))
+                .filter(|(from, to)| from < to)
+                .collect();
+            if overlapping.is_empty() {
+                continue;
+            }
+            let page_bytes: u64 = page
+                .buffer_offsets_and_sizes
+                .iter()
+                .map(|(_, size)| size)
+                .sum();
+            let page_bytes = page_bytes as f64;
+            // The parts of the page the ranges load, in page byte offsets.
+            let (fixed, loaded): (f64, Vec<(f64, f64)>) = match mini_block_chunks(page) {
+                Some((num_chunks, data_bytes)) => {
+                    // Chunks are assumed to hold equal shares of the page's rows.
+                    let rows_per_chunk = page_rows / num_chunks as f64;
+                    let chunk_bytes = data_bytes as f64 / num_chunks as f64;
+                    let loaded = overlapping
+                        .iter()
+                        .map(|(from, to)| {
+                            let first = ((from - start) / rows_per_chunk).floor();
+                            let last = ((to - start) / rows_per_chunk)
+                                .ceil()
+                                .min(num_chunks as f64);
+                            (first * chunk_bytes, last * chunk_bytes)
+                        })
+                        .collect();
+                    (page_bytes - data_bytes as f64, loaded)
+                }
+                None => {
+                    let bytes_per_row = page_bytes / page_rows;
+                    let loaded = overlapping
+                        .iter()
+                        .map(|(from, to)| {
+                            ((from - start) * bytes_per_row, (to - start) * bytes_per_row)
+                        })
+                        .collect();
+                    (0.0, loaded)
+                }
+            };
+            let mut units = 0.0;
+            let mut loaded_end: Option<f64> = None;
+            for (from, to) in loaded {
+                let from = loaded_end.map_or(from, |end| from.max(end));
+                if to <= from {
+                    continue;
+                }
+                units += to - from;
+                // The bytes between two loaded parts are read too when the
+                // parts are close enough to be read together.
+                if let Some(end) = loaded_end
+                    && from - end <= coalesce_gap as f64
+                {
+                    units += from - end;
+                }
+                loaded_end = Some(to);
+            }
+            // The frozen 2.0 and unstable 2.3 encodings read more around a range
+            // than its rows; allow one coalescing gap per range for them.
+            if !matches!(page.encoding, PageEncoding::Structural(_)) {
+                units += (overlapping.len() as u64).saturating_mul(coalesce_gap) as f64;
+            }
+            let loaded = (fixed + units).min(page_bytes);
+            bytes += loaded;
+            let rows: f64 = overlapping.iter().map(|(from, to)| to - from).sum();
+            decoded_bytes += match (row_width, dictionary_item_bytes(page)) {
+                (Some(row_width), _) => rows * row_width,
+                (None, Some(item_bytes)) => rows * values_per_row * item_bytes,
+                (None, None) => {
+                    unknown_bytes += loaded;
+                    loaded
+                }
+            };
+        }
+    }
+    ReadEstimate {
+        bytes: bytes.ceil() as u64,
+        decoded_bytes: decoded_bytes.ceil() as u64,
+        unknown_bytes: unknown_bytes.ceil() as u64,
+    }
+}
+
+/// The average size of a dictionary-encoded mini-block page's dictionary
+/// items, which every value decodes to. A few distinct wide values can store
+/// in a few bytes per row and decode to megabytes.
+fn dictionary_item_bytes(page: &PageInfo) -> Option<f64> {
+    let PageEncoding::Structural(layout) = &page.encoding else {
+        return None;
+    };
+    let Some(page_layout::Layout::MiniBlockLayout(mini_block)) = &layout.layout else {
+        return None;
+    };
+    if mini_block.dictionary.is_none() || mini_block.num_dictionary_items == 0 {
+        return None;
+    }
+    let (_, dictionary_bytes) = *page.buffer_offsets_and_sizes.get(2)?;
+    Some(dictionary_bytes as f64 / mini_block.num_dictionary_items as f64)
+}
+
+/// The number of chunks of a mini-block page and the size of its chunk data,
+/// or `None` for other layouts. Each chunk has one metadata word.
+fn mini_block_chunks(page: &PageInfo) -> Option<(u64, u64)> {
+    let PageEncoding::Structural(layout) = &page.encoding else {
+        return None;
+    };
+    let Some(page_layout::Layout::MiniBlockLayout(mini_block)) = &layout.layout else {
+        return None;
+    };
+    let word_bytes = if mini_block.has_large_chunk { 4 } else { 2 };
+    let (_, metadata_bytes) = *page.buffer_offsets_and_sizes.first()?;
+    let (_, data_bytes) = *page.buffer_offsets_and_sizes.get(1)?;
+    Some(((metadata_bytes / word_bytes).max(1), data_bytes))
 }
 
 /// Inspects a page and returns a String describing the page's encoding
@@ -2742,7 +3080,7 @@ mod tests {
         LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
         UInt8Array, UInt32Array, UInt64Array,
         cast::AsArray,
-        types::{Float64Type, Int8Type, Int32Type, UInt8Type, UInt32Type, UInt64Type},
+        types::{Float32Type, Float64Type, Int8Type, Int32Type, UInt8Type, UInt32Type, UInt64Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -2772,7 +3110,7 @@ mod tests {
     use crate::reader::{
         EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
     };
-    use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
+    use crate::testing::{FsFixture, WrittenFile, open_lance_file, test_cache, write_lance_file};
     use crate::version::{ConcreteFileVersion, LanceFileVersion};
     use crate::versions;
     use crate::writer::{FileWriterOptions, PAGE_BUFFER_ALIGNMENT};
@@ -3675,6 +4013,255 @@ mod tests {
         let reader = reader.into_reader_rows(RowCount::from(1000), BatchCount::from(100));
 
         write_lance_file(reader, fs, version, FileWriterOptions::default()).await
+    }
+
+    /// A few wide values repeated store as a small dictionary and decode to
+    /// every row's full width, which the estimate reads from the page.
+    #[tokio::test]
+    async fn test_estimate_read_decodes_dictionary_pages() {
+        const ROWS: usize = 8192;
+        const VALUE_BYTES: usize = 1024;
+        let values: Vec<String> = (0..ROWS)
+            .map(|row| ["a", "b"][row % 2].repeat(VALUE_BYTES))
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+            .unwrap();
+        let fs = FsFixture::default();
+        let data = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        write_lance_file(
+            data,
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let file_reader = open_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FileReaderOptions::default(),
+        )
+        .await;
+        let estimate = file_reader
+            .estimate_read(&[0..ROWS as u64], None)
+            .await
+            .unwrap();
+        let decoded = (ROWS * VALUE_BYTES) as u64;
+        assert!(estimate.bytes < decoded / 20, "{estimate:?}");
+        assert!(
+            (decoded * 9 / 10..decoded * 11 / 10).contains(&estimate.decoded_bytes),
+            "{estimate:?}"
+        );
+        // Half the rows decode to half the bytes.
+        let half = file_reader
+            .estimate_read(&[0..ROWS as u64 / 2], None)
+            .await
+            .unwrap();
+        assert!(
+            (decoded * 9 / 20..decoded * 11 / 20).contains(&half.decoded_bytes),
+            "{half:?}"
+        );
+    }
+
+    /// Fixed-width values decode to their width however they are stored, so
+    /// only the strings' decoded size is left unknown.
+    #[rstest]
+    #[tokio::test]
+    async fn test_estimate_read_knows_fixed_width_decoded_size(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        const ROWS: u64 = 4096;
+        let fs = FsFixture::default();
+        let data = gen_batch()
+            .col("constant", array::fill::<arrow_array::types::Int64Type>(7))
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .col("flag", array::cycle::<Int8Type>(vec![0, 1]))
+            .col("text", array::rand_utf8(16.into(), false))
+            .into_reader_rows(RowCount::from(ROWS), BatchCount::from(1));
+        write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+        let file_reader = open_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FileReaderOptions::default(),
+        )
+        .await;
+        for rows in [0..ROWS, 100..1100] {
+            let estimate = file_reader
+                .estimate_read(std::slice::from_ref(&rows), None)
+                .await
+                .unwrap();
+            let fixed = (rows.end - rows.start) * (8 + 8 * 4 + 1);
+            assert_eq!(
+                estimate.decoded_bytes - estimate.unknown_bytes,
+                fixed,
+                "{version:?} {estimate:?}"
+            );
+            assert!(estimate.unknown_bytes > 0, "{version:?} {estimate:?}");
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_estimate_read(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        const ROWS: u64 = 64 * 1024;
+        const BIG_BYTES_PER_ROW: u64 = 1024;
+        const DIMENSION: u32 = 128;
+        const POINTS_PER_ROW: u64 = 16;
+        let point = DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)]));
+        let points_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", point, true)),
+            POINTS_PER_ROW as i32,
+        );
+        let fs = FsFixture::default();
+        // Fixed-size lists of structs are written from 2.2 on.
+        let with_points = !matches!(
+            version,
+            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
+        );
+        let mut data = gen_batch()
+            .col("small", array::step::<Int32Type>())
+            .col(
+                "big",
+                array::rand_fixedbin(ByteCount::from(BIG_BYTES_PER_ROW), true),
+            )
+            .col("vector", array::rand_vec::<Float32Type>(DIMENSION.into()));
+        if with_points {
+            data = data.col("points", array::rand_type(&points_type)).col(
+                "images",
+                array::rand_list_any(array::rand_fixedbin(ByteCount::from(256), true), false),
+            );
+        }
+        let data = data.into_reader_rows(RowCount::from(ROWS / 16), BatchCount::from(16));
+        let written_file = write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+        let file_reader = open_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FileReaderOptions::default(),
+        )
+        .await;
+        let field_id_mapping = written_file
+            .field_id_mapping
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>();
+        let projection = |column: &str| {
+            versions::reader_projection_from_field_ids(
+                file_reader.metadata().version(),
+                &written_file.schema.project(&[column]).unwrap(),
+                &field_id_mapping,
+            )
+            .unwrap()
+        };
+        let estimate = |ranges: Vec<std::ops::Range<u64>>, column: &str| {
+            let projection = projection(column);
+            let file_reader = &file_reader;
+            async move {
+                file_reader
+                    .estimate_read(&ranges, Some(projection))
+                    .await
+                    .unwrap()
+                    .bytes
+            }
+        };
+
+        // Random binary does not compress, so the big column is its raw size.
+        let big = estimate(vec![0..ROWS], "big").await;
+        assert!(
+            (ROWS * BIG_BYTES_PER_ROW..ROWS * BIG_BYTES_PER_ROW * 11 / 10).contains(&big),
+            "{big}"
+        );
+        // A projection is charged only for its own columns.
+        let small = estimate(vec![0..ROWS], "small").await;
+        assert!(small < ROWS * 8, "{small}");
+        // Partly read pages count in proportion to the rows read.
+        let half = estimate(vec![0..ROWS / 4, ROWS / 2..ROWS * 3 / 4], "big").await;
+        assert!(half.abs_diff(big / 2) < big / 20, "{half} vs {big}");
+        // Vectors are estimated by row like any column.
+        let vector_bytes = ROWS * DIMENSION as u64 * 4;
+        let vector = estimate(vec![0..ROWS], "vector").await;
+        assert!(
+            (vector_bytes..vector_bytes * 11 / 10).contains(&vector),
+            "{vector}"
+        );
+        let half = estimate(vec![0..ROWS / 4, ROWS / 2..ROWS * 3 / 4], "vector").await;
+        assert!(
+            half.abs_diff(vector / 2) < vector / 20,
+            "{half} vs {vector}"
+        );
+        assert_eq!(estimate(vec![], "big").await, 0);
+        // Many scattered ranges cost what they cost one at a time.
+        let scattered: Vec<_> = (0..ROWS).step_by(97).map(|row| row..row + 13).collect();
+        let mut one_at_a_time = 0;
+        for range in &scattered {
+            one_at_a_time += estimate(vec![range.clone()], "big").await;
+        }
+        let together = estimate(scattered.clone(), "big").await;
+        assert!(
+            together.abs_diff(one_at_a_time) <= scattered.len() as u64,
+            "{together} vs {one_at_a_time}"
+        );
+        if !with_points {
+            return;
+        }
+        // A fixed-size list of structs stores its children per item.
+        let points_bytes = ROWS * POINTS_PER_ROW * 8;
+        let points = estimate(vec![0..ROWS], "points").await;
+        assert!(
+            (points_bytes..points_bytes * 13 / 10).contains(&points),
+            "{points}"
+        );
+        let half = estimate(vec![0..ROWS / 4, ROWS / 2..ROWS * 3 / 4], "points").await;
+        assert!(
+            half.abs_diff(points / 2) < points / 20,
+            "{half} vs {points}"
+        );
+
+        // A list read for its structure only skips its values' pages.
+        let images = estimate(vec![0..ROWS], "images").await;
+        let options = FileReaderOptions {
+            decoder_config: DecoderConfig {
+                list_structure: Arc::new(BTreeMap::from([(
+                    written_file.schema.field("images").unwrap().id,
+                    lance_encoding::decoder::ListReadMode::Length,
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let structure_reader =
+            open_lance_file(&fs, Arc::<DecoderPlugins>::default(), options).await;
+        let structure = structure_reader
+            .estimate_read(&[0..ROWS], Some(projection("images")))
+            .await
+            .unwrap()
+            .bytes;
+        assert!(structure < images / 20, "{structure} vs {images}");
+        assert_eq!(
+            structure_reader
+                .estimate_read(&[0..ROWS], Some(projection("big")))
+                .await
+                .unwrap()
+                .bytes,
+            big
+        );
     }
 
     async fn create_wide_direct_file(fs: &FsFixture, num_columns: usize) -> WrittenFile {

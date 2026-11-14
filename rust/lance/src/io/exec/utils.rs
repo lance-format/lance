@@ -11,6 +11,7 @@ use lance_datafusion::utils::{
 };
 use lance_encoding::decoder::estimate_bytes_per_row;
 use lance_index::metrics::{IndexTiming, MetricsCollector};
+use lance_io::read_budget::{BudgetReader, QueryId};
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
@@ -52,6 +53,7 @@ use tracing::Instrument;
 use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
+use crate::session::Session;
 
 /// Open fragments on cancellation-safe tasks while preserving the stream's
 /// ordering and readahead bound.
@@ -1038,6 +1040,7 @@ pub struct IndexMetrics {
     /// to `io_metrics` for display via [`IndexMetrics::flush_io`].
     io_stats: IoStats,
     io_metrics: IoMetrics,
+    read_budget: Option<BudgetReader>,
 }
 
 impl IndexMetrics {
@@ -1051,7 +1054,21 @@ impl IndexMetrics {
             index_cache_misses: metrics.new_count(INDEX_CACHE_MISSES_METRIC, partition),
             io_stats: IoStats::new(),
             io_metrics: IoMetrics::new(metrics, partition),
+            read_budget: None,
         }
+    }
+
+    /// Loads index data under `session`'s read memory budget, if it has one,
+    /// as part of the query `context` runs.
+    pub fn with_read_budget(
+        mut self,
+        session: &Session,
+        context: &Arc<datafusion::execution::TaskContext>,
+    ) -> Self {
+        self.read_budget = session
+            .read_budget()
+            .map(|budget| budget.reader(QueryId::of(context)));
+        self
     }
 
     /// Publish the I/O accumulated in the per-query sink to the displayed
@@ -1085,6 +1102,11 @@ impl MetricsCollector for IndexMetrics {
     }
     fn io_stats(&self) -> Option<IoStats> {
         Some(self.io_stats.clone())
+    }
+    fn read_budget(&self) -> Option<BudgetReader> {
+        // A fresh reader holds nothing, so a load never waits behind memory
+        // its own query's other loads hold.
+        self.read_budget.as_ref().map(BudgetReader::sibling)
     }
 }
 

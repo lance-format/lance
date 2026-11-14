@@ -1010,7 +1010,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
         let preset_segments = self.preset_segments.clone();
-        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics = Arc::new(
+            FtsIndexMetrics::new(&self.metrics, partition)
+                .with_read_budget(&self.dataset.session, &context),
+        );
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
         let document_granularity = self.document_granularity;

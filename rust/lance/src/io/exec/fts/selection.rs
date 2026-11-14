@@ -15,12 +15,14 @@ use lance_datafusion::utils::{
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::DocumentGranularity;
+use lance_io::read_budget::BudgetReader;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::Dataset;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::io::exec::utils::IndexMetrics;
+use crate::session::Session;
 
 /// Time spent resolving an exact ordered UUID selection to committed FTS segments.
 pub const FTS_SEGMENT_BIND_DURATION_METRIC: &str = "fts_segment_bind_duration";
@@ -183,6 +185,17 @@ impl FtsIndexMetrics {
         }
     }
 
+    /// Loads index data under the session's read memory budget; see
+    /// [`IndexMetrics::with_read_budget`].
+    pub fn with_read_budget(
+        mut self,
+        session: &Session,
+        context: &Arc<datafusion::execution::TaskContext>,
+    ) -> Self {
+        self.index_metrics = self.index_metrics.with_read_budget(session, context);
+        self
+    }
+
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
     }
@@ -215,5 +228,9 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_index_cache_misses(&self, num_misses: usize) {
         self.index_metrics.record_index_cache_misses(num_misses);
+    }
+
+    fn read_budget(&self) -> Option<BudgetReader> {
+        self.index_metrics.read_budget()
     }
 }

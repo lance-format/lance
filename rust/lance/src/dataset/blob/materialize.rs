@@ -17,6 +17,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_io::read_budget::{Admission, Reservation};
 use tokio::sync::Notify;
 
 use super::locate::{BlobLocator, StoredBlob, blob_version_from_descriptions};
@@ -63,12 +64,13 @@ impl BlobMaterializationBudget {
             budget: Some(self.clone()),
             ticket,
             acquired: false,
+            read_budget: None,
         }
     }
 
     #[cfg(test)]
     async fn reserve(self: &Arc<Self>, bytes: u64) -> BlobMaterializationReservation {
-        self.admission().reserve(bytes).await.unwrap()
+        self.admission().reserve_own(bytes).await.unwrap()
     }
 }
 
@@ -76,10 +78,30 @@ pub struct BlobMaterializationAdmission {
     budget: Option<Arc<BlobMaterializationBudget>>,
     ticket: u64,
     acquired: bool,
+    /// The payloads' place in line for the session's read memory budget,
+    /// when the read is under one. The caller has already charged the input
+    /// batch, so only the payloads are reserved here.
+    read_budget: Option<Admission>,
 }
 
 impl BlobMaterializationAdmission {
-    async fn reserve(mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
+    /// Waits for a materialized batch of `bytes` under the scan's own
+    /// readahead limit, and for its `payload_bytes` under the session's read
+    /// memory budget, whichever apply.
+    async fn reserve(mut self, bytes: u64, payload_bytes: u64) -> Vec<Arc<dyn Send + Sync>> {
+        let read_budget = self.read_budget.take();
+        let mut reservations: Vec<Arc<dyn Send + Sync>> = Vec::new();
+        if let Some(own) = self.reserve_own(bytes).await {
+            reservations.push(Arc::new(own));
+        }
+        if let Some(admission) = read_budget {
+            let reservation: Reservation = admission.reserve(payload_bytes).await;
+            reservations.push(Arc::new(reservation));
+        }
+        reservations
+    }
+
+    async fn reserve_own(&mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
         let Some(budget) = self.budget.clone() else {
             self.acquired = true;
             return None;
@@ -170,15 +192,20 @@ impl BlobMaterializationContext {
         })
     }
 
-    pub(crate) fn admission(&self) -> BlobMaterializationAdmission {
-        match &self.budget {
+    /// The next batch's place in line, under the session's read memory
+    /// budget too when `read_budget` is given.
+    pub(crate) fn admission(&self, read_budget: Option<Admission>) -> BlobMaterializationAdmission {
+        let mut admission = match &self.budget {
             Some(budget) => budget.admission(),
             None => BlobMaterializationAdmission {
                 budget: None,
                 ticket: 0,
                 acquired: false,
+                read_budget: None,
             },
-        }
+        };
+        admission.read_budget = read_budget;
+        admission
     }
 
     #[cfg(test)]
@@ -196,7 +223,7 @@ pub struct MaterializedBlobBatch {
     /// Reservations are reference-counted so that splitting a batch into
     /// multiple chunks keeps the original memory reservation alive until the
     /// last chunk is dropped.
-    _reservations: Vec<Arc<BlobMaterializationReservation>>,
+    _reservations: Vec<Arc<dyn Send + Sync>>,
 }
 
 impl MaterializedBlobBatch {
@@ -208,14 +235,17 @@ impl MaterializedBlobBatch {
     }
 
     #[cfg(test)]
-    fn with_reservations(
-        batch: RecordBatch,
-        reservations: Vec<Arc<BlobMaterializationReservation>>,
-    ) -> Self {
+    fn with_reservations(batch: RecordBatch, reservations: Vec<Arc<dyn Send + Sync>>) -> Self {
         Self {
             batch,
             _reservations: reservations,
         }
+    }
+
+    /// Keeps `reservation` until every chunk of this batch is dropped.
+    pub(crate) fn with_reservation(mut self, reservation: Arc<dyn Send + Sync>) -> Self {
+        self._reservations.push(reservation);
+        self
     }
 
     pub(crate) fn batch(&self) -> &RecordBatch {
@@ -265,6 +295,11 @@ impl MaterializedBlobBatch {
 
     pub(crate) fn into_batch(self) -> RecordBatch {
         self.batch
+    }
+
+    /// The batch and the reservations that keep its memory accounted for.
+    pub(crate) fn into_parts(self) -> (RecordBatch, Vec<Arc<dyn Send + Sync>>) {
+        (self.batch, self._reservations)
     }
 }
 
@@ -345,25 +380,6 @@ pub fn blob_v2_descriptor_schema(schema: &Schema) -> Schema {
     }
 }
 
-/// Materialize blob v2 descriptor arrays in a decoded batch into binary arrays.
-///
-/// The input batch must include `_rowaddr`, which is used to resolve packed,
-/// dedicated, inline, and external blob payload locations. `output_schema`
-/// defines the exact returned columns, including requested system columns, with
-/// blob v2 binary leaves exposed as plain `LargeBinary` fields.
-pub async fn materialize_blob_v2_binary_batch(
-    dataset: &Arc<Dataset>,
-    output_schema: &Schema,
-    batch: RecordBatch,
-) -> Result<RecordBatch> {
-    let context = BlobMaterializationContext::new(None, None);
-    Ok(
-        materialize_blob_v2_binary_batch_with_context(dataset, output_schema, batch, &context)
-            .await?
-            .into_batch(),
-    )
-}
-
 /// Split `batch` into row-aligned chunks whose total array memory size is at
 /// most `max_bytes`.
 ///
@@ -408,22 +424,12 @@ fn split_batch_by_bytes_recursive(
     Ok(chunks)
 }
 
-pub fn materialize_blob_v2_binary_batch_with_context<'a>(
-    dataset: &'a Arc<Dataset>,
-    output_schema: &'a Schema,
-    batch: RecordBatch,
-    context: &'a Arc<BlobMaterializationContext>,
-) -> BoxFuture<'a, Result<MaterializedBlobBatch>> {
-    let admission = context.admission();
-    materialize_blob_v2_binary_batch_with_admission(
-        dataset,
-        output_schema,
-        batch,
-        context,
-        admission,
-    )
-}
-
+/// Materialize blob v2 descriptor arrays in a decoded batch into binary arrays.
+///
+/// The input batch must include `_rowaddr`, which is used to resolve packed,
+/// dedicated, inline, and external blob payload locations. `output_schema`
+/// defines the exact returned columns, including requested system columns, with
+/// blob v2 binary leaves exposed as plain `LargeBinary` fields.
 pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
     dataset: &'a Arc<Dataset>,
     output_schema: &'a Schema,
@@ -434,7 +440,8 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
     async move {
         let materialized_bytes =
             estimate_blob_v2_materialized_batch_bytes(dataset, output_schema, &batch).await?;
-        let reservation = admission.reserve(materialized_bytes).await;
+        let payload_bytes = materialized_bytes.saturating_sub(batch.get_array_memory_size() as u64);
+        let reservations = admission.reserve(materialized_bytes, payload_bytes).await;
         let row_addr_idx = batch
             .schema()
             .column_with_name(ROW_ADDR)
@@ -488,7 +495,7 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
                 )),
                 columns,
             )?,
-            _reservations: reservation.into_iter().map(Arc::new).collect(),
+            _reservations: reservations,
         })
     }
     .boxed()
@@ -899,9 +906,9 @@ mod tests {
             state: std::sync::Mutex::new(BlobMaterializationBudgetState::default()),
             notify: Notify::new(),
         });
-        let first = budget.admission();
-        let second = budget.admission();
-        let later = tokio::spawn(async move { second.reserve(60).await.unwrap() });
+        let mut first = budget.admission();
+        let mut second = budget.admission();
+        let later = tokio::spawn(async move { second.reserve_own(60).await.unwrap() });
         assert!(
             tokio::time::timeout(Duration::from_millis(20), waiting_budget_wait(&later))
                 .await
@@ -909,7 +916,7 @@ mod tests {
         );
         assert_eq!(budget.state.lock().unwrap().reserved, 0);
 
-        let earlier = first.reserve(80).await.unwrap();
+        let earlier = first.reserve_own(80).await.unwrap();
         assert_eq!(budget.state.lock().unwrap().reserved, 80);
         drop(earlier);
         let later = later.await.unwrap();
