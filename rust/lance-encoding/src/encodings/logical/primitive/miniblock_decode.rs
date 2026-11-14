@@ -4283,6 +4283,7 @@ mod tests {
 
     /// Mini-block chunks whose u16 level header wrapped while out-of-line bitpacked
     /// rep/def buffers retained every level.
+    #[cfg(feature = "bitpacking")]
     mod wrapped_bitpacked_levels {
         use std::sync::Arc;
 

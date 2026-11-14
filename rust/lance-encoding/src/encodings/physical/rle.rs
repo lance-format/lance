@@ -2913,11 +2913,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::compression::{
-        DecompressionStrategy, DefaultDecompressionStrategy, create_rle_decompressor,
-    };
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    use crate::compression::create_rle_decompressor;
+    use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
     use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
     use crate::{
         buffer::LanceBuffer,

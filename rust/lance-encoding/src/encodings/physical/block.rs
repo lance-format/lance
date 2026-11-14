@@ -1252,8 +1252,6 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
-
     #[rstest::rstest]
     #[case::small_page(PARALLEL_MIN_BYTES - 1, 1, 64, 1)]
     #[case::alone(64 << 20, 1, 8, 8)]
@@ -1362,6 +1360,7 @@ mod tests {
         use std::sync::Arc;
 
         use super::*;
+        use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
 
         #[test]
         fn test_compress_zstd_with_length_prefixed() {

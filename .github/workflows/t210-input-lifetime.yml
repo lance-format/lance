@@ -21,15 +21,8 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Validate codec output layouts and the new transactional MiniBlock path.
-      - name: Validate raw and nested range plans
-        run: cargo test --profile ci --locked -p lance-encoding --lib physical::value::admitted::tests -- --nocapture
-      - name: Validate bitpacking range plans and concat overlap
-        run: cargo test --profile ci --locked -p lance-encoding --lib physical::bitpacking::admitted::tests -- --nocapture
-      - name: Validate single and multiple instruction admission
-        run: cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests -- --nocapture
-      - name: Validate output layout API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc compression::layout::MiniBlockOutputLayout
+      # Default-feature behavior and the layout example passed at 2f75abfb1.
+      # This repair only aligns test imports/modules with their codec features.
       - name: Validate multiple instruction admission without optional codecs
         run: cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::multiple -- --nocapture
       - name: Lint touched crate

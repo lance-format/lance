@@ -2431,6 +2431,7 @@ mod tests {
     use crate::buffer::LanceBuffer;
     use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    #[cfg(all(feature = "lz4", feature = "zstd"))]
     use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
     use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
     use crate::format::EncodingUtils;
