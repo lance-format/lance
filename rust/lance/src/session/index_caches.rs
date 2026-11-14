@@ -312,7 +312,7 @@ impl CacheKey for IndexMetadataKey<'_> {
 /// carries one FRI entry, so one key per snapshot.
 ///
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
-/// listing. Query loading records its own value under [`QueryIndexListingKey`],
+/// listing. Query loading records its own value under `QueryIndexListingKey`,
 /// which also tracks whether an incomplete listing needs another inference or
 /// format-verification attempt. Keyed by the same snapshot identity: a different
 /// table (`store_identity`), a different snapshot (`version`), or any index
