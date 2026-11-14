@@ -586,9 +586,10 @@ pub(super) async fn add_columns(
         .await
 }
 
-/// What `alter_columns` refuses on a table with a MemWAL, and why.
+/// What `alter_columns` and `drop_columns` refuse on a table with a MemWAL, and
+/// why.
 ///
-/// Each is an alteration whose meaning depends on rows the commit cannot see.
+/// Each is a change whose meaning depends on rows the commit cannot see.
 enum Unsupported {
     /// A cast takes a new field id, which rows still in the WAL cannot be
     /// matched to.
@@ -604,6 +605,11 @@ enum Unsupported {
     /// rename can send a row to the wrong shard or store values under the
     /// wrong field ids, and nothing later repairs it.
     RenameKey,
+    /// Every LSM read and flush hashes the primary key to tell which version
+    /// of a row is the newest. Rows still in the WAL carry the key, and once
+    /// the base table has no such column they can no longer be matched to its
+    /// rows.
+    DropKey,
 }
 
 /// Refuse `unsupported` when the table has a MemWAL attached.
@@ -611,8 +617,8 @@ enum Unsupported {
 /// A table without one is unaffected: the presence of a MemWAL is the only
 /// thing this looks at.
 ///
-/// Takes the decision already made rather than the alterations themselves: a
-/// reference to them held across the await would have to be `Sync`.
+/// Takes the decision already made rather than the request itself: a
+/// reference to it held across the await would have to be `Sync`.
 async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) -> Result<()> {
     let Some(unsupported) = unsupported else {
         return Ok(());
@@ -636,6 +642,11 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
             "cannot rename a primary key column on a table with a MemWAL attached: the key is \
              how a writer identifies a row, and one that has not yet seen the new name reads \
              the same batch differently. Drop the MemWAL first."
+        }
+        Unsupported::DropKey => {
+            "cannot drop a primary key column on a table with a MemWAL attached: the key is \
+             how rows still in the WAL are matched to rows in the base table. Drop the MemWAL \
+             first."
         }
     }))
 }
@@ -1445,6 +1456,9 @@ pub(super) async fn alter_columns(
 /// rules here is easy to get wrong, because dropping a struct's last child
 /// removes the struct, and a field whose data files disagree on metadata
 /// semantics is refused outright.
+///
+/// The one check left to [`drop_columns`] is its refusal to drop a primary key
+/// column on a table with a MemWAL attached, which needs an index read.
 pub fn plan_drop_columns(dataset: &Dataset, columns: &[&str]) -> Result<Schema> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
@@ -1518,6 +1532,15 @@ pub fn plan_drop_columns(dataset: &Dataset, columns: &[&str]) -> Result<Schema> 
 
 pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
     let new_schema = plan_drop_columns(dataset, columns)?;
+
+    // Compared by field id, not by the names asked for: dropping a struct
+    // drops a key nested in it.
+    let drops_key = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .any(|key| new_schema.field_by_id(key.id).is_none());
+    reject_on_mem_wal(dataset, drops_key.then_some(Unsupported::DropKey)).await?;
 
     let transaction = Transaction::new(
         dataset.manifest.version,
@@ -1834,6 +1857,62 @@ mod test {
             .await
             .expect("renaming any other column must still be allowed");
         assert!(dataset.schema().field("amount").is_some());
+    }
+
+    /// Dropping a primary key column is refused; other columns drop freely.
+    #[tokio::test]
+    async fn drop_columns_on_a_mem_wal_table_refuses_dropping_the_key() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use arrow_array::Int64Array;
+        use lance_core::datatypes::{
+            LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+        };
+
+        let key_meta = HashMap::from([
+            (LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string()),
+            (
+                LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+                "0".to_string(),
+            ),
+        ]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false).with_metadata(key_meta),
+            ArrowField::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(Int64Array::from(vec![Some(10i64)])),
+            ],
+        )
+        .unwrap();
+        let uri = format!("memory://mem_wal_drop_key_{}", uuid::Uuid::new_v4());
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let err = dataset
+            .drop_columns(&["id"])
+            .await
+            .expect_err("dropping the key must be refused");
+        assert!(
+            err.to_string().contains("cannot drop a primary key column"),
+            "unexpected error: {err}"
+        );
+
+        dataset
+            .drop_columns(&["value"])
+            .await
+            .expect("dropping any other column must still be allowed");
+        assert!(dataset.schema().field("value").is_none());
     }
 
     /// What the MemWAL guard refuses, and what it lets through.
