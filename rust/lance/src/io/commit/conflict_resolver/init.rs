@@ -244,6 +244,17 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
+    /// Use the transaction's read snapshot for every CreateIndex check. The
+    /// submitting handle may already be newer, hiding rewritten columns or
+    /// removed fields when compared with the latest version.
+    pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
+        if matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
+            self.read_fragments = Some(dataset.fragments().clone());
+            self.read_schema = Some(dataset.schema().clone());
+        }
+        self
+    }
+
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());

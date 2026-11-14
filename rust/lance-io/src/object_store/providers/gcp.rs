@@ -350,6 +350,8 @@ impl ObjectStoreProvider for GcsStoreProvider {
 
         Ok(ObjectStore {
             inner,
+            external_blob_inner: None,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             scheme: String::from("gs"),
@@ -420,7 +422,9 @@ mod tests {
     use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use object_store::client::{HttpError, HttpErrorKind};
     use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -588,26 +592,21 @@ mod tests {
         assert!(!requests[0].headers.contains_key("authorization"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_external_account_respects_client_timeout() {
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_secs(1))
-                    .set_body_json(serde_json::json!({
-                        "access_token": "federated-token",
-                        "expires_in": 3600
-                    })),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
+        // Keep virtual time stationary while real file and socket I/O completes.
+        // Dropping the sender also releases the blocking task if an assertion panics.
+        let (release_clock, clock_inhibited) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || {
+            let _ = clock_inhibited.recv_timeout(Duration::from_secs(10));
+        });
+        let start = tokio::time::Instant::now();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut storage_options =
-            external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
+        let mut storage_options = external_account_storage_options(
+            &temp_dir,
+            format!("http://{}/token", listener.local_addr().unwrap()),
+        );
         storage_options.insert("timeout".to_string(), "50ms".to_string());
         let storage_options = StorageOptions::new(storage_options);
         let client_options = gcs_client_options(&storage_options).unwrap();
@@ -617,14 +616,45 @@ mod tests {
         )
         .expect("external account credential provider should build")
         .expect("external account credentials should select the reqsign provider");
+        let mut request = tokio::spawn(async move { credential_provider.get_credential().await });
 
-        let credential_result = tokio::time::timeout(
-            Duration::from_millis(200),
-            credential_provider.get_credential(),
-        )
-        .await
-        .expect("configured client timeout should bound the credential exchange");
-        let error = credential_result.expect_err("the delayed token exchange should time out");
+        // Hold the connection open without responding, so only the client timeout
+        // can end the exchange. The endpoint uses the same runtime as the client.
+        let accept_request = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request_line = String::new();
+            socket.read_line(&mut request_line).await.unwrap();
+            assert_eq!(request_line, "POST /token HTTP/1.1\r\n");
+            socket
+        };
+        let _connection = tokio::select! {
+            result = &mut request => panic!("credential request ended before reaching the endpoint: {result:?}"),
+            connection = tokio::time::timeout(Duration::from_secs(1), accept_request) => {
+                connection.expect("credential request should reach the endpoint")
+            }
+        };
+        assert_eq!(start.elapsed(), Duration::ZERO);
+
+        let observe_timeout = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(
+                !request.is_finished(),
+                "credential request timed out too early"
+            );
+            tokio::time::timeout(Duration::from_millis(20), &mut request)
+                .await
+                .expect("configured 50ms client timeout should end the request")
+                .unwrap()
+        };
+        tokio::pin!(observe_timeout);
+        // Register the observation timer before allowing virtual time to advance.
+        assert!(futures::poll!(&mut observe_timeout).is_pending());
+        drop(release_clock);
+        let error = observe_timeout
+            .await
+            .expect_err("the unanswered token exchange should time out");
+        clock_guard.await.unwrap();
         assert!(matches!(&error, object_store::Error::Generic { .. }));
         assert!(
             error
@@ -632,7 +662,16 @@ mod tests {
                 .contains("failed to send Google workload identity HTTP request"),
             "unexpected error: {error}"
         );
-        mock_server.verify().await;
+        let mut cause: &(dyn std::error::Error + 'static) = &error;
+        let http_error = loop {
+            if let Some(http_error) = cause.downcast_ref::<HttpError>() {
+                break http_error;
+            }
+            cause = cause
+                .source()
+                .expect("HTTP timeout source should be preserved");
+        };
+        assert_eq!(http_error.kind(), HttpErrorKind::Timeout);
     }
 
     #[tokio::test]
