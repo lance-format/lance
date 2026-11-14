@@ -120,6 +120,8 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Their min/max exclude NaNs, which are counted separately by sign. Set in
 /// both reader and writer feature flags and preserve across commits.
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
+/// Positive decimal row count for a field's additional zone write seed collection.
+pub const ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY: &str = "lance.zone_write_seeds.rows_per_zone";
 /// Writer-only protection for clustering definitions, ID allocation, references,
 /// and generic fragment/index segment metadata maintenance.
 /// Set whenever a manifest carries any of them; a writer that does not preserve
@@ -399,6 +401,23 @@ pub fn apply_feature_flags(
     manifest.writer_feature_flags |= row_addr_indices;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
+
+    for field in &manifest.schema.fields {
+        if let Some(value) = field.metadata.get(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY) {
+            if !value.bytes().all(|byte| byte.is_ascii_digit())
+                || value.parse::<u64>().ok().is_none_or(|rows| rows == 0)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Column {}: {ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY} must be a positive u64 row count, got {value:?}",
+                    field.name
+                )));
+            }
+            // Activate at configuration time, before a snapshot's writers may
+            // embed seeds, and retain the capability after policy removal.
+            manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+            manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+        }
+    }
 
     Ok(())
 }
@@ -951,6 +970,43 @@ mod tests {
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
         assert_eq!(destination.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
         assert_eq!(destination.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+    }
+
+    #[test]
+    fn test_zone_write_seed_policy_activates_flags_before_data() {
+        let mut manifest = empty_manifest();
+        manifest.schema.fields[0].metadata.insert(
+            ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY.to_string(),
+            "1000000".to_string(),
+        );
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+        assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+        manifest.schema.fields[0]
+            .metadata
+            .remove(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY);
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+        assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+    }
+
+    #[rstest::rstest]
+    #[case::zero("0")]
+    #[case::negative("-1")]
+    #[case::plus("+1")]
+    #[case::space(" 1")]
+    #[case::text("true")]
+    #[case::overflow("18446744073709551616")]
+    fn test_zone_write_seed_policy_rejects_invalid_row_counts(#[case] value: &str) {
+        let mut manifest = empty_manifest();
+        manifest.schema.fields[0].metadata.insert(
+            ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY.to_string(),
+            value.to_string(),
+        );
+        let error = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(value));
+        assert!(error.to_string().contains("positive u64 row count"));
     }
 
     #[test]

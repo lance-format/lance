@@ -76,6 +76,7 @@ pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
+pub use seeds::ZoneWriteSeedOptions;
 
 impl Dataset {
     pub(super) fn validate_data_file_target(&self, target: &DataFileTarget) -> Result<()> {
