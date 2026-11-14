@@ -184,9 +184,14 @@ def set_memory_observation(enabled: bool) -> None:
 
     The setting belongs to this process: a child created with ``fork`` starts
     with it, and a worker started with ``spawn`` or ``forkserver`` follows its
-    own environment. Memory is only read on Linux, and peaks are only kept once
-    a recorder is installed, so call :func:`instrument_lance_metrics` before the
-    operations to observe.
+    own environment. On Linux, observation reads the process and cgroup memory,
+    keeps the peak of every operation and stage, and emits the memory events.
+    Events need no recorder; the gauges and histograms need the ``metrics``
+    feature and a recorder, so call :func:`instrument_lance_metrics` before the
+    operations to observe. The component gauge is independent of the platform,
+    and in a build with the ``metrics`` feature it counts the I/O schedulers,
+    DataFusion pools and MemWAL writers created while observation is on, never
+    one created before.
 
     Parameters
     ----------
