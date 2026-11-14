@@ -102,7 +102,7 @@ pub fn describe_metrics() {
 /// Set the memory gauges to the current readings of the process, its cgroup
 /// and the Lance components.
 ///
-/// Does nothing unless [`super::OBSERVE_ENV_VAR`] turns observation on. Call it
+/// Does nothing while observation is off (see [`super::set_observation`]). Call it
 /// from the collection loop of the recorder; the Python and Java bridges call
 /// it before every snapshot. A process or cgroup gauge whose source is
 /// unavailable, such as the cgroup limit of a process without one, is left
