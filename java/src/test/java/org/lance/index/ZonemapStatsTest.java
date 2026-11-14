@@ -23,14 +23,19 @@ import org.lance.index.scalar.ZoneStats;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.DecimalVector;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -70,6 +75,46 @@ public class ZonemapStatsTest {
     }
     FragmentOperation.Append appendOp = new FragmentOperation.Append(metas);
     return Dataset.commit(allocator, path, appendOp, Optional.of(version));
+  }
+
+  private static Schema uint64Schema() {
+    return new Schema(
+        Collections.singletonList(Field.nullable("u", new ArrowType.Int(64, false))), null);
+  }
+
+  /**
+   * Write one fragment with a single UInt64 column. Values are raw 64-bit patterns, so a negative
+   * Java long stands for an unsigned value at or above 2^63.
+   */
+  private static void writeUInt64ZonemapFixture(
+      BufferAllocator allocator, String path, long[] values, int rowsPerZone) {
+    Schema schema = uint64Schema();
+    try (Dataset ds = Dataset.create(allocator, path, schema, new WriteParams.Builder().build())) {
+      // empty
+    }
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      UInt8Vector u = (UInt8Vector) root.getVector("u");
+      for (int i = 0; i < values.length; i++) {
+        u.setSafe(i, values[i]);
+      }
+      root.setRowCount(values.length);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    Dataset.commit(allocator, path, new FragmentOperation.Append(metas), Optional.of(1L)).close();
+
+    try (Dataset dataset = Dataset.open(path, allocator)) {
+      ScalarIndexParams params =
+          ScalarIndexParams.create("zonemap", "{\"rows_per_zone\": " + rowsPerZone + "}");
+      IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+      dataset.createIndex(
+          Collections.singletonList("u"),
+          IndexType.ZONEMAP,
+          Optional.of("u_zm"),
+          indexParams,
+          true);
+    }
   }
 
   // -------------------------------------------------------
@@ -290,6 +335,150 @@ public class ZonemapStatsTest {
         List<ZoneStats> stats = dataset.getZonemapStats("id");
         assertNotNull(stats);
         assertTrue(stats.isEmpty(), "Expected empty for non-indexed column");
+      }
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsReportsNanCount(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("nan_col").toString();
+    Schema schema =
+        new Schema(
+            Collections.singletonList(
+                Field.nullable(
+                    "score", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))),
+            null);
+    int rowCount = 100;
+    int nanCount = 3;
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(allocator, path, schema, new WriteParams.Builder().build())) {
+        // empty
+      }
+      List<FragmentMetadata> metas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        Float8Vector scores = (Float8Vector) root.getVector("score");
+        for (int i = 0; i < rowCount; i++) {
+          scores.setSafe(i, i < nanCount ? Double.NaN : (double) i);
+        }
+        root.setRowCount(rowCount);
+        metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+      }
+      Dataset.commit(allocator, path, new FragmentOperation.Append(metas), Optional.of(1L)).close();
+
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        ScalarIndexParams params = ScalarIndexParams.create("zonemap", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+        dataset.createIndex(
+            Collections.singletonList("score"),
+            IndexType.ZONEMAP,
+            Optional.of("score_zm"),
+            indexParams,
+            true);
+
+        // 100 rows fit in one zone. The bounds exclude NaN; the count is the
+        // only trace of it.
+        List<ZoneStats> stats = dataset.getZonemapStats("score");
+        assertEquals(1, stats.size());
+        ZoneStats zone = stats.get(0);
+        assertEquals(nanCount, zone.getNanCount());
+        assertEquals((double) nanCount, zone.getMin());
+        assertEquals((double) (rowCount - 1), zone.getMax());
+      }
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsUnsupportedTypeReturnsEmpty(@TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("decimal_col").toString();
+    Schema schema =
+        new Schema(
+            Collections.singletonList(Field.nullable("amount", new ArrowType.Decimal(10, 2, 128))),
+            null);
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(allocator, path, schema, new WriteParams.Builder().build())) {
+        // empty
+      }
+      List<FragmentMetadata> metas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        DecimalVector amounts = (DecimalVector) root.getVector("amount");
+        for (int i = 0; i < 100; i++) {
+          amounts.setSafe(i, new BigDecimal(i).movePointLeft(2));
+        }
+        root.setRowCount(100);
+        metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+      }
+      Dataset.commit(allocator, path, new FragmentOperation.Append(metas), Optional.of(1L)).close();
+
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        ScalarIndexParams params = ScalarIndexParams.create("zonemap", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+        dataset.createIndex(
+            Collections.singletonList("amount"),
+            IndexType.ZONEMAP,
+            Optional.of("amount_zm"),
+            indexParams,
+            true);
+
+        // Decimal bounds have no Comparable representation: no stats, rather
+        // than null bounds that would read as "all null".
+        assertTrue(dataset.listIndexes().contains("amount_zm"));
+        assertTrue(dataset.getZonemapStats("amount").isEmpty());
+      }
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsUInt64LongMaxValue(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("uint64_long_max").toString();
+    long[] values = new long[100];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = i;
+    }
+    values[99] = Long.MAX_VALUE;
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      writeUInt64ZonemapFixture(allocator, path, values, 50);
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        assertTrue(dataset.listIndexes().contains("u_zm"));
+        List<ZoneStats> stats = dataset.getZonemapStats("u");
+        assertEquals(2, stats.size());
+
+        assertEquals(Long.valueOf(0L), stats.get(0).getMin());
+        assertEquals(Long.valueOf(49L), stats.get(0).getMax());
+        assertEquals(Long.valueOf(50L), stats.get(1).getMin());
+        assertEquals(
+            Long.valueOf(Long.MAX_VALUE),
+            stats.get(1).getMax(),
+            "UInt64 max at Long.MAX_VALUE must be returned exactly");
+      }
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsUInt64AboveLongMaxValue(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("uint64_above_long_max").toString();
+    // 2^63 is the first unsigned value a Java long cannot hold; its raw 64-bit
+    // pattern 0x8000000000000000 reads as Long.MIN_VALUE.
+    long firstUnrepresentable = Long.MIN_VALUE;
+    long[] values = new long[100];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = i < 50 ? i : firstUnrepresentable + (i - 50);
+    }
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      writeUInt64ZonemapFixture(allocator, path, values, 50);
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        assertTrue(dataset.listIndexes().contains("u_zm"));
+        // The first zone is entirely representable, so a per-zone fallback
+        // would return it instead of emptying the whole column.
+        assertTrue(
+            dataset.getZonemapStats("u").isEmpty(),
+            "A UInt64 bound above Long.MAX_VALUE must empty the whole column");
       }
     }
   }

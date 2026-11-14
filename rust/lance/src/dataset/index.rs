@@ -483,6 +483,7 @@ mod tests {
         let descriptions = dataset.describe_indices(None).await.unwrap();
         assert_eq!(descriptions.len(), 1);
         assert_eq!(descriptions[0].name(), FRAG_REUSE_INDEX_NAME);
+        assert_eq!(descriptions[0].details().unwrap(), "{}");
         assert!(
             descriptions[0].fragment_coverage().is_none(),
             "fragment-reuse metadata does not represent data-index coverage"
@@ -812,6 +813,7 @@ mod tests {
             index.index_version = 0;
         }
         index.covering_fields = vec![999, 999];
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,

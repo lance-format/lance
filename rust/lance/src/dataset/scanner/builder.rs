@@ -1258,6 +1258,15 @@ impl Scanner {
     /// When a distance range is set, the selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
     ///
+    /// Completed partition results may be reused for identical queries in the
+    /// same snapshot, within the session index-cache budget. This memory-only
+    /// cache accepts fully indexed single-vector queries without filters,
+    /// fragment subsets, external masks, or stale vector overlays, and requires
+    /// a proven manifest identity. It stores row IDs and quantized distances;
+    /// exact refinement and projections still run independently. Immutable RQ
+    /// index data is cached separately and can remain reusable across queries
+    /// and snapshots even when completed results cannot be reused.
+    ///
     /// ```
     /// # use arrow_array::Float32Array;
     /// # use lance::{Dataset, Result};

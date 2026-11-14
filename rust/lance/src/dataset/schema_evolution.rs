@@ -27,7 +27,10 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::Expr;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{
+    Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION, Schema,
+};
 use lance_core::utils::parse::str_is_truthy;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
@@ -38,6 +41,13 @@ use lance_table::format::{Fragment, overlay::TOMBSTONE_FIELD_ID};
 pub mod optimize;
 
 use optimize::{ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer};
+
+/// Field metadata that declares the unenforced primary and clustering keys.
+const KEY_METADATA: [&str; 3] = [
+    LANCE_UNENFORCED_PRIMARY_KEY,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+];
 
 async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
     let field = dataset.schema().field(path).ok_or_else(|| {
@@ -1184,13 +1194,32 @@ pub(super) async fn alter_columns(
                 )));
             }
 
+            // A manifest stores each key both as a field property and as metadata, and
+            // either can be present alone. Let `Field::try_from` materialize the key
+            // from the reserved metadata, then prefer the source's cached position
+            // when it has one: that property is authoritative and survives metadata
+            // loss.
             let arrow_field = ArrowField::new(
                 field_dest.name.clone(),
                 data_type.clone(),
                 field_dest.nullable,
+            )
+            .with_metadata(
+                field_src
+                    .metadata
+                    .iter()
+                    .filter(|(key, _)| KEY_METADATA.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             );
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.try_set_id(field_src.parent_id, &mut next_field_id)?;
+            if let Some(position) = field_src.unenforced_primary_key_position {
+                field_dest.unenforced_primary_key_position = Some(position);
+            }
+            if let Some(position) = field_src.unenforced_clustering_key_position {
+                field_dest.unenforced_clustering_key_position = Some(position);
+            }
 
             cast_fields.push((field_src.clone(), field_dest.clone()));
         }

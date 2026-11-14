@@ -21,8 +21,10 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # RLE/Binary composition passed at 8819c9e9d. Exercise new random unsigned
-      # lookup, dictionary traversal and their affected visitor/task composition.
+      # Dictionary traversal passed at c13ea7e5b. Revalidate its trait integration
+      # after merging main's pcodec support; keep the ordinary codec path covered.
+      - name: Validate upstream pcodec integration
+        run: cargo test --profile ci --locked -p lance-encoding --lib physical::pcodec::tests -- --nocapture
       - name: Validate unsigned lookup and dictionary traversal
         run: |
           cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned::tests -- --nocapture
