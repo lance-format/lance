@@ -50,7 +50,7 @@ use super::{
 };
 
 /// A mini-block chunk that has been decoded and decompressed
-#[cfg(test)]
+#[cfg(all(test, feature = "bitpacking"))]
 #[derive(Debug, Clone)]
 struct DecodedMiniBlockChunk {
     rep: Option<ScalarBuffer<u16>>,
@@ -917,7 +917,7 @@ impl DecodeMiniBlockTask {
     }
 
     // Unserialize a miniblock into a collection of vectors
-    #[cfg(test)]
+    #[cfg(all(test, feature = "bitpacking"))]
     fn decode_miniblock_chunk(
         &self,
         buf: &LanceBuffer,

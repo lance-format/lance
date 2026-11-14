@@ -2915,6 +2915,7 @@ mod tests {
     use super::*;
     #[cfg(any(feature = "lz4", feature = "zstd"))]
     use crate::compression::create_rle_decompressor;
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
@@ -3377,6 +3378,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn repeating_runs(num_runs: usize, run_length: usize) -> Vec<i32> {
         let mut values = Vec::with_capacity(num_runs * run_length);
         for run in 0..num_runs {
@@ -3385,6 +3387,7 @@ mod tests {
         values
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn expect_rle(encoding: &CompressiveEncoding) -> &crate::format::metadata::Rle {
         match encoding.compression.as_ref().unwrap() {
             crate::format::metadata::compressive_encoding::Compression::Rle(rle) => rle,
@@ -3392,6 +3395,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn assert_decoded_i32_eq(decoded: DataBlock, expected: &[i32]) {
         match decoded {
             DataBlock::FixedWidth(block) => {
@@ -3499,6 +3503,7 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn decompress_i32_chunks(
         compressed: &MiniBlockCompressed,
         encoding: &CompressiveEncoding,

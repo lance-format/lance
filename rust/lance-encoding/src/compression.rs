@@ -2627,6 +2627,7 @@ mod tests {
         run_lengths.bits_per_value
     }
 
+    #[cfg(any(feature = "bitpacking", feature = "lz4", feature = "zstd"))]
     fn expect_rle_encoding(encoding: &CompressiveEncoding) -> &crate::format::metadata::Rle {
         match encoding.compression.as_ref().unwrap() {
             Compression::Rle(rle) => rle,
