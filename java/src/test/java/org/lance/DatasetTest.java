@@ -3101,6 +3101,55 @@ public class DatasetTest {
   }
 
   @Test
+  public void testDescribeIndicesAfterDeferredCompaction(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.toString());
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 4).close();
+      try (Dataset dataset = testDataset.write(2, 4)) {
+        assertEquals(2, dataset.getFragments().size());
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(BTreeIndexParams.builder().build()).build(),
+            false);
+        String indexDetails = dataset.describeIndices().get(0).getDetailsJson();
+
+        dataset.compact(
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(8)
+                .withDeferIndexRemap(true)
+                .build());
+        assertEquals(1, dataset.getFragments().size());
+        assertEquals(8, dataset.countRows());
+
+        List<IndexDescription> descriptions = dataset.describeIndices();
+        assertEquals(2, descriptions.size());
+        IndexDescription systemIndex = descriptions.get(0);
+        assertEquals("__lance_frag_reuse", systemIndex.getName());
+        assertEquals("FragmentReuse", systemIndex.getIndexType());
+        assertEquals("{}", systemIndex.getDetailsJson());
+        assertEquals(1, systemIndex.getSegments().size());
+        assertFalse(systemIndex.getFragmentCoverage().isPresent());
+        IndexDescription userIndex = descriptions.get(1);
+        assertEquals("id_idx", userIndex.getName());
+        assertEquals(indexDetails, userIndex.getDetailsJson());
+        assertEquals(1, userIndex.getSegments().size());
+
+        List<IndexDescription> summaries = dataset.describeIndexSummaries();
+        assertEquals(2, summaries.size());
+        assertEquals(systemIndex.getName(), summaries.get(0).getName());
+        assertEquals(systemIndex.getDetailsJson(), summaries.get(0).getDetailsJson());
+        assertEquals(userIndex.getName(), summaries.get(1).getName());
+        assertEquals(indexDetails, summaries.get(1).getDetailsJson());
+        assertTrue(summaries.stream().allMatch(summary -> summary.getSegments().isEmpty()));
+      }
+    }
+  }
+
+  @Test
   public void testDescribeIndicesByName(@TempDir Path tempDir) throws Exception {
     Path datasetPath = tempDir.resolve("testDescribeIndicesByName");
 
