@@ -2487,7 +2487,7 @@ async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) 
     rewrite_selective_position_encoding(&store, 0..2).await?;
     let store = Arc::new(LanceIndexStore::with_format_version(
         object_store,
-        dir,
+        dir.clone(),
         Arc::new(LanceCache::with_capacity(1 << 20)),
         lance_file::version::ConcreteFileVersion::V2_2,
     ));
@@ -2596,7 +2596,7 @@ async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) 
                 .resolve_document_keys(&[hit.document.doc_id])
                 .await?[0]
                 .0;
-            actual.push((row, hit.score));
+            actual.push((row, hit.score.0));
         }
         actual.sort_unstable_by_key(|hit| hit.0);
         assert_eq!(
@@ -2629,6 +2629,6 @@ async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) 
         .await?[0]
         .0;
     assert!(expected.contains(&row));
-    assert_eq!(hit.score, reference[0].1);
+    assert_eq!(hit.score.0, reference[0].1);
     Ok(())
 }

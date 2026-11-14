@@ -8,8 +8,6 @@ use super::*;
 pub(super) const MAX_ACTIVE_SLICES: usize = 8;
 const MAX_SLICES_PER_PARTITION: usize = 5;
 
-pub(super) type SliceTask<'a> = futures::future::BoxFuture<'a, Result<(usize, Vec<(DocId, f32)>)>>;
-
 /// Equal half-open ranges, independent of dataset row addresses and filtering.
 /// Statistics and scoring lengths remain those of the complete partition.
 pub(super) fn document_ranges(num_docs: usize, target_docs: usize) -> Result<Vec<Range<u64>>> {

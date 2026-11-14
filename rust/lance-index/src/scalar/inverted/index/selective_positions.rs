@@ -464,7 +464,7 @@ impl InvertedIndex {
                         })?;
                         let visibility = documents.visibility(request.mask.clone(), false).await?;
                         if !visibility.may_match().await? {
-                            return Ok::<Vec<sliced_search::SliceTask<'a>>, Error>(Vec::new());
+                            return Ok::<Vec<sliced_search::SliceSearch<'a>>, Error>(Vec::new());
                         }
                         let lengths = documents.lengths().await?;
                         let ids = request.term_ids.map(|ids| ids.partition(ordinal));
@@ -479,12 +479,12 @@ impl InvertedIndex {
                             )
                             .await?
                         else {
-                            return Ok::<Vec<sliced_search::SliceTask<'a>>, Error>(Vec::new());
+                            return Ok::<Vec<sliced_search::SliceSearch<'a>>, Error>(Vec::new());
                         };
                         let ranges = sliced_search::document_ranges(documents.len(), config.target_docs)?;
                         let positions: Arc<[PreparedPositions]> = positions.into();
                         let visibility = Arc::new(visibility);
-                        let mut slices: Vec<sliced_search::SliceTask<'a>> = Vec::with_capacity(ranges.len());
+                        let mut slices: Vec<sliced_search::SliceSearch<'a>> = Vec::with_capacity(ranges.len());
                         for range in ranges {
                             slices.push(sliced_search::SliceSearch {
                                 ordinal,
@@ -495,7 +495,7 @@ impl InvertedIndex {
                                 visibility: visibility.clone(),
                                 range,
                                 shared: shared.clone(),
-                            }.run().boxed());
+                            });
                         }
                         Ok::<_, Error>(slices)
                     }
@@ -504,7 +504,8 @@ impl InvertedIndex {
                 // Do not collect loaded partition payloads ahead of their slices.
                 .buffer_unordered(2)
                 .map_ok(|slices| stream::iter(slices.into_iter().map(Ok::<_, Error>)))
-                .try_flatten();
+                .try_flatten()
+                .map_ok(|slice| slice.run().boxed());
             // 8 active slices x 16MiB encoded payload preserves the 128MiB
             // query ceiling; cached/shared inputs and scratch are separate.
             let mut results = loads.try_buffer_unordered(
