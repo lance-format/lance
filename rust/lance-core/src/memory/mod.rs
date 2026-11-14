@@ -3,7 +3,8 @@
 
 //! Opt-in observation of the process's memory.
 //!
-//! Observation is off unless [`OBSERVE_ENV_VAR`] (`LANCE_MEMORY_OBSERVE`) is
+//! Observation is off unless [`set_observation`] turns it on or, before its
+//! first call, [`OBSERVE_ENV_VAR`] (`LANCE_MEMORY_OBSERVE`) is
 //! set to a true value such as `1`. While it is on, Lance reads the process's
 //! resident set size (RSS) during the stages of an index build and reports
 //! every stage and the whole build in two ways:
@@ -45,7 +46,7 @@ mod report;
 mod telemetry;
 
 pub use components::{Component, register_component};
-pub use observer::{MemoryObserver, OBSERVE_ENV_VAR, StageWindow};
+pub use observer::{MemoryObserver, OBSERVE_ENV_VAR, StageWindow, set_observation};
 pub use report::OperationReport;
 pub use telemetry::{
     METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_COMPONENT, METRIC_OPERATION_PEAK, METRIC_RSS,

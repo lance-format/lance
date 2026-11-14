@@ -4,8 +4,8 @@
 """Bridge Lance's internal metrics into OpenTelemetry.
 
 Lance core publishes metrics (currently object store request counts, bytes,
-latency, errors, and throttles, plus memory when ``LANCE_MEMORY_OBSERVE``
-is set) through the Rust ``metrics`` facade. This module
+latency, errors, and throttles, plus memory while memory observation is on, see
+:func:`set_memory_observation`) through the Rust ``metrics`` facade. This module
 installs a process-global recorder that aggregates them and registers
 OpenTelemetry observable instruments that report the aggregated values into the
 user's ``MeterProvider``.
@@ -25,6 +25,9 @@ from .lance import (
     lance_metrics_catalog,
     register_lance_metrics_recorder,
     snapshot_lance_metrics,
+)
+from .lance import (
+    set_memory_observation as _set_memory_observation,
 )
 
 if TYPE_CHECKING:
@@ -165,3 +168,36 @@ def instrument_lance_metrics(meter_provider: Optional["MeterProvider"] = None) -
 
     _INSTRUMENTED = True
     return True
+
+
+def set_memory_observation(enabled: bool) -> None:
+    """Switch memory observation on or off for this process.
+
+    This takes over from the ``LANCE_MEMORY_OBSERVE`` environment variable:
+    until the first call the variable decides, including failing index builds
+    when its value is not a boolean, and from then on, for the rest of the
+    process, the latest call decides, whatever the variable holds. An
+    operation, such as an index build, checks the switch once, before its first
+    stage, so switching observation off does not cut short the report of one
+    already running. While observation is off, the memory gauges keep their
+    last values.
+
+    The setting belongs to this process: a child created with ``fork`` starts
+    with it, and a worker started with ``spawn`` or ``forkserver`` follows its
+    own environment. Memory is only read on Linux, and peaks are only kept once
+    a recorder is installed, so call :func:`instrument_lance_metrics` before the
+    operations to observe.
+
+    Parameters
+    ----------
+    enabled : bool
+        Whether to observe the memory of the operations that start from now on.
+
+    Examples
+    --------
+    >>> from lance.otel import set_memory_observation
+    >>> set_memory_observation(True)
+    >>> # ... the operations to observe ...
+    >>> set_memory_observation(False)
+    """
+    _set_memory_observation(enabled)

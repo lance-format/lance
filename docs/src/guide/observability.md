@@ -57,6 +57,16 @@ from lance.otel import instrument_lance_metrics
 instrument_lance_metrics()
 ```
 
+Memory metrics stay empty until memory observation is switched on. Set
+`LANCE_MEMORY_OBSERVE=1` before the process starts, or switch observation on
+from code:
+
+```python
+from lance.otel import set_memory_observation
+
+set_memory_observation(True)
+```
+
 ### Java
 
 The Java SDK includes an OpenTelemetry bridge in `org.lance.otel`. Register it
@@ -88,7 +98,15 @@ provider unregisters the existing callback before registering the new one. Call
 `LanceMetrics.close()` to stop exporting while retaining the process-global Rust
 metric state.
 
-From there the metrics flow through whatever OpenTelemetry pipeline you have
+Memory metrics stay empty until memory observation is switched on. A running
+JVM cannot change its own environment, so unless it was started with
+`LANCE_MEMORY_OBSERVE=1`, switch observation on from code:
+
+```java
+LanceMetrics.setMemoryObservation(true);
+```
+
+Once instrumented, the metrics flow through whatever OpenTelemetry pipeline you have
 configured (OTLP, Prometheus, console, …). Because OpenTelemetry has no
 asynchronous histogram instrument, histograms are exported Prometheus-style as
 three observable counters: `<name>_bucket`, `<name>_count`, and `<name>_sum`.

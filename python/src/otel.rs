@@ -435,6 +435,12 @@ pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
     points.into_iter().map(PyMetricPoint::from).collect()
 }
 
+/// Switch memory observation on or off; see `lance_core::memory::set_observation`.
+#[pyfunction]
+pub fn set_memory_observation(enabled: bool) {
+    lance_core::memory::set_observation(enabled);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
