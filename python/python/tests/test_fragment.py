@@ -1144,6 +1144,62 @@ def test_fragment_update_columns_with_offsets_rewrite_columns(tmp_path):
     assert versions == [1, 1, 1, 1, 1, 2, 1, 2]
 
 
+@pytest.mark.parametrize("skip_null", [False, True])
+def test_fragment_update_columns_skip_null(tmp_path, skip_null):
+    data = pa.table(
+        {
+            "id": list(range(8)),
+            "name": [f"old{i}" for i in range(8)],
+            "score": list(range(8)),
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_skip_null"
+    dataset = lance.write_dataset(
+        data, dataset_uri, max_rows_per_file=4, enable_stable_row_ids=True
+    )
+
+    # id 6 has nulls in every updated column; id 7 is not in the stream.
+    update_data = pa.table(
+        {
+            "id": [4, 5, 6],
+            "name": [None, "new5", None],
+            "score": [400, None, None],
+        }
+    )
+    fragment = dataset.get_fragments()[1]
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data,
+        left_on="id",
+        with_offsets=True,
+        skip_null=skip_null,
+    )
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets={updated_fragment.id: matched_offsets},
+    )
+    dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = dataset.to_table(
+        columns=["id", "name", "score", "_row_last_updated_at_version"]
+    ).sort_by("id")
+    names = result["name"].to_pylist()
+    versions = result["_row_last_updated_at_version"].to_pylist()
+    assert names[:4] == ["old0", "old1", "old2", "old3"]
+    if skip_null:
+        assert names[4:] == ["old4", "new5", "old6", "old7"]
+        assert result["score"].to_pylist() == [0, 1, 2, 3, 400, 5, 6, 7]
+        # An all-null update row is not a match, so its version is unchanged.
+        assert versions == [1, 1, 1, 1, 2, 2, 1, 1]
+    else:
+        assert names[4:] == [None, "new5", None, "old7"]
+        assert result["score"].to_pylist() == [0, 1, 2, 3, 400, None, None, 7]
+        assert versions == [1, 1, 1, 1, 2, 2, 2, 1]
+
+
 def test_fragment_update_columns_no_match(tmp_path):
     """Test update when no rows match the join condition."""
     # Create initial dataset

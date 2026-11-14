@@ -193,9 +193,27 @@ public class Fragment {
    */
   public FragmentUpdateResult updateColumns(
       ArrowArrayStream stream, String leftOn, String rightOn) {
+    return updateColumns(stream, leftOn, rightOn, false);
+  }
+
+  /**
+   * Same as {@link #updateColumns(ArrowArrayStream, String, String)}, optionally skipping nulls in
+   * the new data.
+   *
+   * @param stream the input data stream
+   * @param leftOn column name of current fragment to be joined on.
+   * @param rightOn column name of new data to be joined on.
+   * @param skipNull if true, a null value in the new data keeps the existing value of the matched
+   *     row instead of overwriting it. Only top-level nulls are skipped: a non-null struct replaces
+   *     the old struct as a whole, including its null children. A row of new data whose columns
+   *     other than {@code rightOn} are all null changes nothing and is treated as unmatched.
+   * @return the fragment metadata.
+   */
+  public FragmentUpdateResult updateColumns(
+      ArrowArrayStream stream, String leftOn, String rightOn, boolean skipNull) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return nativeUpdateColumns(
-          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn, skipNull);
     }
   }
 
@@ -208,7 +226,8 @@ public class Fragment {
       long fragmentId,
       long arrowStreamMemoryAddress,
       String leftOn,
-      String rightOn);
+      String rightOn,
+      boolean skipNull);
 
   /**
    * Append new columns to this Fragment from a stream of new-column values. This is the
