@@ -2,9 +2,44 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use crate::format::{EncodingUtils, metadata::compressive_encoding::Compression};
+use crate::{
+    compression::BlockCompressor,
+    encodings::physical::{rle::BlockRleEncoder, value::ValueEncoder},
+    format::{EncodingUtils, metadata::compressive_encoding::Compression},
+};
 
-fn payload_fixture(bits: u8, large: bool, nested: bool, available: usize) -> Fixture {
+fn payload_fixture(bits: u8, large: bool, nested: bool, available: usize, is_rle: bool) -> Fixture {
+    if is_rle {
+        let mut values = Vec::new();
+        for value in [0_u64, 1, 1, 3, 4] {
+            values.extend_from_slice(&value.to_le_bytes()[..usize::from(bits / 8)]);
+        }
+        let (payload, encoding) = BlockRleEncoder::try_new(
+            u64::from(bits),
+            Box::<ValueEncoder>::default(),
+            Box::<ValueEncoder>::default(),
+        )
+        .unwrap()
+        .compress(DataBlock::FixedWidth(crate::data::FixedWidthDataBlock {
+            bits_per_value: u64::from(bits),
+            num_values: 5,
+            data: LanceBuffer::from(values),
+            block_info: crate::data::BlockInfo::new(),
+        }))
+        .unwrap();
+        let Some(Compression::Variable(variable)) =
+            EncodingUtils::variable(encoding, None).compression
+        else {
+            panic!("expected Variable")
+        };
+        return framed_fixture(
+            &[payload.as_ref().unwrap(), b"abcd"],
+            BinaryMiniBlockDecompressor::from_variable(&variable).unwrap(),
+            large,
+            nested,
+            available,
+        );
+    }
     let mut offsets = Vec::new();
     for delta in [1_u64, 0, 2, 1] {
         offsets.extend_from_slice(&delta.to_le_bytes()[..usize::from(bits / 8)]);
@@ -35,6 +70,7 @@ fn encoded_offsets_preserve_task_overlap(
     #[values(false, true)] large: bool,
     #[values(false, true)] multiple: bool,
     #[values(false, true)] nested: bool,
+    #[values(false, true)] is_rle: bool,
 ) {
     let width = usize::from(bits / 8);
     let selected: &[&[u8]] = if multiple || nested {
@@ -54,7 +90,7 @@ fn encoded_offsets_preserve_task_overlap(
         budget,
         mut work,
         physical,
-    } = payload_fixture(bits, large, nested, required);
+    } = payload_fixture(bits, large, nested, required, is_rle);
     select(
         &mut task,
         if multiple {
@@ -108,7 +144,7 @@ fn later_encoded_offset_overflow_recycles_structural_scratch() {
         budget,
         mut work,
         ..
-    } = payload_fixture(32, false, true, 1024);
+    } = payload_fixture(32, false, true, 1024, false);
     select(&mut task, &[(0, 2), (2, 2)]);
     let mut bytes = task.instructions[1].1.data.to_vec();
     // 16-byte header, two padded 12-byte level streams, then four u32 deltas.

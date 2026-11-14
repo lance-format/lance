@@ -77,6 +77,7 @@ use crate::statistics::Stat;
 use lance_core::{Error, Result};
 
 mod admitted;
+mod unsigned;
 
 /// Width used to encode RLE run lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2673,6 +2674,16 @@ impl BlockRleDecompressor {
 }
 
 impl BlockDecompressor for BlockRleDecompressor {
+    fn visit_unsigned(
+        &self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        unsigned::visit(self, data, bits_per_value, num_values, visitor)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         if num_values == 0 {
             return Err(Error::invalid_input(

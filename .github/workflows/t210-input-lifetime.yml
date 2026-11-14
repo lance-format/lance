@@ -21,9 +21,20 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # At 5e51b0eed, payload traversal passed 261 default and 231 no-default
-      # cases plus its API example. This fix only removes redundant visibility
-      # qualifiers inside the crate-private unsigned module; retain that evidence.
+      # Reuse unchanged Flat/bitpacked visitor evidence from 5e51b0eed and the
+      # visibility-only strict lint pass at 859387837. Cover RLE and the changed
+      # Binary non-affine metadata path plus its MiniBlock compositions here.
+      - name: Validate RLE unsigned traversal
+        run: cargo test --profile ci --locked -p lance-encoding --lib physical::rle::unsigned::tests -- --nocapture
+      - name: Validate Binary admission and composition
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib physical::binary::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests::binary -- --nocapture
+      - name: Validate RLE and Binary without optional codecs
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::rle::unsigned::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::binary::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::binary -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

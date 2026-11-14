@@ -46,7 +46,7 @@ pub(super) struct RangePlan {
     offsets: Range<u64>,
     offset_bytes: usize,
     width: usize,
-    // A validated arithmetic sequence; None means offsets reside in input bytes.
+    // A validated arithmetic sequence; None uses legacy bytes or the generic visitor.
     metadata: Option<(u64, u64)>,
     values_buffer: usize,
 }
@@ -123,7 +123,16 @@ pub(super) fn plan(
         let count = num_values.checked_add(1).ok_or_else(|| {
             Error::corrupt_file_named("binary mini-block", "offset count overflows")
         })?;
-        let (start, step, last) = match offsets.plan_unsigned_metadata(u64::from(bits), count)? {
+        let metadata = match offsets.plan_unsigned_metadata(u64::from(bits), count) {
+            Ok(metadata) => metadata,
+            // Non-affine metadata, such as RLE(Range, Constant), still has an
+            // allocation-free visitor. Keep the O(1) path for affine sequences.
+            Err(Error::NotSupported { .. }) => {
+                return payload::plan(codec, data, num_values, range);
+            }
+            Err(error) => return Err(error),
+        };
+        let (start, step, last) = match metadata {
             SequenceMetadata::Empty => {
                 return Err(Error::corrupt_file_named(
                     "binary mini-block",
@@ -213,8 +222,9 @@ pub(super) fn decode(
     let mut values = workspace
         .try_allocate(plan.values.len())?
         .ok_or_else(|| Error::internal("binary values exceeded complete admission"))?;
-    if plan.values_buffer == 1 {
-        if let Err(error) = payload::write(codec, &data[0], num_values, &plan, offsets.as_mut()) {
+    if plan.metadata.is_none() && matches!(codec.layout, BinaryMiniBlockLayout::Generic { .. }) {
+        let input = (plan.values_buffer == 1).then(|| &data[0]);
+        if let Err(error) = payload::write(codec, input, num_values, &plan, offsets.as_mut()) {
             offsets.recycle(workspace)?;
             values.recycle(workspace)?;
             return Err(error);
