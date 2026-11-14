@@ -2116,3 +2116,329 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
 
     assert_eq!(row_ids, vec![100]);
 }
+
+#[rstest::rstest]
+#[case::and(Operator::And)]
+#[case::or(Operator::Or)]
+#[tokio::test]
+async fn test_exact_single_term_phrase_uses_frequencies_without_positions(
+    #[case] operator: Operator,
+    #[values(0, 17)] query_position: u32,
+) {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().with_position(true);
+    let format = params.resolved_format_version();
+    let mut partition =
+        InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format);
+    partition.tokens.get_or_add("hit");
+    let mut posting =
+        PostingListBuilder::new_with_posting_tail_codec(true, format.posting_tail_codec());
+    posting.add(0, PositionRecorder::Position(vec![3, 7, 9].into()));
+    posting.add(1, PositionRecorder::Position(vec![4].into()));
+    partition.posting_lists.push(posting);
+    partition.docs.append(100, 10);
+    partition.docs.append(200, 6);
+    partition.docs.append(300, 6);
+    partition.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+
+    let index = InvertedIndex::load(store, None, &LanceCache::with_capacity(1 << 20))
+        .await
+        .unwrap();
+    let tokens = Arc::new(Tokens::with_positions(
+        vec!["hit".to_owned()],
+        vec![query_position],
+        DocType::Text,
+    ));
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let phrase = index
+        .bm25_search(
+            tokens.clone(),
+            Arc::new(params.clone().with_phrase_slop(Some(0))),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        index.partitions[0]
+            .inverted_list
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .is_none(),
+        "a singleton exact phrase must not read or cache its position stream"
+    );
+    let matched = index
+        .bm25_search(
+            tokens,
+            Arc::new(params),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(phrase, matched);
+    let mut rows = phrase.0;
+    rows.sort_unstable();
+    assert_eq!(rows, vec![100, 200]);
+}
+
+#[tokio::test]
+async fn test_exact_single_term_phrase_still_requires_positional_index() {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = write_single_partition_index(
+        store,
+        InvertedIndexParams::default().with_position(false),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await
+    .unwrap();
+    let error = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_phrase_slop(Some(0))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("position is not found"),
+        "{error}"
+    );
+}
+
+#[rstest::rstest]
+#[case::all(false, false, true, vec![0_u64, 4])]
+#[case::filtered(true, false, true, vec![4_u64])]
+#[case::payload_evicted(false, true, true, vec![0_u64, 4])]
+#[case::filtered_payload_evicted(true, true, true, vec![4_u64])]
+#[case::metadata_disabled(false, true, false, vec![0_u64, 4])]
+#[case::filtered_metadata_disabled(true, true, false, vec![4_u64])]
+#[tokio::test]
+async fn selective_phrase_search_reads_committed_partitions(
+    #[case] filtered: bool,
+    #[case] evict_payload: bool,
+    #[case] cache_metadata: bool,
+    #[case] expected_rows: Vec<u64>,
+) -> Result<()> {
+    let dir = TempObjDir::default();
+    let object_store = Arc::new(ObjectStore::local());
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    write_pair_partition_with_position(
+        &store,
+        0,
+        &[("alpha", "beta", 0), ("beta", "alpha", 1)],
+        true,
+    )
+    .await;
+    write_pair_partition_with_position(&store, 1, &[("alpha", "gamma", 2)], true).await;
+    write_pair_partition_with_position(
+        &store,
+        2,
+        &[("alpha", "beta", 4), ("beta", "alpha", 5)],
+        true,
+    )
+    .await;
+    // Construct the same current mini-block positions encoding as final
+    // pipeline outputs. Ordinary FullZip and frozen file 2.0 use fallback.
+    for partition_id in 0..3 {
+        let path = posting_file_path(partition_id);
+        let reader = store.open_index_file(&path).await?;
+        let metadata = reader.schema().metadata.clone();
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let schema = batch.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == COMPRESSED_POSITION_COL {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert(
+                        lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.into(),
+                        lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                    );
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        drop(reader);
+        let mut writer = store.new_index_file(&path, schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish_with_metadata(metadata).await?;
+    }
+    // Fixture construction above rewrites files. Start metadata caching only
+    // once their immutable contents have been finalized.
+    let metadata_cache = Arc::new(if cache_metadata {
+        LanceCache::with_capacity(1024 * 1024)
+    } else {
+        LanceCache::no_cache()
+    });
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        metadata_cache.clone(),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let (index, payload_cache) = load_prewarmed_index(
+        store,
+        vec![0, 1, 2],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".into(), "beta".into()],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(10))
+            .with_phrase_slop(Some(0)),
+    );
+    let scorer = Arc::new(index.bm25_base_scorer(&tokens, &params, None).await?);
+    let mask = if filtered {
+        RowAddrMask::from_allowed([4_u64, 5].into_iter().collect())
+    } else {
+        RowAddrMask::default()
+    };
+    let request = ModernSearchRequest {
+        tokens,
+        params,
+        operator: Operator::And,
+        mask: Arc::new(mask),
+        metrics: Arc::new(NoOpMetricsCollector),
+        impact_scorer: scorer,
+        limit: 10,
+        initial_score_floor: None,
+        term_ids: None,
+    };
+    let selected = index
+        .try_selective_phrase_search(request.clone())
+        .await?
+        .expect("current-format fixture must select the new reader");
+    let offset_activity_before = metadata_cache
+        .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+        .await
+        .by_type
+        .unwrap()
+        .activity
+        .into_iter()
+        .find(|entry| entry.type_name == "PositionOffsets");
+    if evict_payload {
+        payload_cache.clear().await;
+    }
+    let before = object_store.io_stats_snapshot();
+    let repeated = index
+        .try_selective_phrase_search(request.clone())
+        .await?
+        .expect("repeated search must use the same supported reader");
+    let after = object_store.io_stats_snapshot();
+    // Equal scores need not have the same asynchronous completion order.
+    let mut first_hits = selected
+        .iter()
+        .map(|Reverse(hit)| {
+            (
+                hit.document.partition_ordinal(),
+                hit.document.doc_id,
+                hit.score,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut repeated_hits = repeated
+        .iter()
+        .map(|Reverse(hit)| {
+            (
+                hit.document.partition_ordinal(),
+                hit.document.doc_id,
+                hit.score,
+            )
+        })
+        .collect::<Vec<_>>();
+    first_hits.sort_unstable();
+    repeated_hits.sort_unstable();
+    assert_eq!(first_hits, repeated_hits);
+    if evict_payload && cache_metadata {
+        let before = offset_activity_before
+            .expect("small immutable position offsets must use the file metadata budget")
+            .activity;
+        let after = metadata_cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+            .await
+            .by_type
+            .unwrap()
+            .activity
+            .into_iter()
+            .find(|entry| entry.type_name == "PositionOffsets")
+            .unwrap()
+            .activity;
+        assert!(before.loads_succeeded > 0);
+        assert_eq!(
+            before.loads_started, after.loads_started,
+            "evicting index payloads must not reload surviving position offsets"
+        );
+        assert!(after.hits > before.hits);
+    } else if cache_metadata {
+        assert_eq!(
+            before.read_iops, after.read_iops,
+            "warm selective search must reuse locations, offsets and payloads"
+        );
+        assert_eq!(before.read_bytes, after.read_bytes);
+    } else {
+        assert_eq!(metadata_cache.size_bytes().await, 0);
+    }
+    let mut rows = Vec::new();
+    for Reverse(hit) in selected {
+        let documents = index.partitions[hit.document.partition_ordinal()]
+            .docs
+            .modern()
+            .unwrap();
+        rows.push(
+            documents
+                .resolve_document_keys(&[hit.document.doc_id])
+                .await?[0]
+                .0,
+        );
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, expected_rows);
+    let mut unsupported = request;
+    unsupported.params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(10))
+            .with_phrase_slop(Some(1)),
+    );
+    assert!(
+        index
+            .try_selective_phrase_search(unsupported)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}

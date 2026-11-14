@@ -305,6 +305,15 @@ jobs:
             --no-run
       - name: Start DynamoDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
+      - name: Run compact decode and nested selection regressions
+        run: |
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}" \
+            -E '(package(lance-encoding) & (test(test_empty_fixed_width_builder_preserves_arrow_alignment) | test(test_miniblock_planned_binary_bytes_match_partial_drain) | test(test_miniblock_cancelled_tasks_release_exhausted_input) | test(test_miniblock_single_binary_value_retains_only_compact_owned_input) | test(test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input) | test(binary_slices_))) | ((package(lance-file) | package(lance-index)) & test(binary_slices_)) | (package(lance-index) & test(selective_phrase_)) | (package(lance) & test(test_filtered_scan_preserves_nullable_struct_validity))'
       - name: Run tests
         run: |
           ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
@@ -313,6 +322,28 @@ jobs:
             --locked \
             --workspace \
             --features "${ALL_FEATURES}"
+      # Keep the full merge-tree integration pass above, then pin the focused
+      # regressions to the task head even if main advanced during validation.
+      - name: Check out exact PR head for focused decode and FTS regressions
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "${PR_HEAD}"
+          git checkout --detach "${PR_HEAD}"
+          test "$(git rev-parse HEAD)" = "${PR_HEAD}"
+      - name: Run compact decode and FTS regressions with one compute worker
+        env:
+          LANCE_CPU_THREADS: "1"
+          TOKIO_WORKER_THREADS: "2"
+        run: |
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}" \
+            -E '(package(lance-encoding) & (test(test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input) | test(binary_slices_) | test(test_miniblock_single_binary_value_retains_only_compact_owned_input) | test(test_miniblock_cancelled_tasks_release_exhausted_input) | test(test_miniblock_planned_binary_bytes_match_partial_drain))) | ((package(lance-file) | package(lance-index)) & test(binary_slices_)) | (package(lance-index) & (test(scalar::inverted::index) | test(selective_phrase_) | (test(scalar::inverted::builder) & test(pipeline))))'
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x

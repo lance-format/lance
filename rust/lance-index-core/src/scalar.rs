@@ -13,6 +13,7 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::Expr;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::cache::WeakLanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -176,9 +177,68 @@ pub trait IndexWriter: Send {
     ) -> Result<IndexFile>;
 }
 
+/// Prepared byte-range access to one binary value in an immutable index file.
+#[async_trait]
+pub trait IndexBinaryReader: std::fmt::Debug + Send + Sync {
+    /// The exact payload length, available without reading the payload.
+    fn len(&self) -> u64;
+
+    /// Whether the value has no payload bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read value-relative ranges in input order, including overlaps/empties.
+    /// Returned buffers may share I/O backing; visible lengths are not retained
+    /// allocation bounds. Preparation metadata is reused between calls.
+    async fn read_slices(&self, slices: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>>;
+}
+
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
+    /// Return this immutable file's optional, bounded metadata cache namespace.
+    ///
+    /// Auxiliary metadata can use this tier independently of index payload
+    /// eviction. The weak handle must not retain a request's I/O scope. Readers
+    /// without a separate metadata tier return `None`; callers keep their normal
+    /// fallback. A disabled cache is still a supported tier, without retention.
+    ///
+    /// ```
+    /// # use lance_index_core::scalar::IndexReader;
+    /// # fn example(reader: &dyn IndexReader) {
+    /// if let Some(file_metadata) = reader.metadata_cache() {
+    ///     // Reuse the existing file namespace for immutable metadata loaders.
+    ///     # drop(file_metadata);
+    /// }
+    /// # }
+    /// ```
+    fn metadata_cache(&self) -> Option<WeakLanceCache> {
+        None
+    }
+
+    /// Optionally prepare byte reads for one binary value without reading its payload.
+    ///
+    /// `row` is relative to the named column. `None` requests ordinary decoding;
+    /// the default does not issue I/O. Handles retain the current I/O scope and
+    /// must not be cached across requests with different statistics/priority.
+    ///
+    /// ```
+    /// # use lance_index_core::scalar::IndexReader;
+    /// # async fn example(reader: &dyn IndexReader) -> lance_core::Result<()> {
+    /// if let Some(value) = reader.try_prepare_binary_value("positions", 0).await? {
+    ///     let _tail = value.read_slices(&[value.len().saturating_sub(8)..value.len()]).await?;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    async fn try_prepare_binary_value(
+        &self,
+        _column: &str,
+        _row: u64,
+    ) -> Result<Option<Arc<dyn IndexBinaryReader>>> {
+        Ok(None)
+    }
+
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read several record batches, returning one batch per entry of
@@ -382,6 +442,25 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// prefetches nothing may return itself, but must say so explicitly, since a caller
     /// that silently gets no bound cannot tell.
     fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore>;
+
+    /// Return a scope whose index writers use at most `bytes` of configured
+    /// column buffering per file. A single Arrow row and encoding scratch may
+    /// exceed that buffer, so callers must separately bound their batches.
+    /// Unsupported stores return an error rather than silently ignoring a cap.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::Result;
+    /// use lance_index_core::scalar::IndexStore;
+    /// fn bounded_writers(store: &dyn IndexStore) -> Result<Arc<dyn IndexStore>> {
+    ///     store.with_write_buffer_size(8 << 20)
+    /// }
+    /// ```
+    fn with_write_buffer_size(&self, bytes: u64) -> Result<Arc<dyn IndexStore>> {
+        Err(Error::not_supported(format!(
+            "index store does not support a writer buffer of {bytes} bytes"
+        )))
+    }
 
     /// Copy a range of batches from an index file from this store to another
     ///

@@ -33,6 +33,7 @@ mod intersection;
 mod maxscore;
 mod phrase;
 mod posting;
+pub(super) mod selective_phrase;
 
 pub(super) use bounds::{
     CompetitiveFloorMode, outward_f32_upper_bound, score_sum_cannot_compete,
@@ -865,5 +866,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 }
 
+#[cfg(test)]
+#[path = "wand/selective_phrase_tests.rs"]
+mod selective_phrase_tests;
 #[cfg(test)]
 mod tests;

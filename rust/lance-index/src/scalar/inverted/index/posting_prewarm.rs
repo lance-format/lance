@@ -1001,22 +1001,18 @@ impl PostingListReader {
                             Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                             e => e,
                         })?;
-                    let bytes = bytes::Bytes::from(
-                        batch[COMPRESSED_POSITION_COL]
-                            .as_binary::<i64>()
-                            .value(0)
-                            .to_vec(),
-                    );
                     let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
                         .as_list::<i32>()
                         .value(0)
                         .as_primitive::<UInt32Type>()
                         .values()
                         .to_vec();
-                    CompressedPositionStorage::SharedStream(SharedPositionStream::new(
+                    let positions = batch[COMPRESSED_POSITION_COL].as_binary::<i64>().clone();
+                    drop(batch);
+                    CompressedPositionStorage::SharedStream(SharedPositionStream::from_arrow(
                         codec,
                         block_offsets,
-                        bytes,
+                        positions,
                     ))
                 }
             };

@@ -30,7 +30,7 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{BlockDecompressor, DecompressionStrategy, MiniBlockDecompressor};
 #[cfg(feature = "bitpacking")]
 use crate::data::{BlockInfo, FixedWidthDataBlock};
-use crate::data::{DataBlock, DataBlockBuilder, DictionaryDataBlock};
+use crate::data::{DataBlock, DataBlockBuilder, DictionaryDataBlock, VariableWidthBlock};
 use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::InlineBitpacking;
@@ -38,6 +38,7 @@ use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
+mod binary_slices;
 mod structure;
 
 use super::chunk_index::{
@@ -87,6 +88,39 @@ struct DecodeMiniBlockTask {
 }
 
 impl DecodeMiniBlockTask {
+    fn compact_single_binary_value(
+        mut values: VariableWidthBlock,
+        input: LanceBuffer,
+    ) -> VariableWidthBlock {
+        let payload_len = values.data.len();
+        let payload_range = (values.data.as_ptr() as usize)
+            .checked_sub(input.as_ptr() as usize)
+            .and_then(|start| start.checked_add(payload_len).map(|end| start..end))
+            .filter(|range| range.end <= input.len());
+        let Some(payload_range) = payload_range else {
+            values.data = values.data.deep_copy();
+            values.offsets = values.offsets.deep_copy();
+            return values;
+        };
+
+        // Release codec views before asking Arrow to prove unique, standard,
+        // unsliced ownership. Capacity alone cannot prove ownership: custom
+        // owners may hide a larger allocation behind a short visible slice.
+        values.offsets = values.offsets.deep_copy();
+        values.data = LanceBuffer::empty();
+        let payload = match input.into_buffer().into_vec::<u8>() {
+            Ok(mut input) if input.capacity() <= payload_len.saturating_add(64) => {
+                input.copy_within(payload_range, 0);
+                input.truncate(payload_len);
+                input
+            }
+            Ok(input) => input[payload_range].to_vec(),
+            Err(input) => input.as_slice()[payload_range].to_vec(),
+        };
+        values.data = LanceBuffer::from(payload);
+        values
+    }
+
     #[cfg(feature = "bitpacking")]
     fn decode_inline_bitpacking<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
         &self,
@@ -935,7 +969,7 @@ impl DecodeMiniBlockTask {
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
-    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+    fn decode(mut self: Box<Self>) -> Result<DecodedPage> {
         #[cfg(feature = "bitpacking")]
         if self.rep_decompressor.is_none()
             && self.structural_projection.is_none()
@@ -957,6 +991,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
         let max_rep = self.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
+        let max_visible_level = self.max_visible_level;
         let mut level_offset = 0usize;
 
         let map_instruction = |instructions: &ChunkDrainInstructions,
@@ -979,7 +1014,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 rep,
                 def,
                 max_rep,
-                self.max_visible_level,
+                max_visible_level,
                 chunk.items_in_chunk,
                 instructions.preamble_action,
             );
@@ -1016,21 +1051,40 @@ impl DecodePageTask for DecodeMiniBlockTask {
             Ok((item_range, level_range))
         };
 
-        let mut data = if self.instructions.len() == 1
-            && self.structural_projection.is_none()
-            && self.value_decompressor.allocates_output()
-        {
-            let (instructions, chunk) = &self.instructions[0];
+        let mut data = if self.instructions.len() == 1 && self.structural_projection.is_none() {
+            let (instructions, chunk) = self.instructions.pop().unwrap();
             let (rep, def, value_buffers) = self.decode_chunk_sections(&chunk.data)?;
             let (item_range, level_range) =
-                map_instruction(instructions, chunk, rep.as_ref(), def.as_ref())?;
+                map_instruction(&instructions, &chunk, rep.as_ref(), def.as_ref())?;
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, 0);
             Self::extend_levels(level_range, &mut defbuf, &def, 0);
-            self.value_decompressor.decompress_range(
+            let num_values = item_range.end - item_range.start;
+            let decoded = self.value_decompressor.decompress_range(
                 value_buffers,
                 chunk.items_in_chunk,
                 item_range,
-            )?
+            )?;
+            if self.value_decompressor.allocates_output() {
+                decoded
+            } else if num_values == 1
+                && rep.is_none()
+                && def.is_none()
+                && self.dictionary_data.is_none()
+                && let DataBlock::VariableWidth(values) = decoded
+            {
+                // A selected value may dominate a multi-value chunk. Reuse is
+                // safe only when the helper proves unique ownership and its
+                // retained-byte bound, regardless of the other values.
+                DataBlock::VariableWidth(Self::compact_single_binary_value(values, chunk.data))
+            } else {
+                // A codec view must not pin its input chunk. Size its compact
+                // copy after decoding the selection: estimating from the whole
+                // chunk over-reserves unrelated values and forces consumers
+                // that enforce retained-byte bounds to copy again.
+                let mut builder = DataBlockBuilder::with_capacity_estimate(decoded.data_size());
+                builder.append(&decoded, 0..num_values)?;
+                builder.finish()
+            }
         } else if let Some(projection) = &self.structural_projection {
             let mut total_items = 0_u64;
             let mut group_start = 0usize;
@@ -1359,10 +1413,22 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             {
                 self.loaded_chunks.pop_front();
             }
-            drain_instructions.push((instructions, self.loaded_chunks.front().unwrap().clone()));
             if consumed {
                 self.instructions.pop_front();
             }
+            // Instructions are ordered by chunk. Transfer the final reference
+            // to the last task using it; retaining it here pins exhausted I/O
+            // after cancellation and prevents uniquely owned decodes.
+            let chunk_needed_again = !consumed
+                || self.instructions.front().is_some_and(|next| {
+                    next.chunk_idx == instructions.chunk_instructions.chunk_idx
+                });
+            let chunk = if chunk_needed_again {
+                self.loaded_chunks.front().unwrap().clone()
+            } else {
+                self.loaded_chunks.pop_front().unwrap()
+            };
+            drain_instructions.push((instructions, chunk));
         }
         // We can throw away need_preamble here because it must be false.  If it were true it would mean
         // we were still in the middle of loading rows.  We do need to latch skip_in_chunk though.
@@ -2366,7 +2432,7 @@ mod tests {
     };
     use crate::encodings::logical::primitive::tests::encoded_u16_frame;
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
-    use crate::encodings::physical::binary::VariableEncoder;
+    use crate::encodings::physical::binary::{BinaryMiniBlockDecompressor, VariableEncoder};
     #[cfg(feature = "bitpacking")]
     use crate::encodings::physical::bitpacking::InlineBitpacking;
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
@@ -2377,6 +2443,64 @@ mod tests {
         ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, MiniBlockDecoder,
         PreambleAction, Words, build_chunk_index,
     };
+
+    #[rstest]
+    fn test_miniblock_cancelled_tasks_release_exhausted_input(
+        #[values(false, true)] disjoint_selections: bool,
+        #[values(1, 2)] batch_size: u64,
+    ) {
+        // Cancellation drops tasks before decoding. Track the input allocation,
+        // including when a partial drain or a later selection still needs it.
+        let owner: Arc<[u8]> = Arc::from([0_u8; 16]);
+        let weak = Arc::downgrade(&owner);
+        let instructions = if disjoint_selections {
+            [(0, 1), (2, 1)].as_slice()
+        } else {
+            [(0, 2)].as_slice()
+        }
+        .iter()
+        .map(|&(rows_to_skip, rows_to_take)| ChunkInstructions {
+            chunk_idx: 0,
+            preamble: PreambleAction::Absent,
+            rows_to_skip,
+            rows_to_take,
+            take_trailer: false,
+        })
+        .collect();
+        let mut decoder = MiniBlockDecoder {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::from([LoadedChunk {
+                data: LanceBuffer::reinterpret_slice(owner),
+                items_in_chunk: if disjoint_selections { 3 } else { 2 },
+                byte_range: 0..16,
+                chunk_idx: 0,
+            }]),
+            instructions,
+            offset_in_current_chunk: 0,
+            num_rows: 2,
+            num_buffers: 1,
+            dictionary: None,
+            has_large_chunk: false,
+        };
+
+        let first = decoder.drain(batch_size).unwrap();
+        assert!(weak.upgrade().is_some());
+        if batch_size == 1 {
+            drop(first);
+            assert!(weak.upgrade().is_some(), "remaining selection needs input");
+            let last = decoder.drain(1).unwrap();
+            assert!(weak.upgrade().is_some(), "pending task needs input");
+            drop(last);
+        } else {
+            drop(first);
+        }
+        assert!(weak.upgrade().is_none(), "exhausted decoder retains input");
+        std::hint::black_box(&decoder);
+    }
 
     #[test]
     fn test_miniblock_decode_uses_exact_fixed_width_output_size() {
@@ -2454,50 +2578,267 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_miniblock_planned_binary_bytes_match_partial_drain() {
-        use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
-
-        fn binary_value_buffer(values: &[&[u8]]) -> Vec<u8> {
-            let header_bytes = (values.len() as u32 + 1) * 4;
-            let mut offsets = vec![header_bytes];
-            let mut current = header_bytes;
-            for value in values {
-                current += value.len() as u32;
-                offsets.push(current);
-            }
-            let mut buffer = offsets
+    fn binary_value_buffer(values: &[&[u8]], bits_per_offset: u8) -> Vec<u8> {
+        let header_bytes = (values.len() as u64 + 1) * u64::from(bits_per_offset / 8);
+        let mut offsets = vec![header_bytes];
+        let mut current = header_bytes;
+        for value in values {
+            current += value.len() as u64;
+            offsets.push(current);
+        }
+        let mut buffer = if bits_per_offset == 32 {
+            offsets
                 .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>();
-            for value in values {
-                buffer.extend_from_slice(value);
-            }
-            buffer.resize(buffer.len().next_multiple_of(4), 0);
+                .flat_map(|o| (o as u32).to_le_bytes())
+                .collect::<Vec<_>>()
+        } else {
+            offsets
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        for value in values {
+            buffer.extend_from_slice(value);
+        }
+        buffer.resize(
             buffer
-        }
+                .len()
+                .next_multiple_of(usize::from(bits_per_offset / 8)),
+            0,
+        );
+        buffer
+    }
 
-        fn miniblock_chunk(value_buffer: &[u8]) -> LanceBuffer {
-            let mut chunk = Vec::new();
-            chunk.extend_from_slice(&0_u16.to_le_bytes());
+    fn miniblock_chunk(value_buffer: &[u8], large_header: bool) -> LanceBuffer {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&0_u16.to_le_bytes());
+        if large_header {
+            chunk.extend_from_slice(&(value_buffer.len() as u32).to_le_bytes());
+        } else {
             chunk.extend_from_slice(&(value_buffer.len() as u16).to_le_bytes());
-            let padding =
-                lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
-            chunk.resize(chunk.len() + padding, 0);
-            chunk.extend_from_slice(value_buffer);
-            let padding =
-                lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
-            chunk.resize(chunk.len() + padding, 0);
-            LanceBuffer::from(chunk)
         }
+        let padding =
+            lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
+        chunk.resize(chunk.len() + padding, 0);
+        chunk.extend_from_slice(value_buffer);
+        let padding =
+            lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
+        chunk.resize(chunk.len() + padding, 0);
+        LanceBuffer::from(chunk.into_boxed_slice().into_vec())
+    }
 
-        let values: Vec<&[u8]> = vec![b"aa", b"bb", b"ccc", b"d", b"eeeee"];
-        let chunk_data = miniblock_chunk(&binary_value_buffer(&values));
+    #[rstest]
+    fn test_miniblock_single_binary_value_retains_only_compact_owned_input(
+        #[values(32, 64)] bits_per_offset: u8,
+        #[values(false, true)] large_header: bool,
+        #[values(0, 1024, 2049)] payload_len: usize,
+        #[values("owned", "shared", "custom", "oversized", "sliced")] ownership: &str,
+    ) {
+        let expected = vec![b'x'; payload_len];
+        let chunk = miniblock_chunk(
+            &binary_value_buffer(&[expected.as_slice()], bits_per_offset),
+            large_header,
+        );
+        let mut alias = None;
+        let mut owner = None;
+        let chunk = match ownership {
+            "owned" => chunk,
+            "shared" => {
+                alias = Some(chunk.clone());
+                chunk
+            }
+            "custom" => {
+                let mut backing = chunk.to_vec();
+                backing.resize(backing.len() + 4096, 0);
+                let backing: Arc<[u8]> = backing.into();
+                owner = Some(Arc::downgrade(&backing));
+                LanceBuffer::reinterpret_slice(backing).slice_with_length(0, chunk.len())
+            }
+            "oversized" => {
+                let mut backing = Vec::with_capacity(chunk.len() + 4096);
+                backing.extend_from_slice(&chunk);
+                LanceBuffer::from(backing)
+            }
+            "sliced" => {
+                let mut backing = vec![0; 16];
+                backing.extend_from_slice(&chunk);
+                LanceBuffer::from(backing).slice_with_length(16, chunk.len())
+            }
+            _ => unreachable!(),
+        };
+        let input_ptr = chunk.as_ptr();
+        let task = DecodeMiniBlockTask {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(
+                BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap(),
+            ),
+            dictionary_data: None,
+            def_meaning: Arc::from([]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: vec![(
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx: 0,
+                        preamble: PreambleAction::Absent,
+                        rows_to_skip: 0,
+                        rows_to_take: 1,
+                        take_trailer: false,
+                    },
+                    rows_to_skip: 0,
+                    rows_to_take: 1,
+                    preamble_action: PreambleAction::Absent,
+                },
+                LoadedChunk {
+                    byte_range: 0..chunk.len() as u64,
+                    data: chunk,
+                    items_in_chunk: 1,
+                    chunk_idx: 0,
+                },
+            )],
+            has_large_chunk: large_header,
+        };
+        let decoded = Box::new(task).decode().unwrap();
+        let values = decoded.data.as_variable_width_ref().unwrap();
+        assert_eq!(values.num_values, 1);
+        assert_eq!(values.data.as_ref(), expected.as_slice());
+        if bits_per_offset == 32 {
+            assert_eq!(
+                values.offsets.borrow_to_typed_view::<u32>().as_ref(),
+                &[0, payload_len as u32]
+            );
+        } else {
+            assert_eq!(
+                values.offsets.borrow_to_typed_view::<u64>().as_ref(),
+                &[0, payload_len as u64]
+            );
+        }
+        assert!(values.data.clone().into_buffer().capacity() <= payload_len + 64);
+        if ownership == "owned" {
+            assert_eq!(
+                values.data.as_ptr(),
+                input_ptr,
+                "reuse the proven owned allocation"
+            );
+        }
+        if let Some(alias) = alias {
+            assert_eq!(alias.as_ptr(), input_ptr);
+            assert_ne!(values.data.as_ptr(), input_ptr);
+        }
+        if let Some(owner) = owner {
+            assert!(
+                owner.upgrade().is_none(),
+                "result must release hidden backing"
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input(
+        #[values(32, 64)] bits_per_offset: u8,
+        #[values(false, true)] large_header: bool,
+        #[values(0, 128)] other_len: usize,
+        #[values("first", "last", "partial")] selection: &str,
+    ) {
+        let expected = vec![b'x'; 1024];
+        let other = vec![b'y'; other_len];
+        let values = if selection == "last" {
+            [other.as_slice(), expected.as_slice()]
+        } else {
+            [expected.as_slice(), other.as_slice()]
+        };
+        let chunk = miniblock_chunk(&binary_value_buffer(&values, bits_per_offset), large_header);
+        let input_ptr = chunk.as_ptr();
+        let selected_rows = if selection == "partial" { 2 } else { 1 };
         let mut decoder = MiniBlockDecoder {
             structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
-            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            value_decompressor: Arc::new(
+                BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap(),
+            ),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::from([LoadedChunk {
+                byte_range: 0..chunk.len() as u64,
+                data: chunk,
+                items_in_chunk: 2,
+                chunk_idx: 0,
+            }]),
+            instructions: VecDeque::from([ChunkInstructions {
+                chunk_idx: 0,
+                preamble: PreambleAction::Absent,
+                rows_to_skip: u64::from(selection == "last"),
+                rows_to_take: selected_rows,
+                take_trailer: false,
+            }]),
+            offset_in_current_chunk: 0,
+            num_rows: selected_rows,
+            num_buffers: 1,
+            dictionary: None,
+            has_large_chunk: large_header,
+        };
+
+        let decoded = decoder.drain(1).unwrap().decode().unwrap();
+        let data = decoded.data.as_variable_width_ref().unwrap();
+        assert_eq!(data.num_values, 1);
+        assert_eq!(data.data.as_ref(), expected.as_slice());
+        let offsets = if bits_per_offset == 32 {
+            data.offsets
+                .borrow_to_typed_view::<u32>()
+                .iter()
+                .map(|&value| u64::from(value))
+                .collect::<Vec<_>>()
+        } else {
+            data.offsets.borrow_to_typed_view::<u64>().to_vec()
+        };
+        assert_eq!(offsets, [0, expected.len() as u64]);
+        assert!(data.data.clone().into_buffer().capacity() <= expected.len() + 64);
+        if selection != "partial" && other_len == 0 {
+            // The other value and headers fit inside the retained-byte bound.
+            // Selecting one row must not force a second payload allocation.
+            assert_eq!(
+                data.data.as_ptr(),
+                input_ptr,
+                "reuse exhausted compact input"
+            );
+        } else {
+            assert_ne!(data.data.as_ptr(), input_ptr);
+        }
+        if selection == "partial" {
+            // A live parent still owns the same input. Reusing it above would
+            // corrupt the later row, even when its payload is empty.
+            let remaining = decoder.drain(1).unwrap().decode().unwrap();
+            let remaining = remaining.data.as_variable_width_ref().unwrap();
+            assert_eq!(remaining.num_values, 1);
+            assert_eq!(remaining.data.as_ref(), other.as_slice());
+            assert!(remaining.data.clone().into_buffer().capacity() <= other_len + 64);
+        }
+    }
+
+    #[rstest::rstest]
+    fn test_miniblock_planned_binary_bytes_match_partial_drain(
+        #[values(32, 64)] bits_per_offset: u8,
+        #[values(false, true)] large_header: bool,
+    ) {
+        let values = [
+            vec![b'a'; 1024],
+            vec![b'b'; 8192],
+            vec![b'c'; 1024],
+            vec![b'd'; 8192],
+            vec![b'e'; 1024],
+        ];
+        let slices = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let chunk_data =
+            miniblock_chunk(&binary_value_buffer(&slices, bits_per_offset), large_header);
+        let mut decoder = MiniBlockDecoder {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(
+                BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap(),
+            ),
             def_meaning: Arc::from([]),
             loaded_chunks: VecDeque::from([LoadedChunk {
                 data: chunk_data,
@@ -2516,19 +2857,49 @@ mod tests {
             num_rows: values.len() as u64,
             num_buffers: 1,
             dictionary: None,
-            has_large_chunk: false,
+            has_large_chunk: large_header,
         };
 
-        decoder.drain(2).unwrap().decode().unwrap();
+        let first = decoder.drain(2).unwrap().decode().unwrap();
         let planned = decoder.decoded_bytes(3).unwrap();
         let actual = decoder.drain(3).unwrap().decode().unwrap();
         assert_eq!(planned, actual.data.data_size());
+        for (decoded, selected) in [(first, &values[..2]), (actual, &values[2..])] {
+            let data = decoded.data.as_variable_width_ref().unwrap();
+            let offsets = if bits_per_offset == 32 {
+                data.offsets
+                    .borrow_to_typed_view::<u32>()
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect::<Vec<_>>()
+            } else {
+                data.offsets
+                    .borrow_to_typed_view::<u64>()
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(data.num_values as usize, selected.len());
+            for (row, expected) in selected.iter().enumerate() {
+                assert_eq!(
+                    &data.data[offsets[row]..offsets[row + 1]],
+                    expected.as_slice()
+                );
+            }
+            // A partial decode must not reserve output for unrelated chunk
+            // values: that prevents compact consumers from reusing its buffer.
+            let buffer = data.data.clone().into_buffer();
+            assert!(
+                buffer.capacity() <= buffer.len() + 64,
+                "selected {} bytes retained {} bytes",
+                buffer.len(),
+                buffer.capacity()
+            );
+        }
     }
 
     #[test]
     fn test_miniblock_planned_dictionary_bytes_include_shared_values() {
-        use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
-
         let dictionary = Arc::new(DataBlock::FixedWidth(FixedWidthDataBlock {
             data: LanceBuffer::from(vec![0_u8; 64]),
             bits_per_value: 8,

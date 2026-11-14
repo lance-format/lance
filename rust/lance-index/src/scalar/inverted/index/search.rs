@@ -936,8 +936,19 @@ impl InvertedIndex {
 
     pub(super) async fn bm25_search_modern(
         &self,
-        request: ModernSearchRequest<'_>,
+        mut request: ModernSearchRequest<'_>,
     ) -> Result<Vec<ScoredDoc>> {
+        // One exact term has no relative-position constraint. Keep the layout
+        // check so an index without positions retains its phrase validation.
+        if request.params.phrase_slop == Some(0)
+            && request.tokens.len() == 1
+            && self
+                .partitions
+                .iter()
+                .all(|partition| partition.inverted_list.has_positions())
+        {
+            request.params = Arc::new(request.params.as_ref().clone().with_phrase_slop(None));
+        }
         // Select a concrete completion path before candidate search.  The
         // fully resident future never builds deferred address-read state, while
         // a cold query keeps DocIds until its final bounded I/O phase.
@@ -1031,6 +1042,11 @@ impl InvertedIndex {
         &self,
         request: ModernSearchRequest<'_>,
     ) -> Result<Vec<Reverse<ScoredPartitionDoc>>> {
+        if selective_positions::enabled()
+            && let Some(results) = self.try_selective_phrase_search(request.clone()).await?
+        {
+            return Ok(results);
+        }
         let ModernSearchRequest {
             tokens,
             params,
@@ -1098,11 +1114,15 @@ impl InvertedIndex {
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let shared_norm_addends = shared_norm_addends.clone();
                 async move {
-                    let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
-                        let tokens = tokens.clone();
-                        let params = params.clone();
-                        let mask = mask.clone();
-                        let metrics = metrics.clone();
+                    let load_tokens = tokens.clone();
+                    let load_params = params.clone();
+                    let load_mask = mask.clone();
+                    let load_metrics = metrics.clone();
+                    let loads = chunk.into_iter().map(move |(partition_ordinal, part)| {
+                        let tokens = load_tokens.clone();
+                        let params = load_params.clone();
+                        let mask = load_mask.clone();
+                        let metrics = load_metrics.clone();
                         let partition_term_ids =
                             term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
@@ -1154,69 +1174,68 @@ impl InvertedIndex {
                             )))
                         }
                     });
-                    let loaded = stream::iter(loads)
+                    let loads = stream::iter(loads)
                         .buffer_unordered(io_parallelism)
-                        .try_collect::<Vec<_>>()
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
-                    if loaded.is_empty() {
-                        return Result::Ok(Vec::new());
-                    }
+                        .try_filter_map(|loaded| async move { Ok(loaded) });
 
                     // Iterators are built here rather than during the load so
                     // their decode buffers are allocated and freed by the same
                     // thread that runs WAND.
-                    let results = spawn_cpu(move || {
-                        let mut results = Vec::with_capacity(loaded.len());
-                        for (partition_ordinal, part, lengths, visibility, postings) in loaded {
-                            let LoadedPostings {
-                                postings,
-                                grouped_expansions,
-                                impact_safe,
-                                exact_scoring_required,
-                                ..
-                            } = postings.into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
-                            if postings.is_empty() {
-                                continue;
-                            }
-                            let use_global_scorer = impact_safe || exact_scoring_required;
-                            let threshold = if use_global_scorer {
-                                impact_shared_threshold.clone()
-                            } else {
-                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
-                            };
-                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                            let idf_by_position =
-                                idf_by_position(&postings, impact_scorer.as_ref());
-                            let candidates = part.bm25_search_modern(
-                                lengths.as_ref(),
-                                &visibility,
-                                params.as_ref(),
-                                operator,
-                                postings,
-                                wand_scorer,
-                                shared_norm_addends.clone(),
-                                metrics.as_ref(),
-                                threshold,
-                            )?;
-                            // Rescore here too, so each candidate's frequency
-                            // list is freed by the thread that allocated it.
-                            let scored = rescore_partition_candidates(
-                                PartitionCandidates {
-                                    idf_by_position,
+                    let results = super::scheduling::score_ready_partitions(
+                        loads,
+                        chunk_size,
+                        |(_, _, _, _, postings)| postings.retained_bytes(),
+                        move |loaded| {
+                            let mut results = Vec::with_capacity(loaded.len());
+                            for (partition_ordinal, part, lengths, visibility, postings) in loaded {
+                                let LoadedPostings {
+                                    postings,
                                     grouped_expansions,
-                                    candidates,
-                                },
-                                impact_scorer.as_ref(),
-                            );
-                            if !scored.is_empty() {
-                                results.push((partition_ordinal, scored));
+                                    impact_safe,
+                                    exact_scoring_required,
+                                    ..
+                                } = postings
+                                    .into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
+                                if postings.is_empty() {
+                                    continue;
+                                }
+                                let use_global_scorer = impact_safe || exact_scoring_required;
+                                let threshold = if use_global_scorer {
+                                    impact_shared_threshold.clone()
+                                } else {
+                                    Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                                };
+                                let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                                let idf_by_position =
+                                    idf_by_position(&postings, impact_scorer.as_ref());
+                                let candidates = part.bm25_search_modern(
+                                    lengths.as_ref(),
+                                    &visibility,
+                                    params.as_ref(),
+                                    operator,
+                                    postings,
+                                    wand_scorer,
+                                    shared_norm_addends.clone(),
+                                    metrics.as_ref(),
+                                    threshold,
+                                )?;
+                                // Rescore here too, so each candidate's frequency
+                                // list is freed by the thread that allocated it.
+                                let scored = rescore_partition_candidates(
+                                    PartitionCandidates {
+                                        idf_by_position,
+                                        grouped_expansions,
+                                        candidates,
+                                    },
+                                    impact_scorer.as_ref(),
+                                );
+                                if !scored.is_empty() {
+                                    results.push((partition_ordinal, scored));
+                                }
                             }
-                        }
-                        Result::Ok(results)
-                    })
+                            Result::Ok(results)
+                        },
+                    )
                     .await?;
                     Result::Ok(results)
                 }

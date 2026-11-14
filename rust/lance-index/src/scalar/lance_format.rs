@@ -3,13 +3,13 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use super::{IndexFile, IndexReader, IndexStore, IndexWriter};
+use super::{IndexBinaryReader, IndexFile, IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -82,6 +82,8 @@ pub struct LanceIndexStore {
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
+    /// None preserves the normal file-writer default; Some caps its configured column cache.
+    write_buffer_size: Option<u64>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -129,6 +131,7 @@ impl LanceIndexStore {
             file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
+            write_buffer_size: None,
         }
     }
 
@@ -277,6 +280,20 @@ impl IndexReader for V1IndexReader {
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
 struct CurrentIndexReader(CurrentFileReader);
 
+#[derive(Debug)]
+struct LanceBinaryReader(lance_encoding::encodings::physical::binary::PreparedBinaryValue);
+
+#[async_trait]
+impl IndexBinaryReader for LanceBinaryReader {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    async fn read_slices(&self, slices: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
+        self.0.read_slices(slices).await
+    }
+}
+
 impl CurrentIndexReader {
     /// Row range covered by batch `offset`, clamped to the end of the file.
     fn batch_bounds(&self, offset: u64, batch_size: u64) -> (usize, usize) {
@@ -289,6 +306,37 @@ impl CurrentIndexReader {
 
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
+    fn metadata_cache(&self) -> Option<WeakLanceCache> {
+        Some(self.0.metadata_cache())
+    }
+
+    async fn try_prepare_binary_value(
+        &self,
+        column: &str,
+        row: u64,
+    ) -> Result<Option<Arc<dyn IndexBinaryReader>>> {
+        let schema = self.0.schema();
+        let field = schema.field(column).ok_or_else(|| {
+            Error::invalid_input(format!("binary byte read column {column:?} is missing"))
+        })?;
+        if !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+            return Ok(None);
+        }
+        let projection = versions::reader_projection_from_column_names(
+            self.0.metadata().version(),
+            schema,
+            &[column],
+        )?;
+        let [column_index] = projection.column_indices.as_slice() else {
+            return Ok(None);
+        };
+        Ok(self
+            .0
+            .try_prepare_binary_value(*column_index as usize, row)
+            .await?
+            .map(|value| Arc::new(LanceBinaryReader(value)) as Arc<dyn IndexBinaryReader>))
+    }
+
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let (start, end) = self.batch_bounds(offset, batch_size);
         self.read_range(start..end, None).await
@@ -569,11 +617,24 @@ impl IndexStore for LanceIndexStore {
             self.format_version,
             writer,
             schema,
-            current_writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions {
+                data_cache_bytes: self.write_buffer_size,
+                ..Default::default()
+            },
         )?;
         Ok(Box::new(LanceIndexWriter {
             path: name.to_string(),
             inner: writer,
+        }))
+    }
+
+    fn with_write_buffer_size(&self, bytes: u64) -> Result<Arc<dyn IndexStore>> {
+        if bytes == 0 {
+            return Err(Error::invalid_input("writer buffer must be positive"));
+        }
+        Ok(Arc::new(Self {
+            write_buffer_size: Some(bytes),
+            ..self.clone()
         }))
     }
 
@@ -781,6 +842,94 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    #[tokio::test]
+    async fn binary_slices_index_reader_preserves_named_column_and_fallback() -> Result<()> {
+        let tempdir = TempDir::default();
+        let (_, store) = concrete_test_store(&tempdir);
+        let store = LanceIndexStore::with_format_version(
+            store.object_store.clone(),
+            store.index_dir.clone(),
+            store.metadata_cache.clone(),
+            ConcreteFileVersion::V2_3,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("payload", DataType::LargeBinary, false).with_metadata(HashMap::from([(
+                lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.to_owned(),
+            )])),
+        ]));
+        let payloads = (0..4).map(|row| vec![b'a' + row; 8192]).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(&payloads)),
+            ],
+        )?;
+        let mut writer = store.new_index_file("bytes.lance", schema).await?;
+        writer.write_record_batch(batch.clone()).await?;
+        writer.finish().await?;
+        let reader = store.open_index_file("bytes.lance").await?;
+        let slices = [100..112, 0..0, 103..108];
+        for row in [0, 2, 3] {
+            let selected = reader
+                .try_prepare_binary_value("payload", row)
+                .await?
+                .unwrap();
+            assert_eq!(selected.len(), payloads[row as usize].len() as u64);
+            assert!(!selected.is_empty());
+            let tail = selected
+                .read_slices(&[selected.len() - 1..selected.len()])
+                .await?;
+            assert_eq!(tail[0].as_ref(), &payloads[row as usize][8191..]);
+            let selected = selected.read_slices(&slices).await?;
+            for (actual, slice) in selected.iter().zip(&slices) {
+                assert_eq!(
+                    actual.as_ref(),
+                    &payloads[row as usize][slice.start as usize..slice.end as usize]
+                );
+            }
+        }
+        assert!(reader.try_prepare_binary_value("id", 0).await?.is_none());
+        let error = reader
+            .try_prepare_binary_value("missing", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("missing"));
+        assert_eq!(reader.read_range(0..4, None).await?, batch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_writer_scope_preserves_store_and_read_format() -> Result<()> {
+        let tempdir = TempDir::default();
+        let (_, store) = concrete_test_store(&tempdir);
+        let error = store.with_write_buffer_size(0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("positive"));
+        let bounded = store.with_write_buffer_size(4096)?;
+        assert_eq!(store.write_buffer_size, None);
+        assert_eq!(
+            bounded
+                .as_any()
+                .downcast_ref::<LanceIndexStore>()
+                .unwrap()
+                .write_buffer_size,
+            Some(4096)
+        );
+        let batch = arrow_array::record_batch!(("value", Int32, [1, 2, 3]))?;
+        let mut writer = bounded
+            .new_index_file("bounded.lance", batch.schema())
+            .await?;
+        writer.write_record_batch(batch.clone()).await?;
+        writer.finish().await?;
+        let reader = store.open_index_file("bounded.lance").await?;
+        assert_eq!(reader.read_range(0..3, None).await?, batch);
+        Ok(())
     }
 
     #[tokio::test]

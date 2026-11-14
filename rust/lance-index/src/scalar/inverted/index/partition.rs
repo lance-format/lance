@@ -481,18 +481,34 @@ struct PositionMatchSummary {
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
     read_policy: PostingReadPolicy,
+    positions: PositionReadPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PositionReadPolicy {
+    Required,
+    Deferred,
 }
 
 impl PostingLoadOptions {
     pub(super) const fn read_ahead() -> Self {
         Self {
             read_policy: PostingReadPolicy::ReadAhead,
+            positions: PositionReadPolicy::Required,
         }
     }
 
     pub(in super::super) const fn cache_aware_exact() -> Self {
         Self {
             read_policy: PostingReadPolicy::CacheAwareExact,
+            positions: PositionReadPolicy::Required,
+        }
+    }
+
+    pub(super) const fn deferred_positions() -> Self {
+        Self {
+            read_policy: PostingReadPolicy::CacheAwareExact,
+            positions: PositionReadPolicy::Deferred,
         }
     }
 }
@@ -960,7 +976,7 @@ impl InvertedPartition {
         })
     }
 
-    fn map(&self, token: &str) -> Option<u32> {
+    pub(super) fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
     }
 
@@ -1405,8 +1421,10 @@ impl InvertedPartition {
     ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
             read_policy: requested_read_policy,
+            positions,
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
+        let read_positions = is_phrase_query && matches!(positions, PositionReadPolicy::Required);
         let is_and_query = operator == Operator::And;
         // The caller passes final tokens after any fuzzy expansion. Query groups
         // identify alternatives that must share one posting iterator,
@@ -1460,14 +1478,14 @@ impl InvertedPartition {
                     let posting = match read_policy {
                         PostingReadPolicy::ReadAhead => {
                             self.inverted_list
-                                .posting_list(token_id, is_phrase_query, metrics)
+                                .posting_list(token_id, read_positions, metrics)
                                 .await?
                         }
                         PostingReadPolicy::CacheAwareExact => {
                             self.inverted_list
                                 .posting_list_with_policy(
                                     token_id,
-                                    is_phrase_query,
+                                    read_positions,
                                     metrics,
                                     read_policy,
                                 )
@@ -1701,6 +1719,38 @@ pub(super) struct FetchedPostings {
 }
 
 impl FetchedPostings {
+    /// Approximate the cache-backed payload held until this partition is scored.
+    /// Group slices can retain whole Arrow allocations. Shared position streams
+    /// already track the capacity accepted by their ownership checks.
+    pub(super) fn retained_bytes(&self) -> usize {
+        let mut context = lance_core::deepsize::Context::default();
+        self.postings
+            .iter()
+            .fold(0usize, |total, (_, _, _, posting)| {
+                let bytes = match posting {
+                    PostingList::Plain(posting) => posting.deep_size_of_children(&mut context),
+                    PostingList::Compressed(posting) => {
+                        let positions = match &posting.positions {
+                            Some(CompressedPositionStorage::LegacyPerDoc(positions)) => {
+                                super::cache::retained_cache_bytes(positions, &mut context)
+                            }
+                            Some(CompressedPositionStorage::SharedStream(positions)) => {
+                                positions.size()
+                            }
+                            None => 0,
+                        };
+                        let impacts = posting.impacts.as_ref().map_or(0, |impacts| {
+                            super::cache::retained_cache_bytes(impacts.entries(), &mut context)
+                        });
+                        super::cache::retained_cache_bytes(&posting.blocks, &mut context)
+                            .saturating_add(positions)
+                            .saturating_add(impacts)
+                    }
+                };
+                total.saturating_add(bytes)
+            })
+    }
+
     /// Build the iterators; `tokens` must be the tokens these postings were
     /// fetched for.
     pub(super) fn into_loaded(
@@ -1884,6 +1934,35 @@ mod tests {
 
     use super::*;
     use crate::scalar::inverted::document_tokenizer::DocType;
+
+    #[test]
+    fn fetched_postings_weight_counts_shared_backing_once() {
+        let unrelated = vec![7u8; 32 * 1024];
+        // VarintDelta tail: document 0, frequency 1. The preceding value is
+        // outside this posting but its allocation remains owned by the slice.
+        let blocks = LargeBinaryArray::from_iter_values([unrelated.as_slice(), &[0, 1]]);
+        let backing = blocks.get_buffer_memory_size();
+        let posting = PostingList::Compressed(CompressedPostingList::new(
+            blocks.slice(1, 1),
+            1.0,
+            1,
+            PostingTailCodec::VarintDelta,
+            128,
+            None,
+            None,
+        ));
+        let fetched = FetchedPostings {
+            postings: vec![(0, 0, 0, posting.clone()), (1, 1, 1, posting)],
+            num_docs: 1,
+            is_and_query: true,
+            is_phrase_query: false,
+            exact_scoring_required: false,
+            docs_for_union: None,
+        };
+        let retained = fetched.retained_bytes();
+        assert!(retained >= backing);
+        assert!(retained < 2 * backing);
+    }
 
     fn dictionary(terms: &[&str]) -> TokenSet {
         let mut dictionary = TokenSet::default();
