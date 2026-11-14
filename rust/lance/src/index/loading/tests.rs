@@ -304,9 +304,19 @@ async fn test_list_element_dependency_fields_preserve_single_input() {
     };
     assert_eq!(sorted_ids(&indexed), sorted_ids(&scanned));
 
-    crate::dataset::optimize::remapping::remap_column_index(&mut dataset, &["objects"], None)
-        .await
-        .unwrap();
+    // The declaration must pass the input-arity guard before the missing-history check.
+    let error =
+        crate::dataset::optimize::remapping::remap_column_index(&mut dataset, &["objects"], None)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::NotSupported { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Fragment reuse index not found"),
+        "{error}"
+    );
     dataset
         .optimize_indices(&lance_index::optimize::OptimizeOptions::default())
         .await
