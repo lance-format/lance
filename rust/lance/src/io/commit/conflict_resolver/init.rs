@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::datatypes::Schema;
+
 use super::*;
 
 impl<'a> TransactionRebase<'a> {
@@ -329,9 +331,25 @@ impl<'a> TransactionRebase<'a> {
         &mut self,
         missing: &[u64],
         latest_version: u64,
+        read_schema: &Schema,
+        latest_schema: &Schema,
     ) -> Result<()> {
         if missing.is_empty() {
             return Ok(());
+        }
+        if conflicts_with_unseen_schema_change(
+            &self.transaction.operation,
+            read_schema,
+            latest_schema,
+        ) {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} between transaction read version {} and latest                      version {latest_version} were cleaned up, so {} cannot safely check                      conflicts with schema changes; retry the operation on the latest version",
+                    self.transaction.read_version, self.transaction.operation
+                )
+                .into(),
+            ));
         }
         // A missing transaction may have changed a source fragment or inserted
         // the same keys without touching any shared fragment. Neither conflict
@@ -396,6 +414,51 @@ impl<'a> TransactionRebase<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a schema change hidden in a history gap could be undone or violated
+/// by `operation`. A Project replaces the schema with one derived from its read
+/// version. New rows were only validated against the read schema, and their
+/// files keep the field ids they were written with: a field that was dropped,
+/// recast or reused by an overwrite would read them back as nulls or as the
+/// wrong type, and a column that became non-nullable could hold their nulls.
+fn conflicts_with_unseen_schema_change(
+    operation: &Operation,
+    read_schema: &Schema,
+    latest_schema: &Schema,
+) -> bool {
+    let new_fragments = match operation {
+        Operation::Project { .. } => return true,
+        Operation::Append { fragments } => fragments,
+        Operation::Update { new_fragments, .. } => new_fragments,
+        _ => return false,
+    };
+    if new_fragments.is_empty() {
+        return false;
+    }
+    let changes_written_field = new_fragments
+        .iter()
+        .flat_map(|fragment| &fragment.files)
+        .flat_map(|file| file.fields.iter())
+        .filter(|field_id| **field_id >= 0)
+        .any(|field_id| {
+            match (
+                read_schema.field_by_id(*field_id),
+                latest_schema.field_by_id(*field_id),
+            ) {
+                (Some(read_field), Some(latest_field)) => {
+                    read_field.data_type() != latest_field.data_type()
+                }
+                _ => true,
+            }
+        });
+    let requires_new_values = latest_schema.fields_pre_order().any(|field| {
+        !field.nullable
+            && read_schema
+                .field_by_id(field.id)
+                .is_none_or(|read_field| read_field.nullable)
+    });
+    changes_written_field || requires_new_values
 }
 
 /// See `RewriteReuseState`. `dataset` is the handle the transaction is committed

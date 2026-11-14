@@ -1910,7 +1910,12 @@ pub(crate) async fn commit_transaction(
             let missing = (checked_since + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
-            rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            rebase.check_missing_versions(
+                &missing,
+                dataset.manifest.version,
+                read_version_dataset.schema(),
+                dataset.schema(),
+            )?;
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.
             if identity_fence.is_some() && !missing.is_empty() {
@@ -2806,6 +2811,111 @@ mod tests {
             );
             assert_eq!(result.count_rows(Some("id = 3".into())).await.unwrap(), 1);
         }
+    }
+
+    #[rstest::rstest]
+    #[case::drop_columns_after_add_columns("add_columns")]
+    #[case::append_after_cast("cast")]
+    #[case::append_null_after_set_not_null("set_not_null")]
+    #[case::append_after_overwrite_reusing_field_ids("overwrite")]
+    #[tokio::test]
+    async fn test_schema_dependent_commit_rejects_cleaned_history(#[case] concurrent: &str) {
+        let initial = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2, 3]),
+            ("x", Int32, [Some(0), Some(1), Some(2), Some(3)])
+        )
+        .unwrap();
+        let stale = Arc::new(
+            crate::dataset::InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        let staged_append = crate::dataset::InsertBuilder::new(stale.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![
+                arrow_array::record_batch!(("id", Int32, [4]), ("x", Int32, [None])).unwrap(),
+            ])
+            .await
+            .unwrap();
+        let mut latest = stale.as_ref().clone();
+        match concurrent {
+            "add_columns" => latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            "cast" => latest
+                .alter_columns(&[
+                    crate::dataset::ColumnAlteration::new("x".into()).cast_to(DataType::Int64)
+                ])
+                .await
+                .unwrap(),
+            "set_not_null" => latest
+                .alter_columns(&[
+                    crate::dataset::ColumnAlteration::new("x".into()).set_nullable(false)
+                ])
+                .await
+                .unwrap(),
+            "overwrite" => {
+                latest = crate::dataset::InsertBuilder::new(Arc::new(latest))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        ..Default::default()
+                    })
+                    .execute(vec![
+                        arrow_array::record_batch!(("id", Utf8, ["a"]), ("x", Utf8, ["b"]))
+                            .unwrap(),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        let result = if concurrent == "add_columns" {
+            let mut stale = stale.as_ref().clone();
+            stale.drop_columns(&["x"]).await
+        } else {
+            CommitBuilder::new(stale)
+                .execute(staged_append)
+                .await
+                .map(|_| ())
+        };
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("versions [2]"), "{error}");
+        assert_eq!(latest.latest_version_id().await.unwrap(), 3);
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
