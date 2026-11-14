@@ -500,9 +500,8 @@ mod tests {
         let value = binary_value(true, false);
         let plan = prepared(value.clone(), &cache);
         for _ in 0..2 {
-            let error = match plan.read(2, &NoOpMetricsCollector).await {
-                Ok(_) => panic!("short read accepted"),
-                Err(error) => error,
+            let Err(error) = plan.read(2, &NoOpMetricsCollector).await else {
+                panic!("short read accepted");
             };
             assert!(matches!(error, Error::Index { .. }));
             assert!(error.to_string().contains("unexpected buffer length"));
