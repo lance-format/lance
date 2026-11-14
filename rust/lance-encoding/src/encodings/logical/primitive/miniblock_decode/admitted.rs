@@ -162,15 +162,17 @@ pub(super) fn decode(
         }
         selected_rep = copy_levels(rep.as_ref(), &levels, workspace)?;
         selected_def = copy_levels(def.as_ref(), &levels, workspace)?;
-        // This codec API preflights all value output/scratch before it allocates.
-        // Full and selected levels remain charged throughout the call. Refusal
-        // can therefore safely return all level credit without re-admission.
-        let Some(data) = task.value_decompressor.try_decompress_range_in(
-            &sections.value_buffers,
-            chunk.items_in_chunk,
-            items.clone(),
-            workspace,
-        )?
+        // Preparation may need scratch before the inner value layout is known.
+        // Full and selected levels remain charged throughout the call, and refusal
+        // recycles codec scratch before we return level credit to this workspace.
+        let Some(data) = task
+            .value_decompressor
+            .try_prepare_and_decompress_range_in(
+                &sections.value_buffers,
+                chunk.items_in_chunk,
+                items.clone(),
+                workspace,
+            )?
         else {
             return Ok(None);
         };

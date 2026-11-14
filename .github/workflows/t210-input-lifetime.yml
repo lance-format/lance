@@ -21,14 +21,19 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # RLE child traversal passed at ed5ea6bc6. Exercise the new admitted buffer
-      # API and its shared-owner, overlap, refusal and corrupt-frame boundaries.
-      - name: Validate admitted general buffer output
-        run: cargo test --profile ci --locked -p lance-encoding --lib physical::block::admitted::tests -- --nocapture
-      - name: Validate buffer API without optional codecs
-        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::block::admitted::tests -- --nocapture
-      - name: Validate public buffer API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc try_decompress_exact_in -- --nocapture
+      # Buffer codecs passed at b52b7fcd1. Verify preparation/output overlap,
+      # error/refusal cleanup and the single-task structural composition here.
+      - name: Validate admitted general preparation
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib physical::general::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib prepared_general_task -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib list_selection_recycles_scratch_and_preserves_aliases -- --nocapture
+      - name: Validate preparation without optional codecs
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::general::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib prepared_general_task -- --nocapture
+      - name: Validate public preparation API example
+        run: cargo test --profile ci --locked -p lance-encoding --doc try_prepare_and_decompress_range_in -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |

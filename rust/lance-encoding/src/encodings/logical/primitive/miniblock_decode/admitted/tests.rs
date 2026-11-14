@@ -25,6 +25,8 @@ use crate::{
             miniblock_decode::{ChunkDrainInstructions, ChunkInstructions},
         },
         physical::{
+            block::{CompressionConfig, CompressionScheme, GeneralBufferCompressor},
+            general::GeneralMiniBlockDecompressor,
             rle::{RleDecompressor, RunLengthWidth},
             value::ValueDecompressor,
         },
@@ -91,11 +93,41 @@ fn fixture(
     has_large_chunk: bool,
     workspace_bytes: usize,
 ) -> Fixture {
+    fixture_general(rep, def, kind, has_large_chunk, workspace_bytes, None)
+}
+
+fn fixture_general(
+    rep: Option<&[u16]>,
+    def: Option<&[u16]>,
+    kind: Codec,
+    has_large_chunk: bool,
+    workspace_bytes: usize,
+    general: Option<crate::encodings::physical::block::CompressionScheme>,
+) -> Fixture {
     let values = [10_u32, 0, 20, 30];
     let count = rep.or(def).map_or(4, <[u16]>::len);
     let rep = rep.map(|v| levels(v, kind));
     let def = def.map(|v| levels(v, kind));
-    let payload: &[u8] = bytemuck::cast_slice(&values);
+    let mut payload = bytemuck::cast_slice(&values).to_vec();
+    let mut value_decompressor: Arc<dyn MiniBlockDecompressor> =
+        Arc::new(ValueDecompressor::from_flat(&metadata::Flat {
+            bits_per_value: 32,
+            data: None,
+        }));
+    if let Some(scheme) = general {
+        let config = CompressionConfig::new(scheme, None);
+        let compressor = GeneralBufferCompressor::get_compressor(config).unwrap();
+        let mut encoded = Vec::new();
+        compressor.compress(&payload, &mut encoded).unwrap();
+        payload = encoded;
+        value_decompressor = Arc::new(GeneralMiniBlockDecompressor::new(
+            Box::new(ValueDecompressor::from_flat(&metadata::Flat {
+                bits_per_value: 32,
+                data: None,
+            })),
+            config,
+        ));
+    }
     let mut bytes = (count as u16).to_le_bytes().to_vec();
     for (_, data) in rep.iter().chain(def.iter()) {
         bytes.extend_from_slice(&(data.len() as u16).to_le_bytes());
@@ -110,7 +142,7 @@ fn fixture(
         .iter()
         .chain(def.iter())
         .map(|(_, b)| b.as_slice())
-        .chain([payload])
+        .chain([payload.as_slice()])
     {
         bytes.extend_from_slice(data);
         bytes.resize(bytes.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
@@ -134,10 +166,7 @@ fn fixture(
         structural_projection: None,
         rep_decompressor: rep.map(|(c, _)| c),
         def_decompressor: def.map(|(c, _)| c),
-        value_decompressor: Arc::new(ValueDecompressor::from_flat(&metadata::Flat {
-            bits_per_value: 32,
-            data: None,
-        })),
+        value_decompressor,
         dictionary_data: None,
         max_visible_level: max_visible_level(&meanings),
         def_meaning: meanings,
@@ -176,6 +205,70 @@ fn assert_values(page: &DecodedPage, expected: &[u32]) {
     let block = page.data.as_fixed_width_ref().unwrap();
     assert_eq!(block.num_values, expected.len() as u64);
     assert_eq!(bytemuck::cast_slice::<u8, u32>(&block.data), expected);
+}
+
+fn prepared_general_case(scheme: CompressionScheme, large: bool, refusal: bool) {
+    // Six full levels=24, four selected levels=16, raw values=16, output=8.
+    let capacity = if refusal { 63 } else { 64 };
+    let Fixture {
+        task,
+        budget,
+        mut work,
+        physical,
+    } = fixture_general(
+        Some(&[1, 0, 1, 1, 1, 0]),
+        Some(&[0, 1, 2, 3, 0, 0]),
+        Codec::Flat,
+        large,
+        capacity,
+        Some(scheme),
+    );
+    if refusal {
+        for _ in 0..2 {
+            assert!(task.try_decode_in(&mut work).unwrap().is_none());
+            assert_eq!(work.len(), capacity);
+            assert_eq!(budget.reserved(), physical + capacity);
+        }
+    } else {
+        let page = task.try_decode_in(&mut work).unwrap().unwrap();
+        assert_values(&page, &[20, 30]);
+        assert_eq!(work.len(), capacity - 24);
+        let mut structure = CompositeRepDefUnraveler::new(vec![page.repdef]);
+        let leaf = structure
+            .try_unravel_validity_in(2, &mut work)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(leaf.iter().collect::<Vec<_>>(), [true, true]);
+        let (offsets, validity) = structure
+            .try_unravel_offsets_in::<i32>(&mut work)
+            .unwrap()
+            .unwrap();
+        assert_eq!(offsets.as_ref(), &[0, 0, 0, 2]);
+        assert_eq!(
+            validity.unwrap().iter().collect::<Vec<_>>(),
+            [false, true, true]
+        );
+    }
+    drop((task, work));
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+fn prepared_general_task_uncompressed(
+    #[values(false, true)] large: bool,
+    #[values(false, true)] refusal: bool,
+) {
+    prepared_general_case(CompressionScheme::None, large, refusal);
+}
+
+#[cfg(feature = "lz4")]
+#[rstest]
+fn prepared_general_task_lz4(
+    #[values(false, true)] large: bool,
+    #[values(false, true)] refusal: bool,
+) {
+    prepared_general_case(CompressionScheme::Lz4, large, refusal);
 }
 
 fn check_list_selection(codec: Codec, large: bool) {

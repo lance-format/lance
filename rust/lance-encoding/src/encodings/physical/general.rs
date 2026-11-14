@@ -26,6 +26,8 @@ use crate::{
 use arrow_buffer::ArrowNativeType;
 use lance_core::Error;
 
+mod admitted;
+
 /// Compress fixed-width rows independently, retaining their logical type description.
 #[derive(Debug)]
 pub(crate) struct FixedWidthGeneralPerValueCompressor {
@@ -360,6 +362,20 @@ impl GeneralMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        self.inner.admitted_output_layout()
+    }
+
+    fn try_prepare_and_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         self.inner.num_buffers()
     }

@@ -1305,6 +1305,46 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
         ))
     }
 
+    /// Decode a range whose preflight may itself need admitted preparation scratch.
+    /// Unlike [`Self::plan_range`], this can decompress input before its inner layout
+    /// is known. Preparation and output must fit together in the supplied workspace;
+    /// refusal recycles preparation and returns `None` for drain/replan, never EOF.
+    /// Inputs must already be charged. Scratch remains charged through inner decode.
+    /// Inner codecs must not retain temporary input aliases beyond the call, including
+    /// in their output. Unsupported compositions return an error, without fallback.
+    /// This does not make the codec available to allocation-free multi-range planning.
+    /// Codecs needing no preparation use [`Self::try_decompress_range_in`] by default.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::{block::{CompressionConfig, CompressionScheme},
+    ///         general::GeneralMiniBlockDecompressor, value::ValueDecompressor},
+    ///     format::metadata};
+    /// let codec = GeneralMiniBlockDecompressor::new(
+    ///     Box::new(ValueDecompressor::from_flat(&metadata::Flat {
+    ///         bits_per_value: 8, data: None,
+    ///     })), CompressionConfig::new(CompressionScheme::None, None));
+    /// let pool = AllocationBudget::new(8); // 3 input + 3 scratch + 2 output
+    /// let mut work = pool.try_reserve(8).unwrap();
+    /// let mut input = work.try_allocate(3).unwrap().unwrap();
+    /// input.as_mut().copy_from_slice(&[1, 2, 3]);
+    /// let input = [LanceBuffer::from_bytes(input.freeze(), 1)];
+    /// let output = codec.try_prepare_and_decompress_range_in(&input, 3, 1..3, &mut work)
+    ///     .unwrap().unwrap();
+    /// assert_eq!(output.num_values(), 2);
+    /// assert_eq!(work.len(), 3); // Scratch returned to this workspace.
+    /// ```
+    fn try_prepare_and_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+        workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        self.try_decompress_range_in(data, num_values, range, workspace)
+    }
+
     /// Decompress only `range` (`0 <= range.start <= range.end <= num_values`) from a mini-block
     /// chunk containing `num_values` items.
     ///
