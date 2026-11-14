@@ -27,6 +27,7 @@ use arrow_buffer::ArrowNativeType;
 use lance_core::Error;
 
 mod admitted;
+mod unsigned;
 
 /// Compress fixed-width rows independently, retaining their logical type description.
 #[derive(Debug)]
@@ -232,6 +233,16 @@ impl FixedWidthGeneralBlockDecompressor {
 }
 
 impl BlockDecompressor for FixedWidthGeneralBlockDecompressor {
+    fn try_prepare_unsigned_in<'a>(
+        &'a self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::compression::PreparedUnsigned<'a>>> {
+        unsigned::prepare(self, data, bits_per_value, num_values, workspace)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "General fixed-width block")?;
         let expected_bytes = usize::try_from(num_values)

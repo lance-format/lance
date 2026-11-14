@@ -878,6 +878,29 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
+    fn try_prepare_range_in<'a>(
+        &'a self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::compression::PreparedMiniBlockRange<'a>>> {
+        admitted::prepared::prepare(self, data, num_values, range, workspace)
+    }
+
+    fn try_prepare_and_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        match self.try_prepare_range_in(data, num_values, range, workspace)? {
+            Some(plan) => plan.try_decode(workspace),
+            None => Ok(None),
+        }
+    }
+
     fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
         admitted::layout(self)
     }

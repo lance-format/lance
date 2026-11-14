@@ -94,9 +94,11 @@ use std::{ops::Range, str::FromStr, sync::Arc};
 mod layout;
 pub mod levels;
 pub(crate) mod prepared;
+pub(crate) mod prepared_unsigned;
 pub(crate) mod unsigned;
 pub use layout::MiniBlockOutputLayout;
 pub use prepared::PreparedMiniBlockRange;
+pub use prepared_unsigned::PreparedUnsigned;
 
 /// Payload required by one validated MiniBlock range operation.
 ///
@@ -1541,6 +1543,43 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Prepare an unsigned traversal using only admitted payload scratch.
+    /// Input owners must already be charged. `None` refuses admission without
+    /// consuming workspace; the caller must drain/replan, never treat it as EOF.
+    /// The default retains input metadata and delegates to [`Self::visit_unsigned`].
+    /// Unsupported traversal remains an error, without ordinary decode fallback.
+    /// Validate the complete visitor before dependent output admission/publication.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
+    /// let pool = AllocationBudget::new(0);
+    /// let mut work = pool.try_reserve(0).unwrap();
+    /// let prepared = codec.try_prepare_unsigned_in(None, 32, 4, &mut work).unwrap().unwrap();
+    /// let mut sum = 0;
+    /// prepared.visit(&mut |value| { sum += value; Ok(()) }).unwrap();
+    /// assert_eq!(sum, 18);
+    /// prepared.recycle(&mut work).unwrap();
+    /// assert_eq!(pool.reserved(), 0);
+    /// ```
+    fn try_prepare_unsigned_in<'a>(
+        &'a self,
+        data: Option<&LanceBuffer>,
+        bits_per_value: u64,
+        num_values: u64,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<PreparedUnsigned<'a>>> {
+        Ok(Some(PreparedUnsigned::direct(
+            self,
+            data,
+            bits_per_value,
+            num_values,
+        )))
+    }
 
     /// Read one unsigned value without allocating decoded or alignment buffers.
     /// Supported leaf codecs validate framing and use constant-time lookup;

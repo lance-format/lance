@@ -30,7 +30,22 @@ pub(super) fn plan(
     let count = num_values
         .checked_add(1)
         .ok_or_else(|| Error::corrupt_file_named("binary mini-block", "offset count overflows"))?;
-    let max = if *bits_per_offset == 32 {
+    plan_visit(codec, num_values, range, values.len(), |visitor| {
+        offsets.visit_unsigned(input, u64::from(*bits_per_offset), count, visitor)
+    })
+}
+
+pub(super) fn plan_visit(
+    codec: &BinaryMiniBlockDecompressor,
+    num_values: u64,
+    range: Range<u64>,
+    value_bytes: usize,
+    visit: impl FnOnce(&mut dyn FnMut(u64) -> Result<()>) -> Result<()>,
+) -> Result<RangePlan> {
+    let count = num_values
+        .checked_add(1)
+        .ok_or_else(|| Error::corrupt_file_named("binary mini-block", "offset count overflows"))?;
+    let max = if width(codec) == 32 {
         i32::MAX as u64
     } else {
         i64::MAX as u64
@@ -38,12 +53,12 @@ pub(super) fn plan(
     let mut position = 0;
     let mut previous = 0;
     let mut selected = 0..0;
-    offsets.visit_unsigned(input, u64::from(*bits_per_offset), count, &mut |value| {
+    visit(&mut |value| {
         if position >= count
             || (position == 0 && value != 0)
             || value < previous
             || value > max
-            || value > values.len() as u64
+            || value > value_bytes as u64
         {
             return Err(Error::corrupt_file_named(
                 "binary mini-block",
@@ -60,7 +75,7 @@ pub(super) fn plan(
         position += 1;
         Ok(())
     })?;
-    if position != count || previous != values.len() as u64 {
+    if position != count || previous != value_bytes as u64 {
         return Err(Error::corrupt_file_named(
             "binary mini-block",
             "encoded offsets must end at the value-buffer length",
@@ -87,10 +102,24 @@ pub(super) fn write(
     let count = num_values
         .checked_add(1)
         .ok_or_else(|| Error::invalid_input("encoded offset count overflows"))?;
+    write_visit(num_values, plan, output, |visitor| {
+        offsets.visit_unsigned(input, u64::from(*bits_per_offset), count, visitor)
+    })
+}
+
+pub(super) fn write_visit(
+    num_values: u64,
+    plan: &RangePlan,
+    output: &mut [u8],
+    visit: impl FnOnce(&mut dyn FnMut(u64) -> Result<()>) -> Result<()>,
+) -> Result<()> {
+    let count = num_values
+        .checked_add(1)
+        .ok_or_else(|| Error::invalid_input("encoded offset count overflows"))?;
     let mut position = 0;
     // Revisit the same immutable input after admission. Only the selected offsets
     // are materialized; Delta keeps a scalar prefix sum, never a decoded array.
-    offsets.visit_unsigned(input, u64::from(*bits_per_offset), count, &mut |value| {
+    visit(&mut |value| {
         if position >= count {
             return Err(Error::internal(
                 "encoded offset visitor changed cardinality",

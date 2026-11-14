@@ -17,6 +17,7 @@ use crate::{
     format::metadata::compressive_encoding::Compression,
 };
 
+mod general;
 mod metadata;
 mod payload;
 

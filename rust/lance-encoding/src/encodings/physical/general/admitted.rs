@@ -22,7 +22,7 @@ use crate::{
 
 // A temporary read-only view cannot detach the charge. Keep another Arc so that
 // after all views are dropped we can recover exclusive scratch for recycling.
-struct ScratchOwner(Arc<ReservedBuffer>);
+pub(super) struct ScratchOwner(pub(super) Arc<ReservedBuffer>);
 
 impl AsRef<[u8]> for ScratchOwner {
     fn as_ref(&self) -> &[u8] {
@@ -92,7 +92,10 @@ struct GeneralPrepared<'a> {
     scratch: Arc<ReservedBuffer>,
 }
 
-fn recover_scratch(scratch: Arc<ReservedBuffer>, workspace: &mut Reservation) -> Result<()> {
+pub(super) fn recover_scratch(
+    scratch: Arc<ReservedBuffer>,
+    workspace: &mut Reservation,
+) -> Result<()> {
     let scratch = Arc::try_unwrap(scratch).map_err(|_| {
         // An external alias still holds the charge. Never refund live bytes.
         Error::internal("General inner decoder retained an external scratch alias")

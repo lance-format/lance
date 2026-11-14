@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod payload;
+pub(super) mod prepared;
 
 fn width(codec: &BinaryMiniBlockDecompressor) -> u8 {
     match codec.layout {
@@ -213,6 +214,34 @@ pub(super) fn decode(
     workspace: &mut Reservation,
 ) -> Result<Option<DataBlock>> {
     let plan = plan(codec, data, num_values, range.clone())?;
+    materialize(&plan, &data[plan.values_buffer], workspace, |output| {
+        if plan.metadata.is_none() && matches!(codec.layout, BinaryMiniBlockLayout::Generic { .. })
+        {
+            let input = (plan.values_buffer == 1).then(|| &data[0]);
+            payload::write(codec, input, num_values, &plan, output)
+        } else {
+            for (dst, i) in output
+                .chunks_exact_mut(plan.width)
+                .zip(plan.offsets.clone())
+            {
+                let original = match plan.metadata {
+                    Some((start, step)) => start + step * i,
+                    None => offset(&data[0], i as usize, plan.width),
+                };
+                let value = original - plan.values.start as u64;
+                dst.copy_from_slice(&value.to_le_bytes()[..plan.width]);
+            }
+            Ok(())
+        }
+    })
+}
+
+fn materialize(
+    plan: &RangePlan,
+    input: &LanceBuffer,
+    workspace: &mut Reservation,
+    write_offsets: impl FnOnce(&mut [u8]) -> Result<()>,
+) -> Result<Option<DataBlock>> {
     if plan.budget.workspace_bytes > workspace.len() {
         return Ok(None);
     }
@@ -222,35 +251,17 @@ pub(super) fn decode(
     let mut values = workspace
         .try_allocate(plan.values.len())?
         .ok_or_else(|| Error::internal("binary values exceeded complete admission"))?;
-    if plan.metadata.is_none() && matches!(codec.layout, BinaryMiniBlockLayout::Generic { .. }) {
-        let input = (plan.values_buffer == 1).then(|| &data[0]);
-        if let Err(error) = payload::write(codec, input, num_values, &plan, offsets.as_mut()) {
-            offsets.recycle(workspace)?;
-            values.recycle(workspace)?;
-            return Err(error);
-        }
-    } else {
-        for (dst, i) in offsets
-            .as_mut()
-            .chunks_exact_mut(plan.width)
-            .zip(plan.offsets)
-        {
-            let original = match plan.metadata {
-                Some((start, step)) => start + step * i,
-                None => offset(&data[0], i as usize, plan.width),
-            };
-            let value = original - plan.values.start as u64;
-            dst.copy_from_slice(&value.to_le_bytes()[..plan.width]);
-        }
+    if let Err(error) = write_offsets(offsets.as_mut()) {
+        offsets.recycle(workspace)?;
+        values.recycle(workspace)?;
+        return Err(error);
     }
-    values
-        .as_mut()
-        .copy_from_slice(&data[plan.values_buffer][plan.values]);
+    values.as_mut().copy_from_slice(&input[plan.values.clone()]);
     Ok(Some(DataBlock::VariableWidth(VariableWidthBlock {
         data: LanceBuffer::from(Buffer::from(values.freeze())),
         offsets: LanceBuffer::from(Buffer::from(offsets.freeze())),
         bits_per_offset: (plan.width * 8) as u8,
-        num_values: range.end - range.start,
+        num_values: plan.offsets.end - plan.offsets.start - 1,
         block_info: BlockInfo::new(),
     })))
 }
