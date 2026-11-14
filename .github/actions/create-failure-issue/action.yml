@@ -1,5 +1,5 @@
 name: Create Failure Issue
-description: Creates a GitHub issue if any jobs in the workflow failed
+description: Creates a GitHub issue if any jobs in the workflow failed or were cancelled
 
 inputs:
   job-results:
@@ -20,12 +20,12 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        # Check if any job failed
-        if echo "$JOB_RESULTS" | jq -e 'to_entries | any(.value.result == "failure")' > /dev/null; then
+        # A job that hits its timeout ends as "cancelled", not "failure".
+        if echo "$JOB_RESULTS" | jq -e 'to_entries | any(.value.result | IN("failure", "cancelled"))' > /dev/null; then
           echo "Detected job failures, creating issue..."
 
           # Extract failed job names
-          FAILED_JOBS=$(echo "$JOB_RESULTS" | jq -r 'to_entries | map(select(.value.result == "failure")) | map(.key) | join(", ")')
+          FAILED_JOBS=$(echo "$JOB_RESULTS" | jq -r 'to_entries | map(select(.value.result | IN("failure", "cancelled"))) | map(.key) | join(", ")')
 
           # Create issue with workflow name, failed jobs, and run URL
           gh issue create \

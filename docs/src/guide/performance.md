@@ -89,6 +89,7 @@ debugging query performance.
 | `lance::execution` | `indices_loaded`    | The number of indices loaded by the plan                       |
 | `lance::execution` | `parts_loaded`      | The number of index partitions loaded by the plan              |
 | `lance::execution` | `index_comparisons` | The number of comparisons performed inside the various indices |
+| `lance::execution` | `peak_reserved_bytes` | The most bytes the plan's operators held reserved at once in DataFusion's memory pool: sort, aggregation and join buffers, batches queued for repartitioning, and the merge headroom of a sort that may spill. Lance's own read buffers are not included |
 
 ### Memory Events
 

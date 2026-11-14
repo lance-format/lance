@@ -907,6 +907,16 @@ pub fn select_segments_to_merge<'a>(
     selected
 }
 
+/// Whether a scalar index can merge multiple segments without rescanning their data.
+fn has_segment_merge_primitive(index_type: IndexType) -> bool {
+    match index_type {
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram => true,
+        #[cfg(feature = "geo")]
+        IndexType::RTree => true,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn merge_scalar_indices<'a>(
     dataset: Arc<Dataset>,
@@ -1070,12 +1080,6 @@ async fn merge_scalar_indices<'a>(
     rebuild_frags |= &effective_old_frags;
     let new_uuid = Uuid::new_v4();
 
-    // Scalar Index that expos an N:1 segment-merge primitive reachable without
-    // rescanning the dataset
-    let has_segment_merge_primitive = matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram
-    );
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
@@ -1118,7 +1122,7 @@ async fn merge_scalar_indices<'a>(
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
         && !zonemap_requires_rebuild
-        && (has_segment_merge_primitive || selected_old_indices.len() == 1);
+        && (has_segment_merge_primitive(index_type) || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
     // produced:
@@ -1268,6 +1272,27 @@ async fn merge_scalar_indices<'a>(
                     let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                #[cfg(feature = "geo")]
+                IndexType::RTree => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        address_domain,
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    crate::index::scalar::rtree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
@@ -2320,7 +2345,8 @@ mod tests {
     use lance_index::{
         IndexType,
         scalar::{
-            BuiltinIndexType, InvertedIndexParams, ScalarIndexParams, SearchResult, TextQuery,
+            BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+            SearchResult, TextQuery,
         },
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
@@ -6285,6 +6311,77 @@ mod tests {
                 .unwrap(),
             75
         );
+    }
+
+    #[rstest::rstest]
+    #[case::addresses(false)]
+    #[case::stable_ids(true)]
+    #[tokio::test]
+    async fn test_optimize_fts_consolidates_single_row_appends(#[case] stable_ids: bool) {
+        let batch = |id| {
+            arrow_array::record_batch!(("id", Int32, [id]), ("body", Utf8, ["common text"]))
+                .unwrap()
+        };
+        let initial = batch(0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: stable_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["body"],
+                IndexType::Inverted,
+                Some("body_idx".to_owned()),
+                &InvertedIndexParams::default().num_workers(1),
+                false,
+            )
+            .await
+            .unwrap();
+        for step in 1..6 {
+            let batch = batch(step);
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+            if step == 3 {
+                dataset.delete("id = 1").await.unwrap();
+            }
+            dataset
+                .optimize_indices(&OptimizeOptions::default().num_indices_to_merge(Some(1)))
+                .await
+                .unwrap();
+            let metadata = dataset
+                .load_index_by_name("body_idx")
+                .await
+                .unwrap()
+                .unwrap();
+            let index = dataset
+                .open_scalar_index_for_maintenance("body", &metadata.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert_eq!(
+                index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .partition_count(),
+                1
+            );
+            let mut scan = dataset.scan();
+            scan.full_text_search(FullTextSearchQuery::new("common".to_owned()))
+                .unwrap();
+            let expected = if step < 3 { step + 1 } else { step };
+            assert_eq!(scan.count_rows().await.unwrap(), expected as u64);
+        }
     }
 
     /// Same multi-segment gap for FTS, which takes the separate Inverted dispatch

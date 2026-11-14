@@ -35,7 +35,9 @@ pub use lance_datafusion_exec::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
     OneShotExec, RecordBatchExec, StrictBatchSizeExec, collect_execution_metrics,
 };
-use lance_datafusion_exec::exec::{execute_plan_with_context, new_runtime_env, new_session_config};
+use lance_datafusion_exec::exec::{
+    execute_plan_with_context, new_runtime_env, new_session_config, track_execution_memory,
+};
 
 use crate::udf::register_functions;
 
@@ -218,7 +220,7 @@ fn get_task_context(
     // Build from the session state in place. `SessionContext::state` would clone
     // the whole state (every function map, rule list and option) only to drop
     // it, which is a measurable share of CPU for short queries.
-    let task_ctx = TaskContext::from(session_ctx);
+    let task_ctx = track_execution_memory(TaskContext::from(session_ctx), options);
     let Some(batch_size) = options.validated_batch_size()? else {
         return Ok(Arc::new(task_ctx));
     };
@@ -563,7 +565,7 @@ pub async fn provider_to_stream(
 mod tests {
     use super::*;
     use arrow_array::record_batch;
-    use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::memory_pool::{MemoryConsumer, PeakRecordingPool};
     use datafusion_common::DataFusionError;
 
     use datafusion::execution::memory_pool::MemoryLimit;
@@ -705,21 +707,29 @@ mod tests {
         let default_options = LanceExecutionOptions::default();
         let session_ctx = get_session_context(&default_options);
         let task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
+        let other_task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
         // Lance operators key per-execution state on the task context's identity.
-        assert!(!Arc::ptr_eq(
-            &task_ctx,
-            &get_task_context(&session_ctx, &default_options).unwrap()
-        ));
+        assert!(!Arc::ptr_eq(&task_ctx, &other_task_ctx));
         assert_eq!(task_ctx.session_id(), session_ctx.session_id());
         assert_eq!(
             task_ctx.session_config().batch_size(),
             session_ctx.copied_config().batch_size()
         );
-        assert!(Arc::ptr_eq(
-            &task_ctx.runtime_env(),
-            &session_ctx.runtime_env()
-        ));
         assert!(task_ctx.scalar_functions().contains_key("contains_tokens"));
+        // Each execution records the peak of its own reservations, although all
+        // of them go to the session's pool.
+        let peak = |task_ctx: &TaskContext| {
+            PeakRecordingPool::from_pool(task_ctx.memory_pool().as_ref())
+                .unwrap()
+                .peak_reserved()
+        };
+        let reservation = MemoryConsumer::new("execution").register(task_ctx.memory_pool());
+        reservation.grow(1000);
+        let other_reservation =
+            MemoryConsumer::new("other execution").register(other_task_ctx.memory_pool());
+        other_reservation.grow(10);
+        assert_eq!(peak(&task_ctx), 1000);
+        assert_eq!(peak(&other_task_ctx), 10);
 
         let spill_options = LanceExecutionOptions {
             use_spilling: true,
@@ -738,16 +748,17 @@ mod tests {
                 .contains_key("contains_tokens")
         );
         // The batch size override applies to this execution only, and the
-        // execution still shares the session's memory pool.
+        // execution still reserves from the session's memory pool.
         assert_ne!(spill_session_ctx.copied_config().batch_size(), 17);
-        assert!(Arc::ptr_eq(
-            &spill_task_ctx.runtime_env(),
-            &spill_session_ctx.runtime_env()
-        ));
         assert!(matches!(
             spill_task_ctx.memory_pool().memory_limit(),
             MemoryLimit::Finite(limit) if limit == 64 * 1024 * 1024
         ));
+        let spill_reservation =
+            MemoryConsumer::new("spilling execution").register(spill_task_ctx.memory_pool());
+        spill_reservation.grow(1000);
+        assert_eq!(spill_session_ctx.runtime_env().memory_pool.reserved(), 1000);
+        assert_eq!(peak(&spill_task_ctx), 1000);
     }
 
     #[tokio::test]

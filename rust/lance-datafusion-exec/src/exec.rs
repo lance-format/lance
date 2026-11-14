@@ -18,7 +18,7 @@ use datafusion_execution::{
     TaskContext,
     config::SessionConfig,
     disk_manager::DiskManagerBuilder,
-    memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool},
+    memory_pool::{FairSpillPool, MemoryPool, PeakRecordingPool, TrackConsumersPool},
     runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
@@ -49,7 +49,7 @@ use crate::{
     utils::{
         BYTES_READ_METRIC, INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC,
         INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC, MetricsExt,
-        PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        PARTS_LOADED_METRIC, PEAK_RESERVED_BYTES_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -381,6 +381,30 @@ fn pool_reserved_bytes(pool: &(dyn MemoryPool + 'static)) -> u64 {
     pool.reserved() as u64
 }
 
+/// Gives the execution that `task_context` runs a memory pool of its own, a
+/// [`PeakRecordingPool`] over the pool that the context has, when `options`
+/// asks for the summary of the execution: as a `lance::execution` event or
+/// through `options.execution_stats_callback`. A pool tells only how much is
+/// reserved now, and the pool of a session serves every plan that the session
+/// runs, so the summary takes the peak of the execution from the wrapper, see
+/// [`ExecutionSummaryCounts::peak_reserved_bytes`].
+///
+/// The wrapper only records: it passes every reservation on to the pool it
+/// wraps, which still enforces the limit and decides when operators spill.
+pub fn track_execution_memory(
+    task_context: TaskContext,
+    options: &LanceExecutionOptions,
+) -> TaskContext {
+    if options.skip_logging && options.execution_stats_callback.is_none() {
+        return task_context;
+    }
+    // A clone keeps the session's caches untouched, while
+    // `RuntimeEnvBuilder::build` would reset their limits on every execution.
+    let mut runtime = RuntimeEnv::clone(&task_context.runtime_env());
+    runtime.memory_pool = Arc::new(PeakRecordingPool::new(Arc::clone(&runtime.memory_pool)));
+    task_context.with_runtime(Arc::new(runtime))
+}
+
 /// Returns a new task context to execute one plan with `options`.
 ///
 /// The context has no registered functions, so it can only execute plans
@@ -396,11 +420,10 @@ pub fn new_task_context(options: &LanceExecutionOptions) -> Result<Arc<TaskConte
                 ))
             })?;
     }
-    Ok(Arc::new(
-        TaskContext::default()
-            .with_session_config(session_config)
-            .with_runtime(new_runtime_env(options)),
-    ))
+    let task_context = TaskContext::default()
+        .with_session_config(session_config)
+        .with_runtime(new_runtime_env(options));
+    Ok(Arc::new(track_execution_memory(task_context, options)))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -483,6 +506,20 @@ impl ExecutionSummaryCounts {
             .unwrap_or(0)
     }
 
+    /// The most bytes that the operators of the plan held reserved at once in
+    /// DataFusion's memory pool, or `None` when the plan ran in a task context
+    /// that [`track_execution_memory`] did not prepare.
+    ///
+    /// This is what the execution claimed against the limit of the pool, not
+    /// the memory it allocated. Operators reserve the buffers of sorts,
+    /// aggregations and joins and the batches that repartitioning queues, and a
+    /// sort that may spill also sets aside `sort_spill_reservation_bytes` for its
+    /// merge. A plan whose operators reserve nothing reports 0. Lance's own read
+    /// buffers are not reserved in the pool.
+    pub fn peak_reserved_bytes(&self) -> Option<usize> {
+        self.all_counts.get(PEAK_RESERVED_BYTES_METRIC).copied()
+    }
+
     /// Ratio of index cache hits to total lookups. Returns `0.0` when no lookups
     /// were recorded in this scan.
     ///
@@ -554,13 +591,22 @@ pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut Executio
     }
 }
 
-fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutionOptions) {
+fn report_plan_summary_metrics(
+    plan: &dyn ExecutionPlan,
+    options: &LanceExecutionOptions,
+    peak_reserved_bytes: Option<usize>,
+) {
     let output_rows = plan
         .metrics()
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
     collect_execution_metrics(plan, &mut counts);
+    if let Some(peak_reserved_bytes) = peak_reserved_bytes {
+        counts
+            .all_counts
+            .insert(PEAK_RESERVED_BYTES_METRIC.to_string(), peak_reserved_bytes);
+    }
     if !options.skip_logging {
         tracing::info!(
             target: TRACE_EXECUTION,
@@ -575,6 +621,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
             index_comparisons = counts.index_comparisons,
             index_cache_hits = counts.index_cache_hits(),
             index_cache_misses = counts.index_cache_misses(),
+            peak_reserved_bytes,
         );
     }
     if let Some(callback) = options.execution_stats_callback.as_ref() {
@@ -627,7 +674,8 @@ pub fn execute_plan(
 }
 
 /// Executes a plan under `task_context`, reporting its metrics through `options`
-/// once the stream finishes.
+/// once the stream finishes. The report has the peak memory reservation of the
+/// execution when [`track_execution_memory`] prepared `task_context`.
 ///
 /// A plan with more than one partition is merged into one.
 pub fn execute_plan_with_context(
@@ -660,12 +708,15 @@ pub fn execute_plan_with_context(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
+    let memory_pool = Arc::clone(task_context.memory_pool());
     let stream = plan.execute(0, task_context)?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
         if !options.skip_logging || options.execution_stats_callback.is_some() {
-            report_plan_summary_metrics(plan.as_ref(), &options);
+            let peak_reserved_bytes = PeakRecordingPool::from_pool(memory_pool.as_ref())
+                .map(PeakRecordingPool::peak_reserved);
+            report_plan_summary_metrics(plan.as_ref(), &options, peak_reserved_bytes);
         }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -943,6 +994,24 @@ mod tests {
             })
             .collect();
         assert_eq!(reservations.len(), 3);
+
+        // Only an execution whose summary is reported, as an event or to a
+        // callback, tracks the peak of its reservations.
+        let tracked = |options: &LanceExecutionOptions| {
+            let task_ctx = new_task_context(options).unwrap();
+            PeakRecordingPool::from_pool(task_ctx.memory_pool().as_ref()).is_some()
+        };
+        assert!(tracked(&options));
+        let unreported = LanceExecutionOptions {
+            skip_logging: true,
+            ..options
+        };
+        assert!(!tracked(&unreported));
+        let callback: ExecutionStatsCallback = Arc::new(|_: &ExecutionSummaryCounts| {});
+        assert!(tracked(&LanceExecutionOptions {
+            execution_stats_callback: Some(callback),
+            ..unreported
+        }));
     }
 
     #[rstest]
@@ -975,6 +1044,42 @@ mod tests {
             sorted["x"].as_primitive::<Int32Type>(),
             &Int32Array::from(vec![0, 1, 2, 3, 4, 5])
         );
+    }
+
+    /// The summary carries the peak of the reservations made through the task
+    /// context of the execution: 0 when there were none, unlike the `None` of
+    /// an execution that is not tracked.
+    #[rstest]
+    #[case::reserved(1000)]
+    #[case::nothing(0)]
+    #[tokio::test]
+    async fn test_execution_reports_its_peak_reservation(#[case] peak: usize) {
+        let summary = Arc::new(Mutex::new(None));
+        let options = LanceExecutionOptions {
+            execution_stats_callback: Some(Arc::new({
+                let summary = Arc::clone(&summary);
+                move |counts: &ExecutionSummaryCounts| {
+                    *summary.lock().unwrap() = Some(counts.clone());
+                }
+            })),
+            skip_logging: true,
+            ..Default::default()
+        };
+        let task_ctx = new_task_context(&options).unwrap();
+        // What an operator of the plan reserves at its peak and frees again.
+        let reservation = MemoryConsumer::new("operator").register(task_ctx.memory_pool());
+        reservation.grow(peak);
+        reservation.shrink(peak / 2);
+        drop(reservation);
+        let batch = record_batch!(("x", Int32, [1, 2, 3])).unwrap();
+        let plan = Arc::new(OneShotExec::from_batch(batch));
+        let _: Vec<RecordBatch> = execute_plan_with_context(plan, options, task_ctx)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let summary = summary.lock().unwrap().take().unwrap();
+        assert_eq!(summary.peak_reserved_bytes(), Some(peak));
     }
 
     #[tokio::test]
