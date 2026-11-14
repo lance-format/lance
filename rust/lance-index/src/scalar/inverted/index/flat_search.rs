@@ -1087,6 +1087,19 @@ pub struct FlatBm25SearchOptions {
     pub phrase_slop: Option<u32>,
 }
 
+/// Receives the statistics of the rows one flat search read (merged into its
+/// base scorer) and resolves to the scorer used to score the matching rows,
+/// typically from an external coordinator that owns corpus-wide statistics.
+///
+/// A flat search calls the exchange exactly once on every successful path.
+pub type FlatScorerExchange = Arc<
+    dyn Fn(
+            MemBM25Scorer,
+        ) -> futures::future::BoxFuture<'static, DataFusionResult<Arc<MemBM25Scorer>>>
+        + Send
+        + Sync,
+>;
+
 /// Run a flat BM25 search and return the scorer initialized from both the
 /// optional indexed corpus and the flat input corpus.
 pub async fn flat_bm25_search_stream_with_options_and_scorer(
@@ -1096,6 +1109,30 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     tokenizer: Box<dyn LanceTokenizer>,
     base_scorer: Option<MemBM25Scorer>,
     options: FlatBm25SearchOptions,
+) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
+    flat_bm25_search_stream_with_scorer_exchange(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        options,
+        None,
+    )
+    .await
+}
+
+/// Like [`flat_bm25_search_stream_with_options_and_scorer`], but when an
+/// exchange is given, the matching rows are scored with the scorer it returns
+/// instead of the locally accumulated one, and that scorer is returned.
+pub async fn flat_bm25_search_stream_with_scorer_exchange(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    options: FlatBm25SearchOptions,
+    exchange: Option<FlatScorerExchange>,
 ) -> DataFusionResult<(SendableRecordBatchStream, MemBM25Scorer)> {
     let FlatBm25SearchOptions {
         target_batch_size,
@@ -1117,7 +1154,10 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     // proceeding. This mirrors the indexed search path, which already
     // short-circuits on empty query tokens.
     if query_tokens.is_empty() {
-        let scorer = base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()));
+        let mut scorer = base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()));
+        if let Some(exchange) = &exchange {
+            scorer = exchange(scorer).await?.as_ref().clone();
+        }
         return Ok((
             Box::pin(RecordBatchStreamAdapter::new(
                 output_schema,
@@ -1225,6 +1265,9 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     }
 
     // Statistics must be complete before either the indexed or flat arm scores.
+    if let Some(exchange) = &exchange {
+        scorer = exchange(scorer).await?.as_ref().clone();
+    }
     // Score on demand, releasing each count batch as downstream top-k consumes it.
     let stream_scorer = scorer.clone();
     let batches = stream::iter(matching_batches)

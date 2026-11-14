@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use std::sync::atomic::AtomicUsize;
 
 #[rstest::rstest]
 #[case::or(Operator::Or, None, vec![0, 1, 2])]
@@ -1078,4 +1079,190 @@ async fn flat_bm25_search_code_and_counts_repeated_subwords() {
     let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>().values();
 
     assert_eq!(row_ids, &[0]);
+}
+
+fn exchange_test_input(docs: Vec<&str>) -> SendableRecordBatchStream {
+    let row_ids = (0..docs.len() as u64).collect::<Vec<_>>();
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, docs), ("_rowid", UInt64, row_ids)).unwrap();
+    Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter([Ok(batch)]),
+    ))
+}
+
+fn exchange_test_options() -> FlatBm25SearchOptions {
+    FlatBm25SearchOptions {
+        target_batch_size: 1024,
+        elapsed_compute: None,
+        document_granularity: DocumentGranularity::Row,
+        operator: Operator::Or,
+        boost: 1.0,
+        phrase_slop: None,
+    }
+}
+
+async fn collect_row_scores(output: SendableRecordBatchStream) -> Vec<(u64, f32)> {
+    let mut rows = output
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+            let scores = batch["_score"].as_primitive::<Float32Type>().clone();
+            row_ids
+                .values()
+                .iter()
+                .copied()
+                .zip(scores.values().iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(row_id, _)| *row_id);
+    rows
+}
+
+#[tokio::test]
+async fn flat_scorer_exchange_receives_statistics_of_all_read_rows() {
+    let received = Arc::new(std::sync::Mutex::new(None::<MemBM25Scorer>));
+    let exchange: FlatScorerExchange = {
+        let received = received.clone();
+        Arc::new(move |scorer: MemBM25Scorer| {
+            let received = received.clone();
+            async move {
+                let returned = Arc::new(scorer.clone());
+                *received.lock().unwrap() = Some(scorer);
+                Ok::<_, datafusion_common::DataFusionError>(returned)
+            }
+            .boxed()
+        })
+    };
+    let (output, _) = flat_bm25_search_stream_with_scorer_exchange(
+        exchange_test_input(vec!["alpha beta", "gamma delta epsilon", "alpha"]),
+        "text".into(),
+        "alpha beta".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        None,
+        exchange_test_options(),
+        Some(exchange),
+    )
+    .await
+    .unwrap();
+    let rows = collect_row_scores(output).await;
+    assert_eq!(rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(), [0, 2]);
+
+    let received = received.lock().unwrap().take().unwrap();
+    assert_eq!(received.num_docs(), 3);
+    assert_eq!(received.total_tokens, 6);
+    assert_eq!(received.num_docs_containing_token("alpha"), 2);
+    assert_eq!(received.num_docs_containing_token("beta"), 1);
+}
+
+#[tokio::test]
+async fn flat_scorer_exchange_scores_with_returned_scorer() {
+    let docs = vec!["alpha beta", "gamma delta epsilon", "alpha alpha gamma"];
+    let base = MemBM25Scorer::new(
+        40,
+        10,
+        HashMap::from([("alpha".into(), 3), ("beta".into(), 6)]),
+    );
+    let (reference_output, final_scorer) = flat_bm25_search_stream_with_options_and_scorer(
+        exchange_test_input(docs.clone()),
+        "text".into(),
+        "alpha beta".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        Some(base),
+        exchange_test_options(),
+    )
+    .await
+    .unwrap();
+    let reference = collect_row_scores(reference_output).await;
+    assert_eq!(final_scorer.num_docs(), 13);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exchange: FlatScorerExchange = {
+        let calls = calls.clone();
+        let final_scorer = Arc::new(final_scorer.clone());
+        Arc::new(move |local: MemBM25Scorer| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(local.num_docs(), 3);
+            let final_scorer = final_scorer.clone();
+            async move { Ok::<_, datafusion_common::DataFusionError>(final_scorer) }.boxed()
+        })
+    };
+    let (output, returned) = flat_bm25_search_stream_with_scorer_exchange(
+        exchange_test_input(docs),
+        "text".into(),
+        "alpha beta".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        None,
+        exchange_test_options(),
+        Some(exchange),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(returned.num_docs(), final_scorer.num_docs());
+    assert_eq!(returned.total_tokens, final_scorer.total_tokens);
+    for token in ["alpha", "beta"] {
+        assert_eq!(
+            returned.num_docs_containing_token(token),
+            final_scorer.num_docs_containing_token(token)
+        );
+    }
+    let actual = collect_row_scores(output).await;
+    assert!(!reference.is_empty());
+    assert_eq!(actual, reference);
+}
+
+#[tokio::test]
+async fn flat_scorer_exchange_is_called_once_for_empty_query() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exchange: FlatScorerExchange = {
+        let calls = calls.clone();
+        Arc::new(move |scorer: MemBM25Scorer| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, datafusion_common::DataFusionError>(Arc::new(scorer)) }.boxed()
+        })
+    };
+    let (output, _) = flat_bm25_search_stream_with_scorer_exchange(
+        exchange_test_input(vec!["alpha beta"]),
+        "text".into(),
+        "".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        None,
+        exchange_test_options(),
+        Some(exchange),
+    )
+    .await
+    .unwrap();
+    assert!(collect_row_scores(output).await.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn flat_scorer_exchange_error_propagates() {
+    let exchange: FlatScorerExchange = Arc::new(|_scorer: MemBM25Scorer| {
+        async {
+            Err::<Arc<MemBM25Scorer>, _>(datafusion_common::DataFusionError::Execution(
+                "exchange failed".to_string(),
+            ))
+        }
+        .boxed()
+    });
+    let result = flat_bm25_search_stream_with_scorer_exchange(
+        exchange_test_input(vec!["alpha beta"]),
+        "text".into(),
+        "alpha".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        None,
+        exchange_test_options(),
+        Some(exchange),
+    )
+    .await;
+    let Err(err) = result else {
+        panic!("expected the exchange error to propagate");
+    };
+    assert!(err.to_string().contains("exchange failed"), "{err}");
 }
