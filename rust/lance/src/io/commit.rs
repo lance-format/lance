@@ -56,6 +56,7 @@ use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::refs::HistoryLock;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
@@ -1597,6 +1598,18 @@ pub(crate) async fn commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     dataset.ensure_branch_exists().await?;
+    let guard = if matches!(transaction.operation, Operation::Restore { .. }) {
+        Some(
+            HistoryLock::acquire(
+                Arc::new(object_store.clone()),
+                &dataset.branch_location(),
+                "restore a version",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let result = do_commit_detached_transaction(
         dataset,
         object_store,
@@ -1607,8 +1620,11 @@ pub(crate) async fn commit_detached_transaction(
         retry_timeout,
     )
     .await;
-    dataset.ensure_branch_exists().await?;
-    result
+    let result = dataset.ensure_branch_exists().await.and(result);
+    match guard {
+        Some(guard) => guard.finish(result).await,
+        None => result,
+    }
 }
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
@@ -1787,6 +1803,54 @@ pub(crate) async fn commit_transaction(
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
     dataset.ensure_branch_exists().await?;
+    let mut history_lock = if matches!(transaction.operation, Operation::Restore { .. }) {
+        Some(
+            HistoryLock::acquire(
+                Arc::new(object_store.clone()),
+                &dataset.branch_location(),
+                "restore a version",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    // Keep the commit state off callers' futures as history coordination adds
+    // another suspension point to the shared commit path.
+    let result = Box::pin(do_commit_transaction(
+        dataset,
+        object_store,
+        commit_handler,
+        transaction,
+        write_config,
+        commit_config,
+        retry_timeout,
+        manifest_naming_scheme,
+        affected_rows,
+        expected_latest_version,
+        &mut history_lock,
+    ))
+    .await;
+    match history_lock {
+        Some(guard) => guard.finish(result).await,
+        None => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_commit_transaction(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+    retry_timeout: Duration,
+    manifest_naming_scheme: ManifestNamingScheme,
+    affected_rows: Option<&RowAddrTreeMap>,
+    expected_latest_version: Option<u64>,
+    history_lock: &mut Option<HistoryLock>,
+) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -2115,6 +2179,11 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(manifest_location) => {
+                // The new manifest now retains the source files. Release before
+                // auto-cleanup, which needs to acquire the same history lock.
+                if let Some(guard) = history_lock.take() {
+                    guard.release().await?;
+                }
                 record_successful_commit(
                     &dataset,
                     &attempt_transaction,
@@ -2147,6 +2216,9 @@ pub(crate) async fn commit_transaction(
                         location,
                     } => {
                         let committed_manifest = *committed_manifest;
+                        if let Some(guard) = history_lock.take() {
+                            guard.release().await?;
+                        }
                         record_successful_commit(
                             &dataset,
                             &attempt_transaction,
@@ -2220,6 +2292,9 @@ pub(crate) async fn commit_transaction(
                         location,
                     } => {
                         let committed_manifest = *committed_manifest;
+                        if let Some(guard) = history_lock.take() {
+                            guard.release().await?;
+                        }
                         record_successful_commit(
                             &dataset,
                             &attempt_transaction,
