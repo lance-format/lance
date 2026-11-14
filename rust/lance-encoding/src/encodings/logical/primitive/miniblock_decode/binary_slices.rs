@@ -424,7 +424,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("truncat"));
+        assert!(error.to_string().contains("truncated"));
         let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 2, &[0..1], &io)
             .await
             .unwrap_err();
