@@ -38,7 +38,10 @@ enum Layout {
 /// use lance_core::utils::allocation::AllocationBudget;
 /// use lance_encoding::{buffer::LanceBuffer, compression::BlockDecompressor,
 ///     encodings::physical::value::ValueDecompressor, format::metadata};
-/// let codec = ValueDecompressor::from_flat(&metadata::Flat { bits_per_value: 16 });
+/// let codec = ValueDecompressor::from_flat(&metadata::Flat {
+///     bits_per_value: 16,
+///     data: None,
+/// });
 /// let budget = AllocationBudget::new(12);
 /// let mut work = budget.try_reserve(12).unwrap();
 /// let mut input = work.try_allocate(6).unwrap().unwrap();
@@ -216,8 +219,9 @@ fn allocate(workspace: &mut Reservation, len: usize) -> Result<ReservedBuffer> {
 #[cfg(feature = "bitpacking")]
 fn unpack(width: usize, input: &[u8], output: &mut [u16], alignment: Option<&mut ReservedBuffer>) {
     let input = if let Some(alignment) = alignment {
-        alignment.as_mut().copy_from_slice(input);
-        alignment.as_ref()
+        let bytes = <ReservedBuffer as AsMut<[u8]>>::as_mut(alignment);
+        bytes.copy_from_slice(input);
+        bytes
     } else {
         input
     };

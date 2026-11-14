@@ -47,7 +47,10 @@ impl RepDefUnraveler {
     /// use lance_encoding::{buffer::LanceBuffer, format::metadata,
     ///     encodings::physical::value::ValueDecompressor,
     ///     repdef::{RepDefUnraveler, CompositeRepDefUnraveler, DefinitionInterpretation}};
-    /// let codec = ValueDecompressor::from_flat(&metadata::Flat { bits_per_value: 16 });
+    /// let codec = ValueDecompressor::from_flat(&metadata::Flat {
+    ///     bits_per_value: 16,
+    ///     data: None,
+    /// });
     /// let budget = AllocationBudget::new(9); // input + decoded levels + bitmap
     /// let mut work = budget.try_reserve(9).unwrap();
     /// let mut input = work.try_allocate(4).unwrap().unwrap();

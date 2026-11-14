@@ -26,7 +26,10 @@ fn own(bytes: &[u8], work: &mut Reservation) -> LanceBuffer {
 
 #[rstest]
 fn invalid_decoded_levels_recycle_both_outputs(#[values(false, true)] bad_rep: bool) {
-    let codec = ValueDecompressor::from_flat(&metadata::Flat { bits_per_value: 16 });
+    let codec = ValueDecompressor::from_flat(&metadata::Flat {
+        bits_per_value: 16,
+        data: None,
+    });
     let budget = AllocationBudget::new(18);
     let mut work = budget.try_reserve(18).unwrap();
     let rep_values = if bad_rep { [1_u16, 2] } else { [1, 0] };
@@ -56,7 +59,10 @@ fn invalid_decoded_levels_recycle_both_outputs(#[values(false, true)] bad_rep: b
 
 #[test]
 fn invalid_second_frame_is_rejected_before_first_decode() {
-    let codec = ValueDecompressor::from_flat(&metadata::Flat { bits_per_value: 16 });
+    let codec = ValueDecompressor::from_flat(&metadata::Flat {
+        bits_per_value: 16,
+        data: None,
+    });
     let budget = AllocationBudget::new(64);
     let mut work = budget.try_reserve(64).unwrap();
     let rep = own(bytemuck::cast_slice(&[1_u16, 0]), &mut work);
@@ -78,7 +84,10 @@ fn invalid_second_frame_is_rejected_before_first_decode() {
 
 #[rstest]
 fn one_or_no_encoded_stream(#[values(false, true)] has_def: bool) {
-    let codec = ValueDecompressor::from_flat(&metadata::Flat { bits_per_value: 16 });
+    let codec = ValueDecompressor::from_flat(&metadata::Flat {
+        bits_per_value: 16,
+        data: None,
+    });
     let budget = AllocationBudget::new(14);
     let mut work = budget.try_reserve(14).unwrap();
     let input = own(bytemuck::cast_slice(&[0_u16, 1, 0]), &mut work);

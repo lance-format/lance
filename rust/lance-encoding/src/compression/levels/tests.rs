@@ -72,7 +72,10 @@ fn flat_levels_preserve_values_and_owner(
     #[values(false, true)] unaligned: bool,
 ) {
     let values = (0..count).map(|i| (i % 513) as u16).collect::<Vec<_>>();
-    let codec = ValueDecompressor::from_flat(&metadata::Flat { bits_per_value: 16 });
+    let codec = ValueDecompressor::from_flat(&metadata::Flat {
+        bits_per_value: 16,
+        data: None,
+    });
     check(&codec, bytemuck::cast_slice(&values), &values, unaligned, 0);
 }
 
@@ -88,6 +91,7 @@ fn invalid_flat_layout_precedes_admission(
 ) {
     let codec = ValueDecompressor::from_flat(&metadata::Flat {
         bits_per_value: width,
+        data: None,
     });
     let input = LanceBuffer::from(vec![0_u8; bytes]);
     let error = codec.plan_levels(&input, count).unwrap_err();
