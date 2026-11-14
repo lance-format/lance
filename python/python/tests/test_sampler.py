@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import random
 from pathlib import Path
 
 import lance
@@ -48,20 +49,122 @@ def sample_dataset(sample_dataset_path) -> lance.LanceDataset:
     return lance.dataset(sample_dataset_path)
 
 
-def test_consecutive_index_blocks():
+@pytest.fixture
+def preserve_random_state():
+    state = random.getstate()
+    yield
+    random.setstate(state)
+
+
+@pytest.mark.parametrize("randomize", [False, True])
+@pytest.mark.parametrize(
+    "total_rows,world_size,batch_size",
+    [
+        (1000, 4, 250),
+        (23, 4, 3),
+        (24, 4, 3),
+        (5, 4, 2),
+        (10, 3, 2),
+        (2, 4, 10),
+        (0, 4, 0),
+        (0, 4, 2),
+        (5, 1, 2),
+        (4, 2, 1),
+    ],
+)
+def test_consecutive_index_blocks(
+    total_rows, world_size, batch_size, randomize, preserve_random_state
+):
+    seen = set()
+    per_rank = (total_rows + world_size - 1) // world_size
+    for rank in range(world_size):
+        sampler = ShardedFixedBatchSampler(
+            rank=rank,
+            world_size=world_size,
+            total_num_rows=total_rows,
+            batch_size=batch_size,
+            randomize=randomize,
+        )
+        batches = list(sampler)
+        assert len(sampler) == len(batches) == sum(1 for _ in sampler)
+        start = rank * per_rank
+        end = min(start + per_rank, total_rows)
+        expected = (
+            [
+                list(range(i, min(i + batch_size, end)))
+                for i in range(start, end, batch_size)
+            ]
+            if start < end
+            else []
+        )
+        assert sorted(batches) == expected
+        if not randomize:
+            assert batches == expected
+        assert all(
+            isinstance(batch, list) and 0 < len(batch) <= batch_size
+            for batch in batches
+        )
+        rows = [row for batch in batches for row in batch]
+        assert len(rows) == len(set(rows))
+        assert seen.isdisjoint(rows)
+        seen.update(rows)
+    assert seen == set(range(total_rows))
+
+
+@pytest.mark.parametrize(
+    "rank,world_size,batch_size,total_rows,error",
+    [
+        (0, 0, 2, 5, "world_size"),
+        (0, -1, 2, 5, "world_size"),
+        (-1, 4, 2, 5, "rank"),
+        (4, 4, 2, 5, "rank"),
+        (0, 4, 2, -1, "total_num_rows"),
+        (0, 4, 0, 5, "batch_size"),
+        (0, 4, -1, 5, "batch_size"),
+        (0, 4, -1, 0, "batch_size"),
+    ],
+)
+def test_fixed_batch_sampler_invalid_configuration(
+    rank, world_size, batch_size, total_rows, error
+):
+    with pytest.raises(ValueError, match=error):
+        ShardedFixedBatchSampler(
+            rank, world_size, batch_size=batch_size, total_num_rows=total_rows
+        )
+
+
+@pytest.mark.parametrize("randomize", [False, True])
+def test_fixed_batch_sampler_first_batch_is_lazy(
+    monkeypatch, randomize, preserve_random_state
+):
+    row_ranges = []
+
+    def recording_range(*args):
+        result = range(*args)
+        if result.step == 1:
+            row_ranges.append(result)
+        return result
+
+    monkeypatch.setattr("lance.sampler.range", recording_range, raising=False)
     sampler = ShardedFixedBatchSampler(
         rank=0,
-        world_size=TEST_CONFIG["world_size"],
-        total_num_rows=TEST_CONFIG["total_rows"],
-        batch_size=TEST_CONFIG["batch_size"],
+        world_size=1,
+        total_num_rows=1_000_000,
+        batch_size=128,
+        randomize=randomize,
+        seed=42,
     )
-
-    batches = list(sampler)
-    expected_size = TEST_CONFIG["total_rows"] // (
-        TEST_CONFIG["world_size"] * TEST_CONFIG["batch_size"]
-    )
-    assert len(batches) == expected_size
-    assert batches[0] == list(range(TEST_CONFIG["batch_size"]))
+    batches = iter(sampler)
+    assert row_ranges == []
+    first = next(batches)
+    assert len(row_ranges) == 1
+    assert first == list(row_ranges[0])
+    assert len(first) == 128
+    second = next(batches)
+    assert len(row_ranges) == 2
+    assert second == list(row_ranges[1])
+    batches.close()
+    assert len(row_ranges) == 2
 
 
 def _distributed_test_worker(rank, world_size, dataset_path):
@@ -185,27 +288,29 @@ def test_filtered_data_handling(sample_dataset):
     assert all(id_val % 4 == 0 for id_val in all_ids), "Should keep rank 0 shard"
 
 
-def test_randomization_effect():
+@pytest.mark.parametrize("seed", [0, 42])
+@pytest.mark.parametrize("epoch", [0, 1, 2])
+def test_randomization_effect(seed, epoch, preserve_random_state):
     """Verify epoch-based randomization behavior."""
-    # Initialize randomized sampler
-    sampler = ShardedFixedBatchSampler(
-        rank=0,
-        world_size=4,
-        total_num_rows=2000,
-        batch_size=250,
-        randomize=True,
-        seed=42,
-    )
-
-    assert len(list(sampler)) > 1
-
-    # Cross-epoch comparison
-    sampler.set_epoch(1)
-    epoch1 = list(sampler)
-    sampler.set_epoch(2)
-    epoch2 = list(sampler)
-
-    assert epoch1 != epoch2, "Different epochs should produce different orders"
+    for rank in range(4):
+        sampler = ShardedFixedBatchSampler(
+            rank=rank,
+            world_size=4,
+            total_num_rows=101,
+            batch_size=7,
+            randomize=True,
+            seed=seed,
+        )
+        sampler.set_epoch(epoch)
+        assert len(sampler) == sum(1 for _ in sampler)
+        # Reproduce the former eager layout and shuffle to pin seeded batch order.
+        start, end = rank * 26, min((rank + 1) * 26, 101)
+        expected = [list(range(i, min(i + 7, end))) for i in range(start, end, 7)]
+        rng = random.Random(seed + epoch)
+        rng.shuffle(expected)
+        assert list(sampler) == expected
+        assert random.getstate() == rng.getstate()
+        assert list(sampler) == expected
 
 
 @pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])

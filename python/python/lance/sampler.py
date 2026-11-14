@@ -585,13 +585,15 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
     Features:
     - Requires `total_num_rows` and `batch_size` to be specified.
     - Each rank receives consecutive, non-overlapping index ranges.
+    - Length reports this rank's batch count, including partial batches and
+      zero batches for ranks beyond the dataset.
     - Optionally randomizes the order of batches per epoch if `randomize=True`.
     - Suitable for integration with PyTorch DataLoader or similar frameworks.
 
     Example (total_num_rows=1000, world_size=4, batch_size=100):
-    - Rank 0: [0-99], [100-199], [200-299]
-    - Rank 1: [250-349], [350-449], [450-549]
-    - Rank 2: [500-599], [600-699], [700-799]
+    - Rank 0: [0-99], [100-199], [200-249]
+    - Rank 1: [250-349], [350-449], [450-499]
+    - Rank 2: [500-599], [600-699], [700-749]
     - Rank 3: [750-849], [850-949], [950-999]
 
     Parameters
@@ -602,12 +604,15 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         The total number of processes in the distributed cluster.
     randomize : bool, default False
         Whether to randomize the order of batches for each epoch.
+        Sequential iteration retains only the current batch. Randomized iteration
+        also retains one start offset per batch.
     seed : int, default 0
         Random seed for reproducibility when randomize is enabled.
     batch_size : int, default 0
-        The number of rows per batch.
+        The number of rows per batch. Must be positive for nonempty datasets.
     total_num_rows : int, default 0
-        The total number of rows in the dataset.
+        The non-negative total number of rows in the dataset. Empty datasets
+        yield no batches, including with the default batch size of zero.
     """
 
     def __init__(
@@ -619,40 +624,56 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         batch_size: int = 0,
         total_num_rows: int = 0,
     ):
+        if world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(
+                f"rank must satisfy 0 <= rank < world_size ({world_size}), got {rank}"
+            )
+        if total_num_rows < 0:
+            raise ValueError(
+                f"total_num_rows must be non-negative, got {total_num_rows}"
+            )
+        if batch_size < 0 or (batch_size == 0 and total_num_rows > 0):
+            raise ValueError(
+                "batch_size must be non-negative for empty datasets and positive "
+                f"otherwise, got batch_size={batch_size}, "
+                f"total_num_rows={total_num_rows}"
+            )
         super().__init__(rank, world_size, randomize, seed)
         self._total_num_rows = total_num_rows
         self._batch_size = batch_size
+        per_rank = (total_num_rows + world_size - 1) // world_size
+        self._start = min(rank * per_rank, total_num_rows)
+        self._end = min(self._start + per_rank, total_num_rows)
         self._len = self._compute_length()
 
     # The sampler here is mainly implemented with the hope that
     # the data of batch_size are all adjacent, so we don't want
     # to use filter to break this adjacent feature.
     def _compute_length(self):
-        if self._batch_size == 0 and self._total_num_rows == 0:
+        num_rows = self._end - self._start
+        if num_rows == 0:
             return 0
-        per_rank = math.ceil(self._total_num_rows / self._world_size)
-        return math.ceil(per_rank / self._batch_size)
+        return (num_rows + self._batch_size - 1) // self._batch_size
 
     def __len__(self):
         return self._len
 
     def __iter__(self) -> Generator[List[int], None, None]:
-        per_rank = math.ceil(self._total_num_rows / self._world_size)
-        start = self._rank * per_rank
-        end = min(start + per_rank, self._total_num_rows)
+        start, end = self._start, self._end
 
-        batches = []
-        current = start
-        while current < end:
-            batch_end = min(current + self._batch_size, end)
-            batches.append(list(range(current, batch_end)))
-            current = batch_end
+        batch_starts: Union[range, List[int]] = (
+            range(start, end, self._batch_size) if start < end else range(0)
+        )
 
         if self._randomize:
+            batch_starts = list(batch_starts)
             random.seed(self._seed + self._epoch)
-            random.shuffle(batches)
+            random.shuffle(batch_starts)
 
-        yield from batches
+        for current in batch_starts:
+            yield list(range(current, min(current + self._batch_size, end)))
 
     @staticmethod
     def from_torch(
