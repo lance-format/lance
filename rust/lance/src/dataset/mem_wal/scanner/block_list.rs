@@ -401,10 +401,17 @@ async fn open_pk_index(
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let dataset = open_sstable(path, session, store_params, sstable_cache, None).await?;
+    load_pk_index(&dataset).await
+}
+
+/// Open the standalone PK sidecar using the generation's storage and session cache.
+pub(super) async fn load_pk_index(dataset: &crate::Dataset) -> Result<Arc<dyn ScalarIndex>> {
     // Namespace the session index cache by the (immutable) SSTable path so this
     // sidecar's pages live alongside every other index instead of a bespoke
     // cache. `fri_uuid` is None — SSTables carry no fragment-reuse.
-    let index_cache = dataset.index_cache.for_index(&path_cache_uuid(path), None);
+    let index_cache = dataset
+        .index_cache
+        .for_index(&path_cache_uuid(dataset.uri()), None);
     let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
         dataset.object_store.clone(),

@@ -37,7 +37,9 @@ use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 
 use super::collector::{InMemoryMemTableRef, LsmDataSourceCollector};
 use super::data_source::LsmDataSource;
-use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::exec::{
+    BloomFilterGuardExec, CoalesceFirstExec, SsTablePointLookupExec, compute_pk_hash_from_scalars,
+};
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
@@ -64,8 +66,8 @@ const ON_DISK_LOOKUP_CHUNK_KEYS: usize = 4096;
 ///
 /// # Query Plan Structure
 ///
-/// Since data is stored in reverse order (newest first), we use `GlobalLimitExec`
-/// with limit=1 to take the first (most recent) matching row.
+/// Each source returns its newest visible match first. `GlobalLimitExec`
+/// with limit=1 keeps that row before the newest-first coalesce.
 ///
 /// ```text
 /// CoalesceFirstExec: return_first_non_null
@@ -75,12 +77,10 @@ const ON_DISK_LOOKUP_CHUNK_KEYS: usize = 4096;
 ///         ScanExec: memtable_gen_3
 ///   BloomFilterGuardExec: gen=2
 ///     GlobalLimitExec: limit=1
-///       FilterExec: pk = target
-///         ScanExec: flushed_gen_2
+///       SsTablePointLookupExec: PK sidecar -> single-row take
 ///   BloomFilterGuardExec: gen=1
 ///     GlobalLimitExec: limit=1
-///       FilterExec: pk = target
-///         ScanExec: flushed_gen_1
+///       SsTablePointLookupExec: PK sidecar -> single-row take
 ///   GlobalLimitExec: limit=1
 ///     FilterExec: pk = target
 ///       ScanExec: base_table
@@ -312,11 +312,12 @@ impl LsmPointLookupPlanner {
             // through a boxed future's concrete type but stops at a trait
             // object. An arm resolves a generation's schema before it
             // scans, which nests deeply enough to need that.
-            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                Box::pin(self.build_source_scan(&source, projection, &filter_expr));
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> = Box::pin(
+                self.build_source_scan(&source, projection, &filter_expr, Some(pk_values)),
+            );
             let scan = arm.await?;
 
-            // Data is stored in reverse order, so first match is newest
+            // Each source emits its newest visible match first.
             let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(scan, 0, Some(1)));
 
             let guarded_plan: Arc<dyn ExecutionPlan> =
@@ -714,7 +715,7 @@ impl LsmPointLookupPlanner {
                 let filter = col(pk.as_str()).in_list(candidates, false);
                 // Type-erased for the same `Send`-proof depth as `plan_lookup_coalesced`.
                 let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                    Box::pin(self.build_source_scan(source, projection, &filter));
+                    Box::pin(self.build_source_scan(source, projection, &filter, None));
                 let mut stream = arm.await?.execute(0, self.task_ctx.clone())?;
                 while let Some(batch) = stream.try_next().await? {
                     let pk_values = batch.column_by_name(pk).ok_or_else(|| {
@@ -815,6 +816,7 @@ impl LsmPointLookupPlanner {
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: &Expr,
+        pk_values: Option<&[ScalarValue]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         #[cfg(test)]
         self.source_scans
@@ -858,7 +860,6 @@ impl LsmPointLookupPlanner {
                     self.warmer.as_ref(),
                 )
                 .await?;
-                let mut scanner = dataset.scan();
                 // A flushed generation holds the names the table had when it was
                 // frozen, so the projection, the key filter and the output all
                 // go through the same resolution the scanner uses.
@@ -877,14 +878,32 @@ impl LsmPointLookupPlanner {
                         source.generation()
                     ))
                 })?;
-                // Resolve against the *source* schema so a nested path narrows the
-                // struct rather than flattening it; expressions cannot express a
-                // partial nested projection, only a schema can.
-                scanner.project_with_schema(
-                    &dataset.schema().project(&generation.stored_projection())?,
-                )?;
-                scanner.filter_expr(stored_filter);
-                let scan = Box::pin(scanner.create_plan()).await?;
+                let stored_projection =
+                    dataset.schema().project(&generation.stored_projection())?;
+                // The index compares typed keys directly. Keep DataFusion's
+                // coercion semantics for literals of a different type, and the
+                // batched IN path's one scan per source.
+                let pk_columns = generation.stored_pk_columns()?;
+                let indexed_key = pk_values.filter(|values| {
+                    pk_columns.iter().zip(*values).all(|(column, value)| {
+                        dataset
+                            .schema()
+                            .field(column)
+                            .is_some_and(|field| field.data_type() == value.data_type())
+                    })
+                });
+                let scan: Arc<dyn ExecutionPlan> = if let Some(values) = indexed_key {
+                    Arc::new(SsTablePointLookupExec::try_new(
+                        dataset,
+                        values,
+                        stored_projection,
+                    )?)
+                } else {
+                    let mut scanner = dataset.scan();
+                    scanner.project_with_schema(&stored_projection)?;
+                    scanner.filter_expr(stored_filter);
+                    Box::pin(scanner.create_plan()).await?
+                };
                 // `_tombstone` is carried through so the post-coalesce filter
                 // can drop a deleted key; a generation written before deletes
                 // existed lacks it and `project_to_carry` synthesizes `false`.
@@ -1321,9 +1340,12 @@ fn probe_memtable(
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
+    use lance_arrow::json::{JsonArray, is_json_field, json_field};
     use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -1362,10 +1384,16 @@ mod tests {
 
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(WriteParams::default()))
+        let reader = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
             .await
-            .unwrap()
+            .unwrap();
+        if uri.contains("/_mem_wal/") {
+            super::super::block_list::write_pk_sidecar(uri, &batches, &["id"])
+                .await
+                .unwrap();
+        }
+        dataset
     }
 
     #[tokio::test]
@@ -1977,6 +2005,275 @@ mod tests {
             name_arr.value(0),
             "new_1",
             "SSTable-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
+        );
+    }
+
+    #[rstest]
+    #[case::integer(vec!["id"], vec![ScalarValue::Int64(Some(1))])]
+    #[case::string(vec!["key"], vec![ScalarValue::Utf8(Some("one".into()))])]
+    #[case::composite(
+        vec!["id", "key"],
+        vec![ScalarValue::Int64(Some(1)), ScalarValue::Utf8(Some("one".into()))]
+    )]
+    #[tokio::test]
+    async fn test_sstable_point_lookup_takes_indexed_physical_row(
+        #[case] pk_columns: Vec<&str>,
+        #[case] key: Vec<ScalarValue>,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int64, [0, 1, 2, 1, 3, 1]),
+            ("key", Utf8, ["zero", "one", "two", "one", "three", "one"]),
+            ("version", Int32, [0, 1, 2, 3, 4, 5]),
+            (
+                "_tombstone",
+                Boolean,
+                [false, false, false, false, false, true]
+            )
+        )
+        .unwrap();
+        let meta = create_nested_batch(&create_nested_schema(), &[0, 1, 2, 3, 4, 5]);
+        let batch = batch
+            .try_with_column(
+                meta.schema().field_with_name("meta").unwrap().clone(),
+                meta["meta"].clone(),
+            )
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = temp.path().to_str().unwrap();
+        let shard_id = Uuid::new_v4();
+        let uri = format!("{base_uri}/_mem_wal/{shard_id}/gen_1");
+        // Put the live duplicate in the second fragment, beyond deleted rows.
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        super::super::block_list::write_pk_sidecar(&uri, std::slice::from_ref(&batch), &pk_columns)
+            .await
+            .unwrap();
+        dataset.delete("version = 1 OR version = 3").await.unwrap();
+        let shard = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector =
+            LsmDataSourceCollector::without_base_table(base_uri.to_string(), vec![shard]);
+        let planner = LsmPointLookupPlanner::new(
+            collector,
+            pk_columns.iter().map(|s| s.to_string()).collect(),
+            batch.drop_column(TOMBSTONE).unwrap().schema(),
+        )
+        .unwrap();
+        let projection = ["version", "meta.b", "_rowid", "_rowaddr"].map(String::from);
+        let plan = planner.plan_lookup(&key, Some(&projection)).await.unwrap();
+        let display = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(display.contains("SsTablePointLookupExec"), "{display}");
+        assert!(!display.contains("LanceScan"), "{display}");
+        // The newest live physical position is a tombstone. It must win the
+        // coalesce, and ordinary lookup must then report the key as deleted.
+        assert!(
+            planner
+                .lookup(&key, Some(&projection))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let row = planner
+            .lookup_keep_tombstone(&key, Some(&projection))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.num_rows(), 1);
+        assert_eq!(
+            row["version"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(0),
+            5
+        );
+        assert_eq!(meta_children(&row), vec!["b"]);
+        assert_eq!(
+            row["meta"].as_struct()["b"].as_string::<i32>().value(0),
+            "b_5"
+        );
+        assert!(row["_rowid"].is_null(0));
+        assert!(row["_rowaddr"].is_null(0));
+        assert!(tombstone_at(&row));
+        let live_key: Vec<_> = pk_columns
+            .iter()
+            .map(|column| ScalarValue::try_from_array(&batch[*column], 4).unwrap())
+            .collect();
+        let live = planner.lookup(&live_key, None).await.unwrap().unwrap();
+        assert_eq!(live.num_rows(), 1);
+        assert_eq!(
+            live["version"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(0),
+            4
+        );
+        assert_eq!(meta_children(&live), vec!["a", "b"]);
+        let null_key: Vec<_> = key
+            .iter()
+            .map(|k| ScalarValue::try_from(&k.data_type()).unwrap())
+            .collect();
+        assert!(planner.lookup(&null_key, None).await.unwrap().is_none());
+        let missing: Vec<_> = pk_columns
+            .iter()
+            .map(|column| match *column {
+                "id" => ScalarValue::Int64(Some(99)),
+                _ => ScalarValue::Utf8(Some("absent".into())),
+            })
+            .collect();
+        assert!(planner.lookup(&missing, None).await.unwrap().is_none());
+    }
+
+    #[rstest]
+    #[case::top_level(false)]
+    #[case::nested(true)]
+    #[tokio::test]
+    async fn test_sstable_point_lookup_preserves_json_payload(#[case] is_nested: bool) {
+        let json: ArrayRef = Arc::new(
+            JsonArray::try_from_iter([
+                Some(r#"{"name":"Alice"}"#),
+                None,
+                Some("null"),
+                Some(r#"{"name":"Bob"}"#),
+            ])
+            .unwrap()
+            .into_inner(),
+        );
+        let doc_field = json_field("doc", true);
+        let (field, payload, json_projection) = if is_nested {
+            let payload = StructArray::new(vec![doc_field].into(), vec![json], None);
+            (
+                Field::new("meta", payload.data_type().clone(), false),
+                Arc::new(payload) as ArrayRef,
+                "meta.doc",
+            )
+        } else {
+            (doc_field, json, "doc")
+        };
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2, 3, 4]))
+            .unwrap()
+            .try_with_column(field, payload)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = temp.path().to_str().unwrap();
+        let shard_id = Uuid::new_v4();
+        let uri = format!("{base_uri}/_mem_wal/{shard_id}/gen_1");
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        super::super::block_list::write_pk_sidecar(&uri, std::slice::from_ref(&batch), &["id"])
+            .await
+            .unwrap();
+        let shard = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector =
+            LsmDataSourceCollector::without_base_table(base_uri.to_string(), vec![shard]);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".into()], batch.schema()).unwrap();
+        for (projection, has_json) in [
+            (None, true),
+            (Some(vec![json_projection.to_string()]), true),
+            (Some(vec!["id".to_string()]), false),
+        ] {
+            let projection = projection.as_deref();
+            let plan = planner
+                .plan_lookup(&[ScalarValue::Int32(Some(1))], projection)
+                .await
+                .unwrap();
+            let display = displayable(plan.as_ref()).indent(true).to_string();
+            assert!(display.contains("SsTablePointLookupExec"), "{display}");
+            assert!(!display.contains("LanceScan"), "{display}");
+            for id in 1..=4 {
+                let indexed = planner
+                    .lookup(&[ScalarValue::Int32(Some(id))], projection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // A wider literal exercises the retained scan/coercion path.
+                let scanned = planner
+                    .lookup(&[ScalarValue::Int64(Some(i64::from(id)))], projection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(indexed.num_rows(), 1);
+                assert_eq!(indexed, scanned);
+                if has_json {
+                    let schema = indexed.schema();
+                    let field = if is_nested {
+                        let DataType::Struct(fields) =
+                            schema.field_with_name("meta").unwrap().data_type()
+                        else {
+                            panic!("expected struct payload");
+                        };
+                        fields[0].as_ref()
+                    } else {
+                        schema.field_with_name("doc").unwrap()
+                    };
+                    assert!(is_json_field(field));
+                    assert_eq!(field.data_type(), &DataType::LargeBinary);
+                }
+            }
+            assert!(
+                planner
+                    .lookup(&[ScalarValue::Int32(Some(99))], projection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sstable_point_lookup_skips_unused_sidecars() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = temp.path().to_str().unwrap();
+        let shard_id = Uuid::new_v4();
+        for generation in [1, 2] {
+            let uri = format!("{base_uri}/_mem_wal/{shard_id}/gen_{generation}");
+            create_dataset(&uri, vec![create_test_batch(&schema, &[1], "value")]).await;
+        }
+        // Opening this sidecar would fail. Both the newest-first hit and a
+        // negative bloom check must avoid opening it, even during planning.
+        std::fs::remove_dir_all(format!("{base_uri}/_mem_wal/{shard_id}/gen_1/_pk_index")).unwrap();
+        let shard = ShardSnapshot::new(shard_id)
+            .with_current_generation(3)
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
+        let collector =
+            LsmDataSourceCollector::without_base_table(base_uri.to_string(), vec![shard]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".into()], schema).unwrap();
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(1))], None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let planner = planner.with_bloom_filter(1, Arc::new(Sbbf::with_ndv_fpp(1, 0.01).unwrap()));
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(2))], None)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
