@@ -897,7 +897,8 @@ impl Scanner {
                     filter_plan.expr_filter_plan = remainder
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
-                    self.take_source(take_op).await?
+                    self.take_source(take_op, &filter_plan.expr_filter_plan)
+                        .await?
                 } else {
                     let planned_read = self
                         .filtered_read_source(&mut filter_plan.expr_filter_plan, session)

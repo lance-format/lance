@@ -29,7 +29,9 @@ use futures::future::BoxFuture;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
+use lance_core::{
+    ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+};
 use lance_datafusion::exec::RecordBatchExec;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::ScalarIndexExpr;
@@ -659,10 +661,20 @@ impl Scanner {
     pub(super) async fn take_source(
         &self,
         take_op: TakeOperation,
+        filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
         // so we can just use the source projection
-        let mut projection = self.source_projection()?;
+        // Row-stream takes do not synthesize version columns, so load those at the source.
+        let version_columns = filter_plan.refine_columns().into_iter().filter(|name| {
+            matches!(
+                name.as_str(),
+                ROW_CREATED_AT_VERSION | ROW_LAST_UPDATED_AT_VERSION
+            )
+        });
+        let mut projection = self
+            .source_projection()?
+            .union_columns(version_columns, OnMissing::Error)?;
         // Later stages take filter, aggregate and ordering columns by row address, and
         // an empty projection still needs an output column. The address is synthesized.
         projection.with_row_addr = true;
