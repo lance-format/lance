@@ -3546,7 +3546,7 @@ mod tests {
         process::Command,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -3571,6 +3571,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
+    use futures::stream::BoxStream;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
@@ -3585,6 +3586,10 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -3681,6 +3686,210 @@ mod tests {
                     Ok(meta)
                 }),
             );
+        }
+    }
+
+    /// Suffixes that select an outcome class in [`BulkDeleteStore`].
+    const BULK_ALREADY_GONE: &str = "-gone-";
+    const BULK_REJECTED: &str = "-rejected-";
+    const BULK_OMITTED: &str = "-omitted-";
+
+    #[derive(Debug)]
+    struct BulkDeleteObservations {
+        /// Paths carried by each delete request, in the order the requests are issued.
+        /// A single-object delete arrives as one request with one path.
+        batches: Mutex<Vec<usize>>,
+        /// Reject whole requests with one pathless error, as a provider outage does.
+        fail_whole_request: AtomicBool,
+        /// Inject the per-path rejection and omission classes, so a retry can finish.
+        inject_outcomes: AtomicBool,
+    }
+
+    impl BulkDeleteObservations {
+        fn new() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fail_whole_request: AtomicBool::new(false),
+                inject_outcomes: AtomicBool::new(true),
+            }
+        }
+
+        fn batch_sizes(&self) -> Vec<usize> {
+            self.batches.lock().unwrap().clone()
+        }
+    }
+
+    /// A store whose bulk delete handles a whole batch as one request, like a
+    /// provider's `DeleteObjects`, including the outcome shapes cleanup must tolerate:
+    /// a key another writer removed, a rejected key, and a key the response omits even
+    /// though the request removed it.
+    #[derive(Debug)]
+    struct BulkDeleteStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        observations: Arc<BulkDeleteObservations>,
+        /// Cost of one delete operation: one path, or one whole batch.
+        latency: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for BulkDeleteStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        // `ObjectStoreExt::delete` routes a single delete through `delete_stream` with
+        // one path, so this override covers both shapes: one operation per call.
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let inner = Arc::clone(&self.inner);
+            let observations = Arc::clone(&self.observations);
+            let latency = self.latency;
+            stream::once(async move {
+                let mut paths = Vec::new();
+                let mut outcomes = Vec::new();
+                let mut locations = locations;
+                while let Some(location) = locations.next().await {
+                    match location {
+                        Ok(path) => paths.push(path),
+                        // Keep an input error as that path's outcome rather than
+                        // dropping the rest of the batch.
+                        Err(error) => outcomes.push(Err(error)),
+                    }
+                }
+                observations.batches.lock().unwrap().push(paths.len());
+                tokio::time::sleep(latency).await;
+                if observations.fail_whole_request.load(Ordering::SeqCst) {
+                    return stream::once(async move {
+                        Err(object_store::Error::Generic {
+                            store: "BulkDeleteStore",
+                            source: "bulk delete request rejected".into(),
+                        })
+                    })
+                    .boxed();
+                }
+                let inject = observations.inject_outcomes.load(Ordering::SeqCst);
+                for path in paths {
+                    if inject && path.as_ref().contains(BULK_OMITTED) {
+                        // A provider may remove a key and still leave it out of the
+                        // response, so the caller sees no outcome for it.
+                        let _ = inner.delete(&path).await;
+                        continue;
+                    }
+                    if inject && path.as_ref().contains(BULK_REJECTED) {
+                        outcomes.push(Err(object_store::Error::Generic {
+                            store: "BulkDeleteStore",
+                            source: format!("bulk delete rejected {path}").into(),
+                        }));
+                        continue;
+                    }
+                    if inject && path.as_ref().contains(BULK_ALREADY_GONE) {
+                        // Another cleanup removed the key after the listing: the
+                        // removal is real and the report is not-found.
+                        let _ = inner.delete(&path).await;
+                        outcomes.push(Err(object_store::Error::NotFound {
+                            path: path.to_string(),
+                            source: "removed after the listing".into(),
+                        }));
+                        continue;
+                    }
+                    outcomes.push(match inner.delete(&path).await {
+                        Ok(()) => Ok(path),
+                        Err(error) => Err(error),
+                    });
+                }
+                stream::iter(outcomes).boxed()
+            })
+            .flatten()
+            .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    impl std::fmt::Display for BulkDeleteStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BulkDeleteStore({})", self.inner)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BulkDeleteStoreWrapper {
+        observations: Arc<BulkDeleteObservations>,
+        latency: Duration,
+    }
+
+    impl WrappingObjectStore for BulkDeleteStoreWrapper {
+        fn wrap(
+            &self,
+            _storage_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            Arc::new(BulkDeleteStore {
+                inner: original,
+                observations: Arc::clone(&self.observations),
+                latency: self.latency,
+            })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
         }
     }
 
@@ -7177,6 +7386,153 @@ mod tests {
             usize::from(!is_missing),
             "missing files must be silent; other failures warn once per sweep: {output}"
         );
+    }
+
+    /// A coalesced bulk delete must report what it did: removed keys count as
+    /// removed, a key another writer removed still counts, and a rejected or
+    /// unreported key is a failure that a later sweep retries.
+    #[tokio::test]
+    async fn bulk_cleanup_counts_mixed_outcomes() {
+        let observations = Arc::new(BulkDeleteObservations::new());
+        let uri = format!("memory://{}", Uuid::new_v4());
+        let dataset = Dataset::write(
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 2.into()),
+            uri.as_str(),
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(BulkDeleteStoreWrapper {
+                        observations: Arc::clone(&observations),
+                        latency: Duration::ZERO,
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Every class is an unreferenced data file, and together they cross the bulk
+        // threshold, so one request carries the whole batch.
+        let data_dir = dataset.data_dir();
+        let mut removed_paths = Vec::new();
+        let mut unreported = Vec::new();
+        let mut rejected = Vec::new();
+        for (class, count) in [("ok", 110), ("gone", 5), ("rejected", 5), ("omitted", 5)] {
+            for index in 0..count {
+                let path = data_dir
+                    .clone()
+                    .join(format!("orphan-{class}-{index:03}.lance"));
+                dataset.object_store.put(&path, &[0u8; 64]).await.unwrap();
+                match class {
+                    "rejected" => rejected.push(path),
+                    "omitted" => unreported.push(path),
+                    _ => removed_paths.push(path),
+                }
+            }
+        }
+        let policy = || {
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() + TimeDelta::try_days(1).unwrap())
+                .delete_unverified(true)
+                .build()
+        };
+
+        let removed = dataset
+            .cleanup(policy())
+            .with_delete_concurrency(2)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(removed.data_files_removed, removed_paths.len() as u64);
+        assert_eq!(removed.bytes_removed, 64 * removed_paths.len() as u64);
+        // A rejected key and a key the response never mentioned are both failures:
+        // an unknown outcome is not evidence of removal.
+        assert_eq!(
+            removed.failed_deletes,
+            (rejected.len() + unreported.len()) as u64
+        );
+        assert_eq!(observations.batch_sizes(), vec![125]);
+        for path in removed_paths.iter().chain(&unreported) {
+            assert!(
+                !dataset.object_store.exists(path).await.unwrap(),
+                "{path} survived"
+            );
+        }
+        for path in &rejected {
+            assert!(
+                dataset.object_store.exists(path).await.unwrap(),
+                "{path} was rejected but is gone"
+            );
+        }
+
+        // A retry with the rejections cleared finishes the sweep, so counting them as
+        // failures left the files discoverable.
+        observations.inject_outcomes.store(false, Ordering::SeqCst);
+        let retried = dataset
+            .cleanup(policy())
+            .with_delete_concurrency(2)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        // Only the rejected keys remain to delete; the unreported ones are already
+        // gone, so the retry converges instead of double counting them.
+        assert_eq!(retried.data_files_removed, rejected.len() as u64);
+        assert_eq!(retried.failed_deletes, 0);
+        assert_eq!(retried.bytes_removed, 64 * rejected.len() as u64);
+
+        // A request that fails as a whole reports no per-path outcome. Every path it
+        // carried is unresolved, so all of them are failures, not just the one error.
+        observations
+            .fail_whole_request
+            .store(true, Ordering::SeqCst);
+        let unreachable_paths = (0..120)
+            .map(|index| {
+                data_dir
+                    .clone()
+                    .join(format!("orphan-unreachable-{index:03}.lance"))
+            })
+            .collect::<Vec<_>>();
+        for path in &unreachable_paths {
+            dataset.object_store.put(path, &[0u8; 64]).await.unwrap();
+        }
+        let unreachable = dataset
+            .cleanup(policy())
+            .with_delete_concurrency(2)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(unreachable.data_files_removed, 0);
+        assert_eq!(unreachable.bytes_removed, 0);
+        assert_eq!(unreachable.failed_deletes, 120);
+        for path in &unreachable_paths {
+            assert!(
+                dataset.object_store.exists(path).await.unwrap(),
+                "{path} was counted as failed but is gone"
+            );
+        }
+
+        observations
+            .fail_whole_request
+            .store(false, Ordering::SeqCst);
+        let recovered = dataset
+            .cleanup(policy())
+            .with_delete_concurrency(2)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(recovered.data_files_removed, 120);
+        assert_eq!(recovered.failed_deletes, 0);
     }
 
     #[tokio::test]
