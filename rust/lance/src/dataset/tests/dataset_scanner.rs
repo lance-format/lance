@@ -43,7 +43,6 @@ use lance_index::{IndexType, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
