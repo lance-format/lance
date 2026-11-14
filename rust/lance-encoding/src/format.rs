@@ -687,6 +687,16 @@ impl EncodingUtils {
         }
     }
 
+    pub fn pcodec(values: metadata::CompressiveEncoding) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Pcodec(
+                Box::new(metadata::Pcodec {
+                    values: Some(Box::new(values)),
+                }),
+            )),
+        }
+    }
+
     pub fn dictionary(
         indices: metadata::CompressiveEncoding,
         items: metadata::CompressiveEncoding,

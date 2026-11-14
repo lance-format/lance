@@ -39,6 +39,8 @@ bytemuck.workspace = true
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
 zstd = { version = "0.14", optional = true }
+# The Pcodec spec pins the chunk payload to the format written by pco 1.0.
+pco = { version = "~1.0.4", optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
@@ -52,12 +54,13 @@ rand_xoshiro = { workspace = true }
 proptest.workspace = true
 
 [features]
-default = ["lz4", "zstd", "bitpacking"]
+default = ["lz4", "zstd", "bitpacking", "pcodec"]
 # Retained for compatibility; protobuf sources are now checked in.
 protoc = []
 bitpacking = ["dep:lance-bitpacking"]
 lz4 = ["dep:lz4"]
 zstd = ["dep:zstd"]
+pcodec = ["dep:pco"]
 
 [package.metadata.cargo-machete]
 ignored = ["prost"]
