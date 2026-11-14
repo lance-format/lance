@@ -671,6 +671,7 @@ impl ModelFragment {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(self.deleted.len() as usize),
             base_id: None,
+            path: None,
             inline: None,
         });
         fragment.overlays = self

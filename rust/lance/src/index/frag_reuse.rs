@@ -4224,6 +4224,7 @@ mod tests {
             file_type: lance_table::format::DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: None,
         });
         let error = build_frag_reuse_rewrite_entry(

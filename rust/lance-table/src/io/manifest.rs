@@ -256,6 +256,28 @@ async fn do_write_manifest(
     indices: Option<Vec<IndexMetadata>>,
     mut transaction: Option<Transaction>,
 ) -> Result<usize> {
+    for fragment in manifest.fragments.iter() {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            deletion_file.validate_location()?;
+        }
+    }
+    // A reader without the bit would derive a path from the fragment id.
+    let has_deletion_file_paths = manifest.fragments.iter().any(|fragment| {
+        fragment
+            .deletion_file
+            .as_ref()
+            .is_some_and(|deletion_file| deletion_file.path.is_some())
+    });
+    if has_deletion_file_paths {
+        let paths_flag = crate::feature_flags::FLAG_DELETION_FILE_PATHS;
+        if manifest.reader_feature_flags & manifest.writer_feature_flags & paths_flag == 0 {
+            return Err(Error::internal(format!(
+                "Refusing to write manifest version {}: a deletion file has a path, \
+                 but feature flag {paths_flag} is not set in both feature words",
+                manifest.version
+            )));
+        }
+    }
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
         let contract = CoveringContract::of(manifest);
@@ -524,9 +546,11 @@ mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
 
-    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS};
-    use crate::format::ClusteringDefinition;
+    use crate::feature_flags::{
+        FLAG_DELETION_FILE_PATHS, FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS,
+    };
     use crate::format::SelfDescribingFileReader;
+    use crate::format::{ClusteringDefinition, DeletionFile, DeletionFileType};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::deepsize::DeepSizeOf;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -777,6 +801,68 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_write_manifest_requires_flag_for_deletion_file_path() {
+        let mut fragment = Fragment::new(0).with_physical_rows(10);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 2,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some("_deletions/ab/file.bin".to_string()),
+            inline: None,
+        });
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let store = ObjectStore::memory();
+        let path = Path::from("/deletion_file_path");
+        let mut writer = store.create(&path).await.unwrap();
+        let err = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }), "{err:?}");
+
+        manifest.reader_feature_flags = FLAG_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags = FLAG_DELETION_FILE_PATHS;
+        let mut writer = store.create(&path).await.unwrap();
+        write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_rejects_path_and_inline() {
+        let mut fragment = Fragment::new(0).with_physical_rows(10);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 2,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some("_deletions/file.bin".to_string()),
+            inline: Some(Bytes::from_static(&[1, 2, 3])),
+        });
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let store = ObjectStore::memory();
+        let path = Path::from("/path_and_inline");
+        let mut writer = store.create(&path).await.unwrap();
+        let err = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("both path and inline"), "{err}");
+    }
+
+    #[tokio::test]
     async fn test_update_schema_metadata() {
         let store = ObjectStore::memory();
         let path = Path::from("/update_schema_metadata");
@@ -841,6 +927,7 @@ mod test {
                         file_type: DeletionFileType::Bitmap,
                         num_deleted_rows: Some(7),
                         base_id: None,
+                        path: None,
                         inline: Some(Bytes::from_static(b"deleted-rows")),
                     });
                 }

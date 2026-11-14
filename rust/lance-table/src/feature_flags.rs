@@ -136,8 +136,12 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// Reserved for local fragment aliases (`IndexMetadata.fragment_id_map`).
+const RESERVED_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
+/// Some fragment sets `DeletionFile.path` instead of deriving the path from `fragment_id`.
+pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 20;
+pub const FLAG_UNKNOWN: u64 = 1 << 22;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -158,11 +162,16 @@ const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(RESERVED_LOCAL_FRAGMENT_ALIASES < FLAG_DELETION_FILE_PATHS);
+// Released builds refuse bit 20 and above, so they cannot read this format.
+const _: () = assert!(FLAG_DELETION_FILE_PATHS >= 1 << 20);
+const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
     | FLAG_MANAGED_BLOBS
-    | FLAG_ZONE_WRITE_SEEDS;
+    | FLAG_ZONE_WRITE_SEEDS
+    | FLAG_DELETION_FILE_PATHS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
 pub(crate) const COVERING_FLAGS: u64 =
@@ -321,6 +330,15 @@ pub fn apply_feature_flags(
     if has_inline_deletions {
         manifest.reader_feature_flags |= FLAG_INLINE_DELETIONS;
         manifest.writer_feature_flags |= FLAG_INLINE_DELETIONS;
+    }
+    let has_deletion_file_paths = manifest.fragments.iter().any(|frag| {
+        frag.deletion_file
+            .as_ref()
+            .is_some_and(|deletion_file| deletion_file.path.is_some())
+    });
+    if has_deletion_file_paths {
+        manifest.reader_feature_flags |= FLAG_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags |= FLAG_DELETION_FILE_PATHS;
     }
 
     // If any fragment has row ids, they must all have row ids.
@@ -564,6 +582,7 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
+    mark_supported(&mut supported, RESERVED_LOCAL_FRAGMENT_ALIASES, false);
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
@@ -659,6 +678,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
         (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
+        (FLAG_DELETION_FILE_PATHS, "deletion file paths"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -706,7 +726,7 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::BasePath;
+    use crate::format::{BasePath, DeletionFile, DeletionFileType, Fragment};
 
     #[rstest::rstest]
     #[case::missing(None, "requires a cleanup policy")]
@@ -867,7 +887,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 20);
+        assert_eq!(FLAG_UNKNOWN, 1 << 22);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -1550,5 +1570,75 @@ mod tests {
         assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_flag() {
+        assert_eq!(RESERVED_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(RESERVED_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(RESERVED_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
+        assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
+        assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 22);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_are_sticky_and_paired() {
+        let deletion_file = |stored_path| DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: stored_path,
+            inline: None,
+        };
+        let manifest_with = |stored_path| {
+            let mut fragment = Fragment::new(1);
+            fragment.deletion_file = Some(deletion_file(stored_path));
+            let mut manifest = empty_manifest();
+            manifest.fragments = std::sync::Arc::new(vec![fragment]);
+            manifest
+        };
+
+        let mut legacy = manifest_with(None);
+        apply_feature_flags(&mut legacy, false, false).unwrap();
+        assert_eq!(legacy.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+
+        let mut explicit = manifest_with(Some("_deletions/ab/file.bin".to_string()));
+        apply_feature_flags(&mut explicit, false, false).unwrap();
+        assert_eq!(
+            explicit.reader_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        assert_eq!(
+            explicit.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut later = empty_manifest();
+        later.reader_feature_flags = FLAG_DELETION_FILE_PATHS;
+        later.writer_feature_flags = FLAG_DELETION_FILE_PATHS;
+        apply_feature_flags(&mut later, false, false).unwrap();
+        assert_eq!(
+            later.reader_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        assert_eq!(
+            later.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        for (reader, writer) in [(FLAG_DELETION_FILE_PATHS, 0), (0, FLAG_DELETION_FILE_PATHS)] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer;
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(error.to_string().contains("deletion file paths"), "{error}");
+        }
     }
 }

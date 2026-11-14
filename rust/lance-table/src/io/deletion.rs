@@ -33,8 +33,18 @@ static DELETION_ARROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-/// Get the file path for a deletion file. This is relative to the dataset root.
+/// Get the file path for a deletion file relative to `base`.
 pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &DeletionFile) -> Path {
+    if let Some(stored) = &deletion_file.path {
+        return match Path::parse(stored) {
+            Ok(parsed) => {
+                let mut path = base.clone();
+                path.extend(parsed.parts());
+                path
+            }
+            Err(_) => base.clone().join(stored.as_str()),
+        };
+    }
     let DeletionFile {
         read_version,
         id,
@@ -47,7 +57,11 @@ pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &Deletio
         .join(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
 }
 
+/// Get the deletion file path relative to the dataset root.
 pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFile) -> String {
+    if let Some(path) = &deletion_file.path {
+        return path.clone();
+    }
     let DeletionFile {
         read_version,
         id,
@@ -86,6 +100,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
+                path: None,
                 inline: Some(encoded.into()),
             }));
         }
@@ -100,6 +115,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
                 base_id: None,
+                path: None,
                 inline: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
@@ -138,6 +154,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
+                path: None,
                 inline: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
@@ -448,5 +465,54 @@ mod test {
             .await
             .unwrap();
         assert_eq!(read_dv, dv);
+    }
+
+    #[tokio::test]
+    async fn test_read_deletion_file_with_explicit_path() {
+        let encoded = DeletionFile {
+            read_version: 12,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(2),
+            base_id: None,
+            path: Some("_deletions/file%20name.bin".to_string()),
+            inline: None,
+        };
+        assert_eq!(
+            deletion_file_path(&Path::from("stored"), 42, &encoded),
+            Path::parse("stored/_deletions/file%20name.bin").unwrap()
+        );
+
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter([5, 9]));
+        let file = DeletionFile {
+            read_version: 12,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(2),
+            base_id: None,
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            inline: None,
+        };
+        let object_store = ObjectStore::memory();
+        let base = Path::from("/stored");
+        let stored = deletion_file_path(&base, 0, &file);
+        assert_eq!(
+            stored,
+            Path::from("/stored/_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
+        );
+        let mut bytes = Vec::new();
+        RoaringBitmap::from_iter([5u32, 9])
+            .serialize_into(&mut bytes)
+            .unwrap();
+        object_store.put(&stored, &bytes).await.unwrap();
+        for fragment_id in [0, 42, 43] {
+            assert_eq!(deletion_file_path(&base, fragment_id, &file), stored);
+            assert_eq!(
+                read_deletion_file(fragment_id, &file, &base, &object_store)
+                    .await
+                    .unwrap(),
+                dv
+            );
+        }
     }
 }

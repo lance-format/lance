@@ -350,7 +350,8 @@ impl ::prost::Name for FieldCoverage {
 }
 /// Deletion File
 ///
-/// The path of the deletion file is constructed as:
+/// The path of the deletion file is `{root}/{path}` when `path` is set, where
+/// `path` is a normalized relative path under `_deletions/`, or constructed as:
 ///    {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
 /// where {extension} depends on DeletionFileType.
 ///
@@ -371,6 +372,12 @@ pub struct DeletionFile {
     /// The number of rows that are marked as deleted.
     #[prost(uint64, tag = "4")]
     pub num_deleted_rows: u64,
+    /// Normalized relative path under `_deletions/` from the dataset root selected
+    /// by `base_id`, ending in `.arrow` or `.bin` to match `file_type`. Cannot be
+    /// set together with `inline`. Requires `FLAG_DELETION_FILE_PATHS` (1 << 21)
+    /// in both reader and writer feature flags.
+    #[prost(string, optional, tag = "5")]
+    pub path: ::core::option::Option<::prost::alloc::string::String>,
     /// The deletion vector itself, stored in the manifest instead of in a file.
     /// Always the BITMAP encoding (a serialized Roaring bitmap of deleted row
     /// offsets), whatever `file_type` says. A reader that reads one request per

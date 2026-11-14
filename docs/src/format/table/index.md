@@ -208,7 +208,25 @@ and read any metadata the footer references outside the hinted range.
 ## Deletion Files
 
 Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.
-Each fragment can have at most one deletion file per version.
+Each fragment can have at most one deletion file per version. Files live under the dataset
+root selected by `base_id` (or the current dataset root when `base_id` is unset).
+
+A deletion vector can be stored in three ways, and `path` and `inline` cannot both be set.
+
+When `path` and `inline` are unset, the file path is derived from the fragment metadata as
+`{root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}` (requires `FLAG_DELETION_FILES`).
+Because `fragment_id` is part of the filename, a fragment with a derived deletion file cannot be
+assigned a different `fragment_id` at commit time.
+
+When `DeletionFile.path` is set, the file is at `{root}/{path}`. The path must be a normalized relative
+object path under `_deletions/` (no leading or trailing `/`, and no empty, `.`, or `..` segments) and includes the file extension
+while `file_type` selects the decoder. Because the path does not depend on `fragment_id`, it stays valid if
+the fragment is renumbered. Writers must not overwrite an existing deletion file path while any manifest
+version references it. Setting `path` requires `FLAG_DELETION_FILE_PATHS` (`2^21`) in both reader and
+writer feature flags, which remain set on subsequent versions.
+
+When `DeletionFile.inline` is set, the deletion vector is stored directly in the manifest as a
+Roaring bitmap with no external file (requires `FLAG_INLINE_DELETIONS`).
 
 Deletion files support two storage formats.
 The Arrow IPC format (`.arrow` extension) stores a flat Int32Array of deleted row offsets and is efficient for sparse deletions.
