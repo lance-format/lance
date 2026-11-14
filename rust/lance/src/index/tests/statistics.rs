@@ -468,6 +468,14 @@ async fn test_describe_indices_derives_type_from_url_without_plugin() {
         .unwrap();
     assert_eq!(desc.index_type(), "Mystery");
     assert_eq!(desc.type_url(), "/lance.index.pb.MysteryIndexDetails");
+    let error = desc.details().unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("No scalar index plugin found for name 'mystery'"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
