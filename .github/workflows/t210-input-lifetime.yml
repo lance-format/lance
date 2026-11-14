@@ -21,10 +21,16 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Default-feature behavior and the layout example passed at 2f75abfb1.
-      # This repair only aligns test imports/modules with their codec features.
-      - name: Validate multiple instruction admission without optional codecs
-        run: cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::multiple -- --nocapture
+      # Existing MiniBlock composition passed at 2f75abfb1 and 58928688e.
+      # Validate the newly admitted RLE value codec and its task composition.
+      - name: Validate admitted RLE value ranges
+        run: cargo test --profile ci --locked -p lance-encoding --lib physical::rle::admitted::tests -- --nocapture
+      - name: Validate RLE values in single and multiple instructions
+        run: cargo test --profile ci --locked -p lance-encoding --lib rle_values_compose_with_task_admission -- --nocapture
+      - name: Validate RLE admission without optional codecs
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::rle::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib rle_values_compose_with_task_admission -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

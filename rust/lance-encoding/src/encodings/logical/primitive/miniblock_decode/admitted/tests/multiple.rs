@@ -368,3 +368,62 @@ fn multiple_nested_vectors_include_child_bitmap_output(#[values(false, true)] la
     drop(task);
     assert_eq!(budget.reserved(), 0);
 }
+
+#[rstest]
+fn rle_values_compose_with_task_admission(
+    #[values(false, true)] large: bool,
+    #[values(false, true)] multiple: bool,
+) {
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        ..
+    } = fixture(None, None, Codec::Flat, large, 1024);
+    let values = [10_u32, 20, 30];
+    let buffers: [&[u8]; 2] = [bytemuck::cast_slice(&values), &[2, 1, 1]];
+    let mut frame = 4_u16.to_le_bytes().to_vec();
+    for buffer in buffers {
+        if large {
+            frame.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+        } else {
+            frame.extend_from_slice(&(buffer.len() as u16).to_le_bytes());
+        }
+    }
+    frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    for buffer in buffers {
+        frame.extend_from_slice(buffer);
+        frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    }
+    let physical = frame.len() + 17;
+    let mut input = work.try_allocate(physical).unwrap().unwrap();
+    input.as_mut()[1..1 + frame.len()].copy_from_slice(&frame);
+    task.instructions[0].1.data =
+        LanceBuffer::from(Buffer::from(input.freeze()).slice_with_length(1, frame.len()));
+    task.instructions[0].1.byte_range = 0..frame.len() as u64;
+    task.num_buffers = 2;
+    task.value_decompressor = Arc::new(RleDecompressor::new(32));
+    let selections: &[(u64, u64)] = if multiple {
+        &[(1, 2), (3, 1)]
+    } else {
+        &[(1, 2)]
+    };
+    select(&mut task, selections);
+    let expected: &[u32] = if multiple { &[10, 20, 30] } else { &[10, 20] };
+    let required = expected.len() * 4 * if multiple { 2 } else { 1 };
+    let mut short = work.try_split(required - 1).unwrap();
+    assert!(task.try_decode_in(&mut short).unwrap().is_none());
+    assert_eq!(short.len(), required - 1);
+    drop(short);
+    drop(work);
+    let mut work = budget.try_reserve(required).unwrap();
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_values(&page, expected);
+    assert!(work.is_empty());
+    assert_eq!(budget.reserved(), physical + expected.len() * 4);
+    drop(task);
+    assert_eq!(budget.reserved(), expected.len() * 4);
+    drop(page);
+    drop(work);
+    assert_eq!(budget.reserved(), 0);
+}

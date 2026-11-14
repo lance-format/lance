@@ -76,6 +76,8 @@ use crate::statistics::Stat;
 
 use lance_core::{Error, Result};
 
+mod admitted;
+
 /// Width used to encode RLE run lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunLengthWidth {
@@ -1448,6 +1450,11 @@ impl BlockCompressor for RleEncoder {
 }
 
 /// RLE decompressor for miniblock format
+///
+/// Flat value and run-length children support [`MiniBlockDecompressor::plan_range`]
+/// and admitted range decoding. Only selected output is allocated; encoded input
+/// owners must be charged separately. Compressed children require their own
+/// admission plan and return `NotSupported` from these opt-in methods.
 #[derive(Debug)]
 pub struct RleDecompressor {
     bits_per_value: u64,
@@ -2115,6 +2122,29 @@ impl RleDecompressor {
 }
 
 impl MiniBlockDecompressor for RleDecompressor {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        admitted::layout(self)
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self, data, num_values, range)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         2
     }
