@@ -509,16 +509,17 @@ async fn overlay_rescan(
 /// physical address rather than by stable row id (see [`build_old_data_filter`] and
 /// [`overlay_rescan`]). This is the domain the merged index stores, not whether its type
 /// migrated from row ids: BTree, Bitmap, NGram, RTree and MinHash LSH merge as address-domain
-/// segments (a row-id-domain one under stable row ids is rebuilt instead), a LabelList segment
-/// reports its own domain, and of the other types a JSON index over an address-domain target
-/// and a list-element index store addresses.
+/// segments (a row-id-domain one under stable row ids is rebuilt instead), BloomFilter always
+/// stored addresses, a LabelList segment reports its own domain, and of the other types a JSON
+/// index over an address-domain target and a list-element index store addresses.
 fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIndex) -> bool {
     match index_type {
         IndexType::BTree
         | IndexType::Bitmap
         | IndexType::NGram
         | IndexType::RTree
-        | IndexType::MinHashLsh => true,
+        | IndexType::MinHashLsh
+        | IndexType::BloomFilter => true,
         IndexType::LabelList => reference_index.results_are_row_addresses(),
         _ => {
             let index = reference_index.as_any();
@@ -1306,7 +1307,7 @@ async fn merge_scalar_indices<'a>(
                     // above), `can_merge_segments` only allows this arm with
                     // exactly one selected segment, which `update` updates in
                     // place. Its domain can be either: a LabelList segment
-                    // reports its own, while a JSON index over an
+                    // reports its own, while a BloomFilter, a JSON index over an
                     // address-domain target and a list-element index store row
                     // addresses, which a row-id filter would wrongly prune.
                     // That is harmless without stable row ids (the two domains
@@ -6798,6 +6799,192 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(rows, 1, "id = 1 must return exactly one row after merge");
+    }
+
+    async fn sorted_ids(dataset: &Dataset, filter: &str, use_index: bool) -> Vec<i32> {
+        let mut scan = dataset.scan();
+        scan.use_scalar_index(use_index)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["id"]
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// An in-place column rewrite takes fragment 1 out of the bloom filter
+    /// segment, whose file keeps the fragment's zones and null rows; the
+    /// default optimize indexes the fragment into the same segment again,
+    /// and `IS NULL`, which the index answers exactly, must not return the
+    /// rewritten row. With stable row ids the old data is still filtered by
+    /// address, and after a deferred compaction it is judged at the addresses
+    /// the compaction moved it to.
+    #[rstest]
+    #[case::address_row_ids(false, false)]
+    #[case::stable_row_ids(true, false)]
+    #[case::deferred_compaction(false, true)]
+    #[case::stable_row_ids_deferred_compaction(true, true)]
+    #[tokio::test]
+    async fn test_optimize_bloomfilter_drops_null_rows_of_a_rewritten_fragment(
+        #[case] enable_stable_row_ids: bool,
+        #[case] compact_after_rewrite: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // Four fragments of 50 rows; `value` is null where `id % 7 == 3`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new("tag", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter(
+                    (0..200).map(|id| (id % 7 != 3).then_some(id)),
+                )),
+                Arc::new(Int32Array::from_iter_values(0..200)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BloomFilter,
+                Some("value_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Row 52, a null in fragment 1, gets a value in place: the source
+        // omits `tag`, so the merge patches the column.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let source = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![52])),
+                Arc::new(Int32Array::from(vec![5200])),
+            ],
+        )
+        .unwrap();
+        let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(crate::dataset::MergeInsertWriteMode::RewriteColumns)
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new(vec![Ok(source)], source_schema))
+            .await
+            .unwrap();
+        let mut dataset = dataset.as_ref().clone();
+        assert_eq!(dataset.get_fragments().len(), 4, "the rewrite is in place");
+        let segment = &dataset.load_indices_by_name("value_idx").await.unwrap()[0];
+        assert_eq!(
+            segment.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0, 2, 3])
+        );
+
+        let deleted = |id: &i32| compact_after_rewrite && ((90..100).contains(id) || *id >= 190);
+        if compact_after_rewrite {
+            // Deleting a fifth of fragments 1 and 3 makes them the compaction
+            // candidates, in two groups since fragment 2 lies between them.
+            // The deferred remap moves fragment 1's rows, row 52 among them,
+            // to a fragment the segment does not cover, and fragment 3's to
+            // one it does, which its file still addresses as fragment 3.
+            dataset
+                .delete("(id >= 90 AND id < 100) OR id >= 190")
+                .await
+                .unwrap();
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 50,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(dataset.get_fragment(1).is_none());
+            assert!(dataset.get_fragment(3).is_none());
+            let mut scan = dataset.scan();
+            scan.with_row_address().filter("id = 180").unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let fragment_3_moved_to = (batch[lance_core::ROW_ADDR]
+                .as_primitive::<arrow::datatypes::UInt64Type>()
+                .value(0)
+                >> 32) as u32;
+            let segment = &dataset.load_indices_by_name("value_idx").await.unwrap()[0];
+            assert_eq!(
+                segment.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0, 2, fragment_3_moved_to])
+            );
+        }
+
+        let nulls: Vec<i32> = (0..200)
+            .filter(|id| id % 7 == 3 && *id != 52 && !deleted(id))
+            .collect();
+        assert_eq!(sorted_ids(&dataset, "value IS NULL", true).await, nulls);
+
+        let indexed_files = indexed_data_files(&dataset, "value_idx").await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_merged_not_rebuilt(&dataset, "value_idx", &indexed_files).await;
+        let plan = dataset
+            .scan()
+            .filter("value IS NULL")
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(plan.contains("@value_idx(BloomFilter)"), "{plan}");
+
+        assert_eq!(sorted_ids(&dataset, "value IS NULL", false).await, nulls);
+        assert_eq!(sorted_ids(&dataset, "value IS NULL", true).await, nulls);
+        assert_eq!(sorted_ids(&dataset, "value = 5200", true).await, vec![52]);
+        // A value from every fragment: a filter keyed by the wrong domain, or
+        // applied to the stored addresses of moved rows, drops live zones, and
+        // the index then rules their rows out.
+        for id in [0, 60, 120, 180] {
+            assert_eq!(
+                sorted_ids(&dataset, &format!("value = {id}"), true).await,
+                vec![id]
+            );
+        }
     }
 
     #[tokio::test]

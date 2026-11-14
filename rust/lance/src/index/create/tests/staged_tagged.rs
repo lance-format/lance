@@ -2128,6 +2128,120 @@ async fn v0_deferred_vector_segment_merge_keeps_the_legacy_version_pinned() {
     assert_eq!(indexed, flat, "every row is reachable through the index");
 }
 
+/// A committed bloom filter segment over a source a stable partition retired,
+/// which the reader translates, and over a live fragment rewritten in place:
+/// the default optimize indexes that fragment into the segment again. The
+/// rewritten fragment's old null rows go, and the retired source's zones and
+/// null rows are translated rather than dropped.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn bloom_filter_optimize_drops_rewritten_null_rows_on_a_tagged_history() {
+    let dir = TempStrDir::default();
+    // Three fragments of four rows; `value` is null where `i % 4 == 1`.
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
+        arrow_schema::Field::new("w", arrow_schema::DataType::Int32, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..12)),
+            Arc::new(arrow_array::Int32Array::from_iter(
+                (0..12).map(|i| (i % 4 != 1).then_some(i)),
+            )),
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..12)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BloomFilter,
+            Some("value_idx".into()),
+            &ScalarIndexParams::for_builtin(IndexType::BloomFilter.try_into().unwrap()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0], 10).await;
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    assert_eq!(fragments, vec![1, 2, 10, 11]);
+    let stored = stored_segment(&dataset, "value_idx").await;
+    assert_eq!(
+        stored.fragment_bitmap.unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
+
+    // `w = 5` is the null of fragment 1.
+    rewrite_in_place(
+        dir.as_str(),
+        "value",
+        5,
+        Arc::new(arrow_array::Int32Array::from(vec![500])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        derived_coverage(&dataset, "value_idx").await,
+        Some(RoaringBitmap::from_iter([2u32, 10, 11]))
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(stored_segments(&dataset, "value_idx").await.len(), 1);
+    // Merged rather than rebuilt: the segment keeps the provenance it was
+    // stored with, where a rebuild would claim the live fragments.
+    assert_eq!(
+        stored_segment(&dataset, "value_idx")
+            .await
+            .fragment_bitmap
+            .unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
+    let plan = dataset
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("@value_idx(BloomFilter)"), "{plan}");
+    assert_eq!(
+        values(&dataset, Some("value IS NULL"), false).await,
+        vec![1, 9]
+    );
+    assert_eq!(
+        values(&dataset, Some("value IS NULL"), true).await,
+        vec![1, 9]
+    );
+    for value in [0, 2, 3, 4, 6, 7, 8, 10, 11, 500] {
+        let predicate = format!("value = {value}");
+        assert_eq!(
+            values(&dataset, Some(&predicate), true).await,
+            values(&dataset, Some(&predicate), false).await,
+            "{predicate}"
+        );
+    }
+}
+
 /// RTree on a tagged history: segments covering a stable partition's sources
 /// claim its destinations and hold every row of them.
 #[cfg(feature = "geo")]
