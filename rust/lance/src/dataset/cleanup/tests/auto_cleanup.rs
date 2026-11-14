@@ -12,61 +12,116 @@ async fn check_num_files(fixture: &MockDatasetFixture, num_expected_files: usize
     assert_eq!(file_count.num_tx_files, num_expected_files);
 }
 
+/// Writes a data, a transaction and a deletion file that no manifest references.
+async fn write_orphans(dataset: &Dataset, read_version: u64) -> Vec<Path> {
+    let orphans = vec![
+        dataset.data_dir().join(format!("{}.lance", Uuid::new_v4())),
+        dataset
+            .transactions_dir()
+            .join(format!("{read_version}-{}.txn", Uuid::new_v4())),
+        dataset
+            .deletions_dir()
+            .join(format!("0-{read_version}-99.arrow")),
+    ];
+    for orphan in &orphans {
+        dataset
+            .object_store
+            .put(orphan, &[0u8; 1024])
+            .await
+            .unwrap();
+    }
+    orphans
+}
+
 #[rstest]
 // Aged past the unverified threshold, collected by the default policy.
-#[case::aged(false, 20)]
+#[case::aged(false, 20, true)]
 // Fresh, but `delete_unverified` waives the age protection entirely.
-#[case::delete_unverified(true, 4)]
+#[case::delete_unverified(true, 4, true)]
+// Fresh, so the default policy keeps them, even the ones older than the
+// retained floor that it lists.
+#[case::fresh(false, 4, false)]
 #[tokio::test]
 async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     #[case] delete_unverified: bool,
     #[case] cleanup_day: i64,
+    #[case] removes_orphans: bool,
 ) {
-    // A data file referenced by no manifest (e.g. abandoned
-    // `write_fragments` output) is deleted based on its age, and its mtime
-    // is unrelated to the retained floor.
+    // A file referenced by no manifest (e.g. abandoned `write_fragments`
+    // output, or the transaction and deletion files of a commit that never
+    // landed) is deleted once it ages past the unverified threshold, or at once
+    // under `delete_unverified`, and its mtime is unrelated to the retained
+    // floor. Younger ones stay unless `delete_unverified` is set. Files a
+    // retained version references stay, even when they are newer than that
+    // floor.
     MockClock::set_system_time(std::time::Duration::from_secs(0));
     let fixture = MockDatasetFixture::try_new().unwrap();
     fixture.create_some_data().await.unwrap();
     MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
     fixture.append_some_data().await.unwrap();
+    // Older than the retained floor, so every case lists them.
+    MockClock::set_system_time(TimeDelta::try_hours(42).unwrap().to_std().unwrap());
+    let dataset = fixture.open().await.unwrap();
+    let mut orphans = write_orphans(&dataset, 2).await;
     MockClock::set_system_time(TimeDelta::try_days(2).unwrap().to_std().unwrap());
     fixture.append_some_data().await.unwrap();
+    MockClock::set_system_time(TimeDelta::try_hours(60).unwrap().to_std().unwrap());
+    fixture.delete_data("_rowid < 20").await.unwrap();
+    // Every deletion file but the orphan written above.
+    let retained_deletions = fixture.count_files().await.unwrap().num_delete_files - 1;
+    assert!(
+        retained_deletions > 0,
+        "the delete must write a deletion file"
+    );
+    let num_rows = fixture.count_rows().await.unwrap();
 
-    // Newer than every manifest, and old enough to be aged out below.
+    // Newer than every manifest.
     MockClock::set_system_time(TimeDelta::try_days(3).unwrap().to_std().unwrap());
-    let dataset = fixture.open().await.unwrap();
-    let orphan = dataset.data_dir().join(format!("{}.lance", Uuid::new_v4()));
-    dataset
-        .object_store
-        .put(&orphan, &[0u8; 1024])
-        .await
-        .unwrap();
-    drop(dataset);
+    orphans.extend(write_orphans(&dataset, 4).await);
 
     MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
 
     let before_count = fixture.count_files().await.unwrap();
-    assert_eq!(before_count.num_data_files, 4);
-    assert_eq!(before_count.num_manifest_files, 3);
+    assert_eq!(before_count.num_data_files, 5);
+    assert_eq!(before_count.num_manifest_files, 4);
+    assert_eq!(before_count.num_tx_files, 6);
+    assert_eq!(before_count.num_delete_files, retained_deletions + 2);
 
-    // Suffix-only retention: the two oldest versions go, the latest stays.
+    // The two oldest versions go. The append at day 2 and the delete after it
+    // stay, so the delete's deletion files are newer than the retained floor.
     let removed = fixture
         .run_cleanup_with_override(
-            utc_now() - TimeDelta::try_days(2).unwrap(),
+            DateTime::UNIX_EPOCH + TimeDelta::try_hours(36).unwrap(),
             Some(delete_unverified),
             None,
         )
         .await
         .unwrap();
 
+    let (orphans_removed, orphans_kept) = if removes_orphans { (2, 0) } else { (0, 2) };
     assert_eq!(removed.old_versions, 2);
-    assert_eq!(removed.data_files_removed, 1);
+    assert_eq!(removed.data_files_removed, orphans_removed);
+    // The two expired versions' transaction files, and the orphans if they go.
+    assert_eq!(removed.transaction_files_removed, 2 + orphans_removed);
+    assert_eq!(removed.deletion_files_removed, orphans_removed);
+    for orphan in &orphans {
+        assert_eq!(
+            dataset.object_store.exists(orphan).await.unwrap(),
+            !removes_orphans,
+            "{orphan}"
+        );
+    }
 
     let after_count = fixture.count_files().await.unwrap();
-    assert_eq!(after_count.num_manifest_files, 1);
-    // Appends leave every fragment referenced by the latest version.
-    assert_eq!(after_count.num_data_files, 3);
+    assert_eq!(after_count.num_manifest_files, 2);
+    // The delete is partial, so the retained versions still reference every fragment.
+    assert_eq!(after_count.num_data_files, 3 + orphans_kept);
+    assert_eq!(after_count.num_tx_files, 2 + orphans_kept);
+    assert_eq!(
+        after_count.num_delete_files,
+        retained_deletions + orphans_kept
+    );
+    assert_eq!(fixture.count_rows().await.unwrap(), num_rows);
 }
 #[tokio::test]
 async fn auto_cleanup_old_versions() {
