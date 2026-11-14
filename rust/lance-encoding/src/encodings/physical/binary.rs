@@ -625,6 +625,12 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     }
 }
 
+mod admitted;
+
+/// Binary MiniBlock decoder. Flat offsets, still emitted by the current writer,
+/// support admitted range decoding with copied values and normalized offsets.
+/// Input ownership is charged separately; compressed offset codecs are unsupported
+/// by the opt-in admission API. Ordinary decoding is unchanged.
 #[derive(Debug)]
 pub struct BinaryMiniBlockDecompressor {
     layout: BinaryMiniBlockLayout,
@@ -868,6 +874,29 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        admitted::layout(self)
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        Ok(admitted::plan(self, data, num_values, range)?.budget)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         match self.layout {
             BinaryMiniBlockLayout::Legacy { .. } => 1,

@@ -561,4 +561,5 @@ fn inline_values_preserve_range_decode_and_complete_scratch(
     assert_eq!(budget.reserved(), 0);
 }
 
+mod binary;
 mod multiple;

@@ -117,9 +117,8 @@ fn prepare(
             chunk.items_in_chunk,
             range.clone(),
         )?;
-        if budget.output_bytes != layout.payload_bytes(range.end - range.start)?
-            || budget.workspace_bytes < budget.output_bytes
-        {
+        layout.validate_range_bytes(range.end - range.start, budget.output_bytes)?;
+        if budget.workspace_bytes < budget.output_bytes {
             return Err(Error::invalid_input(
                 "MiniBlock value plan disagrees with concat layout",
             ));
@@ -185,6 +184,12 @@ pub(super) fn decode(
         ));
     }
     let layout = task.value_decompressor.admitted_output_layout()?;
+    if task.instructions.is_empty() && matches!(layout, MiniBlockOutputLayout::VariableWidth { .. })
+    {
+        return Err(Error::not_supported(
+            "empty variable-width tasks need an explicit empty range for typed output",
+        ));
+    }
     let mut plans = Vec::with_capacity(task.instructions.len());
     let mut rep = None;
     let mut def = None;
@@ -212,7 +217,11 @@ pub(super) fn decode(
             rep_bytes = add(rep_bytes, plan.rep.as_ref().map_or(0, |b| b.as_ref().len()))?;
             def_bytes = add(def_bytes, plan.def.as_ref().map_or(0, |b| b.as_ref().len()))?;
         }
-        let concat_bytes = layout.payload_bytes(values)?;
+        let concat_bytes = layout.concat_payload_bytes(
+            plans
+                .iter()
+                .map(|plan| (plan.range.end - plan.range.start, plan.budget.output_bytes)),
+        )?;
         let level_bytes = add(rep_bytes, def_bytes)?;
         let required = value_peak
             .max(add(retained, concat_bytes)?)

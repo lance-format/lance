@@ -7,7 +7,7 @@ use arrow_schema::Field;
 
 use super::*;
 
-fn select(task: &mut DecodeMiniBlockTask, selections: &[(u64, u64)]) {
+pub(super) fn select(task: &mut DecodeMiniBlockTask, selections: &[(u64, u64)]) {
     let (template, chunk) = task.instructions.remove(0);
     task.instructions = selections
         .iter()
