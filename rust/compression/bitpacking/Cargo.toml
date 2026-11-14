@@ -19,6 +19,7 @@ seq-macro = "0.3"
 
 [dev-dependencies]
 bitpacking = { workspace = true, features = ["bitpacker4x"] }
+rstest.workspace = true
 
 [lints]
 workspace = true

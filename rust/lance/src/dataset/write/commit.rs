@@ -472,6 +472,12 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
+        // A clone creates a new dataset. The destination may have appeared
+        // after the caller's preflight; never rebase a clone onto its winner.
+        if dest.dataset().is_some() && matches!(transaction.operation, Operation::Clone { .. }) {
+            return Err(Error::dataset_already_exists(dest.uri()));
+        }
+
         if dest.dataset().is_none()
             && !matches!(
                 transaction.operation,

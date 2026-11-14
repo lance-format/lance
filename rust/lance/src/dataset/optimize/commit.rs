@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::execution::{CompactionMetrics, RewriteResult};
 use super::planning::{
-    CompactionOptions, IndexRemapMode, has_eager_remappable_index, load_index_fragmaps,
+    CompactionOptions, IndexRemapMode, has_eager_remappable_index,
     reject_eager_remap_over_undrained_fri, reject_unremappable_rewrite,
     validate_fragment_groups_preserve_index_boundaries,
 };
@@ -256,41 +256,12 @@ pub async fn commit_compaction(
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
-    // Write an FRI only when the compaction touches data an index must later
-    // remap: a rewrite group covered by a data index, or by the existing FRI's new
-    // fragments (the composed remap chain). Compacting only not-yet-indexed data
-    // needs no FRI (one written for it is un-drainable). Decide all-or-nothing per
-    // compaction, never per group -- a partial FRI is unsound: a concurrent reindex
-    // can make a skipped fragment indexed and the conflict resolver's FRI-present
-    // path won't re-check it.
-    //
-    // The same rule applies on tagged tables: a transition for fragments no
-    // index covers and no lineage reaches would grow the history for rows no
-    // reader ever has to translate, with no trim to reclaim it; when nothing
-    // is covered the commit is a plain rewrite, which the tagged-table gate
-    // admits exactly for this uncovered shape.
-    //
-    // Stable row ids record every group: the moves also serve address translation.
-    let indexed_frags: RoaringBitmap = if options.defer_index_remap && !uses_stable_row_ids {
-        let mut covered = RoaringBitmap::new();
-        for bm in load_index_fragmaps(dataset, false, &[]).await? {
-            covered |= bm;
-        }
-        // The stored listing works for v0 and tagged entries alike (the
-        // filtered listing post-processes coverage on tagged tables).
-        if let Some(bm) = load_all_indices(dataset)
-            .await?
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .and_then(|fri| fri.fragment_bitmap.clone())
-        {
-            covered |= bm;
-        }
-        covered
-    } else {
-        RoaringBitmap::new()
-    };
-    let mut any_group_indexed = false;
+    // A deferred compaction records every group, including groups no committed
+    // index covers: an index build in flight may have staged a segment over
+    // those fragments, and only a recorded group lets that segment commit
+    // past this rewrite (a bare rewrite of a covered fragment preempts it).
+    // Trim reclaims such records once every index is disjoint from the chain
+    // or postdates the rewrite.
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -368,15 +339,6 @@ pub async fn commit_compaction(
                 }
             }
         } else if records_row_addrs {
-            // Record every group; track whether any touches indexed/chain
-            // data. Ids beyond the row-address range cannot appear in any
-            // index bitmap, so they are uncovered by definition.
-            if old_fragments
-                .iter()
-                .any(|f| u32::try_from(f.id).is_ok_and(|id| indexed_frags.contains(id)))
-            {
-                any_group_indexed = true;
-            }
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -473,9 +435,7 @@ pub async fn commit_compaction(
     // A stable-row-id table always keeps a v0 record: recording is refused
     // before any rewrite where the table requires a tagged history.
     //
-    // No indexed/chain data touched -> no record at all (all-or-nothing, see
-    // above); the commit is a plain rewrite the tagged gate admits for this
-    // uncovered shape. Otherwise the record's FORM -- a v0 entry, or tagged
+    // The record's FORM -- a v0 entry, or tagged
     // transitions riding the in-memory rewrite intent that
     // `build_frag_reuse_rewrite_entry` assembles onto the entry at every
     // commit attempt -- is decided HERE, at commit time, from the freshest
@@ -495,7 +455,7 @@ pub async fn commit_compaction(
     // the current entry turns out tagged (see `finish_rewrite`); the commit
     // gate still rejects a v0 entry spliced by a writer without that
     // conversion.
-    let frag_reuse_index = if records_row_addrs && (uses_stable_row_ids || any_group_indexed) {
+    let frag_reuse_index = if records_row_addrs {
         // Once a table is v1, it stays v1: the sticky
         // FLAG_FRAGMENT_REUSE_INDEX is the final authority
         // (`uses_tagged_fri`), never the entry's own index_version. With NO

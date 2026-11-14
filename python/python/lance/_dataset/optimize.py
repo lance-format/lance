@@ -41,6 +41,7 @@ class DatasetOptimizer:
         max_source_fragments: Optional[int] = None,
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
+        source_budget_mode: Optional[Literal["hard", "soft"]] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
     ) -> CompactionMetrics:
@@ -78,6 +79,7 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.source_budget_mode``,
         ``lance.compaction.data_storage_version``.
 
         Parameters
@@ -153,6 +155,16 @@ class DatasetOptimizer:
             would exceed this limit. Blob v2 payloads live in separate
             blob files and are not counted, so this is not a cap on total
             compaction I/O for datasets with blob columns.
+        source_budget_mode: {"hard", "soft"}, optional
+            Controls how all configured ``max_source_*`` budgets are applied
+            to cumulative totals across the tasks selected for one plan.
+            ``"hard"`` rejects a task when adding it would exceed any
+            cumulative budget and is the default. ``"soft"`` always admits
+            the first indivisible task. If that task exceeds a budget, the
+            plan stops there; otherwise later tasks use the same cumulative
+            checks as ``"hard"``. If a byte budget is set but the first task
+            has a source file without a recorded size, ``"soft"`` admits that
+            task and stops; ``"hard"`` reports an error.
         excluded_fragment_ids: list[int], optional
             Fragment IDs to exclude from compaction planning. Excluded
             fragments remain unchanged and act as boundaries, so fragments
@@ -190,6 +202,7 @@ class DatasetOptimizer:
                 max_source_fragments=max_source_fragments,
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
+                source_budget_mode=source_budget_mode,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
             ).items()
@@ -277,9 +290,22 @@ class DatasetOptimizer:
 
             The limits are packing targets: an indivisible fragment or segment
             larger than a target is processed on its own.
+        max_rows_to_consolidate: optional, int, default None
+            Consolidate the newest segments of each vector index within this
+            budget of physical rows, reusing the newest selected segment's
+            model instead of training. At least two whole segments must fit;
+            older segments and unindexed fragments are left untouched. A
+            segment counts the greater of its physical index entries and the
+            physical rows of the fragments it covers, deleted rows included.
+            Cannot be combined with `retrain`, `num_indices_to_merge` or
+            `max_rows_per_segment`; `max_rows_per_task` may bound the
+            re-encoding tasks, each of which must fit its fragments.
 
         See :py:class:`lance.optimize.OptimizeIndices` to run the same
-        optimization as a plan whose tasks execute on several workers.
+        optimization as a plan whose tasks execute on several workers. Options
+        that decide commit-time checks, such as `max_rows_to_consolidate`, also
+        belong to :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses
+        the defaults when they are omitted.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

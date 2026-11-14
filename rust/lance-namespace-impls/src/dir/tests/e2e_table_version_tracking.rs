@@ -3,7 +3,7 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Tracking wrapper around a namespace that counts method invocations.
 struct TrackingNamespace {
@@ -11,6 +11,8 @@ struct TrackingNamespace {
     create_table_version_count: AtomicUsize,
     describe_table_version_count: AtomicUsize,
     list_table_versions_count: AtomicUsize,
+    /// While set, `create_table_version` fails without reaching `inner`.
+    fail_create_table_version: AtomicBool,
 }
 
 impl TrackingNamespace {
@@ -20,6 +22,7 @@ impl TrackingNamespace {
             create_table_version_count: AtomicUsize::new(0),
             describe_table_version_count: AtomicUsize::new(0),
             list_table_versions_count: AtomicUsize::new(0),
+            fail_create_table_version: AtomicBool::new(false),
         }
     }
 
@@ -121,6 +124,12 @@ impl LanceNamespace for TrackingNamespace {
     ) -> Result<CreateTableVersionResponse> {
         self.create_table_version_count
             .fetch_add(1, Ordering::SeqCst);
+        if self.fail_create_table_version.load(Ordering::SeqCst) {
+            return Err(NamespaceError::Internal {
+                message: "injected create_table_version failure".to_string(),
+            }
+            .into());
+        }
         self.inner.create_table_version(request).await
     }
 
@@ -405,6 +414,118 @@ async fn test_dataset_commit_with_external_manifest_store() {
         version_2_found,
         "Version 2 manifest should exist in versions directory"
     );
+}
+
+/// A failed `create_table_version` leaves the commit's staging manifest behind
+/// with no namespace record for its version. Cleanup asks the namespace whether
+/// that staging file is the version's manifest, and must treat the missing
+/// record as "no" and delete the file instead of failing.
+#[tokio::test]
+async fn test_cleanup_removes_staging_manifest_without_version_record() {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+    use futures::TryStreamExt;
+    use lance::dataset::builder::DatasetBuilder;
+    use lance::dataset::cleanup::CleanupPolicyBuilder;
+
+    let temp_dir = TempStdDir::default();
+    let inner_ns = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+        .table_version_tracking_enabled(true)
+        .manifest_enabled(true)
+        .build()
+        .await
+        .unwrap();
+    let tracking_ns = Arc::new(TrackingNamespace::new(inner_ns));
+    let ns: Arc<dyn LanceNamespace> = tracking_ns.clone();
+
+    let mut create_ns_req = CreateNamespaceRequest::new();
+    create_ns_req.id = Some(vec!["workspace".to_string()]);
+    ns.create_namespace(create_ns_req).await.unwrap();
+
+    let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = |values: Vec<i32>| {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+    };
+    Dataset::write_into_namespace(
+        RecordBatchIterator::new(vec![Ok(batch(vec![1, 2, 3]))], schema.clone()),
+        ns.clone(),
+        table_id.clone(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut dataset = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+        .await
+        .unwrap()
+        .load()
+        .await
+        .unwrap();
+    let staging_manifests = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .object_store(None)
+                .await
+                .unwrap()
+                .inner
+                .list(Some(&dataset.versions_dir()))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|meta| {
+                    meta.location
+                        .filename()
+                        .is_some_and(|name| name.contains(".manifest-"))
+                })
+                .count()
+        }
+    };
+
+    tracking_ns
+        .fail_create_table_version
+        .store(true, Ordering::SeqCst);
+    let error = dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch(vec![4]))], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap_err();
+    tracking_ns
+        .fail_create_table_version
+        .store(false, Ordering::SeqCst);
+    assert!(error.is_commit_status_unknown(), "{error:?}");
+    assert_eq!(dataset.version().version, 1);
+    assert_eq!(
+        staging_manifests(&dataset).await,
+        1,
+        "the failed commit must leave its staging manifest behind"
+    );
+    assert!(!dataset.has_successor_version().await.unwrap());
+
+    // `delete_unverified` so the fresh staging file is not skipped as a
+    // possibly in-progress commit.
+    dataset
+        .cleanup_with_policy(
+            CleanupPolicyBuilder::default()
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(staging_manifests(&dataset).await, 0);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
 }
 
 /// Helper: create a namespace and a table with some rows, returning (namespace, table_id)

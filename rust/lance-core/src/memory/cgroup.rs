@@ -52,7 +52,7 @@ struct CgroupFiles {
 }
 
 /// Memory of the process's cgroup, or `None` when it is not in a memory cgroup.
-#[cfg(all(feature = "metrics", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(super) fn read_cgroup_memory() -> Option<CgroupMemory> {
     // Not cached: a process can be moved to another group while it runs.
     discover(Path::new("/")).as_ref().map(read)

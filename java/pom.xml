@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>15.0.0-beta.14</version>
+    <version>15.0.0-beta.21</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -190,6 +190,7 @@
                     <protoSourceRoot>${project.basedir}/../protos</protoSourceRoot>
                     <includes>
                         <include>cache_diagnostics.proto</include>
+                        <include>merge_analysis.proto</include>
                     </includes>
                     <protocArtifact>
                         com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}

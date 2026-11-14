@@ -1056,6 +1056,7 @@ mod tests {
             "MemWal",
             "system index type must resolve via infer_system_index_type"
         );
+        assert_eq!(mem_wal_desc.details().unwrap(), "{}");
         assert_eq!(
             mem_wal_desc.rows_indexed(),
             0,

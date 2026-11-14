@@ -184,7 +184,7 @@ fn same_logical_index(a: &IndexMetadata, b: &IndexMetadata) -> bool {
             .as_ref()
             .map(|details| details.type_url.clone())
     };
-    a.fields == b.fields && a.covering_fields == b.covering_fields && type_url(a) == type_url(b)
+    a.declares_same_fields(b) && type_url(a) == type_url(b)
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a

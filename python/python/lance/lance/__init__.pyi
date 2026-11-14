@@ -34,6 +34,7 @@ from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
 from .._dataset.index import Index
+from .._dataset.merge_insert import MergeInsertAnalysis
 from .._dataset.refs import Branch, Tag, Version, VersionRef
 from .._dataset.transaction import (
     AlterColumn,
@@ -311,6 +312,8 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        *,
+        session: Optional[_Session] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -349,6 +352,7 @@ class LanceFileReader:
         namespace_client: Optional[LanceNamespace],
         table_id: Optional[List[str]],
         columns: Optional[List[str]] = None,
+        session: Optional[_Session] = None,
     ): ...
     def read_all(
         self, batch_size: int, batch_readahead: int
@@ -426,6 +430,23 @@ class _Session:
         Either option may be more expensive.
         """
         ...
+    def set_index_cache_capacity(self, capacity_bytes: int) -> None: ...
+    def set_metadata_cache_capacity(self, capacity_bytes: int) -> None: ...
+
+def read_blob_files(
+    blob_files: List[Optional[LanceBlobFile]],
+    *,
+    io_parallelism: Optional[int] = None,
+    io_buffer_size: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]: ...
+def read_blob_file_ranges(
+    requests: List[Tuple[Optional[LanceBlobFile], int, int]],
+    *,
+    io_parallelism: Optional[int] = None,
+    io_buffer_size: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]: ...
 
 class LanceBlobFile:
     def close(self): ...
@@ -457,6 +478,22 @@ class _Dataset:
         index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
+    def _with_read_params(
+        self, read_params: Optional[Dict[str, Any]] = None
+    ) -> _Dataset: ...
+    def _reconfigure(
+        self,
+        block_size: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        commit_lock: Optional[CommitLock] = None,
+        session: Optional[_Session] = None,
+        namespace_client: Optional[Any] = None,
+        table_id: Optional[List[str]] = None,
+        namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> _Dataset: ...
     @property
     def schema(self) -> pa.Schema: ...
     @property
@@ -585,7 +622,13 @@ class _Dataset:
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def column_layout_stats(self) -> List[Dict[str, Any]]: ...
-    def versions(self) -> List[Version]: ...
+    def versions(
+        self,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        descending: bool = False,
+    ) -> List[Version]: ...
+    def count_versions(self) -> int: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
     def current_version(self) -> Version: ...
@@ -794,6 +837,13 @@ class _Dataset:
     ) -> pa.RecordBatchReader: ...
 
 class _MergeInsertBuilder:
+    def _analyze_plan_report_dataset(self, source: _Dataset) -> MergeInsertAnalysis: ...
+    def _analyze_plan_report_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> MergeInsertAnalysis: ...
+    def _analyze_plan_report(
+        self, new_data: pa.RecordBatchReader, is_materialized: bool
+    ) -> MergeInsertAnalysis: ...
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
     def when_matched_update_all(self, condition: Optional[str] = None) -> Self: ...
     def when_matched_fail(self) -> Self: ...
