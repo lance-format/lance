@@ -28,6 +28,7 @@ zmij = "1.0"
 goldenfile = "1.8"
 json-five = "0.3.0"
 proptest = { workspace = true }
+rstest = { workspace = true }
 
 [lints]
 workspace = true
