@@ -98,7 +98,7 @@ The schema is typically stored in the global buffers, but the file format is una
 The file metadata will need to be known before reading the data. A simple approach for loading the footer is to
 read one sector from the end (sector depends on the filesystem, 4KiB for local disk, larger for cloud storage). Then
 parse the footer and read the rest of the metadata (at this point the size will be known). This requires 1-2 IOPS. By
-storing the metadata size in some other location (e.g. table manifest) it is possible to always read the footer in
+storing the metadata size in some other location (e.g. table manifest) it is possible to always read the metadata section in
 a single IOP. If there are _many_ columns in the file and only some are desired then it may be better to read
 individual columns instead of reading all column metadata, increasing the number of IOPS but decreasing the amount
 of data read.
