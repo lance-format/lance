@@ -324,6 +324,17 @@ pub struct VectorIndexDetails {
     #[prost(map = "string, string", tag = "9")]
     pub runtime_hints:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// A 32-byte BLAKE3 fingerprint of the final IVF coarse-routing state:
+    /// - Index distance metric.
+    /// - Centroid scalar type and shape (count and dimension).
+    /// - Centroid values in partition-ID order and coordinate order.
+    ///
+    /// Readers may reuse routing only for identical, well-formed fingerprints.
+    /// Absent when no reliable fingerprint is available.
+    /// See "Coarse-routing fingerprint" in
+    /// docs/src/format/index/vector/index.md for the canonical encoding.
+    #[prost(bytes = "vec", optional, tag = "10")]
+    pub coarse_quantizer_fingerprint: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(oneof = "vector_index_details::Compression", tags = "4, 5, 6, 8")]
     pub compression: ::core::option::Option<vector_index_details::Compression>,
 }
