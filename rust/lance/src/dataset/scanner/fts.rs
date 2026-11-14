@@ -812,7 +812,10 @@ impl Scanner {
         }
     }
 
-    pub(super) fn fts_document_granularity(&self, query: &FtsQuery) -> Result<DocumentGranularity> {
+    pub(in crate::dataset) fn fts_document_granularity(
+        &self,
+        query: &FtsQuery,
+    ) -> Result<DocumentGranularity> {
         #[derive(Default)]
         struct TargetState {
             granularity: Option<DocumentGranularity>,
@@ -1092,7 +1095,7 @@ impl Scanner {
         }
     }
 
-    pub(super) async fn resolve_full_text_search_query(
+    pub(in crate::dataset) async fn resolve_full_text_search_query(
         &self,
         query: &FullTextSearchQuery,
     ) -> Result<FullTextSearchQuery> {

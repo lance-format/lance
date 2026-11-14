@@ -14,6 +14,7 @@ use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::{Expr, ScalarUDFImpl};
 use datafusion_functions::core::getfield::GetFieldFunc;
 use half::f16;
+use lance_core::datatypes::format_field_path_minimal;
 
 const MS_PER_DAY: i64 = 86400000;
 
@@ -643,7 +644,7 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
                 // Build the field path from the column name and any nested fields
                 // The nested field names from get_field already come as literal strings,
                 // so we just need to concatenate them properly
-                let mut path = name.clone();
+                let mut path = format_field_path_minimal(&[name]);
                 for part in self.current_path.drain(..) {
                     path.push('.');
                     // Check if the part needs quoting (contains dots)

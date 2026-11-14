@@ -2747,20 +2747,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_columns_in_expr() {
+    #[rstest]
+    #[case::plain("st", "st.s1", "st.st.s2")]
+    #[case::backtick("st`x", "`st``x`.s1", "`st``x`.st.s2")]
+    fn test_columns_in_expr(#[case] root: &str, #[case] child: &str, #[case] nested: &str) {
         let expr = col("s0").gt(lit("value")).and(
-            col("st")
+            Expr::Column(Column::from_name(root))
                 .field("st")
                 .field("s2")
                 .eq(lit("value"))
-                .or(col("st")
+                .or(Expr::Column(Column::from_name(root))
                     .field("s1")
                     .in_list(vec![lit("value 1"), lit("value 2")], false)),
         );
 
         let columns = Planner::column_names_in_expr(&expr);
-        assert_eq!(columns, vec!["s0", "st.s1", "st.st.s2"]);
+        let mut expected = vec!["s0", child, nested];
+        expected.sort_unstable();
+        assert_eq!(columns, expected);
     }
 
     #[test]
