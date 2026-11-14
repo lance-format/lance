@@ -24,6 +24,10 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
+use lance_file::reader::ReadEstimate;
+use lance_io::read_budget::QueryId;
+use lance_select::bitmap_to_ranges;
+use roaring::RoaringBitmap;
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -195,6 +199,20 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
+    // Charged without waiting: the caller may hold a paused scan whose memory
+    // only it can release.
+    let _reservation = match builder.dataset.session.read_budget() {
+        Some(budget) => {
+            let estimate =
+                estimate_take(&builder.dataset, &row_addrs, &physical_schema, &read_config).await?;
+            Some(
+                budget
+                    .reader(QueryId::unique())
+                    .charge(estimate.bytes + estimate.decoded_bytes),
+            )
+        }
+        None => None,
+    };
     let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
@@ -370,6 +388,40 @@ async fn do_take_rows(
     }
 
     to_logical_json_batch(projection.project_batch(batch).await?)
+}
+
+/// Estimates what taking `row_addrs` loads.
+async fn estimate_take(
+    dataset: &Arc<Dataset>,
+    row_addrs: &[u64],
+    physical_schema: &Arc<Schema>,
+    read_config: &FragReadConfig,
+) -> Result<ReadEstimate> {
+    let mut offsets_per_fragment: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
+    for row_addr in row_addrs {
+        let row_addr = RowAddress::from(*row_addr);
+        offsets_per_fragment
+            .entry(row_addr.fragment_id())
+            .or_default()
+            .insert(row_addr.row_offset());
+    }
+    let ids: Vec<u32> = offsets_per_fragment.keys().copied().collect();
+    let estimates = futures::stream::iter(dataset.get_fragments_from_ids(&ids)?)
+        .map(|fragment| {
+            let ranges = offsets_per_fragment
+                .get(&(fragment.id() as u32))
+                .map(bitmap_to_ranges)
+                .unwrap_or_default();
+            let read_config = read_config.clone();
+            async move {
+                let reader = fragment.open(physical_schema, read_config).await?;
+                reader.estimate_read(ranges.into()).await
+            }
+        })
+        .buffered(dataset.object_store.io_parallelism())
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(estimates.into_iter().sum())
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {

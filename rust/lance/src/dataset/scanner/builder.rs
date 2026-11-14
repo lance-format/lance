@@ -95,6 +95,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
+            keep_batch_size: false,
             file_reader_options,
             aggregate: None,
             legacy_with_row_addr: false,
@@ -774,6 +775,17 @@ impl Scanner {
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
+        self
+    }
+
+    /// Keep [`Self::batch_size`] under the session's read memory limit, which
+    /// otherwise reads rows too wide for one chunk in smaller batches.
+    ///
+    /// Set it when the batches are written out: too few values per batch can
+    /// lose an encoding, such as a dictionary. A batch larger than one chunk
+    /// is then read through the overdraft.
+    pub fn keep_batch_size(&mut self, keep_batch_size: bool) -> &mut Self {
+        self.keep_batch_size = keep_batch_size;
         self
     }
 

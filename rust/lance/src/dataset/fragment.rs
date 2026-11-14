@@ -42,7 +42,7 @@ use lance_core::{
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{
-    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
+    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReadEstimate,
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
@@ -186,6 +186,16 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         projection: Arc<lance_core::datatypes::Schema>,
         take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
+
+    /// Estimates what reading `ranges` (sorted and disjoint) of `projection`
+    /// loads. Readers that cannot read ranges (v1) report nothing.
+    fn estimate_read(
+        &self,
+        _ranges: Arc<[Range<u64>]>,
+        _projection: Arc<lance_core::datatypes::Schema>,
+    ) -> BoxFuture<'_, Result<ReadEstimate>> {
+        futures::future::ready(Ok(ReadEstimate::default())).boxed()
+    }
 
     /// Return the number of rows in the file
     fn len(&self) -> u32;
@@ -685,6 +695,22 @@ mod v2_adapter {
                 batch_size,
                 projection,
             )
+            .boxed()
+        }
+
+        fn estimate_read(
+            &self,
+            ranges: Arc<[Range<u64>]>,
+            projection: Arc<Schema>,
+        ) -> BoxFuture<'_, Result<ReadEstimate>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader.estimate_read(&ranges, Some(projection)).await
+            }
             .boxed()
         }
 
@@ -4172,6 +4198,18 @@ impl FragmentReader {
             reader.read_all_tasks(batch_size, reader.projection().clone())
         })
         .await
+    }
+
+    /// Estimates what [`Self::read_ranges`] loads for `ranges` (sorted and
+    /// disjoint).
+    pub async fn estimate_read(&self, ranges: Arc<[Range<u64>]>) -> Result<ReadEstimate> {
+        let estimates = futures::future::try_join_all(
+            self.readers
+                .iter()
+                .map(|reader| reader.estimate_read(ranges.clone(), reader.projection().clone())),
+        )
+        .await?;
+        Ok(estimates.into_iter().sum())
     }
 
     // This method is a clone of new_read_impl but returns tasks instead of batches
