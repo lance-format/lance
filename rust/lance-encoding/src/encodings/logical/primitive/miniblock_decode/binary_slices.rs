@@ -102,6 +102,14 @@ impl MiniBlockScheduler {
                 "page buffer range overflows u64",
             ));
         }
+        let metadata_len = page.buffer_offsets_and_sizes[0].1;
+        let word_bytes = if layout.has_large_chunk { 4 } else { 2 };
+        if metadata_len == 0 || !metadata_len.is_multiple_of(word_bytes) {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                "invalid metadata word length",
+            ));
+        }
         let mut scheduler = Self::try_new(
             &page.buffer_offsets_and_sizes,
             page.priority,
@@ -128,7 +136,18 @@ impl MiniBlockScheduler {
         if metadata_bytes > MAX_METADATA_BYTES {
             return Ok(None);
         }
-        let buffers = io.submit_request(ranges, page.priority).await?;
+        let buffers = io.submit_request(ranges.clone(), page.priority).await?;
+        if buffers.len() != ranges.len()
+            || buffers
+                .iter()
+                .zip(&ranges)
+                .any(|(bytes, range)| bytes.len() as u64 != range.end - range.start)
+        {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                "truncated metadata read",
+            ));
+        }
         let state = scheduler
             .init_from_buffers(initialization.with_buffers(buffers)?, io)
             .await?;
@@ -250,7 +269,7 @@ mod tests {
     struct RecordedIo {
         bytes: Bytes,
         requests: Mutex<Vec<(Range<u64>, u64)>>,
-        short_reads: bool,
+        short_read_at: Option<usize>,
     }
 
     impl EncodingsIo for RecordedIo {
@@ -262,15 +281,18 @@ mod tests {
             let result = ranges
                 .into_iter()
                 .map(|range| {
-                    self.requests
-                        .lock()
-                        .unwrap()
-                        .push((range.clone(), priority));
+                    let request_index = {
+                        let mut requests = self.requests.lock().unwrap();
+                        requests.push((range.clone(), priority));
+                        requests.len()
+                    };
                     let bytes = self
                         .bytes
                         .get(range.start as usize..range.end as usize)
                         .ok_or_else(|| Error::io("test read outside file"))?;
-                    let len = bytes.len().saturating_sub(usize::from(self.short_reads));
+                    let len = bytes
+                        .len()
+                        .saturating_sub(usize::from(self.short_read_at == Some(request_index)));
                     Ok(Bytes::copy_from_slice(&bytes[..len]))
                 })
                 .collect();
@@ -348,7 +370,7 @@ mod tests {
             RecordedIo {
                 bytes: file.into(),
                 requests: Mutex::default(),
-                short_reads: false,
+                short_read_at: None,
             },
             values,
         )
@@ -390,20 +412,39 @@ mod tests {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn binary_slices_reject_bounds_and_short_reads() {
+    async fn binary_slices_reject_bounds_and_short_reads(
+        #[values(1, 2, 3, 4)] short_read_at: usize,
+    ) {
         let (page, mut recorded, _) = page_fixture(64, true, false);
-        recorded.short_reads = true;
+        recorded.short_read_at = Some(short_read_at);
         let io: Arc<dyn EncodingsIo> = Arc::new(recorded);
         let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 0, &[0..1], &io)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("truncat"));
         let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 2, &[0..1], &io)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("invalid binary row"));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn binary_slices_reject_misaligned_metadata_before_io(#[values(false, true)] wide: bool) {
+        let (mut page, recorded, _) = page_fixture(64, wide, false);
+        let recorded = Arc::new(recorded);
+        let io: Arc<dyn EncodingsIo> = recorded.clone();
+        page.buffer_offsets_and_sizes = Arc::from([(32, if wide { 3 } else { 1 }), (128, 16416)]);
+        let error = MiniBlockScheduler::try_read_binary_value_slices(&page, 0, &[0..1], &io)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("metadata word length"));
+        assert!(recorded.requests.lock().unwrap().is_empty());
     }
 
     #[rstest]
