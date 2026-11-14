@@ -36,8 +36,8 @@ fn check_reader_path() -> Result<()> {
 ///
 /// The second element names the logical indices with a segment excluded only
 /// because its format marker could not be read. Those exclusions hold for THIS
-/// call alone, so the listing must not be cached: the caller re-derives it and
-/// the next call re-probes.
+/// call alone: the caller records the listing as needing re-derivation, so the
+/// next call re-probes instead of treating the exclusion as final.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
@@ -88,8 +88,9 @@ pub(super) async fn load_indices(
                 // A probe that cannot reach the segment's format marker says
                 // nothing about its format, and planning every query on the
                 // table must not fail for it. Treat it as unknown for THIS
-                // call only (no coverage, scan fallback, nothing cached), so
-                // the next call reclassifies once the store answers again.
+                // call only (no coverage, scan fallback) and mark the listing
+                // for re-derivation, so the next call reclassifies once the
+                // store answers again.
                 let can_remap = match segment_supports_batch_remapping(dataset, index).await {
                     Ok(can_remap) => can_remap.unwrap_or(false),
                     Err(error) => {

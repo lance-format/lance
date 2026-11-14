@@ -307,22 +307,19 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 }
 
-/// Legacy cache key for the query-time index listing derived from a v1 (tagged) FRI:
-/// the coverage-rewritten, filtered listing produced by `frag_reuse_reader`.
-/// For a v0 FRI it holds the listing `load_all_indices` remapped through it; a
-/// snapshot carries one FRI entry, so the two never share a key.
+/// Cache key for the listing `load_all_indices` remaps through a v0 FRI: the
+/// fragment bitmaps rewritten so query planning sees live fragments. A snapshot
+/// carries one FRI entry, so one key per snapshot.
 ///
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
-/// listing. Retained with its original value type for callers using this public
-/// key. Query loading now uses a separate internal key that also records whether
-/// incomplete metadata needs another inference or format-verification attempt.
-/// Keyed by the same
-/// snapshot identity: a different table (`store_identity`), a different snapshot
-/// (`version`), or any index add/replace (which commits a new manifest and bumps
-/// `version`/`e_tag`) yields a different key, so a stale derived listing is never
-/// reused.
+/// listing. Query loading records its own value under [`QueryIndexListingKey`],
+/// which also tracks whether an incomplete listing needs another inference or
+/// format-verification attempt. Keyed by the same snapshot identity: a different
+/// table (`store_identity`), a different snapshot (`version`), or any index
+/// add/replace (which commits a new manifest and bumps `version`/`e_tag`) yields
+/// a different key, so a stale remapped listing is never reused.
 ///
-/// This cache is MEMORY-ONLY (no `codec`): the derived listing depends on the
+/// This cache is MEMORY-ONLY (no `codec`): the remapped listing depends on the
 /// READER's translation capability, not only on the snapshot. Different builds
 /// admit different segments for the same snapshot (a build that cannot translate
 /// a segment excludes it; one that can includes it), so a persisted entry

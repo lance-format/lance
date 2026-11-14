@@ -3,7 +3,9 @@
 
 use super::support::*;
 use super::*;
-use crate::session::index_caches::IndexMetadataKey;
+use crate::session::index_caches::{
+    DerivedIndexListingKey, IndexMetadataKey, QueryIndexListing, QueryIndexListingKey,
+};
 
 #[rstest]
 #[case::v1("v3.0.1/fts_v1", INVERTED_INDEX_VERSION_V1)]
@@ -703,4 +705,113 @@ async fn test_query_listing_retries_failed_legacy_inference() {
         &recovered,
         &dataset.load_indices().await.unwrap()
     ));
+}
+
+/// An e-tag is the only generation token in the query-listing key. Without one
+/// a dataset dropped and recreated at the same URI would alias the previous
+/// incarnation's version, so the derived listing must not be published into
+/// the dataset-level cache this PR adds.
+#[tokio::test]
+async fn test_query_listing_is_not_cached_without_a_generation_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = gen_batch()
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(2));
+    let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.manifest_location.e_tag = None;
+
+    let first = dataset.load_indices().await.unwrap();
+    let second = dataset.load_indices().await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].name, "value_idx");
+    assert_eq!(first[0].uuid, second[0].uuid);
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: None,
+    });
+    assert!(
+        dataset.index_cache.get_with_key(&query_key).await.is_none(),
+        "an untagged snapshot must not publish a query listing"
+    );
+    assert_eq!(
+        dataset.load_indices().await.unwrap()[0].uuid,
+        first[0].uuid,
+        "repeated untagged loads must stay correct"
+    );
+}
+
+/// A version-only key can collide with a listing cached for a previous
+/// incarnation at this URI. Seeding exactly that entry proves `load_indices`
+/// neither serves it nor replaces it with the current snapshot's listing.
+#[tokio::test]
+async fn test_query_listing_ignores_stale_entry_without_a_generation_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = gen_batch()
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(2));
+    let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let expected_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    dataset.manifest_location.e_tag = None;
+    // Warm the raw metadata layer so the entry count below isolates the query
+    // listing: that lower cache is keyed independently and is not this test's
+    // subject.
+    crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: None,
+    });
+    dataset
+        .index_cache
+        .insert_with_key(
+            &query_key,
+            Arc::new(QueryIndexListing {
+                indices: Arc::new(Vec::new()),
+                retry_derivation: false,
+            }),
+        )
+        .await;
+    let entries_before = dataset.index_cache_entry_count().await;
+
+    let listing = dataset.load_indices().await.unwrap();
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].uuid, expected_uuid);
+    assert_eq!(
+        dataset.index_cache_entry_count().await,
+        entries_before,
+        "the bypass must not publish a query listing"
+    );
+    let stored = dataset.index_cache.get_with_key(&query_key).await.unwrap();
+    assert!(
+        stored.indices.is_empty(),
+        "the bypass must not replace the seeded entry"
+    );
 }
