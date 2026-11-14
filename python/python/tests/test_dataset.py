@@ -17,7 +17,7 @@ import textwrap
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -669,6 +669,14 @@ def test_asof_checkout(tmp_path: Path):
     ds = lance.dataset(base_dir, asof=ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
+
+    # Aware cutoffs name the same instants in any zone.
+    for offset in (timedelta(hours=-12), timedelta(hours=14)):
+        aware_ts_1 = ts_1.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_1).version == 1
+        assert lance.dataset(base_dir, asof=pd.Timestamp(aware_ts_1)).version == 1
+        aware_ts_2 = ts_2.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_2.isoformat()).version == 2
 
     with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
         lance.dataset(base_dir, asof=pd.NaT)
