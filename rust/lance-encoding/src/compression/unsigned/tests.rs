@@ -128,11 +128,7 @@ fn packed_fixture(bits: u64, width: u64, tail: Tail) -> (Vec<u8>, Vec<u64>) {
     let raw_tail = matches!(tail, Tail::Raw | Tail::Tie);
     if raw_tail {
         for value in &mut expected[2048..] {
-            *value = if bits == 32 {
-                u32::MAX as u64
-            } else {
-                u64::MAX
-            };
+            *value = u64::MAX >> (64 - bits);
         }
     }
     let mut bytes = Vec::new();
@@ -141,26 +137,26 @@ fn packed_fixture(bits: u64, width: u64, tail: Tail) -> (Vec<u8>, Vec<u64>) {
             for value in chunk {
                 bytes.extend_from_slice(&value.to_le_bytes()[..(bits / 8) as usize]);
             }
-        } else if bits == 32 {
-            let mut values = [0_u32; 1024];
-            for (dst, src) in values.iter_mut().zip(chunk) {
-                *dst = *src as u32;
-            }
-            let mut packed = vec![0_u32; 1024 * width as usize / 32];
-            // SAFETY: a full input block, valid width, and exact packed word count.
-            unsafe {
-                u32::unchecked_pack(width as usize, &values, &mut packed);
-            }
-            bytes.extend_from_slice(bytemuck::cast_slice(&packed));
         } else {
-            let mut values = [0_u64; 1024];
-            values[..chunk.len()].copy_from_slice(chunk);
-            let mut packed = vec![0_u64; 1024 * width as usize / 64];
-            // SAFETY: a full input block, valid width, and exact packed word count.
-            unsafe {
-                u64::unchecked_pack(width as usize, &values, &mut packed);
+            macro_rules! pack {
+                ($word:ty) => {{
+                    let mut values = [0 as $word; 1024];
+                    for (dst, src) in values.iter_mut().zip(chunk) {
+                        *dst = *src as $word;
+                    }
+                    let mut packed = vec![0 as $word; 1024 * width as usize / bits as usize];
+                    // SAFETY: a full input block, valid width, and exact packed word count.
+                    unsafe { <$word>::unchecked_pack(width as usize, &values, &mut packed) };
+                    bytes.extend_from_slice(bytemuck::cast_slice(&packed));
+                }};
             }
-            bytes.extend_from_slice(bytemuck::cast_slice(&packed));
+            match bits {
+                8 => pack!(u8),
+                16 => pack!(u16),
+                32 => pack!(u32),
+                64 => pack!(u64),
+                _ => unreachable!(),
+            }
         }
     }
     (bytes, expected)
@@ -174,7 +170,7 @@ fn packed_fixture(bits: u64, width: u64, tail: Tail) -> (Vec<u8>, Vec<u64>) {
 #[case::equal_size_raw_precedence(Tail::Tie)]
 fn bitpacked_visit_matches_encoder_at_every_width(
     #[case] tail: Tail,
-    #[values(32, 64)] bits: u64,
+    #[values(8, 16, 32, 64)] bits: u64,
     #[values(0, 1)] displacement: usize,
 ) {
     for width in 1..bits {
@@ -219,7 +215,7 @@ fn bitpacked_visit_matches_encoder_at_every_width(
 #[cfg(feature = "bitpacking")]
 #[rstest]
 fn malformed_bitpacked_framing_precedes_visits(
-    #[values(32, 64)] bits: u64,
+    #[values(8, 16, 32, 64)] bits: u64,
     #[values(-1, 1)] change: i8,
 ) {
     let (mut payload, expected) = packed_fixture(bits, 3, Tail::Padded);

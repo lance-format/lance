@@ -6,6 +6,12 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::Field;
 
 use super::*;
+#[cfg(feature = "bitpacking")]
+use crate::{
+    compression::{BlockCompressor, DecompressionStrategy, DefaultDecompressionStrategy},
+    data::{BlockInfo, FixedWidthDataBlock},
+    format::EncodingUtils,
+};
 
 pub(super) fn select(task: &mut DecodeMiniBlockTask, selections: &[(u64, u64)]) {
     let (template, chunk) = task.instructions.remove(0);
@@ -374,14 +380,28 @@ fn rle_values_compose_with_task_admission(
     #[values(false, true)] large: bool,
     #[values(false, true)] multiple: bool,
 ) {
+    check_rle_values(large, multiple, None);
+}
+
+#[cfg(feature = "bitpacking")]
+#[rstest]
+fn bitpacked_rle_values_compose_with_task_admission(
+    #[values(false, true)] large: bool,
+    #[values(false, true)] multiple: bool,
+    #[values(false, true)] packed_values: bool,
+) {
+    check_rle_values(large, multiple, Some(packed_values));
+}
+
+fn check_rle_values(large: bool, multiple: bool, packed: Option<bool>) {
     let Fixture {
         mut task,
         budget,
         mut work,
         ..
     } = fixture(None, None, Codec::Flat, large, 1024);
-    let values = [10_u32, 20, 30];
-    let buffers: [&[u8]; 2] = [bytemuck::cast_slice(&values), &[2, 1, 1]];
+    let (payloads, codec) = rle_payloads(packed);
+    let buffers: [&[u8]; 2] = [&payloads[0], &payloads[1]];
     let mut frame = 4_u16.to_le_bytes().to_vec();
     for buffer in buffers {
         if large {
@@ -402,7 +422,7 @@ fn rle_values_compose_with_task_admission(
         LanceBuffer::from(Buffer::from(input.freeze()).slice_with_length(1, frame.len()));
     task.instructions[0].1.byte_range = 0..frame.len() as u64;
     task.num_buffers = 2;
-    task.value_decompressor = Arc::new(RleDecompressor::new(32));
+    task.value_decompressor = codec;
     let selections: &[(u64, u64)] = if multiple {
         &[(1, 2), (3, 1)]
     } else {
@@ -426,4 +446,41 @@ fn rle_values_compose_with_task_admission(
     drop(page);
     drop(work);
     assert_eq!(budget.reserved(), 0);
+}
+
+fn rle_payloads(packed: Option<bool>) -> ([Vec<u8>; 2], Arc<dyn MiniBlockDecompressor>) {
+    let values = [10_u32, 20, 30];
+    let payloads = [bytemuck::cast_slice(&values).to_vec(), vec![2, 1, 1]];
+    let Some(packed_values) = packed else {
+        return (payloads, Arc::new(RleDecompressor::new(32)));
+    };
+    #[cfg(feature = "bitpacking")]
+    {
+        let mut payloads = payloads;
+        let index = usize::from(!packed_values);
+        let bits = if packed_values { 32 } else { 8 };
+        let (encoded, encoding) = BlockCompressor::compress(
+            &OutOfLineBitpacking::new(if packed_values { 5 } else { 2 }, bits),
+            DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::from(payloads[index].clone()),
+                bits_per_value: bits,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            }),
+        )
+        .unwrap();
+        payloads[index] = encoded.unwrap().to_vec();
+        let encoding = if packed_values {
+            EncodingUtils::rle(encoding, EncodingUtils::flat(8, None))
+        } else {
+            EncodingUtils::rle(EncodingUtils::flat(32, None), encoding)
+        };
+        let strategy = DefaultDecompressionStrategy::default();
+        let decoder = strategy
+            .create_miniblock_decompressor(&encoding, &strategy)
+            .unwrap();
+        (payloads, Arc::from(decoder))
+    }
+    #[cfg(not(feature = "bitpacking"))]
+    panic!("bitpacked RLE feature disabled (values={packed_values})")
 }

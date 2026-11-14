@@ -4,10 +4,15 @@
 use arrow_buffer::Buffer;
 use lance_core::utils::allocation::AllocationBudget;
 use rstest::rstest;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
+use crate::format::metadata::compressive_encoding::Compression;
 use crate::{
-    compression::{BlockDecompressor, MiniBlockDecompressor},
+    compression::{
+        BlockDecompressor, DecompressionStrategy, DefaultDecompressionStrategy,
+        MiniBlockDecompressor,
+    },
     encodings::{
         logical::primitive::miniblock::{MiniBlockCompressionContext, MiniBlockCompressor},
         physical::rle::{RleChildDecompressor, RleEncoder, RunLengthWidth},
@@ -250,21 +255,81 @@ fn compressed_children_refuse_before_ordinary_decode(#[values(false, true)] valu
         .try_decompress_range_in(&data, 1, 0..1, &mut work)
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(
-        error
-            .to_string()
-            .contains("flat value and run-length children")
-    );
+    assert!(error.to_string().contains("no unsigned payload visitor"));
     assert_eq!(work.len(), 4);
 }
+
+#[derive(Debug, Default)]
+struct ReplayFailure(AtomicUsize);
+
+impl BlockDecompressor for ReplayFailure {
+    fn decompress(&self, _: Option<LanceBuffer>, _: u64) -> Result<DataBlock> {
+        panic!("ordinary child decoder must not run during admission")
+    }
+
+    fn visit_unsigned(
+        &self,
+        _: Option<&LanceBuffer>,
+        _: u64,
+        _: u64,
+        visitor: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        visitor(7)?;
+        if self.0.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
+            return Err(Error::invalid_input("child failed during replay"));
+        }
+        visitor(9)
+    }
+}
+
+#[test]
+fn replay_error_recycles_exclusive_output() {
+    let codec = RleDecompressor::with_child_decompressors(
+        32,
+        RunLengthWidth::U8,
+        RleChildDecompressor::block(32, Box::<ReplayFailure>::default(), true),
+        RleChildDecompressor::flat(8),
+    );
+    let data = [LanceBuffer::empty(), LanceBuffer::from(vec![1, 1])];
+    let budget = AllocationBudget::new(8);
+    let mut work = budget.try_reserve(8).unwrap();
+    for _ in 0..2 {
+        let error = codec
+            .try_decompress_range_in(&data, 2, 0..2, &mut work)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("child failed during replay"));
+        assert_eq!(work.len(), 8);
+        assert_eq!(budget.reserved(), 8);
+    }
+    drop(work);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[cfg(feature = "bitpacking")]
+mod packed;
 
 #[rstest]
 fn current_writer_chunks_preserve_selected_rows(
     #[values(RunLengthWidth::U8, RunLengthWidth::U16, RunLengthWidth::U32)]
     length_width: RunLengthWidth,
 ) {
-    let expected: Vec<u32> = (0..40)
-        .flat_map(|r| std::iter::repeat_n(r % 7, 9))
+    check_writer_chunks(length_width, false);
+}
+
+#[cfg(feature = "bitpacking")]
+#[rstest]
+fn current_writer_packed_chunks_preserve_selected_rows(
+    #[values(RunLengthWidth::U8, RunLengthWidth::U16, RunLengthWidth::U32)]
+    length_width: RunLengthWidth,
+) {
+    check_writer_chunks(length_width, true);
+}
+
+fn check_writer_chunks(length_width: RunLengthWidth, packed: bool) {
+    let runs = if packed { 2048 } else { 40 };
+    let expected: Vec<u32> = (0..runs)
+        .flat_map(|r| std::iter::repeat_n(r % 7, if packed { 4 } else { 9 }))
         .collect();
     let input = DataBlock::FixedWidth(FixedWidthDataBlock {
         bits_per_value: 32,
@@ -272,14 +337,26 @@ fn current_writer_chunks_preserve_selected_rows(
         data: LanceBuffer::reinterpret_vec(expected.clone()),
         block_info: BlockInfo::new(),
     });
-    let encoder = RleEncoder::with_run_length_width(length_width);
-    let (encoded, _) = MiniBlockCompressor::compress(
+    let encoder = RleEncoder::with_child_encoding(length_width, None, None, packed);
+    let (encoded, encoding) = MiniBlockCompressor::compress(
         &encoder,
         MiniBlockCompressionContext::new(0, true, true),
         input,
     )
     .unwrap();
-    let codec = RleDecompressor::with_run_length_width(32, length_width);
+    if packed {
+        let Some(Compression::Rle(rle)) = encoding.compression.as_ref() else {
+            panic!("not RLE");
+        };
+        assert!([&rle.values, &rle.run_lengths].iter().any(|child| matches!(
+            child.as_ref().unwrap().compression.as_ref().unwrap(),
+            Compression::OutOfLineBitpacking(_)
+        )));
+    }
+    let strategy = DefaultDecompressionStrategy::default();
+    let codec = strategy
+        .create_miniblock_decompressor(&encoding, &strategy)
+        .unwrap();
     let mut offsets = [0, 0];
     let mut processed = 0;
     for chunk in &encoded.chunks {

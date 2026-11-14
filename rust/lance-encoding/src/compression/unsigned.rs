@@ -127,7 +127,7 @@ pub fn bitpacked_at(
 
 #[cfg(feature = "bitpacking")]
 fn validate_bitpacked(data: &LanceBuffer, bits: u64, packed: u64, count: u64) -> Result<u64> {
-    if !matches!(bits, 32 | 64) || packed == 0 || packed >= bits {
+    if !matches!(bits, 8 | 16 | 32 | 64) || packed == 0 || packed >= bits {
         return Err(Error::invalid_input(
             "unsigned bitpacking visitor requires a narrower positive width",
         ));

@@ -21,17 +21,20 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # At 100c52c09, all 379 default/pcodec cases and all-features Clippy passed.
-      # The only source change gates an unused pcodec-only getter. Exercise the
-      # affected no-default configuration and the previously skipped API example.
-      - name: Validate dictionary and Binary without optional codecs
+      # Earlier dictionary/Binary and pcodec evidence is retained at c13ea7e5b,
+      # 100c52c09 and 0bef7ca30. Exercise the new borrowed RLE child traversal,
+      # narrow packed widths and affected task composition at this exact head.
+      - name: Validate borrowed packed traversal and RLE admission
         run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::unsigned::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::dictionary::unsigned::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::binary::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::binary -- --nocapture
-      - name: Validate unsigned lookup API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc unsigned_value_at -- --nocapture
-      - name: Lint without optional codecs
+          cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib physical::rle::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib rle_values_compose_with_task_admission -- --nocapture
+      - name: Validate RLE without optional codecs
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::rle::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib rle_values_compose_with_task_admission -- --nocapture
+      - name: Lint touched crate
         if: ${{ !cancelled() }}
-        run: cargo clippy --profile ci --locked -p lance-encoding --no-default-features --all-targets --no-deps -- -D warnings
+        run: |
+          cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding --no-default-features --all-targets --no-deps -- -D warnings
