@@ -127,6 +127,46 @@ pub struct ReservedBuffer {
 }
 
 impl ReservedBuffer {
+    /// Replace this exclusive buffer only after reserving the entire new allocation.
+    /// Both layouts remain charged during the copy. On success, the old allocation's
+    /// credit becomes workspace headroom again. On refusal, neither buffer nor credit
+    /// changes. Shared/frozen bytes intentionally cannot be resized through this API.
+    pub fn try_resize(&mut self, len: usize, workspace: &mut Reservation) -> Result<bool> {
+        if !Arc::ptr_eq(&self.reservation.budget, &workspace.budget) {
+            return Err(Error::invalid_input(
+                "buffer and workspace use different allocation budgets",
+            ));
+        }
+        if len == self.data.len() {
+            return Ok(true);
+        }
+        if len > isize::MAX as usize {
+            return Err(Error::invalid_input(
+                "reserved payload exceeds addressable allocation size",
+            ));
+        }
+        if len > workspace.bytes {
+            return Ok(false);
+        }
+        let recycled = (workspace.bytes - len)
+            .checked_add(self.reservation.bytes)
+            .ok_or_else(|| Error::internal("allocation credit overflow"))?;
+        let Some(credit) = workspace.try_split(len) else {
+            return Ok(false);
+        };
+        let mut replacement = credit.allocate()?;
+        let copy_len = len.min(self.data.len());
+        replacement.data[..copy_len].copy_from_slice(&self.data[..copy_len]);
+        let Self {
+            data,
+            mut reservation,
+        } = std::mem::replace(self, replacement);
+        drop(data);
+        workspace.bytes = recycled;
+        reservation.bytes = 0;
+        Ok(true)
+    }
+
     /// Publish immutable bytes. Clones/slices share this owner and its single charge.
     pub fn freeze(self) -> Bytes {
         Bytes::from_owner(self)
@@ -206,6 +246,28 @@ mod tests {
         drop(old);
         assert_eq!(budget.reserved(), 8);
         drop(new);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn resize_requires_old_and_new_layouts_to_fit() {
+        let budget = AllocationBudget::new(20);
+        let mut work = budget.try_reserve(20).unwrap();
+        let mut data = work.try_split(8).unwrap().allocate().unwrap();
+        data.as_mut().copy_from_slice(b"abcdefgh");
+        assert!(!data.try_resize(13, &mut work).unwrap());
+        assert_eq!(data.as_ref(), b"abcdefgh");
+        assert_eq!(work.len(), 12);
+        assert!(data.try_resize(12, &mut work).unwrap());
+        assert_eq!(data.as_ref(), b"abcdefgh\0\0\0\0");
+        assert_eq!(work.len(), 8);
+        assert_eq!(budget.reserved(), 20);
+        assert!(data.try_resize(4, &mut work).unwrap());
+        assert_eq!(data.as_ref(), b"abcd");
+        assert_eq!(work.len(), 16);
+        drop(work);
+        assert_eq!(budget.reserved(), 4);
+        drop(data);
         assert_eq!(budget.reserved(), 0);
     }
 

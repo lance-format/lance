@@ -73,31 +73,8 @@ pub fn try_read_ranges(
                 .map(|(range, reservation)| {
                     let reader = reader.clone();
                     async move {
-                        let mut output = reservation.allocate()?;
-                        if range.is_empty() {
-                            return Ok(output.freeze());
-                        }
-                        let mut body = reader.get_range_stream(range.clone()).await?;
-                        let mut offset = 0;
-                        while let Some(chunk) = body.next().await {
-                            let chunk = chunk?;
-                            let remaining = range.len() - offset;
-                            if chunk.len() > remaining {
-                                return Err(Error::io(format!(
-                                    "body for {} range {range:?} exceeds requested length",
-                                    reader.path()
-                                )));
-                            }
-                            output.as_mut()[offset..offset + chunk.len()].copy_from_slice(&chunk);
-                            offset += chunk.len();
-                        }
-                        if offset != range.len() {
-                            return Err(Error::io(format!(
-                                "body for {} range {range:?} has {offset} bytes, expected {}",
-                                reader.path(),
-                                range.len()
-                            )));
-                        }
+                        let output = reservation.allocate()?;
+                        let output = reader.get_range_into(range, output).await?;
                         Ok(output.freeze())
                     }
                 })
@@ -114,14 +91,54 @@ mod tests {
     use super::*;
     use crate::{object_reader::CloudObjectReader, traits::ByteStream};
     use arrow::buffer::Buffer;
-    use arrow_array::{Array, UInt8Array};
+    use arrow_array::UInt8Array;
     use futures::poll;
     use lance_core::{
         cache::{Context, DeepSizeOf},
         utils::allocation::AllocationBudget,
     };
-    use object_store::{ObjectStore, memory::InMemory, path::Path};
+    use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn local_reader_fills_the_admitted_allocation_directly() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"abcdefgh").unwrap();
+        let reader = crate::local::LocalObjectReader::open_local_path(file.path(), 4096, Some(8))
+            .await
+            .unwrap();
+        let budget = AllocationBudget::new(4);
+        let buffer = budget.try_reserve(4).unwrap().allocate().unwrap();
+        let pointer = buffer.as_ref().as_ptr() as usize;
+        let output = reader.get_range_into(2..6, buffer).await.unwrap();
+        assert_eq!(output.as_ref(), b"cdef");
+        assert_eq!(output.as_ref().as_ptr() as usize, pointer);
+        assert_eq!(budget.reserved(), 4);
+        drop(output);
+        assert_eq!(budget.reserved(), 0);
+        let buffer = budget.try_reserve(4).unwrap().allocate().unwrap();
+        let error = reader.get_range_into(6..10, buffer).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_reader_rejects_mismatched_buffer_without_losing_credit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let reader = crate::local::LocalObjectReader::open_local_path(file.path(), 4096, Some(0))
+            .await
+            .unwrap();
+        let budget = AllocationBudget::new(4);
+        let buffer = budget.try_reserve(4).unwrap().allocate().unwrap();
+        let error = reader.get_range_into(0..3, buffer).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match reserved payload")
+        );
+        assert_eq!(budget.reserved(), 0);
+    }
 
     #[tokio::test]
     async fn slow_input_does_not_prevent_other_admitted_work_from_finishing() {

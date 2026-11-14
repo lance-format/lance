@@ -20,7 +20,7 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, utils::allocation::ReservedBuffer};
 use object_store::path::Path;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
@@ -376,6 +376,41 @@ impl Reader for LocalObjectReader {
             }
 
             result
+        })
+    }
+
+    fn get_range_into(
+        &self,
+        range: Range<usize>,
+        mut output: ReservedBuffer,
+    ) -> BoxFuture<'_, Result<ReservedBuffer>> {
+        let file = self.file.clone();
+        let io_tracker = self.io_tracker.clone();
+        let path = self.path.clone();
+        Box::pin(async move {
+            if range.end.checked_sub(range.start) != Some(output.capacity()) {
+                return Err(Error::invalid_input(
+                    "read range does not match reserved payload",
+                ));
+            }
+            let bytes = range.len() as u64;
+            let range_u64 = range.start as u64..range.end as u64;
+            let metrics = io_tracker.begin_io("get");
+            // The blocking operation owns the reservation. Dropping the async
+            // waiter must not refund memory while the read still writes into it.
+            let result = join_local_io(tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                file.read_exact_at(output.as_mut(), range.start as u64)?;
+                #[cfg(windows)]
+                read_exact_at(file, output.as_mut(), range.start as u64)?;
+                Ok(output)
+            }))
+            .await;
+            metrics.record(&result, bytes);
+            if result.is_ok() {
+                io_tracker.record_read("get_range_into", path, bytes, Some(range_u64));
+            }
+            Ok(result?)
         })
     }
 
