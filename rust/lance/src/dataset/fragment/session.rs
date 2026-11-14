@@ -48,7 +48,7 @@ impl FragmentSession {
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
         // Remap row ids if needed
         let row_ids = if let Some(sorted_deleted_ids) = &self.sorted_deleted_ids {
-            Cow::Owned(resolve_actual_row_ids(indices, sorted_deleted_ids))
+            Cow::Owned(resolve_actual_row_ids(indices, sorted_deleted_ids)?)
         } else {
             Cow::Borrowed(indices)
         };
