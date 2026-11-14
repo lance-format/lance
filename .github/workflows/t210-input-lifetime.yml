@@ -21,18 +21,9 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Dictionary traversal passed at c13ea7e5b. Revalidate its trait integration
-      # after merging main's pcodec support; keep the ordinary codec path covered.
-      - name: Validate upstream pcodec integration
-        run: cargo test --profile ci --locked -p lance-encoding --lib physical::pcodec::tests -- --nocapture
-      - name: Validate unsigned lookup and dictionary traversal
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib physical::dictionary::unsigned::tests -- --nocapture
-      - name: Validate Binary admission and composition
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --lib physical::binary::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted::tests::binary -- --nocapture
+      # At 100c52c09, all 379 default/pcodec cases and all-features Clippy passed.
+      # The only source change gates an unused pcodec-only getter. Exercise the
+      # affected no-default configuration and the previously skipped API example.
       - name: Validate dictionary and Binary without optional codecs
         run: |
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::unsigned::tests -- --nocapture
@@ -41,6 +32,6 @@ jobs:
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib miniblock_decode::admitted::tests::binary -- --nocapture
       - name: Validate unsigned lookup API example
         run: cargo test --profile ci --locked -p lance-encoding --doc unsigned_value_at -- --nocapture
-      - name: Lint touched crate
+      - name: Lint without optional codecs
         if: ${{ !cancelled() }}
-        run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --profile ci --locked -p lance-encoding --no-default-features --all-targets --no-deps -- -D warnings
