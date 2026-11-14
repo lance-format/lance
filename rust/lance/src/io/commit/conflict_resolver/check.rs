@@ -559,7 +559,7 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if let Operation::DataReplacement { replacements } = &self.transaction.operation {
+        if let Operation::DataReplacement { replacements, .. } = &self.transaction.operation {
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
@@ -658,6 +658,12 @@ impl<'a> TransactionRebase<'a> {
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
                     // this would introduce fragment bitmaps with holes which may not be well tested
                     // yet.  For now, we don't allow this case.
+                    //
+                    // Values that only moved still match what the index was
+                    // built from, so those never conflict.
+                    if self.only_moves_values() {
+                        return Ok(());
+                    }
                     let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.dependency_fields().into_owned())
@@ -690,6 +696,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::DataReplacement {
                     replacements: other_replacements,
+                    ..
                 } => {
                     // These conflict if there is overlap in fragment id && fields.
                     for replacement in replacements {

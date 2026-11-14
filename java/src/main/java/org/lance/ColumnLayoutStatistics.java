@@ -71,9 +71,9 @@ public final class ColumnLayoutStatistics {
   }
 
   /**
-   * Share of each fragment's field slots holding no live data: slots tombstoned by a column update,
-   * or left by a dropped column. Spilled row lineage is not counted. A fragment rewrite reclaims
-   * these slots.
+   * Share of each fragment's field slots holding no live data: slots tombstoned by a column update
+   * or repack, or left by a dropped column. Spilled row lineage is not counted. A fragment rewrite
+   * reclaims these slots.
    */
   public double[] getDeadSlotRatios() {
     return deadSlotRatios;

@@ -523,9 +523,15 @@ class LanceOperation:
     class DataReplacement(BaseOperation):
         """
         Operation that replaces existing datafiles in the dataset.
+
+        ``data_change=False`` declares that the new files hold the same values
+        as the files they replace (compaction moved them). Indices then keep
+        their coverage, overlays keep shadowing, and no row is reported as
+        updated.
         """
 
         replacements: List[LanceOperation.DataReplacementGroup]
+        data_change: bool = True
 
     @dataclass
     class DataOverlayFile:

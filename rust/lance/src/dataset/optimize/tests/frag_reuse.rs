@@ -479,6 +479,104 @@ async fn test_eager_remap_refuses_undrained_fri_over_address_domain_index(
         .unwrap();
     assert_answers(&dataset).await;
 }
+/// A repack-only run remaps no index, so an undrained FRI doesn't refuse
+/// it, and the FRI still resolves the btree's stale addresses after it. Under
+/// `CompactionScope::All` the run is repack-only because the one fragment left
+/// has no rewrite to plan.
+#[rstest]
+#[case::stable_row_ids(true, CompactionScope::RepackColumns)]
+#[case::row_addresses(false, CompactionScope::RepackColumns)]
+#[case::stable_row_ids_any_scope(true, CompactionScope::All)]
+#[case::row_addresses_any_scope(false, CompactionScope::All)]
+#[tokio::test]
+async fn test_undrained_fri_allows_a_repack_only_plan(
+    #[case] enable_stable_row_ids: bool,
+    #[case] scope: CompactionScope,
+) {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_dataset_with_params(
+            "memory://",
+            FragmentCount::from(5),
+            FragmentRowCount::from(10),
+            Some(WriteParams {
+                enable_stable_row_ids,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("d".into(), "i + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let fragment_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(fragment_ids.len(), 1);
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            scope,
+            max_data_files_per_fragment: Some(1),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+        fragment_ids
+    );
+    assert!(
+        dataset
+            .fragments()
+            .iter()
+            .all(|fragment| fragment.files.len() == 1)
+    );
+    assert!(
+        !dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    // Answered through the btree, whose stale addresses only the FRI
+    // translates.
+    let mut scanner = dataset.scan();
+    scanner.filter("i = 7").unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(dataset.count_rows(Some("i = 7".into())).await.unwrap(), 1);
+}
 /// A table whose only index can never consume an eager remap (ZoneMap
 /// always reports `RemapResult::Drop`) still has to honor row-address
 /// moves its tasks recorded under `defer_index_remap` at plan/execution
@@ -550,11 +648,7 @@ async fn test_recording_refuses_moves_it_cannot_pair() {
     fragments.reverse();
     let error = rewrite_files(
         Cow::Borrowed(&dataset),
-        TaskData {
-            fragments: fragments.clone(),
-            output_clustering_id: None,
-            output_metadata: HashMap::new(),
-        },
+        TaskData::rewrite_fragments(fragments.clone()),
         &options,
     )
     .await
@@ -2804,6 +2898,59 @@ async fn test_defer_index_remap_rejected_while_row_id_index_present() {
     assert_eq!(dataset.manifest.version, version_before);
     assert_eq!(zonemap_coverage(&dataset).await.len(), 3);
 }
+/// A repack-only run records no row-address moves, so `defer_index_remap`
+/// does not refuse it for an index the moves could not be applied to.
+#[tokio::test]
+async fn test_defer_index_remap_allows_a_repack_only_plan() {
+    let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["cat"],
+            IndexType::Inverted,
+            Some("cat_idx".into()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("d".into(), "id + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let fragment_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+
+    let options = CompactionOptions {
+        defer_index_remap: true,
+        scope: CompactionScope::RepackColumns,
+        max_data_files_per_fragment: Some(1),
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.num_tasks(), fragment_ids.len());
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    assert_eq!(
+        dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+        fragment_ids
+    );
+    assert!(
+        dataset
+            .fragments()
+            .iter()
+            .all(|fragment| fragment.files.len() == 1)
+    );
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
 /// The mirror image: once an FRI is live, a row-id-domain index cannot be
 /// added, because the FRI would be applied to it on load.
 #[tokio::test]
@@ -3399,11 +3546,7 @@ async fn test_deferred_compaction_rejects_crossing_an_unsupported_index_boundary
         ..Default::default()
     };
     let task = CompactionTask {
-        task: TaskData {
-            fragments: dataset.fragments().as_ref().clone(),
-            output_clustering_id: None,
-            output_metadata: HashMap::new(),
-        },
+        task: TaskData::rewrite_fragments(dataset.fragments().as_ref().clone()),
         read_version: dataset.manifest.version,
         options: deferred_options.clone(),
     };

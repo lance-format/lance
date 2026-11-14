@@ -387,10 +387,13 @@ impl<'a> TransactionRebase<'a> {
             // checks. Added columns and further deletions keep coverage, but a
             // revived row was never indexed by this build.
             if dataset.manifest.version != self.transaction.read_version
-                && let Some(read_fragments) = &self.read_fragments
+                && let Some(read) = &self.read_fragments
             {
-                let rewrites =
-                    Transaction::merge_rewritten_fields(read_fragments, dataset.fragments());
+                let mut rewrites =
+                    Transaction::merge_rewritten_fields(&read.fragments, dataset.fragments());
+                if let Some(moved) = &read.moved_files {
+                    keep_unmoved_rewrites(&mut rewrites, dataset.fragments(), moved);
+                }
                 Transaction::withdraw_in_place_rewrites(
                     new_indices,
                     rewrites,
@@ -404,7 +407,8 @@ impl<'a> TransactionRebase<'a> {
                     .filter(|index| !is_system_index(index))
                     .filter_map(|index| index.fragment_bitmap.as_ref())
                     .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
-                let previously_deleted_fragments = read_fragments
+                let previously_deleted_fragments = read
+                    .fragments
                     .iter()
                     .filter(|fragment| fragment.deletion_file.is_some())
                     .map(|fragment| (fragment.id, fragment))
@@ -476,8 +480,9 @@ impl<'a> TransactionRebase<'a> {
                 // not list its sources, which would leave their pre-rewrite
                 // liveness unrestored and clear the untouched remainder.
                 let pre_rewrite_live = match self.read_fragments.as_ref() {
-                    Some(read_fragments) => {
-                        let read_live: RoaringBitmap = read_fragments
+                    Some(read) => {
+                        let read_live: RoaringBitmap = read
+                            .fragments
                             .iter()
                             .filter_map(|fragment| u32::try_from(fragment.id).ok())
                             .collect();
@@ -787,4 +792,31 @@ async fn read_fragment_deletion_bitmap(
         }
         None => Ok(RoaringBitmap::new()),
     }
+}
+
+/// Drop from `rewrites` (`Transaction::merge_rewritten_fields` against the read
+/// fragments) each field whose current data file is one of `moved`.
+fn keep_unmoved_rewrites(
+    rewrites: &mut Vec<(u64, Vec<u32>)>,
+    fragments: &[Fragment],
+    moved: &HashMap<u64, HashSet<String>>,
+) {
+    let fragments: HashMap<u64, &Fragment> = fragments.iter().map(|f| (f.id, f)).collect();
+    rewrites.retain_mut(|(fragment_id, fields)| {
+        let (Some(fragment), Some(paths)) = (fragments.get(fragment_id), moved.get(fragment_id))
+        else {
+            return true;
+        };
+        fields.retain(|field| {
+            // The file `merge_rewritten_fields` takes as the field's: the
+            // last one listing it.
+            let file = fragment
+                .files
+                .iter()
+                .rev()
+                .find(|file| file.fields.contains(&(*field as i32)));
+            !file.is_some_and(|file| paths.contains(&file.path))
+        });
+        !fields.is_empty()
+    });
 }

@@ -56,7 +56,10 @@ public class CompactionOptions implements Serializable {
   private List<Long> excludedFragmentIds;
   private Optional<DataStorageVersion> dataStorageVersion;
   private Optional<SourceBudgetMode> sourceBudgetMode;
+  private Optional<Long> maxDataFilesPerFragment;
+  private Optional<CompactionScope> scope;
 
+  // Also called from the native layer.
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,
@@ -74,7 +77,9 @@ public class CompactionOptions implements Serializable {
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
       Optional<String> dataStorageVersion,
-      Optional<SourceBudgetMode> sourceBudgetMode) {
+      Optional<SourceBudgetMode> sourceBudgetMode,
+      Optional<Long> maxDataFilesPerFragment,
+      Optional<String> scope) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -92,6 +97,17 @@ public class CompactionOptions implements Serializable {
     this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
     this.dataStorageVersion = dataStorageVersion.map(DataStorageVersion::fromRustString);
     this.sourceBudgetMode = sourceBudgetMode;
+    this.maxDataFilesPerFragment = maxDataFilesPerFragment;
+    this.scope = scope.map(CompactionOptions::scopeFromValue);
+  }
+
+  public Optional<Long> getMaxDataFilesPerFragment() {
+    return maxDataFilesPerFragment;
+  }
+
+  /** Returns the scope as its string value for the native layer. */
+  public Optional<String> getScope() {
+    return scope.map(CompactionScope::getValue);
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -190,6 +206,8 @@ public class CompactionOptions implements Serializable {
         .add("excludedFragmentIds", excludedFragmentIds)
         .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .add("sourceBudgetMode", sourceBudgetMode.orElse(null))
+        .add("maxDataFilesPerFragment", maxDataFilesPerFragment.orElse(null))
+        .add("scope", scope.orElse(null))
         .toString();
   }
 
@@ -211,6 +229,8 @@ public class CompactionOptions implements Serializable {
     output.writeObject(getDataStorageVersion().orElse(null));
     output.writeObject(minBytesPerFile.orElse(null));
     output.writeObject(sourceBudgetMode.map(SourceBudgetMode::getValue).orElse(null));
+    output.writeObject(maxDataFilesPerFragment.orElse(null));
+    output.writeObject(getScope().orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -240,6 +260,17 @@ public class CompactionOptions implements Serializable {
     this.dataStorageVersion = readTrailingString(input).map(DataStorageVersion::fromRustString);
     this.minBytesPerFile = readTrailingLong(input);
     this.sourceBudgetMode = readTrailingSourceBudgetMode(input);
+    this.maxDataFilesPerFragment = readTrailingLong(input);
+    this.scope = readTrailingString(input).map(CompactionOptions::scopeFromValue);
+  }
+
+  private static CompactionScope scopeFromValue(String value) {
+    for (CompactionScope scope : CompactionScope.values()) {
+      if (scope.getValue().equals(value)) {
+        return scope;
+      }
+    }
+    throw new IllegalArgumentException("Unknown compaction scope: " + value);
   }
 
   /**
@@ -318,6 +349,8 @@ public class CompactionOptions implements Serializable {
     private List<Long> excludedFragmentIds = Collections.emptyList();
     private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
     private Optional<SourceBudgetMode> sourceBudgetMode = Optional.empty();
+    private Optional<Long> maxDataFilesPerFragment = Optional.empty();
+    private Optional<CompactionScope> scope = Optional.empty();
 
     private Builder() {}
 
@@ -416,9 +449,10 @@ public class CompactionOptions implements Serializable {
 
     /**
      * Maximum number of source bytes to compact in a single run, measured as the total size of the
-     * source fragments' data and overlay files. Tasks are included until adding the next task would
-     * exceed this limit. Blob v2 payloads live in separate blob files and are not counted, so this
-     * is not a cap on total compaction I/O for datasets with blob columns.
+     * source fragments' data and overlay files (for a column repack, only the data files holding
+     * the columns it moves). Tasks are included until adding the next task would exceed this limit.
+     * Blob v2 payloads live in separate blob files and are not counted, so this is not a cap on
+     * total compaction I/O for datasets with blob columns.
      *
      * @throws IllegalArgumentException if {@code maxSourceBytes} is not positive
      */
@@ -473,6 +507,29 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
+     * Maximum number of data files a fragment may hold columns in before its columns are repacked
+     * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
+     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are. The
+     * file count is the only repack trigger. Unset uses {@code
+     * lance.compaction.max_data_files_per_fragment} from the table config, or no repack. Must be at
+     * least 1; checked when the compaction is planned.
+     */
+    public Builder withMaxDataFilesPerFragment(long maxDataFilesPerFragment) {
+      this.maxDataFilesPerFragment = Optional.of(maxDataFilesPerFragment);
+      return this;
+    }
+
+    /**
+     * Which kinds of task to plan. Defaults to {@link CompactionScope#ALL}. {@link
+     * CompactionScope#REPACK_COLUMNS} requires a max data file count and refuses {@link
+     * CompactionMode#FORCE_BINARY_COPY}; checked when the compaction is planned.
+     */
+    public Builder withScope(CompactionScope scope) {
+      this.scope = Optional.of(Objects.requireNonNull(scope, "scope"));
+      return this;
+    }
+
+    /**
      * A max source budget of zero admits no work and a negative value would wrap around to an
      * effectively unlimited budget on the Rust side, so both are rejected here. Leave the option
      * unset for no limit.
@@ -503,7 +560,9 @@ public class CompactionOptions implements Serializable {
           maxSourceBytes,
           excludedFragmentIds,
           dataStorageVersion.map(DataStorageVersion::toRustString),
-          sourceBudgetMode);
+          sourceBudgetMode,
+          maxDataFilesPerFragment,
+          scope.map(CompactionScope::getValue));
     }
   }
 }
