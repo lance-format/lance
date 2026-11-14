@@ -17,6 +17,8 @@ use crate::{
     format::metadata::compressive_encoding::Compression,
 };
 
+mod metadata;
+
 fn frame(values: &[&[u8]], width: usize) -> Vec<u8> {
     let mut pos = (values.len() + 1) * width;
     let mut bytes = Vec::new();

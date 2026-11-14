@@ -1410,6 +1410,27 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Validate an unsigned metadata-only sequence without expanding its values.
+    /// Width, cardinality and arithmetic must match the ordinary decoder. Callers
+    /// must separately reject unexpected payload buffers. Unsupported codecs or
+    /// shapes return an error; this must never call ordinary allocating decode.
+    ///
+    /// ```
+    /// use lance_encoding::{compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    ///     encodings::physical::sequence::SequenceMetadata, format::EncodingUtils};
+    /// let codec = DefaultDecompressionStrategy::default()
+    ///     .create_block_decompressor(&EncodingUtils::range(32, 0, 3)).unwrap();
+    /// assert_eq!(codec.plan_unsigned_metadata(32, 4).unwrap(),
+    ///     SequenceMetadata::Range { start: 0, step: 3 });
+    /// ```
+    fn plan_unsigned_metadata(
+        &self,
+        _bits_per_value: u64,
+        _num_values: u64,
+    ) -> Result<crate::encodings::physical::sequence::SequenceMetadata> {
+        Err(Error::not_supported("codec has no unsigned metadata plan"))
+    }
+
     /// Validate a dense u16 structural stream and plan all decoded payload/scratch
     /// before allocation. The input owner must already be charged. Unsupported
     /// codecs return an error instead of invoking ordinary, unaccounted decode.

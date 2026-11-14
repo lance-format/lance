@@ -139,6 +139,34 @@ impl DeltaDecompressor {
 }
 
 impl BlockDecompressor for DeltaDecompressor {
+    fn plan_unsigned_metadata(
+        &self,
+        bits: u64,
+        count: u64,
+    ) -> Result<super::sequence::SequenceMetadata> {
+        if bits != self.bits_per_value {
+            return Err(Error::invalid_input(
+                "Delta metadata width disagrees with requested width",
+            ));
+        }
+        validate_delta_header(bits, self.base, count)?;
+        match self.child.plan_unsigned_metadata(bits, count - 1)? {
+            super::sequence::SequenceMetadata::Constant(0) => {
+                Ok(super::sequence::SequenceMetadata::Constant(self.base))
+            }
+            super::sequence::SequenceMetadata::Constant(step) => {
+                super::range::checked_range_last(bits, self.base, step, count)?;
+                Ok(super::sequence::SequenceMetadata::Range {
+                    start: self.base,
+                    step,
+                })
+            }
+            _ => Err(Error::not_supported(
+                "admitted Delta metadata requires constant deltas",
+            )),
+        }
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         validate_delta_header(self.bits_per_value, self.base, num_values)?;
         let child = self.child.decompress(data, num_values - 1)?;

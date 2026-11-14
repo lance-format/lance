@@ -152,6 +152,23 @@ impl RangeDecompressor {
 }
 
 impl BlockDecompressor for RangeDecompressor {
+    fn plan_unsigned_metadata(
+        &self,
+        bits: u64,
+        count: u64,
+    ) -> Result<super::sequence::SequenceMetadata> {
+        if bits != self.bits_per_value {
+            return Err(Error::invalid_input(
+                "Range metadata width disagrees with requested width",
+            ));
+        }
+        checked_range_last(bits, self.start, self.step, count)?;
+        Ok(super::sequence::SequenceMetadata::Range {
+            start: self.start,
+            step: self.step,
+        })
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         require_no_block_payload(data, "Range")?;
         checked_range_last(self.bits_per_value, self.start, self.step, num_values)?;
