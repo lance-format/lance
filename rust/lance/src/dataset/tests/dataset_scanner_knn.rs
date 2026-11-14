@@ -3093,6 +3093,40 @@ fn refinement_scan(dataset: &Dataset) -> Scanner {
     scan
 }
 
+const CROSS_COLUMN_CACHE_K: usize = 4;
+const CROSS_COLUMN_CACHE_REFINE_FACTOR: u32 = 2;
+const CROSS_COLUMN_CACHE_QUANTIZED_REFINE: u32 = 4;
+
+/// Cross-column refinement reranks the coarse candidates with its own key,
+/// metric and final-space bounds, so one coarse entry serves every key.
+async fn cross_column_refinement_scan(
+    dataset: &Dataset,
+    coarse: &FixedSizeListArray,
+    refine: &dyn Array,
+    batch: bool,
+    bounds: (Option<f32>, Option<f32>),
+) -> RecordBatch {
+    let mut scan = dataset.scan();
+    if batch {
+        scan.nearest("coarse", coarse, CROSS_COLUMN_CACHE_K)
+            .unwrap();
+    } else {
+        scan.nearest("coarse", coarse.value(0).as_ref(), CROSS_COLUMN_CACHE_K)
+            .unwrap();
+    }
+    scan.distance_metric(MetricType::L2)
+        .nprobes(2)
+        .refine(CROSS_COLUMN_CACHE_REFINE_FACTOR)
+        .quantized_refine(CROSS_COLUMN_CACHE_QUANTIZED_REFINE)
+        .with_refine_column("full", refine, MetricType::L2)
+        .unwrap()
+        .distance_range(bounds.0, bounds.1)
+        .with_row_id()
+        .project(&[ROW_ID, DIST_COL])
+        .unwrap();
+    scan.try_into_batch().await.unwrap()
+}
+
 // Compare the actual rows and distance bits against the same snapshot with its
 // result cache disabled. Counters alone cannot detect stale rankings.
 async fn assert_refinement_cache(dataset: &Dataset, expect_hit: bool) -> RecordBatch {
@@ -3359,6 +3393,136 @@ async fn test_quantized_refinement_cache_bypass(#[case] restriction: u8) {
     let after = refinement_cache_activity(dataset).await;
     assert_eq!(after.hits, before.hits);
     assert_eq!(after.loads_started, before.loads_started);
+}
+
+// The cached entry is the coarse partition batch, so a different refinement
+// key must legitimately reuse it and still rerank in its own final space.
+#[rstest]
+#[case::single(false)]
+#[case::batch(true)]
+#[tokio::test]
+async fn test_quantized_refinement_cache_cross_column_refinement(#[case] batch: bool) {
+    const COARSE_DIM: u32 = 8;
+    const FULL_DIM: u32 = 16;
+
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "coarse",
+            array::rand_vec::<Float32Type>(Dimension::from(COARSE_DIM)),
+        )
+        .col(
+            "full",
+            array::rand_vec::<Float32Type>(Dimension::from(FULL_DIM)),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(32))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["coarse"],
+            IndexType::Vector,
+            Some("rq".to_string()),
+            &VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                RQBuildParams::with_rotation_type(8, RQRotationType::Fast),
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let keys = |dim: u32, seed: f32| {
+        let rows = if batch { 2 } else { 1 };
+        let values = (0..rows * dim as usize)
+            .map(|index| seed + index as f32 / 64.0)
+            .collect::<Vec<_>>();
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
+    };
+    let coarse = keys(COARSE_DIM, 0.1);
+    let first_keys = keys(FULL_DIM, 0.2);
+    let second_keys = keys(FULL_DIM, 0.9);
+    let refine = |keys: &FixedSizeListArray| -> ArrayRef {
+        if batch {
+            Arc::new(keys.clone())
+        } else {
+            keys.value(0)
+        }
+    };
+    let first_refine = refine(&first_keys);
+    let second_refine = refine(&second_keys);
+
+    let mut uncached = dataset.clone();
+    uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+    let unbounded = cross_column_refinement_scan(
+        &uncached,
+        &coarse,
+        first_refine.as_ref(),
+        batch,
+        (None, None),
+    )
+    .await;
+    // Bound the refinement space around its median so the range rejects rows.
+    // The filter sees every coarse candidate, so the bound must come from the
+    // refined output rather than the candidate budget.
+    let mut distances = unbounded[DIST_COL]
+        .as_primitive::<Float32Type>()
+        .values()
+        .to_vec();
+    distances.sort_by(f32::total_cmp);
+    let bounds = (Some(distances[0]), Some(distances[distances.len() / 2]));
+    let first_reference =
+        cross_column_refinement_scan(&uncached, &coarse, first_refine.as_ref(), batch, bounds)
+            .await;
+    let second_reference =
+        cross_column_refinement_scan(&uncached, &coarse, second_refine.as_ref(), batch, bounds)
+            .await;
+    assert!(first_reference.num_rows() < unbounded.num_rows());
+
+    let before = refinement_cache_activity(&dataset).await;
+    let first =
+        cross_column_refinement_scan(&dataset, &coarse, first_refine.as_ref(), batch, bounds).await;
+    let missed = refinement_cache_activity(&dataset).await;
+    assert_eq!(missed.hits, before.hits);
+    assert!(missed.loads_succeeded > before.loads_succeeded);
+
+    let warm =
+        cross_column_refinement_scan(&dataset, &coarse, first_refine.as_ref(), batch, bounds).await;
+    let warmed = refinement_cache_activity(&dataset).await;
+    assert!(warmed.hits > missed.hits);
+    assert_eq!(warmed.loads_started, missed.loads_started);
+
+    // A different refinement key reuses the coarse candidates but must not
+    // reuse its predecessor's final distances.
+    let second =
+        cross_column_refinement_scan(&dataset, &coarse, second_refine.as_ref(), batch, bounds)
+            .await;
+    let reused = refinement_cache_activity(&dataset).await;
+    assert!(reused.hits > warmed.hits);
+    assert_eq!(reused.loads_started, missed.loads_started);
+
+    assert_eq!(first, first_reference);
+    assert_eq!(warm, first_reference);
+    assert_eq!(second, second_reference);
+    assert_ne!(
+        first_reference[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values(),
+        second_reference[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+    );
+    for result in [&first, &second] {
+        assert!(
+            result[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| *distance >= bounds.0.unwrap() && *distance <= bounds.1.unwrap()),
+            "final-space bounds must apply to cached coarse candidates"
+        );
+    }
 }
 
 #[tokio::test]
