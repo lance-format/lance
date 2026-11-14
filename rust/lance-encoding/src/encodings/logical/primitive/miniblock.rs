@@ -157,57 +157,48 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
+    use rstest::rstest;
 
     use super::*;
 
-    #[test]
-    #[serial]
-    fn test_parse_default() {
-        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
-        assert_eq!(parse_max_miniblock_values(), 4096);
-    }
+    #[rstest]
+    #[case::unset(None, 4096)]
+    #[case::custom_value(Some("256"), 256)]
+    #[case::can_raise_to_32k(Some("32768"), 32768)]
+    #[case::clamps_zero_to_one(Some("0"), 1)]
+    #[case::clamps_above_max(Some("99999"), MAX_CONFIGURABLE_MINIBLOCK_VALUES)]
+    #[case::invalid_falls_back_to_default(Some("not_a_number"), DEFAULT_MAX_MINIBLOCK_VALUES)]
+    fn test_parse_max_miniblock_values(#[case] env_value: Option<&str>, #[case] expected: u64) {
+        // Other tests initialize `MAX_MINIBLOCK_VALUES` from the process-wide environment, so
+        // instead of changing `LANCE_MINIBLOCK_MAX_VALUES` here the test re-runs itself in a child
+        // process that starts with it. libtest names the thread after the running test, so the
+        // child's filter cannot drift from this test's name.
+        const CHILD_ENV: &str = "LANCE_TEST_MINIBLOCK_MAX_VALUES_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1");
+            match env_value {
+                Some(value) => command.env("LANCE_MINIBLOCK_MAX_VALUES", value),
+                None => command.env_remove("LANCE_MINIBLOCK_MAX_VALUES"),
+            };
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
 
-    #[test]
-    #[serial]
-    fn test_parse_custom_value() {
-        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "256") };
-        assert_eq!(parse_max_miniblock_values(), 256);
-        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
-    }
-
-    #[test]
-    #[serial]
-    fn test_parse_can_raise_to_32k() {
-        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "32768") };
-        assert_eq!(parse_max_miniblock_values(), 32768);
-        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
-    }
-
-    #[test]
-    #[serial]
-    fn test_parse_clamps_zero_to_one() {
-        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "0") };
-        assert_eq!(parse_max_miniblock_values(), 1);
-        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
-    }
-
-    #[test]
-    #[serial]
-    fn test_parse_clamps_above_max() {
-        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "99999") };
-        assert_eq!(
-            parse_max_miniblock_values(),
-            MAX_CONFIGURABLE_MINIBLOCK_VALUES
-        );
-        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
-    }
-
-    #[test]
-    #[serial]
-    fn test_parse_invalid_falls_back_to_default() {
-        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "not_a_number") };
-        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
-        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+        assert_eq!(parse_max_miniblock_values(), expected);
+        assert_eq!(*MAX_MINIBLOCK_VALUES, expected);
     }
 }

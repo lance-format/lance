@@ -29,7 +29,9 @@ use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
+use arrow_array::{
+    Array, BooleanArray, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array,
+};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
@@ -528,9 +530,13 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
     let test_uri = TempStrDir::default();
     let num_rows = 10_000u64;
     let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let flags: BooleanArray = (0..num_rows)
+        .map(|id| (id % 3 != 0).then_some(id % 2 == 0))
+        .collect();
     let ids = UInt64Array::from_iter_values(0..num_rows);
     let batch = RecordBatch::try_from_iter(vec![
         ("value", Arc::new(values) as ArrayRef),
+        ("flag", Arc::new(flags) as ArrayRef),
         ("id", Arc::new(ids) as ArrayRef),
     ])
     .unwrap();
@@ -558,6 +564,16 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         )
         .await
         .unwrap();
+    dataset
+        .create_index(
+            &["flag"],
+            IndexType::BTree,
+            Some("flag_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
 
     for predicate in [
         "value = 7",
@@ -566,12 +582,35 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "NOT (value = 7)",
         "NOT (value = 99 OR value = 7)",
         "NOT (NOT (value = 7))",
+        // NULL rows are distinct from a value, and are neither TRUE nor FALSE.
+        "value IS NOT DISTINCT FROM 7",
+        "value IS DISTINCT FROM 7",
+        "value IS DISTINCT FROM 99",
+        "NOT (value IS DISTINCT FROM 7)",
+        "value IS NOT DISTINCT FROM NULL",
+        "(value IN (7, 99)) IS NOT TRUE",
+        "(value = 7) IS FALSE",
+        "(value != 7) IS NOT FALSE",
+        "flag IS TRUE",
+        "NOT (flag IS TRUE)",
+        "flag IS NOT FALSE",
+        // Predicates compared with each other are NULL where either one is.
+        "(value > 6) != (value < 7)",
+        "(value > 6) = (value < 7)",
+        "NOT ((value > 6) != (value < 8))",
+        "flag != (value = 7)",
         "value = 99 OR value = 7",
         // Float operands are rewritten exactly onto the integer column.
         "value > 6.5",
         "value = 6.5",
         "value BETWEEN 6.5 AND 7.5",
         "value IN (6.5, 7)",
+        // So are comparisons of the column cast to a float.
+        "CAST(value AS double) > 6.5",
+        "TRY_CAST(value AS double) = 7.0",
+        "NOT (CAST(value AS double) <= 7.0)",
+        "CAST(value AS double) BETWEEN 6.5 AND 7.5",
+        "CAST(value AS double) IN (6.5, 7.0)",
     ] {
         let mut indexed_scan = dataset.scan();
         indexed_scan
@@ -609,6 +648,57 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
             sorted_ids(&baseline),
             "indexed result differs for {predicate}"
         );
+    }
+}
+
+/// The FM index reports NULL text rows as FALSE rather than NULL, so a
+/// comparison between FM predicates must not be planned by negating them.
+#[tokio::test]
+async fn test_fm_predicate_equality_keeps_null_rows_null() {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        ("t", Utf8, [None, Some("needle"), Some("other")]),
+        ("u", Utf8, [Some("other"), Some("needle"), Some("needle")]),
+        ("id", UInt64, [0, 1, 2])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let write_params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+    for column in ["t", "u"] {
+        dataset
+            .create_index(&[column], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+    }
+
+    // Row 0 is NULL in both comparisons, so neither keeps it.
+    for (predicate, expected) in [
+        ("contains(t, 'needle') = contains(u, 'needle')", vec![1]),
+        ("contains(t, 'needle') != contains(u, 'needle')", vec![2]),
+    ] {
+        for use_scalar_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.use_scalar_index(use_scalar_index)
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "{predicate}, use_scalar_index={use_scalar_index}"
+            );
+        }
     }
 }
 
@@ -2074,22 +2164,37 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
 }
 
 #[rstest]
+#[case::full(false)]
+#[case::hybrid(true)]
 #[tokio::test]
-async fn test_multimatch_shared_prefilter(#[values(false, true)] use_scalar_index: bool) {
+async fn test_multimatch_shared_prefilter(
+    #[values(false, true)] use_scalar_index: bool,
+    #[case] partial_scalar_coverage: bool,
+) {
     const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
     const LIMIT: usize = 3;
 
     let mut dataset = write_cross_column_compound_dataset().await;
     create_fragmented_fts_index(&mut dataset, "title", true).await;
     create_fragmented_fts_index(&mut dataset, "body", true).await;
+    let covered = if partial_scalar_coverage {
+        1
+    } else {
+        dataset.fragments().len()
+    };
+    let fragments = dataset.fragments()[..covered]
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let segment = dataset
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_owned())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap();
     dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
+        .commit_existing_index_segments("id_idx", "id", vec![segment])
         .await
         .unwrap();
     let query: FtsQuery = MultiMatchQuery::try_new(
@@ -2136,6 +2241,23 @@ async fn test_multimatch_shared_prefilter(#[values(false, true)] use_scalar_inde
         usize::from(use_scalar_index) * 2,
         "each field should declare the shared prefilter dependency:\n{plan}"
     );
+    if use_scalar_index && partial_scalar_coverage {
+        assert_eq!(plan.matches("PrefilterUnion:").count(), 2, "{plan}");
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        let unions = analyzed
+            .lines()
+            .filter(|line| line.trim_start().starts_with("PrefilterUnion:"))
+            .collect::<Vec<_>>();
+        assert_eq!(unions.len(), 2, "{analyzed}");
+        assert_eq!(
+            unions
+                .iter()
+                .filter(|line| line.contains("prefilter_loads=1,"))
+                .count(),
+            1,
+            "the shared source must load missing-fragment row IDs once: {analyzed}"
+        );
+    }
 
     let batch = scanner.try_into_batch().await.unwrap();
     let actual = batch[ROW_ID]

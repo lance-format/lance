@@ -325,6 +325,38 @@ pub async fn row_addrs_to_row_ids(
     row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Include).await
 }
 
+/// Resolve row ids to their current row addresses, in input order.
+///
+/// A row address is `(fragment_id << 32) | offset`. With stable row ids, ids
+/// that are unknown or deleted yield `None`. Without stable row ids, row ids
+/// are row addresses, so each id is returned unchanged.
+///
+/// With stable row ids, this may read row-id metadata and deletion vectors from
+/// the dataset and returns an error if either read fails.
+///
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::rowids::row_ids_to_row_addrs;
+/// # async fn test(dataset: &Dataset) -> Result<()> {
+/// let addrs = row_ids_to_row_addrs(dataset, &[3, 21]).await?;
+/// let fragment_ids: Vec<u64> = addrs.into_iter().flatten().map(|addr| addr >> 32).collect();
+/// # Ok(())
+/// # }
+/// ```
+pub async fn row_ids_to_row_addrs(dataset: &Dataset, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+    if row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(index) = get_row_id_index(dataset).await? else {
+        return Ok(row_ids.iter().copied().map(Some).collect());
+    };
+    Ok(index
+        .get_many(row_ids)?
+        .into_iter()
+        .map(|addr| addr.map(u64::from))
+        .collect())
+}
+
 /// Resolve physical row addresses to stable row ids only for live physical slots.
 ///
 /// When stable row ids are enabled, missing fragments, out-of-range offsets,
@@ -336,6 +368,57 @@ pub(crate) async fn live_row_addrs_to_row_ids(
     addrs: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<Vec<Option<u64>>> {
     row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
+}
+
+/// Builds a synchronous lookup, for the rows of `fragment_ids`, that a caller
+/// can use like [`live_row_addrs_to_row_ids`] one address at a time (e.g.
+/// inside a scoring loop) instead of as a batch. This function itself is
+/// still async: it awaits loading every fragment's row id sequence and
+/// deletion vector up front, so the returned closure never has to.
+///
+/// The returned lookup yields `None` for an address in a fragment outside
+/// `fragment_ids` or no longer in the dataset, past the end of its fragment,
+/// or at a deleted physical slot. Requires stable row ids.
+pub(crate) async fn live_row_addr_to_row_id_lookup(
+    dataset: &Dataset,
+    fragment_ids: impl IntoIterator<Item = u32>,
+) -> Result<impl Fn(u64) -> Option<u64> + Send + Sync + 'static> {
+    // Loaded concurrently (bounded by io_parallelism): on a dataset with many
+    // fragments, loading each one's row id sequence and deletion vector in
+    // turn serializes IO that has no reason to wait on the last one.
+    let to_load: Vec<_> = fragment_ids
+        .into_iter()
+        .filter_map(|fragment_id| {
+            dataset
+                .get_fragment(fragment_id as usize)
+                .map(|fragment| (fragment_id, fragment))
+        })
+        .collect();
+    let loaded: Vec<_> = futures::stream::iter(to_load)
+        .map(|(fragment_id, fragment)| async move {
+            let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+            let deletion_vector = fragment.get_deletion_vector().await?;
+            Result::Ok((fragment_id, sequence, deletion_vector))
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    let fragments: std::collections::HashMap<_, _> = loaded
+        .into_iter()
+        .map(|(fragment_id, sequence, deletion_vector)| (fragment_id, (sequence, deletion_vector)))
+        .collect();
+    Ok(move |row_addr: u64| {
+        let row_addr = RowAddress::from(row_addr);
+        let (sequence, deletion_vector) = fragments.get(&row_addr.fragment_id())?;
+        let offset = row_addr.row_offset();
+        if deletion_vector
+            .as_ref()
+            .is_some_and(|deletions| deletions.contains(offset))
+        {
+            return None;
+        }
+        sequence.get(offset as usize)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -524,6 +607,7 @@ mod test {
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
+    use crate::index::visibility::IndexVisibility;
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
@@ -817,6 +901,85 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_visibility_retries_spilled_row_id_read() {
+        let batch = sequence_batch(0..8);
+        let directory = lance_core::utils::tempfile::TempStrDir::default();
+        let test_uri = directory.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let uri = format!("file-object-store://{path_prefix}{test_uri}");
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .update_config([
+                ("lance.row_lineage.spill", "true"),
+                ("lance.row_lineage.inline_max_bytes", "0"),
+            ])
+            .await
+            .unwrap();
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 4")
+            .unwrap()
+            .set("id", "id + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let mut dataset = dataset.as_ref().clone();
+        let fragment_id = dataset.fragments().last().unwrap().id as u32;
+        assert!(matches!(
+            dataset.fragments().last().unwrap().row_id_meta,
+            Some(RowIdMeta::Column)
+        ));
+        dataset.delete("id = 104 OR id = 106").await.unwrap();
+        drop(dataset);
+        let failing = Arc::new(FailingProxyStore::new());
+        let dataset = DatasetBuilder::from_uri(&uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let store = dataset.object_store(None).await.unwrap();
+        let visibility = IndexVisibility::from_physical_rows(
+            Arc::new(dataset),
+            HashMap::from([(fragment_id, [1, 2, 3].into_iter().collect())]),
+        );
+        failing.fail_when("get_opts", "data/", "injected row-id sequence failure");
+        let error = visibility.result_rows().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected row-id sequence failure")
+        );
+        failing.clear_fail_when("get_opts", "data/");
+        store.io_stats_incremental();
+        let rows = visibility.result_rows().await.unwrap();
+        assert_eq!(rows, &RowAddrTreeMap::from_iter([5, 7]));
+        assert!(store.io_stats_incremental().read_iops > 0);
+        visibility.block_mask().await.unwrap();
+        assert!(std::ptr::eq(rows, visibility.result_rows().await.unwrap()));
+        assert_eq!(store.io_stats_incremental().read_iops, 0);
+    }
+
+    #[tokio::test]
     async fn test_row_id_index_propagates_deletion_vector_read_error() {
         let batch = sequence_batch(0..10);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
@@ -863,7 +1026,23 @@ mod test {
                 .contains("injected deletion-vector read failure")
         );
 
+        let visibility = IndexVisibility::from_physical_rows(
+            Arc::new(dataset.clone()),
+            HashMap::from([(0, [4].into_iter().collect())]),
+        );
+        let error = visibility.block_mask().await.unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected deletion-vector read failure")
+        );
+
         failing_store.clear_fail_when("get_opts", "_deletions");
+        assert_eq!(
+            visibility.result_rows().await.unwrap(),
+            &RowAddrTreeMap::from_iter([4])
+        );
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(2).unwrap().is_some());
         assert!(index.get(3).unwrap().is_none());
@@ -912,6 +1091,58 @@ mod test {
         let addrs = vec![addr(1, 2), None];
         let ids = row_addrs_to_row_ids(&plain, addrs.clone()).await.unwrap();
         assert_eq!(ids, addrs);
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_to_row_addrs() {
+        let batch = sequence_batch(0..25);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        // Rewriting row 3 gives it a new address in a new fragment but keeps its id.
+        UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 3")
+            .unwrap()
+            .set("id", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        dataset.delete("id = 21").await.unwrap();
+
+        let addr = |frag: u64, offset: u64| Some((frag << 32) | offset);
+        let addrs = row_ids_to_row_addrs(&dataset, &[12, 3, 21, 999, 12])
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec![addr(1, 2), addr(3, 0), None, None, addr(1, 2)]);
+        assert!(
+            row_ids_to_row_addrs(&dataset, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            row_addrs_to_row_ids(&dataset, addrs).await.unwrap(),
+            vec![Some(12), Some(3), None, None, Some(12)]
+        );
+
+        // Without stable row ids, ids are the addresses: input passes through
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let plain = Dataset::write(reader, "memory://", None).await.unwrap();
+        let ids = [(1u64 << 32) | 2, 999];
+        assert_eq!(
+            row_ids_to_row_addrs(&plain, &ids).await.unwrap(),
+            vec![Some(ids[0]), Some(ids[1])]
+        );
     }
 
     #[tokio::test]

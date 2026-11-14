@@ -19,7 +19,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_arrow::list::ListArrayExt;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_encoding::encodings::logical::primitive::dict::encoded_dictionary_values;
 
 /// A 128-bit BLAKE3 digest of a value's row encoding.
@@ -76,6 +76,10 @@ pub struct DictionaryValueBudget {
     dictionaries: Vec<TrackedDictionary>,
 }
 
+/// Values checked for one atomic write, recorded only after the write succeeds.
+#[derive(Debug)]
+pub struct DictionaryReservation(Vec<HashSet<ValueDigest>>);
+
 impl DictionaryValueBudget {
     /// Returns `None` when `schema` has no dictionary whose key type is narrower than
     /// 32 bits, since wider keys never overflow in practice.
@@ -90,6 +94,49 @@ impl DictionaryValueBudget {
             )?;
         }
         Ok((!dictionaries.is_empty()).then_some(Self { dictionaries }))
+    }
+
+    /// Checks a whole write against the remaining capacity without changing the budget.
+    /// Unlike [`Self::admit`], this rejects an oversized first write too: a MemTable
+    /// must flush to exactly one fragment and cannot rely on file splitting.
+    pub fn reserve(&self, batches: &[RecordBatch]) -> Result<DictionaryReservation> {
+        let mut additions = Vec::with_capacity(self.dictionaries.len());
+        for dictionary in &self.dictionaries {
+            let mut new_values = HashSet::new();
+            for batch in batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                new_values.extend(dictionary.new_values(batch)?);
+                let value_count = dictionary.values.len() + new_values.len();
+                if value_count > dictionary.capacity {
+                    let path =
+                        dictionary
+                            .path
+                            .iter()
+                            .fold(dictionary.column.clone(), |path, step| match step {
+                                PathStep::Child(name) => format!("{path}.{name}"),
+                                PathStep::Items => format!("{path}[]"),
+                            });
+                    return Err(Error::invalid_input(format!(
+                        "Dictionary column '{path}' would contain {value_count} distinct encoded \
+                         values, exceeding its single-fragment key capacity of {}; call \
+                         force_freeze_active and retry, or split the write if it exceeds \
+                         capacity on its own",
+                        dictionary.capacity,
+                    )));
+                }
+            }
+            additions.push(new_values);
+        }
+        Ok(DictionaryReservation(additions))
+    }
+
+    /// Records a reservation made against this budget after its write succeeds.
+    pub fn commit(&mut self, reservation: DictionaryReservation) {
+        for (dictionary, new_values) in self.dictionaries.iter_mut().zip(reservation.0) {
+            dictionary.values.extend(new_values);
+        }
     }
 
     /// Admits the leading `batches`, up to `max_rows` rows, whose dictionary values still
@@ -360,6 +407,25 @@ mod tests {
         };
         assert_eq!(budget.admit(&batches, usize::MAX).unwrap(), full);
 
+        // Strict MemTable admission never leaves a prefix of a rejected write
+        // in the budget, including when the table starts empty.
+        budget.reset();
+        let batches = Vec::from(batches);
+        let error = budget.reserve(&batches).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("capacity of 128"));
+        assert!(budget.is_empty());
+        let reservation = budget.reserve(&batches[..2]).unwrap();
+        budget.commit(reservation);
+        assert_eq!(budget.dictionaries[0].values.len(), 128);
+        let error = budget.reserve(&batches[2..]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("capacity of 128"));
+        // Repeated values do not consume more capacity.
+        let reservation = budget.reserve(&batches[..2]).unwrap();
+        budget.commit(reservation);
+        assert_eq!(budget.dictionaries[0].values.len(), 128);
+
         budget.reset();
         let rest = VecDeque::from([project(nested_batch(128))]);
         let admitted = Admission {
@@ -473,6 +539,12 @@ mod tests {
             .unwrap();
         let batches = VecDeque::from([first, second_batch()]);
         assert_eq!(budget.admit(&batches, usize::MAX).unwrap(), full);
+
+        budget.reset();
+        let error = budget.reserve(&Vec::from(batches)).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("129 distinct encoded values"));
+        assert!(budget.is_empty());
     }
 
     #[test]

@@ -1,0 +1,144 @@
+name: Recover beta Windows ARM64 wheel
+
+# Manual follow-up for an already published beta whose Windows ARM64 wheel never
+# reached the Gemfury beta channel, for example because the wheel job hit its
+# timeout while linking the extension. It rebuilds that one wheel from the
+# commit the published tag resolves to, with the same settings as the release
+# workflow, and only uploads it when this run is explicitly asked to publish.
+# The tag, the GitHub release, the other platforms and PyPI are left untouched.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published beta tag to recover, e.g. v15.0.0-beta.20"
+        required: true
+        type: string
+      sha:
+        description: "Full commit SHA the tag must resolve to"
+        required: true
+        type: string
+      publish:
+        description: "Upload the rebuilt wheel to the Gemfury beta channel"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recover-beta-win-arm64-wheel-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate recovery target
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install packaging
+      - name: Check tag, release and published wheels
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python ci/check_beta_wheel_recovery.py --tag "$TAG" --sha "$SHA"
+      - name: Summarize the planned recovery
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.sha }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          {
+            echo "### Beta wheel recovery"
+            echo ""
+            echo "- Tag: \`$TAG\`"
+            echo "- Commit: \`$SHA\`"
+            echo "- Wheel: pylance Windows ARM64"
+            echo "- Upload to the Gemfury beta channel: \`$PUBLISH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build Windows ARM64 wheel
+    needs: validate
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 1
+          lfs: true
+      # The published source predates this recovery helper. Keep the helper
+      # from the workflow revision separate from the source being rebuilt.
+      - name: Check out the recovery helper
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .recovery-tools
+          sparse-checkout: ci/check_beta_wheel_recovery.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Set the version from the tag
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.sha }}
+        shell: bash
+        run: |
+          SOURCE_SHA=$(git rev-parse HEAD)
+          if [ "$SOURCE_SHA" != "$SHA" ]; then
+            echo "Checked out $SOURCE_SHA instead of the verified commit $SHA" >&2
+            exit 1
+          fi
+          CARGO_VERSION=$(grep -m1 '^version = ' python/Cargo.toml | cut -d'"' -f2)
+          if [ "$CARGO_VERSION" != "${TAG#v}" ]; then
+            echo "python/Cargo.toml declares $CARGO_VERSION, but $TAG expects ${TAG#v}" >&2
+            exit 1
+          fi
+          pip install packaging
+          python ci/setup_version.py "$TAG"
+      - name: Build wheel
+        uses: ./.github/workflows/build_windows_wheel
+        with:
+          python-minor-version: "11"
+          args: "--release --strip"
+      - name: Verify the built wheel
+        env:
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: python .recovery-tools/ci/check_beta_wheel_recovery.py --tag "$TAG" --wheel-dir python/target/wheels
+      - name: Upload the wheel as an artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pylance-beta-win_arm64
+          path: python/target/wheels/*.whl
+          retention-days: 30
+      - name: Re-check the target right before publishing
+        if: ${{ inputs.publish }}
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: python .recovery-tools/ci/check_beta_wheel_recovery.py --tag "$TAG" --sha "$SHA"
+      - name: Publish to the Gemfury beta channel
+        if: ${{ inputs.publish }}
+        uses: ./.github/workflows/upload_wheel
+        with:
+          os: windows-11-arm
+          repo: fury
+          pypi_token: ${{ secrets.PYPI_TOKEN }}
+          fury_token: ${{ secrets.FURY_TOKEN }}

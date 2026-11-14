@@ -3,6 +3,8 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+mod prewarm;
+
 use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
 use crate::vector::bq::planes::{EntryColumns, PlaneBatch, PlaneKey, plane_columns};
@@ -260,6 +262,12 @@ pub(crate) fn accumulate_distances_into_heap(
     let mut max_dist = res.peek().map(|node| node.dist);
 
     for (id, dist) in dists.iter().copied().enumerate() {
+        // Nearly every row of a full heap loses to its worst entry; one plain
+        // float compare settles those before the total-order compares below.
+        // A NaN fails this test and takes the ordered path unchanged.
+        if res.len() >= k && max_dist.is_some_and(|max_dist| dist >= max_dist.0) {
+            continue;
+        }
         let dist = OrderedFloat(dist);
         if dist < lower_bound || dist >= upper_bound {
             continue;
@@ -2006,52 +2014,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .partition_from_codes(part_id, &codes, attach, io_stats.as_ref())
             .await?;
         Ok((storage, hit))
-    }
-
-    /// Warm every plane entry a full-precision scan reads. Backend admission
-    /// enforces its byte budget.
-    ///
-    /// A backend that gates lower planes on their sign plane is warmed plane
-    /// by plane: all sign planes first, then the other planes of partitions
-    /// whose sign plane stayed resident. Other backends admit plane entries
-    /// like any entry, so they are warmed partition by partition, which loads
-    /// (and persists) every plane whatever fits in RAM, as the native
-    /// partition prewarm does.
-    pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
-        let planes = [0, 1];
-        if !cache.plane_admission_gated() {
-            for part_id in 0..self.num_partitions() {
-                for &plane in &planes {
-                    cache
-                        .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                            Ok(plane_cache_entry(
-                                self.read_plane_entry(part_id, plane, None).await?,
-                            ))
-                        })
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-        for &plane in &planes {
-            for part_id in 0..self.num_partitions() {
-                if plane > 0
-                    && !cache
-                        .peek_resident_with_key(&self.plane_key(part_id, 0))
-                        .await
-                {
-                    continue;
-                }
-                cache
-                    .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                        Ok(plane_cache_entry(
-                            self.read_plane_entry(part_id, plane, None).await?,
-                        ))
-                    })
-                    .await?;
-            }
-        }
-        Ok(())
     }
 
     /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
