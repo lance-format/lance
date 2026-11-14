@@ -213,7 +213,7 @@ pub(super) fn decode(
     range: Range<u64>,
     workspace: &mut Reservation,
 ) -> Result<Option<DataBlock>> {
-    let plan = plan(codec, data, num_values, range.clone())?;
+    let plan = plan(codec, data, num_values, range)?;
     materialize(&plan, &data[plan.values_buffer], workspace, |output| {
         if plan.metadata.is_none() && matches!(codec.layout, BinaryMiniBlockLayout::Generic { .. })
         {

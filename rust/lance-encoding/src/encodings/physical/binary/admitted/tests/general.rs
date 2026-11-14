@@ -6,6 +6,7 @@ use crate::{
     compression::BlockCompressor,
     data::FixedWidthDataBlock,
     encodings::physical::{
+        binary::test_utils::uncompressed_general_offsets,
         block::{CompressionConfig, CompressionScheme},
         general::GeneralBlockCompressor,
         value::ValueEncoder,
@@ -22,6 +23,9 @@ fn encoded(
         .iter()
         .flat_map(|v| v.to_le_bytes()[..usize::from(bits / 8)].to_vec())
         .collect::<Vec<_>>();
+    if scheme == CompressionScheme::None {
+        return (uncompressed_general_offsets(bits), LanceBuffer::from(bytes));
+    }
     // Use the same General(Flat) writer and descriptor as the sequence candidate.
     let (payload, encoding) = GeneralBlockCompressor::new(
         Box::new(ValueEncoder::default()),

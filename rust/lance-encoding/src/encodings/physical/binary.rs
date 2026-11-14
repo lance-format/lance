@@ -1454,6 +1454,9 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 }
 
 #[cfg(test)]
+pub(crate) mod test_utils;
+
+#[cfg(test)]
 mod tests {
     use super::{BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder};
     use arrow_array::{

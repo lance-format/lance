@@ -5,8 +5,8 @@ use super::*;
 use crate::{
     compression::BlockCompressor,
     encodings::physical::{
-        dictionary::BlockDictionaryEncoder, general::GeneralBlockCompressor, rle::BlockRleEncoder,
-        value::ValueEncoder,
+        binary::test_utils::uncompressed_general_offsets, dictionary::BlockDictionaryEncoder,
+        general::GeneralBlockCompressor, rle::BlockRleEncoder, value::ValueEncoder,
     },
     format::{EncodingUtils, metadata::compressive_encoding::Compression},
 };
@@ -30,6 +30,15 @@ fn payload_fixture(
         let mut values = Vec::new();
         for value in [0_u64, 1, 1, 3, 4] {
             values.extend_from_slice(&value.to_le_bytes()[..usize::from(bits / 8)]);
+        }
+        if matches!(kind, OffsetCodec::General(CompressionScheme::None)) {
+            return framed_fixture(
+                &[&values, b"abcd"],
+                uncompressed_general_offsets(bits),
+                large,
+                nested,
+                available,
+            );
         }
         let compressor: Box<dyn BlockCompressor> = if matches!(kind, OffsetCodec::Rle) {
             Box::new(
