@@ -624,7 +624,8 @@ mod tests {
 
         // A list-element index passes `address_index_incompatibility` either
         // way; only a key that no longer resolves refuses it.
-        let list_index = index_with("detections_idx", list_element_details(), 0);
+        let mut list_index = index_with("detections_idx", list_element_details(), 0);
+        list_index.fields.extend([2, 3]);
         assert!(address_index_incompatibility(&list_index).is_none());
         let detections = |with_confidence: bool| {
             let mut item_fields = vec![arrow_schema::Field::new(

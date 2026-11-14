@@ -4,6 +4,8 @@
 //! Utilities for remapping row ids. Necessary before stable row ids.
 //!
 
+use crate::index::field_dependencies::input_field_ids;
+
 use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
@@ -1200,7 +1202,7 @@ pub async fn remap_column_index(
         // The real question is "does this index belong to this column",
         // i.e. its one keyed field is `field.id`. Carried fields are
         // irrelevant here, same as in `index::remap::remap_index`.
-        if index.keyed_field() != Some(field.id) {
+        if input_field_ids(index)?.as_ref() != [field.id] {
             return Err(Error::index(format!(
                 "Index name {} already exists with fields {:?} (carried fields {:?}); \
                  expected a single keyed field {}",

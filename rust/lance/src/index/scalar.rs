@@ -17,6 +17,7 @@ pub(crate) mod ngram;
 pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
+use super::field_dependencies::input_field_ids;
 use super::frag_reuse::ResolvedRemapping;
 pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
@@ -833,14 +834,19 @@ pub async fn load_scalar_segment_params(
     dataset: &Dataset,
     segment: &IndexMetadata,
 ) -> Result<ScalarIndexParams> {
-    let field_id = segment.keyed_field().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "Scalar index {} ({}) must have one keyed field, got {:?}",
-            segment.name,
-            segment.uuid,
-            segment.keyed_fields()
-        ))
-    })?;
+    let inputs = input_field_ids(segment)?;
+    let field_id = inputs
+        .first()
+        .copied()
+        .filter(|_| inputs.len() == 1)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Scalar index {} ({}) must have one keyed field, got {:?}",
+                segment.name,
+                segment.uuid,
+                segment.keyed_fields()
+            ))
+        })?;
     let column = dataset.schema().field_path(field_id)?;
     let details = IndexDetails(fetch_index_details(dataset, &column, segment).await?);
     if details.is_vector() {
@@ -1133,15 +1139,13 @@ pub fn index_matches_criteria(
     }
 
     if let Some(for_column) = criteria.for_column {
-        // A covered index lists its carried columns in `fields` too. Only the
-        // keyed prefix decides which column this index answers for, and there
-        // must be exactly one of it.
-        if index.keyed_field().is_none() {
+        // Carried columns and additional dependencies do not add query inputs.
+        if input_field_ids(index)?.len() != 1 {
             return Ok(false);
         }
         if fields.len() != 1 {
-            // Callers must resolve `fields` from the keyed prefix alone. A caller
-            // that passes all of `index.fields` -- carried columns included --
+            // Callers must resolve `fields` from the query inputs alone. A caller
+            // that passes all of `index.fields` -- dependencies included --
             // lands here for every covered index and silently gets "no match"
             // rather than an error, which is how `describe_indices` came to omit
             // them.

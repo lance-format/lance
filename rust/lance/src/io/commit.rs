@@ -19,6 +19,7 @@
 //! terms of a lock. The trait `CommitLock` can be implemented as a simpler
 //! alternative to [`CommitHandler`].
 
+use crate::index::field_dependencies::input_field_ids;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZero;
@@ -1162,11 +1163,10 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         if needs_recalculating.contains(&index.name)
             || bitmap_missing_or_legacy && !is_system_index(index)
         {
-            // A covered index still has exactly one keyed field; the trailing
-            // `covering_fields` are carried, not keyed, so counting them
-            // against `fields.len()` would fail this on a legal covered index.
+            // Additional dependencies and carried columns do not change the
+            // one query input used to recover the bitmap.
             debug_assert!(
-                index.keyed_field().is_some(),
+                input_field_ids(index)?.len() == 1,
                 "migrate_indices expects a single keyed field, got fields {:?} carrying {:?}",
                 index.fields,
                 index.covering_fields,
