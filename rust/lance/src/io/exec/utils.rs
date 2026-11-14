@@ -360,7 +360,7 @@ fn shared_prefilter_future(
                                 }
                             }
                             .await;
-                            CloneableResult::from(result.map(Arc::new))
+                            CloneableResult::from(result)
                         }
                         .boxed()
                         .shared()
@@ -455,11 +455,7 @@ fn prefilter_mask_future(
         }
         None => prefilter_loader,
     };
-    Ok(prefilter_loader.map(|loader| {
-        async move { loader.load().await.map(Arc::new) }
-            .in_current_span()
-            .boxed()
-    }))
+    Ok(prefilter_loader.map(|loader| async move { loader.load().await }.in_current_span().boxed()))
 }
 
 pub(crate) fn build_prefilter(
@@ -557,7 +553,7 @@ impl FilteredRowIdsToPrefilter {
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         let metrics = self.metrics.as_ref();
         let _load_timer = metrics.map(|m| m.load_time.timer());
         if let Some(metrics) = metrics {
@@ -593,7 +589,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         {
             metrics.row_ids.add(row_ids as usize);
         }
-        Ok(mask)
+        Ok(Arc::new(mask))
     }
 }
 
@@ -602,7 +598,7 @@ pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         let batch = self.0.try_next().await?.ok_or_else(|| {
             Error::internal("Selection vector source for prefilter did not yield any batches")
         })?;
@@ -615,7 +611,7 @@ impl FilterLoader for SelectionVectorToPrefilter {
         // support both the TwoMask and the legacy ThreeVariant wire formats
         // that ScalarIndexExec may emit.
         let (result, _) = IndexExprResult::deserialize(&batch)?;
-        Ok(result.upper)
+        Ok(Arc::new(result.upper))
     }
 }
 

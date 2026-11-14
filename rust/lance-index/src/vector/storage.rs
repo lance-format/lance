@@ -1521,8 +1521,30 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
+        Self::from_cached_with_quantizer(
+            reader,
+            ivf,
+            metadata,
+            distance_type,
+            frag_reuse_index,
+            None,
+        )
+    }
+
+    /// [`Self::from_cached_with_remapper`] with a quantizer built earlier for
+    /// the same metadata, so reconstructing an index does not rebuild it (and
+    /// its prepared targets) from the metadata each time.
+    #[doc(hidden)]
+    pub fn from_cached_with_quantizer(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        quantizer: Option<Quantizer>,
+    ) -> Self {
         let quantizer = if Q::retain_quantizer_for_partition_storage() {
-            Q::from_metadata(&metadata, distance_type).ok()
+            quantizer.or_else(|| Q::from_metadata(&metadata, distance_type).ok())
         } else {
             None
         };

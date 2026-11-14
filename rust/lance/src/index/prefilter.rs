@@ -68,7 +68,7 @@ pub struct DatasetPreFilter {
     // Row addresses whose index entries are stale due to a newer data overlay committed after
     // the index was built. Computed synchronously at plan time and ANDead into the final mask
     // so the index never returns those rows.
-    pub(super) overlay_block: Option<RowAddrMask>,
+    pub(super) overlay_block: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -79,11 +79,8 @@ impl DatasetPreFilter {
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
-        let filter = filter.map(|filter| {
-            async move { filter.load().await.map(Arc::new) }
-                .in_current_span()
-                .boxed()
-        });
+        let filter =
+            filter.map(|filter| async move { filter.load().await }.in_current_span().boxed());
         Self::new_with_filter_future(dataset, indices, filter)
     }
 
@@ -329,7 +326,7 @@ impl DatasetPreFilter {
     /// Block specific row addresses from index results because their index entries are stale
     /// due to a data overlay committed after the index was built.
     pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
-        self.overlay_block = Some(block);
+        self.overlay_block = Some(Arc::new(block));
         self
     }
 
@@ -521,30 +518,33 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
-            // Deletions only: `RowAddrMask::default()` selects every row, so the
-            // combined mask is the deletion mask itself. Share it instead of copying.
-            if self.only_deletions()
-                && let Some(deleted_ids) = &self.deleted_ids
-            {
-                return deleted_ids.get_ready();
-            }
-            let mut combined = RowAddrMask::default();
-            if let Some(filtered_ids) = &self.filtered_ids {
-                combined = combined & filtered_ids.get_ready().as_ref().clone();
-            }
-            if let Some(deleted_ids) = &self.deleted_ids {
-                combined = combined & (*deleted_ids.get_ready()).clone();
-            }
-            if let Some(deleted) = &self.deleted_fragments {
+            // Every mask is shared (with its cache or with this prefilter), so
+            // they are intersected by reference and only the result is
+            // allocated; a lone mask is handed out as is.
+            let deleted_fragments = self.deleted_fragments.as_ref().map(|deleted| {
                 let mut block_list = RowAddrTreeMap::new();
                 for frag_id in deleted.iter() {
                     block_list.insert_fragment(frag_id);
                 }
-                combined = combined & RowAddrMask::from_block(block_list);
-            }
-            if let Some(overlay_block) = &self.overlay_block {
-                combined = combined & overlay_block.clone();
-            }
+                Arc::new(RowAddrMask::from_block(block_list))
+            });
+            let mut masks = [
+                self.filtered_ids.as_ref().map(|ids| ids.get_ready()),
+                self.deleted_ids.as_ref().map(|ids| ids.get_ready()),
+                deleted_fragments,
+                self.overlay_block.clone(),
+            ]
+            .into_iter()
+            .flatten();
+            let Some(first) = masks.next() else {
+                return Arc::new(RowAddrMask::default());
+            };
+            let Some(second) = masks.next() else {
+                return first;
+            };
+            let combined = masks.fold(first.intersect_ref(&second), |combined, mask| {
+                combined.intersect_ref(&mask)
+            });
             Arc::new(combined)
         });
 
