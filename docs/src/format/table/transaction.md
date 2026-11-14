@@ -362,7 +362,13 @@ The Restore operation reverts the table to a previous version. It's generally as
 other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
-- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
+- UpdateConfig (only if it changes schema or field metadata, or changes table metadata
+  by setting `table_metadata_updates.replace` or providing an `update_entries` entry)
+
+A config-only UpdateConfig and an empty, non-replacing `table_metadata_updates` remain
+compatible. A table metadata change cannot be rebased over Restore: provider metadata
+keys are opaque to Lance and may refer to clustering definitions discarded by the
+restore. The update must be recomputed from the restored snapshot.
 
 ### ReserveFragments
 
@@ -456,11 +462,13 @@ Modifies table configuration, table metadata, schema metadata, or field metadata
 
 #### UpdateConfig Compatibility
 
-An UpdateConfig operation only modifies table config and tends to be compatible with other operations. Here
+An UpdateConfig operation does not change data and tends to be compatible with other operations. Here
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
-- Restore (only if the UpdateConfig updates schema or field metadata)
+- Restore (only if the UpdateConfig changes schema or field metadata, or changes table
+  metadata by setting `table_metadata_updates.replace` or providing an `update_entries`
+  entry)
 - UpdateConfig (only if the two operations modify the same config)
 
 ### DataReplacement
