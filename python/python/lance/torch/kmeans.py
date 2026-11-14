@@ -66,10 +66,10 @@ class KMeans:
         self.max_iters = max_iters
 
         self.metric = _normalize_metric_type(metric)
-        if metric in ["l2", "cosine"]:
+        if self.metric in ["l2", "cosine"]:
             # Cosine uses normalized unit vector and calculate l2 distance
             self.dist_func = l2_distance
-        elif metric == "dot":
+        elif self.metric == "dot":
             self.dist_func = dot_distance
         else:
             raise ValueError(

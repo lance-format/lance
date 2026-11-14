@@ -10,6 +10,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from lance.torch.distance import dot_distance, l2_distance  # noqa: E402
 from lance.torch.kmeans import KMeans  # noqa: E402
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
 
@@ -26,6 +27,16 @@ def test_kmeans():
     _, cnts = torch.unique(cluster_ids, return_counts=True)
     assert (cnts >= 1).all() and (cnts <= 8).all()
     assert len(cnts) == 4  # all cluster has data
+
+
+@pytest.mark.parametrize(
+    "metric,expected",
+    [("L2", "l2"), ("euclidean", "l2"), ("COSINE", "cosine"), ("Dot", "dot")],
+)
+def test_kmeans_normalizes_metric(metric, expected):
+    kmeans = KMeans(4, metric=metric, device="cpu")
+    assert kmeans.metric == expected
+    assert kmeans.dist_func is (dot_distance if expected == "dot" else l2_distance)
 
 
 def test_torch_kmeans_accept_torch_device(tmp_path: Path):
