@@ -21,14 +21,10 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Unchanged allocation/read/buffer/bitpacking/MiniBlock suites passed at b80f037d
-      # (run 43580442840); raw/FSL decoding passed at b3d8ac559 (run 43583185775).
-      - name: Validate typed materialization and Arrow validation scratch
-        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib data::admitted::tests -- --nocapture
-      - name: Validate raw codec and typed materialization composition
-        run: >-
-          cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::physical::value::admitted::tests -- --nocapture
-      - name: Validate typed materialization API example
-        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc data::DataBlock::try_to_arrow_in
+      # Run 43586027417 at d5354ac64 passed 61 typed cases, 63 raw/FSL composition
+      # cases and the API example, then failed two strict lint rules. Revalidate the
+      # one changed fixture here; the production repair only spells Vec<Plan> as Vec<Self>.
+      - name: Validate repaired zero-copy fixture
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib data::admitted::tests::compatible_variable_layout_is_zero_copy -- --nocapture
       - name: Lint touched crate
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

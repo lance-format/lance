@@ -282,7 +282,12 @@ fn compatible_variable_layout_is_zero_copy() {
     let budget = AllocationBudget::new(27);
     let mut work = budget.try_reserve(27).unwrap();
     let mut input = work.try_allocate(27).unwrap().unwrap();
-    for (chunk, value) in input.as_mut()[..24].chunks_exact_mut(8).zip([0_i64, 1, 3]) {
+    for (chunk, value) in input.as_mut()[..24]
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip([0_i64, 1, 3])
+    {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
     input.as_mut()[24..].copy_from_slice(b"abc");

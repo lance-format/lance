@@ -55,7 +55,7 @@ enum Plan<'a> {
         data_type: DataType,
         len: usize,
         buffers: Vec<Payload<'a>>,
-        children: Vec<Plan<'a>>,
+        children: Vec<Self>,
         validity: Option<Validity>,
     },
 }
