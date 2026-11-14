@@ -602,3 +602,54 @@ fn prepared_real_writer_and_factory_preserve_range_decode() {
     }
     assert_eq!(first_row, expected.len());
 }
+
+#[rstest]
+#[case::noop(CompressionScheme::None)]
+#[cfg_attr(feature = "lz4", case::lz4(CompressionScheme::Lz4))]
+fn prepared_range_can_recycle_before_any_output(#[case] scheme: CompressionScheme) {
+    let config = CompressionConfig::new(scheme, None);
+    let codec = GeneralMiniBlockDecompressor::new(Box::new(flat()), config);
+    let compressor = GeneralBufferCompressor::get_compressor(config).unwrap();
+    let mut encoded = Vec::new();
+    compressor
+        .compress(bytemuck::cast_slice(&[10_u32, 20, 30, 40]), &mut encoded)
+        .unwrap();
+    let Input {
+        pool,
+        mut work,
+        buffers,
+        sibling,
+        physical,
+    } = input(&[encoded], 32, 1);
+    let first = codec
+        .try_prepare_range_in(&buffers, 4, 0..2, &mut work)
+        .unwrap()
+        .unwrap();
+    let second = codec
+        .try_prepare_range_in(&buffers, 4, 2..4, &mut work)
+        .unwrap()
+        .unwrap();
+    assert!(work.is_empty());
+    assert_eq!(first.budget().output_bytes, 8);
+    // A caller may abandon one prepared range and execute the other. No input
+    // alias or prepared plan can refund the other allocation prematurely.
+    first.recycle(&mut work).unwrap();
+    assert_eq!(work.len(), 16);
+    let result = second.try_decode(&mut work).unwrap().unwrap();
+    assert_eq!(
+        result.as_fixed_width_ref().unwrap().data.as_ref(),
+        bytemuck::cast_slice::<u32, u8>(&[30, 40])
+    );
+    assert_eq!(work.len(), 24);
+    drop(result);
+    let abandoned = codec
+        .try_prepare_range_in(&buffers, 4, 1..2, &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.len(), 8);
+    drop(abandoned);
+    assert_eq!(work.len(), 8); // Drop refunds the pool, not an unrelated workspace.
+    assert_eq!(pool.reserved(), physical + 8);
+    drop((work, buffers, sibling));
+    assert_eq!(pool.reserved(), 0);
+}

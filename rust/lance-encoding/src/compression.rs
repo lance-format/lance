@@ -93,8 +93,10 @@ use std::{ops::Range, str::FromStr, sync::Arc};
 
 mod layout;
 pub mod levels;
+pub(crate) mod prepared;
 pub(crate) mod unsigned;
 pub use layout::MiniBlockOutputLayout;
+pub use prepared::PreparedMiniBlockRange;
 
 /// Payload required by one validated MiniBlock range operation.
 ///
@@ -1303,6 +1305,42 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
         Err(Error::not_supported(
             "mini-block codec has no admitted range decoder",
         ))
+    }
+
+    /// Retain validated input preparation until a complete task can be admitted.
+    /// Unlike [`Self::plan_range`], this may allocate admitted preparation scratch.
+    /// The returned budget excludes that already-charged scratch. No value output
+    /// is published. On refusal/error, exclusive preparation returns to this
+    /// workspace. Unsupported compositions fail without an ordinary fallback.
+    /// Codecs with pure preflight only retain input metadata by default.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::{block::{CompressionConfig, CompressionScheme},
+    ///         general::GeneralMiniBlockDecompressor, value::ValueDecompressor},
+    ///     format::metadata};
+    /// let codec = GeneralMiniBlockDecompressor::new(
+    ///     Box::new(ValueDecompressor::from_flat(&metadata::Flat {
+    ///         bits_per_value: 8, data: None,
+    ///     })), CompressionConfig::new(CompressionScheme::None, None));
+    /// let pool = AllocationBudget::new(8);
+    /// let mut work = pool.try_reserve(8).unwrap();
+    /// let input = [LanceBuffer::from_bytes(work.try_allocate(3).unwrap().unwrap().freeze(), 1)];
+    /// let plan = codec.try_prepare_range_in(&input, 3, 1..3, &mut work).unwrap().unwrap();
+    /// assert_eq!(work.len(), 2); // Three input bytes and three preparation bytes live.
+    /// assert_eq!(plan.budget().workspace_bytes, 2);
+    /// plan.recycle(&mut work).unwrap(); // A later instruction can refuse the whole task.
+    /// assert_eq!(work.len(), 5);
+    /// ```
+    fn try_prepare_range_in<'a>(
+        &'a self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<PreparedMiniBlockRange<'a>>> {
+        PreparedMiniBlockRange::direct(self, data, num_values, range).map(Some)
     }
 
     /// Decode a range whose preflight may itself need admitted preparation scratch.

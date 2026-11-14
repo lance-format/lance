@@ -366,6 +366,16 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
         self.inner.admitted_output_layout()
     }
 
+    fn try_prepare_range_in<'a>(
+        &'a self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<crate::compression::PreparedMiniBlockRange<'a>>> {
+        admitted::prepare(self, data, num_values, range, workspace)
+    }
+
     fn try_prepare_and_decompress_range_in(
         &self,
         data: &[LanceBuffer],
@@ -373,7 +383,10 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
         range: std::ops::Range<u64>,
         workspace: &mut lance_core::utils::allocation::Reservation,
     ) -> Result<Option<DataBlock>> {
-        admitted::decode(self, data, num_values, range, workspace)
+        match self.try_prepare_range_in(data, num_values, range, workspace)? {
+            Some(prepared) => prepared.try_decode(workspace),
+            None => Ok(None),
+        }
     }
 
     fn num_buffers(&self) -> usize {

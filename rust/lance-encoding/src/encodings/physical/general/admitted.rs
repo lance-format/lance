@@ -14,7 +14,9 @@ use lance_core::{
 
 use super::GeneralMiniBlockDecompressor;
 use crate::{
-    buffer::LanceBuffer, compression::MiniBlockDecompressor, data::DataBlock,
+    buffer::LanceBuffer,
+    compression::{MiniBlockDecompressor, PreparedMiniBlockRange, prepared::PreparedExecution},
+    data::DataBlock,
     encodings::physical::block::GeneralBufferCompressor,
 };
 
@@ -28,13 +30,13 @@ impl AsRef<[u8]> for ScratchOwner {
     }
 }
 
-pub(super) fn decode(
-    codec: &GeneralMiniBlockDecompressor,
+pub(super) fn prepare<'a>(
+    codec: &'a GeneralMiniBlockDecompressor,
     data: &[LanceBuffer],
     num_values: u64,
     range: Range<u64>,
     workspace: &mut Reservation,
-) -> Result<Option<DataBlock>> {
+) -> Result<Option<PreparedMiniBlockRange<'a>>> {
     if data.len() != codec.num_buffers() || data.is_empty() {
         return Err(Error::invalid_input(format!(
             "General mini-block has {} buffers, expected {}",
@@ -62,40 +64,66 @@ pub(super) fn decode(
     let mut prepared = data.to_vec();
     prepared[0] = LanceBuffer::from(Buffer::from(view));
     let result = (|| {
-        // Pure inner preflight sees decompressed bytes but cannot publish scratch.
-        // Nested preparation and unaccounted codecs deliberately remain unsupported.
-        let plan = codec
-            .inner
-            .plan_range(&prepared, num_values, range.clone())?;
-        layout.validate_range_bytes(range.end - range.start, plan.output_bytes)?;
-        if plan.workspace_bytes < plan.output_bytes {
-            return Err(Error::internal("General inner plan omits retained output"));
-        }
-        if plan.workspace_bytes > workspace.len() {
-            return Ok(None);
-        }
-        codec
-            .inner
-            .try_decompress_range_in(&prepared, num_values, range, workspace)
+        // Keep pure inner preflight: nested preparation remains unsupported.
+        let plan = PreparedMiniBlockRange::direct(
+            codec.inner.as_ref(),
+            &prepared,
+            num_values,
+            range.clone(),
+        )?;
+        layout.validate_range_bytes(range.end - range.start, plan.budget().output_bytes)?;
+        Ok(plan)
     })();
     drop(prepared);
-    // Reject an inner codec that publishes aliases of preparation instead of its
-    // admitted output. Drop that result before attempting to regain exclusivity.
-    let result = if Arc::strong_count(&scratch) == 1 {
-        result
-    } else {
-        drop(result);
-        Err(Error::internal(
-            "General inner decoder retained preparation scratch",
-        ))
-    };
+    match result {
+        Ok(inner) => Ok(Some(PreparedMiniBlockRange::new(
+            inner.budget(),
+            Box::new(GeneralPrepared { inner, scratch }),
+        ))),
+        Err(error) => {
+            recover_scratch(scratch, workspace)?;
+            Err(error)
+        }
+    }
+}
+
+struct GeneralPrepared<'a> {
+    inner: PreparedMiniBlockRange<'a>,
+    scratch: Arc<ReservedBuffer>,
+}
+
+fn recover_scratch(scratch: Arc<ReservedBuffer>, workspace: &mut Reservation) -> Result<()> {
     let scratch = Arc::try_unwrap(scratch).map_err(|_| {
-        // A misbehaving custom codec may retain an external alias. Its owner still
-        // holds the charge; never refund live bytes merely to restore headroom.
+        // An external alias still holds the charge. Never refund live bytes.
         Error::internal("General inner decoder retained an external scratch alias")
     })?;
-    scratch.recycle(workspace)?;
-    result
+    scratch.recycle(workspace)
+}
+
+impl PreparedExecution for GeneralPrepared<'_> {
+    fn decode(self: Box<Self>, workspace: &mut Reservation) -> Result<Option<DataBlock>> {
+        let Self { inner, scratch } = *self;
+        let result = inner.try_decode(workspace);
+        // Consuming the inner plan drops its read-only views before checking
+        // exclusivity. A codec cannot publish preparation as its admitted output.
+        let result = if Arc::strong_count(&scratch) == 1 {
+            result
+        } else {
+            drop(result);
+            Err(Error::internal(
+                "General inner decoder retained preparation scratch",
+            ))
+        };
+        recover_scratch(scratch, workspace)?;
+        result
+    }
+
+    fn recycle(self: Box<Self>, workspace: &mut Reservation) -> Result<()> {
+        let Self { inner, scratch } = *self;
+        let result = inner.recycle(workspace);
+        recover_scratch(scratch, workspace)?;
+        result
+    }
 }
 
 #[cfg(test)]

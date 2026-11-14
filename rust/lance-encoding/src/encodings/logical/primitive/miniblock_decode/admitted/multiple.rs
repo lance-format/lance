@@ -13,16 +13,17 @@ use lance_core::{
 use super::super::{ChunkDrainInstructions, DecodeMiniBlockTask, LoadedChunk};
 use super::{copy_levels, decode_levels, recycle, selected_ranges};
 use crate::{
-    buffer::LanceBuffer,
-    compression::{MiniBlockDecodeBudget, MiniBlockOutputLayout, levels::LevelDecodePlan},
+    compression::{
+        MiniBlockDecodeBudget, MiniBlockOutputLayout, PreparedMiniBlockRange,
+        levels::LevelDecodePlan,
+    },
     data::DataBlock,
     decoder::DecodedPage,
     repdef::{RepDefUnraveler, max_visible_level},
 };
 
-struct Prepared {
-    values: Vec<LanceBuffer>,
-    stored: u64,
+struct Prepared<'a> {
+    values: Option<PreparedMiniBlockRange<'a>>,
     range: Range<u64>,
     budget: MiniBlockDecodeBudget,
     rep: Option<ReservedBuffer>,
@@ -34,13 +35,13 @@ fn add(left: usize, right: usize) -> Result<usize> {
         .ok_or_else(|| Error::invalid_input("MiniBlock task workspace overflows"))
 }
 
-fn prepare(
-    task: &DecodeMiniBlockTask,
+fn prepare<'a>(
+    task: &'a DecodeMiniBlockTask,
     instruction: &ChunkDrainInstructions,
     chunk: &LoadedChunk,
     layout: &MiniBlockOutputLayout,
     workspace: &mut Reservation,
-) -> Result<Option<Prepared>> {
+) -> Result<Option<Prepared<'a>>> {
     let start = instruction
         .rows_to_skip
         .checked_add(instruction.chunk_instructions.rows_to_skip)
@@ -93,6 +94,7 @@ fn prepare(
     let mut def = None;
     let mut selected_rep = None;
     let mut selected_def = None;
+    let mut values = None;
     let result = (|| {
         rep = decode_levels(rep_plan.as_ref(), workspace)?;
         def = decode_levels(def_plan.as_ref(), workspace)?;
@@ -112,17 +114,17 @@ fn prepare(
             chunk.items_in_chunk,
             instruction.preamble_action,
         )?;
-        let budget = task.value_decompressor.plan_range(
+        values = task.value_decompressor.try_prepare_range_in(
             &sections.value_buffers,
             chunk.items_in_chunk,
             range.clone(),
+            workspace,
         )?;
+        let Some(prepared) = values.as_ref() else {
+            return Ok(None);
+        };
+        let budget = prepared.budget();
         layout.validate_range_bytes(range.end - range.start, budget.output_bytes)?;
-        if budget.workspace_bytes < budget.output_bytes {
-            return Err(Error::invalid_input(
-                "MiniBlock value plan disagrees with concat layout",
-            ));
-        }
         let selected = (levels.end - levels.start)
             .checked_mul(2 * (u64::from(rep.is_some()) + u64::from(def.is_some())))
             .and_then(|n| usize::try_from(n).ok())
@@ -133,14 +135,16 @@ fn prepare(
         selected_rep = copy_levels(rep.as_ref(), &levels, workspace)?;
         selected_def = copy_levels(def.as_ref(), &levels, workspace)?;
         Ok(Some(Prepared {
-            values: sections.value_buffers,
-            stored: chunk.items_in_chunk,
+            values: values.take(),
             range,
             budget,
             rep: selected_rep.take(),
             def: selected_def.take(),
         }))
     })();
+    if let Some(values) = values {
+        values.recycle(workspace)?;
+    }
     recycle(&mut rep, workspace)?;
     recycle(&mut def, workspace)?;
     recycle(&mut selected_rep, workspace)?;
@@ -149,7 +153,7 @@ fn prepare(
 }
 
 fn combine_levels(
-    plans: &[Prepared],
+    plans: &[Prepared<'_>],
     is_rep: bool,
     bytes: usize,
     is_present: bool,
@@ -226,6 +230,9 @@ pub(super) fn decode(
         let required = value_peak
             .max(add(retained, concat_bytes)?)
             .max(level_bytes);
+        // Preparation is already deducted from workspace. Keep that charge
+        // throughout this conservative output/concat preflight, even though each
+        // decoded range will recycle its own preparation before the next decode.
         if required > workspace.len() {
             return Ok(None);
         }
@@ -257,10 +264,12 @@ pub(super) fn decode(
             &task.def_meaning,
         )?;
         let mut decoded = Vec::with_capacity(plans.len());
-        for plan in &plans {
-            let data = task
-                .value_decompressor
-                .try_decompress_range_in(&plan.values, plan.stored, plan.range.clone(), workspace)?
+        for plan in &mut plans {
+            let data = plan
+                .values
+                .take()
+                .ok_or_else(|| Error::internal("missing MiniBlock value preparation"))?
+                .try_decode(workspace)?
                 .ok_or_else(|| {
                     Error::internal("MiniBlock value decoder refused its complete plan")
                 })?;
@@ -280,6 +289,9 @@ pub(super) fn decode(
         Ok(Some(DecodedPage { data, repdef }))
     })();
     for plan in &mut plans {
+        if let Some(values) = plan.values.take() {
+            values.recycle(workspace)?;
+        }
         recycle(&mut plan.rep, workspace)?;
         recycle(&mut plan.def, workspace)?;
     }
