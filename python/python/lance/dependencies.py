@@ -248,7 +248,10 @@ def _enum_values(value: Any) -> Any:
         return value.value
     if isinstance(value, dict):
         return {key: _enum_values(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple)) and value:
+        # Skip lists of plain scalars, such as vectors, without walking them.
+        if isinstance(value[0], (int, float, str, bytes)):
+            return value
         return [_enum_values(item) for item in value]
     return value
 

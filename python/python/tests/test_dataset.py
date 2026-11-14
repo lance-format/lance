@@ -136,14 +136,26 @@ class _EnumRecord(BaseModel):
     color: _Color
     priority: _Priority
     tags: List[_Tag]
+    colors: List[_Color]
+    vector: List[float]
 
 
 @pytest.mark.parametrize("entry_point", ["write_dataset", "from_pydantic_model"])
 def test_pydantic_enum_fields_store_enum_values(tmp_path: Path, entry_point):
     data = [
-        _EnumRecord(color=_Color.BLUE, priority=_Priority.HIGH, tags=[]),
         _EnumRecord(
-            color=_Color.RED, priority=_Priority.LOW, tags=[_Tag(color=_Color.BLUE)]
+            color=_Color.BLUE,
+            priority=_Priority.HIGH,
+            tags=[],
+            colors=[],
+            vector=[0.5, 1.5],
+        ),
+        _EnumRecord(
+            color=_Color.RED,
+            priority=_Priority.LOW,
+            tags=[_Tag(color=_Color.BLUE)],
+            colors=[_Color.RED, _Color.BLUE],
+            vector=[2.5, 3.5],
         ),
     ]
     uri = str(tmp_path / "enum_record")
@@ -153,8 +165,20 @@ def test_pydantic_enum_fields_store_enum_values(tmp_path: Path, entry_point):
         ds = lance.write_dataset(data, uri)
 
     assert ds.to_table().to_pylist() == [
-        {"color": "blue", "priority": 2, "tags": []},
-        {"color": "red", "priority": 1, "tags": [{"color": "blue"}]},
+        {
+            "color": "blue",
+            "priority": 2,
+            "tags": [],
+            "colors": [],
+            "vector": [0.5, 1.5],
+        },
+        {
+            "color": "red",
+            "priority": 1,
+            "tags": [{"color": "blue"}],
+            "colors": ["red", "blue"],
+            "vector": [2.5, 3.5],
+        },
     ]
 
 
