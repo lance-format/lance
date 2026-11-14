@@ -17,6 +17,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+mod hybrid;
+pub use hybrid::{HybridQueryUDTF, HybridQueryUDTFBuilder};
+
 /// Provide a table based on full text search query.
 #[derive(Debug)]
 struct FtsTableProvider {
