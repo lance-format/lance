@@ -77,6 +77,15 @@ Retraining rebuilds the selected indexes and can be expensive. See [Index Mainte
 
 `fast_search=True` limits searches to indexed coverage and can skip recently appended unindexed data. Use it only when lower latency is more important than seeing every newly appended row.
 
+Updates stored in overlay files also affect index visibility. Lance excludes stale index entries in every search mode. The following table describes whether the changed rows are then evaluated using their current values:
+
+| Query | Default search | `fast_search=True` |
+| --- | --- | --- |
+| Scalar filtering | Evaluate changed rows | Evaluate changed rows |
+| Vector search, full-text search, MinHash | Evaluate changed rows | Skip changed rows |
+
+Vector and MinHash searches remain approximate. Full-text search scores need not match a freshly rebuilt index on every query path.
+
 ### Compaction and Rebuilding
 
 Physical rewrites can invalidate row addresses used by indexes. Run compaction before rebuilding or optimizing indexes, and let Lance perform the index remap rather than preserving stale row addresses. Stable row IDs preserve logical row identity across updates and compaction, but they do not by themselves eliminate index maintenance.

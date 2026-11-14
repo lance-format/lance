@@ -14,7 +14,10 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
+use crate::dataset::{
+    AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder, UpdateJoinOptions,
+    UpdateJoinStrategy,
+};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::{ROW_ADDR, ROW_LAST_UPDATED_AT_VERSION};
@@ -228,6 +231,66 @@ async fn test_merge_rejects_duplicate_right_keys(
     dataset.checkout_latest().await.unwrap();
     assert_eq!(dataset.version().version, version);
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), original);
+}
+
+/// A right side holding only the join key has nothing to merge, which every
+/// entry point that joins on it reports as an input error.
+#[rstest]
+#[case::dataset_merge("merge")]
+#[case::fragment_merge_columns("merge_columns")]
+#[case::fragment_update_columns("update_columns")]
+#[case::fragment_update_columns_sort_merge("update_columns_sort_merge")]
+#[tokio::test]
+async fn test_merge_rejects_a_key_only_right_side(
+    #[case] entry_point: &str,
+    #[values(false, true)] empty: bool,
+) {
+    let original =
+        arrow_array::record_batch!(("id", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30]))
+            .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(original.clone())], original.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let right = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let batches = if empty {
+        vec![]
+    } else {
+        vec![Ok(right.clone())]
+    };
+    let reader = RecordBatchIterator::new(batches, right.schema());
+    let error = match entry_point {
+        "merge" => dataset.merge(reader, "id", "id").await.unwrap_err(),
+        "merge_columns" => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            fragment
+                .merge_columns(reader, "id", "id")
+                .await
+                .unwrap_err()
+        }
+        "update_columns" => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            fragment
+                .update_columns(reader, "id", "id")
+                .await
+                .unwrap_err()
+        }
+        _ => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            let options = UpdateJoinOptions::default().with_strategy(UpdateJoinStrategy::SortMerge);
+            fragment
+                .update_columns_with_options(reader, "id", "id", options)
+                .await
+                .unwrap_err()
+        }
+    };
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("no columns besides the join key 'id'"),
+        "{error}"
+    );
+    assert_eq!(dataset.version().version, 1);
 }
 
 #[rstest]
@@ -5965,4 +6028,68 @@ async fn test_merge_staged_new_fragments_concurrent_append_conflicts() {
         "unexpected message: {}",
         err
     );
+}
+
+/// An update that matches no rows leaves the table as it was: no version, no
+/// manifest, so it cannot pre-empt a concurrent writer or a compaction.
+#[rstest]
+#[tokio::test]
+async fn test_update_matching_no_rows_commits_nothing(
+    #[values(false, true)] use_stable_row_id: bool,
+) {
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .col("value", array::fill_utf8("value".to_string()))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(3));
+    let test_uri = TempStrDir::default();
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(data, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    let version = dataset.manifest.version;
+    let dataset = Arc::new(dataset);
+
+    let result = UpdateBuilder::new(dataset.clone())
+        .update_where("key < 0")
+        .unwrap()
+        .set("value", "'changed'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 0);
+    assert_eq!(result.new_dataset.manifest.version, version);
+    assert_eq!(
+        Dataset::open(&test_uri).await.unwrap().manifest.version,
+        version
+    );
+    assert_eq!(
+        result
+            .new_dataset
+            .count_rows(Some("value = 'value'".to_string()))
+            .await
+            .unwrap(),
+        30
+    );
+
+    // An update that does match still commits.
+    let result = UpdateBuilder::new(dataset)
+        .update_where("key < 5")
+        .unwrap()
+        .set("value", "'changed'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 5);
+    assert_eq!(result.new_dataset.manifest.version, version + 1);
 }

@@ -71,12 +71,6 @@ pub struct TransactionRebase<'a> {
     /// to detect in-place column rewrites even after transaction cleanup,
     /// and fields a concurrent `Merge` removed or retyped.
     read_fragments: Option<Arc<Vec<Fragment>>>,
-    /// The fragments live in the snapshot the transaction's `read_version`
-    /// names, set by [`Self::with_read_version_fragments`]. `read_fragments`
-    /// comes from the handle the commit was submitted through, which may
-    /// already be past the rewrite being rebased over; the undeferrable
-    /// withdrawal must be measured against the read version instead.
-    read_version_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -190,7 +184,7 @@ fn same_logical_index(a: &IndexMetadata, b: &IndexMetadata) -> bool {
             .as_ref()
             .map(|details| details.type_url.clone())
     };
-    a.fields == b.fields && a.covering_fields == b.covering_fields && type_url(a) == type_url(b)
+    a.declares_same_fields(b) && type_url(a) == type_url(b)
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a

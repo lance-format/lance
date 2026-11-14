@@ -110,12 +110,13 @@ public class Index {
   }
 
   /**
-   * Fields whose values this index carries but is not keyed on. Always a suffix of {@link
-   * #fields()}, and never all of it, so the first entry of {@code fields()} is always a column the
-   * index is keyed on. Empty for an index that carries no extra columns.
+   * Fields whose values this index carries. Empty for an index that carries no extra columns.
    *
-   * <p>These ids also appear in {@link #fields()} — that is deliberate, so that every consumer
-   * reading {@code fields()} as the index's dependency set also covers them with no change.
+   * <p>When these ids are a shorter trailing slice of {@link #fields()}, those trailing entries of
+   * {@code fields()} are carried, not keyed on, and the first entry of {@code fields()} is a column
+   * the index is keyed on. Otherwise every entry of {@code fields()} is a key, and this list may
+   * repeat entries of {@code fields()}. A consumer reading the index's dependency set reads both
+   * lists.
    *
    * @return the covering field IDs
    */
