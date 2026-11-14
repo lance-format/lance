@@ -486,10 +486,20 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
         "memory://",
-        None,
+        // Two fragments, so a partition offset is not a row address: the masked
+        // scorers must map the selected offset through `storage.row_id`.
+        Some(WriteParams {
+            max_rows_per_file: PQ_MATRIX_NUM_ROWS / 2,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
+    assert_eq!(
+        dataset.fragments().len(),
+        2,
+        "the fixture must span two fragments"
+    );
     let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
     ivf.max_iters = 2;
     ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
@@ -578,6 +588,11 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         assert_ge!(recall, 0.5);
     }
     let row_ids = all_results[0][ROW_ID].as_primitive::<UInt64Type>();
+    assert!(
+        row_ids.values().iter().any(|row_id| row_id >> 32 != 0),
+        "the indexed results must include a row from the second fragment, \
+         whose address differs from its partition offset"
+    );
     let stale_row = row_ids.value(0);
     let owned_rows = row_ids.values().iter().copied().collect::<RowAddrTreeMap>();
     let mixed_rows = row_ids

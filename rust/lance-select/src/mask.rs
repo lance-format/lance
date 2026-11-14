@@ -96,53 +96,71 @@ impl RowAddrMask {
     /// Return the indices of the input row ids that were valid
     ///
     /// Rows are grouped into runs that share a fragment, so the fragment's
-    /// selection is looked up once per run instead of once per row, and a run
-    /// whose rows ascend is intersected with the fragment bitmap in bulk instead
-    /// of probed row by row. Vector search filters whole index partitions through
-    /// this, where per-row [`Self::selected`] dominated the query.
+    /// selection is looked up once per run instead of once per row, and an
+    /// ascending run of 64 or more rows is intersected with the fragment bitmap
+    /// in bulk instead of probed row by row. Vector search filters whole index
+    /// partitions through this, where per-row [`Self::selected`] dominated the
+    /// query.
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
         let mut out = Vec::new();
-        self.selected_offsets_into(row_ids, &mut out);
-        out.into_iter().map(u64::from).collect()
+        self.for_each_selected(row_ids, |offset| out.push(offset as u64));
+        out
     }
 
     /// [`Self::selected_indices`] as `u32` offsets into `out`, cleared first,
-    /// so a scan over many partitions reuses one buffer. `row_ids` must hold
-    /// fewer than `u32::MAX` rows, which an index partition always does.
+    /// so a scan over many partitions reuses one buffer.
+    ///
+    /// Callers must pass fewer than `u32::MAX` rows; an index partition always
+    /// does. Use [`Self::selected_indices`] when the row count is unbounded.
     pub fn selected_offsets_into<'a>(
         &self,
         row_ids: impl Iterator<Item = &'a u64> + 'a,
         out: &mut Vec<u32>,
     ) {
+        out.clear();
+        self.for_each_selected(row_ids, |offset| out.push(offset as u32));
+    }
+
+    /// Calls `emit` with the position of every selected row id. Positions stay
+    /// `usize` here, so no caller's offset goes through `u32` and then back out.
+    fn for_each_selected<'a>(
+        &self,
+        row_ids: impl Iterator<Item = &'a u64> + 'a,
+        mut emit: impl FnMut(usize),
+    ) {
+        // Bulk intersection beats per-row probes only once a run amortizes
+        // building its own bitmap.
+        const BULK_RUN_MIN: usize = 64;
         let (tree, allow) = match self {
             Self::AllowList(tree) => (tree, true),
             Self::BlockList(tree) => (tree, false),
         };
-        out.clear();
         let mut run: Vec<u32> = Vec::new();
         let mut run_fragment = None;
         let mut run_start = 0;
         let mut ascending = true;
-        let mut flush = |fragment: Option<u32>, start: u32, run: &[u32], ascending: bool| {
+        let mut flush = |fragment: Option<u32>, start: usize, run: &[u32], ascending: bool| {
             let Some(fragment) = fragment else {
                 return;
             };
-            let all = start..start + run.len() as u32;
+            let all = start..start + run.len();
             match tree.inner.get(&fragment) {
                 None => {
                     if !allow {
-                        out.extend(all);
+                        for offset in all {
+                            emit(offset);
+                        }
                     }
                 }
                 Some(RowAddrSelection::Full) => {
                     if allow {
-                        out.extend(all);
+                        for offset in all {
+                            emit(offset);
+                        }
                     }
                 }
                 Some(RowAddrSelection::Partial(bitmap)) => {
-                    // Bulk intersection beats per-row probes only once a run
-                    // amortizes building its own bitmap.
-                    if ascending && run.len() >= 64 {
+                    if ascending && run.len() >= BULK_RUN_MIN {
                         let run_set = RoaringBitmap::from_sorted_iter(run.iter().copied())
                             .expect("run checked ascending");
                         let hits = if allow {
@@ -154,14 +172,14 @@ impl RowAddrMask {
                         let mut next = hits.next();
                         for (offset, &row) in run.iter().enumerate() {
                             if next == Some(row) {
-                                out.push(start + offset as u32);
+                                emit(start + offset);
                                 next = hits.next();
                             }
                         }
                     } else {
                         for (offset, &row) in run.iter().enumerate() {
                             if bitmap.contains(row) == allow {
-                                out.push(start + offset as u32);
+                                emit(start + offset);
                             }
                         }
                     }
@@ -174,7 +192,7 @@ impl RowAddrMask {
                 flush(run_fragment, run_start, &run, ascending);
                 run.clear();
                 run_fragment = Some(fragment);
-                run_start = idx as u32;
+                run_start = idx;
                 ascending = true;
             }
             let row = row_id as u32;

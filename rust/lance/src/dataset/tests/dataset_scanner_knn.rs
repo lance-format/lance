@@ -22,6 +22,7 @@ use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
 use lance_core::cache::{CacheActivity, CacheSnapshotMode, LanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
@@ -4177,20 +4178,21 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
 
 /// A query whose probed partitions hold at least two scoring tasks' worth of
 /// bytes (`SCORING_TASK_BYTES`) is scored by concurrent CPU tasks that merge
-/// their heaps, unless the query asks for a single worker (#6475); either way
-/// the result must be the exact top-k, here checked against a flat scan over
-/// the same rows.
+/// their heaps, unless the query asks for a single worker (#6475) or the
+/// compute pool has only one worker; either way the result must be the exact
+/// top-k, here checked against a flat scan over the same rows.
 #[rstest]
-#[case::automatic(0, true)]
-#[case::single_worker(1, false)]
+#[case::automatic(0)]
+#[case::single_worker(1)]
 #[tokio::test]
-async fn test_knn_scores_large_chunk_on_concurrent_tasks(
-    #[case] query_parallelism: i32,
-    #[case] splits: bool,
-) {
+async fn test_knn_scores_large_chunk_on_concurrent_tasks(#[case] query_parallelism: i32) {
     use crate::index::vector::ivf::v2::{PARALLEL_SCORING_CHUNKS, SCORING_TASK_BYTES};
     use rand::{Rng, SeedableRng};
     use std::sync::atomic::Ordering;
+
+    // An automatic query follows the pool size; an explicit count of one pins
+    // the chunk to a single task whatever the pool offers.
+    let splits = query_parallelism != 1 && get_num_compute_intensive_cpus() >= 2;
 
     // The split counter is process-wide, so the cases must not interleave.
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
