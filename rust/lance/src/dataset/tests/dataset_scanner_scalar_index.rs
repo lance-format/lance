@@ -642,8 +642,8 @@ ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(N
 #[tokio::test]
 async fn test_not_or_zone_map(
     #[case] filter: &str,
-    #[case] expected_ids: Vec<i32>,
-    #[values(None, Some(8))] limit: Option<i64>,
+    #[case] mut expected_ids: Vec<i32>,
+    #[values(None, Some(1), Some(8))] limit: Option<i64>,
 ) {
     let batch = arrow_array::record_batch!(
         ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
@@ -706,6 +706,9 @@ async fn test_not_or_zone_map(
             .unwrap();
     }
 
+    if let Some(limit) = limit {
+        expected_ids.truncate(limit as usize);
+    }
     let mut full_scan = dataset.scan();
     full_scan.use_scalar_index(false).filter(filter).unwrap();
     full_scan.limit(limit, None).unwrap();
@@ -715,8 +718,9 @@ async fn test_not_or_zone_map(
 
     let mut indexed_scan = dataset.scan();
     indexed_scan.filter(filter).unwrap();
-    // Eight rows exceed the guaranteed matches, so the limit must fall back to
-    // checking candidates instead of reading only the lower bound.
+    // Neither limit can be served from the guaranteed matches alone: eight rows
+    // exceed them, and in the `OR` cases the first match (id 0) is a candidate
+    // that only a recheck confirms.
     indexed_scan.limit(limit, None).unwrap();
     let plan = indexed_scan.explain_plan(false).await.unwrap();
     assert!(plan.contains("ScalarIndexQuery"), "{plan}");
