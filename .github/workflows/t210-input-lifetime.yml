@@ -1,0 +1,25 @@
+name: T210 input lifetime qualification
+
+on:
+  push:
+    branches: [yang/t210-miniblock-input-lifetime-20261114]
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04-8x
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Verify exact source
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - name: Validate coalesced allocation lifetime
+        run: cargo test --profile ci --locked -p lance-encoding --lib miniblock_input_owner_lifetime -- --nocapture

@@ -2378,6 +2378,259 @@ mod tests {
         PreambleAction, Words, build_chunk_index,
     };
 
+    #[derive(Clone, Copy, Debug)]
+    enum InputOwnership {
+        Separate,
+        Coalesced,
+        CoalescedWithSibling,
+    }
+
+    struct TrackedInput {
+        bytes: Vec<u8>,
+        live: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TrackedInput {
+        fn into_bytes(bytes: Vec<u8>, live: &Arc<std::sync::atomic::AtomicUsize>) -> Bytes {
+            live.fetch_add(bytes.capacity(), std::sync::atomic::Ordering::SeqCst);
+            Bytes::from_owner(Self {
+                bytes,
+                live: live.clone(),
+            })
+        }
+    }
+
+    impl AsRef<[u8]> for TrackedInput {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for TrackedInput {
+        fn drop(&mut self) {
+            self.live
+                .fetch_sub(self.bytes.capacity(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObserveRangeDecode {
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        scratch: Arc<std::sync::atomic::AtomicUsize>,
+        calls: std::sync::Mutex<Vec<(u8, std::ops::Range<u64>, usize)>>,
+        fail_on: Option<u8>,
+        allocate: bool,
+    }
+
+    impl MiniBlockDecompressor for ObserveRangeDecode {
+        fn decompress(&self, _: Vec<LanceBuffer>, _: u64) -> crate::Result<DataBlock> {
+            panic!("range selection must reach decompress_range");
+        }
+
+        fn decompress_range(
+            &self,
+            buffers: Vec<LanceBuffer>,
+            num_values: u64,
+            range: std::ops::Range<u64>,
+        ) -> crate::Result<DataBlock> {
+            use std::sync::atomic::Ordering;
+            assert_eq!(num_values, 8);
+            assert_eq!(
+                self.scratch.load(Ordering::SeqCst),
+                0,
+                "previous decoded scratch is still live"
+            );
+            let input = buffers.into_iter().next().unwrap();
+            let marker = input[0];
+            self.calls.lock().unwrap().push((
+                marker,
+                range.clone(),
+                self.live.load(Ordering::SeqCst),
+            ));
+            if self.fail_on == Some(marker) {
+                return Err(lance_core::Error::corrupt_file_named(
+                    "lifetime-fixture",
+                    "injected range decode failure",
+                ));
+            }
+            let len = (range.end - range.start) as usize;
+            let selected = input.slice_with_length(range.start as usize, len);
+            let data = if self.allocate {
+                LanceBuffer::from_bytes(
+                    TrackedInput::into_bytes(selected.to_vec(), &self.scratch),
+                    1,
+                )
+            } else {
+                selected
+            };
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data,
+                bits_per_value: 8,
+                num_values: len as u64,
+                block_info: BlockInfo::new(),
+            }))
+        }
+
+        fn allocates_output(&self) -> bool {
+            self.allocate
+        }
+
+        fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+            Some(num_values)
+        }
+    }
+
+    // Count the physical owner, not the small slices exposed by Bytes/Arrow. Two chunks
+    // can share one allocation; an unrelated consumer can also keep that owner alive.
+    #[rstest]
+    #[case::separate(InputOwnership::Separate, None)]
+    #[case::coalesced(InputOwnership::Coalesced, None)]
+    #[case::sibling(InputOwnership::CoalescedWithSibling, None)]
+    #[case::error(InputOwnership::Separate, Some(20))]
+    #[case::coalesced_error(InputOwnership::Coalesced, Some(20))]
+    #[case::sibling_error(InputOwnership::CoalescedWithSibling, Some(20))]
+    fn miniblock_input_owner_lifetime(
+        #[case] ownership: InputOwnership,
+        #[case] fail_on: Option<u8>,
+        #[values(false, true)] has_large_chunk: bool,
+        #[values(false, true)] allocate: bool,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const ALLOCATION: usize = 4096;
+        let live = Arc::new(AtomicUsize::new(0));
+        let scratch = Arc::new(AtomicUsize::new(0));
+        let encode = |marker: u8| {
+            let mut bytes = vec![0, 0];
+            if has_large_chunk {
+                bytes.extend_from_slice(&8_u32.to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&8_u16.to_le_bytes());
+            }
+            bytes.resize(
+                bytes.len() + lance_core::utils::bit::pad_bytes::<MINIBLOCK_ALIGNMENT>(bytes.len()),
+                0,
+            );
+            bytes.extend(marker..marker + 8);
+            bytes
+        };
+        let chunks = [encode(10), encode(20), encode(30)];
+        let independent = |encoded: &[u8]| {
+            let mut bytes = vec![0; ALLOCATION];
+            bytes[..encoded.len()].copy_from_slice(encoded);
+            TrackedInput::into_bytes(bytes, &live).slice(..encoded.len())
+        };
+        let (first, second, sibling) = match ownership {
+            InputOwnership::Separate => (independent(&chunks[0]), independent(&chunks[1]), None),
+            _ => {
+                let mut bytes = vec![0; ALLOCATION];
+                bytes[..chunks[0].len()].copy_from_slice(&chunks[0]);
+                bytes[64..64 + chunks[1].len()].copy_from_slice(&chunks[1]);
+                let bytes = TrackedInput::into_bytes(bytes, &live);
+                let sibling =
+                    matches!(ownership, InputOwnership::CoalescedWithSibling).then(|| {
+                        // Exercise the same custom-allocation bridge used by real decode output.
+                        LanceBuffer::from_bytes(bytes.slice(128..129), 1).into_buffer()
+                    });
+                (
+                    bytes.slice(..chunks[0].len()),
+                    bytes.slice(64..64 + chunks[1].len()),
+                    sibling,
+                )
+            }
+        };
+        let third = independent(&chunks[2]);
+        let instruction = |index, data: Bytes, start, count| {
+            (
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx: index,
+                        preamble: PreambleAction::Absent,
+                        rows_to_skip: 0,
+                        rows_to_take: 8,
+                        take_trailer: false,
+                    },
+                    rows_to_skip: start,
+                    rows_to_take: count,
+                    preamble_action: PreambleAction::Absent,
+                },
+                LoadedChunk {
+                    byte_range: 0..data.len() as u64,
+                    data: LanceBuffer::from_bytes(data, 1),
+                    items_in_chunk: 8,
+                    chunk_idx: index,
+                },
+            )
+        };
+        let decoder = Arc::new(ObserveRangeDecode {
+            live: live.clone(),
+            scratch: scratch.clone(),
+            calls: Default::default(),
+            fail_on,
+            allocate,
+        });
+        let task = Box::new(DecodeMiniBlockTask {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: decoder.clone(),
+            dictionary_data: None,
+            def_meaning: Arc::from([]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: vec![
+                instruction(0, first.clone(), 1, 1),
+                instruction(0, first, 3, 1),
+                instruction(1, second, 2, 1),
+                instruction(2, third, 0, 1),
+            ],
+            has_large_chunk,
+        });
+        let result = task.decode();
+        if fail_on.is_some() {
+            let error = result.err().unwrap();
+            assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("injected range decode failure"));
+        } else {
+            let result = result.unwrap();
+            assert_eq!(
+                result.data.as_fixed_width_ref().unwrap().data.as_ref(),
+                &[11, 13, 22, 30]
+            );
+        }
+        let live_after = if sibling.is_some() { ALLOCATION } else { 0 };
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            live_after,
+            "error/EOF must drop owned input"
+        );
+        assert_eq!(scratch.load(Ordering::SeqCst), 0);
+        drop(sibling);
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "last shared consumer releases allocation"
+        );
+
+        let allocations = match ownership {
+            InputOwnership::Separate => [3, 2, 1],
+            InputOwnership::Coalesced => [2, 2, 1],
+            InputOwnership::CoalescedWithSibling => [2, 2, 2],
+        };
+        let mut expected = vec![
+            (10, 1..4, allocations[0] * ALLOCATION),
+            (20, 2..3, allocations[1] * ALLOCATION),
+            (30, 0..1, allocations[2] * ALLOCATION),
+        ];
+        if fail_on.is_some() {
+            expected.truncate(2);
+        }
+        assert_eq!(
+            *decoder.calls.lock().unwrap(),
+            expected,
+            "consumed physical input remained live before the next range decode"
+        );
+    }
+
     #[test]
     fn test_miniblock_decode_uses_exact_fixed_width_output_size() {
         #[derive(Debug)]
