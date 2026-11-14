@@ -19,7 +19,7 @@ use crate::{Error, Result};
 /// Query inputs in their declared order, excluding carried and additional fields.
 /// Unknown plugins and legacy details keep their complete keyed declaration;
 /// neither is evidence that a multi-field declaration has just one input.
-pub(crate) fn input_field_ids(index: &IndexMetadata) -> Result<Cow<'_, [i32]>> {
+pub fn input_field_ids(index: &IndexMetadata) -> Result<Cow<'_, [i32]>> {
     input_field_ids_for(
         &index.fields,
         &index.covering_fields,
@@ -28,7 +28,7 @@ pub(crate) fn input_field_ids(index: &IndexMetadata) -> Result<Cow<'_, [i32]>> {
 }
 
 /// Resolve a staged segment's declaration using the same rules as its metadata.
-pub(crate) fn input_field_ids_for<'a>(
+pub fn input_field_ids_for<'a>(
     fields: &'a [i32],
     covering_fields: &[i32],
     details: Option<&prost_types::Any>,
@@ -73,7 +73,7 @@ fn resolve_input_field_ids<'a>(
 
 /// Persist additional dependencies after the input columns for a newly built index.
 /// The plugin must already have recorded any dataset field IDs in its details.
-pub(crate) fn fields_with_dependencies(
+pub fn fields_with_dependencies(
     schema: &Schema,
     inputs: &[i32],
     details: &prost_types::Any,
