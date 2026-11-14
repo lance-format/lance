@@ -494,16 +494,28 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::moka(LanceCache::with_capacity(4096))]
+    #[case::quick(LanceCache::with_backend(Arc::new(
+        lance_core::cache::QuickCacheBackend::with_capacity(4096)
+    )))]
+    #[case::disabled(LanceCache::no_cache())]
     #[tokio::test]
-    async fn selective_phrase_short_payload_is_an_error_not_a_cache_entry() {
-        let cache = LanceCache::with_capacity(4096);
+    async fn selective_phrase_short_payload_is_an_error_not_a_cache_entry(
+        #[case] cache: LanceCache,
+    ) {
         let value = binary_value(true, false);
         let plan = prepared(value.clone(), &cache);
         for _ in 0..2 {
             let Err(error) = plan.read(2, &NoOpMetricsCollector).await else {
                 panic!("short read accepted");
             };
-            assert!(matches!(error, Error::Index { .. }));
+            // Moka can return Shared while another caller retains the same
+            // loader failure. The root kind and message remain the contract.
+            assert!(
+                matches!(error.find_root(), Error::Index { .. }),
+                "{error:?}"
+            );
             assert!(error.to_string().contains("unexpected buffer length"));
         }
         assert_eq!(value.calls.load(Ordering::SeqCst), 2);
