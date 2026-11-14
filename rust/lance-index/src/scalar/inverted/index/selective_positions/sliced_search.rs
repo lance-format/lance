@@ -27,37 +27,42 @@ pub(super) fn document_ranges(num_docs: usize, target_docs: usize) -> Result<Vec
         .collect())
 }
 
-pub(super) struct SliceSearch<'a> {
+pub(super) struct SliceSearch {
     pub(super) ordinal: usize,
     pub(super) positions: Arc<[PreparedPositions]>,
     pub(super) fetched: FetchedPostings,
-    pub(super) request: ModernSearchRequest<'a>,
+    pub(super) tokens: Arc<Tokens>,
+    pub(super) params: Arc<FtsSearchParams>,
+    pub(super) metrics: Arc<dyn MetricsCollector>,
+    pub(super) impact_scorer: Arc<MemBM25Scorer>,
     pub(super) lengths: Arc<DocLengths>,
     pub(super) visibility: Arc<DocVisibility>,
     pub(super) range: Range<u64>,
     pub(super) shared: Arc<AtomicU32>,
 }
 
-impl SliceSearch<'_> {
+impl SliceSearch {
     pub(super) async fn run(self) -> Result<(usize, Vec<(DocId, f32)>)> {
         let Self {
             ordinal,
             positions,
             fetched,
-            request,
+            tokens,
+            params,
+            metrics,
+            impact_scorer,
             lengths,
             visibility,
             range,
             shared,
         } = self;
-        let tokens = request.tokens.clone();
-        let scorer = request.impact_scorer.clone();
-        let limit = request
-            .params
+        let query_tokens = tokens.clone();
+        let scorer = impact_scorer.clone();
+        let limit = params
             .limit
             .ok_or_else(|| Error::internal("selective phrase lost its finite limit"))?;
         let (mut search, idf, block_limits) = spawn_cpu(move || {
-            let loaded = fetched.into_loaded(&tokens, scorer.as_ref())?;
+            let loaded = fetched.into_loaded(&query_tokens, scorer.as_ref())?;
             let idf = idf_by_position(&loaded.postings, scorer.as_ref());
             let search = PhraseSearch::new(loaded.postings, limit)?.with_doc_range(range)?;
             let block_limits = search.position_block_limits();
@@ -65,16 +70,16 @@ impl SliceSearch<'_> {
         })
         .await?;
         let mut read_ahead = ReadAhead::new(positions.len());
-        let clause_budget = MAX_LIVE_WINDOW_BYTES / request.tokens.len() as u64;
+        let clause_budget = MAX_LIVE_WINDOW_BYTES / tokens.len() as u64;
         loop {
             let lengths = lengths.clone();
             let visibility = visibility.clone();
-            let scorer = request.impact_scorer.clone();
+            let scorer = impact_scorer.clone();
             let shared = shared.clone();
-            let metrics = request.metrics.clone();
+            let cpu_metrics = metrics.clone();
             let advance = spawn_cpu(move || {
                 let docs = ModernWandDocuments::filtered(&lengths, visibility.as_ref());
-                let progress = search.advance(&docs, scorer, shared, metrics.as_ref())?;
+                let progress = search.advance(&docs, scorer, shared, cpu_metrics.as_ref())?;
                 Ok::<_, Error>((search, progress))
             });
             let (next, progress) = read_ahead.drive(advance).await?;
@@ -83,7 +88,7 @@ impl SliceSearch<'_> {
                 PhraseProgress::Done(candidates) => {
                     read_ahead.clear();
                     drop(search);
-                    let scorer = request.impact_scorer.clone();
+                    let scorer = impact_scorer.clone();
                     let scored = spawn_cpu(move || {
                         Ok::<_, Error>(rescore_partition_candidates(
                             PartitionCandidates {
@@ -107,7 +112,7 @@ impl SliceSearch<'_> {
                             .ok_or_else(|| {
                                 Error::internal("position request has no prepared term")
                             })?;
-                        let metrics = request.metrics.as_ref();
+                        let metrics = metrics.as_ref();
                         let read = read_ahead
                             .take(term, block_request.index)
                             .unwrap_or_else(|| plan.read(block_request.index, metrics).boxed());
@@ -137,8 +142,7 @@ impl SliceSearch<'_> {
                         read_ahead.schedule(
                             term,
                             predictions.map(|blocks| {
-                                let future =
-                                    plan.read(blocks.start, request.metrics.as_ref()).boxed();
+                                let future = plan.read(blocks.start, metrics.as_ref()).boxed();
                                 (blocks, future)
                             }),
                         )?;

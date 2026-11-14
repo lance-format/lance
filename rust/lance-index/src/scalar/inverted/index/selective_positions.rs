@@ -464,7 +464,7 @@ impl InvertedIndex {
                         })?;
                         let visibility = documents.visibility(request.mask.clone(), false).await?;
                         if !visibility.may_match().await? {
-                            return Ok::<Vec<sliced_search::SliceSearch<'a>>, Error>(Vec::new());
+                            return Ok::<Vec<sliced_search::SliceSearch>, Error>(Vec::new());
                         }
                         let lengths = documents.lengths().await?;
                         let ids = request.term_ids.map(|ids| ids.partition(ordinal));
@@ -479,18 +479,21 @@ impl InvertedIndex {
                             )
                             .await?
                         else {
-                            return Ok::<Vec<sliced_search::SliceSearch<'a>>, Error>(Vec::new());
+                            return Ok::<Vec<sliced_search::SliceSearch>, Error>(Vec::new());
                         };
                         let ranges = sliced_search::document_ranges(documents.len(), config.target_docs)?;
                         let positions: Arc<[PreparedPositions]> = positions.into();
                         let visibility = Arc::new(visibility);
-                        let mut slices: Vec<sliced_search::SliceSearch<'a>> = Vec::with_capacity(ranges.len());
+                        let mut slices: Vec<sliced_search::SliceSearch> = Vec::with_capacity(ranges.len());
                         for range in ranges {
                             slices.push(sliced_search::SliceSearch {
                                 ordinal,
                                 positions: positions.clone(),
                                 fetched: fetched.clone(),
-                                request: request.clone(),
+                                tokens: request.tokens.clone(),
+                                params: request.params.clone(),
+                                metrics: request.metrics.clone(),
+                                impact_scorer: request.impact_scorer.clone(),
                                 lengths: lengths.clone(),
                                 visibility: visibility.clone(),
                                 range,
