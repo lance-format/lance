@@ -11,6 +11,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use lance_arrow::SchemaExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::SCORE_FIELD;
 use lance_index::scalar::inverted::parser::from_json;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -18,13 +19,14 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 /// Provide a table based on full text search query.
+///
+/// The table has the dataset's columns, then `_score`, then `_rowid` and
+/// `_rowaddr` when requested.
 #[derive(Debug)]
 struct FtsTableProvider {
     dataset: Arc<Dataset>,
     fts_query: FullTextSearchQuery,
     full_schema: Arc<Schema>,
-    row_id_idx: Option<usize>,
-    row_addr_idx: Option<usize>,
     ordered: bool,
 }
 
@@ -36,23 +38,19 @@ impl FtsTableProvider {
         with_row_addr: bool,
         ordered: bool,
     ) -> Self {
-        let mut full_schema = Schema::from(dataset.schema());
-        let mut row_id_idx = None;
-        let mut row_addr_idx = None;
+        let mut full_schema = Schema::from(dataset.schema())
+            .try_with_column(SCORE_FIELD.clone())
+            .unwrap();
         if with_row_id {
             full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
-            row_id_idx = Some(full_schema.fields().len() - 1);
         }
         if with_row_addr {
             full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
-            row_addr_idx = Some(full_schema.fields().len() - 1);
         }
         Self {
             dataset,
             fts_query,
             full_schema: Arc::new(full_schema),
-            row_id_idx,
-            row_addr_idx,
             ordered,
         }
     }
@@ -77,28 +75,22 @@ impl TableProvider for FtsTableProvider {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
         scan.full_text_search(self.fts_query.clone())?;
-
-        match projection {
-            Some(projection) if projection.is_empty() => {
-                scan.empty_project()?;
-            }
-            Some(projection) => {
-                let mut columns = Vec::with_capacity(projection.len());
-                for field_idx in projection {
-                    if Some(*field_idx) == self.row_id_idx {
-                        scan.with_row_id();
-                    } else if Some(*field_idx) == self.row_addr_idx {
-                        scan.with_row_address();
-                    } else {
-                        columns.push(self.full_schema.field(*field_idx).name());
-                    }
-                }
-                if !columns.is_empty() {
-                    scan.project(&columns)?;
-                }
-            }
-            _ => {}
-        }
+        // Project exactly the requested columns, in the requested order, so
+        // the plan's schema is the one DataFusion asked for.
+        let columns: Vec<&str> = match projection {
+            Some(projection) => projection
+                .iter()
+                .map(|idx| self.full_schema.field(*idx).name().as_str())
+                .collect(),
+            None => self
+                .full_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect(),
+        };
+        scan.disable_scoring_autoprojection();
+        scan.project(&columns)?;
 
         let combined_filter = match filters.len() {
             0 => None,
@@ -214,16 +206,23 @@ impl TableFunctionImpl for FtsQueryUDTF {
 fn parse_query_options(options: &str) -> datafusion::common::Result<(bool, bool, bool)> {
     let value: Value = serde_json::from_str(options)
         .map_err(|e| Error::invalid_input(format!("invalid json options: {}", e)))?;
-    let with_row_id = value
-        .get("with_row_id")
-        .is_some_and(|v| v.as_bool().unwrap_or(false));
-    let with_row_addr = value
-        .get("with_row_addr")
-        .is_some_and(|v| v.as_bool().unwrap_or(false));
-    let ordered = value
-        .get("ordered")
-        .is_some_and(|v| v.as_bool().unwrap_or(false));
-    Ok((with_row_id, with_row_addr, ordered))
+    Ok((
+        parse_bool_option(&value, "with_row_id")?,
+        parse_bool_option(&value, "with_row_addr")?,
+        parse_bool_option(&value, "ordered")?,
+    ))
+}
+
+/// Reads a boolean option. An absent or null value is false.
+fn parse_bool_option(options: &Value, key: &str) -> datafusion::common::Result<bool> {
+    match options.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(value) => Err(Error::invalid_input(format!(
+            "invalid fts option '{key}': expected a boolean, got {value}"
+        ))
+        .into()),
+    }
 }
 
 /// Builder of `FtsQueryUDTF`
@@ -253,8 +252,11 @@ impl FtsQueryUDTFBuilder {
 #[cfg(test)]
 mod tests {
     use crate::Dataset;
-    use crate::dataset::udtf::FtsQueryUDTFBuilder;
+    use crate::dataset::udtf::{FtsQueryUDTFBuilder, parse_query_options};
     use crate::index::DatasetIndexExt;
+    use arrow::compute::concat_batches;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
@@ -262,6 +264,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use lance_index::IndexType;
     use lance_index::scalar::InvertedIndexParams;
+    use rstest::rstest;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -342,5 +345,61 @@ mod tests {
         row_id_col
             .iter()
             .for_each(|v| assert!([1u64, 2u64, 4u64].contains(&v.unwrap())));
+
+        // The scan returns only the projected columns, so DataFusion reads
+        // each column it planned on at the index it expects.
+        let fts = format!("fts('foo', '{}', '{}')", fts_query, options);
+        let sql = |query: String| {
+            let ctx = ctx.clone();
+            async move { ctx.sql(&query).await.unwrap().collect().await.unwrap() }
+        };
+        let results = sql(format!("SELECT count(*) AS n FROM {fts}")).await;
+        assert_eq!(results[0]["n"].as_primitive::<Int64Type>().value(0), 4);
+
+        let results = sql(format!("SELECT _rowid FROM {fts} ORDER BY _rowid DESC")).await;
+        let results = concat_batches(&results[0].schema(), &results).unwrap();
+        assert_eq!(results.num_columns(), 1);
+        assert_eq!(
+            results["_rowid"].as_primitive::<UInt64Type>().values(),
+            &[4, 2, 1, 0]
+        );
+
+        let results = sql(format!(
+            "SELECT number, _rowid FROM {fts} ORDER BY _rowid DESC"
+        ))
+        .await;
+        let results = concat_batches(&results[0].schema(), &results).unwrap();
+        assert_eq!(results.num_columns(), 2);
+        assert_eq!(
+            results["number"].as_primitive::<Int32Type>().values(),
+            &[5, 3, 2, 1]
+        );
+
+        let results = sql(format!("SELECT _score FROM {fts}")).await;
+        assert_eq!(results[0].num_columns(), 1);
+        assert_eq!(results[0]["_score"].data_type(), &DataType::Float32);
+    }
+
+    #[rstest]
+    #[case::absent("{}", Some((false, false, false)))]
+    #[case::null(r#"{"with_row_id": null}"#, Some((false, false, false)))]
+    #[case::booleans(
+        r#"{"with_row_id": true, "with_row_addr": false, "ordered": true}"#,
+        Some((true, false, true))
+    )]
+    #[case::number(r#"{"with_row_id": 1}"#, None)]
+    #[case::string(r#"{"ordered": "true"}"#, None)]
+    fn test_parse_query_options(
+        #[case] options: &str,
+        #[case] expected: Option<(bool, bool, bool)>,
+    ) {
+        let parsed = parse_query_options(options);
+        match expected {
+            Some(expected) => assert_eq!(parsed.unwrap(), expected),
+            None => {
+                let err = parsed.unwrap_err().to_string();
+                assert!(err.contains("expected a boolean"), "{err}");
+            }
+        }
     }
 }
