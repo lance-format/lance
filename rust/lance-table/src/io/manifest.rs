@@ -27,6 +27,7 @@ use lance_io::{
     utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
+use crate::feature_flags::CoveringContract;
 use crate::format::{
     DataStorageFormat, Fragment, IndexMetadata, MAGIC, Manifest, Transaction, pb,
     pb_manifest_without_fragments,
@@ -221,10 +222,11 @@ pub async fn read_manifest_indexes(
             other => other?,
         };
 
+        let contract = CoveringContract::of(manifest);
         let indices = section
             .indices
             .into_iter()
-            .map(IndexMetadata::try_from)
+            .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
             .collect::<Result<Vec<_>>>()?;
         Ok(indices)
     } else {
@@ -256,8 +258,12 @@ async fn do_write_manifest(
 ) -> Result<usize> {
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
+        let contract = CoveringContract::of(manifest);
         let section = pb::IndexSection {
-            indices: indices.iter().map(|i| i.into()).collect(),
+            indices: indices
+                .iter()
+                .map(|index| index.to_manifest_proto(contract))
+                .collect::<Result<_>>()?,
         };
         let pos = writer.write_protobuf(&section).await?;
         manifest.index_section = Some(pos);
@@ -666,6 +672,108 @@ mod test {
         assert!(manifest.index_section.is_none());
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
         assert!(roundtripped_manifest.index_section.is_none());
+    }
+
+    async fn write_index_section(
+        store: &ObjectStore,
+        flags: u64,
+        indices: Vec<IndexMetadata>,
+    ) -> Result<(ManifestLocation, Manifest)> {
+        let mut manifest = crate::transaction::test_support::sample_manifest();
+        manifest.reader_feature_flags = flags;
+        manifest.writer_feature_flags = flags;
+        let path = Path::from(format!("_versions/{flags}.manifest"));
+        let written = crate::io::commit::write_manifest_file_to_path(
+            store,
+            &mut manifest,
+            Some(indices),
+            &path,
+            None,
+        )
+        .await?;
+        let location = ManifestLocation {
+            version: 1,
+            path,
+            size: Some(written.size as u64),
+            naming_scheme: crate::io::commit::ManifestNamingScheme::V1,
+            e_tag: written.e_tag,
+            identity: None,
+            last_modified: None,
+        };
+        Ok((location, manifest))
+    }
+
+    /// The manifest writer stores each entry in the layout the manifest's flags
+    /// select, and the reader gives back the same keys and carried fields.
+    #[tokio::test]
+    async fn test_index_section_follows_the_covering_contract() {
+        use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS};
+
+        let store = ObjectStore::memory();
+        let index = |name: &str, fields: Vec<i32>, covering_fields: Vec<i32>| IndexMetadata {
+            fields,
+            covering_fields,
+            ..crate::transaction::test_support::sample_index_metadata(name)
+        };
+        let suffix = index("suffix", vec![0, 1], vec![1]);
+        let composite = index("composite", vec![0, 1, 1], vec![1]);
+        let independent = index("independent", vec![0], vec![0, 1]);
+        let entries = vec![suffix.clone(), composite.clone(), independent.clone()];
+
+        let (location, manifest) = write_index_section(
+            &store,
+            FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS,
+            entries.clone(),
+        )
+        .await
+        .unwrap();
+        let stored = read_index_section(
+            &store,
+            &location.path,
+            None,
+            manifest.index_section.unwrap(),
+        )
+        .await
+        .unwrap();
+        let stored_fields = stored
+            .indices
+            .iter()
+            .map(|entry| entry.fields.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(stored_fields, vec![vec![0], vec![0, 1], vec![0]]);
+        let read = read_manifest_indexes(&store, &location, &manifest)
+            .await
+            .unwrap();
+        for (read, written) in read.iter().zip(&entries) {
+            assert_eq!(read.keyed_fields(), written.keyed_fields(), "{}", read.name);
+            assert_eq!(read.covering_fields, written.covering_fields);
+        }
+
+        let suffix_entries = vec![suffix, composite];
+        let (location, manifest) =
+            write_index_section(&store, FLAG_COVERED_INDEX_METADATA, suffix_entries.clone())
+                .await
+                .unwrap();
+        let declarations = |indices: &[IndexMetadata]| {
+            indices
+                .iter()
+                .map(|index| (index.fields.clone(), index.covering_fields.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            declarations(
+                &read_manifest_indexes(&store, &location, &manifest)
+                    .await
+                    .unwrap()
+            ),
+            declarations(&suffix_entries),
+            "without the flag, suffix entries are stored and read unchanged"
+        );
+
+        let error = write_index_section(&store, FLAG_COVERED_INDEX_METADATA, vec![independent])
+            .await
+            .expect_err("a keys-only entry must not be written without the flag");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
     }
 
     #[tokio::test]

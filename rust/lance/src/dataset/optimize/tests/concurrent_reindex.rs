@@ -545,6 +545,8 @@ async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_
 enum Racing {
     UpdateInPlace,
     FoldOverlay,
+    Overlay,
+    OverlayThenDelete,
     /// An in-place update, then cleanup of the compaction's version.
     UpdateAndCleanUpCompaction,
     /// The remap job trims the compaction's record.
@@ -557,6 +559,8 @@ enum Racing {
 #[rstest]
 #[case::update_in_place(Racing::UpdateInPlace)]
 #[case::fold_overlay(Racing::FoldOverlay)]
+#[case::overlay(Racing::Overlay)]
+#[case::overlay_then_delete(Racing::OverlayThenDelete)]
 #[case::update_and_clean_up_compaction(Racing::UpdateAndCleanUpCompaction)]
 #[case::remap_and_trim(Racing::RemapAndTrim)]
 #[tokio::test]
@@ -575,6 +579,13 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
         let mut table = open_in_new_session(&hook_uri).await;
         let compaction = table.manifest.version;
         match racing {
+            Racing::Overlay | Racing::OverlayThenDelete => {
+                let fragment = fragment_of(&hook_uri, 0).await as u64;
+                let mut table = overlay_val(table, fragment, 999).await;
+                if matches!(racing, Racing::OverlayThenDelete) {
+                    table.delete("id = 0").await.unwrap();
+                }
+            }
             Racing::UpdateInPlace => update_in_place(table, vec![0], vec![999]).await,
             Racing::FoldOverlay => {
                 let fragment = fragment_of(&hook_uri, 0).await as u64;
@@ -613,7 +624,66 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
         let live = live_fragments(&uri).await;
         assert!(coverage(&uri, "val_idx").await.is_disjoint(&live));
     } else {
-        assert_covers_all_but_the_fragment_of(&uri, Some(0)).await;
+        let withdrawn =
+            (!matches!(racing, Racing::Overlay | Racing::OverlayThenDelete)).then_some(0);
+        assert_covers_all_but_the_fragment_of(&uri, withdrawn).await;
+    }
+}
+
+/// A remap changes addresses without refreshing indexed values. An overlay
+/// racing its publication must survive as either invalidation or a retry.
+#[tokio::test]
+async fn test_remap_publication_races_overlay() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str().to_string();
+    let mut table = indexed_table(&uri, 4).await;
+    build_index(&mut table, "val", "val_idx", false)
+        .await
+        .unwrap();
+    compact_files(&mut table, deferred_compaction(2), None)
+        .await
+        .unwrap();
+    let hook_uri = uri.clone();
+    let hook: Hook = Box::pin(async move {
+        let table = open_in_new_session(&hook_uri).await;
+        let fragment = fragment_of(&hook_uri, 0).await as u64;
+        overlay_val(table, fragment, 999).await;
+    });
+    let (mut remapper, race) = builder_racing(&uri, hook).await;
+    let result =
+        remapping::remap_column_index(&mut remapper, &["val"], Some("val_idx".into())).await;
+    assert!(race.attempts.load(Ordering::SeqCst) >= 1);
+    if let Err(error) = result {
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert!(error.to_string().contains("conflict"));
+    }
+    let mut current = open_in_new_session(&uri).await;
+    let published = current.clone();
+    assert_lookups_match_scan(&uri, probes(24, [999])).await;
+    remapping::remap_column_index(&mut current, &["val"], Some("val_idx".into()))
+        .await
+        .unwrap();
+    assert_lookups_match_scan(&uri, probes(24, [999])).await;
+    for snapshot in [&published, &current] {
+        let index = snapshot
+            .load_index_by_name("val_idx")
+            .await
+            .unwrap()
+            .unwrap();
+        for fragment in snapshot.fragments().iter() {
+            for overlay in &fragment.overlays {
+                // Remapping never reads current values. If its watermark
+                // passes this overlay, it must withdraw the fragment.
+                assert!(
+                    !index
+                        .fragment_bitmap
+                        .as_ref()
+                        .unwrap()
+                        .contains(fragment.id as u32)
+                        || index.dataset_version < overlay.committed_version
+                );
+            }
+        }
     }
 }
 
@@ -1266,4 +1336,122 @@ async fn packed_parent_data_replacement_races_have_expected_outcomes(
         }
     }
     assert!(race.attempts.load(Ordering::SeqCst) > 0);
+}
+
+/// An index build staged over fragments that no committed index covers yet
+/// commits past a deferred compaction that rewrites exactly those fragments.
+#[rstest]
+#[case::merged(true)]
+#[case::unmerged(false)]
+#[tokio::test]
+async fn test_staged_fts_commits_past_a_deferred_compaction_of_unindexed_fragments(
+    #[case] merge: bool,
+) {
+    use lance_index::scalar::InvertedIndexParams;
+
+    fn text_batch(start: i32, rows: i32) -> RecordBatch {
+        let ids: Vec<i32> = (start..start + rows).collect();
+        let text: Vec<String> = ids.iter().map(|id| format!("doc {id} word{id}")).collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("text", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(arrow_array::StringArray::from(text)),
+            ],
+        )
+        .unwrap()
+    }
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    // Indexed base fragments of 12 rows: already at the compaction target.
+    let batch = text_batch(0, 48);
+    let params = WriteParams {
+        max_rows_per_file: 12,
+        ..Default::default()
+    };
+    let mut table = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(params),
+    )
+    .await
+    .unwrap();
+    let fts = InvertedIndexParams::default();
+    table
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &fts,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Small unindexed appends.
+    let batch = text_batch(1000, 24);
+    let params = WriteParams {
+        max_rows_per_file: 6,
+        ..Default::default()
+    };
+    table
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+    // An index build stages a segment over the unindexed fragments.
+    let mut builder = open_in_new_session(uri).await;
+    let indexed = coverage(uri, "text_idx").await;
+    let unindexed: Vec<u32> = builder
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u32)
+        .filter(|id| !indexed.contains(*id))
+        .collect();
+    assert_eq!(unindexed.len(), 4);
+    let segment = builder
+        .create_index_builder(&["text"], IndexType::Inverted, &fts)
+        .name("text_idx".to_string())
+        .replace(true)
+        .fragments(unindexed.clone())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let segments = if merge {
+        vec![
+            builder
+                .merge_existing_index_segments(vec![segment])
+                .await
+                .unwrap(),
+        ]
+    } else {
+        vec![segment]
+    };
+
+    // A deferred compaction folds exactly those fragments.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 12,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    let metrics = compact_files(&mut table, options, None).await.unwrap();
+    assert_eq!(metrics.fragments_removed, 4);
+    let remaining: Vec<u32> = table
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u32)
+        .collect();
+    assert!(unindexed.iter().all(|id| !remaining.contains(id)));
+
+    builder
+        .commit_existing_index_segments("text_idx", "text", segments)
+        .await
+        .unwrap();
 }

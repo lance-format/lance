@@ -928,6 +928,9 @@ public class Dataset implements Closeable {
    * update moves it, so its address can differ between versions. Without stable row IDs, a row ID
    * is its row address, and each input is returned unchanged without checking that the row exists.
    *
+   * <p>Reading stable row IDs may access row-id metadata and deletion files; I/O failures surface
+   * as {@link IOException}.
+   *
    * @param rowIds the row IDs to resolve
    * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
    *     is unknown or its row was deleted
@@ -1078,6 +1081,40 @@ public class Dataset implements Closeable {
   }
 
   private native List<Version> nativeListVersions();
+
+  /**
+   * Get one page of the version history of the dataset.
+   *
+   * <p>Versions are ordered ascending by version, or descending when {@code descending} is true.
+   * Detached versions are never part of the history, and only the manifests in the returned page
+   * are read.
+   *
+   * <p>On a lexically ordered store with V2 manifest paths, a descending page stops listing once
+   * {@code offset + limit} manifest entries have been observed. Ascending pages, V1 manifest paths,
+   * and stores without lexically ordered listings enumerate every manifest location before
+   * selecting the page.
+   *
+   * @param offset the number of versions to skip; an offset past the end of the history returns an
+   *     empty list
+   * @param limit the maximum number of versions to return, or empty for every remaining version;
+   *     zero returns an empty list without listing or reading any manifest
+   * @param descending whether to return the newest version first
+   * @return the requested page of versions
+   */
+  public List<Version> listVersions(long offset, Optional<Long> limit, boolean descending) {
+    Preconditions.checkArgument(offset >= 0, "offset must be non-negative, got %s", offset);
+    Preconditions.checkNotNull(limit, "limit must not be null");
+    limit.ifPresent(
+        value ->
+            Preconditions.checkArgument(value >= 0, "limit must be non-negative, got %s", value));
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListVersionsWithOptions(offset, limit.orElse(-1L), descending);
+    }
+  }
+
+  private native List<Version> nativeListVersionsWithOptions(
+      long offset, long limit, boolean descending);
 
   /**
    * Get the number of versions in the current version history.
@@ -2554,7 +2591,7 @@ public class Dataset implements Closeable {
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
-      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
+      update(tag, Ref.ofMain(versionNumber));
     }
 
     /**

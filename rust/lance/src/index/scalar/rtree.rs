@@ -3,26 +3,16 @@
 
 use std::sync::Arc;
 
-use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
+use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_geo::rtree::RTreeIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::progress::noop_progress;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{OldIndexDataFilter, index_files_to_table};
-use lance_select::RowSetOps;
+use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
-
-fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
-    match filter {
-        Some(
-            OldIndexDataFilter::Fragments { to_keep, .. }
-            | OldIndexDataFilter::RowAddresses { to_keep, .. },
-        ) => to_keep.is_empty(),
-        Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
-        None => false,
-    }
-}
 
 /// Merge one caller-defined group of source RTree segments into a single segment.
 pub(in crate::index) async fn merge_segments(
@@ -47,20 +37,57 @@ pub(in crate::index) async fn merge_segments(
         .min()
         .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
+    // Without stable row ids the two domains coincide, so once a row-id-domain
+    // segment is refused on a stable-row-id dataset the filters can always be
+    // address-domain. `RTreeIndex::merge_segments` keeps the sources' own domain.
+    super::shared_segment_domain(dataset, "RTree", &segment_refs)?;
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
             .await?;
 
+    let new_uuid = Uuid::new_v4();
+    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let created_index = open_and_merge_segments(
+        dataset,
+        &field_path,
+        &segment_refs,
+        None,
+        &new_store,
+        &old_data_filters,
+        staged,
+    )
+    .await?;
+
+    Ok(IndexMetadata {
+        uuid: new_uuid,
+        dataset_version,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(created_index.index_details)),
+        index_version: created_index.index_version as i32,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
+        ..segments[0].clone()
+    })
+}
+
+/// Reuse stored bounding boxes for both maintenance tasks and physical merges.
+pub(in crate::index) async fn open_and_merge_segments(
+    dataset: &Dataset,
+    field_path: &str,
+    segments: &[&IndexMetadata],
+    new_data: Option<SendableRecordBatchStream>,
+    new_store: &LanceIndexStore,
+    old_data_filters: &[Option<OldIndexDataFilter>],
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+) -> Result<CreatedIndex> {
     let mut source_indices = Vec::with_capacity(segments.len());
-    let mut source_filters = Vec::with_capacity(old_data_filters.len());
-    let all_keep_nothing = old_data_filters.iter().all(filter_keeps_nothing);
-    for (position, (segment, filter)) in segments.iter().zip(&old_data_filters).enumerate() {
-        if filter_keeps_nothing(filter) && !(all_keep_nothing && position == 0) {
-            continue;
-        }
+    for segment in segments {
         let scalar_index = super::open_scalar_index_with_plan(
             dataset,
-            &field_path,
+            field_path,
             segment,
             staged.and_then(|plans| plans.get(&segment.uuid)),
             crate::index::frag_reuse::OpenPurpose::Maintenance,
@@ -78,24 +105,14 @@ pub(in crate::index) async fn merge_segments(
                 ))
             })?;
         source_indices.push(Arc::new(rtree_index.clone()));
-        source_filters.push(filter.clone());
     }
 
-    let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    let created_index = merge_rtree_indices(&source_indices, &new_store, &source_filters).await?;
-
-    Ok(IndexMetadata {
-        uuid: new_uuid,
-        dataset_version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        clustering_id: None,
-        metadata: Default::default(),
-        ..segments[0].clone()
-    })
+    RTreeIndex::merge_segments(
+        &source_indices,
+        new_data,
+        new_store,
+        old_data_filters,
+        noop_progress(),
+    )
+    .await
 }

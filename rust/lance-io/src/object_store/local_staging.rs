@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{io::ErrorKind, path::PathBuf};
+use std::{io::ErrorKind, path::PathBuf, sync::Arc};
 
 use futures::{StreamExt, stream, stream::BoxStream};
 use lance_core::{Error, Result};
@@ -10,7 +10,8 @@ use object_store::{
     path::{Path, PathPart},
 };
 
-use super::ObjectStore;
+use super::{LocalDirOperations, ObjectStore};
+use crate::utils::tracking_store::IOTracker;
 
 pub(super) fn is_staging_file_name(name: &str) -> bool {
     name.split_once('#').is_some_and(|(_, suffix)| {
@@ -18,8 +19,32 @@ pub(super) fn is_staging_file_name(name: &str) -> bool {
     })
 }
 
-impl ObjectStore {
-    pub(super) fn local_staging_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+/// The store state that resolves a hidden local staging path to a filesystem path.
+///
+/// [`ObjectStore::delete_stream`] returns a `'static` stream that cannot borrow the
+/// store, so it holds this instead of a second copy of the staging-name and
+/// local-root rules. [`Self::for_store`] yields `None` for a store that cannot hold
+/// hidden staging files, so its deletes need no local special case.
+#[derive(Clone)]
+pub(super) struct LocalStagingPaths {
+    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
+    /// Whether object paths map directly onto filesystem paths below the root.
+    has_local_root: bool,
+}
+
+impl LocalStagingPaths {
+    pub(super) fn for_store(store: &ObjectStore) -> Option<Self> {
+        let has_local_root = store.has_direct_local_paths() || store.scheme == "file-object-store";
+        if store.local_dir_operations.is_none() && !has_local_root {
+            return None;
+        }
+        Some(Self {
+            local_dir_operations: store.local_dir_operations.clone(),
+            has_local_root,
+        })
+    }
+
+    pub(super) fn resolve(&self, path: &Path) -> Result<Option<PathBuf>> {
         let Some(name) = path.filename().filter(|name| is_staging_file_name(name)) else {
             return Ok(None);
         };
@@ -29,12 +54,21 @@ impl ObjectStore {
         // Resolve the parent: LocalFileSystem rejects the staging filename itself.
         let local_parent = if let Some(operations) = &self.local_dir_operations {
             operations.directory_to_filesystem(&parent)?
-        } else if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        } else if self.has_local_root {
             PathBuf::from(crate::local::to_local_path(&parent))
         } else {
             return Ok(None);
         };
         Ok(Some(local_parent.join(name)))
+    }
+}
+
+impl ObjectStore {
+    pub(super) fn local_staging_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        match LocalStagingPaths::for_store(self) {
+            Some(paths) => paths.resolve(path),
+            None => Ok(None),
+        }
     }
 
     /// Recursively list local staging files hidden by `object_store`'s normal listing.
@@ -174,11 +208,93 @@ impl ObjectStore {
     }
 }
 
+/// Removes one hidden local staging file and records it as a delete.
+///
+/// `object_store`'s local implementation rejects these names, so removal bypasses it.
+/// Recording the IO here keeps one logical delete in the metrics whether it took this
+/// path or the backend path.
+pub(super) async fn remove_local_staging_file(
+    path: &Path,
+    local_path: &std::path::Path,
+    io_tracker: &IOTracker,
+) -> Result<()> {
+    let metrics = io_tracker.begin_io("delete");
+    let result = tokio::fs::remove_file(local_path).await.map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            Error::not_found(path.to_string())
+        } else {
+            Error::io(format!(
+                "Failed to remove local staging file {}: {error}",
+                local_path.display()
+            ))
+        }
+    });
+    metrics.record(&result, 0);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::TryStreamExt;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::local("file")]
+    #[case::object_store("file-object-store")]
+    #[tokio::test]
+    async fn delete_stream_removes_hidden_staging_files(#[case] scheme: &str) {
+        // Cleanup hands a whole batch to `delete_stream` once it has enough
+        // candidates, so crossing that bound must not lose staging files to
+        // LocalFileSystem's rejection of their names.
+        let staging_count = 120;
+        let directory = tempfile::tempdir().unwrap();
+        let local_root = directory.path().join("dataset");
+        std::fs::create_dir_all(local_root.join("data")).unwrap();
+        let file_url = url::Url::from_directory_path(&local_root).unwrap();
+        let uri = file_url
+            .as_str()
+            .replacen("file:", &format!("{scheme}:"), 1);
+        let (store, root) = ObjectStore::from_uri(&uri).await.unwrap();
+
+        let mut paths = Vec::new();
+        for index in 0..staging_count {
+            let name = format!("data/part-{index:03}#{index}");
+            std::fs::write(local_root.join(&name), b"staging").unwrap();
+            paths.push(Path::parse(format!("{root}/{name}")).unwrap());
+        }
+        // A regular object in the same batch must still take the backend delete.
+        let regular = root.clone().join("data/part-regular.lance");
+        store.put(&regular, b"regular").await.unwrap();
+        paths.push(regular.clone());
+
+        let to_remove = stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut removed = store
+            .delete_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("a batch of staging files must delete without errors");
+        removed.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(removed, expected);
+
+        for index in 0..staging_count {
+            let name = format!("data/part-{index:03}#{index}");
+            assert!(!local_root.join(&name).exists(), "{name} survived");
+        }
+        assert!(!store.exists(&regular).await.unwrap());
+        // The listing must not find them either, so the deletion is not merely
+        // unreported.
+        assert!(
+            store
+                .read_local_staging_files(&root)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[rstest]
     #[case::local("file")]

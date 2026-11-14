@@ -290,9 +290,22 @@ class DatasetOptimizer:
 
             The limits are packing targets: an indivisible fragment or segment
             larger than a target is processed on its own.
+        max_rows_to_consolidate: optional, int, default None
+            Consolidate the newest segments of each vector index within this
+            budget of physical rows, reusing the newest selected segment's
+            model instead of training. At least two whole segments must fit;
+            older segments and unindexed fragments are left untouched. A
+            segment counts the greater of its physical index entries and the
+            physical rows of the fragments it covers, deleted rows included.
+            Cannot be combined with `retrain`, `num_indices_to_merge` or
+            `max_rows_per_segment`; `max_rows_per_task` may bound the
+            re-encoding tasks, each of which must fit its fragments.
 
         See :py:class:`lance.optimize.OptimizeIndices` to run the same
-        optimization as a plan whose tasks execute on several workers.
+        optimization as a plan whose tasks execute on several workers. Options
+        that decide commit-time checks, such as `max_rows_to_consolidate`, also
+        belong to :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses
+        the defaults when they are omitted.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

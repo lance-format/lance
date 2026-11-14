@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.compaction.CompactionOptions;
 import org.lance.file.FileWriteOptions;
+import org.lance.fragment.DeletionFile;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -57,6 +58,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayInputStream;
@@ -269,6 +272,46 @@ public class DatasetTest {
   }
 
   @Test
+  void testOpenMissingDatasetThrowsDatasetNotFound(@TempDir Path tempDir) {
+    String missingPath = tempDir.resolve("missing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DatasetNotFoundException error =
+          assertThrows(DatasetNotFoundException.class, () -> Dataset.open(missingPath, allocator));
+      assertTrue(error.getMessage().contains("missing_dataset"), error.getMessage());
+      // Handlers written for the IllegalArgumentException thrown before still catch it.
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testCreateExistingDatasetThrowsDatasetAlreadyExists(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("existing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      DatasetAlreadyExistsException error =
+          assertThrows(DatasetAlreadyExistsException.class, testDataset::createEmptyDataset);
+      assertTrue(error.getMessage().contains("existing_dataset"), error.getMessage());
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testOpenUnknownSchemeIsNotDatasetNotFound() {
+    // Invalid input is still reported as a plain IllegalArgumentException, so callers can tell it
+    // apart from a missing dataset.
+    try (BufferAllocator allocator = new RootAllocator()) {
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> Dataset.open("nosuchscheme://bucket/table.lance", allocator));
+      assertEquals(IllegalArgumentException.class, error.getClass(), error.getMessage());
+      assertTrue(error.getMessage().contains("nosuchscheme"), error.getMessage());
+    }
+  }
+
+  @Test
   void testDatasetVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -374,6 +417,42 @@ public class DatasetTest {
             assertEquals(8, summaries.get(2).getTotalRows());
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testListVersionsWithOptions(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("list_versions_with_options").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 5).close();
+      testDataset.write(2, 5).close();
+      testDataset.write(3, 5).close();
+      try (Dataset dataset = testDataset.write(4, 5)) {
+        List<Version> all = dataset.listVersions();
+        assertEquals(5, all.size());
+        assertEquals(5, dataset.getVersionCount());
+
+        List<Version> newest = dataset.listVersions(0, Optional.of(2L), true);
+        assertEquals(Arrays.asList(all.get(4), all.get(3)), newest);
+
+        List<Version> secondPage = dataset.listVersions(2, Optional.of(2L), true);
+        assertEquals(Arrays.asList(all.get(2), all.get(1)), secondPage);
+
+        List<Version> ascending = dataset.listVersions(3, Optional.empty(), false);
+        assertEquals(Arrays.asList(all.get(3), all.get(4)), ascending);
+
+        assertEquals(all, dataset.listVersions(0, Optional.empty(), false));
+        assertTrue(dataset.listVersions(5, Optional.of(2L), false).isEmpty());
+        assertTrue(dataset.listVersions(0, Optional.of(0L), false).isEmpty());
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.listVersions(-1, Optional.empty(), false));
+        assertThrows(
+            IllegalArgumentException.class, () -> dataset.listVersions(0, Optional.of(-1L), false));
       }
     }
   }
@@ -550,6 +629,14 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         dataset2.tags().delete("tag_on_branch");
         assertEquals(1, dataset2.tags().list().size());
+
+        dataset2.tags().update("tag1", 2);
+        assertEquals(2, dataset2.tags().getVersion("tag1"));
+        Dataset.Tags tags = dataset2.tags();
+        dataset2.close();
+        IllegalArgumentException closed =
+            assertThrows(IllegalArgumentException.class, () -> tags.update("tag1", 1));
+        assertTrue(closed.getMessage().contains("Dataset is closed"));
       }
     }
   }
@@ -1113,6 +1200,65 @@ public class DatasetTest {
   }
 
   @Test
+  void testTakeStructProjection(@TempDir Path tempDir) throws Exception {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = createStructTakeDataset(allocator, datasetPath)) {
+      assertEquals(2, dataset.getFragments().size());
+      List<Long> rowIds = listRowIds(dataset);
+
+      try (ArrowReader reader = dataset.take(Arrays.asList(0L, 4L), Arrays.asList("id", "s.x"))) {
+        assertStructTakeResult(reader, new long[] {0L, 4L}, new Integer[] {0, 40});
+      }
+
+      // The row IDs come from a scan, so the selectors are physical and cross fragments.
+      try (ArrowReader reader =
+          dataset.takeRows(
+              Arrays.asList(rowIds.get(5), rowIds.get(0)), Arrays.asList("id", "s.x"))) {
+        assertStructTakeResult(reader, new long[] {5L, 0L}, new Integer[] {50, 0});
+      }
+    }
+  }
+
+  @ParameterizedTest(name = "{0} rejects {1}")
+  @MethodSource("missingStructProjections")
+  void testTakeRejectsMissingStructProjection(String api, String missingPath, @TempDir Path tempDir)
+      throws Exception {
+    Path datasetPath =
+        tempDir.resolve("testTakeRejectsMissingStructProjection-" + missingPath.replace('.', '-'));
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = createStructTakeDataset(allocator, datasetPath.toString())) {
+      List<Long> selectors;
+      if (api.equals("take")) {
+        selectors = Arrays.asList(0L, 4L);
+      } else {
+        List<Long> rowIds = listRowIds(dataset);
+        selectors = Arrays.asList(rowIds.get(0), rowIds.get(5));
+      }
+      List<String> columns = Arrays.asList("id", missingPath);
+
+      RuntimeException error =
+          assertThrows(
+              RuntimeException.class,
+              () -> {
+                try (ArrowReader reader =
+                    api.equals("take")
+                        ? dataset.take(selectors, columns)
+                        : dataset.takeRows(selectors, columns)) {
+                  fail("expected " + api + " to reject the projection path " + missingPath);
+                }
+              });
+      // A Java precondition failure is an IllegalArgumentException, and a native call that
+      // failed to throw would leave null Arrow data and surface as a NullPointerException.
+      assertEquals(RuntimeException.class, error.getClass(), error.toString());
+      String message = error.getMessage();
+      assertNotNull(message);
+      assertTrue(message.contains("Field '" + missingPath + "' not found"), message);
+    }
+  }
+
+  @Test
   void testSample(@TempDir Path tempDir) throws IOException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -1636,7 +1782,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testGetRowAddresses(@TempDir Path tempDir) {
+  void testGetRowAddresses(@TempDir Path tempDir) throws IOException {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
@@ -1671,6 +1817,39 @@ public class DatasetTest {
         // Without stable row ids a row id is its address, so ids pass through unchanged.
         List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
         assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String datasetPath = tempDir.resolve("deletion-io").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset
+          .createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())
+          .close();
+      testDataset.write(1, 5).close();
+
+      Path deletionFile;
+      try (Dataset ds = testDataset.write(2, 5)) {
+        ds.delete("id = 2");
+        Fragment fragment = ds.getFragments().get(0);
+        DeletionFile deletion = fragment.metadata().getDeletionFile();
+        assertNotNull(deletion);
+        String relativePath = deletion.getRelativePath(fragment.getId());
+        assertNotNull(relativePath);
+        deletionFile = Path.of(datasetPath).resolve(relativePath);
+      }
+
+      assertTrue(Files.deleteIfExists(deletionFile), "deletion file should exist");
+
+      try (Dataset ds = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        // A cold empty lookup must return before loading row-id metadata or deletion files.
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+        IOException error =
+            assertThrows(
+                IOException.class, () -> ds.getRowAddresses(Collections.singletonList(0L)));
+        assertTrue(error.getMessage().contains("_deletions"), error.getMessage());
       }
     }
   }
@@ -2529,6 +2708,103 @@ public class DatasetTest {
         }
       }
     }
+  }
+
+  private static Dataset createStructTakeDataset(BufferAllocator allocator, String path) {
+    Field structField =
+        new Field(
+            "s",
+            FieldType.nullable(new ArrowType.Struct()),
+            Collections.singletonList(Field.nullable("x", new ArrowType.Int(32, true))));
+    Schema schema =
+        new Schema(
+            Arrays.asList(Field.notNullable("id", new ArrowType.Int(32, true)), structField));
+    try (Dataset empty =
+            Dataset.write()
+                .allocator(allocator)
+                .uri(path)
+                .schema(schema)
+                .enableStableRowIds(true)
+                .execute();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector ids = (IntVector) root.getVector("id");
+      StructVector struct = (StructVector) root.getVector("s");
+      IntVector x = (IntVector) struct.getChild("x");
+      for (int i = 0; i < 6; i++) {
+        ids.setSafe(i, i);
+        if (i == 2) {
+          struct.setNull(i);
+        } else {
+          struct.setIndexDefined(i);
+          x.setSafe(i, i * 10);
+        }
+      }
+      root.setRowCount(6);
+      List<FragmentMetadata> fragments =
+          Fragment.create(
+              path,
+              allocator,
+              root,
+              new WriteParams.Builder()
+                  .withMode(WriteParams.WriteMode.APPEND)
+                  .withEnableStableRowIds(true)
+                  .withMaxRowsPerFile(3)
+                  .build());
+      try (Transaction transaction =
+          new Transaction.Builder()
+              .readVersion(empty.version())
+              .operation(Append.builder().fragments(fragments).build())
+              .build()) {
+        return new CommitBuilder(empty).execute(transaction);
+      }
+    }
+  }
+
+  private static List<Long> listRowIds(Dataset dataset) throws Exception {
+    List<Long> rowIds = new ArrayList<>();
+    Set<Long> fragmentIds = new HashSet<>();
+    try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .columns(List.of("id"))
+                    .withRowId(true)
+                    .withRowAddress(true)
+                    .build());
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        UInt8Vector ids = (UInt8Vector) root.getVector("_rowid");
+        UInt8Vector addresses = (UInt8Vector) root.getVector("_rowaddr");
+        for (int i = 0; i < root.getRowCount(); i++) {
+          rowIds.add(ids.get(i));
+          fragmentIds.add(addresses.get(i) >>> 32);
+        }
+      }
+    }
+    assertEquals(2, fragmentIds.size(), "expected row addresses in both fragments");
+    return rowIds;
+  }
+
+  private static Stream<Arguments> missingStructProjections() {
+    List<String> paths = Arrays.asList("missing", "s.missing", "id.child", "_rowid.child");
+    return Stream.of("take", "takeRows")
+        .flatMap(api -> paths.stream().map(path -> Arguments.of(api, path)));
+  }
+
+  private static void assertStructTakeResult(
+      ArrowReader reader, long[] expectedIds, Integer[] expectedX) throws IOException {
+    assertTrue(reader.loadNextBatch());
+    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+    assertEquals(expectedIds.length, root.getRowCount());
+    IntVector ids = (IntVector) root.getVector("id");
+    StructVector struct = (StructVector) root.getVector("s");
+    IntVector x = (IntVector) struct.getChild("x");
+    for (int i = 0; i < expectedIds.length; i++) {
+      assertEquals(expectedIds[i], ids.get(i));
+      assertEquals(expectedX[i], x.getObject(i));
+    }
+    assertFalse(reader.loadNextBatch());
   }
 
   @Test

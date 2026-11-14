@@ -34,7 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
-use lance_table::feature_flags::ensure_can_write_manifest;
+use lance_table::feature_flags::{CoveringContract, ensure_can_write_manifest};
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
     WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
@@ -490,10 +490,11 @@ async fn do_commit_new_dataset(
             let reader = source_store.open(&source_manifest_location.path).await?;
             let section: pb::IndexSection =
                 lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            let contract = CoveringContract::of(&source_manifest);
             section
                 .indices
                 .into_iter()
-                .map(IndexMetadata::try_from)
+                .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
@@ -1763,6 +1764,11 @@ async fn record_successful_commit(
             store_identity: &dataset.object_store.store_prefix,
             e_tag: location.e_tag.as_deref(),
         };
+        let contract = CoveringContract::of(manifest);
+        let indices = indices
+            .into_iter()
+            .map(|index| index.into_stored_shape(contract))
+            .collect::<Vec<_>>();
         dataset
             .index_cache
             .insert_with_key(&key, Arc::new(indices))
@@ -1959,7 +1965,7 @@ async fn do_commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
                     .await?
-                    .with_read_version_fragments(read_version_dataset.fragments().clone());
+                    .with_read_version_dataset(&read_version_dataset);
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
