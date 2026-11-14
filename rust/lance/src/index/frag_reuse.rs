@@ -2106,9 +2106,8 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
 /// whose type cannot translate stored addresses through the history in
 /// batches.
 ///
-/// The classification is the reader's own
-/// (`segment_supports_batch_remapping`), so a segment the reader would
-/// translate keeps its provenance:
+/// The classification is the reader's own (`segment_supports_batch_remapping`),
+/// so a segment the reader would translate keeps its provenance:
 /// - `Some(true)`: deferrable, not listed;
 /// - `Some(false)`: listed, its coverage of the rewritten sources withdrawn;
 /// - `None`: not listed. Details that cannot be interpreted are refused

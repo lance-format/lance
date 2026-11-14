@@ -13,6 +13,7 @@ use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, jso
 use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
 use crate::index::DatasetIndexExt;
+use crate::index::frag_reuse_with_stable_row_ids::is_hidden_by_frag_reuse;
 use arrow::compute::concat_batches;
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
@@ -30,6 +31,7 @@ use lance_datafusion::exec::{ExecutionSummaryCounts, execute_plan};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
     SCORE_FIELD,
@@ -43,14 +45,21 @@ use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
+use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, QueryFilter};
+use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
+use crate::dataset::write::CommitBuilder;
 use crate::dataset::write::WriteParams;
 use crate::dataset::{ColumnAlteration, NewColumnTransform};
+use crate::index::frag_reuse::frag_reuse_entry_appending;
+use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::{Dataset, Error};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
+use lance_table::format::Fragment;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 use tracing_mock::{expect, subscriber};
@@ -1592,6 +1601,17 @@ fn detection_batch(ids: std::ops::Range<i32>) -> RecordBatch {
 /// list-element index on `detections`, then a fourth fragment the indices do
 /// not cover.
 async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> Dataset {
+    detection_dataset_with(element_index, enable_stable_row_ids, false).await
+}
+
+/// [`detection_dataset`]; with `tagged`, a stable partition of the three
+/// fragments is committed before the indices exist, which gives the table a
+/// tagged fragment reuse history.
+async fn detection_dataset_with(
+    element_index: bool,
+    enable_stable_row_ids: bool,
+    tagged: bool,
+) -> Dataset {
     let params = WriteParams {
         max_rows_per_file: 500,
         enable_stable_row_ids,
@@ -1606,6 +1626,9 @@ async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> 
     )
     .await
     .unwrap();
+    if tagged {
+        stable_partition(&mut dataset).await;
+    }
     dataset
         .create_index(
             &["width"],
@@ -1636,8 +1659,48 @@ async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> 
         )
         .await
         .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 4);
+    // A partition leaves two fragments for the three it rewrote.
+    assert_eq!(dataset.get_fragments().len(), if tagged { 3 } else { 4 });
     dataset
+}
+
+/// Partitions every live fragment into two destinations through the commit
+/// path, recording a stable-partition transition (a tagged history).
+async fn stable_partition(dataset: &mut Dataset) {
+    let reserve = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveFragments { num_fragments: 2 },
+        None,
+    );
+    dataset
+        .apply_commit(reserve, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    let dest_base_id = dataset.manifest.max_fragment_id().unwrap() - 1;
+    let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+    let source_ids: Vec<u64> = old_fragments.iter().map(|fragment| fragment.id).collect();
+    let (transition, new_fragments) = prepare_partition(dataset, &source_ids, dest_base_id).await;
+    let read_version = dataset.manifest.version;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    *dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
 }
 
 async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
@@ -1912,6 +1975,188 @@ async fn test_element_index_delete_and_compaction(
     );
 }
 
+/// Compacts with `defer_index_remap`, which on a table with stable row IDs
+/// records the row-address moves in a fragment reuse index instead of
+/// remapping the indices. The list-element index applies that index, so
+/// readers keep using it.
+async fn compact_with_frag_reuse(dataset: &mut Dataset) {
+    let metrics = compact_files(
+        dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(metrics.fragments_removed > 0);
+    assert!(dataset.manifest.uses_stable_row_ids());
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // `load_indices_by_name` already drops the segments hidden by the fragment
+    // reuse index, so only the unfiltered list can show one. Commit validation
+    // (`validate_frag_reuse_with_stable_row_ids`) makes the hidden assert
+    // defense in depth.
+    let segments = crate::index::loading::load_all_indices_by_name(dataset, "detections_idx")
+        .await
+        .unwrap();
+    assert!(!segments.is_empty(), "the manifest must keep the index");
+    for segment in &segments {
+        assert!(
+            !is_hidden_by_frag_reuse(segment),
+            "segment {} is hidden by the fragment reuse index",
+            segment.uuid
+        );
+    }
+    let uuids = |segments: &[lance_table::format::IndexMetadata]| {
+        let mut uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        uuids.sort();
+        uuids
+    };
+    let read = dataset
+        .load_indices_by_name("detections_idx")
+        .await
+        .unwrap();
+    assert_eq!(
+        uuids(&read),
+        uuids(&segments),
+        "readers must keep every segment"
+    );
+}
+
+/// Filters asked of a list-element index that applies a fragment reuse
+/// index, with the rows each keeps and whether the index answers it without a
+/// recheck: a match, its negation, which keeps neither the NULL lists nor the
+/// lists with a NULL detection, and one with a condition on a non-key field.
+fn frag_reuse_filters() -> [(String, DetectionCheck, bool); 3] {
+    [
+        (
+            CAR_ABOVE_09.to_string(),
+            |_, d| any_detection(d, is_car_above_09) == Some(true),
+            true,
+        ),
+        (
+            format!("NOT {CAR_ABOVE_09}"),
+            |_, d| any_detection(d, is_car_above_09) == Some(false),
+            true,
+        ),
+        (
+            "any_element(detections, 'label = ''car'' AND confidence > 0.9 AND area > 10000')"
+                .to_string(),
+            |_, d| any_detection(d, |d| is_car_above_09(d) && d.2 > 10000.0) == Some(true),
+            false,
+        ),
+    ]
+}
+
+/// Asserts, for each of [`frag_reuse_filters`], that the list-element index
+/// alone (`fast_search`) keeps the fixture's answer over `indexed`, and
+/// that the index with a scan of the unindexed fragments, and a scan alone,
+/// keep the rows of `live`. The index-only answer excludes the rows it does
+/// not cover, at the append step. `fast_search` skips unindexed fragments only
+/// while the plan uses the index, which the plan assert checks.
+async fn assert_frag_reuse_answers(dataset: &Dataset, live: &[i32], indexed: &[i32], step: &str) {
+    let keeps = |ids: &[i32], keep: DetectionCheck| {
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                let (width, detections) = detection_row(*id);
+                keep(width, &detections)
+            })
+            .collect::<Vec<_>>()
+    };
+    for (filter, keep, exact) in frag_reuse_filters() {
+        let expected_indexed = keeps(indexed, keep);
+        let expected_live = keeps(live, keep);
+        assert!(
+            !expected_indexed.is_empty(),
+            "{step}: `{filter}` should match"
+        );
+        if indexed.len() < live.len() {
+            assert!(
+                expected_live.len() > expected_indexed.len(),
+                "{step}: appended rows must match `{filter}`"
+            );
+        }
+        let plan = explain(dataset, &filter).await;
+        assert!(
+            plan.contains("ListElement(detections"),
+            "{step}: `{filter}`: {plan}"
+        );
+        assert_eq!(
+            !plan.contains("recheck"),
+            exact,
+            "{step}: `{filter}`: {plan}"
+        );
+        assert_eq!(
+            scan_any_element_ids(dataset, &filter, true, true).await,
+            expected_indexed,
+            "{step}: `{filter}`, index only"
+        );
+        for use_scalar_index in [true, false] {
+            assert_eq!(
+                any_element_ids(dataset, &filter, use_scalar_index).await,
+                expected_live,
+                "{step}: `{filter}`, index: {use_scalar_index}"
+            );
+        }
+    }
+}
+
+/// On a table with stable row IDs, a compaction may defer the index remap:
+/// the list-element index then answers through the fragment reuse index,
+/// alone (`fast_search`) for the rewritten fragments, and its answers match a
+/// scan after the compaction, after `optimize_indices`, and after an append.
+#[tokio::test]
+async fn test_element_index_applies_frag_reuse_with_stable_row_ids() {
+    let mut dataset = detection_dataset(true, true).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    dataset.delete("id >= 100 AND id < 600").await.unwrap();
+    let mut live = (0..DETECTION_ROWS)
+        .filter(|id| !(100..600).contains(id))
+        .collect::<Vec<_>>();
+
+    compact_with_frag_reuse(&mut dataset).await;
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        live.iter()
+            .copied()
+            .filter(|id| any_detection(&detection_row(*id).1, is_car_above_09) == Some(true))
+            .collect::<Vec<_>>()
+    );
+    assert_frag_reuse_answers(&dataset, &live, &live, "deferred compaction").await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_frag_reuse_answers(&dataset, &live, &live, "optimize_indices").await;
+
+    let appended = DETECTION_ROWS..DETECTION_ROWS + 300;
+    let batch = detection_batch(appended.clone());
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    // The appended rows are not indexed: only a scan sees them.
+    let indexed = live.clone();
+    live.extend(appended);
+    assert_frag_reuse_answers(&dataset, &live, &indexed, "append").await;
+}
+
 /// The `detections` column of `detection_batch(ids)` with its element fields
 /// named `names` in place, values unmoved.
 fn detections_named(ids: std::ops::Range<i32>, names: [&str; 3]) -> RecordBatch {
@@ -1964,9 +2209,29 @@ async fn explain(dataset: &Dataset, filter: &str) -> String {
 /// (a key) and `area` (not a key), both floats, must not let `confidence`
 /// conditions use the index; `area` conditions now do. An update after the swap,
 /// through an index opened before it, reads the key from its new name.
+///
+/// With `has_frag_reuse`, the table has stable row IDs and a compaction first
+/// records its row-address moves in a fragment reuse index, which the index
+/// applies whenever it is loaded, the reload after the renames included.
+#[rstest]
 #[tokio::test]
-async fn test_element_index_follows_renamed_key_fields() {
-    let mut dataset = detection_dataset(true, false).await;
+async fn test_element_index_follows_renamed_key_fields(
+    #[values(false, true)] has_frag_reuse: bool,
+) {
+    let mut dataset = detection_dataset(true, has_frag_reuse).await;
+    if has_frag_reuse {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        compact_with_frag_reuse(&mut dataset).await;
+    }
+    let fields_before = crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.fields)
+        .collect::<Vec<_>>();
     // Open the index before the renames, so it is cached under the old names.
     assert_eq!(
         any_element_ids(&dataset, CAR_ABOVE_09, true).await,
@@ -1984,6 +2249,16 @@ async fn test_element_index_follows_renamed_key_fields() {
             .await
             .unwrap();
     }
+    let fields_after = crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.fields)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields_after, fields_before,
+        "renames changed dependency IDs"
+    );
     let batch = detections_named(
         DETECTION_ROWS..DETECTION_ROWS + 400,
         ["label", "area", "confidence"],
@@ -2034,17 +2309,116 @@ async fn test_element_index_follows_renamed_key_fields() {
     assert!(plan.contains("recheck"), "{plan}");
 }
 
-/// Dropping a key field leaves the index in place but unusable: queries scan,
-/// and optimizing skips it.
+/// The history the table carries when its list-element key field is dropped.
+#[derive(Clone, Copy, Debug)]
+enum KeyDropHistory {
+    None,
+    /// A tagged fragment reuse history, recorded before the indices exist.
+    Tagged,
+    /// Stable row IDs with a deferred compaction already recorded.
+    StableRowIds,
+    /// A tagged history whose deferred compaction ran while the key still
+    /// resolved, so the segment kept provenance until the key was dropped.
+    TaggedAfterDefer,
+}
+
+async fn frag_reuse_entry_version(dataset: &Dataset) -> Option<i32> {
+    crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .map(|index| index.index_version)
+}
+
+/// The number of versions in a v0 (stable row ID) history.
+async fn stable_history_len(dataset: &Dataset) -> usize {
+    let entry = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .cloned()
+        .unwrap();
+    assert_eq!(entry.index_version, 0, "the history is not the v0 form");
+    crate::index::frag_reuse::load_frag_reuse_index_details(dataset, &entry)
+        .await
+        .unwrap()
+        .versions
+        .len()
+}
+
+/// Dropping an indexed nested key removes the index through ordinary schema
+/// dependency checks, before or after deferred compaction. Queries scan and
+/// later compaction and cleanup need no remap of the removed index.
+#[rstest]
 #[tokio::test]
-async fn test_element_index_dropped_key_field() {
-    let mut dataset = detection_dataset(true, false).await;
+async fn test_element_index_dropped_key_field(
+    #[values(
+        KeyDropHistory::None,
+        KeyDropHistory::Tagged,
+        KeyDropHistory::StableRowIds,
+        KeyDropHistory::TaggedAfterDefer
+    )]
+    history: KeyDropHistory,
+) {
+    let mut dataset = match history {
+        KeyDropHistory::None => detection_dataset(true, false).await,
+        KeyDropHistory::Tagged => {
+            let mut dataset = detection_dataset_with(true, false, true).await;
+            assert!(frag_reuse_entry_version(&dataset).await.unwrap() >= 1);
+            // Only the list-element index may pin the history.
+            dataset.drop_index("width_idx").await.unwrap();
+            dataset
+        }
+        KeyDropHistory::StableRowIds => {
+            let mut dataset = detection_dataset(true, true).await;
+            // Allowed: the key field still resolves.
+            compact_with_frag_reuse(&mut dataset).await;
+            // Leave the compacted fragment a rewrite candidate after the drop.
+            dataset.delete("id % 4 = 0").await.unwrap();
+            dataset
+        }
+        KeyDropHistory::TaggedAfterDefer => {
+            let mut dataset = detection_dataset_with(true, false, true).await;
+            dataset.drop_index("width_idx").await.unwrap();
+            // Only indexed fragments remain, so every source is covered.
+            dataset.delete("id >= 1500").await.unwrap();
+            // The key still resolves: the segment keeps its provenance.
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: true,
+                    target_rows_per_fragment: 1000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            assert!(frag_reuse_entry_version(&dataset).await.unwrap() >= 1);
+            dataset
+        }
+    };
     dataset
         .drop_columns(&["detections.item.confidence"])
         .await
         .unwrap();
+    assert!(
+        crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the dropped key's segment remains in the manifest"
+    );
     let filter = "any_element(detections, 'label = ''carrot''')";
-    let expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
+    let mut expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
+    match history {
+        KeyDropHistory::StableRowIds => expected.retain(|id| id % 4 != 0),
+        KeyDropHistory::TaggedAfterDefer => expected.retain(|id| *id < 1500),
+        KeyDropHistory::None | KeyDropHistory::Tagged => {}
+    }
     assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
     assert!(!explain(&dataset, filter).await.contains("ListElement("));
     dataset
@@ -2052,6 +2426,80 @@ async fn test_element_index_dropped_key_field() {
         .await
         .unwrap();
     assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+
+    match history {
+        KeyDropHistory::None => {}
+        KeyDropHistory::TaggedAfterDefer => {
+            // The removed index no longer pins its retired provenance.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(frag_reuse_entry_version(&dataset).await, None);
+            // Give the eager compaction something to rewrite.
+            dataset.delete("id % 4 = 0").await.unwrap();
+            expected.retain(|id| id % 4 != 0);
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: false,
+                    target_rows_per_fragment: 2000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+        }
+        KeyDropHistory::Tagged => {
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: true,
+                    target_rows_per_fragment: 1000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(frag_reuse_entry_version(&dataset).await, None);
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: false,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+        }
+        KeyDropHistory::StableRowIds => {
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            // The independent width index can still pin the stable history.
+            remap_column_index(&mut dataset, &["width"], None)
+                .await
+                .unwrap();
+            assert!(stable_history_len(&dataset).await > 0);
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            // The entry stays, empty.
+            assert_eq!(stable_history_len(&dataset).await, 0);
+            assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+        }
+    }
 }
 
 /// label, confidence, area, each possibly NULL.

@@ -6,6 +6,8 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
+use super::field_dependencies::input_field_ids;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -684,16 +686,23 @@ impl Dataset {
         // entry has a bitmap; if any are missing, we leave the entry absent
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
-        for index in indices.iter().filter(|idx| {
-            if ignored_index_names.contains(&idx.name) {
-                return false;
+        for index in indices {
+            if ignored_index_names.contains(&index.name) {
+                continue;
             }
-            if idx.keyed_fields().len() > 1 && !registers_planners {
-                return false;
+            let input_fields = match input_field_ids(index) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    log::warn!("Skipping index '{}': {error}", index.name);
+                    continue;
+                }
+            };
+            if input_fields.len() > 1 && !registers_planners {
+                continue;
             }
 
             // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(details) = &idx.index_details {
+            let is_fts_index = if let Some(details) = &index.index_details {
                 IndexDetails(details.clone()).supports_fts()
             } else {
                 false
@@ -701,17 +710,15 @@ impl Dataset {
 
             // Only include indices with non-empty fragment bitmaps, except for FTS indices
             // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+            let has_non_empty_bitmap = index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                 !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
             });
 
-            // Same name-collision rationale as `CreateIndexBuilder`'s
-            // default-name loop in create.rs: only the keyed prefix decides
-            // which column this index answers for.
-            !idx.keyed_fields().is_empty() && (has_non_empty_bitmap || is_fts_index)
-        }) {
-            let keyed_columns = index
-                .keyed_fields()
+            // Dependencies and carried columns do not add query inputs.
+            if input_fields.is_empty() || !(has_non_empty_bitmap || is_fts_index) {
+                continue;
+            }
+            let keyed_columns = input_fields
                 .iter()
                 .map(|&field_id| {
                     schema.field_by_id(field_id).ok_or_else(|| {
@@ -1741,11 +1748,9 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-        // Only the keyed prefix matters here. The rebuild below writes fresh,
-        // non-covered metadata and never reads the carried columns, so requiring
-        // them to exist and type-match would reject a target that can hold this
-        // index perfectly well.
-        let keyed_fields = source_index.keyed_fields();
+        // Rebuild from the query inputs. The target build records its own field
+        // IDs for additional dependencies and does not read carried columns.
+        let keyed_fields = input_field_ids(source_index)?;
         let mut field_paths = Vec::with_capacity(keyed_fields.len());
         for field_id in keyed_fields.iter() {
             let source_field = source_dataset

@@ -49,10 +49,12 @@ pub struct IndexMetadata {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,
 
-    /// Fields to build the index.
+    /// Fields used to build the index, including plugin-declared dependencies.
     ///
     /// `fields[0]` is always a column the index is keyed on. Trailing entries
-    /// may instead be merely carried, not keyed on -- see [`Self::covering_fields`].
+    /// may be additional plugin dependencies or merely carried columns -- see
+    /// [`Self::covering_fields`]. Query input routing must also consult the
+    /// plugin's additional field declaration.
     pub fields: Vec<i32>,
 
     /// Fields whose values this index carries.
@@ -344,9 +346,10 @@ impl IndexMetadata {
     /// columns of [`Self::covering_fields`] removed when they use the suffix
     /// layout. Under the independent layout this is all of `fields`.
     ///
-    /// Only this prefix decides which column an index answers for;
-    /// [`Self::dependency_fields`] answers what invalidates it. Empty for a system index
-    /// that declares no fields.
+    /// This is a metadata declaration and can still contain additional plugin
+    /// dependencies. Query input routing resolves those through the plugin;
+    /// [`Self::dependency_fields`] answers what invalidates the index without
+    /// loading a plugin. Empty for a system index that declares no fields.
     pub fn keyed_fields(&self) -> &[i32] {
         Self::keyed_fields_of(&self.fields, &self.covering_fields)
     }
@@ -374,7 +377,8 @@ impl IndexMetadata {
     }
 
     /// The single column this index is keyed on, or `None` when it is keyed on
-    /// several -- a genuinely composite index -- or on none at all.
+    /// several fields or on none at all. A plugin may declare additional
+    /// dependencies, so `None` alone does not establish composite query inputs.
     ///
     /// Most selection paths are only defined for one keyed column, so they can
     /// compare this against the column they are resolving.
