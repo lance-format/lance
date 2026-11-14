@@ -86,6 +86,8 @@ use lance_core::utils::allocation::Reservation;
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use std::{ops::Range, str::FromStr, sync::Arc};
 
+pub mod levels;
+
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
 ///
 /// If no threshold is provided, we use a size model instead of a fixed run ratio.
@@ -1338,6 +1340,20 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Validate a dense u16 structural stream and plan all decoded payload/scratch
+    /// before allocation. The input owner must already be charged. Unsupported
+    /// codecs return an error instead of invoking ordinary, unaccounted decode.
+    /// See [`levels::LevelDecodePlan`] and its admission example.
+    fn plan_levels<'a>(
+        &self,
+        _data: &'a LanceBuffer,
+        _num_values: u64,
+    ) -> Result<levels::LevelDecodePlan<'a>> {
+        Err(Error::not_supported(
+            "codec has no admitted structural-level decoder",
+        ))
+    }
 
     /// Whether this codec consumes one payload buffer.
     fn requires_payload(&self) -> bool {

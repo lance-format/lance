@@ -16,6 +16,7 @@ use lance_core::{
 
 use super::{CompositeRepDefUnraveler, DefinitionInterpretation, LevelBuffer, RepDefUnraveler};
 
+mod compressed;
 mod offsets;
 
 #[derive(Debug)]

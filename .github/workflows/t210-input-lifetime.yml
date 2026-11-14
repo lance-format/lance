@@ -21,8 +21,19 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # f4d4d4d9c passed 95 rep/def + 69 constant cases and the new List API
-      # example (run 43597844026). Only Vec<OffsetPlan> -> Vec<Self> changes
-      # Rust source here. Reuse that behavioral evidence and verify strict lint.
+      # List/constant behavior passed at f4d4d4d9c (164 cases + API example),
+      # and strict lint at d241585b6. Validate new compressed-level admission.
+      - name: Validate structural codec workspace
+        run: >-
+          cargo test --profile ci --locked -p lance-encoding --all-features --lib compression::levels:: -- --nocapture
+      - name: Validate encoded level ownership composition
+        run: >-
+          cargo test --profile ci --locked -p lance-encoding --all-features --lib repdef::admitted::compressed:: -- --nocapture
+      - name: Validate structural codec API example
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc LevelDecodePlan
+      - name: Validate encoded level API example
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc try_from_encoded_in
+      - name: Check capability without bitpacking
+        run: cargo check --profile ci --locked -p lance-encoding --no-default-features --lib
       - name: Lint touched crate
         run: cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

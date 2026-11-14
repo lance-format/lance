@@ -940,6 +940,23 @@ impl BlockCompressor for OutOfLineBitpacking {
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<crate::compression::levels::LevelDecodePlan<'a>> {
+        if self.uncompressed_bit_width != 16 {
+            return Err(Error::invalid_input(
+                "structural levels require u16 bitpacking output",
+            ));
+        }
+        crate::compression::levels::LevelDecodePlan::bitpacked(
+            data,
+            num_values,
+            self.compressed_bit_width,
+        )
+    }
+
     fn infer_u16_wrapped_count(
         &self,
         data: &LanceBuffer,
