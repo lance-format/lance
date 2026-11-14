@@ -304,7 +304,7 @@ async fn test_list_element_dependency_fields_preserve_single_input() {
     };
     assert_eq!(sorted_ids(&indexed), sorted_ids(&scanned));
 
-    crate::dataset::optimize::remap_column_index(&mut dataset, &["objects"], None)
+    crate::dataset::optimize::remapping::remap_column_index(&mut dataset, &["objects"], None)
         .await
         .unwrap();
     dataset
