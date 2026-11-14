@@ -846,8 +846,10 @@ impl CoreFieldDecoderStrategy {
             file_buffers: buffers,
             positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
         };
-        let items_scheduler =
-            self.create_array_field_scheduler(&list_field.children[0], column_infos, buffers)?;
+        let items_field = &list_field.children[0];
+        let items_scheduler = self
+            .create_array_field_scheduler(items_field, column_infos, buffers)
+            .map_err(|source| wrap_scheduler_error(items_field, source))?;
 
         let mut inner_infos = Vec::with_capacity(offsets_column.page_infos.len());
         let mut null_offset_adjustments = Vec::with_capacity(offsets_column.page_infos.len());
@@ -1009,12 +1011,14 @@ impl CoreFieldDecoderStrategy {
                 }
 
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
-                for field in field.children.iter() {
-                    let field_scheduler = self.create_structural_field_scheduler_with_mode(
-                        field,
-                        column_infos,
-                        mode.map(|_| ListReadMode::Length),
-                    )?;
+                for child_field in field.children.iter() {
+                    let field_scheduler = self
+                        .create_structural_field_scheduler_with_mode(
+                            child_field,
+                            column_infos,
+                            mode.map(|_| ListReadMode::Length),
+                        )
+                        .map_err(|source| wrap_scheduler_error(child_field, source))?;
                     child_schedulers.push(field_scheduler);
                 }
 
@@ -1033,11 +1037,9 @@ impl CoreFieldDecoderStrategy {
                         ListReadMode::Length
                     }
                 });
-                let child_scheduler = self.create_structural_field_scheduler_with_mode(
-                    child,
-                    column_infos,
-                    child_mode,
-                )?;
+                let child_scheduler = self
+                    .create_structural_field_scheduler_with_mode(child, column_infos, child_mode)
+                    .map_err(|source| wrap_scheduler_error(child, source))?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -1045,11 +1047,13 @@ impl CoreFieldDecoderStrategy {
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler = self.create_structural_field_scheduler_with_mode(
-                    child,
-                    column_infos,
-                    mode.map(|_| ListReadMode::Length),
-                )?;
+                let child_scheduler = self
+                    .create_structural_field_scheduler_with_mode(
+                        child,
+                        column_infos,
+                        mode.map(|_| ListReadMode::Length),
+                    )
+                    .map_err(|source| wrap_scheduler_error(child, source))?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
                     child_scheduler,
                     *dimension,
@@ -1063,11 +1067,13 @@ impl CoreFieldDecoderStrategy {
                     return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
-                let child_scheduler = self.create_structural_field_scheduler_with_mode(
-                    entries_child,
-                    column_infos,
-                    mode.map(|_| ListReadMode::Length),
-                )?;
+                let child_scheduler = self
+                    .create_structural_field_scheduler_with_mode(
+                        entries_child,
+                        column_infos,
+                        mode.map(|_| ListReadMode::Length),
+                    )
+                    .map_err(|source| wrap_scheduler_error(entries_child, source))?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -1193,10 +1199,11 @@ impl CoreFieldDecoderStrategy {
                         .map(|page| page.num_rows)
                         .sum();
                     let mut child_schedulers = Vec::with_capacity(field.children.len());
-                    for field in &field.children {
+                    for child_field in &field.children {
                         column_infos.next_top_level();
-                        let field_scheduler =
-                            self.create_array_field_scheduler(field, column_infos, buffers)?;
+                        let field_scheduler = self
+                            .create_array_field_scheduler(child_field, column_infos, buffers)
+                            .map_err(|source| wrap_scheduler_error(child_field, source))?;
                         child_schedulers.push(Arc::from(field_scheduler));
                     }
 
@@ -1650,6 +1657,150 @@ impl DecodeBatchScheduler {
 pub struct ReadBatchTask {
     pub task: BoxFuture<'static, Result<RecordBatch>>,
     pub num_rows: u32,
+}
+
+/// The top-level column context attached to decode errors.
+#[derive(Debug, Clone)]
+pub struct ColumnContext {
+    /// The name of the top-level column.
+    pub name: String,
+    /// The Lance field id of the top-level column.
+    pub id: i32,
+}
+
+/// An error wrapper that adds column context to decoding errors.
+///
+/// Decode errors are often raised deep inside a page decoder where the field
+/// name and field id are no longer available. This wrapper carries that context
+/// and keeps the underlying message visible:
+///
+/// ```text
+/// failed to decode column 'age' (id 7): number out of range
+/// ```
+///
+/// The underlying error is also exposed through [`std::error::Error::source`].
+#[derive(Debug)]
+pub struct DecodeColumnError {
+    /// The name of the column being decoded.
+    pub field_name: String,
+    /// The Lance field id of the column being decoded.
+    pub field_id: i32,
+    /// The underlying decode error.
+    pub source: Error,
+}
+
+impl DecodeColumnError {
+    /// Create a wrapper for a decode failure on `field`.
+    pub fn new(field: &Field, source: Error) -> Self {
+        Self {
+            field_name: field.name.clone(),
+            field_id: field.id,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for DecodeColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to decode column '{}' (id {}): {}",
+            self.field_name, self.field_id, self.source
+        )
+    }
+}
+
+impl std::error::Error for DecodeColumnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<DecodeColumnError> for Error {
+    fn from(err: DecodeColumnError) -> Self {
+        Self::wrapped(Box::new(err))
+    }
+}
+
+/// A display-only wrapper used to add column context to a corrupt-file error
+/// without changing the outer error variant.
+#[derive(Debug)]
+struct ColumnContextError {
+    field_name: String,
+    field_id: i32,
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl std::fmt::Display for ColumnContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to decode column '{}' (id {}): {}",
+            self.field_name, self.field_id, self.source
+        )
+    }
+}
+
+impl std::error::Error for ColumnContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Whether this error already carries column context from an inner field.
+fn has_column_context(err: &Error) -> bool {
+    match err {
+        Error::Wrapped { error, .. } => error.downcast_ref::<DecodeColumnError>().is_some(),
+        Error::CorruptFile { source, .. } => source.downcast_ref::<ColumnContextError>().is_some(),
+        _ => false,
+    }
+}
+
+/// Attach column context to a decode error.
+///
+/// `CorruptFile` keeps its variant and gets the column context on its inner
+/// source, because callers match on that variant and Python maps it to
+/// `ValueError`. User-input errors are left untouched for the same reason.
+pub(crate) fn with_column_context(field_name: &str, field_id: i32, source: Error) -> Error {
+    if has_column_context(&source) {
+        return source;
+    }
+    match source {
+        Error::CorruptFile {
+            path,
+            source,
+            location,
+            backtrace,
+        } => Error::CorruptFile {
+            path,
+            source: Box::new(ColumnContextError {
+                field_name: field_name.to_string(),
+                field_id,
+                source,
+            }),
+            location,
+            backtrace,
+        },
+        source
+            if matches!(
+                source.find_root(),
+                Error::InvalidInput { .. } | Error::NotSupported { .. }
+            ) =>
+        {
+            source
+        }
+        source => DecodeColumnError {
+            field_name: field_name.to_string(),
+            field_id,
+            source,
+        }
+        .into(),
+    }
+}
+
+/// Attach column context to an error raised while building a field scheduler.
+fn wrap_scheduler_error(field: &Field, source: Error) -> Error {
+    with_column_context(&field.name, field.id, source)
 }
 
 /// A stream that takes scheduled jobs and generates decode tasks from them.
@@ -2554,6 +2705,17 @@ pub fn create_decode_stream(
     )
 }
 
+fn root_column_contexts(schema: &Schema) -> Vec<ColumnContext> {
+    schema
+        .fields
+        .iter()
+        .map(|field| ColumnContext {
+            name: field.name.clone(),
+            id: field.id,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_decode_stream_with_i32_offset_limit(
     schema: &Schema,
@@ -2573,7 +2735,8 @@ fn create_decode_stream_with_i32_offset_limit(
             should_validate,
             /*is_root=*/ true,
             /*nullable=*/ false,
-        )?;
+        )?
+        .with_column_contexts(root_column_contexts(schema));
         Ok(StructuralBatchDecodeStream::new(
             rx,
             batch_size,
@@ -2590,7 +2753,8 @@ fn create_decode_stream_with_i32_offset_limit(
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields;
 
-        let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
+        let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows)
+            .with_column_contexts(root_column_contexts(schema));
         Ok(BatchDecodeStream::new_with_i32_offset_limit(
             rx,
             batch_size,
@@ -2621,7 +2785,8 @@ pub fn create_decode_iterator(
             should_validate,
             /*is_root=*/ true,
             /*nullable=*/ false,
-        )?;
+        )?
+        .with_column_contexts(root_column_contexts(schema));
         Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
@@ -2630,7 +2795,8 @@ pub fn create_decode_iterator(
             arrow_schema,
         )))
     } else {
-        let root_decoder = SimpleStructDecoder::new(root_fields, num_rows);
+        let root_decoder = SimpleStructDecoder::new(root_fields, num_rows)
+            .with_column_contexts(root_column_contexts(schema));
         Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
@@ -4173,6 +4339,38 @@ mod tests {
         }
     }
 
+    struct CorruptFileDecodeTask;
+
+    impl DecodeArrayTask for CorruptFileDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Err(Error::corrupt_file_named(
+                "some_file",
+                "malformed sparse page",
+            ))
+        }
+    }
+
+    #[test]
+    fn with_column_context_leaves_invalid_input_untouched() {
+        let err = with_column_context("age", 7, Error::invalid_input("bad value"));
+        assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn with_column_context_preserves_corrupt_file_variant() {
+        let err = with_column_context(
+            "age",
+            7,
+            Error::corrupt_file_named("some_file", "bad bytes"),
+        );
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert!(
+            err.to_string()
+                .contains("failed to decode column 'age' (id 7)"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn next_decode_task_preserves_invalid_input_errors() {
         let err = NextDecodeTask {
@@ -4182,6 +4380,126 @@ mod tests {
         .into_batch(Arc::new(Once::new()))
         .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn decode_column_error_reports_column_id_and_source_message() {
+        let err = DecodeColumnError {
+            field_name: "age".to_string(),
+            field_id: 7,
+            source: Error::invalid_input("number out of range"),
+        };
+        let display = err.to_string();
+        assert!(
+            display.starts_with(
+                "failed to decode column 'age' (id 7): Invalid user input: number out of range"
+            ),
+            "unexpected display: {display}"
+        );
+
+        let lance_err: Error = err.into();
+        assert!(
+            lance_err
+                .to_string()
+                .contains("failed to decode column 'age' (id 7)"),
+            "unexpected error: {lance_err}"
+        );
+        let wrapper = std::error::Error::source(&lance_err)
+            .expect("wrapped error should expose the column context");
+        assert!(
+            std::error::Error::source(wrapper)
+                .expect("column context should expose the decode error")
+                .to_string()
+                .contains("number out of range")
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingDecodePageDecoder {
+        data_type: DataType,
+        num_rows: u64,
+    }
+
+    impl LogicalPageDecoder for FailingDecodePageDecoder {
+        fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<'_, Result<()>> {
+            std::future::ready(Ok(())).boxed()
+        }
+
+        fn rows_loaded(&self) -> u64 {
+            self.num_rows
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.num_rows
+        }
+
+        fn rows_drained(&self) -> u64 {
+            0
+        }
+
+        fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+            Ok(NextDecodeTask {
+                task: Box::new(CorruptFileDecodeTask),
+                num_rows,
+            })
+        }
+
+        fn data_type(&self) -> &DataType {
+            &self.data_type
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_task_error_is_wrapped_with_column_context() {
+        let fields = Fields::from(vec![ArrowField::new("age", DataType::Int32, false)]);
+        let root = SimpleStructDecoder::new(fields, 1).with_column_contexts(vec![ColumnContext {
+            name: "age".to_string(),
+            id: 7,
+        }]);
+        let (tx, rx) = unbounded_channel();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: 1,
+            decoders: vec![MessageType::DecoderReady(DecoderReady {
+                decoder: Box::new(FailingDecodePageDecoder {
+                    data_type: DataType::Int32,
+                    num_rows: 1,
+                }),
+                path: VecDeque::from([0]),
+            })],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream = BatchDecodeStream::new(rx, 1, 1, root).into_stream();
+        let err = stream
+            .next()
+            .await
+            .expect("stream should emit a decode task")
+            .task
+            .await
+            .expect_err("decode task should fail");
+
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "corrupt-file variant must be preserved, got: {err}"
+        );
+        let context = std::error::Error::source(&err)
+            .expect("corrupt-file error should expose the column context");
+        let inner = std::error::Error::source(context)
+            .expect("column context should expose the decode error");
+        // Evidence for the PR: a genuine decode failure before and after the context wrapper.
+        println!("decode error before context: {inner}");
+        println!("decode error with context: {context}");
+        assert!(
+            context
+                .to_string()
+                .starts_with("failed to decode column 'age' (id 7): malformed sparse page"),
+            "unexpected context: {context}"
+        );
+        assert!(
+            inner.to_string().contains("malformed sparse page"),
+            "unexpected source: {inner}"
+        );
     }
 
     #[test]
