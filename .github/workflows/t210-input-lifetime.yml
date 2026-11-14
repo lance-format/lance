@@ -27,11 +27,17 @@ jobs:
         run: cargo test --profile ci --locked -p lance-io --lib reserved_read::tests -- --nocapture
       - name: Validate admitted decoder buffer boundaries
         run: cargo test --profile ci --locked -p lance-encoding --all-features --lib buffer::tests -- --nocapture
+      - name: Validate admitted bitpacking and existing range decoding
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::physical::bitpacking:: -- --nocapture
+      - name: Validate MiniBlock composition after chunk validation refactor
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --lib encodings::logical::primitive::miniblock_decode::tests -- --nocapture
       - name: Validate allocation API examples
         run: cargo test --profile ci --locked -p lance-core --doc utils::allocation
       - name: Validate reserved read API example
         run: cargo test --profile ci --locked -p lance-io --doc reserved_read
       - name: Validate admitted decoder buffer examples
         run: cargo test --profile ci --locked -p lance-encoding --all-features --doc buffer::LanceBuffer::try_
+      - name: Validate admitted codec example
+        run: cargo test --profile ci --locked -p lance-encoding --all-features --doc compression::MiniBlockDecompressor::try_decompress_range_in
       - name: Lint touched crates
         run: cargo clippy --profile ci --locked -p lance-core -p lance-io -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

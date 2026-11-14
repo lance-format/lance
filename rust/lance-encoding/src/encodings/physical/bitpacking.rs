@@ -37,6 +37,8 @@ use crate::format::{EncodingUtils, metadata};
 use crate::statistics::{GetStat, Stat};
 use bytemuck::Pod;
 
+mod admitted;
+
 pub(crate) const LOG_ELEMS_PER_CHUNK: u8 = 10;
 /// Number of values encoded in each inline bitpacking chunk.
 pub const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
@@ -216,6 +218,20 @@ impl InlineBitpacking {
         data: &[u8],
         num_values: u64,
     ) -> Result<(usize, Cow<'_, [T]>)> {
+        let bit_width_value = Self::validate_chunk::<T>(data, num_values)?;
+        let chunk_words = if data.as_ptr().align_offset(std::mem::align_of::<T>()) == 0 {
+            Cow::Borrowed(bytemuck::cast_slice::<u8, T>(data))
+        } else {
+            Cow::Owned(bytemuck::pod_collect_to_vec::<u8, T>(data))
+        };
+        Ok((bit_width_value, chunk_words))
+    }
+
+    // Validate before any alignment repair allocates, including on admitted paths.
+    fn validate_chunk<T: ArrowNativeType + BitPackingUninit + Pod>(
+        data: &[u8],
+        num_values: u64,
+    ) -> Result<usize> {
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
         let word_size = std::mem::size_of::<T>();
 
@@ -249,12 +265,7 @@ impl InlineBitpacking {
             ));
         }
 
-        let chunk_words = if data.as_ptr().align_offset(std::mem::align_of::<T>()) == 0 {
-            Cow::Borrowed(bytemuck::cast_slice::<u8, T>(data))
-        } else {
-            Cow::Owned(bytemuck::pod_collect_to_vec::<u8, T>(data))
-        };
-        let bit_width_value = chunk_words[0].as_usize();
+        let bit_width_value = bytemuck::pod_read_unaligned::<T>(&data[..word_size]).as_usize();
         if bit_width_value > uncompressed_bit_width {
             return Err(Error::corrupt_file_named(
                 "inline_bitpacking",
@@ -264,7 +275,6 @@ impl InlineBitpacking {
                 ),
             ));
         }
-        let chunk = &chunk_words[1..];
         // bit_width_value has already been verified to be <= uncompressed_bit_width
         // (8/16/32/64), so bit_width_value * ELEMS_PER_CHUNK (1024) can never
         // overflow usize on supported targets. Keep checked_mul as defense in depth.
@@ -280,7 +290,7 @@ impl InlineBitpacking {
                 )
             })?;
         let expected_num_bytes = expected_num_bits / 8;
-        let actual_num_bytes = std::mem::size_of_val(chunk);
+        let actual_num_bytes = data.len() - word_size;
         if actual_num_bytes != expected_num_bytes {
             return Err(Error::corrupt_file_named(
                 "inline_bitpacking",
@@ -291,7 +301,7 @@ impl InlineBitpacking {
             ));
         }
 
-        Ok((bit_width_value, chunk_words))
+        Ok(bit_width_value)
     }
 
     fn unchunk<T: ArrowNativeType + BitPackingUninit + Pod>(
@@ -559,6 +569,22 @@ impl BlockCompressor for InlineBitpacking {
 }
 
 impl MiniBlockDecompressor for InlineBitpacking {
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(
+            self.uncompressed_bit_width,
+            data,
+            num_values,
+            range,
+            workspace,
+        )
+    }
+
     fn allocates_output(&self) -> bool {
         true
     }

@@ -134,6 +134,29 @@ pub struct ReservedBuffer {
 }
 
 impl ReservedBuffer {
+    /// Free an exclusive scratch buffer and return its credit to the same workspace.
+    /// No global admission is needed to reuse the returned headroom. On a budget
+    /// mismatch the buffer is still consumed/freed, but `workspace` is unchanged.
+    pub fn recycle(self, workspace: &mut Reservation) -> Result<()> {
+        if !Arc::ptr_eq(&self.reservation.budget, &workspace.budget) {
+            return Err(Error::invalid_input(
+                "buffer and workspace use different allocation budgets",
+            ));
+        }
+        let recycled = workspace
+            .bytes
+            .checked_add(self.reservation.bytes)
+            .ok_or_else(|| Error::internal("allocation credit overflow"))?;
+        let Self {
+            data,
+            mut reservation,
+        } = self;
+        drop(data);
+        workspace.bytes = recycled;
+        reservation.bytes = 0;
+        Ok(())
+    }
+
     /// Replace this exclusive buffer only after reserving the entire new allocation.
     /// Both layouts remain charged during the copy. On success, the old allocation's
     /// credit becomes workspace headroom again. On refusal, neither buffer nor credit
@@ -227,6 +250,26 @@ mod tests {
         assert!(error.to_string().contains("addressable allocation size"));
         assert_eq!(workspace.len(), 8);
         assert_eq!(budget.reserved(), 8);
+    }
+
+    #[test]
+    fn exclusive_scratch_credit_is_reusable_without_new_admission() {
+        let budget = AllocationBudget::new(8);
+        let mut workspace = budget.try_reserve(8).unwrap();
+        for _ in 0..3 {
+            let scratch = workspace.try_allocate(8).unwrap().unwrap();
+            assert!(budget.try_reserve(1).is_none());
+            scratch.recycle(&mut workspace).unwrap();
+            assert_eq!(workspace.len(), 8);
+            assert_eq!(budget.reserved(), 8);
+        }
+        let other = AllocationBudget::new(8);
+        let foreign = other.try_reserve(8).unwrap().allocate().unwrap();
+        let error = foreign.recycle(&mut workspace).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("different allocation budgets"));
+        assert_eq!(workspace.len(), 8);
+        assert_eq!(other.reserved(), 0);
     }
 
     #[test]

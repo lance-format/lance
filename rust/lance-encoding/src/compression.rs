@@ -82,6 +82,7 @@ use crate::{
 use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
+use lance_core::utils::allocation::Reservation;
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use std::{ops::Range, str::FromStr, sync::Arc};
 
@@ -1138,6 +1139,44 @@ pub fn try_fixed_size_list_block(
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Decode a selected range only after all output and codec scratch fit in the
+    /// supplied workspace. Inputs must already carry their physical allocation charge.
+    /// `Ok(None)` refuses admission without allocating or changing the workspace;
+    /// the caller must drain/replan rather than treat refusal as EOF or a result cap.
+    /// Completed scratch is recycled to the workspace and output retains its credit.
+    ///
+    /// The default returns `NotSupported`, never calls an unaccounted decoder. This
+    /// opt-in capability does not change existing scan paths or bound other stages.
+    ///
+    /// ```
+    /// # #[cfg(feature = "bitpacking")]
+    /// # fn example() -> lance_core::Result<()> {
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::bitpacking::InlineBitpacking};
+    /// let budget = AllocationBudget::new(12);
+    /// let mut workspace = budget.try_reserve(12).unwrap();
+    /// // A zero-width u32 chunk has only its four-byte zero header.
+    /// let input = workspace.try_allocate(4)?.unwrap().freeze();
+    /// let buffers = [LanceBuffer::from_bytes(input, 4)];
+    /// let output = InlineBitpacking::new(32)
+    ///     .try_decompress_range_in(&buffers, 1024, 3..5, &mut workspace)?.unwrap();
+    /// assert_eq!(output.num_values(), 2);
+    /// assert_eq!(budget.reserved(), 12);
+    /// # Ok(()) }
+    /// ```
+    fn try_decompress_range_in(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _range: Range<u64>,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted range decoder",
+        ))
+    }
 
     /// Decompress only `range` (`0 <= range.start <= range.end <= num_values`) from a mini-block
     /// chunk containing `num_values` items.
