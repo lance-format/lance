@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -25,6 +25,63 @@ use crate::rowids::version::{
 };
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
+
+/// Fragment metadata key for the schema fingerprint.
+///
+/// The value is `v1:<blake3 hex>` over the field identities present in the
+/// fragment's data files. It lets append validation reject fragments written
+/// from an incompatible field-id-to-name/type mapping without reading file
+/// footers. Fragments without this key retain the legacy append behavior.
+pub const SCHEMA_FINGERPRINT_METADATA_KEY: &str = "lance.schema.fingerprint";
+
+const SCHEMA_FINGERPRINT_VERSION: &str = "v1";
+
+fn hash_schema_fingerprint_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// Collect the descendants of a packed struct for fingerprinting.
+///
+/// Child field ids are intentionally omitted: a staged writer may not have
+/// assigned nested ids yet, while a committed target schema has them. The
+/// packed physical layout is ordered by the child schema, so names, logical
+/// types, and order are the identities that matter here.
+fn collect_packed_children<'a>(
+    field: &'a lance_core::datatypes::Field,
+    depth: usize,
+    entries: &mut Vec<(&'a lance_core::datatypes::Field, bool, usize)>,
+) {
+    for child in &field.children {
+        entries.push((child, false, depth));
+        collect_packed_children(child, depth + 1, entries);
+    }
+}
+
+fn hash_schema_fingerprint_field(
+    hasher: &mut blake3::Hasher,
+    field: &lance_core::datatypes::Field,
+    include_id: bool,
+) {
+    if include_id {
+        hasher.update(&field.id.to_le_bytes());
+        hasher.update(&field.parent_id.to_le_bytes());
+    } else {
+        // Mark a packed child entry; its id is intentionally not part of the
+        // identity.
+        hasher.update(&[u8::MAX]);
+    }
+    hash_schema_fingerprint_part(hasher, field.name.as_bytes());
+    // Legacy blobs and Blob v2 descriptors are different physical
+    // representations of the same logical field. Commit-time blob promotion
+    // may change the representation without changing the field-id mapping, so
+    // normalize both to one identity.
+    if field.is_blob() {
+        hash_schema_fingerprint_part(hasher, b"blob");
+    } else {
+        hash_schema_fingerprint_part(hasher, field.logical_type.to_string().as_bytes());
+    }
+}
 
 /// Lance Data File
 ///
@@ -650,6 +707,134 @@ impl Fragment {
         }
     }
 
+    /// Compute the schema fingerprint for the fields this fragment actually stores.
+    ///
+    /// Only non-negative field ids referenced by the fragment's data files are
+    /// included. Packed structs additionally include their child identities
+    /// (name, type, order, nesting, and direct-child count) because only the
+    /// parent id appears in the data file mapping. This makes schema evolution additive: a target schema may
+    /// have extra fields without invalidating an older fragment, while a
+    /// changed name, type, or parent for the same field id is rejected.
+    /// Nullability is intentionally not part of the identity; tightening a
+    /// nullable column does not change how its stored values are decoded.
+    pub fn schema_fingerprint(&self, schema: &Schema) -> Result<Option<String>> {
+        let mut selected_ids = BTreeSet::new();
+        for field_id in self
+            .files
+            .iter()
+            .flat_map(|file| file.fields.iter().copied())
+            .filter(|field_id| *field_id >= 0)
+        {
+            selected_ids.insert(field_id);
+        }
+
+        if selected_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut entries = Vec::new();
+        let mut covered_ids = BTreeSet::new();
+        for field_id in selected_ids {
+            if covered_ids.contains(&field_id) {
+                continue;
+            }
+            let field = schema.field_by_id(field_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Fragment {} references field id {} which is absent from the dataset schema",
+                    self.id, field_id
+                ))
+            })?;
+            entries.push((field, true, 0));
+            if field.is_packed_struct() {
+                let first_child = entries.len();
+                collect_packed_children(field, 1, &mut entries);
+                for (child, _, _) in &entries[first_child..] {
+                    if child.id >= 0 {
+                        covered_ids.insert(child.id);
+                    }
+                }
+            }
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hash_schema_fingerprint_part(&mut hasher, SCHEMA_FINGERPRINT_VERSION.as_bytes());
+        for (field, include_id, depth) in entries {
+            hash_schema_fingerprint_field(&mut hasher, field, include_id);
+            // A flat sequence of packed child names is ambiguous: a child can
+            // be nested under the previous struct or be its sibling. Hash the
+            // explicit depth and direct-child count to preserve the subtree
+            // shape without relying on nested field ids.
+            if !include_id || field.is_packed_struct() {
+                hasher.update(&(depth as u64).to_le_bytes());
+                hasher.update(&(field.children.len() as u64).to_le_bytes());
+            }
+        }
+
+        Ok(Some(format!(
+            "{SCHEMA_FINGERPRINT_VERSION}:{}",
+            hasher.finalize().to_hex()
+        )))
+    }
+
+    /// Attach the schema fingerprint to this fragment's metadata.
+    ///
+    /// Fragments with no stored fields are left unmarked. Writers call this
+    /// after assigning the final data file mappings so that append validation
+    /// can compare the fragment schema with the target dataset without any
+    /// additional object-store reads.
+    pub fn set_schema_fingerprint(&mut self, schema: &Schema) -> Result<()> {
+        if let Some(fingerprint) = self.schema_fingerprint(schema)? {
+            self.metadata
+                .insert(SCHEMA_FINGERPRINT_METADATA_KEY.to_string(), fingerprint);
+        }
+        Ok(())
+    }
+
+    /// Validate a fragment schema fingerprint against the target schema.
+    ///
+    /// Fragments without a fingerprint are legacy fragments and are accepted
+    /// unchanged. A fragment with a fingerprint is rejected if any field it
+    /// stores no longer has the same name, type, or parent in the target
+    /// schema. Nullability is intentionally excluded: tightening a nullable
+    /// column does not change the stored value encoding.
+    pub fn validate_schema_fingerprint(&self, schema: &Schema) -> Result<()> {
+        let Some(expected) = self.metadata.get(SCHEMA_FINGERPRINT_METADATA_KEY) else {
+            return Ok(());
+        };
+
+        // A fragment may legitimately carry a field that a concurrent schema
+        // change removed. The append path already decides whether such a
+        // fragment is conflict-compatible; the fingerprint must not turn that
+        // into an unconditional error. We cannot compare the full marker when
+        // the field set differs, so leave this decision to the existing append
+        // validation. All fields must be present for this optimization to
+        // provide a meaningful schema comparison.
+        if self
+            .files
+            .iter()
+            .flat_map(|file| file.fields.iter())
+            .any(|field_id| *field_id >= 0 && schema.field_by_id(*field_id).is_none())
+        {
+            return Ok(());
+        }
+
+        let actual = self.schema_fingerprint(schema)?.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Fragment {} has a schema fingerprint but no field ids to validate",
+                self.id
+            ))
+        })?;
+        if expected != &actual {
+            return Err(Error::invalid_input(format!(
+                "Fragment {} has a schema fingerprint that does not match the target dataset \
+                 schema. Refusing to append it because its field-id-to-name/type mapping differs \
+                 from the dataset; this would silently misalign columns.",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
     pub fn num_rows(&self) -> Option<usize> {
         match (self.physical_rows, &self.deletion_file) {
             // Known fragment length, no deletion file.
@@ -1011,6 +1196,136 @@ mod tests {
     use roaring::RoaringBitmap;
     use rstest::rstest;
     use serde_json::{Value, json};
+
+    #[test]
+    fn test_fragment_schema_fingerprint_rejects_name_and_type_changes() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]))
+        .unwrap();
+        let mut fragment = Fragment::new(7);
+        fragment.files.push(DataFile::new_legacy_from_fields(
+            "data/one.lance",
+            vec![0],
+            None,
+        ));
+        fragment.set_schema_fingerprint(&schema).unwrap();
+        assert!(
+            fragment
+                .metadata
+                .contains_key(SCHEMA_FINGERPRINT_METADATA_KEY)
+        );
+        fragment.validate_schema_fingerprint(&schema).unwrap();
+
+        let mut renamed = schema.clone();
+        renamed.fields[0].name = "label".to_string();
+        let error = fragment.validate_schema_fingerprint(&renamed).unwrap_err();
+        assert!(error.to_string().contains("schema fingerprint"), "{error}");
+
+        let mut retyped = schema.clone();
+        retyped.fields[0].logical_type = "int32".into();
+        let error = fragment.validate_schema_fingerprint(&retyped).unwrap_err();
+        assert!(error.to_string().contains("schema fingerprint"), "{error}");
+
+        // Adding a field to the target schema is normal schema evolution; the
+        // fragment does not store the new field, so it remains appendable.
+        let mut extended = schema.clone();
+        let mut extra =
+            lance_core::datatypes::Field::new_arrow("extra", DataType::Int32, true).unwrap();
+        extra.id = 1;
+        extra.parent_id = -1;
+        extended.fields.push(extra);
+        fragment.validate_schema_fingerprint(&extended).unwrap();
+    }
+
+    #[test]
+    fn test_packed_struct_schema_fingerprint_covers_children() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "packed",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("a", DataType::Int32, false),
+                        ArrowField::new("b", DataType::Int32, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                "lance-encoding:packed".to_string(),
+                "true".to_string(),
+            )])),
+        ]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        // The staged writer may not have assigned nested ids yet.
+        schema.fields[0].id = 0;
+        schema.fields[0].parent_id = -1;
+        let mut fragment = Fragment::new(9);
+        // A packed struct occupies one physical column, so the data file names
+        // only the parent field id.
+        fragment.files.push(DataFile::new_legacy_from_fields(
+            "data/packed.lance",
+            vec![0],
+            None,
+        ));
+        assert!(schema.fields[0].is_packed_struct());
+        fragment.set_schema_fingerprint(&schema).unwrap();
+
+        let mut target = schema.clone();
+        target.fields[0].children[0].id = 1;
+        target.fields[0].children[0].parent_id = 0;
+        target.fields[0].children[1].id = 2;
+        target.fields[0].children[1].parent_id = 0;
+        fragment.validate_schema_fingerprint(&target).unwrap();
+
+        let mut swapped = target.clone();
+        swapped.fields[0].children[0].name = "b".to_string();
+        swapped.fields[0].children[1].name = "a".to_string();
+        let error = fragment.validate_schema_fingerprint(&swapped).unwrap_err();
+        assert!(error.to_string().contains("schema fingerprint"), "{error}");
+    }
+
+    #[test]
+    fn test_packed_struct_nested_shape_is_part_of_fingerprint() {
+        fn schema(b_inside: bool) -> Schema {
+            let a = ArrowField::new("a", DataType::Utf8, false);
+            let b = ArrowField::new("b", DataType::Int32, false);
+            let x = if b_inside {
+                ArrowField::new("x", DataType::Struct(vec![a, b.clone()].into()), false)
+            } else {
+                ArrowField::new("x", DataType::Struct(vec![a].into()), false)
+            };
+            let packed = if b_inside {
+                ArrowField::new("packed", DataType::Struct(vec![x].into()), false)
+            } else {
+                ArrowField::new("packed", DataType::Struct(vec![x, b].into()), false)
+            }
+            .with_metadata(HashMap::from([(
+                "lance-encoding:packed".to_string(),
+                "true".to_string(),
+            )]));
+            let mut schema = Schema::try_from(&ArrowSchema::new(vec![packed])).unwrap();
+            schema.fields[0].id = 0;
+            schema.fields[0].parent_id = -1;
+            schema
+        }
+
+        let mut fragment = Fragment::new(10);
+        fragment.files.push(DataFile::new_legacy_from_fields(
+            "data/nested-packed.lance",
+            vec![0],
+            None,
+        ));
+        fragment.set_schema_fingerprint(&schema(false)).unwrap();
+
+        let error = fragment
+            .validate_schema_fingerprint(&schema(true))
+            .unwrap_err();
+        assert!(error.to_string().contains("schema fingerprint"), "{error}");
+    }
 
     #[test]
     fn test_data_overlay_roundtrip() {

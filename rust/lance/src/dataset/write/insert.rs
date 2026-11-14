@@ -160,7 +160,12 @@ impl<'a> InsertBuilder<'a> {
     /// # }
     /// ```
     pub async fn execute_uncommitted(&self, data: Vec<RecordBatch>) -> Result<Transaction> {
-        self.write_uncommitted_impl(data).await.map(|(t, _)| t)
+        let (mut transaction, context) = self.write_uncommitted_impl(data).await?;
+        Self::stamp_schema_fingerprints(
+            &mut transaction,
+            context.dest.dataset().map(|dataset| dataset.schema()),
+        )?;
+        Ok(transaction)
     }
 
     async fn do_commit(
@@ -188,6 +193,31 @@ impl<'a> InsertBuilder<'a> {
         }
 
         commit_builder.execute(transaction).await
+    }
+
+    fn stamp_schema_fingerprints(
+        transaction: &mut Transaction,
+        dataset_schema: Option<&Schema>,
+    ) -> Result<()> {
+        match &mut transaction.operation {
+            Operation::Append { fragments } => {
+                let Some(schema) = dataset_schema else {
+                    return Ok(());
+                };
+                for fragment in fragments {
+                    fragment.set_schema_fingerprint(schema)?;
+                }
+            }
+            Operation::Overwrite {
+                schema, fragments, ..
+            } => {
+                for fragment in fragments {
+                    fragment.set_schema_fingerprint(schema)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn write_uncommitted_impl(
@@ -220,7 +250,11 @@ impl<'a> InsertBuilder<'a> {
         source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
         let (stream, schema) = source.into_stream_and_schema().await?;
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        let (mut transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        Self::stamp_schema_fingerprints(
+            &mut transaction,
+            context.dest.dataset().map(|dataset| dataset.schema()),
+        )?;
         Ok(transaction)
     }
 
