@@ -371,7 +371,12 @@ lance_core::dispatch! {
                 L2_F32_SCALAR,
             ]
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        // NEON is part of the aarch64 baseline, so this dispatch is static.
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[aarch64::L2_F32_NEON, L2_F32_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             &[L2_F32_SCALAR]
         }
@@ -392,7 +397,11 @@ lance_core::dispatch! {
                 L2_F32_BATCH_SCALAR,
             ]
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[aarch64::L2_F32_BATCH_NEON, L2_F32_BATCH_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             &[L2_F32_BATCH_SCALAR]
         }
@@ -962,6 +971,143 @@ mod x86 {
     }
 }
 
+/// aarch64 ASIMD kernels. NEON is part of the aarch64 baseline, so the
+/// candidates below need no extra target features and dispatch is static.
+#[cfg(target_arch = "aarch64")]
+mod aarch64 {
+    use std::arch::aarch64::*;
+
+    use crate::distance::{BatchKernel, PairKernel};
+
+    lance_core::target_kernel! {
+        #[target_features()]
+        #[candidate(pub(super) L2_F32_NEON: PairKernel)]
+        /// Eight `float32x4_t` accumulators over 32 values per iteration,
+        /// then 16- and 4-wide loops and a scalar tail.
+        #[inline]
+        pub(super) fn l2_f32_neon(x: &[f32], y: &[f32]) -> f32 {
+            // Every load is bounded by `dim`, so no read crosses either slice.
+            unsafe {
+                // Callers pass equal lengths; `min` keeps the unchecked loads
+                // in bounds for any input, as a safe function must.
+                let dim = x.len().min(y.len());
+                let mut i = 0usize;
+
+                let mut a0 = vdupq_n_f32(0.0);
+                let mut a1 = vdupq_n_f32(0.0);
+                let mut a2 = vdupq_n_f32(0.0);
+                let mut a3 = vdupq_n_f32(0.0);
+                let mut a4 = vdupq_n_f32(0.0);
+                let mut a5 = vdupq_n_f32(0.0);
+                let mut a6 = vdupq_n_f32(0.0);
+                let mut a7 = vdupq_n_f32(0.0);
+                while i + 32 <= dim {
+                    let d0 =
+                        vsubq_f32(vld1q_f32(x.as_ptr().add(i)), vld1q_f32(y.as_ptr().add(i)));
+                    let d1 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 4)),
+                        vld1q_f32(y.as_ptr().add(i + 4)),
+                    );
+                    let d2 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 8)),
+                        vld1q_f32(y.as_ptr().add(i + 8)),
+                    );
+                    let d3 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 12)),
+                        vld1q_f32(y.as_ptr().add(i + 12)),
+                    );
+                    let d4 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 16)),
+                        vld1q_f32(y.as_ptr().add(i + 16)),
+                    );
+                    let d5 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 20)),
+                        vld1q_f32(y.as_ptr().add(i + 20)),
+                    );
+                    let d6 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 24)),
+                        vld1q_f32(y.as_ptr().add(i + 24)),
+                    );
+                    let d7 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 28)),
+                        vld1q_f32(y.as_ptr().add(i + 28)),
+                    );
+                    a0 = vfmaq_f32(a0, d0, d0);
+                    a1 = vfmaq_f32(a1, d1, d1);
+                    a2 = vfmaq_f32(a2, d2, d2);
+                    a3 = vfmaq_f32(a3, d3, d3);
+                    a4 = vfmaq_f32(a4, d4, d4);
+                    a5 = vfmaq_f32(a5, d5, d5);
+                    a6 = vfmaq_f32(a6, d6, d6);
+                    a7 = vfmaq_f32(a7, d7, d7);
+                    i += 32;
+                }
+
+                if i + 16 <= dim {
+                    let d0 =
+                        vsubq_f32(vld1q_f32(x.as_ptr().add(i)), vld1q_f32(y.as_ptr().add(i)));
+                    let d1 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 4)),
+                        vld1q_f32(y.as_ptr().add(i + 4)),
+                    );
+                    let d2 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 8)),
+                        vld1q_f32(y.as_ptr().add(i + 8)),
+                    );
+                    let d3 = vsubq_f32(
+                        vld1q_f32(x.as_ptr().add(i + 12)),
+                        vld1q_f32(y.as_ptr().add(i + 12)),
+                    );
+                    a0 = vfmaq_f32(a0, d0, d0);
+                    a1 = vfmaq_f32(a1, d1, d1);
+                    a2 = vfmaq_f32(a2, d2, d2);
+                    a3 = vfmaq_f32(a3, d3, d3);
+                    i += 16;
+                }
+
+                while i + 4 <= dim {
+                    let d = vsubq_f32(vld1q_f32(x.as_ptr().add(i)), vld1q_f32(y.as_ptr().add(i)));
+                    a0 = vfmaq_f32(a0, d, d);
+                    i += 4;
+                }
+
+                let s0 = vaddq_f32(
+                    vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)),
+                    vaddq_f32(vaddq_f32(a4, a5), vaddq_f32(a6, a7)),
+                );
+                let sum = vaddvq_f32(s0);
+
+                let tail: f32 = x[i..]
+                    .iter()
+                    .zip(y[i..].iter())
+                    .map(|(&a, &b)| {
+                        let diff = a - b;
+                        diff * diff
+                    })
+                    .sum();
+
+                sum + tail
+            }
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features()]
+        #[candidate(pub(super) L2_F32_BATCH_NEON: BatchKernel)]
+        #[inline]
+        pub(super) fn l2_batch_f32_neon(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = l2_f32_neon(x, y);
+            }
+        }
+    }
+}
+
 /// Accumulate squared differences for one dimension into per-target results.
 ///
 /// Separated into its own function so that LLVM sees `row` and `result`
@@ -1197,6 +1343,22 @@ mod tests {
             let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.5 - 3.0).collect();
             let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 1.5).collect();
             assert_relative_eq!(l2_f32(&x, &y), l2(&x, &y), max_relative = 1e-5);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_l2_f32_batch_neon_matches_scalar() {
+        for &(dim, nvecs) in &[(8usize, 7usize), (16, 5), (100, 3), (256, 17), (1024, 4)] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.25 - 7.0).collect();
+            let batch: Vec<f32> = (0..dim * nvecs)
+                .map(|i| ((i * 13 + 5) % 211) as f32 * 0.1)
+                .collect();
+            let mut got = vec![0.0f32; nvecs];
+            let mut expected = vec![0.0f32; nvecs];
+            super::aarch64::l2_batch_f32_neon(&x, &batch, dim, &mut got);
+            super::l2_batch_f32_scalar(&x, &batch, dim, &mut expected);
+            assert_relative_eq!(got.as_slice(), expected.as_slice(), max_relative = 1e-3);
         }
     }
 
@@ -1512,6 +1674,16 @@ mod tests {
         #[test]
         fn test_l2_distance_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
             do_l2_test(&x, &y)?;
+        }
+
+        /// NEON-direct parity for f32: the explicit kernel must match the
+        /// portable auto-vectorised path for every tail length.
+        #[cfg(target_arch = "aarch64")]
+        #[test]
+        fn test_l2_f32_neon_matches_scalar((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)) {
+            let scalar = super::l2_f32_scalar(&x, &y);
+            let neon = super::aarch64::l2_f32_neon(&x, &y);
+            prop_assert!(approx::relative_eq!(scalar, neon, max_relative = 1e-3));
         }
     }
 
