@@ -80,6 +80,7 @@ pub mod files;
 pub mod fragment;
 pub(crate) mod fragment_slice;
 mod hash_joiner;
+mod history_retention;
 pub mod index;
 pub mod mem_wal;
 mod metadata;
@@ -1741,20 +1742,36 @@ impl Dataset {
 
     /// Restore the currently checked out version of the dataset as the latest version.
     pub async fn restore(&mut self) -> Result<()> {
+        self.pin_restore_target().await?;
         let (latest_manifest, _) = self.latest_manifest().await?;
-        let latest_version = latest_manifest.version;
-
         let transaction = Transaction::new(
-            latest_version,
+            latest_manifest.version,
             Operation::Restore {
                 version: self.manifest.version,
             },
             None,
         );
-
         self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+            .await
+    }
 
+    /// Pins the checked-out version, then fails if cleanup has expired it.
+    ///
+    /// Cleanup lists pins after writing its retention rule, so either cleanup
+    /// keeps the version or this check sees the rule. The pin is left in place
+    /// once the restore may commit: a cleanup that planned before the commit
+    /// cannot see the restored version, so the pin protects its files until it
+    /// goes stale.
+    async fn pin_restore_target(&self) -> Result<()> {
+        let pin = history_retention::Pin::write(self).await?;
+        if let Err(error) = self
+            .refs
+            .ensure_not_expired(self.manifest.branch.as_deref(), self.manifest.version)
+            .await
+        {
+            pin.remove(self).await;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1789,6 +1806,7 @@ impl Dataset {
     /// }
     /// ```
     pub async fn restore_from(&mut self, expected_latest_version: u64) -> Result<()> {
+        self.pin_restore_target().await?;
         let transaction = Transaction::new(
             expected_latest_version,
             Operation::Restore {

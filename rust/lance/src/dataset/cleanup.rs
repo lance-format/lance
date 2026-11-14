@@ -43,6 +43,7 @@ pub mod retention;
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
+use super::history_retention;
 use super::mem_wal::util::is_mem_wal_dir_name;
 use super::refs::{REFS_DIR, TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
@@ -437,6 +438,11 @@ struct CleanupTask<'a> {
     action: CleanupAction,
     read_version: u64,
     ignored_manifests: HashSet<Path>,
+    /// Versions pinned by in-progress restores. Kept like tagged versions, but
+    /// never reported as tagged.
+    pinned_versions: HashSet<u64>,
+    /// When this run started planning. Restore pins are aged against it.
+    started_at: DateTime<Utc>,
     track_removed_manifests: bool,
     include_referenced_branches: bool,
 }
@@ -483,6 +489,8 @@ struct CleanupInspection {
     verified_files: ReferencedFiles,
     /// Track tagged old versions in case we want to raise a `CleanupError`.
     tagged_old_versions: HashSet<u64>,
+    /// Attached versions this run keeps, for the history retention rule.
+    kept_versions: BTreeSet<u64>,
     /// Source versions whose files are still referenced by descendant branches.
     branch_referenced_versions: HashSet<u64>,
     /// Tagged fragment-reuse-index entries seen across manifests, deduped by
@@ -928,6 +936,8 @@ impl<'a> CleanupTask<'a> {
             action,
             read_version,
             ignored_manifests,
+            pinned_versions: HashSet::new(),
+            started_at: utc_now(),
             track_removed_manifests,
             include_referenced_branches,
         })
@@ -1091,6 +1101,10 @@ impl<'a> CleanupTask<'a> {
                 .retain_branch_lineage_files(inspection, &referenced_branches, &ignored_manifests)
                 .await?
         };
+        if self.action.deletes_files() {
+            self.pinned_versions =
+                history_retention::pinned_versions(self.dataset, self.started_at).await?;
+        }
         let inspection = self.process_manifests(&tagged_versions, inspection).await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
@@ -1100,11 +1114,80 @@ impl<'a> CleanupTask<'a> {
             ));
         }
 
+        let (inspection, rule_written) = self
+            .publish_history_retention(inspection, &tagged_versions, &referenced_branches)
+            .await?;
+
         final_result.merge(
             self.delete_unreferenced_files(inspection).await?,
             candidate_file_limit,
         );
+        if rule_written {
+            history_retention::finish_deleting(self.dataset, self.started_at).await;
+        }
         Ok(final_result)
+    }
+
+    /// Writes the history retention rule for this run's deletions, then keeps
+    /// the versions that tags, branches, or pins started referencing after
+    /// planning. Returns whether a rule was written.
+    ///
+    /// `planned_branch_roots` are the branches the plan saw. Their roots may
+    /// be planned for deletion when the branch no longer uses their files.
+    async fn publish_history_retention(
+        &self,
+        inspection: CleanupInspection,
+        tagged_versions: &HashSet<u64>,
+        planned_branch_roots: &[(String, u64)],
+    ) -> Result<(CleanupInspection, bool)> {
+        if !self.action.deletes_files() {
+            return Ok((inspection, false));
+        }
+        let deleted: HashSet<u64> = inspection
+            .old_manifests
+            .values()
+            .map(|manifest| manifest.version)
+            .filter(|version| !is_detached_version(*version))
+            .collect();
+        let Some(rule) = history_retention::planned_rule(
+            deleted.iter().copied(),
+            inspection.kept_versions.iter().copied(),
+        ) else {
+            return Ok((inspection, false));
+        };
+        let newly_referenced: Vec<u64> =
+            history_retention::publish(self.dataset, rule, self.started_at)
+                .await?
+                .versions_unplanned(planned_branch_roots)
+                .into_iter()
+                .filter(|version| deleted.contains(version))
+                .collect();
+        if newly_referenced.is_empty() {
+            return Ok((inspection, true));
+        }
+        let protected: HashSet<u64> = tagged_versions
+            .iter()
+            .chain(&newly_referenced)
+            .copied()
+            .collect();
+        let branch_versions = inspection.branch_referenced_versions.clone();
+        let inspection = Mutex::new(inspection);
+        for version in newly_referenced {
+            let location = self
+                .dataset
+                .commit_handler
+                .resolve_version_location(
+                    &self.dataset.base,
+                    version,
+                    &self.dataset.object_store.inner,
+                )
+                .await?;
+            // The bucket-survivor path moves an already planned manifest back
+            // into the working set.
+            self.process_manifest_file(location, &inspection, &protected, &branch_versions, true)
+                .await?;
+        }
+        Ok((inspection.into_inner().unwrap(), true))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1441,6 +1524,7 @@ impl<'a> CleanupTask<'a> {
             || is_latest
             || !(hard_expired || thinning_candidate.is_some())
             || is_tagged
+            || self.pinned_versions.contains(&manifest.version)
             || branch_versions.contains(&manifest.version);
         if manifest.has_managed_blobs() {
             let snapshot = self
@@ -1501,6 +1585,7 @@ impl<'a> CleanupTask<'a> {
             // Detached versions do not move the retained-manifest cutoff; their own
             // files are referenced either way.
             if !is_detached {
+                inspection.kept_versions.insert(manifest.version);
                 match inspection.earliest_retained_manifest_time {
                     Some(ts) if commit_ts >= ts => {}
                     _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
@@ -3581,6 +3666,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
     use lance_linalg::distance::MetricType;
+    use lance_table::format::history_retention::RETENTION_DIR;
     use lance_table::io::commit::{RenameCommitHandler, uses_version_hint, write_version_hint};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
@@ -4155,7 +4241,11 @@ mod tests {
             let (os, path) =
                 ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
                     .await?;
-            let mut file_stream = os.read_dir_all(&path, None);
+            // Retention files are bookkeeping that cleanup writes, not removable data.
+            let retention_dir = path.clone().join(RETENTION_DIR);
+            let mut file_stream = os
+                .read_dir_all(&path, None)
+                .try_filter(|meta| future::ready(!meta.location.prefix_matches(&retention_dir)));
             let mut file_count = FileCounts {
                 num_data_files: 0,
                 num_delete_files: 0,
