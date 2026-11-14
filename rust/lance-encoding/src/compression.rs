@@ -88,7 +88,9 @@ use lance_core::utils::allocation::Reservation;
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
 use std::{ops::Range, str::FromStr, sync::Arc};
 
+mod layout;
 pub mod levels;
+pub use layout::MiniBlockOutputLayout;
 
 /// Payload required by one validated MiniBlock range operation.
 ///
@@ -1164,6 +1166,17 @@ pub fn try_fixed_size_list_block(
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Describe the fixed-layout output of every admitted range from this codec.
+    /// This capability permits planning concatenation before decoding any values.
+    /// Implementations must return the same shape for empty and nonempty ranges;
+    /// [`Self::plan_range`] must validate all payload-dependent errors first.
+    /// Unsupported or variable-layout codecs return an error by default.
+    fn admitted_output_layout(&self) -> Result<MiniBlockOutputLayout> {
+        Err(Error::not_supported(
+            "mini-block codec has no admitted concat layout",
+        ))
+    }
 
     /// Validate a range and price its complete output/scratch without allocating
     /// payload. This is the same preflight used by [`Self::try_decompress_range_in`].

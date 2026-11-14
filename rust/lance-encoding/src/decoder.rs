@@ -3632,7 +3632,11 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
     /// Single-instruction MiniBlock tasks may decode charged structural scratch
     /// to map rows to values before discovering insufficient value credit. They
     /// recycle that scratch and selected levels on refusal, preserving this
-    /// reservation. Multi-instruction concatenation is not yet supported there.
+    /// reservation. Multi-instruction tasks preflight every selection, value
+    /// output and concatenation before freezing values. Planning refusal/error
+    /// returns exclusive structural credit to this workspace. On success, copied
+    /// intermediate values refund the global pool when dropped; reserve later
+    /// stages separately rather than assuming that credit is recycled here.
     fn try_decode_in(
         &self,
         _workspace: &mut lance_core::utils::allocation::Reservation,

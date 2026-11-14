@@ -269,6 +269,14 @@ mod tests {
         let planned = codec.plan_range(&buffers, stored, range.clone()).unwrap();
         assert_eq!(planned.output_bytes, output_bytes);
         assert_eq!(planned.workspace_bytes, operation_bytes);
+        assert_eq!(
+            codec
+                .admitted_output_layout()
+                .unwrap()
+                .payload_bytes(range.end - range.start)
+                .unwrap(),
+            output_bytes
+        );
         assert_eq!(workspace.len(), operation_bytes);
         assert_eq!(budget.reserved(), input_bytes + operation_bytes);
         if operation_bytes > 0 {

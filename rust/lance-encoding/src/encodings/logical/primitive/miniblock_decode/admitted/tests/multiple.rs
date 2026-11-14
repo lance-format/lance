@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use arrow_array::{Array, FixedSizeListArray, UInt32Array};
+use arrow_buffer::NullBuffer;
+use arrow_schema::Field;
+
+use super::*;
+
+fn select(task: &mut DecodeMiniBlockTask, selections: &[(u64, u64)]) {
+    let (template, chunk) = task.instructions.remove(0);
+    task.instructions = selections
+        .iter()
+        .map(|&(start, count)| {
+            (
+                ChunkDrainInstructions {
+                    chunk_instructions: template.chunk_instructions.clone(),
+                    rows_to_skip: start,
+                    rows_to_take: count,
+                    preamble_action: template.preamble_action,
+                },
+                chunk.clone(),
+            )
+        })
+        .collect();
+}
+
+fn list_fixture(codec: Codec, large: bool, workspace: usize) -> Fixture {
+    let mut fixture = fixture(
+        Some(&[1, 0, 1, 1, 1, 0]),
+        Some(&[0, 1, 2, 3, 0, 0]),
+        codec,
+        large,
+        workspace,
+    );
+    select(&mut fixture.task, &[(0, 2), (2, 2)]);
+    fixture
+}
+
+fn assert_lists(page: DecodedPage, work: &mut Reservation) {
+    assert_values(&page, &[10, 0, 20, 30]);
+    let mut structure = CompositeRepDefUnraveler::new(vec![page.repdef]);
+    let leaf = structure
+        .try_unravel_validity_in(4, work)
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(leaf.iter().collect::<Vec<_>>(), [true, false, true, true]);
+    let (offsets, validity) = structure
+        .try_unravel_offsets_in::<i32>(work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(offsets.as_ref(), &[0, 2, 2, 2, 4]);
+    assert_eq!(
+        validity.unwrap().iter().collect::<Vec<_>>(),
+        [true, false, true, true]
+    );
+}
+
+#[rstest]
+#[case::flat(Codec::Flat)]
+#[case::rle(Codec::Rle)]
+fn multiple_selections_preserve_list_null_empty_order(
+    #[case] codec: Codec,
+    #[values(false, true)] large: bool,
+) {
+    let Fixture {
+        task,
+        budget,
+        mut work,
+        physical,
+    } = list_fixture(codec, large, 128);
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    // 24 combined level bytes,16 intermediate value bytes and16 final values.
+    assert_eq!(work.len(), 128 - 56);
+    assert_eq!(budget.reserved(), physical + 128 - 16);
+    assert_lists(page, &mut work);
+    drop(work);
+    drop(task);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[cfg(feature = "bitpacking")]
+#[rstest]
+fn multiple_bitpacked_structural_streams(#[values(false, true)] large: bool) {
+    let Fixture {
+        task,
+        budget,
+        mut work,
+        ..
+    } = list_fixture(Codec::Bitpacked, large, 4096);
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_lists(page, &mut work);
+    drop(work);
+    drop(task);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[case::first_levels(23)]
+#[case::first_copy(35)]
+#[case::later_copy(47)]
+#[case::combined_execution(55)]
+fn multiple_refusal_recycles_all_prepared_selections(#[case] available: usize) {
+    let Fixture {
+        task,
+        budget,
+        mut work,
+        physical,
+    } = list_fixture(Codec::Flat, false, 56);
+    let mut short = work.try_split(available).unwrap();
+    for _ in 0..2 {
+        assert!(task.try_decode_in(&mut short).unwrap().is_none());
+        assert_eq!(short.len(), available);
+        assert_eq!(budget.reserved(), physical + 56);
+        assert!(budget.try_reserve(1).is_none());
+    }
+    drop(short);
+    drop(work);
+    let mut work = budget.try_reserve(56).unwrap();
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_values(&page, &[10, 0, 20, 30]);
+    assert!(work.is_empty());
+    drop(page);
+    drop(task);
+    drop(work);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[case::item_count(0, "item count")]
+#[case::selection(1, "repetition boundaries")]
+#[case::truncated_last_chunk(2, "buffer")]
+fn multiple_late_invalid_input_restores_the_same_workspace(
+    #[case] fault: u8,
+    #[case] message: &str,
+) {
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        physical,
+    } = list_fixture(Codec::Flat, false, 128);
+    match fault {
+        0 => task.instructions[1].1.items_in_chunk += 1,
+        1 => task.instructions[1].0.rows_to_take = 10,
+        2 => {
+            let data = &task.instructions[1].1.data;
+            task.instructions[1].1.data = data.slice_with_length(0, data.len() - 17);
+        }
+        _ => unreachable!(),
+    }
+    let error = task.try_decode_in(&mut work).err().unwrap();
+    assert!(matches!(
+        error,
+        Error::InvalidInput { .. } | Error::CorruptFile { .. }
+    ));
+    assert!(error.to_string().contains(message), "{error}");
+    assert_eq!(work.len(), 128);
+    assert_eq!(budget.reserved(), physical + 128);
+}
+
+#[test]
+fn multiple_preamble_and_rows_keep_existing_selection_semantics() {
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        ..
+    } = fixture(
+        Some(&[0, 0, 1, 1, 1, 0]),
+        Some(&[0, 1, 2, 3, 0, 0]),
+        Codec::Flat,
+        false,
+        128,
+    );
+    select(&mut task, &[(0, 0), (0, 3)]);
+    task.instructions[0].0.preamble_action = PreambleAction::Take;
+    task.instructions[1].0.preamble_action = PreambleAction::Skip;
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_values(&page, &[10, 0, 20, 30]);
+    drop(page);
+    drop(work);
+    drop(task);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn empty_multiple_ranges_preserve_typed_empty_output() {
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        physical,
+    } = fixture(None, None, Codec::Flat, false, 0);
+    select(&mut task, &[(1, 0), (2, 0)]);
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert_values(&page, &[]);
+    let arrow = page
+        .data
+        .try_to_arrow_in(&DataType::UInt32, &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(arrow.len(), 0);
+    assert_eq!(budget.reserved(), physical);
+    drop(arrow);
+    drop(page);
+    drop(work);
+    drop(task);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+fn distinct_chunks_preserve_order_and_independent_input_owners(#[values(false, true)] large: bool) {
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        ..
+    } = fixture(None, None, Codec::Flat, large, 1024);
+    let values = [100_u32, 200, 300, 400];
+    let payload: &[u8] = bytemuck::cast_slice(&values);
+    let mut frame = 4_u16.to_le_bytes().to_vec();
+    if large {
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    } else {
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    }
+    frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    frame.extend_from_slice(payload);
+    frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    let physical = frame.len() + 17;
+    let mut input = work.try_allocate(physical).unwrap().unwrap();
+    input.as_mut()[1..1 + frame.len()].copy_from_slice(&frame);
+    let input = LanceBuffer::from(Buffer::from(input.freeze()).slice_with_length(1, frame.len()));
+    select(&mut task, &[(2, 2), (1, 2)]);
+    let start = task.instructions[0].1.byte_range.end;
+    task.instructions[1].0.chunk_instructions.chunk_idx = 1;
+    task.instructions[1].1 = LoadedChunk {
+        byte_range: start..start + frame.len() as u64,
+        data: input.clone(),
+        items_in_chunk: 4,
+        chunk_idx: 1,
+    };
+    let mut exact = work.try_split(32).unwrap();
+    let page = task.try_decode_in(&mut exact).unwrap().unwrap();
+    assert_values(&page, &[20, 30, 200, 300]);
+    assert!(exact.is_empty());
+    let output_alias = page.data.as_fixed_width_ref().unwrap().data.clone();
+    drop(page);
+    drop(exact);
+    drop(work);
+    drop(task);
+    assert_eq!(budget.reserved(), physical + 16);
+    drop(input);
+    assert_eq!(budget.reserved(), 16);
+    drop(output_alias);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn multiple_outputs_allow_finite_concurrent_progress() {
+    let Fixture {
+        mut task,
+        budget,
+        work,
+        physical,
+    } = fixture(None, None, Codec::Flat, false, 64);
+    select(&mut task, &[(0, 2), (2, 2)]);
+    drop(work);
+    let consume = || {
+        let mut work = budget.try_reserve(32).unwrap();
+        task.try_decode_in(&mut work).unwrap().unwrap()
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(consume);
+        let second = scope.spawn(consume);
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_values(&first, &[10, 0, 20, 30]);
+    assert_values(&second, &[10, 0, 20, 30]);
+    assert_eq!(budget.reserved(), physical + 32);
+    // A third workspace fits while both completed outputs remain live.
+    let third = consume();
+    let alias = first.data.as_fixed_width_ref().unwrap().data.clone();
+    drop(first);
+    assert!(budget.try_reserve(32).is_none());
+    drop(alias);
+    let fourth = consume();
+    assert_values(&fourth, &[10, 0, 20, 30]);
+    drop(second);
+    drop(third);
+    drop(fourth);
+    drop(task);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+fn multiple_nested_vectors_include_child_bitmap_output(#[values(false, true)] large: bool) {
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        ..
+    } = fixture(None, None, Codec::Flat, large, 1024);
+    let values: Vec<u32> = (0..12).collect();
+    let buffers: [&[u8]; 2] = [&[0b1011_0110, 0b0000_1101], bytemuck::cast_slice(&values)];
+    let mut frame = 4_u16.to_le_bytes().to_vec();
+    for buffer in buffers {
+        if large {
+            frame.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+        } else {
+            frame.extend_from_slice(&(buffer.len() as u16).to_le_bytes());
+        }
+    }
+    frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    for buffer in buffers {
+        frame.extend_from_slice(buffer);
+        frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
+    }
+    let physical = frame.len() + 1;
+    let mut input = work.try_allocate(physical).unwrap().unwrap();
+    input.as_mut()[1..].copy_from_slice(&frame);
+    task.instructions[0].1.data =
+        LanceBuffer::from(Buffer::from(input.freeze()).slice_with_length(1, frame.len()));
+    task.instructions[0].1.byte_range = 0..frame.len() as u64;
+    task.num_buffers = 2;
+    let encoding =
+        crate::format::EncodingUtils::fsl(3, true, crate::format::EncodingUtils::flat(32, None));
+    let metadata::compressive_encoding::Compression::FixedSizeList(fsl) =
+        encoding.compression.unwrap()
+    else {
+        unreachable!()
+    };
+    task.value_decompressor = Arc::new(ValueDecompressor::from_fsl(&fsl).unwrap());
+    select(&mut task, &[(1, 1), (2, 2)]);
+    let mut short = work.try_split(75).unwrap();
+    assert!(task.try_decode_in(&mut short).unwrap().is_none());
+    assert_eq!(short.len(), 75);
+    drop(short);
+    drop(work);
+    let mut work = budget.try_reserve(76).unwrap();
+    let page = task.try_decode_in(&mut work).unwrap().unwrap();
+    assert!(work.is_empty());
+    let child = UInt32Array::new(
+        values[3..].to_vec().into(),
+        Some(NullBuffer::from(
+            (3..12)
+                .map(|i| arrow_buffer::bit_util::get_bit(buffers[0], i))
+                .collect::<Vec<_>>(),
+        )),
+    );
+    let expected = FixedSizeListArray::new(
+        Arc::new(Field::new("item", DataType::UInt32, true)),
+        3,
+        Arc::new(child),
+        None,
+    );
+    let actual = page
+        .data
+        .try_to_arrow_in(expected.data_type(), &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected.to_data());
+    drop(page);
+    drop(actual);
+    drop(work);
+    drop(task);
+    assert_eq!(budget.reserved(), 0);
+}

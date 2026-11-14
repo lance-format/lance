@@ -291,6 +291,14 @@ mod tests {
             .unwrap();
         assert_eq!(planned.output_bytes, output_bytes);
         assert_eq!(planned.workspace_bytes, output_bytes);
+        assert_eq!(
+            codec
+                .admitted_output_layout()
+                .unwrap()
+                .payload_bytes(range.end - range.start)
+                .unwrap(),
+            output_bytes
+        );
         assert_eq!(workspace.len(), output_bytes);
         assert_eq!(budget.reserved(), input_bytes + output_bytes);
 

@@ -6,7 +6,7 @@ use arrow_buffer::{BooleanBufferBuilder, bit_util};
 use crate::buffer::LanceBuffer;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
-    require_block_payload,
+    MiniBlockOutputLayout, require_block_payload,
 };
 use crate::data::{
     AllNullDataBlock, BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
@@ -660,6 +660,23 @@ impl BlockDecompressor for ValueDecompressor {
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
+    fn admitted_output_layout(&self) -> Result<MiniBlockOutputLayout> {
+        let mut layout = MiniBlockOutputLayout::FixedWidth {
+            bits_per_value: self.bits_per_item,
+        };
+        for layer in self.layers.iter().rev() {
+            if layer.has_validity {
+                layout = MiniBlockOutputLayout::Nullable(Box::new(layout));
+            }
+            layout = MiniBlockOutputLayout::FixedSizeList {
+                dimension: layer.dimension,
+                child: Box::new(layout),
+            };
+        }
+        layout.payload_bytes(0)?;
+        Ok(layout)
+    }
+
     fn plan_range(
         &self,
         data: &[LanceBuffer],

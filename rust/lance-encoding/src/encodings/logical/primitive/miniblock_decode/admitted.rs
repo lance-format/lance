@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Admitted range decoding for one drained MiniBlock instruction. Levels are
+//! Admitted range decoding for drained MiniBlock instructions. Levels are
 //! decoded into charged scratch to resolve the selected value range. A later
 //! refusal recycles this scratch and selected-level copies into the same
 //! workspace. No task cursor is advanced, and no ordinary decoder is called.
-//! Multiple instructions need admitted concatenation/builder support first.
+//! Multiple instructions preflight all values and concatenation before publishing output.
 
 use std::ops::Range;
 
@@ -20,6 +20,8 @@ use crate::{
     decoder::DecodedPage,
     repdef::{RepDefUnraveler, max_visible_level},
 };
+
+mod multiple;
 
 fn decode_levels(
     plan: Option<&LevelDecodePlan<'_>>,
@@ -66,9 +68,7 @@ pub(super) fn decode(
         ));
     }
     let [(instruction, chunk)] = task.instructions.as_slice() else {
-        return Err(Error::not_supported(
-            "admitted MiniBlock tasks currently require one instruction; split before drain",
-        ));
+        return multiple::decode(task, workspace);
     };
     RepDefUnraveler::validate_dense_levels(None, None, &task.def_meaning)?;
     let max_rep = task.def_meaning.iter().filter(|m| m.is_list()).count() as u16;

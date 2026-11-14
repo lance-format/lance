@@ -458,13 +458,14 @@ fn unsupported_task_shapes_preserve_input_and_credit(#[values(false, true)] dict
             chunk.clone(),
         );
         task.instructions.push(duplicate);
+        task.value_decompressor = Arc::new(Unsupported);
     }
     let error = task.try_decode_in(&mut work).err().unwrap();
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(error.to_string().contains(if dictionary {
         "dictionary/projection"
     } else {
-        "one instruction"
+        "no admitted concat layout"
     }));
     assert_eq!(work.len(), 128);
     assert_eq!(budget.reserved(), physical + 128);
@@ -481,13 +482,14 @@ fn inline_values_preserve_range_decode_and_complete_scratch(
     #[case] start: u64,
     #[case] count: u64,
     #[values(false, true)] large: bool,
+    #[values(false, true)] multiple: bool,
 ) {
     let Fixture {
         mut task,
         budget,
         mut work,
         ..
-    } = fixture(None, None, Codec::Flat, large, 16_384);
+    } = fixture(None, None, Codec::Flat, large, 32_768);
     let mut values = [0_u32; 1024];
     values[..4].copy_from_slice(&[10, 0, 20, 30]);
     let mut packed = vec![5_u32; 161];
@@ -513,12 +515,28 @@ fn inline_values_preserve_range_decode_and_complete_scratch(
     task.instructions[0].0.rows_to_skip = start;
     task.instructions[0].0.rows_to_take = count;
     task.value_decompressor = Arc::new(InlineBitpacking::new(32));
+    if multiple {
+        let (instruction, chunk) = &task.instructions[0];
+        task.instructions.push((
+            ChunkDrainInstructions {
+                chunk_instructions: instruction.chunk_instructions.clone(),
+                rows_to_skip: start,
+                rows_to_take: count,
+                preamble_action: PreambleAction::Absent,
+            },
+            chunk.clone(),
+        ));
+    }
     // Price physical shapes independently: selected u32 values, an unaligned
     // encoded copy, and a full decoded chunk only for dense partial selection.
     let output = count as usize * 4;
     let alignment = if count > 0 { 644 } else { 0 };
     let scratch = if count > 32 && count < 1024 { 4096 } else { 0 };
-    let required = output + alignment + scratch;
+    let required = if multiple {
+        (2 * output + alignment + scratch).max(4 * output)
+    } else {
+        output + alignment + scratch
+    };
     if required > 0 {
         let mut short = work.try_split(required - 1).unwrap();
         assert!(task.try_decode_in(&mut short).unwrap().is_none());
@@ -528,12 +546,19 @@ fn inline_values_preserve_range_decode_and_complete_scratch(
     drop(work);
     let mut work = budget.try_reserve(required).unwrap();
     let page = task.try_decode_in(&mut work).unwrap().unwrap();
-    assert_values(&page, &values[start as usize..(start + count) as usize]);
-    assert_eq!(work.len(), alignment + scratch);
+    let expected =
+        values[start as usize..(start + count) as usize].repeat(if multiple { 2 } else { 1 });
+    assert_values(&page, &expected);
+    assert_eq!(
+        work.len(),
+        required - if multiple { 4 * output } else { output }
+    );
     drop(work);
-    assert_eq!(budget.reserved(), physical + output);
+    assert_eq!(budget.reserved(), physical + expected.len() * 4);
     drop(task);
-    assert_eq!(budget.reserved(), output);
+    assert_eq!(budget.reserved(), expected.len() * 4);
     drop(page);
     assert_eq!(budget.reserved(), 0);
 }
+
+mod multiple;

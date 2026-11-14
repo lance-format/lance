@@ -569,6 +569,12 @@ impl BlockCompressor for InlineBitpacking {
 }
 
 impl MiniBlockDecompressor for InlineBitpacking {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        Ok(crate::compression::MiniBlockOutputLayout::FixedWidth {
+            bits_per_value: self.uncompressed_bit_width,
+        })
+    }
+
     fn plan_range(
         &self,
         data: &[LanceBuffer],
