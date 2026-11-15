@@ -35,6 +35,7 @@ jobs:
             target/ci/examples/overlay_selection prepare "$fixture" 8193 4 "$version"
             target/ci/examples/overlay_selection verify "$fixture" full 256
             target/ci/examples/overlay_selection verify "$fixture" ranges 17
+            target/ci/examples/overlay_selection verify "$fixture" pruned 17
           done
       - name: Lint touched paths
         if: ${{ !cancelled() }}

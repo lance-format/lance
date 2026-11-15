@@ -7,7 +7,7 @@
 //! `run` measures complete consumption; use only on a managed benchmark VM.
 //!
 //! Commands: `prepare ROOT ROWS OVERLAYS VERSION`, or
-//! `verify|run ROOT full|ranges BATCH_ROWS`. VERSION is `2.2` or `2.3`.
+//! `verify|run ROOT full|ranges|pruned BATCH_ROWS`. VERSION is `2.2` or `2.3`.
 
 #![allow(clippy::print_stdout)]
 
@@ -136,14 +136,18 @@ async fn prepare(root: &Path, fixture: Fixture) -> Result<()> {
 }
 
 async fn consume(root: &Path, scenario: &str, batch_rows: u32, verify: bool) -> Result<()> {
-    if batch_rows == 0 || !matches!(scenario, "full" | "ranges") {
-        return Err("batch rows must be positive; scenario must be full or ranges".into());
+    if batch_rows == 0 || !matches!(scenario, "full" | "ranges" | "pruned") {
+        return Err("batch rows must be positive; scenario must be full, ranges or pruned".into());
     }
     let fixture: Fixture = serde_json::from_slice(&std::fs::read(root.join("fixture.json"))?)?;
-    let ranges = scenario == "ranges";
-    let mut expected = (0..fixture.rows).filter(|row| !ranges || row % 4096 < 32);
+    let ranges = scenario != "full";
+    // Shift beyond all overlay residues so pruning must inspect every range.
+    let shift = if scenario == "pruned" { 64 } else { 0 };
+    let mut expected =
+        (0..fixture.rows).filter(|row| !ranges || (shift..shift + 32).contains(&(row % 4096)));
     let expected_count = if ranges {
-        u64::from(fixture.rows / 4096) * 32 + u64::from((fixture.rows % 4096).min(32))
+        u64::from(fixture.rows / 4096) * 32
+            + u64::from((fixture.rows % 4096).saturating_sub(shift).min(32))
     } else {
         u64::from(fixture.rows)
     };
@@ -155,7 +159,7 @@ async fn consume(root: &Path, scenario: &str, batch_rows: u32, verify: bool) -> 
         .open(dataset.schema(), FragReadConfig::default())
         .await?;
     let mut stream = if ranges {
-        let selection = (0..fixture.rows)
+        let selection = (shift..fixture.rows)
             .step_by(4096)
             .map(|row| u64::from(row)..(u64::from(row) + 32).min(u64::from(fixture.rows)))
             .collect::<Vec<_>>();
@@ -246,7 +250,7 @@ async fn main() -> Result<()> {
             .await
         }
         _ => Err(
-            "usage: prepare ROOT ROWS OVERLAYS VERSION | verify|run ROOT full|ranges BATCH_ROWS"
+            "usage: prepare ROOT ROWS OVERLAYS VERSION | verify|run ROOT full|ranges|pruned BATCH_ROWS"
                 .into(),
         ),
     }
