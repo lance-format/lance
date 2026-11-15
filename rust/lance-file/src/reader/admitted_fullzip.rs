@@ -25,6 +25,8 @@ use lance_encoding::{
 use super::FileReader;
 use crate::version::ConcreteFileVersion;
 
+mod deletions;
+use deletions::DeletionMode;
 mod row_ids;
 mod row_versions;
 pub use row_ids::PhysicalRowIdSource;
@@ -43,7 +45,7 @@ pub enum FullZipScanOutcome {
     /// The cursor is unchanged. Drain retained output or replan before retrying;
     /// this also covers a minimal row that cannot fit the configured workspace.
     NeedsCapacity,
-    /// Every non-deleted row in the requested physical range has been returned.
+    /// Every selected row has been returned, including deleted rows in marker mode.
     Finished,
 }
 
@@ -69,6 +71,7 @@ pub struct FullZipScan {
     end: u64,
     cursor: u64,
     deleted_rows: Option<Arc<DeletionVector>>,
+    deletion_mode: DeletionMode,
     row_ids: Option<RowIdColumns>,
     row_versions: Option<RowVersionColumns>,
     has_started: bool,
@@ -262,6 +265,7 @@ impl FileReader {
             end: rows.end,
             cursor: rows.start,
             deleted_rows: None,
+            deletion_mode: DeletionMode::Filter,
             row_ids: None,
             row_versions: None,
             has_started: false,
@@ -336,7 +340,8 @@ impl FullZipScan {
     /// No mask, filtered payload or full list of live ranges is allocated. The
     /// supplied shared deletion metadata is outside the payload budget.
     ///
-    /// This removes rows; it does not implement make-deletions-null. Use
+    /// This removes rows, replacing any earlier marker mode. Use
+    /// [`Self::with_deleted_rows_as_nulls`] to preserve physical rows instead, or
     /// [`Self::advance_to_live_range`] for a logical range after deletions.
     /// Opening still validates all selected page layouts.
     /// Fragmented deletions can reduce batch sizes and increase I/O; performance
@@ -356,6 +361,7 @@ impl FullZipScan {
                 "FullZip deletion snapshot must be bound before the first read attempt or logical selection",
             ));
         }
+        self.deletion_mode = DeletionMode::Filter;
         if deleted.is_empty() {
             self.deleted_rows = None;
         } else {
@@ -549,6 +555,11 @@ impl FullZipScan {
     /// }
     /// ```
     pub fn advance_to_live_range(&mut self, rows: Range<u64>) -> Result<()> {
+        if self.deletion_mode == DeletionMode::MarkNull {
+            return Err(Error::invalid_input(
+                "FullZip deletion markers require physical ranges, not live-row selections",
+            ));
+        }
         let deleted = self.deleted_rows.as_deref();
         let live_count = self.read_len - deleted_prefix_count(deleted, self.read_len);
         if rows.start > rows.end || rows.end > live_count {
@@ -620,7 +631,10 @@ impl FullZipScan {
         // Keep generated columns inside this attempt's admission, including while
         // payload inputs and decoded arrays coexist. Reserve before any reads.
         let row_ids = if let Some(columns) = &self.row_ids {
-            let Some(prepared) = columns.prepare(rows.clone(), &mut workspace)? else {
+            let markers = (self.deletion_mode == DeletionMode::MarkNull)
+                .then_some(self.deleted_rows.as_ref())
+                .flatten();
+            let Some(prepared) = columns.prepare(rows.clone(), markers, &mut workspace)? else {
                 return Ok(None);
             };
             Some(prepared)
@@ -686,9 +700,11 @@ impl FullZipScan {
         Done: Future<Output = Result<Option<RecordBatch>>>,
     {
         self.has_started = true;
-        let live = match &self.deleted_rows {
-            Some(deleted) => next_live_range(deleted, self.cursor..self.end),
-            None => (self.cursor < self.end).then_some(self.cursor..self.end),
+        let live = match (&self.deleted_rows, self.deletion_mode) {
+            (Some(deleted), DeletionMode::Filter) => {
+                next_live_range(deleted, self.cursor..self.end)
+            }
+            _ => (self.cursor < self.end).then_some(self.cursor..self.end),
         };
         let Some(live) = live else {
             // No await or allocation: there is no outstanding row to deliver.

@@ -55,8 +55,12 @@ impl VersionSource {
 
     fn array(&self, rows: Range<usize>, credit: &mut Reservation) -> Result<ArrayRef> {
         match self {
-            Self::Default => row_array(credit, rows.len(), std::iter::repeat_n(1, rows.len())),
-            Self::Sequence(source) => row_array(credit, rows.len(), source.select_range(rows)?),
+            Self::Default => {
+                row_array(credit, rows.len(), std::iter::repeat_n(1, rows.len()), None)
+            }
+            Self::Sequence(source) => {
+                row_array(credit, rows.len(), source.select_range(rows)?, None)
+            }
         }
     }
 }

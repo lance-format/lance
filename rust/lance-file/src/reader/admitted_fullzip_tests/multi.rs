@@ -16,6 +16,7 @@ use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
 
 mod row_ids;
+mod row_markers;
 mod row_versions;
 
 fn batches() -> Vec<RecordBatch> {
@@ -76,10 +77,10 @@ fn assert_address_batch(
     fragment: u32,
 ) {
     let selected = expected.slice(rows.start as usize, (rows.end - rows.start) as usize);
-    let addresses: ArrayRef = Arc::new(arrow_array::UInt64Array::from_iter_values(
-        rows.clone()
-            .map(|row| u64::from(fragment) * (1_u64 << 32) + row),
-    ));
+    let addresses: ArrayRef =
+        Arc::new(arrow_array::UInt64Array::from_iter(rows.clone().map(
+            |row| (![1, 4].contains(&row)).then_some(u64::from(fragment) * (1_u64 << 32) + row),
+        )));
     let mut fields = selected.schema().fields().to_vec();
     fields.extend([
         Arc::new(lance_core::ROW_ID_FIELD.clone()),
@@ -520,6 +521,8 @@ async fn queued_batch_owns_all_columns_and_credit(
         .with_row_last_updated_at_version(None)
         .unwrap()
         .with_row_address(7)
+        .unwrap()
+        .with_deleted_rows_as_nulls(Arc::new([1_u32, 4].into_iter().collect()))
         .unwrap();
     let queued = RefCell::new(None);
     let entered = tokio::sync::Notify::new();

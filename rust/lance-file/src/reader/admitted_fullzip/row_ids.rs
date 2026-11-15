@@ -6,14 +6,14 @@
 use std::{fmt::Debug, ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, UInt64Array};
-use arrow_buffer::{Buffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::Schema;
 use lance_core::{
     Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result,
-    utils::{address::RowAddress, allocation::Reservation},
+    utils::{address::RowAddress, allocation::Reservation, deletion::DeletionVector},
 };
 
-use super::FullZipScan;
+use super::{FullZipScan, deleted_prefix_count};
 
 /// Immutable mapping from physical file-row positions to stable row IDs.
 ///
@@ -53,6 +53,7 @@ pub(super) struct PreparedRowIds {
     columns: RowIdColumns,
     rows: Range<usize>,
     credit: Reservation,
+    deleted: Option<Arc<DeletionVector>>,
 }
 
 impl FullZipScan {
@@ -66,8 +67,9 @@ impl FullZipScan {
     /// shared and outside the payload budget. Generated values are admitted with
     /// each batch, and Arrow aliases retain that charge until their final drop.
     ///
-    /// This does not implement make-deletions-null, overlays or
-    /// ordinary fragment/scanner adoption. Rows excluded before decoding have no
+    /// Use [`Self::with_deleted_rows_as_nulls`] after configuring identifiers for
+    /// deletion markers. This does not implement overlays or ordinary
+    /// fragment/scanner adoption. Rows excluded before decoding have no
     /// output ID. Forward live-range selections still use physical offsets here.
     ///
     /// ```
@@ -204,8 +206,13 @@ impl RowIdColumns {
     pub(super) fn prepare(
         &self,
         rows: Range<u64>,
+        deleted: Option<&Arc<DeletionVector>>,
         workspace: &mut Reservation,
     ) -> Result<Option<PreparedRowIds>> {
+        let deleted = deleted.filter(|deleted| {
+            deleted_prefix_count(Some(deleted), rows.end)
+                > deleted_prefix_count(Some(deleted), rows.start)
+        });
         // Configuration validated all offsets against both u32 and usize domains.
         let rows = rows.start as usize..rows.end as usize;
         let buffers = 1 + usize::from(self.has_row_address && self.sequence.is_some());
@@ -213,17 +220,26 @@ impl RowIdColumns {
             .len()
             .checked_mul(8)
             .and_then(|bytes| bytes.checked_mul(buffers))
+            .and_then(|bytes| {
+                bytes.checked_add(if deleted.is_some() {
+                    rows.len().div_ceil(8)
+                } else {
+                    0
+                })
+            })
             .ok_or_else(|| Error::invalid_input("FullZip row column allocation overflows"))?;
         Ok(workspace.try_split(bytes).map(|credit| PreparedRowIds {
             columns: self.clone(),
             rows,
             credit,
+            deleted: deleted.cloned(),
         }))
     }
 }
 
 impl PreparedRowIds {
     pub(super) fn append_to(mut self, arrays: &mut Vec<ArrayRef>) -> Result<()> {
+        let nulls = self.deletion_nulls()?;
         let address_needed = self.columns.has_row_address
             || (self.columns.has_row_id && self.columns.sequence.is_none());
         let addresses = if address_needed {
@@ -236,6 +252,7 @@ impl PreparedRowIds {
                         offset as u32,
                     ))
                 }),
+                nulls.clone(),
             )?)
         } else {
             None
@@ -246,6 +263,7 @@ impl PreparedRowIds {
                     &mut self.credit,
                     self.rows.len(),
                     sequence.select_range(self.rows.clone())?,
+                    nulls,
                 )?
             } else {
                 addresses
@@ -260,12 +278,51 @@ impl PreparedRowIds {
         }
         Ok(())
     }
+
+    fn deletion_nulls(&mut self) -> Result<Option<NullBuffer>> {
+        let Some(deleted) = &self.deleted else {
+            return Ok(None);
+        };
+        let mut mask = self
+            .credit
+            .try_allocate(self.rows.len().div_ceil(8))?
+            .ok_or_else(|| Error::internal("missing pre-admitted deletion bitmap credit"))?;
+        mask.as_mut().fill(0xff);
+        let mut clear = |row: u32| {
+            let index = row as usize - self.rows.start;
+            mask.as_mut()[index / 8] &= !(1 << (index % 8));
+        };
+        // Borrow the snapshot directly; do not materialize selected offsets or
+        // create a second, uncharged Arrow bitmap while the output is live.
+        match deleted.as_ref() {
+            DeletionVector::NoDeletions => (),
+            DeletionVector::Set(set) => {
+                for row in set
+                    .iter()
+                    .filter(|row| self.rows.contains(&(**row as usize)))
+                {
+                    clear(*row);
+                }
+            }
+            DeletionVector::Bitmap(bitmap) => {
+                for row in bitmap.range(self.rows.start as u32..=(self.rows.end - 1) as u32) {
+                    clear(row);
+                }
+            }
+        }
+        Ok(Some(NullBuffer::new(BooleanBuffer::new(
+            Buffer::from(mask.freeze()),
+            0,
+            self.rows.len(),
+        ))))
+    }
 }
 
 pub(super) fn row_array(
     credit: &mut Reservation,
     count: usize,
     mut values: impl Iterator<Item = u64>,
+    nulls: Option<NullBuffer>,
 ) -> Result<ArrayRef> {
     let mut buffer = credit
         .try_allocate(count * 8)?
@@ -282,5 +339,5 @@ pub(super) fn row_array(
         ));
     }
     let values = ScalarBuffer::new(Buffer::from(buffer.freeze()), 0, count);
-    Ok(Arc::new(UInt64Array::new(values, None)))
+    Ok(Arc::new(UInt64Array::new(values, nulls)))
 }

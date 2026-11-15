@@ -84,6 +84,7 @@ mod tests {
 
     use super::*;
     use crate::rowids::{segment::U64Segment, version::RowDatasetVersionRun};
+    use crate::utils::stream::{RowIdAndDeletesConfig, apply_row_id_and_deletes};
 
     #[rstest]
     #[tokio::test]
@@ -93,6 +94,7 @@ mod tests {
         #[values(false, true)] lite: bool,
         #[values(false, true)] multiple_segments: bool,
         #[values("defaults", "mixed", "distinct", "shared")] versions: &str,
+        #[values(false, true)] markers: bool,
     ) {
         let expected_ids = (0..35_u64)
             .map(|row| {
@@ -111,7 +113,8 @@ mod tests {
         } else {
             sequence = RowIdSequence::try_from_iter(expected_ids.iter().copied()).unwrap();
         }
-        let source: Arc<dyn PhysicalRowIdSource> = Arc::new(sequence);
+        let sequence = Arc::new(sequence);
+        let source: Arc<dyn PhysicalRowIdSource> = sequence.clone();
         assert_eq!(source.num_rows(), 35);
         for bounds in [35..35, 3..3, 6..17] {
             let actual = source
@@ -245,7 +248,7 @@ mod tests {
             .open_admitted_fullzip_scan(0..0, budget.clone(), 4096, 8)
             .await
             .unwrap()
-            .with_deleted_rows(deleted)
+            .with_deleted_rows(deleted.clone())
             .unwrap()
             .with_row_created_at_version(created_source)
             .unwrap()
@@ -255,25 +258,56 @@ mod tests {
             .unwrap()
             .with_row_address(23)
             .unwrap();
+        if markers {
+            scan = scan.with_deleted_rows_as_nulls(deleted.clone()).unwrap();
+        }
         for selection in [1..7, 9..live.len() as u64] {
-            scan.advance_to_live_range(selection.clone()).unwrap();
+            if markers {
+                scan.advance_to_range(selection.clone()).unwrap();
+            } else {
+                scan.advance_to_live_range(selection.clone()).unwrap();
+            }
             let mut actual = Vec::new();
             loop {
                 match scan.try_next().await.unwrap() {
                     FullZipScanOutcome::Batch { rows, batch } => {
                         actual.extend(rows.clone());
-                        let ids = UInt64Array::from(
-                            expected_ids[rows.start as usize..rows.end as usize].to_vec(),
-                        );
-                        let addresses = UInt64Array::from_iter_values(
-                            rows.clone().map(|row| 23_u64 * (1_u64 << 32) + row),
-                        );
+                        let ids = UInt64Array::from_iter(rows.clone().map(|row| {
+                            (!markers || !offsets.contains(&(row as u32)))
+                                .then_some(expected_ids[row as usize])
+                        }));
+                        let addresses = UInt64Array::from_iter(rows.clone().map(|row| {
+                            (!markers || !offsets.contains(&(row as u32)))
+                                .then_some(23_u64 * (1_u64 << 32) + row)
+                        }));
                         let payload = StringArray::from_iter_values(
                             rows.clone().map(|row| format!("row-{row:03}")),
                         );
                         assert_eq!(batch[ROW_ID].to_data(), ids.to_data());
                         assert_eq!(batch[ROW_ADDR].to_data(), addresses.to_data());
                         assert_eq!(batch["payload"].to_data(), payload.to_data());
+                        // Match the existing table wrapper, independently of the
+                        // admitted mask implementation and its shared owners.
+                        let ordinary = apply_row_id_and_deletes(
+                            batch.project(&[0]).unwrap(),
+                            0,
+                            23,
+                            &RowIdAndDeletesConfig {
+                                params: (rows.start as usize..rows.end as usize).into(),
+                                with_row_id: true,
+                                with_row_addr: true,
+                                with_row_last_updated_at_version: false,
+                                with_row_created_at_version: false,
+                                deletion_vector: Some(deleted.clone()),
+                                row_id_sequence: Some(sequence.clone()),
+                                last_updated_at_sequence: None,
+                                created_at_sequence: None,
+                                make_deletions_null: markers,
+                                total_num_rows: 35,
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(batch.project(&[0, 1, 2]).unwrap(), ordinary);
                         let created = UInt64Array::from(
                             created_values[rows.start as usize..rows.end as usize].to_vec(),
                         );
@@ -297,8 +331,14 @@ mod tests {
                         let alias = batch[ROW_CREATED_AT_VERSION].slice(0, 1);
                         let id_alias = batch[ROW_ID].slice(0, 1);
                         let count = batch.num_rows();
+                        let bitmap_bytes = if batch[ROW_ID].null_count() > 0 {
+                            count.div_ceil(8)
+                        } else {
+                            0
+                        };
+                        drop(ordinary);
                         drop(batch);
-                        assert_eq!(budget.reserved(), count * 16);
+                        assert_eq!(budget.reserved(), count * 16 + bitmap_bytes);
                         drop(id_alias);
                         assert_eq!(budget.reserved(), count * 8);
                         if actual.len() < (selection.end - selection.start) as usize {
@@ -317,10 +357,12 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(
-                actual,
-                live[selection.start as usize..selection.end as usize]
-            );
+            let expected = if markers {
+                selection.collect::<Vec<_>>()
+            } else {
+                live[selection.start as usize..selection.end as usize].to_vec()
+            };
+            assert_eq!(actual, expected);
         }
     }
 }

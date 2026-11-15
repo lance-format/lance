@@ -25,7 +25,7 @@ impl PhysicalRowIdSource for RowIds {
     }
 }
 
-fn stable_ids(count: usize) -> (Vec<u64>, Arc<dyn PhysicalRowIdSource>) {
+pub(super) fn stable_ids(count: usize) -> (Vec<u64>, Arc<dyn PhysicalRowIdSource>) {
     // Non-contiguous, non-monotonic values distinguish
     // physical offsets from stable identities across deletion/range boundaries.
     let ids = (0..count)
