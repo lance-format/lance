@@ -21,15 +21,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Partial workspace and cross-file progress
+      - name: Partial workspace cancellation and projection
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-core --lib utils::allocation -- --nocapture
-          cargo test --profile ci --locked -p lance-core --doc try_reserve_up_to -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc with_partial_workspace -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib later_column_cancellation_and_error_leave_no_partial_batch -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-core -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings

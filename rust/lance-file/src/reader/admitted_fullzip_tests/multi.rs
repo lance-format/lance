@@ -329,16 +329,28 @@ impl EncodingsIo for LaterColumnIo {
 }
 
 #[rstest]
+#[case::exact(false, false, 0)]
+#[case::partial(true, false, 9)]
+#[case::reversed_partial(true, true, 9)]
 #[tokio::test]
 async fn later_column_cancellation_and_error_leave_no_partial_batch(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
     #[values(3, 7)] max_rows: u64,
+    #[case] partial: bool,
+    #[case] reverse: bool,
+    #[case] start: u64,
 ) {
-    let (_fs, reader) = fixture_batches(ConcreteFileVersion::V2_2, lite, batches(), 1).await;
+    let input = batches();
+    let expected = arrow_select::concat::concat_batches(&input[0].schema(), &input).unwrap();
+    let (fs, reader) = fixture_batches(version, lite, input, 1).await;
+    let order = if reverse { [1, 0] } else { [0, 1] };
+    let reader = project(&fs, &reader, &order).await;
+    let expected = expected.project(&order).unwrap();
     let mode = Arc::new(AtomicUsize::new(1));
     let second_reads = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
-    let second_buffers = reader.metadata().column_infos[1]
+    let second_buffers = reader.metadata().column_infos[order[1]]
         .page_infos
         .iter()
         .flat_map(|page| {
@@ -355,13 +367,27 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         entered: entered.clone(),
     }));
     let budget = AllocationBudget::new(4096);
-    // Independent credit must survive a failed compound attempt, regardless of
-    // whether earlier columns are still prepared input or retained raw output.
-    let peer = budget.try_reserve(1024).unwrap();
-    let mut scan = reader
-        .open_admitted_fullzip_scan(0..7, budget.clone(), 3072, max_rows)
+    // Another file's final Arrow alias, not just an unallocated reservation,
+    // must survive cancellation/error of a partially admitted compound read.
+    let (_peer_fs, peer_reader) = fixture_arrays(version, lite, vec![array(17, 1)]).await;
+    let mut peer_scan = peer_reader
+        .open_admitted_fullzip_scan(0..1, budget.clone(), 4096, 1)
         .await
         .unwrap();
+    let FullZipScanOutcome::Batch { batch, .. } = peer_scan.try_next().await.unwrap() else {
+        panic!("peer must return its complete first row")
+    };
+    let peer = batch.column(0).slice(0, 1);
+    drop((batch, peer_scan, peer_reader));
+    let peer_bytes = budget.reserved();
+    assert!(peer_bytes > 0 && peer_bytes < 4096);
+    let workspace = if partial { 4096 } else { 4096 - peer_bytes };
+    let end = start + 11;
+    let mut scan = reader
+        .open_admitted_fullzip_scan(start..end, budget.clone(), workspace, max_rows)
+        .await
+        .unwrap()
+        .with_partial_workspace(partial);
     {
         let future = scan.try_next();
         tokio::pin!(future);
@@ -372,12 +398,12 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         // Earlier input, the pending read and remaining workspace stay charged
         // independently of the peer. No intermediate refund is required.
         let active = budget.reserved();
-        assert!(active > peer.len() && active <= 4096);
+        assert!(active > peer_bytes && active <= 4096);
     }
-    assert_eq!(scan.position(), 0);
+    assert_eq!(scan.position(), start);
     assert_eq!(
         budget.reserved(),
-        peer.len(),
+        peer_bytes,
         "cancellation must preserve unrelated credit"
     );
     mode.store(2, Ordering::Relaxed);
@@ -390,16 +416,28 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         1,
         "errors must not trigger a smaller retry"
     );
-    assert_eq!(scan.position(), 0);
-    assert_eq!(budget.reserved(), peer.len());
+    assert_eq!(scan.position(), start);
+    assert_eq!(budget.reserved(), peer_bytes);
     mode.store(0, Ordering::Relaxed);
-    let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
-        panic!("retry must return original complete rows")
-    };
-    assert_eq!(rows, 0..max_rows);
-    assert_batch(&batch, &rows, &batches()[0]);
-    drop(batch);
-    assert_eq!(budget.reserved(), peer.len());
+    let mut next = start;
+    loop {
+        match scan.try_next().await.unwrap() {
+            FullZipScanOutcome::Batch { rows, batch } => {
+                assert_eq!(rows.start, next);
+                assert!(rows.end > next && rows.end <= end);
+                assert_batch(&batch, &rows, &expected);
+                next = rows.end;
+                assert_eq!(scan.position(), next);
+                assert!(budget.reserved() <= 4096);
+                drop(batch);
+                assert_eq!(budget.reserved(), peer_bytes);
+            }
+            FullZipScanOutcome::Finished => break,
+            FullZipScanOutcome::NeedsCapacity => panic!("one row must fit beside retained peer"),
+        }
+    }
+    assert_eq!(next, end);
+    assert_eq!(peer.to_data(), array(17, 1).slice(0, 1).to_data());
     drop(peer);
     assert_eq!(budget.reserved(), 0);
 }
