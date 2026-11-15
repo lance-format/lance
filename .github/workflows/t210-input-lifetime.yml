@@ -21,20 +21,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Prepared MiniBlock ownership passed at 9fdf342fa. Exercise changed
-      # Binary materialization and admitted General offset preparation here.
-      - name: Validate prepared binary offsets
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --lib physical::binary::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib admitted::tests::binary -- --nocapture
-      - name: Validate offsets without optional codecs
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::binary::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib admitted::tests::binary -- --nocapture
-      - name: Validate public unsigned preparation API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc try_prepare_unsigned_in -- --nocapture
+      # Binary admission passed at 4e08f3db9. This change adds only the FSST
+      # exact-value primitive; existing allocating readers remain unchanged.
+      - name: Validate exact FSST value expansion
+        run: cargo test --profile ci --locked -p fsst --lib fsst::value::tests -- --nocapture
+      - name: Validate public exact-value API example
+        run: cargo test --profile ci --locked -p fsst --doc decompressed_value_len -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
-          cargo clippy --profile ci --locked -p lance-encoding --no-default-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p fsst --all-features --all-targets --no-deps -- -D warnings
