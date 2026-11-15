@@ -1227,3 +1227,156 @@ async fn deleted_rows_reject_invalid_or_unaligned_snapshots(
     drop(held);
     assert_eq!(budget.reserved(), 0);
 }
+
+#[rstest]
+#[tokio::test]
+async fn logical_ranges_preserve_live_counts_and_physical_rows(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] bitmap: bool,
+) {
+    let input = batches();
+    let expected = arrow_select::concat::concat_batches(&input[0].schema(), &input[..5]).unwrap();
+    let labels = input[..5]
+        .iter()
+        .map(|batch| batch.project(&[0]).unwrap())
+        .collect();
+    let frames = input[..5]
+        .iter()
+        .map(|batch| batch.project(&[1]).unwrap())
+        .collect();
+    let (_left_fs, left) = fixture_batches(version, lite, labels, 1).await;
+    let (_right_fs, right) = fixture_batches(version, !lite, frames, 1).await;
+    let stats = IoStats::new();
+    let left = left.with_io_stats(stats.recorder());
+    let right = right.with_io_stats(stats.recorder());
+    let offsets = [
+        0, 1, 2, 6, 7, 8, 9, 14, 15, 16, 17, 18, 19, 20, 26, 27, 33, 34,
+    ];
+    let deleted = Arc::new(if bitmap {
+        DeletionVector::Bitmap(offsets.into_iter().collect())
+    } else {
+        DeletionVector::Set(offsets.into_iter().collect())
+    });
+    let live = (0..expected.num_rows() as u64)
+        .filter(|row| !offsets.contains(&(*row as u32)))
+        .collect::<Vec<_>>();
+    let count = live.len() as u64;
+    let budget = AllocationBudget::new(4096);
+    let a = left
+        .open_admitted_fullzip_scan(0..0, budget.clone(), 4096, 8)
+        .await
+        .unwrap();
+    let b = right
+        .open_admitted_fullzip_scan(0..0, budget.clone(), 4096, 8)
+        .await
+        .unwrap();
+    let mut scan = a.try_merge(b).unwrap().with_deleted_rows(deleted).unwrap();
+    for selection in [0..0, 1..4, 4..6, 8..count, count..count] {
+        let reads = stats.snapshot().iops;
+        scan.advance_to_live_range(selection.clone()).unwrap();
+        assert_eq!(stats.snapshot().iops, reads, "mapping uses metadata only");
+        let expected_rows = &live[selection.start as usize..selection.end as usize];
+        let initial = scan.position();
+        let mut actual_rows = Vec::new();
+        if !selection.is_empty() {
+            let error = scan
+                .advance_to_live_range(selection.end..selection.end)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("must be drained"));
+            assert_eq!(scan.position(), initial);
+        }
+        let held = budget.try_reserve(4096).unwrap();
+        let outcome = scan.try_next().await.unwrap();
+        if selection.is_empty() {
+            assert!(matches!(outcome, FullZipScanOutcome::Finished));
+            assert_eq!(stats.snapshot().iops, reads);
+            drop(held);
+            continue;
+        }
+        assert!(matches!(outcome, FullZipScanOutcome::NeedsCapacity));
+        assert_eq!(scan.position(), initial);
+        assert_eq!(stats.snapshot().iops, reads);
+        drop(held);
+        loop {
+            match scan.try_next().await.unwrap() {
+                FullZipScanOutcome::Batch { rows, batch } => {
+                    assert_batch(&batch, &rows, &expected);
+                    actual_rows.extend(rows.clone());
+                    assert_eq!(scan.position(), rows.end);
+                    let alias = batch.column(1).slice(0, 1);
+                    drop(batch);
+                    assert!(budget.reserved() > 0 && budget.reserved() <= 4096);
+                    if actual_rows.len() < expected_rows.len() {
+                        let reads = stats.snapshot().iops;
+                        assert!(matches!(
+                            scan.try_next().await.unwrap(),
+                            FullZipScanOutcome::NeedsCapacity
+                        ));
+                        assert_eq!(scan.position(), rows.end);
+                        assert_eq!(stats.snapshot().iops, reads);
+                    }
+                    drop(alias);
+                    assert_eq!(budget.reserved(), 0);
+                }
+                FullZipScanOutcome::Finished => break,
+                FullZipScanOutcome::NeedsCapacity => {
+                    panic!("selected live row must fit after drain")
+                }
+            }
+        }
+        assert_eq!(actual_rows, expected_rows);
+        assert_eq!(actual_rows.len() as u64, selection.end - selection.start);
+        // Reject a backward request without disturbing the drained cursor.
+        let position = scan.position();
+        let error = scan.advance_to_live_range(0..1).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("start at or after"));
+        assert_eq!(scan.position(), position);
+    }
+    assert_eq!(scan.position(), expected.num_rows() as u64);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn logical_empty_eof_and_invalid_ranges_preserve_snapshot(
+    #[values(false, true)] all_deleted: bool,
+) {
+    let (_fs, reader) = fixture(ConcreteFileVersion::V2_3, false, 1, 2).await;
+    let stats = IoStats::new();
+    let reader = reader.with_io_stats(stats.recorder());
+    let deleted = Arc::new(if all_deleted {
+        (0..reader.num_rows() as u32).collect::<DeletionVector>()
+    } else {
+        DeletionVector::NoDeletions
+    });
+    let budget = AllocationBudget::new(4096);
+    let held = budget.try_reserve(4096).unwrap();
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..0, budget.clone(), 4096, 4)
+        .await
+        .unwrap()
+        .with_deleted_rows(deleted.clone())
+        .unwrap();
+    let live_count = if all_deleted { 0 } else { reader.num_rows() };
+    for invalid in [0..live_count + 1, Range { start: 1, end: 0 }] {
+        let error = scan.advance_to_live_range(invalid).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("live rows"));
+        assert_eq!(scan.position(), 0);
+        assert_eq!(stats.snapshot().iops, 0);
+    }
+    // Failed mapping must not freeze the snapshot; successful mapping must.
+    let mut scan = scan.with_deleted_rows(deleted.clone()).unwrap();
+    scan.advance_to_live_range(live_count..live_count).unwrap();
+    assert_eq!(scan.position(), reader.num_rows());
+    assert_eq!(stats.snapshot().iops, 0);
+    let error = scan.with_deleted_rows(deleted).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("logical selection"));
+    assert_eq!(budget.reserved(), 4096);
+    drop(held);
+    assert_eq!(budget.reserved(), 0);
+}

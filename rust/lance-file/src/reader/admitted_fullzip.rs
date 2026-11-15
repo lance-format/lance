@@ -302,9 +302,10 @@ impl FullZipColumn {
 impl FullZipScan {
     /// Exclude deleted physical file-row offsets before reading payload.
     ///
-    /// Bind the snapshot before the first `try_next` attempt, including a refused
-    /// or cancelled attempt. It then applies to all forward ranges. Nonempty
-    /// snapshots require at most 2^32 file rows and every deleted offset must be
+    /// Bind the snapshot before the first `try_next` attempt or logical range
+    /// selection, including a refused or cancelled read attempt. It then applies
+    /// to all forward ranges. Nonempty snapshots require at most 2^32 file rows,
+    /// and every deleted offset must be
     /// within that file. The caller must establish that these are the file's
     /// physical offsets, not stable row IDs or logical post-deletion positions.
     ///
@@ -314,8 +315,9 @@ impl FullZipScan {
     /// No mask, filtered payload or full list of live ranges is allocated. The
     /// supplied shared deletion metadata is outside the payload budget.
     ///
-    /// This removes rows; it does not implement make-deletions-null or remap a
-    /// logical range/limit. Opening still validates all selected page layouts.
+    /// This removes rows; it does not implement make-deletions-null. Use
+    /// [`Self::advance_to_live_range`] for a logical range after deletions.
+    /// Opening still validates all selected page layouts.
     /// Fragmented deletions can reduce batch sizes and increase I/O; performance
     /// is not qualified. Ordinary fragment/scanner execution is unchanged.
     ///
@@ -330,7 +332,7 @@ impl FullZipScan {
     pub fn with_deleted_rows(mut self, deleted: Arc<DeletionVector>) -> Result<Self> {
         if self.has_started {
             return Err(Error::invalid_input(
-                "FullZip deletion snapshot must be bound before the first read attempt",
+                "FullZip deletion snapshot must be bound before the first read attempt or logical selection",
             ));
         }
         if deleted.is_empty() {
@@ -483,6 +485,64 @@ impl FullZipScan {
         Ok(())
     }
 
+    /// Select a forward range in the file's live row sequence after deletions.
+    ///
+    /// `rows` counts surviving rows from the beginning of the entire file, not
+    /// from the previous selection. Its end must not exceed the live row count;
+    /// reversed or out-of-bounds ranges are errors, not silently clipped limits.
+    /// Start with an empty physical range (`0..0`), bind any deletion snapshot,
+    /// then select the desired live interval before polling `try_next`.
+    ///
+    /// The current interval must be drained and the mapped interval must be
+    /// forward and non-overlapping. Mapping and page validation use metadata
+    /// only; errors preserve the current selection. Successful mapping freezes
+    /// the deletion snapshot even before the first read. Empty intervals read
+    /// nothing, including an empty selection at EOF or in an all-deleted file.
+    ///
+    /// Returned batches still report physical row ranges and never contain
+    /// deleted rows. This does not evaluate query filters, map stable row IDs or
+    /// allocate system columns. No full live-row list or complement bitmap is
+    /// built. Ordinary fragment/scanner execution is unchanged.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{Result, utils::{allocation::AllocationBudget, deletion::DeletionVector}};
+    /// use lance_file::reader::FileReader;
+    /// async fn select(reader: &FileReader, deleted: Arc<DeletionVector>) -> Result<()> {
+    ///     let mut scan = reader.open_admitted_fullzip_scan(
+    ///         0..0, AllocationBudget::new(65536), 65536, 1024).await?
+    ///         .with_deleted_rows(deleted)?;
+    ///     scan.advance_to_live_range(10..20)?; // ten live rows after skipping ten
+    ///     drop(scan.try_next().await?); // caller consumes or handles refusal
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn advance_to_live_range(&mut self, rows: Range<u64>) -> Result<()> {
+        let deleted = self.deleted_rows.as_deref();
+        let live_count = self.read_len - deleted_prefix_count(deleted, self.read_len);
+        if rows.start > rows.end || rows.end > live_count {
+            return Err(Error::invalid_input(format!(
+                "FullZip logical range {}..{} must be ordered and end within {live_count} live rows",
+                rows.start, rows.end
+            )));
+        }
+        let start = if rows.start == live_count {
+            self.read_len
+        } else {
+            live_row_position(deleted, rows.start, self.read_len)
+        };
+        let end = if rows.is_empty() {
+            start
+        } else {
+            // The last selected live row bounds the interval, so trailing
+            // deleted rows need neither page validation nor payload access.
+            live_row_position(deleted, rows.end - 1, self.read_len) + 1
+        };
+        self.advance_to_range(start..end)?;
+        self.has_started = true;
+        Ok(())
+    }
+
     /// Allow an attempt to use currently available credit below its configured
     /// workspace size. This lets a file make progress while another file's output
     /// still retains part of the shared budget. The entire smaller workspace is
@@ -616,6 +676,39 @@ impl FullZipScan {
     }
 }
 
+// Nonempty snapshots have validated u32 physical offsets. Use u64 prefix lengths
+// so the boundary just after u32::MAX is representable without wrapping.
+fn deleted_prefix_count(deleted: Option<&DeletionVector>, end: u64) -> u64 {
+    match deleted {
+        None | Some(DeletionVector::NoDeletions) => 0,
+        Some(DeletionVector::Set(set)) => {
+            set.iter().filter(|row| u64::from(**row) < end).count() as u64
+        }
+        Some(DeletionVector::Bitmap(bitmap)) if end > 0 => bitmap.rank((end - 1) as u32),
+        Some(DeletionVector::Bitmap(_)) => 0,
+    }
+}
+
+// The caller validates row < live_count. Search prefix cardinalities instead of
+// enumerating the skipped live/deleted rows or allocating an offsets array.
+fn live_row_position(deleted: Option<&DeletionVector>, row: u64, read_len: u64) -> u64 {
+    if deleted.is_none_or(DeletionVector::is_empty) {
+        return row;
+    }
+    let mut left = row;
+    let mut right = read_len - 1;
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let live_prefix = mid + 1 - deleted_prefix_count(deleted, mid + 1);
+        if live_prefix <= row {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    left
+}
+
 // Snapshot binding validates the u32 domain. Return only the first live run;
 // never materialize a complement bitmap or enumerate a large deleted prefix.
 fn next_live_range(deleted: &DeletionVector, mut rows: Range<u64>) -> Option<Range<u64>> {
@@ -676,6 +769,15 @@ mod tests {
                 .clone()
                 .filter(|row| !deleted.contains(*row as u32))
                 .collect::<Vec<_>>();
+            for (index, physical) in expected.iter().enumerate() {
+                // The fixture has no deletions before rows.start, so that many
+                // live rows precede this independently enumerated suffix.
+                assert_eq!(
+                    live_row_position(Some(&deleted), rows.start + index as u64, rows.end),
+                    *physical
+                );
+            }
+            assert_eq!(deleted_prefix_count(Some(&deleted), 0), 0);
             let mut actual = Vec::new();
             let mut start = rows.start;
             while let Some(live) = next_live_range(&deleted, start..rows.end) {
@@ -698,5 +800,6 @@ mod tests {
             Some(1_000_000..1_000_001)
         );
         assert_eq!(next_live_range(&deleted, 19..65540), None);
+        assert_eq!(live_row_position(Some(&deleted), 0, 1_000_001), 1_000_000);
     }
 }
