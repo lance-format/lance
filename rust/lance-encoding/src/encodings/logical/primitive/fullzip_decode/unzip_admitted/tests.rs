@@ -55,6 +55,7 @@ impl CompressionStrategy for Codec {
 struct Fixture {
     scheduler: FullZipScheduler,
     zipped: LanceBuffer,
+    index: LanceBuffer,
     row_offsets: Vec<usize>,
     values: Vec<Vec<u8>>,
     meanings: Vec<Meaning>,
@@ -153,6 +154,7 @@ fn fixture(bits: u8, fsst: bool, kind: &str) -> Fixture {
     Fixture {
         scheduler,
         zipped: page.data[0].clone(),
+        index: page.data[1].clone(),
         row_offsets,
         values,
         meanings,
@@ -453,3 +455,5 @@ fn fullzip_unzip_invalid_request_preserves_credit(#[values(false, true)] invalid
     assert_eq!(work.len(), 16);
     assert_eq!(pool.reserved(), 16);
 }
+
+mod read;

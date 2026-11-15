@@ -38,6 +38,7 @@ use super::{
 };
 
 mod admitted;
+mod read_admitted;
 mod structure;
 mod unzip_admitted;
 

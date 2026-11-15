@@ -67,7 +67,7 @@ fn levels(parser: ControlWordParser, src: &[u8]) -> Result<(u32, u32)> {
 /// Validate all framing, including unselected tails, before admitting output.
 fn visit(
     scheduler: &FullZipScheduler,
-    data: &[LanceBuffer],
+    data: &[impl AsRef<[u8]>],
     num_rows: u64,
     range: Range<u64>,
     mut visitor: impl FnMut(u16, u16, bool, &[u8]) -> Result<()>,
@@ -174,7 +174,7 @@ fn visit(
 
 fn plan(
     scheduler: &FullZipScheduler,
-    data: &[LanceBuffer],
+    data: &[impl AsRef<[u8]>],
     rows: u64,
     range: Range<u64>,
 ) -> Result<Plan> {
@@ -249,6 +249,18 @@ impl FullZipScheduler {
     pub fn try_unzip_range_in(
         &self,
         data: &[LanceBuffer],
+        num_rows: u64,
+        range: Range<u64>,
+        workspace: &mut Reservation,
+    ) -> Result<Option<Box<dyn DecodePageTask>>> {
+        self.try_unzip_buffers_in(data, num_rows, range, workspace)
+    }
+
+    // Borrow exclusive read allocations so the read stage can recycle their
+    // credit after unzipping, including when output admission is refused.
+    pub(super) fn try_unzip_buffers_in(
+        &self,
+        data: &[impl AsRef<[u8]>],
         num_rows: u64,
         range: Range<u64>,
         workspace: &mut Reservation,
