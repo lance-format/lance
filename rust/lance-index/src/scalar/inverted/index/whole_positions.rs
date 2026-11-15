@@ -92,15 +92,36 @@ async fn read_payload(value: &dyn IndexBinaryReader, chunk_bytes: usize) -> Resu
         }
     }))
     .buffer_unordered(MAX_PENDING_PAYLOAD_READS);
+    let mut initialized = 0usize;
     while let Some((start, bytes)) = reads.try_next().await? {
-        // Ranges are disjoint and read_payload_range validates their lengths.
-        // Initialize gaps before writing out of order; this private buffer is
-        // published only after every read succeeds, without uninitialized bytes.
         let end = start + bytes.len();
-        if end > output.len() {
-            output.resize(end, 0);
+        // Keep the vector length at zero while filling disjoint ranges. A late
+        // prefix must not force us to zero and touch pages before their reads
+        // finish. No spare-capacity byte is exposed or read here.
+        let destination = output
+            .spare_capacity_mut()
+            .get_mut(start..end)
+            .ok_or_else(|| Error::index("whole positions read exceeds reserved output"))?;
+        for (destination, byte) in destination.iter_mut().zip(bytes.iter()) {
+            destination.write(*byte);
         }
-        output[start..end].copy_from_slice(&bytes);
+        initialized = initialized
+            .checked_add(bytes.len())
+            .filter(|initialized| *initialized <= len)
+            .ok_or_else(|| Error::index("whole positions initialized byte count overflow"))?;
+    }
+    if initialized != len {
+        return Err(Error::index(format!(
+            "whole positions initialized {initialized} bytes, expected {len}",
+        )));
+    }
+    // SAFETY: try_reserve_exact reserved at least len bytes. The step_by ranges
+    // cover 0..len exactly once, and read_payload_range validates every result's
+    // length before its bytes are written. Exhausting the stream successfully
+    // therefore initializes every byte in 0..len, including a partial tail.
+    // Error and cancellation leave the vector length at zero and publish nothing.
+    unsafe {
+        output.set_len(len);
     }
     Ok(compact_payload(bytes::Bytes::from(output)))
 }
@@ -444,6 +465,44 @@ mod tests {
         );
         let owned = Vec::<u8>::from(payload);
         assert_eq!(owned.capacity(), owned.len());
+    }
+
+    #[rstest::rstest]
+    #[case::reverse((0..11).rev().collect())]
+    #[case::alternating(vec![1, 3, 5, 7, 9, 0, 2, 4, 6, 8, 10])]
+    #[case::tail_before_prefix(vec![7, 6, 5, 4, 3, 2, 1, 0, 10, 9, 8])]
+    #[tokio::test]
+    async fn selective_phrase_whole_payload_preserves_bytes_across_completion_orders(
+        #[case] order: Vec<usize>,
+    ) {
+        let value = RangedValue::new();
+        let mut read = Box::pin(read_payload(&value, 8));
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        let mut payload = None;
+        for (step, ordinal) in order.iter().enumerate() {
+            value.gates[*ordinal].notify_one();
+            if let std::task::Poll::Ready(result) = futures::poll!(read.as_mut()) {
+                assert_eq!(step + 1, order.len(), "published before all reads finished");
+                payload = Some(result.unwrap());
+                break;
+            }
+        }
+        let payload = match payload {
+            Some(payload) => payload,
+            None => read.await.unwrap(),
+        };
+        assert_eq!(payload.as_ref(), (0..83).collect::<Vec<u8>>());
+        assert_eq!(value.requests.lock().unwrap().len(), 11);
+        assert_eq!(value.active.load(Ordering::SeqCst), 0);
+        assert!(value.peak.load(Ordering::SeqCst) <= 8);
+        assert!(
+            value
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|owner| owner.upgrade().is_none())
+        );
     }
 
     #[tokio::test]
