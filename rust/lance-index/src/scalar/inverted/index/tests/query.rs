@@ -2460,7 +2460,7 @@ async fn selective_phrase_whole_positions_match_committed_arrow_streams() -> Res
         lance_file::version::ConcreteFileVersion::V2_2,
     ));
     for partition_id in 0..2 {
-        let documents = (0..384)
+        let documents = (0..385)
             .map(|row| {
                 let (left, right) = if row % 3 == 0 {
                     ("alpha", "alpha")
@@ -2469,7 +2469,7 @@ async fn selective_phrase_whole_positions_match_committed_arrow_streams() -> Res
                 } else {
                     ("beta", "alpha")
                 };
-                (left, right, partition_id * 384 + row)
+                (left, right, partition_id * 385 + row)
             })
             .collect::<Vec<_>>();
         write_pair_partition_with_position(&store, partition_id, &documents, true).await;
