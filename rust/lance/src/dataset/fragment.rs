@@ -46,6 +46,7 @@ use lance_file::reader::{
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
+use lance_file::writer::FileWriterOptions;
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
@@ -2928,12 +2929,27 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        self.write_columns_with_file_writer_options(data, schema, FileWriterOptions::default())
+            .await
+    }
+
+    /// Write replacement column data with runtime file-writer options.
+    ///
+    /// This has the same format and commit semantics as [`Self::write_columns`].
+    /// The options control buffering and execution only; the fragment's
+    /// manifest still selects the file grammar and physical layout.
+    pub async fn write_columns_with_file_writer_options(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<super::transaction::DataReplacementGroup> {
         let write_version = self
             .dataset
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.write_column_with_version(data, schema, write_version)
+        self.write_column_with_version_and_options(data, schema, write_version, file_writer_options)
             .await
     }
 
@@ -2962,6 +2978,22 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
         write_version: ConcreteFileVersion,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    async fn write_column_with_version_and_options(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        write_version: ConcreteFileVersion,
+        file_writer_options: FileWriterOptions,
     ) -> Result<super::transaction::DataReplacementGroup> {
         versions::validate_write_version(
             self.dataset
@@ -3010,11 +3042,12 @@ impl FileFragment {
             true,
         )
         .await?;
-        let mut writer = versions::open_update_writer(
+        let mut writer = versions::open_update_writer_with_options(
             write_version,
             self.dataset.as_ref(),
             &writer_schema,
             has_blob_v2,
+            file_writer_options,
         )
         .await?;
         let staged_path = {
