@@ -68,6 +68,32 @@ fn assert_batch(batch: &RecordBatch, rows: &Range<u64>, expected: &RecordBatch) 
     }
 }
 
+fn assert_address_batch(
+    batch: &RecordBatch,
+    rows: &Range<u64>,
+    expected: &RecordBatch,
+    fragment: u32,
+) {
+    let selected = expected.slice(rows.start as usize, (rows.end - rows.start) as usize);
+    let addresses: ArrayRef = Arc::new(arrow_array::UInt64Array::from_iter_values(
+        rows.clone()
+            .map(|row| u64::from(fragment) * (1_u64 << 32) + row),
+    ));
+    let mut fields = selected.schema().fields().to_vec();
+    fields.extend([
+        Arc::new(lance_core::ROW_ID_FIELD.clone()),
+        Arc::new(lance_core::ROW_ADDR_FIELD.clone()),
+    ]);
+    let mut arrays = selected.columns().to_vec();
+    arrays.extend([addresses.clone(), addresses]);
+    let expected = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+    assert_batch(batch, &(0..rows.end - rows.start), &expected);
+    assert!(Arc::ptr_eq(
+        &batch[lance_core::ROW_ID],
+        &batch[lance_core::ROW_ADDR]
+    ));
+}
+
 // This independently composes the public per-column API. It is the bounded
 // reference for the compound cursor's progress, not an unadmitted fallback.
 async fn sequential_row(reader: &FileReader, bytes: usize) -> Option<RecordBatch> {
@@ -508,11 +534,7 @@ async fn queued_batch_owns_all_columns_and_credit(
             };
             assert_eq!(rows, 0..3);
             assert_eq!(scan.position(), 3);
-            assert_batch(&batch.project(&[0, 1]).unwrap(), &rows, &batches()[0]);
-            assert!(Arc::ptr_eq(
-                &batch[lance_core::ROW_ID],
-                &batch[lance_core::ROW_ADDR]
-            ));
+            assert_address_batch(&batch, &rows, &batches()[0], 7);
             let alias = batch[lance_core::ROW_ID].slice(0, 1);
             drop(batch);
             assert!(budget.reserved() > peer.len());
@@ -538,7 +560,7 @@ async fn queued_batch_owns_all_columns_and_credit(
                     assert!(error.to_string().contains("non-nullable"));
                 } else {
                     let batch = result.unwrap().unwrap();
-                    assert_batch(&batch, &(0..3), &batches()[0]);
+                    assert_address_batch(&batch, &(0..3), &batches()[0], 7);
                     drop(batch);
                 }
             }

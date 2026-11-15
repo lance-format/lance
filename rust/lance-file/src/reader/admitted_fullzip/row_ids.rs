@@ -267,7 +267,7 @@ fn row_array(
     let mut buffer = credit
         .try_allocate(count * 8)?
         .ok_or_else(|| Error::internal("missing pre-admitted row column credit"))?;
-    for slot in buffer.as_mut().chunks_exact_mut(8) {
+    for slot in buffer.as_mut().as_chunks_mut::<8>().0 {
         let value = values.next().ok_or_else(|| {
             Error::invalid_input("row ID sequence ended before physical selection")
         })?;
