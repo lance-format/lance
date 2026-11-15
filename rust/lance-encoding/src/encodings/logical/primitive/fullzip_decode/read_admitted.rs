@@ -89,8 +89,30 @@ impl FullZipScheduler {
         rows: Range<u64>,
         budget: &Arc<AllocationBudget>,
         workspace_bytes: usize,
-        mut read: F,
+        read: F,
     ) -> Result<Option<DecodedFullZipPrefix>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        Ok(self
+            .try_read_prefix_in(rows, budget, workspace_bytes, read, |page, _| {
+                Ok(Some(page))
+            })
+            .await?
+            .map(|(rows, page)| DecodedFullZipPrefix { rows, page }))
+    }
+
+    // All dependent stages share one admission. In particular a caller cannot
+    // retain decoded inputs, release the headroom, then wait to admit Arrow output.
+    pub(super) async fn try_read_prefix_in<F, Fut, T>(
+        &self,
+        rows: Range<u64>,
+        budget: &Arc<AllocationBudget>,
+        workspace_bytes: usize,
+        mut read: F,
+        mut finish: impl FnMut(DecodedPage, &mut Reservation) -> Result<Option<T>>,
+    ) -> Result<Option<(Range<u64>, T)>>
     where
         F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
         Fut: Future<Output = Result<ReservedBuffer>>,
@@ -114,14 +136,15 @@ impl FullZipScheduler {
             } else {
                 None
             };
-            // The task is gone before reacquiring credit; on success its decoded
-            // payload has an independent owner, on refusal nothing is retained.
+            let output = match page {
+                Some(page) => finish(page, &mut workspace)?,
+                None => None,
+            };
+            // Task, decoded page and any refused reconstruction are gone before
+            // retry. Only a successful output keeps an independent payload owner.
             drop(workspace);
-            if let Some(page) = page {
-                return Ok(Some(DecodedFullZipPrefix {
-                    rows: candidate,
-                    page,
-                }));
+            if let Some(output) = output {
+                return Ok(Some((candidate, output)));
             }
             let count = candidate.end - candidate.start;
             if count == 1 {

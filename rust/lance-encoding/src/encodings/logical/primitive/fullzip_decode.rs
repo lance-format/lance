@@ -40,10 +40,12 @@ use super::{
 };
 
 mod admitted;
+mod array_admitted;
 mod read_admitted;
 mod structure;
 mod unzip_admitted;
 
+pub use array_admitted::FullZipArrayPrefix;
 pub use read_admitted::DecodedFullZipPrefix;
 
 #[derive(Debug, Clone, Copy)]

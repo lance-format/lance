@@ -5,7 +5,10 @@
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator};
+use arrow_array::{
+    Array, ArrayRef, LargeBinaryArray, LargeListArray, ListArray, RecordBatch, RecordBatchIterator,
+    StringArray,
+};
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
@@ -72,6 +75,19 @@ async fn fixture(
     depth: usize,
     pages: usize,
 ) -> (FsFixture, FileReader) {
+    fixture_arrays(
+        version,
+        lite,
+        (0..pages).map(|page| array(page, depth)).collect(),
+    )
+    .await
+}
+
+async fn fixture_arrays(
+    version: ConcreteFileVersion,
+    lite: bool,
+    arrays: Vec<ArrayRef>,
+) -> (FsFixture, FileReader) {
     let mut fs = FsFixture::default();
     fs.scheduler = ScanScheduler::new(
         fs.object_store.clone(),
@@ -81,15 +97,16 @@ async fn fixture(
         },
     );
     let schema = Arc::new(Schema::new(vec![
-        Field::new("payload", array(0, depth).data_type().clone(), true).with_metadata(
-            HashMap::from([(
+        Field::new("payload", arrays[0].data_type().clone(), true).with_metadata(HashMap::from([
+            (
                 STRUCTURAL_ENCODING_META_KEY.to_string(),
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
-            )]),
-        ),
+            ),
+        ])),
     ]));
-    let batches = (0..pages)
-        .map(|page| RecordBatch::try_new(schema.clone(), vec![array(page, depth)]))
+    let batches = arrays
+        .into_iter()
+        .map(|array| RecordBatch::try_new(schema.clone(), vec![array]))
         .collect::<Vec<_>>();
     write_lance_file(
         RecordBatchIterator::new(batches, schema),
@@ -334,4 +351,302 @@ async fn admitted_file_adapter_never_falls_back_to_unowned_reads() {
         FullZipScheduler::try_from_page(&page, &DefaultDecompressionStrategy {}).unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(error.to_string().contains("expected a dense FullZip page"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_file_array_prefix_keeps_reconstruction_credit(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(0, 1, 2)] depth: usize,
+) {
+    let (_fs, reader) = fixture(version, lite, depth, 3).await;
+    let pages = &reader.metadata().column_infos[0].page_infos;
+    let budget = AllocationBudget::new(8192);
+    for (index, page) in pages.iter().enumerate() {
+        let expected = array(index, depth);
+        let decoder =
+            FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {}).unwrap();
+        let mut row = 0;
+        while row < page.num_rows {
+            let result = decoder
+                .try_read_array_prefix_in(
+                    row..page.num_rows,
+                    expected.data_type(),
+                    &budget,
+                    8192,
+                    |range, output| {
+                        reader
+                            .core
+                            .scheduler
+                            .submit_single_into(range, page.priority, output)
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.rows.start, row);
+            assert!(result.rows.end > row);
+            assert_eq!(
+                result.array.to_data(),
+                expected
+                    .slice(row as usize, (result.rows.end - row) as usize)
+                    .to_data()
+            );
+            row = result.rows.end;
+            let held = result.array.slice(0, 1);
+            drop(result);
+            assert!(budget.reserved() > 0 && budget.reserved() <= 8192);
+            assert!(budget.try_reserve(8192).is_none());
+            drop(held);
+            assert_eq!(budget.reserved(), 0);
+        }
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_file_reconstruction_refuses_after_successful_decode(
+    #[values(false, true)] lite: bool,
+) {
+    // Many empty/null large lists have tiny value data but large final offsets.
+    // This distinguishes reconstruction refusal from the existing codec refusal.
+    let mut offsets = vec![0_i64; 65];
+    offsets[64] = 1;
+    let expected: ArrayRef = Arc::new(LargeListArray::new(
+        Arc::new(Field::new("item", DataType::LargeBinary, true)),
+        OffsetBuffer::new(offsets.into()),
+        Arc::new(LargeBinaryArray::from_vec(vec![b"leaf"])),
+        Some(NullBuffer::from(
+            (0..64)
+                .map(|row| row % 3 != 0 || row == 63)
+                .collect::<Vec<_>>(),
+        )),
+    ));
+    let (_fs, reader) =
+        fixture_arrays(ConcreteFileVersion::V2_2, lite, vec![expected.clone()]).await;
+    let page = &reader.metadata().column_infos[0].page_infos[0];
+    let budget = AllocationBudget::new(640);
+    let raw = prefix(&reader, page, 0..64, &budget, 640).await.unwrap();
+    assert_eq!(
+        raw.rows,
+        0..64,
+        "fixture must first prove full raw decode fits"
+    );
+    drop(raw);
+    assert_eq!(budget.reserved(), 0);
+    let decoder = FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {}).unwrap();
+    let mut row = 0;
+    let mut prefixes = 0;
+    while row < 64 {
+        let result = decoder
+            .try_read_array_prefix_in(
+                row..64,
+                expected.data_type(),
+                &budget,
+                640,
+                |range, output| {
+                    reader
+                        .core
+                        .scheduler
+                        .submit_single_into(range, page.priority, output)
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.rows.start, row);
+        assert!(result.rows.end > row);
+        if row == 0 {
+            assert!(
+                result.rows.end < 64,
+                "whole-array reconstruction must refuse the first candidate"
+            );
+        }
+        assert_eq!(
+            result.array.to_data(),
+            expected
+                .slice(row as usize, (result.rows.end - row) as usize)
+                .to_data()
+        );
+        assert!(budget.reserved() <= 640);
+        row = result.rows.end;
+        drop(result);
+        assert_eq!(budget.reserved(), 0);
+        prefixes += 1;
+    }
+    assert!(prefixes > 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_file_array_peers_finish_without_reacquiring_credit(
+    #[values(false, true)] lite: bool,
+) {
+    let (_fs, reader) = fixture(ConcreteFileVersion::V2_2, lite, 2, 2).await;
+    let pages = &reader.metadata().column_infos[0].page_infos;
+    let a = FullZipScheduler::try_from_page(&pages[0], &DefaultDecompressionStrategy {}).unwrap();
+    let b = FullZipScheduler::try_from_page(&pages[1], &DefaultDecompressionStrategy {}).unwrap();
+    let expected_a = array(0, 2);
+    let expected_b = array(1, 2);
+    let budget = AllocationBudget::new(8192);
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        futures::join!(
+            a.try_read_array_prefix_in(
+                0..pages[0].num_rows,
+                expected_a.data_type(),
+                &budget,
+                4096,
+                |range, output| reader.core.scheduler.submit_single_into(
+                    range,
+                    pages[0].priority,
+                    output
+                )
+            ),
+            b.try_read_array_prefix_in(
+                0..pages[1].num_rows,
+                expected_b.data_type(),
+                &budget,
+                4096,
+                |range, output| reader.core.scheduler.submit_single_into(
+                    range,
+                    pages[1].priority,
+                    output
+                )
+            ),
+        )
+    })
+    .await
+    .expect("independent peers must finish within their original reservations");
+    let a = a.unwrap().unwrap();
+    let b = b.unwrap().unwrap();
+    assert_eq!(
+        a.array.to_data(),
+        expected_a.slice(0, a.rows.end as usize).to_data()
+    );
+    assert_eq!(
+        b.array.to_data(),
+        expected_b.slice(0, b.rows.end as usize).to_data()
+    );
+    assert!(budget.reserved() <= 8192);
+    drop((a, b));
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn admitted_file_array_schema_errors_do_not_read_or_retry() {
+    let (_fs, reader) = fixture(ConcreteFileVersion::V2_2, false, 1, 1).await;
+    let page = &reader.metadata().column_infos[0].page_infos[0];
+    let decoder = FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {}).unwrap();
+    let budget = AllocationBudget::new(8192);
+    let mut reads = 0;
+    for data_type in [
+        DataType::Int32,
+        DataType::LargeBinary,
+        DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+    ] {
+        let error = decoder
+            .try_read_array_prefix_in(0..page.num_rows, &data_type, &budget, 8192, |_, _| {
+                reads += 1;
+                std::future::ready(Err(Error::io("unexpected read")))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            Error::NotSupported { .. } | Error::InvalidInput { .. }
+        ));
+        assert!(error.to_string().contains("FullZip"));
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(reads, 0);
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_file_array_binary_and_string_shapes(
+    #[values(
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::Utf8,
+        DataType::LargeUtf8
+    )]
+    leaf_type: DataType,
+    #[values(false, true)] lite: bool,
+) {
+    let leaf = StringArray::from(vec![Some("one"), None, Some(""), Some("你好")]);
+    let leaf = arrow_cast::cast(&leaf, &leaf_type).unwrap();
+    let inner: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("text", leaf_type, true)),
+        OffsetBuffer::new(vec![0_i32, 2, 2, 4].into()),
+        leaf,
+        Some(NullBuffer::from(vec![true, false, true])),
+    ));
+    let expected: ArrayRef = Arc::new(LargeListArray::new(
+        Arc::new(Field::new("lists", inner.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0_i64, 0, 1, 3].into()),
+        inner,
+        None,
+    ));
+    let (_fs, reader) =
+        fixture_arrays(ConcreteFileVersion::V2_2, lite, vec![expected.clone()]).await;
+    let page = &reader.metadata().column_infos[0].page_infos[0];
+    let decoder = FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {}).unwrap();
+    let budget = AllocationBudget::new(1024);
+    let result = decoder
+        .try_read_array_prefix_in(
+            0..3,
+            expected.data_type(),
+            &budget,
+            1024,
+            |range, output| {
+                reader
+                    .core
+                    .scheduler
+                    .submit_single_into(range, page.priority, output)
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.rows, 0..3);
+    assert_eq!(result.array.to_data(), expected.to_data());
+    drop(result);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn admitted_file_array_materialization_error_is_not_a_smaller_prefix() {
+    let (_fs, reader) = fixture(ConcreteFileVersion::V2_2, false, 1, 1).await;
+    let stats = IoStats::new();
+    let reader = reader.with_io_stats(stats.recorder());
+    let page = &reader.metadata().column_infos[0].page_infos[0];
+    let decoder = FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {}).unwrap();
+    let budget = AllocationBudget::new(8192);
+    let data_type = DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, false)));
+    let error = decoder
+        .try_read_array_prefix_in(
+            0..page.num_rows,
+            &data_type,
+            &budget,
+            8192,
+            |range, output| {
+                reader
+                    .core
+                    .scheduler
+                    .submit_single_into(range, page.priority, output)
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Arrow { .. }));
+    assert!(error.to_string().contains("cannot contain nulls"));
+    assert_eq!(
+        stats.snapshot().iops,
+        3,
+        "one pair of index reads plus payload; no smaller retry"
+    );
+    assert_eq!(budget.reserved(), 0);
 }
