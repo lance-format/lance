@@ -388,6 +388,10 @@ def test_blob_v2_api(tmp_path: Path):
     dataset = lance.write_dataset(
         tbl, tmp_path / "data.lance", data_storage_version="2.2"
     )
+    dataset = lance.dataset(tmp_path / "data.lance")
+    blob_type = dataset.schema.field("val").type
+    assert isinstance(blob_type, pa.ExtensionType)
+    assert blob_type.extension_name == "lance.blob.v2"
 
     seen = []
 
