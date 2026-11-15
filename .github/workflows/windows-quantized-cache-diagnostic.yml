@@ -58,6 +58,19 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Disable CRLF conversion before the reproduction checkout
+        # The Windows runner image sets core.autocrlf=true globally, so the red
+        # checkout would carry CRLF bytes. The whole-tree guard below compares
+        # worktree bytes against LF blobs; converting them after checkout would
+        # surface every converted file as modified. Set the ephemeral runner
+        # config before the second checkout so the red tree starts LF.
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          echo "core.autocrlf=$(git config --global --get core.autocrlf)"
+
       - name: Checkout exact red head 3c570b96 (reproduction tree)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
