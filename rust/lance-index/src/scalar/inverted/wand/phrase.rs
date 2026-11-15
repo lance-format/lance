@@ -6,13 +6,17 @@
 #[cfg(test)]
 use std::cell::Cell;
 
-use lance_core::Result;
+use std::{convert::Infallible, ops::ControlFlow};
+
+use lance_core::{Error, Result};
 
 use crate::scalar::inverted::scorer::Scorer;
 
 use super::Wand;
 use super::doc_source::WandDocuments;
 use super::posting::{PositionCursor, PostingIterator};
+use super::selective_phrase::PositionBlockRequest;
+use crate::scalar::inverted::PostingList;
 
 impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     fn current_doc_postings(&self) -> Vec<&PostingIterator> {
@@ -113,6 +117,43 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             |index| postings[index].position_cursor(),
         )
     }
+
+    /// Suspend only when the frequency-ordered confirmation actually reaches
+    /// a missing clause. Earlier mismatches leave later windows unread.
+    pub(super) fn check_exact_position_windows(
+        &self,
+    ) -> Result<ControlFlow<PositionBlockRequest, bool>> {
+        let postings = self.current_doc_postings();
+        try_exact_phrase_positions_match(
+            postings.len(),
+            |index| {
+                postings[index]
+                    .doc()
+                    .map(|doc| doc.frequency())
+                    .unwrap_or(u32::MAX)
+            },
+            |index| {
+                let posting = postings[index];
+                let PostingList::Compressed(list) = &posting.list else {
+                    return Err(Error::internal(
+                        "selective phrase posting became uncompressed",
+                    ));
+                };
+                let block = posting.index >> list.block_shift();
+                if posting
+                    .position_window
+                    .as_ref()
+                    .is_none_or(|window| !window.contains(block))
+                {
+                    return Ok(ControlFlow::Break(PositionBlockRequest {
+                        token_id: posting.token_id,
+                        index: block,
+                    }));
+                }
+                posting.position_cursor().map(ControlFlow::Continue)
+            },
+        )
+    }
 }
 
 /// Decode exact-phrase position lists in current-doc frequency order.
@@ -123,11 +164,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 fn exact_phrase_positions_match<'a>(
     num_clauses: usize,
     frequency: impl Fn(usize) -> u32,
-    decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
+    mut decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
 ) -> Result<bool> {
+    match try_exact_phrase_positions_match(num_clauses, frequency, |index| {
+        decode(index).map(ControlFlow::<Infallible, _>::Continue)
+    })? {
+        ControlFlow::Continue(matched) => Ok(matched),
+        ControlFlow::Break(never) => match never {},
+    }
+}
+
+fn try_exact_phrase_positions_match<'a, B>(
+    num_clauses: usize,
+    frequency: impl Fn(usize) -> u32,
+    decode: impl FnMut(usize) -> Result<ControlFlow<B, PositionCursor<'a>>>,
+) -> Result<ControlFlow<B, bool>> {
     const MAX_INLINE_CLAUSES: usize = 16;
     if num_clauses == 0 {
-        return Ok(false);
+        return Ok(ControlFlow::Continue(false));
     }
     if num_clauses > MAX_INLINE_CLAUSES {
         let mut order: Vec<usize> = (0..num_clauses).collect();
@@ -145,17 +199,20 @@ fn exact_phrase_positions_match<'a>(
     exact_phrase_scan(&order[..num_clauses], &mut cursors, decode)
 }
 
-fn exact_phrase_scan<'a>(
+fn exact_phrase_scan<'a, B>(
     order: &[usize],
     cursors: &mut [Option<PositionCursor<'a>>],
-    mut decode: impl FnMut(usize) -> Result<PositionCursor<'a>>,
-) -> Result<bool> {
+    mut decode: impl FnMut(usize) -> Result<ControlFlow<B, PositionCursor<'a>>>,
+) -> Result<ControlFlow<B, bool>> {
     let num_clauses = order.len();
     if num_clauses == 0 {
-        return Ok(false);
+        return Ok(ControlFlow::Continue(false));
     }
     let rarest = order[0];
-    cursors[rarest] = Some(decode(rarest)?);
+    cursors[rarest] = Some(match decode(rarest)? {
+        ControlFlow::Continue(cursor) => cursor,
+        ControlFlow::Break(request) => return Ok(ControlFlow::Break(request)),
+    });
     let (n_pos, anchor_offset) = {
         let cursor = cursors[rarest]
             .as_ref()
@@ -163,7 +220,7 @@ fn exact_phrase_scan<'a>(
         (cursor.len(), cursor.position_in_query as u32)
     };
     if num_clauses == 1 {
-        return Ok(n_pos > 0);
+        return Ok(ControlFlow::Continue(n_pos > 0));
     }
 
     // Every clause's target is `anchor_position - anchor_offset + query_offset`,
@@ -200,14 +257,17 @@ fn exact_phrase_scan<'a>(
         };
         for &index in &order[1..num_clauses] {
             if cursors[index].is_none() {
-                cursors[index] = Some(decode(index)?);
+                cursors[index] = Some(match decode(index)? {
+                    ControlFlow::Continue(cursor) => cursor,
+                    ControlFlow::Break(request) => return Ok(ControlFlow::Break(request)),
+                });
             }
             let query_offset = cursors[index]
                 .as_ref()
                 .expect("phrase clause cursor was just populated")
                 .position_in_query as u32;
             let Some(target) = base.checked_add(query_offset) else {
-                return Ok(false);
+                return Ok(ControlFlow::Continue(false));
             };
             let Some(position) = cursors[index]
                 .as_mut()
@@ -216,7 +276,7 @@ fn exact_phrase_scan<'a>(
             else {
                 // No follower position reaches `target`, and every later anchor
                 // only raises it, so no remaining base can align either.
-                return Ok(false);
+                return Ok(ControlFlow::Continue(false));
             };
             if position == target {
                 continue;
@@ -247,9 +307,9 @@ fn exact_phrase_scan<'a>(
             };
             continue 'anchor;
         }
-        return Ok(true);
+        return Ok(ControlFlow::Continue(true));
     }
-    Ok(false)
+    Ok(ControlFlow::Continue(false))
 }
 
 #[cfg(test)]

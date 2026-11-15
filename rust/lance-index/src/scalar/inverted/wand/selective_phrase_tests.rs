@@ -398,13 +398,24 @@ fn selective_phrase_does_not_read_a_rejected_follower(
     #[values(PositionStreamCodec::VarintDocDelta, PositionStreamCodec::PackedDelta)]
     codec: PositionStreamCodec,
     #[values(false, true)] matches: bool,
+    #[values(false, true)] late_match: bool,
 ) -> Result<()> {
     let docs = unit_length_docs(1);
-    let positions = [
-        vec![0],
-        vec![if matches { 1 } else { 3 }],
-        (0..2048).map(|index| index * 3 + 2).collect::<Vec<_>>(),
-    ];
+    // In the late case, the first rare-pair alignment fails on the common
+    // clause. Resuming after its I/O must still find the second alignment.
+    let positions = if late_match {
+        [
+            vec![0, 4],
+            if matches { vec![1, 5] } else { vec![3, 7] },
+            (0..2048).map(|index| index * 3 + 6).collect::<Vec<_>>(),
+        ]
+    } else {
+        [
+            vec![0],
+            vec![if matches { 1 } else { 3 }],
+            (0..2048).map(|index| index * 3 + 2).collect::<Vec<_>>(),
+        ]
+    };
     let build = || {
         positions
             .iter()

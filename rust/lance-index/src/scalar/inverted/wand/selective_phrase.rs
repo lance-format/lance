@@ -7,6 +7,8 @@ use super::*;
 use crate::scalar::inverted::DocInfo;
 use crate::scalar::inverted::index::PositionStreamCodec;
 use lance_core::Error;
+use smallvec::SmallVec;
+use std::ops::ControlFlow;
 
 /// One compact contiguous read containing complete adjacent position blocks.
 #[derive(Clone)]
@@ -238,7 +240,6 @@ impl PhraseSearch {
             {
                 continue;
             }
-            let mut requests = Vec::new();
             for posting in &mut wand.lead {
                 let PostingList::Compressed(list) = &posting.list else {
                     return Err(Error::internal(
@@ -249,24 +250,54 @@ impl PhraseSearch {
                 if posting
                     .position_window
                     .as_ref()
-                    .is_none_or(|window| !window.contains(index))
+                    .is_some_and(|window| !window.contains(index))
                 {
-                    // Release the old allocation before asynchronous replacement.
+                    // Drop stale payloads before requesting replacements,
+                    // including clauses that this candidate may not reach.
                     posting.position_window = None;
-                    let request = PositionBlockRequest {
-                        token_id: posting.token_id,
-                        index,
-                    };
-                    if !requests.contains(&request) {
-                        requests.push(request);
-                    }
+                }
+            }
+            // The first pair must align before any later clause can match.
+            // Keep those two loads parallel; defer every other clause to the
+            // confirmation's actual demand rather than loading all stopwords.
+            let mut order = (0..wand.lead.len()).collect::<SmallVec<[usize; 16]>>();
+            order.sort_unstable_by_key(|&index| {
+                wand.lead[index]
+                    .doc()
+                    .map(|doc| doc.frequency())
+                    .unwrap_or(u32::MAX)
+            });
+            let mut requests = Vec::with_capacity(2);
+            for &index in order.iter().take(2) {
+                let posting = &wand.lead[index];
+                if posting.position_window.is_some() {
+                    continue;
+                }
+                let PostingList::Compressed(list) = &posting.list else {
+                    return Err(Error::internal(
+                        "selective phrase posting became uncompressed",
+                    ));
+                };
+                let request = PositionBlockRequest {
+                    token_id: posting.token_id,
+                    index: posting.index >> list.block_shift(),
+                };
+                if !requests.contains(&request) {
+                    requests.push(request);
                 }
             }
             if !requests.is_empty() {
                 self.pending = Some((doc, score));
                 break PhraseProgress::Read(requests);
             }
-            if wand.check_exact_positions()?
+            let matched = match wand.check_exact_position_windows()? {
+                ControlFlow::Continue(matched) => matched,
+                ControlFlow::Break(request) => {
+                    self.pending = Some((doc, score));
+                    break PhraseProgress::Read(vec![request]);
+                }
+            };
+            if matched
                 && self.collector.insert(
                     ScoredDoc::new(document_key, score),
                     doc_length,
