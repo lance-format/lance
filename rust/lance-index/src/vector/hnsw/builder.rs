@@ -28,6 +28,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
+use super::remap::remap_graph_batch;
 use super::{
     HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
 };
@@ -1703,6 +1704,27 @@ impl IvfSubIndex for HNSW {
     // wire.
     fn read_columns() -> Option<&'static [&'static str]> {
         Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
+    }
+
+    fn positional_rows(metadata: &str) -> Result<Option<usize>> {
+        // Legacy files may leave an empty partition's metadata blank; such a
+        // partition has no graph to realign.
+        if metadata.is_empty() {
+            return Ok(None);
+        }
+        let metadata: HnswMetadata = serde_json::from_str(metadata).map_err(|e| {
+            Error::index(format!(
+                "Failed to decode HNSW metadata: {e}, json: {metadata}"
+            ))
+        })?;
+        Ok(Some(match metadata.level_offsets.as_slice() {
+            [start, end, ..] => end.saturating_sub(*start),
+            _ => 0,
+        }))
+    }
+
+    fn remap_positions(data: RecordBatch, new_ids: &[Option<u32>]) -> Result<RecordBatch> {
+        remap_graph_batch(&data, new_ids)
     }
 
     #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]

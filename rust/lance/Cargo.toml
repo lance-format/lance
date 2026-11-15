@@ -293,6 +293,10 @@ name = "frag_reuse"
 harness = false
 
 [[bench]]
+name = "hnsw_auto_remap"
+harness = false
+
+[[bench]]
 name = "mem_wal_write"
 path = "benches/mem_wal/write/mem_wal_write.rs"
 harness = false

@@ -1497,6 +1497,7 @@ async fn test_ivf_flat_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         10,
+        false,
     ))
     .await;
 }
@@ -1511,7 +1512,42 @@ async fn test_ivf_hnsw_sq_defer_compaction_merge_only() {
     );
     // No deletions: storage positions are stable, so the graph stays aligned.
     // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
-    Box::pin(check_vector_defer_compaction(params, None, 10, 9)).await;
+    Box::pin(check_vector_defer_compaction(params, None, 10, 9, false)).await;
+}
+
+/// Deletions spread through every partition drop rows from the storage as it
+/// loads, so the HNSW graph must be realigned with the shifted positions.
+#[rstest]
+#[case::sq(VectorIndexParams::with_ivf_hnsw_sq_params(
+    DistanceType::L2,
+    small_ivf(),
+    lance_index::vector::hnsw::builder::HnswBuildParams::default(),
+    lance_index::vector::sq::builder::SQBuildParams::default(),
+))]
+#[case::pq(VectorIndexParams::with_ivf_hnsw_pq_params(
+    DistanceType::L2,
+    small_ivf(),
+    lance_index::vector::hnsw::builder::HnswBuildParams::default(),
+    lance_index::vector::pq::PQBuildParams {
+        max_iters: 2,
+        num_sub_vectors: 4,
+        ..Default::default()
+    },
+))]
+#[tokio::test]
+async fn test_ivf_hnsw_defer_compaction_with_deletions(
+    #[case] params: VectorIndexParams,
+    #[values(false, true)] prewarm: bool,
+) {
+    // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+    Box::pin(check_vector_defer_compaction(
+        params,
+        Some("id % 3 = 0"),
+        10,
+        8,
+        prewarm,
+    ))
+    .await;
 }
 #[tokio::test]
 async fn test_ivf_pq_defer_compaction_with_deletions() {
@@ -1531,6 +1567,7 @@ async fn test_ivf_pq_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         8,
+        false,
     ))
     .await;
 }
@@ -1548,6 +1585,7 @@ async fn test_ivf_sq_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         8,
+        false,
     ))
     .await;
 }
@@ -1562,6 +1600,7 @@ async fn test_ivf_rq_defer_compaction_with_deletions() {
         Some("id < 1500"),
         10,
         8,
+        false,
     ))
     .await;
 }

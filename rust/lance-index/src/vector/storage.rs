@@ -1766,6 +1766,64 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
     }
 
+    /// Where each stored row of partition `part_id` sits in the storage
+    /// [`Self::load_partition`] builds: `Some(position)` for a row the
+    /// row-ID remapping keeps, `None` for one it drops. Surviving rows keep
+    /// their stored order, as every quantizer storage keeps them.
+    ///
+    /// Reads only the row-ID column. Errors if the storage has no remapping,
+    /// since no row is dropped then.
+    pub async fn partition_row_positions(
+        &self,
+        part_id: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Vec<Option<u32>>> {
+        let batch = self
+            .read_file_columns(self.ivf.row_range(part_id), &[ROW_ID], io_stats)
+            .await?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .and_then(|ids| ids.as_primitive_opt::<UInt64Type>())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "partition {part_id} storage needs a uint64 {ROW_ID} column"
+                ))
+            })?;
+        let is_kept: Vec<bool> = if let Some(remapper) = &self.batch_remapper {
+            // Null addresses are dropped as tombstones by the batch remapping.
+            let ids: Vec<u64> = row_ids
+                .iter()
+                .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
+                .collect();
+            remap_row_ids_async(remapper.as_ref(), &ids)
+                .await?
+                .into_iter()
+                .map(|id| id.is_some_and(|id| id != RowAddress::TOMBSTONE_ROW))
+                .collect()
+        } else if let Some(remapper) = &self.frag_reuse_index {
+            row_ids
+                .values()
+                .iter()
+                .map(|&id| remapper.remap_row_id(id).is_some())
+                .collect()
+        } else {
+            return Err(Error::internal(format!(
+                "partition {part_id} storage has no row-ID remapping to drop rows"
+            )));
+        };
+        let mut num_kept = 0u32;
+        Ok(is_kept
+            .into_iter()
+            .map(|is_kept| {
+                is_kept.then(|| {
+                    let position = num_kept;
+                    num_kept += 1;
+                    position
+                })
+            })
+            .collect())
+    }
+
     /// Load a partition's quantization storage, optionally measuring the exact
     /// I/O it performs into `io_stats`.
     ///

@@ -1257,9 +1257,10 @@ async fn assert_vector_index_coverage(dataset: &Dataset) {
 /// The deletion path is the interesting one: materialized deletions drop
 /// rows from the quantization storage at load time, which shifts storage
 /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
-/// fine, but the HNSW graph addresses storage positionally and is not
-/// frag-reuse aware, so a desync would surface here as recall collapse or a
-/// resurrected/again-deleted row.
+/// fine, but the HNSW graph addresses storage positionally and is realigned
+/// as it loads, so a desync would surface here as a load error, recall
+/// collapse or a resurrected/again-deleted row. `prewarm` loads the
+/// partitions through the prewarm path before querying instead.
 /// Top-k `id`s for a KNN query against the `vec` column.
 async fn vector_knn_ids(dataset: &Dataset, query: &[f32], k: usize) -> Vec<i32> {
     use arrow_array::cast::AsArray;
@@ -1288,6 +1289,7 @@ async fn check_vector_defer_compaction(
     delete_predicate: Option<&str>,
     k: usize,
     min_overlap: usize,
+    prewarm: bool,
 ) {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type};
@@ -1392,6 +1394,10 @@ async fn check_vector_defer_compaction(
         "index must not be physically remapped yet (FRI window)"
     );
 
+    if prewarm {
+        dataset.prewarm_index("vec_idx").await.unwrap();
+    }
+
     // During the FRI window: no deleted rows, and stable vs the baseline.
     for (i, (_, q)) in queries.iter().enumerate() {
         let after = vector_knn_ids(&dataset, q, k).await;
@@ -1417,12 +1423,6 @@ fn small_ivf() -> lance_index::vector::ivf::IvfBuildParams {
         ..Default::default()
     }
 }
-
-// NOTE: IVF_HNSW_* under materialized deletions is a known gap (lance#3993,
-// HNSW auto-remap not implemented) — the HNSW graph isn't realigned after the
-// frag-reuse drop. Deferred remap is gated off for HNSW tables, so there is
-// no lance-level reproducer here; the gate is tested in the data plane.
-// Merge-only HNSW is covered (see the *_remap_and_trim tests).
 
 /// Merge-only deferred compaction, then a PHYSICAL remap + FRI trim. Asserts
 /// the index is rebuilt with its details kept, the fragment-reuse index
