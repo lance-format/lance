@@ -12,16 +12,38 @@ use crate::{
     data::{BlockInfo, DataBlock, VariableWidthBlock},
 };
 
-fn offset(bytes: &[u8], index: usize, width: usize) -> u64 {
+fn offset<const WIDTH: usize>(bytes: &[u8]) -> u64 {
     let mut word = [0_u8; 8];
-    word[..width].copy_from_slice(&bytes[index * width..(index + 1) * width]);
+    word[..WIDTH].copy_from_slice(bytes);
     u64::from_le_bytes(word)
 }
 
-// Return offset width, entry count and logical payload length only after the
+// Keep the signed limit and byte width constant inside the traversal. Byte
+// chunks also support deliberately unaligned slices without an alignment copy.
+fn validate_offsets<const WIDTH: usize>(bytes: &[u8], payload_len: usize) -> Result<usize> {
+    let max = if WIDTH == 4 {
+        i32::MAX as u64
+    } else {
+        i64::MAX as u64
+    };
+    let mut previous = 0;
+    for (i, bytes) in bytes.chunks_exact(WIDTH).enumerate() {
+        let next = offset::<WIDTH>(bytes);
+        if (i == 0 && next != 0) || next < previous || next > max || next > payload_len as u64 {
+            return Err(Error::corrupt_file_named(
+                "per-value binary",
+                "offsets must start at zero, remain monotonic and fit the signed input bounds",
+            ));
+        }
+        previous = next;
+    }
+    Ok(previous as usize)
+}
+
+// Return offset width and logical payload length only after the
 // entire table is validated. In particular, an invalid tail cannot be hidden
 // by an empty workspace or by a callback failing on an earlier value.
-fn validate(data: &VariableWidthBlock) -> Result<(usize, usize, usize)> {
+fn validate(data: &VariableWidthBlock) -> Result<(usize, usize)> {
     let width = match data.bits_per_offset {
         32 => 4,
         64 => 8,
@@ -40,40 +62,43 @@ fn validate(data: &VariableWidthBlock) -> Result<(usize, usize, usize)> {
             "offset table size disagrees with value count",
         ));
     }
-    let max = if width == 4 {
-        i32::MAX as u64
+    let payload = if width == 4 {
+        validate_offsets::<4>(&data.offsets, data.data.len())?
     } else {
-        i64::MAX as u64
+        validate_offsets::<8>(&data.offsets, data.data.len())?
     };
-    let mut previous = 0;
-    for i in 0..count {
-        let next = offset(&data.offsets, i, width);
-        if (i == 0 && next != 0) || next < previous || next > max || next > data.data.len() as u64 {
-            return Err(Error::corrupt_file_named(
-                "per-value binary",
-                "offsets must start at zero, remain monotonic and fit the signed input bounds",
-            ));
-        }
-        previous = next;
-    }
-    Ok((width, count, previous as usize))
+    Ok((width, payload))
 }
 
 pub fn visit(
     data: &VariableWidthBlock,
     visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    let (width, count, _) = validate(data)?;
-    for i in 0..count - 1 {
-        let start = offset(&data.offsets, i, width) as usize;
-        let end = offset(&data.offsets, i + 1, width) as usize;
+    let (width, _) = validate(data)?;
+    if width == 4 {
+        visit_values::<4>(data, visitor)
+    } else {
+        visit_values::<8>(data, visitor)
+    }
+}
+
+fn visit_values<const WIDTH: usize>(
+    data: &VariableWidthBlock,
+    visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    // Full validation precedes callbacks. Reuse the previous endpoint rather
+    // than decoding each interior offset again for the following value.
+    let mut start = 0;
+    for bytes in data.offsets.chunks_exact(WIDTH).skip(1) {
+        let end = offset::<WIDTH>(bytes) as usize;
         visitor(&data.data[start..end])?;
+        start = end;
     }
     Ok(())
 }
 
 pub fn plan(data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
-    let (_, _, payload_bytes) = validate(data)?;
+    let (_, payload_bytes) = validate(data)?;
     let output_bytes = data
         .offsets
         .len()

@@ -4,6 +4,7 @@
 use std::ops::Range;
 
 use arrow_array::{Array, BinaryArray, LargeBinaryArray};
+use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use lance_core::utils::allocation::AllocationBudget;
 use rstest::rstest;
@@ -75,6 +76,15 @@ fn raw_per_value_detaches_shared_input_with_exact_overlap(
     let mut work = pool.try_reserve(physical + needed).unwrap();
     let (input, sibling, actual) = charge_per_value(input, displacement, &mut work);
     assert_eq!(actual, physical);
+    let mut visited = Vec::new();
+    codec
+        .visit_binary_values(&input, &mut |value| {
+            visited.push(value.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(visited, selected);
+    assert_eq!(work.len(), needed);
     assert_eq!(
         codec.plan_decode(&input).unwrap(),
         PerValueDecodeBudget {
@@ -121,6 +131,7 @@ fn raw_per_value_detaches_shared_input_with_exact_overlap(
 fn raw_per_value_rejects_complete_invalid_offsets_before_admission(
     #[values(32, 64)] bits: u8,
     #[values("decreasing", "signed", "nonzero", "outside", "truncated", "extra")] corruption: &str,
+    #[values(0, 1)] displacement: usize,
 ) {
     let (codec, mut input) = fixture(bits, &[b"ab".to_vec(), b"c".to_vec()]);
     let width = usize::from(bits / 8);
@@ -136,7 +147,12 @@ fn raw_per_value_rejects_complete_invalid_offsets_before_admission(
         "extra" => offsets.extend_from_slice(&0_u64.to_le_bytes()[..width]),
         _ => unreachable!(),
     }
-    input.offsets = LanceBuffer::from(offsets);
+    let mut backing = vec![255; displacement];
+    backing.extend_from_slice(&offsets);
+    input.offsets = LanceBuffer::from(Buffer::from(backing.as_slice()).slice(displacement));
+    if displacement != 0 {
+        assert!(!(input.offsets.as_ptr() as usize).is_multiple_of(width));
+    }
     let pool = AllocationBudget::new(0);
     let mut work = pool.try_reserve(0).unwrap();
     for _ in 0..2 {

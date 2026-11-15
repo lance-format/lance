@@ -179,13 +179,33 @@ impl RepDefUnraveler {
 // Iterates the current dense validity layer without a temporary bitmap or index
 // array. Construction is preceded by validation, so level lookups are in bounds.
 struct ValidityBits<'a> {
-    source: &'a RepDefUnraveler,
-    next: usize,
+    levels: Option<std::slice::Iter<'a, u16>>,
+    levels_to_rep: &'a [u16],
+    current_rep_cmp: u16,
+    current_def_cmp: u16,
+    all_valid_left: usize,
 }
 
 impl<'a> ValidityBits<'a> {
     fn new(source: &'a RepDefUnraveler) -> Self {
-        Self { source, next: 0 }
+        // Layer metadata is invariant for this borrowed traversal. In particular,
+        // is_all_valid must not inspect the schema again for every emitted bit.
+        let is_all_valid = source.is_all_valid();
+        Self {
+            levels: if is_all_valid {
+                None
+            } else {
+                source.def_levels.as_ref().map(|levels| levels.iter())
+            },
+            levels_to_rep: &source.levels_to_rep,
+            current_rep_cmp: source.current_rep_cmp,
+            current_def_cmp: source.current_def_cmp,
+            all_valid_left: if is_all_valid {
+                source.num_items as usize
+            } else {
+                0
+            },
+        }
     }
 }
 
@@ -193,18 +213,13 @@ impl Iterator for ValidityBits<'_> {
     type Item = bool;
 
     fn next(&mut self) -> Option<bool> {
-        if self.source.is_all_valid() {
-            if self.next < self.source.num_items as usize {
-                self.next += 1;
-                return Some(true);
-            }
-            return None;
+        if self.all_valid_left > 0 {
+            self.all_valid_left -= 1;
+            return Some(true);
         }
-        let defs = self.source.def_levels.as_ref()?;
-        while let Some(&level) = defs.get(self.next) {
-            self.next += 1;
-            if self.source.levels_to_rep[level as usize] <= self.source.current_rep_cmp {
-                return Some(level <= self.source.current_def_cmp);
+        for &level in self.levels.as_mut()? {
+            if self.levels_to_rep[level as usize] <= self.current_rep_cmp {
+                return Some(level <= self.current_def_cmp);
             }
         }
         None
