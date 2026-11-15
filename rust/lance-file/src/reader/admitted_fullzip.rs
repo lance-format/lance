@@ -25,6 +25,9 @@ use lance_encoding::{
 use super::FileReader;
 use crate::version::ConcreteFileVersion;
 
+mod row_ids;
+use row_ids::{PreparedRowIds, RowIdColumns};
+
 /// One step of an admitted file cursor. Refusal and EOF are deliberately distinct.
 #[derive(Debug)]
 pub enum FullZipScanOutcome {
@@ -62,6 +65,7 @@ pub struct FullZipScan {
     end: u64,
     cursor: u64,
     deleted_rows: Option<Arc<DeletionVector>>,
+    row_ids: Option<RowIdColumns>,
     has_started: bool,
 }
 
@@ -78,6 +82,7 @@ pub(super) struct BatchDecodeJob {
     inputs: Vec<FullZipArrayInput>,
     schema: Arc<ArrowSchema>,
     workspace: Reservation,
+    row_ids: Option<PreparedRowIds>,
 }
 
 impl BatchDecodeJob {
@@ -89,6 +94,9 @@ impl BatchDecodeJob {
                 return Ok(None);
             };
             arrays.push(array);
+        }
+        if let Some(row_ids) = self.row_ids {
+            row_ids.append_to(&mut arrays)?;
         }
         Ok(Some(RecordBatch::try_new(self.schema, arrays)?))
     }
@@ -106,8 +114,9 @@ impl FileReader {
     /// Existing version-specific projection validation and read length are used.
     /// This API takes physical file-row ranges and starts without deletion
     /// handling; use [`FullZipScan::with_deleted_rows`] to bind a snapshot. It
-    /// does not apply query filters, takes or dataset-level row IDs. Ordinary
-    /// scans are unchanged.
+    /// does not apply query filters or takes. Optional row ID columns can be
+    /// configured with [`FullZipScan::with_row_id`] after file composition.
+    /// Ordinary scans are unchanged.
     ///
     /// `max_rows` limits a single batch, never the total selection. A batch ends
     /// at the earliest projected page boundary, or earlier when its complete
@@ -243,6 +252,7 @@ impl FileReader {
             end: rows.end,
             cursor: rows.start,
             deleted_rows: None,
+            row_ids: None,
             has_started: false,
         })
     }
@@ -358,6 +368,7 @@ impl FullZipScan {
 
     /// Combine disjoint columns from row-aligned files into one admitted cursor.
     ///
+    /// Configure generated row columns only after merging physical files.
     /// Both cursors must use the same shared budget, workspace size, partial-mode
     /// setting and maximum batch rows. Their physical file length, next row and
     /// selected end must match, with either no deletions or the same shared
@@ -386,6 +397,11 @@ impl FullZipScan {
     /// }
     /// ```
     pub fn try_merge(mut self, other: Self) -> Result<Self> {
+        if self.row_ids.is_some() || other.row_ids.is_some() {
+            return Err(Error::invalid_input(
+                "FullZip row ID columns must be configured after merging physical files",
+            ));
+        }
         let same_deletions = match (&self.deleted_rows, &other.deleted_rows) {
             (None, None) => true,
             (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -586,6 +602,16 @@ impl FullZipScan {
         Run: FnMut(BatchDecodeJob) -> Done,
         Done: Future<Output = Result<Option<RecordBatch>>>,
     {
+        // Keep generated columns inside this attempt's admission, including while
+        // payload inputs and decoded arrays coexist. Reserve before any reads.
+        let row_ids = if let Some(columns) = &self.row_ids {
+            let Some(prepared) = columns.prepare(rows.clone(), &mut workspace)? else {
+                return Ok(None);
+            };
+            Some(prepared)
+        } else {
+            None
+        };
         let mut inputs = Vec::with_capacity(self.columns.len());
         for (column, field) in self.columns.iter().zip(self.schema.fields()) {
             let decoder = column
@@ -613,6 +639,7 @@ impl FullZipScan {
             inputs,
             schema: self.schema.clone(),
             workspace,
+            row_ids,
         })
         .await
     }

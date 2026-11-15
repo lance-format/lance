@@ -15,6 +15,8 @@ use lance_core::{
 use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
 
+mod row_ids;
+
 fn batches() -> Vec<RecordBatch> {
     let meta = HashMap::from([(
         STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -473,7 +475,11 @@ async fn queued_batch_owns_all_columns_and_credit(
         .open_admitted_fullzip_scan(0..7, budget.clone(), if partial { 4096 } else { 3072 }, 3)
         .await
         .unwrap()
-        .with_partial_workspace(partial);
+        .with_partial_workspace(partial)
+        .with_row_id(7, None)
+        .unwrap()
+        .with_row_address(7)
+        .unwrap();
     let queued = RefCell::new(None);
     let entered = tokio::sync::Notify::new();
     let dispatches = AtomicUsize::new(0);
@@ -502,8 +508,12 @@ async fn queued_batch_owns_all_columns_and_credit(
             };
             assert_eq!(rows, 0..3);
             assert_eq!(scan.position(), 3);
-            assert_batch(&batch, &rows, &batches()[0]);
-            let alias = batch.column(1).slice(0, 1);
+            assert_batch(&batch.project(&[0, 1]).unwrap(), &rows, &batches()[0]);
+            assert!(Arc::ptr_eq(
+                &batch[lance_core::ROW_ID],
+                &batch[lance_core::ROW_ADDR]
+            ));
+            let alias = batch[lance_core::ROW_ID].slice(0, 1);
             drop(batch);
             assert!(budget.reserved() > peer.len());
             drop(alias);
@@ -685,67 +695,85 @@ async fn finite_files_wait_for_shared_capacity_and_drain_forward_selections(
         fixtures.push(fixture_batches(version, lite, input, 1).await);
     }
     let mut scans = Vec::new();
-    for (_, reader) in &fixtures {
+    for (fragment, (_, reader)) in fixtures.iter().enumerate() {
         scans.push(
             reader
                 .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, 3)
                 .await
+                .unwrap()
+                .with_row_id(fragment as u32, None)
+                .unwrap()
+                .with_row_address(fragment as u32)
                 .unwrap(),
         );
     }
     let waits = AtomicUsize::new(0);
-    let drains = scans
-        .iter_mut()
-        .zip(&expected_files)
-        .map(|(scan, expected)| {
-            let budget = &budget;
-            let waits = &waits;
-            async move {
-                let mut delivered = 0;
-                for selection in [0..7, 11..20] {
-                    if scan.position() != selection.start {
-                        scan.advance_to_range(selection.clone()).unwrap();
-                    }
-                    let mut next = selection.start;
-                    while next < selection.end {
-                        waits.fetch_add(1, Ordering::Relaxed);
-                        budget.wait_for_capacity(4096).await.unwrap();
-                        match scan.try_next().await.unwrap() {
-                            FullZipScanOutcome::Batch { rows, batch } => {
-                                assert_eq!(rows.start, next);
-                                assert!(rows.end > next && rows.end <= selection.end);
-                                assert_batch(&batch, &rows, expected);
-                                delivered += batch.num_rows();
-                                next = rows.end;
-                                let alias = batch.column(1).slice(0, 1);
-                                drop(batch);
-                                assert!(budget.reserved() > 0 && budget.reserved() <= 4096);
-                                // The independent consumer owns the only credit that
-                                // can unblock another file. It drains without waiting
-                                // for that file or occupying a CPU worker.
-                                tokio::task::yield_now().await;
-                                drop(alias);
-                            }
-                            FullZipScanOutcome::NeedsCapacity => {
-                                // These fixtures fit a full workspace. A competing
-                                // admission may win after the wait; it must release
-                                // capacity before this caller retries. A decode
-                                // refusal with an empty pool would require replan.
-                                assert!(budget.reserved() > 0, "full workspace must fit a row");
-                            }
-                            FullZipScanOutcome::Finished => {
-                                panic!("selected rows are still pending")
+    let drains =
+        scans
+            .iter_mut()
+            .zip(&expected_files)
+            .enumerate()
+            .map(|(fragment, (scan, expected))| {
+                let budget = &budget;
+                let waits = &waits;
+                async move {
+                    let mut delivered = 0;
+                    for selection in [0..7, 11..20] {
+                        if scan.position() != selection.start {
+                            scan.advance_to_range(selection.clone()).unwrap();
+                        }
+                        let mut next = selection.start;
+                        while next < selection.end {
+                            waits.fetch_add(1, Ordering::Relaxed);
+                            budget.wait_for_capacity(4096).await.unwrap();
+                            match scan.try_next().await.unwrap() {
+                                FullZipScanOutcome::Batch { rows, batch } => {
+                                    assert_eq!(rows.start, next);
+                                    assert!(rows.end > next && rows.end <= selection.end);
+                                    assert_batch(&batch.project(&[0, 1]).unwrap(), &rows, expected);
+                                    let expected_ids = arrow_array::UInt64Array::from_iter_values(
+                                        rows.clone()
+                                            .map(|row| (fragment as u64) * (1_u64 << 32) + row),
+                                    );
+                                    assert_eq!(
+                                        batch[lance_core::ROW_ID].to_data(),
+                                        expected_ids.to_data()
+                                    );
+                                    assert!(Arc::ptr_eq(
+                                        &batch[lance_core::ROW_ID],
+                                        &batch[lance_core::ROW_ADDR]
+                                    ));
+                                    delivered += batch.num_rows();
+                                    next = rows.end;
+                                    let alias = batch[lance_core::ROW_ID].slice(0, 1);
+                                    drop(batch);
+                                    assert!(budget.reserved() > 0 && budget.reserved() <= 4096);
+                                    // The independent consumer owns the only credit that
+                                    // can unblock another file. It drains without waiting
+                                    // for that file or occupying a CPU worker.
+                                    tokio::task::yield_now().await;
+                                    drop(alias);
+                                }
+                                FullZipScanOutcome::NeedsCapacity => {
+                                    // These fixtures fit a full workspace. A competing
+                                    // admission may win after the wait; it must release
+                                    // capacity before this caller retries. A decode
+                                    // refusal with an empty pool would require replan.
+                                    assert!(budget.reserved() > 0, "full workspace must fit a row");
+                                }
+                                FullZipScanOutcome::Finished => {
+                                    panic!("selected rows are still pending")
+                                }
                             }
                         }
+                        assert!(matches!(
+                            scan.try_next().await.unwrap(),
+                            FullZipScanOutcome::Finished
+                        ));
                     }
-                    assert!(matches!(
-                        scan.try_next().await.unwrap(),
-                        FullZipScanOutcome::Finished
-                    ));
+                    delivered
                 }
-                delivered
-            }
-        });
+            });
     let mut drains = Box::pin(futures::future::join_all(drains));
     assert!(drains.as_mut().now_or_never().is_none());
     assert_eq!(
