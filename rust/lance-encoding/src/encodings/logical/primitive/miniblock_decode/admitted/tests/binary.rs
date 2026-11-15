@@ -53,9 +53,9 @@ fn framed_fixture(
     }
     for payload in payloads {
         if large {
-            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         } else {
-            frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
         }
     }
     frame.resize(frame.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);

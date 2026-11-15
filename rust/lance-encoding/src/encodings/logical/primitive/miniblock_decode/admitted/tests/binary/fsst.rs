@@ -17,7 +17,15 @@ fn fsst_tasks_admit_expanded_values_levels_and_concat(
     #[values(false, true)] multiple: bool,
     #[values(false, true)] nested: bool,
 ) {
-    let values = [vec![b'a'; 16384], vec![], vec![b'b'; 32768], b"d".to_vec()];
+    // The larger input's unsampled symbols expand enough to require a u32
+    // header. Keep both fixtures above FSST's compression threshold, but do
+    // not truncate that encoded length into a u16 header.
+    let values = [
+        vec![b'a'; 16384],
+        vec![],
+        vec![b'b'; if large { 32768 } else { 16384 }],
+        b"d".to_vec(),
+    ];
     let refs = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
     let block = if bits == 32 {
         DataBlock::from_array(BinaryArray::from_vec(refs.clone()))
@@ -25,12 +33,24 @@ fn fsst_tasks_admit_expanded_values_levels_and_concat(
         DataBlock::from_array(LargeBinaryArray::from_vec(refs.clone()))
     };
     let (encoded, description) = FsstMiniBlockEncoder::new(Some(1 << 20))
-        .compress(MiniBlockCompressionContext::new(0, true, true), block)
+        .compress(MiniBlockCompressionContext::new(0, large, true), block)
         .unwrap();
     assert_eq!(encoded.chunks.len(), 1);
+    assert_eq!(encoded.data.len(), 1);
+    assert_eq!(
+        encoded.chunks[0].buffer_sizes[0] as usize,
+        encoded.data[0].len()
+    );
+    assert_eq!(encoded.data[0].len() > usize::from(u16::MAX), large);
     let Some(Compression::Fsst(description)) = description.compression else {
         panic!("expected FSST")
     };
+    let header = u64::from_ne_bytes(description.symbol_table[..8].try_into().unwrap());
+    assert_ne!(
+        header & (1 << 24),
+        0,
+        "fixture must exercise FSST expansion"
+    );
     let codec = FsstMiniBlockDecompressor::new(
         &description,
         Box::new(BinaryMiniBlockDecompressor::new(bits).unwrap()),
