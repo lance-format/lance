@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::blocking_scanner::build_full_text_search_query;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -47,9 +47,8 @@ fn inner_list_indexes<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let index_names = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let indexes = dataset_guard.list_indexes()?;
+        let dataset = clone_dataset(env, &java_dataset)?;
+        let indexes = dataset.list_indexes()?;
         indexes
             .iter()
             .map(|index| index.name.clone())
@@ -689,9 +688,8 @@ fn inner_get_indexes<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let indexes = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_indexes()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_indexes()?
     };
 
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
@@ -729,9 +727,8 @@ fn inner_get_index_statistics<'local>(
 ) -> Result<JString<'local>> {
     let index_name: String = jindex_name.extract(env)?;
     let stats_json = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.index_statistics(&index_name))?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        block_on(dataset.inner.index_statistics(&index_name))?
     };
     let jstats = env.new_string(stats_json)?;
     Ok(jstats)
@@ -879,9 +876,8 @@ fn inner_get_fts_global_statistics(
 ) -> Result<jbyteArray> {
     let query = build_full_text_search_query(env, query_obj)?;
     let mut scanner = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.inner.scan()
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.inner.scan()
     };
     scanner.full_text_search(FullTextSearchQuery::new_query(query))?;
     let statistics = block_on(scanner.fts_global_statistics())?;
@@ -937,9 +933,8 @@ fn inner_describe_indices<'local>(
     })?;
 
     let descriptions = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.describe_indices(index_criteria))?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        block_on(dataset.inner.describe_indices(index_criteria))?
     };
 
     if include_metadata {
@@ -1058,9 +1053,8 @@ fn count_indexed_rows(
     fragment_ids: Option<Vec<u32>>,
 ) -> Result<i64> {
     let count = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.count_indexed_rows(
+        let dataset = clone_dataset(env, &java_dataset)?;
+        block_on(dataset.inner.count_indexed_rows(
             &index_name,
             &filter,
             segment_uuids.as_deref(),
@@ -1095,8 +1089,8 @@ fn inner_get_zonemap_stats<'local>(
     use datafusion_common::ScalarValue;
     use lance::dataset::index::LanceIndexStoreExt;
     use lance::index::DatasetIndexExt;
-    use lance_index::scalar::IndexStore;
     use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
 
     let column_name: String = jcolumn_name.extract(env)?;
 
@@ -1111,12 +1105,19 @@ fn inner_get_zonemap_stats<'local>(
         // Guard is dropped here — dataset is owned
 
         // Find the field for the requested column (validates it exists)
-        dataset.schema().field(&column_name).ok_or_else(|| {
+        let field = dataset.schema().field(&column_name).ok_or_else(|| {
             Error::input_error(format!(
                 "Column '{}' not found in dataset schema",
                 column_name
             ))
         })?;
+
+        // A bound that cannot be converted would surface as null, and null
+        // already means "every value in the zone is null". Decide once per
+        // column and report no stats at all rather than ambiguous ones.
+        if !zone_bounds_convertible(&field.data_type()) {
+            return Ok(env.new_object("java/util/ArrayList", "()V", &[])?);
+        }
 
         // Do all async work in a single block_on call to avoid nested runtime issues
         block_on(async {
@@ -1152,24 +1153,29 @@ fn inner_get_zonemap_stats<'local>(
 
                     let mut batches = Vec::with_capacity(indices.len());
                     for index in &indices {
-                        let index_store = Arc::new(
-                            LanceIndexStore::from_dataset_for_existing(&dataset, index)
-                                .await
-                                .map_err(Error::from)?,
-                        );
-                        let index_file = index_store
-                            .open_index_file("zonemap.lance")
+                        // Decode through the index's own reader (version check,
+                        // invariants, typed bounds) but read only the zones:
+                        // no null bitmap, no cache entry.
+                        let version = ZoneMapIndexVersion::from_metadata(
+                            u32::try_from(index.index_version).unwrap_or(u32::MAX),
+                        )
+                        .map_err(Error::from)?;
+                        let store = LanceIndexStore::from_dataset_for_existing(&dataset, index)
                             .await
                             .map_err(Error::from)?;
-                        if index_file.num_rows() == 0 {
-                            continue;
-                        }
                         batches.push(
-                            index_file
-                                .read_range(0..index_file.num_rows(), None)
+                            ZoneMapIndex::load_zone_statistics(&store, version)
                                 .await
                                 .map_err(Error::from)?,
                         );
+                    }
+                    // A UInt64 bound fits a Java long only up to i64::MAX. One
+                    // zone above that and the column reports no stats rather
+                    // than a wrapped value.
+                    if field.data_type() == arrow_schema::DataType::UInt64
+                        && batches.iter().any(uint64_max_exceeds_java_long)
+                    {
+                        return Ok(Vec::new());
                     }
                     Ok::<_, Error>(batches)
                 }
@@ -1200,6 +1206,16 @@ fn inner_get_zonemap_stats<'local>(
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
                 Error::input_error("ZoneMap 'null_count' column is not UInt32".to_string())
+            })?;
+        let nan_count_col = record_batch
+            .column_by_name("nan_count")
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap index file missing 'nan_count' column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap 'nan_count' column is not UInt32".to_string())
             })?;
         let fragment_id_col = record_batch
             .column_by_name("fragment_id")
@@ -1237,6 +1253,7 @@ fn inner_get_zonemap_stats<'local>(
             let zone_start = zone_start_col.value(i) as i64;
             let zone_length = zone_length_col.value(i) as i64;
             let null_count = null_count_col.value(i) as i64;
+            let nan_count = nan_count_col.value(i) as i64;
 
             let min_scalar = ScalarValue::try_from_array(min_col, i).map_err(|e| {
                 Error::input_error(format!("Failed to read min value at row {}: {}", i, e))
@@ -1250,7 +1267,7 @@ fn inner_get_zonemap_stats<'local>(
 
             let zone_stats = env.new_object(
                 "org/lance/index/scalar/ZoneStats",
-                "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;J)V",
+                "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;JJ)V",
                 &[
                     JValue::Int(fragment_id),
                     JValue::Long(zone_start),
@@ -1258,6 +1275,7 @@ fn inner_get_zonemap_stats<'local>(
                     JValue::Object(&j_min),
                     JValue::Object(&j_max),
                     JValue::Long(null_count),
+                    JValue::Long(nan_count),
                 ],
             )?;
 
@@ -1271,6 +1289,44 @@ fn inner_get_zonemap_stats<'local>(
     }
 
     Ok(array_list)
+}
+
+/// The column types whose zone bounds `scalar_value_to_java` converts to a
+/// Java `Comparable` without losing information: no decimal, binary or
+/// nested type. UInt64 is convertible only while its values fit a Java long;
+/// see `uint64_max_exceeds_java_long`.
+fn zone_bounds_convertible(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+    )
+}
+
+/// Whether any zone's UInt64 `max` is above `i64::MAX`. Since `min <= max`,
+/// a column whose every `max` fits a Java long has every bound fit.
+fn uint64_max_exceeds_java_long(zones: &arrow_array::RecordBatch) -> bool {
+    use arrow_array::Array;
+    zones
+        .column_by_name("max")
+        .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>())
+        .is_some_and(|max| max.iter().flatten().any(|v| v > i64::MAX as u64))
 }
 
 #[cfg(test)]

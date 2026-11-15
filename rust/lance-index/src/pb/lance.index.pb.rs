@@ -518,6 +518,58 @@ impl ::prost::Name for JsonIndexDetails {
         "/lance.index.pb.JsonIndexDetails".into()
     }
 }
+/// Details of a list-element index: a B-tree over the elements of a
+/// `list<struct>` column, keyed by a tuple of fields of the element struct.
+///
+/// EXPERIMENTAL: this index is an experimental format feature. This message
+/// and the index files may change incompatibly without a separate vote, in
+/// which case the index must be rebuilt (the data is never rewritten), and
+/// the feature is removed if its stabilization vote does not pass. Datasets
+/// that do not use the index are not affected either way.
+///
+/// Every segment of one logical index carries the same `key_field_ids`,
+/// `key_types` and `key_encoding`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListElementIndexDetails {
+    /// The key fields, in key order, as Lance field IDs (`file.Field.id`). Each
+    /// is a direct child of the element struct of the indexed column, and no ID
+    /// appears twice. There is at least one.
+    ///
+    /// A reader resolves each ID against the current schema and refers to the
+    /// field by its current name, so the index follows a rename. A reader must
+    /// not use the index when an ID is no longer a direct child of the element
+    /// struct, or when its field no longer has the type in `key_types`.
+    #[prost(int32, repeated, tag = "1")]
+    pub key_field_ids: ::prost::alloc::vec::Vec<i32>,
+    /// The names of the key fields when this segment was written, parallel to
+    /// `key_field_ids`. They are informational: a rename does not update them,
+    /// and a reader must not use them to find the key fields.
+    #[prost(string, repeated, tag = "2")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The Lance logical type of each key field when the index was trained,
+    /// parallel to `key_field_ids` (for example "string" or "float").
+    #[prost(string, repeated, tag = "3")]
+    pub key_types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "ListElementKeyEncoding", tag = "4")]
+    pub key_encoding: i32,
+    /// Details of the B-tree that stores the encoded keys.
+    #[prost(message, optional, tag = "5")]
+    pub target_details: ::core::option::Option<::prost_types::Any>,
+    /// The B-tree's own format version, the `index_version` it would have in
+    /// `IndexMetadata` as a standalone index.
+    #[prost(uint32, tag = "6")]
+    pub target_index_version: u32,
+}
+impl ::prost::Name for ListElementIndexDetails {
+    const NAME: &'static str = "ListElementIndexDetails";
+    const PACKAGE: &'static str = "lance.index.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.index.pb.ListElementIndexDetails".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.index.pb.ListElementIndexDetails".into()
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BloomFilterIndexDetails {}
 impl ::prost::Name for BloomFilterIndexDetails {
@@ -795,6 +847,38 @@ impl JsonTargetDataType {
             "JSON_TARGET_DATA_TYPE_FLOAT64" => Some(Self::Float64),
             "JSON_TARGET_DATA_TYPE_UTF8" => Some(Self::Utf8),
             "JSON_TARGET_DATA_TYPE_LARGE_BINARY" => Some(Self::LargeBinary),
+            _ => None,
+        }
+    }
+}
+/// How a list-element index encodes the key tuple of one element into the
+/// bytes its B-tree orders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ListElementKeyEncoding {
+    /// Not recorded. A reader must not use the index, because the bytes in its
+    /// B-tree have no known meaning.
+    Unspecified = 0,
+    /// The Arrow row format with every key ascending and nulls first, as
+    /// specified in the list-element index documentation.
+    ArrowRowV1 = 1,
+}
+impl ListElementKeyEncoding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LIST_ELEMENT_KEY_ENCODING_UNSPECIFIED",
+            Self::ArrowRowV1 => "LIST_ELEMENT_KEY_ENCODING_ARROW_ROW_V1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LIST_ELEMENT_KEY_ENCODING_UNSPECIFIED" => Some(Self::Unspecified),
+            "LIST_ELEMENT_KEY_ENCODING_ARROW_ROW_V1" => Some(Self::ArrowRowV1),
             _ => None,
         }
     }
