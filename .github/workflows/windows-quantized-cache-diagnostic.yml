@@ -2,17 +2,23 @@ name: Windows quantized-cache diagnostic
 
 # Diagnostic only. This workflow localizes the failing phase of the three
 # Windows nightly failures observed at 3c570b969c88fa2ad29f18199a3886ec4de3f8be
-# (run 43657826113, job 132640223080). It is not a repair, not a merge
-# candidate, and must not be merged.
+# (run 43657826113, job 132640223080). This PR is not a merge candidate and must
+# not be merged.
 #
-# Trigger: pull_request only, narrowed to the two diagnostic paths and guarded
+# Trigger: pull_request only, narrowed to the three diagnostic paths and guarded
 # at job level by github.head_ref for the single diagnostic branch. There is no
 # push and no workflow_dispatch trigger, so opening/updating this PR is the only
 # way this workflow runs.
 #
-# The PR head carries only this workflow and the saved identity-probe patch. The build
-# happens in a second checkout pinned to the exact red head, so later commits on
-# the PR branch cannot change what is built or run.
+# The PR head carries only this workflow and the two saved patch products. The
+# build happens in a second checkout pinned to the exact red head, so later
+# commits on the PR branch cannot change what is built or run.
+#
+# The second patch is the exact production hunk of the published-e_tag repair
+# (source commit da8d069191ab8e08b948019079ee947a84be27ea, blob 518f98579269 ->
+# 4c8e3710ad24). The workflow applies it after the identity probe, and guards
+# both the patch bytes and the resulting blob, so this diagnostic cannot drift
+# from the production change. It is not a test-side substitute for the repair.
 
 on:
   pull_request:
@@ -22,6 +28,7 @@ on:
     paths:
       - .github/workflows/windows-quantized-cache-diagnostic.yml
       - ci/diagnostics/quantized-cache-identity-20261115.patch
+      - ci/diagnostics/rename-commit-published-etag-20261115.patch
 
 permissions:
   contents: read
@@ -32,7 +39,7 @@ concurrency:
 
 jobs:
   lifecycle:
-    name: Quantized refinement cache lifecycle (3 cases, red head)
+    name: Quantized refinement cache lifecycle (3 cases, red head + published-etag repair)
     if: github.head_ref == 'xuanwo/diagnose-quantized-cache-windows-20261115'
     runs-on: windows-latest
     # Reuses the nightly windows-rust-tests timeout; the workspace build is the
@@ -97,10 +104,10 @@ jobs:
         with:
           tool: nextest@0.9.129
 
-      - name: Verify red objects, patch oracle, and apply identity instrumentation
-        # bash (Git Bash) is used for byte-exact handling: the saved patch is
-        # read from the PR-head git object, never from the CRLF-converted
-        # worktree, and is applied to the reproduction checkout only.
+      - name: Verify red objects, patch oracles, and apply identity instrumentation and repair
+        # bash (Git Bash) is used for byte-exact handling: the saved patches are
+        # read from the PR-head git objects, never from the CRLF-converted
+        # worktree, and are applied to the reproduction checkout only.
         working-directory: reproduction
         shell: bash
         env:
@@ -113,9 +120,13 @@ jobs:
           TEST_PATH="rust/lance/src/dataset/tests/dataset_scanner_knn.rs"
           KNN_PATH="rust/lance/src/io/exec/knn.rs"
           INDEX_CACHE_PATH="rust/lance/src/session/index_caches.rs"
-          TEST_PATHS=("$TEST_PATH" "$KNN_PATH" "$INDEX_CACHE_PATH")
+          COMMIT_PATH="rust/lance-table/src/io/commit.rs"
+          PATCH_PATHS=("$TEST_PATH" "$KNN_PATH" "$INDEX_CACHE_PATH")
+          MATERIALIZE_PATHS=("${PATCH_PATHS[@]}" "$COMMIT_PATH")
           PATCH_BLOB_PATH="ci/diagnostics/quantized-cache-identity-20261115.patch"
           PATCH="../quantized-cache-identity-20261115.patch"
+          REPAIR_PATCH_BLOB_PATH="ci/diagnostics/rename-commit-published-etag-20261115.patch"
+          REPAIR_PATCH="../rename-commit-published-etag-20261115.patch"
 
           cd "$REPRO"
           HEAD_SHA=$(git rev-parse HEAD)
@@ -150,12 +161,14 @@ jobs:
           check_object "rust/lance-core/src/cache/mod.rs" "06547ea350e4beeb2bc035f39cdb7fbc4dfb5d15"
           check_object "Cargo.lock" "be54ca4a3271c5ddd2d33e867cb4ac3c16660d52"
           check_object "rust/lance/Cargo.toml" "a4c2ac1179520c3d3cfdd26ff1342747392e53e3"
+          check_object "$COMMIT_PATH" "518f98579269ff97e1966bc7905df84d5e9036ca"
 
           echo "toolchain_pin=$(grep -m1 '^channel' rust-toolchain.toml)"
 
-          # Patch oracle: extract the patch from the PR-head object and check the
-          # reviewed bytes before touching the reproduction worktree. The copy
-          # lives next to (not inside) the reproduction checkout.
+          # Probe patch oracle: extract the patch from the PR-head object and
+          # check the reviewed bytes before touching the reproduction worktree.
+          # Both patch copies live next to (not inside) the reproduction
+          # checkout.
           PATCH_BLOB=$(git -C "$DIAG" rev-parse "HEAD:$PATCH_BLOB_PATH")
           git -C "$DIAG" cat-file blob "$PATCH_BLOB" > "$PATCH"
           PATCH_SHA=$(sha256sum "$PATCH" | cut -d' ' -f1)
@@ -166,20 +179,49 @@ jobs:
             exit 1
           fi
 
+          # Repair patch oracle: same treatment, plus a shape check. The only
+          # file it may touch is the production commit handler; a test hunk
+          # would be a substitute for the repair and must not enter this run.
+          REPAIR_PATCH_BLOB=$(git -C "$DIAG" rev-parse "HEAD:$REPAIR_PATCH_BLOB_PATH")
+          git -C "$DIAG" cat-file blob "$REPAIR_PATCH_BLOB" > "$REPAIR_PATCH"
+          REPAIR_PATCH_SHA=$(sha256sum "$REPAIR_PATCH" | cut -d' ' -f1)
+          echo "repair_patch_blob=$REPAIR_PATCH_BLOB"
+          echo "repair_patch_sha256=$REPAIR_PATCH_SHA"
+          if [ "$REPAIR_PATCH_SHA" != "dbc549f2adafaa1766f23c093b455547f0af71ab4fc325cd4427732bd05ab606" ]; then
+            echo "::error::repair patch oracle mismatch: $REPAIR_PATCH_SHA"
+            exit 1
+          fi
+          REPAIR_NUMSTAT=$(git apply --numstat "$REPAIR_PATCH")
+          echo "repair_patch_numstat=$REPAIR_NUMSTAT"
+          if [ "$REPAIR_NUMSTAT" != $'8\t1\t'"$COMMIT_PATH" ]; then
+            echo "::error::repair patch touches an unexpected path: $REPAIR_NUMSTAT"
+            exit 1
+          fi
+          if grep -q '^diff --git a/rust/lance/src/' "$REPAIR_PATCH"; then
+            echo "::error::repair patch contains a test-side hunk"
+            exit 1
+          fi
+
           # Materialize the committed blob for each patched path. A Windows
           # checkout can leave CRLF bytes in the worktree, and `git checkout --`
           # may skip a path whose index stat data still says it is up to date.
           # cat-file writes the exact HEAD bytes without smudge/eol filters.
           # Nothing here is pushed or committed.
           git config --local core.autocrlf false
-          for path in "${TEST_PATHS[@]}"; do
+          for path in "${MATERIALIZE_PATHS[@]}"; do
             blob=$(git rev-parse "HEAD:$path")
             git cat-file blob "$blob" > "$path"
           done
           PRE=$(git hash-object --no-filters "$TEST_PATH")
-          echo "pre_apply_worktree_blob=$PRE"
+          echo "pre_apply_worktree_blob=$TEST_PATH sha=$PRE"
           if [ "$PRE" != "1c62b04b68d064bde8c56e63c149de959a25cf7d" ]; then
             echo "::error::reproduction worktree is not the red test source: $PRE"
+            exit 1
+          fi
+          PRE_COMMIT=$(git hash-object --no-filters "$COMMIT_PATH")
+          echo "pre_apply_worktree_blob=$COMMIT_PATH sha=$PRE_COMMIT"
+          if [ "$PRE_COMMIT" != "518f98579269ff97e1966bc7905df84d5e9036ca" ]; then
+            echo "::error::reproduction worktree is not the red commit handler: $PRE_COMMIT"
             exit 1
           fi
 
@@ -203,8 +245,6 @@ jobs:
           check_post "$TEST_PATH" "7ec24ee2f09dcdbf1dce19f2b200846f362ec3c7"
           check_post "$KNN_PATH" "a41b564fd1cf9df325fa64f1281b1e2cfabb0531"
           check_post "$INDEX_CACHE_PATH" "e34e3bedf80877433a2a74b074b8420b3906cbd6"
-          git diff --stat -- "${TEST_PATHS[@]}"
-          git diff --numstat -- "${TEST_PATHS[@]}"
 
           # The post-patch blob already pins every byte; these greps are a
           # readable cross-check that the 11 phase emissions and the original
@@ -244,6 +284,32 @@ jobs:
           check_marker "$KNN_PATH" "peek_resident_with_key"
           check_marker "$TEST_PATH" "refinement_cache_residency"
           echo "identity_probes=base_identity,entry_key,resident_before residency_units=bytes,entries"
+
+          # Apply the production repair after the probe. It must apply to the
+          # red blob, leave the probe blobs untouched, and produce exactly the
+          # production blob. `git diff --name-only` then proves the build tree
+          # is red + probe + repair with no unrelated change.
+          if ! git apply --check "$REPAIR_PATCH"; then
+            echo "::error::repair patch does not apply to the red head"
+            exit 1
+          fi
+          if ! git apply "$REPAIR_PATCH"; then
+            echo "::error::repair patch failed to apply"
+            exit 1
+          fi
+          check_post "$COMMIT_PATH" "4c8e3710ad24a57fb76603a0a4a05bb830e79c08"
+          check_post "$TEST_PATH" "7ec24ee2f09dcdbf1dce19f2b200846f362ec3c7"
+          check_post "$KNN_PATH" "a41b564fd1cf9df325fa64f1281b1e2cfabb0531"
+          check_post "$INDEX_CACHE_PATH" "e34e3bedf80877433a2a74b074b8420b3906cbd6"
+          CHANGED=$(git diff --name-only | sort)
+          EXPECTED=$(printf '%s\n' "${MATERIALIZE_PATHS[@]}" | sort)
+          echo "changed_paths=$(printf '%s ' "$CHANGED")"
+          if [ "$CHANGED" != "$EXPECTED" ]; then
+            echo "::error::unexpected changed paths: $CHANGED"
+            exit 1
+          fi
+          git diff --stat -- "${MATERIALIZE_PATHS[@]}"
+          git diff --numstat -- "${MATERIALIZE_PATHS[@]}"
 
       - name: Record toolchain
         run: |
