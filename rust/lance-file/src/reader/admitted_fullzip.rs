@@ -36,7 +36,8 @@ pub enum FullZipScanOutcome {
 /// The same shared allocation budget covers each operation through final Arrow
 /// reconstruction. Retained output keeps its charge. This is not a process RSS
 /// limit: file metadata, transport/cache and allocator overhead are excluded.
-/// CPU remains inline and repeated prefix attempts are not performance qualified.
+/// Unzip/decode/Arrow reconstruction run on the CPU pool. Repeated prefix attempts
+/// and dispatch overhead are not performance qualified.
 /// Dropping a pending `try_next` leaves the cursor unchanged; backend operations
 /// that outlive cancellation retain their allocation owners until access stops.
 #[derive(Debug)]
@@ -56,7 +57,7 @@ struct FullZipColumn {
     column: Arc<ColumnInfo>,
     page_index: usize,
     page_start: u64,
-    decoder: Option<FullZipScheduler>,
+    decoder: Option<Arc<FullZipScheduler>>,
 }
 
 impl FileReader {
@@ -225,10 +226,10 @@ impl FullZipColumn {
                 continue;
             }
             if self.decoder.is_none() {
-                self.decoder = Some(FullZipScheduler::try_from_page(
+                self.decoder = Some(Arc::new(FullZipScheduler::try_from_page(
                     page,
                     &DefaultDecompressionStrategy {},
-                )?);
+                )?));
             }
             return Ok(page_end);
         }
@@ -244,7 +245,7 @@ impl FullZipScan {
     async fn try_read_batch_in(
         &self,
         rows: Range<u64>,
-        workspace: &mut lance_core::utils::allocation::Reservation,
+        mut workspace: lance_core::utils::allocation::Reservation,
     ) -> Result<Option<RecordBatch>> {
         let mut arrays = Vec::with_capacity(self.columns.len());
         for (column, field) in self.columns.iter().zip(self.schema.fields()) {
@@ -254,12 +255,17 @@ impl FullZipScan {
                 .ok_or_else(|| Error::internal("missing FullZip decoder"))?;
             let priority = column.column.page_infos[column.page_index].priority;
             let local = (rows.start - column.page_start)..(rows.end - column.page_start);
-            let Some(array) = decoder
-                .try_read_array_range_in(local, field.data_type(), workspace, |range, buffer| {
-                    self.io.submit_single_into(range, priority, buffer)
-                })
-                .await?
-            else {
+            let (remaining, array) = decoder
+                .clone()
+                .try_read_array_range_on_cpu(
+                    local,
+                    field.data_type().clone(),
+                    workspace,
+                    |range, buffer| self.io.submit_single_into(range, priority, buffer),
+                )
+                .await?;
+            workspace = remaining;
+            let Some(array) = array else {
                 // Earlier columns must drop before the outer retry admits again.
                 return Ok(None);
             };
@@ -280,11 +286,10 @@ impl FullZipScan {
         }
         let mut rows = self.cursor..end;
         loop {
-            let Some(mut workspace) = self.budget.try_reserve(self.workspace_bytes) else {
+            let Some(workspace) = self.budget.try_reserve(self.workspace_bytes) else {
                 return Ok(FullZipScanOutcome::NeedsCapacity);
             };
-            let batch = self.try_read_batch_in(rows.clone(), &mut workspace).await?;
-            drop(workspace);
+            let batch = self.try_read_batch_in(rows.clone(), workspace).await?;
             if let Some(batch) = batch {
                 // No await follows the commit: cancellation cannot consume rows
                 // without returning the complete, aligned batch to the caller.

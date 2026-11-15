@@ -190,8 +190,33 @@ impl FullZipScheduler {
         &self,
         rows: Range<u64>,
         workspace: &mut Reservation,
-        mut read: F,
+        read: F,
     ) -> Result<Option<Box<dyn DecodePageTask>>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        let Some(input) = self
+            .read_selected_range(rows.clone(), workspace, read)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let count = rows.end - rows.start;
+        let result =
+            self.try_unzip_buffers_in(std::slice::from_ref(&input), count, 0..count, workspace);
+        input.recycle(workspace)?;
+        result
+    }
+
+    // Only I/O and index endpoint validation belong on the async executor.
+    // The returned exclusive input can move with its workspace to a CPU job.
+    pub(super) async fn read_selected_range<F, Fut>(
+        &self,
+        rows: Range<u64>,
+        workspace: &mut Reservation,
+        mut read: F,
+    ) -> Result<Option<ReservedBuffer>>
     where
         F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
         Fut: Future<Output = Result<ReservedBuffer>>,
@@ -204,7 +229,7 @@ impl FullZipScheduler {
             ));
         }
         if rows.is_empty() {
-            return self.try_unzip_range_in(&[], 0, 0..0, workspace);
+            return workspace.try_allocate(0);
         }
         let index = self.rep_index.ok_or_else(|| {
             Error::invalid_input("variable FullZip read requires a repetition index")
@@ -256,11 +281,6 @@ impl FullZipScheduler {
         };
         // The page-end check above bounds both additions without overflow.
         let range = (self.data_buf_position + start)..(self.data_buf_position + end);
-        let input = fill(&mut read, range, input).await?;
-        let count = rows.end - rows.start;
-        let result =
-            self.try_unzip_buffers_in(std::slice::from_ref(&input), count, 0..count, workspace);
-        input.recycle(workspace)?;
-        result
+        fill(&mut read, range, input).await.map(Some)
     }
 }

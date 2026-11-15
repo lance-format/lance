@@ -399,4 +399,5 @@ async fn corrupt_selected_payload_recycles_exclusive_read() {
     assert_eq!(budget.reserved(), 0);
 }
 
+mod cpu;
 mod prefix;
