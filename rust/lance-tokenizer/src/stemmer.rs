@@ -85,7 +85,7 @@ impl TokenFilter for Stemmer {
         StemmerFilter {
             stemmer_algorithm: self.stemmer_algorithm,
             inner: tokenizer,
-            cache: Some(StemCache::default()),
+            cache: (self.stemmer_algorithm == Algorithm::English).then(StemCache::default),
         }
     }
 }
@@ -103,7 +103,7 @@ impl<T: Clone> Clone for StemmerFilter<T> {
         Self {
             stemmer_algorithm: self.stemmer_algorithm,
             inner: self.inner.clone(),
-            cache: Some(StemCache::default()),
+            cache: (self.stemmer_algorithm == Algorithm::English).then(StemCache::default),
         }
     }
 }
@@ -152,7 +152,12 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<'_, T> {
         }
         // Snowball handles very short tokens cheaply; hashing and copying
         // them into the dictionary can cost more than stemming them directly.
-        if self.cache.is_none() || !(3..=MAX_CACHED_TOKEN_BYTES).contains(&token.text.len()) {
+        // Cache the profiled English ASCII path. Other languages and Unicode
+        // retain direct Snowball processing, whose cost can differ considerably.
+        if self.cache.is_none()
+            || !(3..=MAX_CACHED_TOKEN_BYTES).contains(&token.text.len())
+            || !token.text.is_ascii()
+        {
             if let Cow::Owned(stemmed) = self.stemmer.stem(&token.text) {
                 token.text = stemmed;
             }
@@ -161,7 +166,7 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<'_, T> {
         // High-cardinality text may cost more to cache than to stem. Recheck
         // each window so a repeated prefix cannot keep a low-value cache alive.
         if self.cache.as_ref().is_some_and(|cache| {
-            cache.lookups == CACHE_SAMPLE_TOKENS && cache.hits < CACHE_SAMPLE_TOKENS / 8
+            cache.lookups == CACHE_SAMPLE_TOKENS && cache.hits < CACHE_SAMPLE_TOKENS * 9 / 20
         }) {
             *self.cache = None;
         }
@@ -309,7 +314,10 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_stemming_after_dictionary_turnover(#[values(false, true)] repeated_prefix: bool) {
+    fn test_stemming_after_dictionary_turnover(
+        #[values(false, true)] repeated_prefix: bool,
+        #[values(false, true)] repeat_each_word: bool,
+    ) {
         let reference = frostem::Stemmer::new(Language::English.algorithm());
         let mut analyzer = TextAnalyzer::builder(RawTokenizer::default())
             .filter(Stemmer::default())
@@ -323,11 +331,13 @@ mod tests {
         for pass in 0..2 {
             for index in 0..(super::MAX_CACHED_STEMS * 2) {
                 let text = format!("running{index}");
-                let mut stream = analyzer.token_stream(&text);
-                let token = stream.next().unwrap();
-                assert_eq!(token.text, reference.stem(&text), "pass {pass}");
-                assert_eq!(token.position, 0);
-                assert!(!stream.advance());
+                for _ in 0..if repeat_each_word { 2 } else { 1 } {
+                    let mut stream = analyzer.token_stream(&text);
+                    let token = stream.next().unwrap();
+                    assert_eq!(token.text, reference.stem(&text), "pass {pass}");
+                    assert_eq!(token.position, 0);
+                    assert!(!stream.advance());
+                }
             }
         }
         for _ in 0..3 {
