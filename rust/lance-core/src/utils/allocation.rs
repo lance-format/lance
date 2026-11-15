@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_buffer::{MutableBuffer, alloc::ALIGNMENT};
 use bytes::Bytes;
+use tokio::sync::Notify;
 
 use crate::{Error, Result};
 
@@ -32,6 +33,7 @@ use crate::{Error, Result};
 pub struct AllocationBudget {
     limit: usize,
     reserved: AtomicUsize,
+    released: Notify,
 }
 
 impl AllocationBudget {
@@ -40,12 +42,57 @@ impl AllocationBudget {
         Arc::new(Self {
             limit,
             reserved: AtomicUsize::new(0),
+            released: Notify::new(),
         })
     }
 
     /// Currently reserved bytes, including unallocated workspace headroom.
     pub fn reserved(&self) -> usize {
         self.reserved.load(Ordering::Acquire)
+    }
+
+    /// Wait until at least `bytes` of shared capacity is available, without
+    /// reserving it. Rejects requests above this pool's limit. A competing caller
+    /// can consume capacity before the next [`Self::try_reserve`], so admission
+    /// must still be atomic. This does not promise admission order or fairness.
+    ///
+    /// Use only in outer scheduling, after releasing a failed operation's inputs
+    /// and workspace. Never wait while holding data needed to release that same
+    /// capacity. Retained consumer output must have an independent drain path.
+    /// This does not prove that a row/codec fits the requested workspace: a decode
+    /// refusal with enough available capacity needs replanning, not this wait.
+    /// Cancelling the wait owns no credit and cannot consume another waiter's wake.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{Result, utils::allocation::{AllocationBudget, Reservation}};
+    /// async fn admit(budget: &Arc<AllocationBudget>, bytes: usize) -> Result<Reservation> {
+    ///     // The caller holds no input/output needed to release this capacity.
+    ///     loop {
+    ///         budget.wait_for_capacity(bytes).await?;
+    ///         if let Some(workspace) = budget.try_reserve(bytes) {
+    ///             return Ok(workspace);
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn wait_for_capacity(&self, bytes: usize) -> Result<()> {
+        if bytes > self.limit {
+            return Err(Error::invalid_input(format!(
+                "requested capacity {bytes} exceeds allocation budget {}",
+                self.limit
+            )));
+        }
+        loop {
+            // notify_waiters reaches futures created before the notification,
+            // even before their first poll. Subscribe before checking credit so
+            // a refund between the check and await cannot strand this caller.
+            let released = self.released.notified();
+            if self.reserved.load(Ordering::Acquire) <= self.limit - bytes {
+                return Ok(());
+            }
+            released.await;
+        }
     }
 
     /// Atomically admit the entire workspace or return `None` without allocating.
@@ -155,7 +202,10 @@ fn validate_layout(bytes: usize) -> Result<()> {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.bytes != 0 {
+            self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.budget.released.notify_waiters();
+        }
     }
 }
 
@@ -253,7 +303,105 @@ impl AsMut<[u8]> for ReservedBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::zero(0, true)]
+    #[case::exact(64, true)]
+    #[case::too_large(65, false)]
+    #[tokio::test]
+    async fn capacity_wait_validates_pool_limit(#[case] bytes: usize, #[case] valid: bool) {
+        let budget = AllocationBudget::new(64);
+        let result = budget.wait_for_capacity(bytes).now_or_never().unwrap();
+        if valid {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("exceeds allocation budget"));
+        }
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[rstest]
+    #[case::before_poll(false)]
+    #[case::after_poll(true)]
+    #[tokio::test]
+    async fn capacity_wait_observes_last_physical_owner(#[case] poll_first: bool) {
+        let budget = AllocationBudget::new(64);
+        let bytes = budget.try_reserve(64).unwrap().allocate().unwrap().freeze();
+        let alias = bytes.slice(0..1);
+        let mut wait = Box::pin(budget.wait_for_capacity(64));
+        if poll_first {
+            assert!(wait.as_mut().now_or_never().is_none());
+        }
+        drop(bytes);
+        assert_eq!(budget.reserved(), 64);
+        if poll_first {
+            assert!(wait.as_mut().now_or_never().is_none());
+        }
+        drop(alias);
+        assert_eq!(budget.reserved(), 0);
+        wait.now_or_never()
+            .expect("final owner must wake admission")
+            .unwrap();
+        assert_eq!(budget.reserved(), 0, "waiting does not reserve credit");
+    }
+
+    #[tokio::test]
+    async fn capacity_wait_broadcasts_and_rechecks_after_competing_admission() {
+        let budget = AllocationBudget::new(64);
+        let mut work = budget.try_reserve(64).unwrap();
+        let first = work.try_split(32).unwrap();
+        let mut small = Box::pin(budget.wait_for_capacity(32));
+        let mut large = Box::pin(budget.wait_for_capacity(64));
+        let mut cancelled = Box::pin(budget.wait_for_capacity(32));
+        assert!(small.as_mut().now_or_never().is_none());
+        assert!(large.as_mut().now_or_never().is_none());
+        assert!(cancelled.as_mut().now_or_never().is_none());
+        drop(cancelled);
+        drop(first);
+        small
+            .now_or_never()
+            .expect("enough for small waiter")
+            .unwrap();
+        assert!(large.as_mut().now_or_never().is_none());
+        drop(work);
+        // Another caller can consume the refunded space before a notified future
+        // is polled. Notification must not be mistaken for reserved capacity.
+        let competitor = budget.try_reserve(64).unwrap();
+        assert!(large.as_mut().now_or_never().is_none());
+        let mut second = Box::pin(budget.wait_for_capacity(64));
+        assert!(second.as_mut().now_or_never().is_none());
+        drop(competitor);
+        large
+            .now_or_never()
+            .expect("large waiter must wake")
+            .unwrap();
+        second
+            .now_or_never()
+            .expect("all eligible waiters must wake")
+            .unwrap();
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn recycled_scratch_does_not_release_shared_capacity() {
+        let budget = AllocationBudget::new(64);
+        let mut work = budget.try_reserve(64).unwrap();
+        let scratch = work.try_allocate(64).unwrap().unwrap();
+        let mut wait = Box::pin(budget.wait_for_capacity(1));
+        assert!(wait.as_mut().now_or_never().is_none());
+        scratch.recycle(&mut work).unwrap();
+        drop(budget.try_reserve(0).unwrap());
+        assert_eq!(budget.reserved(), 64);
+        assert!(wait.as_mut().now_or_never().is_none());
+        drop(work);
+        wait.now_or_never()
+            .expect("workspace refund must wake")
+            .unwrap();
+    }
 
     #[rstest]
     #[case::zero(0, None)]

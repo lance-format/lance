@@ -21,13 +21,14 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Forward selection fixture and API example
+      - name: Shared capacity wakeups and finite file progress
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-file --lib admitted_scan_advances_without_reading_skipped_pages -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc advance_to_range -- --nocapture
+          cargo test --profile ci --locked -p lance-core --lib utils::allocation -- --nocapture
+          cargo test --profile ci --locked -p lance-core --doc wait_for_capacity -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-core -p lance-file --all-features --all-targets --no-deps -- -D warnings
