@@ -15,8 +15,9 @@ use chrono::{DateTime, Utc};
 
 use lance_table::io::commit::read_version_hint;
 
-use super::Dataset;
+use super::{Dataset, history_retention};
 use crate::Result;
+use crate::utils::temporal::utc_now;
 
 /// Versions that must survive regardless of age or policy.
 ///
@@ -31,6 +32,8 @@ pub struct ProtectedVersions {
     pub tagged: HashSet<u64>,
     /// Versions a branch is rooted at. Removing one orphans that branch's history.
     pub branch_referenced: HashSet<u64>,
+    /// Versions on the current branch that an in-progress restore has pinned.
+    pub pinned: HashSet<u64>,
     /// The version recorded in the version hint, when the dataset keeps one.
     ///
     /// Everything from here up must stay contiguous. Resolving the latest version starts at
@@ -61,17 +64,19 @@ impl ProtectedVersions {
             .collect();
 
         let hint_floor = read_version_hint(&dataset.object_store, &dataset.base).await?;
+        let pinned = history_retention::pinned_versions(dataset, utc_now()).await?;
 
         Ok(Self {
             latest: dataset.manifest.version,
             tagged,
             branch_referenced,
+            pinned,
             hint_floor,
         })
     }
 
     /// Tags on `current_branch`, as cleanup selects them.
-    fn tagged_versions(
+    pub(super) fn tagged_versions(
         tags: &HashMap<String, crate::dataset::refs::TagContents>,
         current_branch: Option<&String>,
     ) -> HashSet<u64> {
@@ -90,6 +95,7 @@ impl ProtectedVersions {
         version >= self.latest
             || self.tagged.contains(&version)
             || self.branch_referenced.contains(&version)
+            || self.pinned.contains(&version)
             || self.hint_floor.is_some_and(|floor| version >= floor)
     }
 
@@ -160,6 +166,7 @@ mod tests {
             latest: 100,
             tagged: HashSet::from([7]),
             branch_referenced: HashSet::from([42]),
+            pinned: HashSet::from([9]),
             hint_floor: None,
         };
 
@@ -169,6 +176,7 @@ mod tests {
             "anything at or past latest is protected"
         );
         assert!(protected.contains(7), "a tagged version is protected");
+        assert!(protected.contains(9), "a pinned version is protected");
         assert!(
             protected.contains(42),
             "a branch-referenced version is protected"
@@ -185,6 +193,7 @@ mod tests {
             latest: 100,
             tagged: HashSet::new(),
             branch_referenced: HashSet::new(),
+            pinned: HashSet::new(),
             hint_floor: Some(50),
         };
 

@@ -65,6 +65,8 @@ Branch datasets are organized using the `tree/` directory at the dataset root:
             _indices/
                 {UUID}/
                     index.idx
+            _retention/
+                *.json
 ```
 
 Named branches store their version-specific files under `tree/{branch_name}/`, resembling the GitHub branch path convention.
@@ -125,3 +127,75 @@ Each tag file is a JSON file with the following fields:
 | `updatedAt`     | string | Yes      | RFC 3339 timestamp for the latest tag reference update.                 |
 | `manifestSize`  | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |
 | `metadata`      | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object. |
+
+## History Retention
+
+Cleanup can run while another writer publishes a reference to an old version: creating or updating
+a tag, creating a branch, or restoring. So that such a reference never points at a version cleanup
+is deleting, cleanup first records the versions it **expires**. Readers may still check out an
+expired version until it is deleted, but no new tag, branch, or restore may reference it.
+
+When cleanup and the publishing writer both follow this section, a reference published while
+cleanup runs either keeps its version or is rejected.
+
+### Retention Files
+
+Each branch records its rule in the `_retention/` directory of its own root (see
+[Branch Dataset Layout](#branch-dataset-layout)), in files named `{n}.json` where `n` is a positive
+integer. The file with the largest `n` holds the current rule:
+
+| JSON Key        | Type             | Optional | Description                                                            |
+|-----------------|------------------|----------|------------------------------------------------------------------------|
+| `expiredBefore` | number           |          | A version number `F`.                                                  |
+| `retained`      | array of numbers | Yes      | Ascending versions below `F` that are not expired. Absent means empty. |
+
+A version `v` is **expired** when `v < F` and `v` is not in `retained`. A missing directory or a
+current file that cannot be parsed expires nothing.
+
+To write a rule, read the current file `{n}.json` and create `{n+1}.json`, or `1.json` if there is
+none, with [put-if-not-exists](transaction.md#storage-primitives). If that file already exists,
+read it and retry.
+
+Expiration is never lifted: a new rule is always merged with the current one, so it expires every
+version that either expires. `F` is the larger of the two, and `retained` lists the versions below it
+that neither rule expires. Implementations may offer an override that writes any rule for repairs;
+it is safe only while no cleanup is running.
+
+### Pins
+
+A restore writes a pin to protect its target version. Pins are stored at `_refs/pins/{uuid}.json` in
+the dataset root:
+
+| JSON Key    | Type   | Optional | Description                                                              |
+|-------------|--------|----------|--------------------------------------------------------------------------|
+| `branch`    | string | Yes      | Branch name being pinned. `null` or absent indicates the default branch. |
+| `version`   | number |          | Version number being pinned within that branch.                          |
+| `createdAt` | string |          | RFC 3339 timestamp for when the pin was created.                         |
+
+Cleanup treats a pinned version like a tagged one, but ignores, and may delete, pins created more
+than 24 hours before the cleanup began.
+
+### Cleanup
+
+Only one cleanup may run on a dataset at a time. Before deleting any version, cleanup must:
+
+1. Plan which versions it will delete.
+2. Write a rule with `F` above every version it will delete, retaining the versions below `F` that
+   it keeps. The write may be skipped if the merged rule equals the current one.
+3. List tags, branches, and pins, and keep every version they reference.
+4. Delete, then delete every retention file except the current one.
+
+### Publishing References
+
+To create or update a tag, or create a branch, at version `v` of branch `b`, a writer must write the
+reference, then read the current rule of `b`. If `v` is expired, it must remove the reference and
+fail.
+
+To restore version `v` of branch `b`, a writer must:
+
+1. Write a pin for `v`.
+2. Read the current rule of `b`. If `v` is expired, delete the pin and fail.
+3. Commit within 24 hours of writing the pin, and leave the pin in place.
+
+The pin outlives the commit because a cleanup that began earlier cannot see the restored version. A
+cleanup that ignores the pin began after the commit.

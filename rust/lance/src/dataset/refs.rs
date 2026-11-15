@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::future::Future;
 use std::ops::Range;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
+use lance_table::format::history_retention::RETENTION_DIR;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::{
@@ -17,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::history_retention;
 use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
@@ -125,6 +128,36 @@ impl Refs {
 
     pub fn root(&self) -> Result<BranchLocation> {
         self.base_location.find_main()
+    }
+
+    /// Fails if cleanup has expired `version` of `branch`.
+    pub(crate) async fn ensure_not_expired(
+        &self,
+        branch: Option<&str>,
+        version: u64,
+    ) -> Result<()> {
+        let location = self.base_location.find_branch(branch)?;
+        history_retention::ensure_not_expired(&self.object_store, &location.path, branch, version)
+            .await
+    }
+
+    /// Runs [`Self::ensure_not_expired`] for a reference just written, calling
+    /// `roll_back` to undo the write if the version is expired.
+    async fn ensure_not_expired_or_roll_back<F: Future<Output = Result<()>>>(
+        &self,
+        branch: Option<&str>,
+        version: u64,
+        roll_back: impl FnOnce() -> F,
+    ) -> Result<()> {
+        let Err(error) = self.ensure_not_expired(branch, version).await else {
+            return Ok(());
+        };
+        if let Err(roll_back_error) = roll_back().await {
+            log::warn!(
+                "failed to remove a reference to expired version {version}: {roll_back_error}"
+            );
+        }
+        Err(error)
     }
 }
 
@@ -255,7 +288,14 @@ impl Tags<'_> {
             serde_json::to_vec_pretty(&tag_contents)?,
             format!("tag {} already exists", tag),
         )
-        .await
+        .await?;
+        self.refs
+            .ensure_not_expired_or_roll_back(
+                tag_contents.branch.as_deref(),
+                tag_contents.version,
+                || self.object_store().delete(&tag_file),
+            )
+            .await
     }
 
     pub async fn delete(&self, tag: &str) -> Result<()> {
@@ -284,6 +324,7 @@ impl Tags<'_> {
             });
         }
         let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let previous_contents = serde_json::to_string_pretty(&tag_contents)?;
         let updated_reference = self
             .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
             .await?;
@@ -298,8 +339,19 @@ impl Tags<'_> {
                 &tag_file,
                 serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
             )
+            .await?;
+        self.refs
+            .ensure_not_expired_or_roll_back(
+                tag_contents.branch.as_deref(),
+                tag_contents.version,
+                || async {
+                    self.object_store()
+                        .put(&tag_file, previous_contents.as_bytes())
+                        .await
+                        .map(|_| ())
+                },
+            )
             .await
-            .map(|_| ())
     }
 
     pub async fn replace_metadata(
@@ -540,7 +592,14 @@ impl Branches<'_> {
             serde_json::to_vec_pretty(&branch_contents)?,
             format!("branch {} already exists", branch_name),
         )
-        .await
+        .await?;
+        self.refs
+            .ensure_not_expired_or_roll_back(
+                branch_contents.parent_branch.as_deref(),
+                version_number,
+                || self.object_store().delete(&branch_file),
+            )
+            .await
     }
 
     pub async fn replace_metadata(
@@ -1529,6 +1588,7 @@ const DATASET_DIRS: &[&str] = &[
     INDICES_DIR,
     BLOBS_DIR,
     FRAG_REUSE_DIR,
+    RETENTION_DIR,
 ];
 
 fn is_dataset_dir(segment: &str) -> bool {
@@ -1714,6 +1774,7 @@ mod tests {
     #[case::indices("outer/_indices")]
     #[case::blobs("outer/_blobs")]
     #[case::frag_reuse("outer/_fri")]
+    #[case::retention("outer/_retention")]
     #[case::mem_wal("outer/_mem_wal")]
     #[case::dir_id_mem_wal("outer/_a1b2c3d4_mem_wal")]
     #[case::below_a_nested_branch("a/b/_indices")]

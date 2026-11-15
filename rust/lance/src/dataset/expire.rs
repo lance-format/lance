@@ -43,7 +43,9 @@ use tokio_stream::wrappers::IntervalStream;
 
 use super::Dataset;
 use super::cleanup::calculate_duration;
+use super::history_retention;
 use super::version_retention::{ProtectedVersions, thin_to_one_per};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 
 /// Smallest bucket width [`ExpireVersionsPolicy::keep_one_per`] accepts.
@@ -212,6 +214,15 @@ pub async fn plan_expire_versions(
     dataset: &Dataset,
     policy: &ExpireVersionsPolicy,
 ) -> Result<(ExpireVersionsPlan, Vec<ManifestLocation>)> {
+    let (plan, to_delete, _kept) = plan_with_kept_versions(dataset, policy).await?;
+    Ok((plan, to_delete))
+}
+
+/// [`plan_expire_versions`], plus the listed versions the plan keeps.
+async fn plan_with_kept_versions(
+    dataset: &Dataset,
+    policy: &ExpireVersionsPolicy,
+) -> Result<(ExpireVersionsPlan, Vec<ManifestLocation>, Vec<u64>)> {
     // A detached handle's high-bit version would dominate the attached latest
     // version and let an otherwise ordinary policy remove the attached history.
     // This is the same boundary cleanup enforces.
@@ -317,6 +328,11 @@ pub async fn plan_expire_versions(
         failed_deletes: 0,
     };
 
+    let kept = retained
+        .iter()
+        .chain(&thinned_back)
+        .map(|location| location.version)
+        .collect();
     Ok((
         ExpireVersionsPlan {
             versions,
@@ -324,6 +340,7 @@ pub async fn plan_expire_versions(
             tagged_but_kept,
         },
         to_delete,
+        kept,
     ))
 }
 
@@ -349,10 +366,20 @@ pub async fn expire_versions(
     dataset: &Dataset,
     policy: ExpireVersionsPolicy,
 ) -> Result<ExpireVersionsStats> {
-    let (plan, to_delete) = plan_expire_versions(dataset, &policy).await?;
-    if to_delete.is_empty() {
+    let started_at = utc_now();
+    let (plan, mut to_delete, kept) = plan_with_kept_versions(dataset, &policy).await?;
+    let Some(rule) = history_retention::planned_rule(to_delete.iter().map(|l| l.version), kept)
+    else {
         return Ok(plan.stats);
-    }
+    };
+    // Versions referenced after planning stay, as they would have if the
+    // reference had existed when the plan was made.
+    let referenced = history_retention::publish(dataset, rule, started_at)
+        .await?
+        .versions();
+    let planned_count = to_delete.len();
+    to_delete.retain(|location| !referenced.contains(&location.version));
+    let newly_kept = (planned_count - to_delete.len()) as u64;
 
     let identities: HashMap<u64, String> = to_delete
         .iter()
@@ -361,7 +388,7 @@ pub async fn expire_versions(
 
     // Count removals from outcomes rather than from the plan, so a manifest that failed
     // to delete is never reported as removed.
-    let planned_retained = plan.stats.versions_retained;
+    let planned_retained = plan.stats.versions_retained + newly_kept;
     let stats = Mutex::new(ExpireVersionsStats {
         bytes_removed: 0,
         ..Default::default()
@@ -438,6 +465,7 @@ pub async fn expire_versions(
             .forget_version(&dataset.base, *version, identity)
             .await?;
     }
+    history_retention::finish_deleting(dataset, started_at).await;
 
     Ok(stats)
 }
