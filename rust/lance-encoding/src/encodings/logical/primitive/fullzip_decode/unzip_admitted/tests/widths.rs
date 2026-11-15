@@ -52,14 +52,17 @@ fn admitted_unzip_control_widths_preserve_values_and_structure(
                 vec![
                     (1, 0, b"ab".as_slice()),
                     (0, 1, b""),
+                    // NullableItem consumes level 1; the list uses 2 for null
+                    // and 3 for empty, as emitted by the rep/def writer.
+                    (1, 2, b""),
                     (1, 3, b""),
                     (1, 0, b"c"),
                 ],
                 vec![Meaning::NullableItem, Meaning::NullableAndEmptyableList],
-                3,
+                4,
                 vec![b"ab".as_slice(), b"", b"c"],
                 vec![true, false, true],
-                Some((vec![0, 2, 2, 3], vec![true, false, true])),
+                Some((vec![0, 2, 2, 2, 3], vec![true, false, true, true])),
             ),
         };
     let parser = ControlWordParser::new(rep_bits, def_bits);

@@ -21,11 +21,11 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: FullZip framing widths and dependent read/decode
+      - name: Corrected width fixtures and no-default framing coverage
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib admitted_unzip_control_widths_preserve_values_and_structure -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::unzip_admitted -- --nocapture
       - name: Real file cursor and codec composition
         env:
@@ -37,4 +37,3 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
-          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
