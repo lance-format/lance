@@ -14,6 +14,8 @@
 //!   fragment in a valid manifest file then it will be deleted.
 //! * Unreferenced delete files - If a delete file is not referenced by
 //!   any fragment in a valid manifest file then it will be deleted.
+//! * Unreferenced transaction files - If a transaction file is not referenced
+//!   by any valid manifest file then it will be deleted.
 //! * Unreferenced index files - If an index file is not referenced by
 //!   any valid manifest file then it will be deleted.
 //! * Orphaned staging manifests - If a staging manifest is not recorded by
@@ -499,30 +501,20 @@ struct CleanupInspection {
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
     latest_deleted_manifest_time: Option<DateTime<Utc>>,
-    /// Set when an expired manifest was classified from the listing instead of read, so
-    /// its commit time is unknown and the listing cutoff cannot be trusted.
-    skipped_expired_manifest_read: bool,
 }
 
 impl CleanupInspection {
-    /// Cutoff for `read_dir_all(..., unmodified_since)`.
+    /// Retained-manifest floor of the cutoff for `read_dir_all(..., unmodified_since)`.
     ///
-    /// Listing only files with `last_modified <= earliest_retained` is valid
-    /// when the working set is a time suffix: every retained version is newer
-    /// than every deleted one. A tagged old version (or any other sparse
-    /// retain) pulls that cutoff backwards, so files from newer deleted
-    /// versions are never listed. Their manifests are still removed, which
-    /// permanently orphans the data files ([#8705](https://github.com/lance-format/lance/issues/8705)).
-    ///
-    /// When a deleted manifest is newer than the earliest retained one, drop
-    /// the cutoff and scan the whole subtree — the same approach already used
-    /// for `_indices/`.
+    /// When every retained version is newer than every deleted one, the files of
+    /// deleted versions are all at or below this floor. A tagged old version (or
+    /// any other sparse retain) pulls it below files of newer deleted versions
+    /// ([#8705](https://github.com/lance-format/lance/issues/8705)), so the cutoff
+    /// is dropped then, as for `_indices/`. Callers raise it to the unverified
+    /// threshold, since files no manifest references can be newer than the floor.
+    /// Only meaningful when `delete_unverified` is off: the fast path in
+    /// `process_manifest_file` does not record commit times.
     fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
-        if self.skipped_expired_manifest_read {
-            // At least one deleted manifest's commit time was never read, so the
-            // comparison below cannot be made safely. Scan everything.
-            return None;
-        }
         match (
             self.earliest_retained_manifest_time,
             self.latest_deleted_manifest_time,
@@ -1382,10 +1374,8 @@ impl<'a> CleanupTask<'a> {
                     .retired_records
                     .insert(location.version, identity);
             }
-            // Without the commit time there is nothing to compare against the retained
-            // side, so give up the listing cutoff and scan the whole subtree. Missing a
-            // file would orphan it permanently; an extra listing only costs time.
-            inspection.skipped_expired_manifest_read = true;
+            // The commit time stays unknown, which is safe because `delete_unverified`
+            // lists without a cutoff.
             return Ok(());
         }
 
@@ -1732,15 +1722,17 @@ impl<'a> CleanupTask<'a> {
         // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
-        let unmodified_since = inspection.listing_unmodified_since();
-        // Data files owned by no manifest can be newer than the retained
-        // manifest floor. List through the moving verification threshold so
-        // they become candidates once old enough, or list all data files when
-        // the caller explicitly permits deleting unverified files.
-        let data_unmodified_since = if self.policy.delete_unverified {
+        // Files owned by no manifest, such as those of a failed commit, can be
+        // newer than the retained manifest floor. List through the moving
+        // verification threshold so they become candidates once old enough, or
+        // list everything when the caller explicitly permits deleting unverified
+        // files.
+        let unmodified_since = if self.policy.delete_unverified {
             None
         } else {
-            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+            inspection
+                .listing_unmodified_since()
+                .map(|cutoff| cutoff.max(verification_threshold))
         };
         let mut streams = vec![
             // Staging manifests can be newer than the latest retained manifest,
@@ -1748,11 +1740,8 @@ impl<'a> CleanupTask<'a> {
             // paths are revalidated against the commit handler instead.
             build_listing_stream(self.dataset.versions_dir(), None),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
-            build_listing_stream(
-                self.dataset.base.clone().join("_blobs"),
-                data_unmodified_since,
-            ),
+            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            build_listing_stream(self.dataset.base.clone().join("_blobs"), unmodified_since),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -3090,7 +3079,9 @@ pub struct CleanupPolicy {
     pub before_version: Option<u64>,
     /// If not none, cleanup only the specified versions.
     pub versions: Option<HashSet<u64>>,
-    /// If true, delete unverified data files even if they are recent
+    /// If true, delete files that no manifest references, such as the data,
+    /// transaction and deletion files of a failed commit, even if they are recent.
+    /// Only safe when no other operation is in progress on the dataset.
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
     pub error_if_tagged_old_versions: bool,
