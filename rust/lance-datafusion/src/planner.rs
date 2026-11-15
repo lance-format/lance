@@ -328,6 +328,33 @@ impl ContextProvider for LanceContextProvider {
     }
 }
 
+/// Element type of a SQL array literal such as `[0, 0.5, NULL]`.
+///
+/// Untyped `NULL` elements do not take part in the choice, and integer
+/// elements mixed with floating point elements widen to `Float64`, so the
+/// order of the elements does not change the result. Otherwise the first
+/// non-null element decides and the others are coerced to it.
+fn array_literal_element_type(values: &[ScalarValue]) -> ArrowDataType {
+    let mut types = values
+        .iter()
+        .map(ScalarValue::data_type)
+        .filter(|data_type| !data_type.is_null());
+    let Some(first) = types.next() else {
+        return ArrowDataType::Null;
+    };
+    let mut has_float = first.is_floating();
+    let mut all_numeric = first.is_numeric();
+    for data_type in types {
+        has_float |= data_type.is_floating();
+        all_numeric &= data_type.is_numeric();
+    }
+    if has_float && all_numeric && !first.is_floating() {
+        ArrowDataType::Float64
+    } else {
+        first
+    }
+}
+
 pub struct Planner {
     schema: SchemaRef,
     context_provider: LanceContextProvider,
@@ -902,25 +929,36 @@ impl Planner {
                     }
                 }
 
-                let field = if !values.is_empty() {
-                    let data_type = values[0].data_type();
-
-                    for value in &mut values {
-                        if value.data_type() != data_type {
-                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type())))?;
-                        }
-                    }
-                    Field::new("item", data_type, true)
-                } else {
-                    Field::new("item", ArrowDataType::Null, true)
-                };
-
+                let data_type = array_literal_element_type(&values);
                 let values = values
                     .into_iter()
-                    .map(|v| v.to_array().map_err(Error::from))
+                    .map(|value| {
+                        if value.data_type() == data_type {
+                            Ok(value)
+                        } else if value.is_null() {
+                            ScalarValue::try_from(&data_type).map_err(Error::from)
+                        } else {
+                            safe_coerce_scalar(&value, &data_type).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "Array expressions must have a consistent datatype. Expected: {}, got: {}",
+                                    data_type,
+                                    value.data_type()
+                                ))
+                            })
+                        }
+                    })
                     .collect::<Result<Vec<_>>>()?;
-                let array_refs = values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
-                let values = concat(&array_refs)?;
+                let values = if values.is_empty() {
+                    arrow_array::new_empty_array(&data_type)
+                } else {
+                    let values = values
+                        .iter()
+                        .map(|v| v.to_array().map_err(Error::from))
+                        .collect::<Result<Vec<_>>>()?;
+                    let array_refs = values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
+                    concat(&array_refs)?
+                };
+                let field = Field::new("item", data_type, true);
                 let values = ListArray::try_new(
                     field.into(),
                     OffsetBuffer::from_lengths([values.len()]),
