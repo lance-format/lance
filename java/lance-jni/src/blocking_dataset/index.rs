@@ -5,7 +5,10 @@ use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::blocking_scanner::build_full_text_search_query;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::index::IndexDescriptionSummary;
+use crate::index::{
+    IndexDescriptionSummary, index_description_to_java, index_metadata_to_java,
+    resolve_missing_index_details,
+};
 use crate::index_progress::JavaIndexBuildProgress;
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec_to_rust};
 use crate::utils::{get_scalar_index_params, get_vector_index_params};
@@ -23,6 +26,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::{IndexParams, IndexType};
+use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -598,7 +602,7 @@ fn inner_commit_existing_index_segments<'local>(
 
     let committed = {
         let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         block_on(dataset_guard.inner.commit_existing_index_segments(
             &index_name,
             &column,
@@ -607,7 +611,27 @@ fn inner_commit_existing_index_segments<'local>(
         block_on(dataset_guard.inner.load_indices_by_name(&index_name))?
     };
 
-    export_vec(env, &committed)
+    // Resolve fallback details outside the write guard so the inference probes
+    // never run while the mutable dataset guard is held.
+    let dataset = clone_dataset(env, &java_dataset)?;
+    let fallback_details = resolve_missing_index_details(&dataset.inner, &committed);
+
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for index_meta in committed.iter() {
+        let java_index = index_metadata_to_java(
+            env,
+            index_meta,
+            fallback_details.get(&index_meta.uuid).map(Arc::as_ref),
+        )?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&java_index)],
+        )?;
+    }
+
+    Ok(array_list)
 }
 
 fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
@@ -687,15 +711,18 @@ fn inner_get_indexes<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
-    let indexes = {
-        let dataset = clone_dataset(env, &java_dataset)?;
-        dataset.list_indexes()?
-    };
+    let dataset = clone_dataset(env, &java_dataset)?;
+    let indexes = dataset.list_indexes()?;
+    let fallback_details = resolve_missing_index_details(&dataset.inner, &indexes);
 
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
     for index_meta in indexes.iter() {
-        let java_index = index_meta.into_java(env)?;
+        let java_index = index_metadata_to_java(
+            env,
+            index_meta,
+            fallback_details.get(&index_meta.uuid).map(Arc::as_ref),
+        )?;
         env.call_method(
             &array_list,
             "add",
@@ -932,13 +959,30 @@ fn inner_describe_indices<'local>(
         })
     })?;
 
-    let descriptions = {
-        let dataset = clone_dataset(env, &java_dataset)?;
-        block_on(dataset.inner.describe_indices(index_criteria))?
+    let dataset = clone_dataset(env, &java_dataset)?;
+    let descriptions = block_on(dataset.inner.describe_indices(index_criteria))?;
+    let fallback_details = if include_metadata {
+        let all_segments: Vec<IndexMetadata> = descriptions
+            .iter()
+            .flat_map(|desc| desc.metadata().iter().cloned())
+            .collect();
+        resolve_missing_index_details(&dataset.inner, &all_segments)
+    } else {
+        HashMap::new()
     };
 
     if include_metadata {
-        export_vec(env, &descriptions)
+        let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+        for desc in &descriptions {
+            let java_desc = index_description_to_java(desc, env, true, &fallback_details)?;
+            env.call_method(
+                &array_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_desc)],
+            )?;
+        }
+        Ok(array_list)
     } else {
         let summaries = descriptions
             .iter()
