@@ -81,16 +81,26 @@ async fn read_payload(value: &dyn IndexBinaryReader, chunk_bytes: usize) -> Resu
         ))
     })?;
     // Separate requests prevent the scheduler from coalescing adjacent chunks
-    // back into a large read. Keep completion order and release each chunk as
-    // it is copied, instead of retaining every response until the value is ready.
+    // back into a large read. Consume completion order so a stalled first read
+    // neither retains ready chunks nor hides an error from a later read.
     // Dropping this stream also drops its pending, unspawned read futures.
     let mut reads = futures::stream::iter((0..expected).step_by(chunk_bytes).map(|start| {
         let end = start.saturating_add(chunk_bytes as u64).min(expected);
-        read_payload_range(value, start..end)
+        async move {
+            let bytes = read_payload_range(value, start..end).await?;
+            Result::Ok((start as usize, bytes))
+        }
     }))
-    .buffered(MAX_PENDING_PAYLOAD_READS);
-    while let Some(bytes) = reads.try_next().await? {
-        output.extend_from_slice(&bytes);
+    .buffer_unordered(MAX_PENDING_PAYLOAD_READS);
+    while let Some((start, bytes)) = reads.try_next().await? {
+        // Ranges are disjoint and read_payload_range validates their lengths.
+        // Initialize gaps before writing out of order; this private buffer is
+        // published only after every read succeeds, without uninitialized bytes.
+        let end = start + bytes.len();
+        if end > output.len() {
+            output.resize(end, 0);
+        }
+        output[start..end].copy_from_slice(&bytes);
     }
     Ok(compact_payload(bytes::Bytes::from(output)))
 }
@@ -398,14 +408,22 @@ mod tests {
         let mut read = Box::pin(read_payload(&value, 8));
         assert!(futures::poll!(read.as_mut()).is_pending());
         assert_eq!(value.active.load(Ordering::SeqCst), 8);
-        // Complete later reads first. They must stay bounded while the first
-        // response is pending, and must not be appended out of order.
+        // Complete later reads first. Consume their bytes and admit more work
+        // without waiting for the first read, preserving final byte order.
         for gate in &value.gates[1..8] {
             gate.notify_one();
         }
         assert!(futures::poll!(read.as_mut()).is_pending());
-        assert_eq!(value.active.load(Ordering::SeqCst), 1);
-        assert_eq!(value.requests.lock().unwrap().len(), 8);
+        assert_eq!(value.active.load(Ordering::SeqCst), 4);
+        assert_eq!(value.requests.lock().unwrap().len(), 11);
+        assert!(
+            value
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|owner| owner.upgrade().is_none())
+        );
         value.gates[0].notify_one();
         assert!(futures::poll!(read.as_mut()).is_pending());
         for gate in &value.gates[8..] {
@@ -437,19 +455,8 @@ mod tests {
             gate.notify_one();
         }
         assert!(futures::poll!(read.as_mut()).is_pending());
-        assert_eq!(value.active.load(Ordering::SeqCst), 1);
+        assert_eq!(value.active.load(Ordering::SeqCst), 4);
         assert_eq!(value.owners.lock().unwrap().len(), 7);
-        assert!(
-            value
-                .owners
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|owner| owner.upgrade().is_some())
-        );
-        drop(read);
-        assert_eq!(value.active.load(Ordering::SeqCst), 0);
-        assert_eq!(value.requests.lock().unwrap().len(), 8);
         assert!(
             value
                 .owners
@@ -458,6 +465,33 @@ mod tests {
                 .iter()
                 .all(|owner| owner.upgrade().is_none())
         );
+        drop(read);
+        assert_eq!(value.active.load(Ordering::SeqCst), 0);
+        assert_eq!(value.requests.lock().unwrap().len(), 11);
+        assert!(
+            value
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|owner| owner.upgrade().is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn selective_phrase_whole_payload_later_error_bypasses_stalled_first_read() {
+        let mut value = RangedValue::new();
+        value.failure = Some((1, false));
+        value.gates[1].notify_one();
+        let mut read = Box::pin(read_payload(&value, 8));
+        let result = futures::poll!(read.as_mut());
+        let std::task::Poll::Ready(Err(error)) = result else {
+            panic!("a completed read error must not wait for an earlier pending read");
+        };
+        assert!(matches!(error, Error::Index { .. }), "{error:?}");
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert_eq!(value.active.load(Ordering::SeqCst), 0);
+        assert!(value.peak.load(Ordering::SeqCst) <= 8);
     }
 
     #[rstest::rstest]
