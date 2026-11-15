@@ -36,8 +36,8 @@
 //! A [`TakeExec`] or row-stream [`FilteredReadExec`] in the chain (the
 //! scanner's own late materialization behind a filter) is dropped: the take
 //! above the sort fetches its columns instead.
-//! Row-stream reads with a physical row selection prevent the rewrite, since
-//! dropping them would remove a restriction that must apply before sorting.
+//! Row-stream reads with a physical row selection or fragment scope prevent the
+//! rewrite, since dropping them would remove a restriction that must apply before sorting.
 //!
 //! Rebuilding the read and fetching deferred columns can replace the planner's
 //! field metadata with the dataset's storage metadata. Projections under the new
@@ -175,12 +175,14 @@ impl TopKLateMaterialization {
                 if read.row_stream_input().is_none() {
                     break;
                 }
-                if read.options().physical_row_addr_prefilter.is_some() {
-                    return Err("row-stream read has a physical row selection".into());
+                if read.options().physical_row_addr_prefilter.is_some()
+                    || read.options().fragments.is_some()
+                {
+                    return Err("row-stream read has a row selection".into());
                 }
                 // Row-stream reads take every input row: their constructor
                 // rejects filters, scan ranges, and deleted rows, and the
-                // guard above excludes physical row selections.
+                // guard above excludes physical row selections and fragment scopes.
                 dropped_takes.push(read.dataset().clone());
             } else if let Some(take) = current.downcast_ref::<TakeExec>() {
                 dropped_takes.push(take.dataset().clone());
@@ -507,6 +509,7 @@ fn max_rows(read: &FilteredReadExec) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
     };
@@ -724,6 +727,59 @@ mod tests {
             .unwrap();
         assert_eq!(takes, 1);
         assert_eq!(run(rewritten).await, run(plan).await);
+    }
+
+    #[rstest]
+    #[case::single(Some(vec![0]), &[8, 5, 3])]
+    #[case::multiple(Some(vec![0, 2]), &[8, 7, 6])]
+    #[case::empty(Some(vec![]), &[])]
+    #[case::unscoped(None, &[9, 8, 7])]
+    #[tokio::test]
+    async fn preserves_row_stream_fragment_scope(
+        #[case] fragment_indices: Option<Vec<usize>>,
+        #[case] expected_keys: &[i32],
+        #[values(false, true)] has_stable_row_ids: bool,
+        #[values(false, true)] is_partitioned: bool,
+    ) {
+        let dataset = dataset(has_stable_row_ids, false).await;
+        let projection = dataset
+            .empty_projection()
+            .union_columns(["key"], OnMissing::Error)
+            .unwrap()
+            .with_row_id();
+        let source: Arc<dyn ExecutionPlan> = Arc::new(
+            FilteredReadExec::try_new(dataset.clone(), FilteredReadOptions::new(projection), None)
+                .unwrap(),
+        );
+        let projection = dataset
+            .empty_projection()
+            .union_columns(["key", "wide", "other"], OnMissing::Error)
+            .unwrap();
+        let mut options = FilteredReadOptions::new(projection);
+        let has_scope = fragment_indices.is_some();
+        if let Some(indices) = fragment_indices {
+            options = options.with_fragments(Arc::new(
+                indices
+                    .into_iter()
+                    .map(|i| dataset.fragments()[i].clone())
+                    .collect(),
+            ));
+        }
+        let selected = FilteredReadExec::try_new(dataset, options, Some(source)).unwrap();
+        let plan = top_k(Arc::new(selected), is_partitioned);
+        let rewritten = optimize(&TopKLateMaterialization::new(), &plan);
+        if !has_scope {
+            assert!(!Arc::ptr_eq(&rewritten, &plan));
+        }
+        let expected = run(plan).await;
+        assert_eq!(
+            expected["key"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .as_ref(),
+            expected_keys,
+        );
+        assert_eq!(run(rewritten).await, expected);
     }
 
     #[cfg(feature = "substrait")]
