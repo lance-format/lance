@@ -344,9 +344,9 @@ jobs:
             --workspace \
             --features "${ALL_FEATURES}" \
             -E '(package(lance-encoding) & (test(test_miniblock_selected_binary_value_reuses_only_compact_exhausted_input) | test(binary_slices_) | test(test_miniblock_single_binary_value_retains_only_compact_owned_input) | test(test_miniblock_cancelled_tasks_release_exhausted_input) | test(test_miniblock_planned_binary_bytes_match_partial_drain))) | ((package(lance-file) | package(lance-index)) & test(binary_slices_)) | (package(lance-index) & (test(scalar::inverted::index) | test(selective_phrase_) | (test(scalar::inverted::builder) & test(pipeline))))'
-      - name: Run opt-in whole-position reads at the exact head
+      - name: Run Arrow position fallback at the exact head
         env:
-          LANCE_FTS_DIRECT_POSITIONS: "1"
+          LANCE_FTS_DIRECT_POSITIONS: "0"
           LANCE_CPU_THREADS: "1"
           TOKIO_WORKER_THREADS: "2"
         run: |

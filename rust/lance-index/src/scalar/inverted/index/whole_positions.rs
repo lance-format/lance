@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Opt-in whole-stream reads without Arrow payload materialization.
+//! Bounded whole-stream reads without Arrow payload materialization.
 
 use super::*;
 use crate::scalar::IndexBinaryReader;
 
-// Independent of selective windows: this preserves one complete term stream
-// and ordinary WAND execution. Qualification must include large-term RSS.
-static ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("LANCE_FTS_DIRECT_POSITIONS").is_ok_and(|value| value == "1"));
+// Preserve complete term streams and ordinary WAND execution. An explicit zero
+// retains the Arrow fallback for diagnosing supported current-layout reads.
+// Unsupported encodings and frozen legacy layouts keep their existing readers.
+static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("LANCE_FTS_DIRECT_POSITIONS").map_or(true, |value| value == "1")
+});
 
 // Bound staging for one complete value without changing ordinary posting I/O.
 // The final stream and concurrent values still count separately from staging.
