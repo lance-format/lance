@@ -1431,3 +1431,25 @@ def test_optimize_indices_consolidate(tmp_path: Path, distributed: bool):
         columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
     )
     assert nearest["id"].to_pylist() == [175]
+
+
+def test_read_transaction_of_a_compaction_that_rewrites_an_index(tmp_path: Path):
+    # Compacting a stable-row-id table rewrites its BTREE index; the commit's
+    # transaction must read back with every RewrittenIndex field.
+    data = pa.table({"id": pa.array(range(64), pa.int64())})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=16
+    )
+    ds.create_scalar_index("id", "BTREE")
+    ds.optimize.compact_files(target_rows_per_fragment=64)
+
+    ds = lance.dataset(tmp_path)
+    transaction = ds.read_transaction(ds.version)
+
+    assert isinstance(transaction.operation, lance.LanceOperation.Rewrite)
+    (rewritten,) = transaction.operation.rewritten_indices
+    (index,) = ds.describe_indices()
+    assert rewritten.new_id == index.segments[0].uuid
+    assert rewritten.new_details_type_url == index.type_url
+    assert isinstance(rewritten.new_details_value, bytes)
+    assert rewritten.new_index_version == index.segments[0].index_version
