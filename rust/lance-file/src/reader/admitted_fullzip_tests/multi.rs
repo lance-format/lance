@@ -210,7 +210,8 @@ impl EncodingsIo for LaterColumnIo {
         let is_second = self
             .second_buffers
             .iter()
-            .any(|buffer| range.start >= buffer.start && range.end <= buffer.end);
+            // A compact whole-page read can span both payload and index.
+            .any(|buffer| range.start < buffer.end && buffer.start < range.end);
         let inner = self.inner.clone();
         let mode = self.mode.clone();
         let entered = self.entered.clone();
@@ -235,6 +236,7 @@ impl EncodingsIo for LaterColumnIo {
 #[tokio::test]
 async fn later_column_cancellation_and_error_leave_no_partial_batch(
     #[values(false, true)] lite: bool,
+    #[values(3, 7)] max_rows: u64,
 ) {
     let (_fs, reader) = fixture_batches(ConcreteFileVersion::V2_2, lite, batches(), 1).await;
     let mode = Arc::new(AtomicUsize::new(1));
@@ -258,7 +260,7 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
     }));
     let budget = AllocationBudget::new(4096);
     let mut scan = reader
-        .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, 7)
+        .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, max_rows)
         .await
         .unwrap();
     let peer;
@@ -300,7 +302,7 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
     let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
         panic!("retry must return original complete rows")
     };
-    assert_eq!(rows, 0..7);
+    assert_eq!(rows, 0..max_rows);
     assert_batch(&batch, &rows, &batches()[0]);
     drop(batch);
     assert_eq!(budget.reserved(), 0);
