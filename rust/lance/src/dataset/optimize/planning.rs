@@ -2020,10 +2020,7 @@ pub(super) async fn load_index_fragmaps(
     // group that splits an index's coverage, and it walks every index the new
     // manifest carries - including the ones this build cannot read. Binning from
     // the filtered view fails that check outright on a dataset holding an index
-    // written by a newer Lance. The same bitmaps also decide, through
-    // `any_group_indexed`, whether a deferred compaction writes the
-    // fragment-reuse index that a build which can read that index needs to
-    // repair its coverage.
+    // written by a newer Lance.
     let indices = load_all_indices(dataset).await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
     let mut segments_by_name = HashMap::<&str, Vec<_>>::new();

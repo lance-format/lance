@@ -442,6 +442,14 @@ pub async fn open_scalar_index_segments(
                 .is_none_or(|coverage| coverage.intersection_len(fragments) > 0)
         });
     }
+    if metrics.records_index_segments() {
+        metrics.record_index_segments(
+            &indices
+                .iter()
+                .map(|index| index.uuid.to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
     match indices.len() {
         0 => Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
@@ -2262,6 +2270,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // No committed index needs the compaction's record, so trim drops it
+        // and nothing maps the retired coverage.
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
 
         let direct_err = dataset
             .commit_existing_index_segments("text_ngram", "text", segments.clone())

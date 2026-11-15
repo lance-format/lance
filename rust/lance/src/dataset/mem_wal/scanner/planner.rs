@@ -2768,6 +2768,110 @@ mod integration_tests {
         );
     }
 
+    /// `count_rows` plans its own scan, without the caller's projection; it
+    /// must count what the scan returns across base, an SSTable and the
+    /// active memtable: an overwritten key once, a deleted key not at all,
+    /// and a filter on a column the projection leaves out.
+    #[tokio::test]
+    async fn test_lsm_count_rows_matches_scan_across_sources() {
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3, 4, 5], "base")],
+            )
+            .await,
+        );
+        // SSTable gen 1 overwrites id=3 and deletes id=4.
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(
+            &gen1_uri,
+            vec![ts_batch(
+                &mem_schema,
+                &[(3, Some("gen1_3"), false), (4, None, true)],
+            )],
+        )
+        .await;
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        // The active memtable overwrites id=1, deletes id=5 and adds id=6.
+        let active_batch = ts_batch(
+            &mem_schema,
+            &[
+                (1, Some("active_1"), false),
+                (5, None, true),
+                (6, Some("active_6"), false),
+            ],
+        );
+        let (bs, ix) = pk_indexed(&[active_batch]);
+        let scanner = |filter: &str, offset: Option<i64>| {
+            LsmScanner::new(
+                base.clone(),
+                vec![shard_snapshot.clone()],
+                vec!["id".to_string()],
+            )
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: bs.clone(),
+                        index_store: ix.clone(),
+                        schema: mem_schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .project(&["name"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .limit(None, offset)
+            .unwrap()
+        };
+
+        // Live keys: 1 (active), 2 (base), 3 (gen 1), 6 (active). The
+        // projection leaves out the key.
+        for (filter, offset, expected) in [
+            ("id > 0", None, 4),
+            ("name != 'base_2'", None, 3),
+            ("name LIKE 'base%'", None, 1),
+            ("id = 3", None, 1),
+            ("id IN (1, 4, 5, 6)", None, 2),
+            ("id > 0", Some(1), 3),
+        ] {
+            if filter.starts_with("id =") || filter.starts_with("id IN") {
+                let plan = scanner(filter, offset).create_plan().await.unwrap();
+                let plan = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert!(
+                    plan.contains("OneShotStream"),
+                    "{filter} must take the point-lookup route:\n{plan}"
+                );
+            }
+            let batches: Vec<RecordBatch> = scanner(filter, offset)
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, expected, "scan, {filter}, offset {offset:?}");
+            assert_eq!(
+                scanner(filter, offset).count_rows().await.unwrap(),
+                expected as u64,
+                "count_rows, {filter}, offset {offset:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_lsm_scan_tombstone_does_not_consume_limit() {
         // A single (newest) SSTable holds both tombstones and live

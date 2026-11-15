@@ -149,7 +149,11 @@ public class CleanupPolicy {
       return this;
     }
 
-    /** If true, delete unverified data files even if they are recent. */
+    /**
+     * If true, delete files that no manifest references, such as the data, transaction and deletion
+     * files of a failed commit, even if they are recent. Only safe when no other operation is in
+     * progress on the dataset.
+     */
     public Builder withDeleteUnverified(boolean deleteUnverified) {
       this.deleteUnverified = Optional.of(deleteUnverified);
       return this;
