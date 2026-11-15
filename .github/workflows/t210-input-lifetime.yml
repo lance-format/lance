@@ -21,15 +21,16 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Admitted row IDs and physical selection
+      - name: Admitted lineage columns and physical selection
         env:
           LANCE_CPU_THREADS: 1
         run: |
           cargo test --profile ci --locked -p lance-file --lib queued_batch_owns_all_columns_and_credit -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::multi::row_ids -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::multi::row_ -- --nocapture
           cargo test --profile ci --locked -p lance-file --lib finite_files_wait_for_shared_capacity_and_drain_forward_selections -- --nocapture
           cargo test --profile ci --locked -p lance-file --doc with_row_ -- --nocapture
           cargo test --profile ci --locked -p lance-file --doc PhysicalRowIdSource -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc PhysicalRowVersionSource -- --nocapture
           cargo test --profile ci --locked -p lance-table --lib admitted_row_ids -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}

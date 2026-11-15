@@ -66,7 +66,7 @@ impl FullZipScan {
     /// shared and outside the payload budget. Generated values are admitted with
     /// each batch, and Arrow aliases retain that charge until their final drop.
     ///
-    /// This does not implement make-deletions-null, version columns, overlays or
+    /// This does not implement make-deletions-null, overlays or
     /// ordinary fragment/scanner adoption. Rows excluded before decoding have no
     /// output ID. Forward live-range selections still use physical offsets here.
     ///
@@ -101,7 +101,7 @@ impl FullZipScan {
             .get_or_insert_with(|| RowIdColumns::new(fragment_id));
         ids.has_row_id = true;
         ids.sequence = sequence;
-        self.update_row_column_schema()?;
+        self.update_generated_schema()?;
         Ok(self)
     }
 
@@ -129,7 +129,7 @@ impl FullZipScan {
             ));
         }
         ids.has_row_address = true;
-        self.update_row_column_schema()?;
+        self.update_generated_schema()?;
         Ok(self)
     }
 
@@ -159,7 +159,7 @@ impl FullZipScan {
         Ok(())
     }
 
-    fn update_row_column_schema(&mut self) -> Result<()> {
+    pub(super) fn update_generated_schema(&mut self) -> Result<()> {
         let mut fields = self.schema.fields()[..self.columns.len()].to_vec();
         if let Some(ids) = &self.row_ids {
             for (included, field) in [
@@ -179,6 +179,9 @@ impl FullZipScan {
                     fields.push(Arc::new(field.clone()));
                 }
             }
+        }
+        if let Some(versions) = &self.row_versions {
+            versions.append_fields(&mut fields)?;
         }
         self.schema = Arc::new(Schema::new_with_metadata(
             fields,
@@ -259,7 +262,7 @@ impl PreparedRowIds {
     }
 }
 
-fn row_array(
+pub(super) fn row_array(
     credit: &mut Reservation,
     count: usize,
     mut values: impl Iterator<Item = u64>,
@@ -269,13 +272,13 @@ fn row_array(
         .ok_or_else(|| Error::internal("missing pre-admitted row column credit"))?;
     for slot in buffer.as_mut().as_chunks_mut::<8>().0 {
         let value = values.next().ok_or_else(|| {
-            Error::invalid_input("row ID sequence ended before physical selection")
+            Error::invalid_input("generated row source ended before physical selection")
         })?;
         slot.copy_from_slice(&value.to_ne_bytes());
     }
     if values.next().is_some() {
         return Err(Error::invalid_input(
-            "row ID source exceeded physical selection",
+            "generated row source exceeded physical selection",
         ));
     }
     let values = ScalarBuffer::new(Buffer::from(buffer.freeze()), 0, count);

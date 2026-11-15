@@ -54,7 +54,9 @@ use crate::{
 mod admitted_fullzip;
 pub(crate) mod structural;
 
-pub use admitted_fullzip::{FullZipScan, FullZipScanOutcome, PhysicalRowIdSource};
+pub use admitted_fullzip::{
+    FullZipScan, FullZipScanOutcome, PhysicalRowIdSource, PhysicalRowVersionSource,
+};
 
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read

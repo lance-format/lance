@@ -6,9 +6,38 @@
 use std::ops::Range;
 
 use lance_core::{Error, Result};
-use lance_file::reader::PhysicalRowIdSource;
+use lance_file::reader::{PhysicalRowIdSource, PhysicalRowVersionSource};
 
 use super::RowIdSequence;
+use super::version::RowDatasetVersionSequence;
+
+impl PhysicalRowVersionSource for RowDatasetVersionSequence {
+    fn num_rows(&self) -> u64 {
+        self.len()
+    }
+
+    fn select_range(&self, rows: Range<usize>) -> Result<Box<dyn Iterator<Item = u64> + '_>> {
+        if rows.start > rows.end || rows.end as u64 > self.len() {
+            return Err(Error::invalid_input(
+                "version range exceeds physical sequence length",
+            ));
+        }
+        // Skip whole runs, not individual rows. Empty runs emit no value; the
+        // span's cardinality determines positional length, not its stored labels.
+        let mut skip = rows.start;
+        let values = self
+            .runs
+            .iter()
+            .flat_map(move |run| {
+                let len = run.len();
+                let offset = skip.min(len);
+                skip -= offset;
+                std::iter::repeat_n(run.version(), len - offset)
+            })
+            .take(rows.len());
+        Ok(Box::new(values))
+    }
+}
 
 impl PhysicalRowIdSource for RowIdSequence {
     fn num_rows(&self) -> u64 {
@@ -37,7 +66,7 @@ mod tests {
     use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::{
-        ROW_ADDR, ROW_ID,
+        ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION,
         cache::LanceCache,
         utils::{allocation::AllocationBudget, deletion::DeletionVector},
     };
@@ -54,6 +83,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::rowids::{segment::U64Segment, version::RowDatasetVersionRun};
 
     #[rstest]
     #[tokio::test]
@@ -62,6 +92,7 @@ mod tests {
         version: ConcreteFileVersion,
         #[values(false, true)] lite: bool,
         #[values(false, true)] multiple_segments: bool,
+        #[values("defaults", "mixed", "distinct", "shared")] versions: &str,
     ) {
         let expected_ids = (0..35_u64)
             .map(|row| {
@@ -94,6 +125,70 @@ mod tests {
             assert!(matches!(error, Error::InvalidInput { .. }));
             assert!(error.to_string().contains("physical sequence length"));
         }
+        let created_values = [vec![3; 9], vec![8; 5], vec![2; 21]].concat();
+        let updated_values = [vec![10; 4], vec![11; 15], vec![10; 16]].concat();
+        let make_versions = |values: &[u64]| {
+            let mut runs = vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..0),
+                version: 99,
+            }];
+            let mut start = 0;
+            while start < values.len() {
+                let end = start
+                    + values[start..]
+                        .iter()
+                        .take_while(|v| **v == values[start])
+                        .count();
+                runs.push(RowDatasetVersionRun {
+                    span: U64Segment::Range(start as u64..end as u64),
+                    version: values[start],
+                });
+                runs.push(RowDatasetVersionRun {
+                    span: U64Segment::Range(end as u64..end as u64),
+                    version: 99,
+                });
+                start = end;
+            }
+            Arc::new(RowDatasetVersionSequence { runs }) as Arc<dyn PhysicalRowVersionSource>
+        };
+        let created_source = make_versions(&created_values);
+        let updated_source = make_versions(&updated_values);
+        for (source, values) in [
+            (&created_source, &created_values),
+            (&updated_source, &updated_values),
+        ] {
+            for bounds in [0..0, 35..35, 3..18, 8..34] {
+                assert_eq!(
+                    source
+                        .select_range(bounds.clone())
+                        .unwrap()
+                        .collect::<Vec<_>>(),
+                    values[bounds]
+                );
+            }
+            for (start, end) in [(0, 36), (36, 36), (7, 3)] {
+                let error = source.select_range(start..end).err().unwrap();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(error.to_string().contains("physical sequence length"));
+            }
+        }
+        let (created_source, updated_source, created_values, updated_values) = match versions {
+            "defaults" => (None, None, vec![1; 35], vec![1; 35]),
+            "mixed" => (None, Some(updated_source), vec![1; 35], updated_values),
+            "shared" => (
+                Some(created_source.clone()),
+                Some(created_source),
+                created_values.clone(),
+                created_values,
+            ),
+            "distinct" => (
+                Some(created_source),
+                Some(updated_source),
+                created_values,
+                updated_values,
+            ),
+            _ => unreachable!(),
+        };
         let schema = Arc::new(Schema::new(vec![
             Field::new("payload", DataType::Utf8, false).with_metadata(HashMap::from([(
                 "lance-encoding:structural-encoding".to_string(),
@@ -152,7 +247,11 @@ mod tests {
             .unwrap()
             .with_deleted_rows(deleted)
             .unwrap()
+            .with_row_created_at_version(created_source)
+            .unwrap()
             .with_row_id(23, Some(source))
+            .unwrap()
+            .with_row_last_updated_at_version(updated_source)
             .unwrap()
             .with_row_address(23)
             .unwrap();
@@ -175,9 +274,32 @@ mod tests {
                         assert_eq!(batch[ROW_ID].to_data(), ids.to_data());
                         assert_eq!(batch[ROW_ADDR].to_data(), addresses.to_data());
                         assert_eq!(batch["payload"].to_data(), payload.to_data());
-                        let alias = batch[ROW_ID].slice(0, 1);
+                        let created = UInt64Array::from(
+                            created_values[rows.start as usize..rows.end as usize].to_vec(),
+                        );
+                        let updated = UInt64Array::from(
+                            updated_values[rows.start as usize..rows.end as usize].to_vec(),
+                        );
+                        assert_eq!(batch[ROW_CREATED_AT_VERSION].to_data(), created.to_data());
+                        assert_eq!(
+                            batch[ROW_LAST_UPDATED_AT_VERSION].to_data(),
+                            updated.to_data()
+                        );
+                        assert_eq!(batch.schema().field(3).name(), ROW_LAST_UPDATED_AT_VERSION);
+                        assert_eq!(batch.schema().field(4).name(), ROW_CREATED_AT_VERSION);
+                        assert_eq!(
+                            Arc::ptr_eq(
+                                &batch[ROW_CREATED_AT_VERSION],
+                                &batch[ROW_LAST_UPDATED_AT_VERSION]
+                            ),
+                            matches!(versions, "defaults" | "shared")
+                        );
+                        let alias = batch[ROW_CREATED_AT_VERSION].slice(0, 1);
+                        let id_alias = batch[ROW_ID].slice(0, 1);
                         let count = batch.num_rows();
                         drop(batch);
+                        assert_eq!(budget.reserved(), count * 16);
+                        drop(id_alias);
                         assert_eq!(budget.reserved(), count * 8);
                         if actual.len() < (selection.end - selection.start) as usize {
                             assert!(matches!(

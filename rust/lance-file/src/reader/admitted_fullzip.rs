@@ -26,8 +26,11 @@ use super::FileReader;
 use crate::version::ConcreteFileVersion;
 
 mod row_ids;
+mod row_versions;
 pub use row_ids::PhysicalRowIdSource;
 use row_ids::{PreparedRowIds, RowIdColumns};
+pub use row_versions::PhysicalRowVersionSource;
+use row_versions::{PreparedRowVersions, RowVersionColumns};
 
 /// One step of an admitted file cursor. Refusal and EOF are deliberately distinct.
 #[derive(Debug)]
@@ -67,6 +70,7 @@ pub struct FullZipScan {
     cursor: u64,
     deleted_rows: Option<Arc<DeletionVector>>,
     row_ids: Option<RowIdColumns>,
+    row_versions: Option<RowVersionColumns>,
     has_started: bool,
 }
 
@@ -84,6 +88,7 @@ pub(super) struct BatchDecodeJob {
     schema: Arc<ArrowSchema>,
     workspace: Reservation,
     row_ids: Option<PreparedRowIds>,
+    row_versions: Option<PreparedRowVersions>,
 }
 
 impl BatchDecodeJob {
@@ -98,6 +103,9 @@ impl BatchDecodeJob {
         }
         if let Some(row_ids) = self.row_ids {
             row_ids.append_to(&mut arrays)?;
+        }
+        if let Some(versions) = self.row_versions {
+            versions.append_to(&mut arrays)?;
         }
         Ok(Some(RecordBatch::try_new(self.schema, arrays)?))
     }
@@ -116,7 +124,8 @@ impl FileReader {
     /// This API takes physical file-row ranges and starts without deletion
     /// handling; use [`FullZipScan::with_deleted_rows`] to bind a snapshot. It
     /// does not apply query filters or takes. Optional row ID columns can be
-    /// configured with [`FullZipScan::with_row_id`] after file composition.
+    /// configured with [`FullZipScan::with_row_id`] after file composition;
+    /// [`FullZipScan::with_row_created_at_version`] adds lineage versions.
     /// Ordinary scans are unchanged.
     ///
     /// `max_rows` limits a single batch, never the total selection. A batch ends
@@ -254,6 +263,7 @@ impl FileReader {
             cursor: rows.start,
             deleted_rows: None,
             row_ids: None,
+            row_versions: None,
             has_started: false,
         })
     }
@@ -398,9 +408,13 @@ impl FullZipScan {
     /// }
     /// ```
     pub fn try_merge(mut self, other: Self) -> Result<Self> {
-        if self.row_ids.is_some() || other.row_ids.is_some() {
+        if self.row_ids.is_some()
+            || other.row_ids.is_some()
+            || self.row_versions.is_some()
+            || other.row_versions.is_some()
+        {
             return Err(Error::invalid_input(
-                "FullZip row ID columns must be configured after merging physical files",
+                "FullZip generated row columns must be configured after merging physical files",
             ));
         }
         let same_deletions = match (&self.deleted_rows, &other.deleted_rows) {
@@ -613,6 +627,14 @@ impl FullZipScan {
         } else {
             None
         };
+        let row_versions = if let Some(columns) = &self.row_versions {
+            let Some(prepared) = columns.prepare(rows.clone(), &mut workspace)? else {
+                return Ok(None);
+            };
+            Some(prepared)
+        } else {
+            None
+        };
         let mut inputs = Vec::with_capacity(self.columns.len());
         for (column, field) in self.columns.iter().zip(self.schema.fields()) {
             let decoder = column
@@ -641,6 +663,7 @@ impl FullZipScan {
             schema: self.schema.clone(),
             workspace,
             row_ids,
+            row_versions,
         })
         .await
     }

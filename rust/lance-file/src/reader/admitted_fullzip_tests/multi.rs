@@ -16,6 +16,7 @@ use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
 
 mod row_ids;
+mod row_versions;
 
 fn batches() -> Vec<RecordBatch> {
     let meta = HashMap::from([(
@@ -86,6 +87,16 @@ fn assert_address_batch(
     ]);
     let mut arrays = selected.columns().to_vec();
     arrays.extend([addresses.clone(), addresses]);
+    fields.extend([
+        Arc::new(lance_core::ROW_LAST_UPDATED_AT_VERSION_FIELD.clone()),
+        Arc::new(lance_core::ROW_CREATED_AT_VERSION_FIELD.clone()),
+    ]);
+    let versions: ArrayRef = Arc::new(arrow_array::UInt64Array::from(vec![1; selected.num_rows()]));
+    arrays.extend([versions.clone(), versions]);
+    assert!(Arc::ptr_eq(
+        &batch[lance_core::ROW_LAST_UPDATED_AT_VERSION],
+        &batch[lance_core::ROW_CREATED_AT_VERSION]
+    ));
     let expected = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
     assert_batch(batch, &(0..rows.end - rows.start), &expected);
     assert!(Arc::ptr_eq(
@@ -502,7 +513,11 @@ async fn queued_batch_owns_all_columns_and_credit(
         .await
         .unwrap()
         .with_partial_workspace(partial)
+        .with_row_created_at_version(None)
+        .unwrap()
         .with_row_id(7, None)
+        .unwrap()
+        .with_row_last_updated_at_version(None)
         .unwrap()
         .with_row_address(7)
         .unwrap();
