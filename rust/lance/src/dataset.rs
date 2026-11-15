@@ -179,8 +179,10 @@ pub use take::TakeBuilder;
 pub use update_join_options::{UpdateJoinOptions, UpdateJoinStrategy};
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior,
-    UncommittedMergeInsert, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertAnalysis, MergeInsertBuilder, MergeInsertJob, MergeInsertJoin,
+    MergeInsertJoinStrategy, MergeInsertWriteMode, MergeInsertWriteStrategy, MergeOperatorSpills,
+    MergeStats, MergeSubplan, SourceDedupeBehavior, UncommittedMergeInsert, WhenMatched,
+    WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;

@@ -2559,7 +2559,7 @@ impl FileFragment {
         let mut last_id = row_ids[0];
 
         for id in row_ids.iter().skip(1) {
-            if *id != last_id + 1 {
+            if last_id.checked_add(1) != Some(*id) {
                 return false;
             }
             last_id = *id;

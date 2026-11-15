@@ -190,6 +190,7 @@
                     <protoSourceRoot>${project.basedir}/../protos</protoSourceRoot>
                     <includes>
                         <include>cache_diagnostics.proto</include>
+                        <include>merge_analysis.proto</include>
                     </includes>
                     <protocArtifact>
                         com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}

@@ -10,7 +10,9 @@ use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use datafusion::common::Result as DFResult;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
@@ -287,6 +289,8 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let write_time =
+            MetricBuilder::new(&self.metrics).subset_time("merge_write_time", partition);
         let metrics = MergeInsertMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
 
@@ -302,6 +306,8 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
 
         let result_stream = futures::stream::once(async move {
+            // Time lazy execution, including upstream waits, rather than stream construction.
+            let _write_timer = write_time.timer();
             // Delete-only merges write no data files, but still validate any
             // requested target bases so unknown bases fail on every path.
             resolve_target_bases(&dataset, &params).await?;

@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+package lance.pb;
+option java_package = "org.lance.proto";
+option java_outer_classname = "MergeAnalysisWire";
+
+/* Runtime diagnostics across JNI, never persisted in a Lance dataset.
+ * Optional numeric fields distinguish unavailable measurements from measured zero.
+ * Durations use nanoseconds, storage and memory measurements use bytes.
+ */
+message MergeAnalysisReport {
+  string operation_id = 1;
+  MergeExecutionReport execution = 2;
+  string write_mode = 3;
+  // Complete change statistics; absent after failed execution.
+  optional MergeChangeStats stats = 4;
+  // Existing fragments modified/removed; absent without a complete transaction.
+  optional uint64 fragments_touched = 5;
+  // Logical scan visits, including repeated reads; absent without a scan producer.
+  optional uint64 target_rows_read = 6;
+  // Fragment scan visits, not distinct fragments; absent without a scan producer.
+  optional uint64 fragments_read = 7;
+  // Absent if failure prevented observing whether a probe ran.
+  optional bool index_used = 8;
+  // Distinct selected segment UUIDs; zero for non-indexed, absent if index use is unknown.
+  optional uint64 join_index_segments = 9;
+  // Actual join-node time, overlapping write time; absent without a join producer.
+  optional uint64 join_duration_ns = 10;
+  // Join output before merge actions; absent without an output-row producer.
+  optional uint64 joined_rows = 11;
+  // Distinct mapped target addresses, an upper bound on matches; absent without a mapper.
+  optional uint64 mapped_target_rows = 12;
+  MergeSpillUsage operator_spills = 13;
+  MergeSpillUsage replay_spills = 14;
+  // Absent when the route has no diagnostic scratch owner.
+  optional MergeSpillUsage scratch_spills = 15;
+  repeated MergeAnalysisSubplan subplans = 16;
+  repeated MergePhysicalJoin joins = 17;
+  // Inclusive merge sink duration; overlaps join time. Absent if never measured.
+  optional uint64 merge_write_duration_ns = 18;
+}
+
+message MergeExecutionReport {
+  string plan = 1;
+  string outcome = 2;
+  optional string error = 3;
+  uint64 elapsed_ns = 4;
+  // Maximum concurrent DataFusion pool reservations; absent without a tracked pool.
+  optional uint64 pool_peak_reserved_bytes = 5;
+  repeated MergeMetric counts = 6;
+  repeated MergeMetric times = 7;
+  repeated MergeOperatorMetrics operators = 8;
+}
+
+message MergeMetric {
+  string name = 1;
+  // count, gauge, peak_memory_bytes, or time_ns. Counts retain producer-specific units.
+  string kind = 2;
+  uint64 value = 3;
+  optional uint64 partition = 4;
+  repeated MergeMetricLabel labels = 5;
+}
+
+message MergeMetricLabel { string name = 1; string value = 2; }
+message MergeOperatorMetrics {
+  repeated uint64 path = 1;
+  string name = 2;
+  repeated MergeMetric metrics = 3;
+}
+message MergePhysicalJoin {
+  repeated uint64 path = 1;
+  string strategy = 2;
+  optional string partition_mode = 3;
+  string join_type = 4;
+  uint64 subplan_id = 5;
+}
+message MergeAnalysisSubplan {
+  uint64 id = 1;
+  string purpose = 2;
+  MergeExecutionReport execution = 3;
+  repeated MergePhysicalJoin joins = 4;
+}
+message MergeChangeStats {
+  uint64 num_inserted_rows = 1;
+  uint64 num_updated_rows = 2;
+  uint64 num_deleted_rows = 3;
+  uint64 bytes_written = 4;
+  uint64 num_files_written = 5;
+  uint64 num_skipped_duplicates = 6;
+}
+message MergeSpillUsage {
+  // Every absent field denotes a measurement unsupported by this producer.
+  optional uint64 spill_count = 1;
+  optional uint64 bytes_written = 2;
+  optional uint64 bytes_read = 3;
+  optional uint64 write_duration_ns = 4;
+  optional uint64 read_duration_ns = 5;
+  optional uint64 rows = 6;
+  optional uint64 accepted_bytes = 7;
+  optional uint64 charged_bytes = 8;
+  optional uint64 peak_charged_bytes = 9;
+  optional uint64 live_files = 10;
+  optional uint64 files_created = 11;
+  optional uint64 quota_failures = 12;
+  optional uint64 cleanup_failures = 13;
+}
