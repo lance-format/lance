@@ -19,7 +19,7 @@ use crate::{
     format::metadata::CompressiveEncoding,
 };
 
-pub(crate) fn per_value_fixture(
+pub fn per_value_fixture(
     bits: u8,
     compressed: bool,
 ) -> (
@@ -50,7 +50,7 @@ pub(crate) fn per_value_fixture(
 
 /// One charged coalesced owner, with independently sliced data/offsets and a
 /// sibling outside both logical slices. Padding must stay charged too.
-pub(crate) fn charge_per_value(
+pub fn charge_per_value(
     mut block: VariableWidthBlock,
     displacement: usize,
     work: &mut Reservation,

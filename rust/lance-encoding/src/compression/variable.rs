@@ -13,7 +13,7 @@ fn offset(bytes: &[u8], index: usize, width: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
-pub(crate) fn visit(
+pub fn visit(
     data: &VariableWidthBlock,
     visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {

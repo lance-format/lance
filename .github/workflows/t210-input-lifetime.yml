@@ -21,18 +21,9 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # MiniBlock FSST and framing are qualified at 3ccffae5a. Validate the new
-      # per-value API and already-drained FullZip task without replaying those suites.
-      - name: Validate FSST per-value and FullZip admission
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --lib per_value_admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::admitted::tests -- --nocapture
-      - name: Validate per-value admission without optional codecs
-        run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib per_value_admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::admitted::tests -- --nocapture
-      - name: Validate public per-value admission API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc VariablePerValueDecompressor::try_decompress_in -- --nocapture
+      # Per-value FSST and FullZip test steps passed at 02946458c. The only
+      # source correction changes redundant item visibility inside crate-private
+      # modules. Keep the original run's test/API evidence; check both lint builds.
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
