@@ -481,10 +481,10 @@ pub async fn hamming_clustering_for_sample(
         let batch = dataset
             .take(
                 &indices,
-                crate::dataset::ProjectionRequest::from_columns(
+                crate::dataset::ProjectionRequest::try_from_columns(
                     [column, "_rowid"],
                     dataset.schema(),
-                ),
+                )?,
             )
             .await?;
 

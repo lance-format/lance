@@ -992,7 +992,16 @@ mod tests {
         planned("TupleQuery[tenant = 1, ts = 10, at >= 1704067200000]", &[], &[])
     )]
     #[case::literal_overflows_key("tenant = 3000000000", None)]
-    #[case::float_literal_on_integer_key("tenant = 1.5", None)]
+    // The comparison is coerced to `CAST(tenant AS double) = 1.5`, which the
+    // planner rewrites back onto the key: never equal, or an exact equality.
+    #[case::float_literal_on_integer_key(
+        "tenant = 1.5",
+        planned("TupleQuery[tenant < -2147483648]", &[], &[])
+    )]
+    #[case::exact_float_literal_on_integer_key(
+        "tenant = 2.0",
+        planned("TupleQuery[tenant = 2]", &[], &[])
+    )]
     #[case::or_across_keys("tenant = 1 OR ts = 2", None)]
     #[case::or_on_one_key(
         "tenant = 1 OR tenant = 2",

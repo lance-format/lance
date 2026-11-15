@@ -198,7 +198,7 @@ fn ex_dot_kernels_for_dim(c: &mut Criterion, ex_dim: usize) {
                 b.iter(|| {
                     let mut sum = 0.0f32;
                     for row in kernel_codes.chunks_exact(kernel_code_len) {
-                        sum += kernel(ex_query, row);
+                        sum += kernel.call(ex_query, row);
                     }
                     black_box(sum)
                 })
@@ -508,7 +508,7 @@ fn ex_bulk_paths(c: &mut Criterion) {
                 b.iter(|| {
                     let mut sum = 0.0f32;
                     for row in ex_codes.chunks_exact(ex_code_len) {
-                        sum += kernel(&ex_query, row);
+                        sum += kernel.call(&ex_query, row);
                     }
                     black_box(sum)
                 })
