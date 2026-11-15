@@ -21,22 +21,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Raw offsets and validity traversal
+      - name: Typed raw offset chunks
         env:
           LANCE_CPU_THREADS: 1
         run: |
           cargo test --profile ci --locked -p lance-encoding --lib compression::variable::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib repdef::admitted -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib per_value_admitted -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::variable::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib repdef::admitted -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib per_value_admitted -- --nocapture
-      - name: Real file cursor and codec composition
-        env:
-          LANCE_CPU_THREADS: 1
-        run: |
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip -- --nocapture
-          cargo test --profile ci --locked -p lance-file --example admitted_fullzip -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |

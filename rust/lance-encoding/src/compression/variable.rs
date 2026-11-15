@@ -27,7 +27,7 @@ fn validate_offsets<const WIDTH: usize>(bytes: &[u8], payload_len: usize) -> Res
         i64::MAX as u64
     };
     let mut previous = 0;
-    for (i, bytes) in bytes.chunks_exact(WIDTH).enumerate() {
+    for (i, bytes) in bytes.as_chunks::<WIDTH>().0.iter().enumerate() {
         let next = offset::<WIDTH>(bytes);
         if (i == 0 && next != 0) || next < previous || next > max || next > payload_len as u64 {
             return Err(Error::corrupt_file_named(
@@ -89,7 +89,7 @@ fn visit_values<const WIDTH: usize>(
     // Full validation precedes callbacks. Reuse the previous endpoint rather
     // than decoding each interior offset again for the following value.
     let mut start = 0;
-    for bytes in data.offsets.chunks_exact(WIDTH).skip(1) {
+    for bytes in data.offsets.as_chunks::<WIDTH>().0.iter().skip(1) {
         let end = offset::<WIDTH>(bytes) as usize;
         visitor(&data.data[start..end])?;
         start = end;
