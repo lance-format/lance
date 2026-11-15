@@ -5,6 +5,7 @@ use lance_core::{cache::LanceCache, utils::allocation::AllocationBudget};
 use lance_file::reader::{
     FileReader, FullZipScanOutcome, PhysicalRowIdSource, PhysicalRowVersionSource,
 };
+use pretty_assertions::assert_eq;
 
 use super::*;
 
@@ -63,7 +64,9 @@ async fn admitted_logical_range_matches_fragment_markers(
             .await
             .unwrap();
         assert_eq!(fragment.metadata.files.len(), 1);
-        let path = dataset.data_dir().join(&fragment.metadata.files[0].path);
+        let path = dataset
+            .data_dir()
+            .join(fragment.metadata.files[0].path.as_str());
         let scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
             SchedulerConfig {
