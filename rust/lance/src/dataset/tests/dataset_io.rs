@@ -6089,3 +6089,90 @@ async fn test_append_rejects_offset_overflow() {
     assert!(message.contains("32-bit offsets"), "{message}");
     assert_eq!(dataset.latest_version_id().await.unwrap(), 1);
 }
+
+fn map_of(key_type: DataType, value_type: DataType) -> DataType {
+    let entries = ArrowField::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                ArrowField::new("keys", key_type, false),
+                ArrowField::new("values", value_type, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    DataType::Map(Arc::new(entries), false)
+}
+
+/// Map keys and values convert like top-level columns; null maps stay null.
+#[tokio::test]
+async fn test_append_converts_map_string_representations() {
+    let table_type = map_of(DataType::Utf8, DataType::Utf8);
+    let table_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", table_type.clone(), true),
+    ]));
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(
+            vec![Ok(RecordBatch::new_empty(table_schema.clone()))],
+            table_schema.clone(),
+        ),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let input_type = map_of(DataType::LargeUtf8, DataType::Utf8View);
+    let DataType::Map(entries_field, _) = &input_type else {
+        unreachable!()
+    };
+    let DataType::Struct(entry_fields) = entries_field.data_type() else {
+        unreachable!()
+    };
+    let entries = StructArray::new(
+        entry_fields.clone(),
+        vec![
+            representation_array(&DataType::LargeUtf8, &[Some("k1"), Some("k2"), Some("k3")]),
+            representation_array(
+                &DataType::Utf8View,
+                &[Some("v1"), None, Some("a value past the inline size")],
+            ),
+        ],
+        None,
+    );
+    let maps = Arc::new(
+        arrow_array::MapArray::try_new(
+            entries_field.clone(),
+            arrow_buffer::OffsetBuffer::from_lengths([2, 0, 1]),
+            entries,
+            Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+            false,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let dataset = append_representation(dataset, ArrowField::new("value", input_type, true), maps)
+        .await
+        .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    let maps = result["value"].as_map();
+    assert_eq!(
+        maps.nulls().unwrap().iter().collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    assert_eq!(maps.value_offsets(), &[0, 2, 2, 3]);
+    assert_eq!(
+        maps.keys().as_string::<i32>().iter().collect::<Vec<_>>(),
+        [Some("k1"), Some("k2"), Some("k3")]
+    );
+    assert_eq!(
+        maps.values().as_string::<i32>().iter().collect::<Vec<_>>(),
+        [Some("v1"), None, Some("a value past the inline size")]
+    );
+}
