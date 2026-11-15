@@ -36,7 +36,7 @@
 
 mod selection;
 pub mod writer;
-pub(crate) use selection::OverlayReadSelection;
+pub use selection::OverlayReadSelection;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -848,7 +848,7 @@ fn apply_struct_validities(
 /// surviving file is opened once, concurrently, projected to the covered fields; the
 /// value bytes are still not read here (the per-batch [`merge_overlay_batch`] fetches
 /// only the values it needs).
-pub(crate) async fn resolve_overlays(
+pub async fn resolve_overlays(
     planner: &OverlayReadPlanner,
     selection: &OverlayReadSelection,
     fragment: &FileFragment,

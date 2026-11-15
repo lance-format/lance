@@ -23,7 +23,7 @@ enum Selection {
     Indices(UInt32Array, RoaringBitmap),
 }
 
-pub(crate) struct OverlayReadSelection {
+pub struct OverlayReadSelection {
     selection: Selection,
     num_rows: usize,
 }
