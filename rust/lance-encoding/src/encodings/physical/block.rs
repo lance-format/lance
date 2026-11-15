@@ -1361,20 +1361,16 @@ mod tests {
             encoder.compressor.compress(v, out)
         })
         .unwrap();
-        let data_block = DataBlock::VariableWidth(VariableWidthBlock {
+        let data_block = VariableWidthBlock {
             data: LanceBuffer::from(data.clone()),
             offsets: LanceBuffer::reinterpret_vec(offsets.clone()),
             bits_per_offset,
             num_values: (offsets.len() - 1) as u64,
             block_info: BlockInfo::new(),
-        });
-        let (compressed, _) =
-            PerValueCompressor::compress_with_validity_async(Arc::new(encoder), data_block, None)
-                .await
-                .unwrap();
-        let PerValueDataBlock::Variable(compressed) = compressed else {
-            panic!("expected variable-width output");
         };
+        // Compare the parallel payload kernel directly. Without codec features
+        // the default is Noop, which has no General wire descriptor to serialize.
+        let compressed = encoder.per_value_compress_async(data_block).await.unwrap();
         assert_eq!(seq, compressed.data.as_ref());
         assert_eq!(
             seq_offsets.borrow_to_typed_slice::<T>().as_ref(),
