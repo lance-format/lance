@@ -166,11 +166,15 @@ jobs:
             exit 1
           fi
 
-          # Normalize the runner scratch checkout to LF so the saved patch
-          # applies byte-for-byte. Nothing here is pushed or committed.
+          # Materialize the committed blob for each patched path. A Windows
+          # checkout can leave CRLF bytes in the worktree, and `git checkout --`
+          # may skip a path whose index stat data still says it is up to date.
+          # cat-file writes the exact HEAD bytes without smudge/eol filters.
+          # Nothing here is pushed or committed.
           git config --local core.autocrlf false
           for path in "${TEST_PATHS[@]}"; do
-            git checkout -- "$path"
+            blob=$(git rev-parse "HEAD:$path")
+            git cat-file blob "$blob" > "$path"
           done
           PRE=$(git hash-object --no-filters "$TEST_PATH")
           echo "pre_apply_worktree_blob=$PRE"
