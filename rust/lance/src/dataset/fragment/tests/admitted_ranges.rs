@@ -57,8 +57,8 @@ async fn admitted_logical_range_matches_fragment_markers(
                 FragReadConfig::default()
                     .with_row_id(true)
                     .with_row_address(true)
-                    .with_row_created_at_version(true)
-                    .with_row_last_updated_at_version(true)
+                    .with_row_created_at_version(stable_ids)
+                    .with_row_last_updated_at_version(stable_ids)
                     .with_make_deletions_null(true),
             )
             .await
@@ -103,24 +103,29 @@ async fn admitted_logical_range_matches_fragment_markers(
             )
             .unwrap()
             .with_row_address(fragment.id() as u32)
-            .unwrap()
-            .with_row_created_at_version(
-                ordinary
-                    .created_at_sequence
-                    .clone()
-                    .map(|versions| versions as Arc<dyn PhysicalRowVersionSource>),
-            )
-            .unwrap()
-            .with_row_last_updated_at_version(
-                ordinary
-                    .last_updated_at_sequence
-                    .clone()
-                    .map(|versions| versions as Arc<dyn PhysicalRowVersionSource>),
-            )
-            .unwrap()
+            .unwrap();
+        // The ordinary fragment reader supports version columns only with stable IDs.
+        if stable_ids {
+            admitted = admitted
+                .with_row_created_at_version(
+                    ordinary
+                        .created_at_sequence
+                        .clone()
+                        .map(|versions| versions as Arc<dyn PhysicalRowVersionSource>),
+                )
+                .unwrap()
+                .with_row_last_updated_at_version(
+                    ordinary
+                        .last_updated_at_sequence
+                        .clone()
+                        .map(|versions| versions as Arc<dyn PhysicalRowVersionSource>),
+                )
+                .unwrap();
+        }
+        let mut admitted = admitted
             .with_deleted_rows_as_nulls(ordinary.deletion_vec.clone().unwrap())
             .unwrap();
-        for selection in [0..7_u64, 7..10, live.len() as u64..live.len() as u64] {
+        for selection in [0..7_u64, 7..10] {
             let reference = ordinary
                 .read_range(selection.start as u32..selection.end as u32, 2)
                 .await
@@ -131,11 +136,8 @@ async fn admitted_logical_range_matches_fragment_markers(
                 .unwrap();
             let reference =
                 concat_batches(&Arc::new(ordinary.output_schema.clone()), &reference).unwrap();
-            let expected_rows = if selection.is_empty() {
-                20..20
-            } else {
-                live[selection.start as usize]..live[selection.end as usize - 1] + 1
-            };
+            let expected_rows =
+                live[selection.start as usize]..live[selection.end as usize - 1] + 1;
             assert_eq!(
                 reference.num_rows() as u64,
                 expected_rows.end - expected_rows.start
@@ -182,5 +184,30 @@ async fn admitted_logical_range_matches_fragment_markers(
             assert_eq!(output_rows, reference.num_rows());
             assert_eq!(valid_ids as u64, selection.end - selection.start);
         }
+
+        // FragmentReader rejects an empty EOF request; the resumable cursor accepts
+        // it as a terminal selection. Compare nonempty reads above, and assert each
+        // API's boundary behavior independently here.
+        let live_count = live.len() as u32;
+        let error = ordinary
+            .read_range(live_count..live_count, 2)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid read params Range(20..20)")
+        );
+        admitted
+            .advance_to_live_range(u64::from(live_count)..u64::from(live_count))
+            .unwrap();
+        assert_eq!(admitted.position(), 20);
+        assert!(matches!(
+            admitted.try_next().await.unwrap(),
+            FullZipScanOutcome::Finished
+        ));
+        assert_eq!(budget.reserved(), 0);
     }
 }
