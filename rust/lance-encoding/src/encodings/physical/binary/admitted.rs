@@ -41,6 +41,30 @@ fn offset(data: &[u8], index: usize, width: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
+pub(super) fn visit(
+    codec: &BinaryMiniBlockDecompressor,
+    data: &[LanceBuffer],
+    num_values: u64,
+    visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let BinaryMiniBlockLayout::Legacy { bits_per_offset } = codec.layout else {
+        return Err(Error::not_supported(
+            "borrowed binary traversal requires legacy Flat offsets",
+        ));
+    };
+    // The current FSST writer uses this legacy container. Reuse its complete
+    // framing validation, including unselected offsets, before borrowing slices.
+    plan(codec, data, num_values, 0..num_values)?;
+    let input = &data[0];
+    let width = usize::from(bits_per_offset / 8);
+    for row in 0..num_values as usize {
+        let start = offset(input, row, width) as usize;
+        let end = offset(input, row + 1, width) as usize;
+        visitor(&input[start..end])?;
+    }
+    Ok(())
+}
+
 pub(super) struct RangePlan {
     pub(super) budget: MiniBlockDecodeBudget,
     values: Range<usize>,

@@ -34,6 +34,8 @@ use crate::{
 
 use super::binary::BinaryMiniBlockEncoder;
 
+mod admitted;
+
 pub(crate) fn map_fsst_error(err: std::io::Error) -> Error {
     match err.kind() {
         std::io::ErrorKind::InvalidData => Error::corrupt_file_named("fsst", err.to_string()),
@@ -308,6 +310,29 @@ impl FsstMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
+    fn admitted_output_layout(&self) -> Result<crate::compression::MiniBlockOutputLayout> {
+        admitted::layout(self)
+    }
+
+    fn plan_range(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<crate::compression::MiniBlockDecodeBudget> {
+        admitted::plan(self, data, num_values, range)
+    }
+
+    fn try_decompress_range_in(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        range: std::ops::Range<u64>,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        admitted::decode(self, data, num_values, range, workspace)
+    }
+
     fn num_buffers(&self) -> usize {
         self.inner_decompressor.num_buffers()
     }

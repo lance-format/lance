@@ -878,6 +878,15 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
+    fn visit_binary_values(
+        &self,
+        data: &[LanceBuffer],
+        num_values: u64,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        admitted::visit(self, data, num_values, visitor)
+    }
+
     fn try_prepare_range_in<'a>(
         &'a self,
         data: &[LanceBuffer],

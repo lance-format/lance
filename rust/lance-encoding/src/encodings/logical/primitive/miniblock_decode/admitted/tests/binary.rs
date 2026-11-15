@@ -7,6 +7,7 @@ use super::multiple::select;
 use super::*;
 use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 
+mod fsst;
 mod metadata;
 mod payload;
 
@@ -30,7 +31,7 @@ fn binary_fixture(bits: u8, large: bool, nested: bool, available: usize) -> Fixt
 
 fn framed_fixture(
     payloads: &[&[u8]],
-    decoder: BinaryMiniBlockDecompressor,
+    decoder: impl MiniBlockDecompressor + 'static,
     large: bool,
     nested: bool,
     available: usize,

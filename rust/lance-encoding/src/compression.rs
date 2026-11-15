@@ -1225,6 +1225,36 @@ pub fn try_fixed_size_list_block(
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Visit each binary value in order without allocating decoded payload.
+    /// Complete framing must be validated before the first callback. The callback
+    /// borrows each value only for the call and is responsible for its own work.
+    /// Unsupported codecs return an error instead of allocating an intermediate
+    /// array. This lets an outer codec price expansion before output admission.
+    ///
+    /// ```
+    /// use lance_encoding::{buffer::LanceBuffer, compression::MiniBlockDecompressor,
+    ///     encodings::physical::binary::BinaryMiniBlockDecompressor};
+    /// let mut frame = [12_u32, 13, 15].into_iter()
+    ///     .flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    /// frame.extend_from_slice(b"abc\0"); // Four-byte frame alignment.
+    /// let mut lengths = Vec::new();
+    /// BinaryMiniBlockDecompressor::new(32).unwrap().visit_binary_values(
+    ///     &[LanceBuffer::from(frame)], 2, &mut |value| {
+    ///         lengths.push(value.len()); Ok(())
+    ///     }).unwrap();
+    /// assert_eq!(lengths, [1, 2]);
+    /// ```
+    fn visit_binary_values(
+        &self,
+        _data: &[LanceBuffer],
+        _num_values: u64,
+        _visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "mini-block codec has no borrowed binary traversal",
+        ))
+    }
+
     /// Describe the physical output shape of every admitted range from this codec.
     /// This capability permits planning concatenation before decoding any values.
     /// Implementations must return the same shape for empty and nonempty ranges;
