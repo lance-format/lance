@@ -3946,8 +3946,8 @@ impl FragmentReader {
                 ReadBatchTask {
                     num_rows,
                     task: async move {
-                        let batch_offsets = selection.batch_offsets(start, num_rows as usize)?;
-                        merge_overlay_batch(inner, batch_offsets.values(), &plans).await
+                        let batch_selection = selection.batch(start, num_rows as usize)?;
+                        merge_overlay_batch(inner, &batch_selection, &plans).await
                     }
                     .boxed(),
                 }

@@ -8,6 +8,8 @@
 //!
 //! Commands: `prepare ROOT ROWS OVERLAYS VERSION`, or
 //! `verify|run ROOT full|ranges|pruned BATCH_ROWS`. VERSION is `2.2` or `2.3`.
+//! Release builds require the existing `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1`
+//! opt-in for these isolated overlay fixtures; do not enable it in production.
 
 #![allow(clippy::print_stdout)]
 

@@ -23,6 +23,12 @@ enum Selection {
     Indices(UInt32Array, RoaringBitmap),
 }
 
+/// A batch keeps contiguous row identity without an offsets allocation.
+pub enum OverlayBatchSelection {
+    Range(Range<u32>),
+    Indices(UInt32Array),
+}
+
 pub struct OverlayReadSelection {
     selection: Selection,
     num_rows: usize,
@@ -94,8 +100,10 @@ impl OverlayReadSelection {
         }
     }
 
-    /// Produce only this batch's physical offsets, preserving order and repeats.
-    pub(crate) fn batch_offsets(&self, start: usize, len: usize) -> Result<UInt32Array> {
+    /// Slice this batch's physical rows, preserving order and repeats.
+    /// Contiguous reads stay a range through routing; only disjoint ranges need
+    /// an offsets buffer, and only for the batch being consumed.
+    pub(crate) fn batch(&self, start: usize, len: usize) -> Result<OverlayBatchSelection> {
         if start.checked_add(len).is_none_or(|end| end > self.num_rows) {
             return Err(Error::invalid_input(format!(
                 "overlay batch {start} + {len} exceeds {} selected rows",
@@ -105,9 +113,11 @@ impl OverlayReadSelection {
         match &self.selection {
             Selection::Range(range) => {
                 let begin = range.start + start as u32;
-                Ok(UInt32Array::from(Vec::from_iter(begin..begin + len as u32)))
+                Ok(OverlayBatchSelection::Range(begin..begin + len as u32))
             }
-            Selection::Indices(indices, _) => Ok(indices.slice(start, len)),
+            Selection::Indices(indices, _) => {
+                Ok(OverlayBatchSelection::Indices(indices.slice(start, len)))
+            }
             Selection::Ranges { ranges, ends } => {
                 // ReadBatchParams::slice reserves descriptors for every source range.
                 // Build only the consumed batch, including when it crosses ranges.
@@ -129,7 +139,7 @@ impl OverlayReadSelection {
                     offsets.extend(begin as u32..(begin + count) as u32);
                     skip = 0;
                 }
-                Ok(UInt32Array::from(offsets))
+                Ok(OverlayBatchSelection::Indices(UInt32Array::from(offsets)))
             }
         }
     }
@@ -139,6 +149,13 @@ impl OverlayReadSelection {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    fn offsets(selection: OverlayBatchSelection) -> Vec<u32> {
+        match selection {
+            OverlayBatchSelection::Range(range) => range.collect(),
+            OverlayBatchSelection::Indices(indices) => indices.values().to_vec(),
+        }
+    }
 
     #[rstest]
     #[case::full(ReadBatchParams::RangeFull, vec![0, 1, 2, 3, 4, 5, 6, 7])]
@@ -156,11 +173,7 @@ mod tests {
         for start in 0..=expected.len() {
             for len in 0..=expected.len() - start {
                 assert_eq!(
-                    selection
-                        .batch_offsets(start, len)
-                        .unwrap()
-                        .values()
-                        .as_ref(),
+                    offsets(selection.batch(start, len).unwrap()).as_slice(),
                     &expected[start..start + len]
                 );
             }
@@ -172,29 +185,31 @@ mod tests {
                 expected.iter().any(|offset| offsets.contains(offset))
             );
         }
-        let error = selection.batch_offsets(expected.len(), 1).unwrap_err();
+        let error = selection.batch(expected.len(), 1).err().unwrap();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("selected rows"));
     }
 
     #[test]
     fn full_fragment_does_not_expand_before_batch_consumption() {
-        // Expanding this selection up front would require almost 16 GiB. Only
-        // the two consumed offsets should be materialized, even near the end.
+        // Expanding this selection up front would require almost 16 GiB. Both
+        // selection and batch descriptions must remain compact near the end.
         let selection = OverlayReadSelection::new(&ReadBatchParams::RangeFull, u32::MAX).unwrap();
+        // Even a declared whole-fragment batch retains a compact range. Do not
+        // expand it in this test: the physical row identity needs no allocation.
+        assert!(matches!(
+            selection.batch(0, u32::MAX as usize).unwrap(),
+            OverlayBatchSelection::Range(range) if range == (0..u32::MAX)
+        ));
         let coverage = [u32::MAX - 1].into_iter().collect();
         assert!(selection.intersects(&coverage));
         assert!(!selection.intersects(&[u32::MAX].into_iter().collect()));
         assert_eq!(
-            selection
-                .batch_offsets(u32::MAX as usize - 2, 2)
-                .unwrap()
-                .values()
-                .as_ref(),
+            offsets(selection.batch(u32::MAX as usize - 2, 2).unwrap()).as_slice(),
             &[u32::MAX - 2, u32::MAX - 1]
         );
         assert_eq!(
-            selection.batch_offsets(u32::MAX as usize, 0).unwrap().len(),
+            offsets(selection.batch(u32::MAX as usize, 0).unwrap()).len(),
             0
         );
     }
@@ -207,11 +222,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            selection
-                .batch_offsets(u32::MAX as usize - 101, 3)
-                .unwrap()
-                .values()
-                .as_ref(),
+            offsets(selection.batch(u32::MAX as usize - 101, 3).unwrap()).as_slice(),
             &[u32::MAX - 1, 0, 1]
         );
         assert!(!selection.intersects(&[99].into_iter().collect()));

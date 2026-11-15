@@ -36,7 +36,7 @@
 
 mod selection;
 pub mod writer;
-pub use selection::OverlayReadSelection;
+pub use selection::{OverlayBatchSelection, OverlayReadSelection};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -917,13 +917,13 @@ pub async fn resolve_overlays(
 }
 
 /// Resolve overlays for one base batch: route each relevant atomic field against the
-/// batch's `offsets_in_frag`, fetch only the overlay values the batch needs
+/// batch's compact physical selection, fetch only the overlay values the batch needs
 /// (concurrently with the base read), and collect projected struct validity. For a
 /// projected value, assemble the merged atomic field and splice it into its output
 /// column. Atomic fields with no covered rows, and columns with no plan, pass through.
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
-    offsets_in_frag: &[u32],
+    selection: &OverlayBatchSelection,
     plans: &[LoadedAtomicField],
 ) -> Result<RecordBatch> {
     let atomic_field_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
@@ -932,7 +932,12 @@ pub async fn merge_overlay_batch(
             .iter()
             .map(|overlay| overlay.coverage.as_ref())
             .collect();
-        let routing = route_overlays(offsets_in_frag, &coverages);
+        let routing = match selection {
+            OverlayBatchSelection::Range(range) => {
+                route_contiguous(range.start, (range.end - range.start) as usize, &coverages)
+            }
+            OverlayBatchSelection::Indices(indices) => route_overlays(indices.values(), &coverages),
+        };
         if !routing.any_overlay {
             return Ok::<_, Error>((plan, None));
         }
