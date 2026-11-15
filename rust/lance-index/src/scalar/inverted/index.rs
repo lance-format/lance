@@ -116,7 +116,9 @@ mod prewarm;
 mod scheduling;
 mod search;
 mod search_candidates;
+mod selective_positions;
 mod token_set;
+mod whole_positions;
 
 pub use cache::*;
 pub use doc_set::*;

@@ -102,7 +102,7 @@ impl WandDocuments for CostOnlyDocuments {
     }
 }
 
-struct UnitScorer;
+pub(super) struct UnitScorer;
 
 impl Scorer for UnitScorer {
     fn query_weight(&self, _token: &str) -> f32 {
@@ -289,7 +289,7 @@ fn generate_impact_posting_list_with_freqs_and_block_size(
     ))
 }
 
-fn generate_posting_list_with_positions(
+pub(super) fn generate_posting_list_with_positions(
     doc_ids: Vec<u32>,
     positions_by_doc: Vec<Vec<u32>>,
     max_score: f32,

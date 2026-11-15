@@ -51,6 +51,7 @@ use crate::{
     versions,
 };
 
+mod binary_slices;
 pub(crate) mod structural;
 
 /// Default chunk size for reading large pages (8MiB)
@@ -2764,7 +2765,9 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::metadata,
     };
-    use lance_io::{scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        ReadBatchParams, scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize,
+    };
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
@@ -5257,6 +5260,198 @@ mod tests {
     /// The writer cuts a column into many small pages when its buffer is
     /// small (or, for nested columns, when the rep/def levels of a page hit
     /// the mini-block budget). Reading them must not cost one request per page.
+    #[rstest]
+    #[tokio::test]
+    async fn binary_slices_file_reader_crosses_pages_and_preserves_fallback(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)] encoding: &str,
+    ) {
+        let values = (0..6).map(|row| vec![b'a' + row; 8192]).collect::<Vec<_>>();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("payload", DataType::LargeBinary, false).with_metadata(HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                encoding.to_owned(),
+            )])),
+        ]));
+        let batches = values
+            .chunks(2)
+            .enumerate()
+            .map(|(batch, values)| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![
+                            batch as u32 * 2,
+                            batch as u32 * 2 + 1,
+                        ])),
+                        Arc::new(LargeBinaryArray::from_iter_values(values)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fs = FsFixture::default();
+        write_lance_file(
+            RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            &fs,
+            version,
+            FileWriterOptions {
+                data_cache_bytes: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(reader.metadata().column_infos[1].page_infos.len() >= 2);
+        fs.object_store.io_stats_incremental();
+        let slices = [120..137, 0..0, 3..11, 5..9];
+        for row in [0, 2, 5] {
+            let selected = reader.try_prepare_binary_value(1, row).await.unwrap();
+            if encoding == STRUCTURAL_ENCODING_MINIBLOCK && version != ConcreteFileVersion::V2_0 {
+                let value = selected.expect("current binary mini-block must support byte reads");
+                assert_eq!(value.len(), values[row as usize].len() as u64);
+                let before = fs.object_store.io_stats_snapshot();
+                let again = reader
+                    .try_prepare_binary_value(1, row)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let after = fs.object_store.io_stats_snapshot();
+                assert_eq!(again.len(), value.len());
+                assert_eq!(
+                    before.read_iops, after.read_iops,
+                    "cached preparation must not issue metadata reads"
+                );
+                assert_eq!(before.read_bytes, after.read_bytes);
+                let selected = value.read_slices(&slices).await.unwrap();
+                let tail = value
+                    .read_slices(&[value.len() - 1..value.len()])
+                    .await
+                    .unwrap();
+                assert_eq!(tail[0].as_ref(), &values[row as usize][8191..]);
+                for (bytes, slice) in selected.iter().zip(&slices) {
+                    assert_eq!(
+                        bytes.as_ref(),
+                        &values[row as usize][slice.start as usize..slice.end as usize]
+                    );
+                }
+            } else {
+                assert!(
+                    selected.is_none(),
+                    "unsupported layouts must request ordinary decoding"
+                );
+            }
+        }
+        let stats = fs.object_store.io_stats_incremental();
+        assert!(
+            stats.read_bytes < 8192,
+            "byte selections must not read a complete value: {}",
+            stats.read_bytes
+        );
+        let error = reader.try_prepare_binary_value(2, 0).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("physical columns"));
+        let error = reader.try_prepare_binary_value(1, 6).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("outside physical column"));
+        // The optional reader must leave ordinary scanning and unsupported
+        // encodings intact, including values on either side of page boundaries.
+        let batches = reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                100,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        for (row, value) in values.iter().enumerate() {
+            assert_eq!(actual["payload"].as_binary::<i64>().value(row), value);
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_slices_file_reader_uses_physical_column_row_domain() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("short", DataType::Int32, false),
+            Field::new("payload", DataType::LargeBinary, false).with_metadata(HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                STRUCTURAL_ENCODING_MINIBLOCK.to_owned(),
+            )])),
+        ]);
+        let fs = FsFixture::default();
+        let mut writer = versions::v2_3::create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            Schema::try_from(&schema).unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer
+            .write_column(0, Arc::new(Int32Array::from(vec![1])))
+            .await
+            .unwrap();
+        let values = [vec![b'a'; 1024], vec![b'b'; 1024], vec![b'c'; 1024]];
+        writer
+            .write_column(1, Arc::new(LargeBinaryArray::from_iter_values(&values)))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.column_num_rows(0).unwrap(), 1);
+        assert_eq!(reader.column_num_rows(1).unwrap(), 3);
+        let error = reader.try_prepare_binary_value(0, 1).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("outside physical column"));
+        let selected = reader
+            .try_prepare_binary_value(1, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 1024);
+        let selected = selected.read_slices(&[4..12]).await.unwrap();
+        assert_eq!(selected[0].as_ref(), &values[2][4..12]);
+        let error = reader.try_prepare_binary_value(1, 3).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("outside physical column"));
+    }
+
     #[tokio::test]
     async fn test_read_batches_page_reads_into_one_request() {
         let fs = FsFixture::default();

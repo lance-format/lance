@@ -30,10 +30,10 @@ pub use lance_index_core::remapping::{
     materialize_remap,
 };
 pub use lance_index_core::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter, OrderedScalarIndex, RowIdRemapper,
-    ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria,
-    TrainingOrdering, UpdateCriteria, lookup_batch, lookup_schema,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexBinaryReader, IndexFile, IndexReader,
+    IndexStore, IndexWriter, LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter,
+    OrderedScalarIndex, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
+    TrainingCriteria, TrainingOrdering, UpdateCriteria, lookup_batch, lookup_schema,
 };
 
 /// The most matches one built-in index's [`ScalarIndex::lookup`] batch holds.

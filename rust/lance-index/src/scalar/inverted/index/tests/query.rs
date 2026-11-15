@@ -2116,3 +2116,581 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
 
     assert_eq!(row_ids, vec![100]);
 }
+
+#[rstest::rstest]
+#[case::and(Operator::And)]
+#[case::or(Operator::Or)]
+#[tokio::test]
+async fn test_exact_single_term_phrase_uses_frequencies_without_positions(
+    #[case] operator: Operator,
+    #[values(0, 17)] query_position: u32,
+) {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().with_position(true);
+    let format = params.resolved_format_version();
+    let mut partition =
+        InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format);
+    partition.tokens.get_or_add("hit");
+    let mut posting =
+        PostingListBuilder::new_with_posting_tail_codec(true, format.posting_tail_codec());
+    posting.add(0, PositionRecorder::Position(vec![3, 7, 9].into()));
+    posting.add(1, PositionRecorder::Position(vec![4].into()));
+    partition.posting_lists.push(posting);
+    partition.docs.append(100, 10);
+    partition.docs.append(200, 6);
+    partition.docs.append(300, 6);
+    partition.write(store.as_ref()).await.unwrap();
+    write_test_metadata(&store, vec![0], params).await;
+
+    let index = InvertedIndex::load(store, None, &LanceCache::with_capacity(1 << 20))
+        .await
+        .unwrap();
+    let tokens = Arc::new(Tokens::with_positions(
+        vec!["hit".to_owned()],
+        vec![query_position],
+        DocType::Text,
+    ));
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let phrase = index
+        .bm25_search(
+            tokens.clone(),
+            Arc::new(params.clone().with_phrase_slop(Some(0))),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        index.partitions[0]
+            .inverted_list
+            .index_cache
+            .get_with_key(&PositionKey { token_id: 0 })
+            .await
+            .is_none(),
+        "a singleton exact phrase must not read or cache its position stream"
+    );
+    let matched = index
+        .bm25_search(
+            tokens,
+            Arc::new(params),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(phrase, matched);
+    let mut rows = phrase.0;
+    rows.sort_unstable();
+    assert_eq!(rows, vec![100, 200]);
+}
+
+#[tokio::test]
+async fn test_exact_single_term_phrase_still_requires_positional_index() {
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::memory()),
+        "index".into(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = write_single_partition_index(
+        store,
+        InvertedIndexParams::default().with_position(false),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await
+    .unwrap();
+    let error = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["hit".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_phrase_slop(Some(0))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("position is not found"),
+        "{error}"
+    );
+}
+
+#[rstest::rstest]
+#[case::all(false, false, true, vec![0_u64, 4])]
+#[case::filtered(true, false, true, vec![4_u64])]
+#[case::payload_evicted(false, true, true, vec![0_u64, 4])]
+#[case::filtered_payload_evicted(true, true, true, vec![4_u64])]
+#[case::metadata_disabled(false, true, false, vec![0_u64, 4])]
+#[case::filtered_metadata_disabled(true, true, false, vec![4_u64])]
+#[tokio::test]
+async fn selective_phrase_search_reads_committed_partitions(
+    #[case] filtered: bool,
+    #[case] evict_payload: bool,
+    #[case] cache_metadata: bool,
+    #[case] expected_rows: Vec<u64>,
+) -> Result<()> {
+    let dir = TempObjDir::default();
+    let object_store = Arc::new(ObjectStore::local());
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    write_pair_partition_with_position(
+        &store,
+        0,
+        &[("alpha", "beta", 0), ("beta", "alpha", 1)],
+        true,
+    )
+    .await;
+    write_pair_partition_with_position(&store, 1, &[("alpha", "gamma", 2)], true).await;
+    write_pair_partition_with_position(
+        &store,
+        2,
+        &[("alpha", "beta", 4), ("beta", "alpha", 5)],
+        true,
+    )
+    .await;
+    rewrite_selective_position_encoding(&store, 0..3).await?;
+    // Fixture construction above rewrites files. Start metadata caching only
+    // once their immutable contents have been finalized.
+    let metadata_cache = Arc::new(if cache_metadata {
+        LanceCache::with_capacity(1024 * 1024)
+    } else {
+        LanceCache::no_cache()
+    });
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        metadata_cache.clone(),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let (index, payload_cache) = load_prewarmed_index(
+        store,
+        vec![0, 1, 2],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".into(), "beta".into()],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(10))
+            .with_phrase_slop(Some(0)),
+    );
+    let scorer = Arc::new(index.bm25_base_scorer(&tokens, &params, None).await?);
+    let mask = if filtered {
+        RowAddrMask::from_allowed([4_u64, 5].into_iter().collect())
+    } else {
+        RowAddrMask::default()
+    };
+    let request = ModernSearchRequest {
+        tokens,
+        params,
+        operator: Operator::And,
+        mask: Arc::new(mask),
+        metrics: Arc::new(NoOpMetricsCollector),
+        impact_scorer: scorer,
+        limit: 10,
+        initial_score_floor: None,
+        term_ids: None,
+    };
+    let selected = index
+        .try_selective_phrase_search(request.clone())
+        .await?
+        .expect("current-format fixture must select the new reader");
+    let offset_activity_before = metadata_cache
+        .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+        .await
+        .by_type
+        .unwrap()
+        .activity
+        .into_iter()
+        .find(|entry| entry.type_name == "PositionOffsets");
+    if evict_payload {
+        payload_cache.clear().await;
+    }
+    let before = object_store.io_stats_snapshot();
+    let repeated = index
+        .try_selective_phrase_search(request.clone())
+        .await?
+        .expect("repeated search must use the same supported reader");
+    let after = object_store.io_stats_snapshot();
+    // Equal scores need not have the same asynchronous completion order.
+    let mut first_hits = selected
+        .iter()
+        .map(|Reverse(hit)| {
+            (
+                hit.document.partition_ordinal(),
+                hit.document.doc_id,
+                hit.score,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut repeated_hits = repeated
+        .iter()
+        .map(|Reverse(hit)| {
+            (
+                hit.document.partition_ordinal(),
+                hit.document.doc_id,
+                hit.score,
+            )
+        })
+        .collect::<Vec<_>>();
+    first_hits.sort_unstable();
+    repeated_hits.sort_unstable();
+    assert_eq!(first_hits, repeated_hits);
+    if evict_payload && cache_metadata {
+        let before = offset_activity_before
+            .expect("small immutable position offsets must use the file metadata budget")
+            .activity;
+        let after = metadata_cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+            .await
+            .by_type
+            .unwrap()
+            .activity
+            .into_iter()
+            .find(|entry| entry.type_name == "PositionOffsets")
+            .unwrap()
+            .activity;
+        assert!(before.loads_succeeded > 0);
+        assert_eq!(
+            before.loads_started, after.loads_started,
+            "evicting index payloads must not reload surviving position offsets"
+        );
+        assert!(after.hits > before.hits);
+    } else if cache_metadata {
+        assert_eq!(
+            before.read_iops, after.read_iops,
+            "warm selective search must reuse locations, offsets and payloads"
+        );
+        assert_eq!(before.read_bytes, after.read_bytes);
+    } else {
+        assert_eq!(metadata_cache.size_bytes().await, 0);
+    }
+    let mut rows = Vec::new();
+    for Reverse(hit) in selected {
+        let documents = index.partitions[hit.document.partition_ordinal()]
+            .docs
+            .modern()
+            .unwrap();
+        rows.push(
+            documents
+                .resolve_document_keys(&[hit.document.doc_id])
+                .await?[0]
+                .0,
+        );
+    }
+    rows.sort_unstable();
+    assert_eq!(rows, expected_rows);
+    let mut unsupported = request;
+    unsupported.params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(10))
+            .with_phrase_slop(Some(1)),
+    );
+    assert!(
+        index
+            .try_selective_phrase_search(unsupported)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+async fn rewrite_selective_position_encoding(
+    store: &Arc<LanceIndexStore>,
+    partition_ids: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    // Use the existing mini-block positions encoding emitted by final mergers.
+    for partition_id in partition_ids {
+        let path = posting_file_path(partition_id);
+        let reader = store.open_index_file(&path).await?;
+        let metadata = reader.schema().metadata.clone();
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let schema = batch.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == COMPRESSED_POSITION_COL {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert(
+                        lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.into(),
+                        lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                    );
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        drop(reader);
+        let mut writer = store.new_index_file(&path, schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish_with_metadata(metadata).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn selective_phrase_whole_positions_match_committed_arrow_streams() -> Result<()> {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        Arc::new(ObjectStore::local()),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    for partition_id in 0..2 {
+        let documents = (0..385)
+            .map(|row| {
+                let (left, right) = if row % 3 == 0 {
+                    ("alpha", "alpha")
+                } else if row % 3 == 1 {
+                    ("alpha", "beta")
+                } else {
+                    ("beta", "alpha")
+                };
+                (left, right, partition_id * 385 + row)
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition_with_position(&store, partition_id, &documents, true).await;
+    }
+    rewrite_selective_position_encoding(&store, 0..2).await?;
+    let (index, _) = load_prewarmed_index(
+        store.clone(),
+        vec![0, 1],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    for partition in &index.partitions {
+        let inverted = &partition.inverted_list;
+        let PositionsLayout::SharedStream(codec) = inverted.positions_layout else {
+            panic!("fixture must use current shared position streams");
+        };
+        let reader = inverted.reader.get().await?;
+        for token_id in 0..inverted.len() as u32 {
+            let batch = reader
+                .read_range(
+                    token_id as usize..token_id as usize + 1,
+                    Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
+                )
+                .await?;
+            let offsets = batch[POSITION_BLOCK_OFFSET_COL].as_list::<i32>().value(0);
+            let expected = SharedPositionStream::from_arrow(
+                codec,
+                offsets.as_primitive::<UInt32Type>().values().to_vec(),
+                batch[COMPRESSED_POSITION_COL].as_binary::<i64>().clone(),
+            );
+            // Compare the entire encoded stream, not only rows selected by a
+            // query. This includes repeated positions and the partial tail.
+            assert!(expected.block_count() > 1);
+            for _ in 0..2 {
+                let actual = whole_positions::try_read(reader.as_ref(), token_id, codec)
+                    .await?
+                    .expect("mini-block fixture must support direct reads");
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    actual.size(),
+                    actual.bytes().len() + std::mem::size_of_val(actual.block_offsets()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::unfiltered(false)]
+#[case::filtered(true)]
+#[tokio::test]
+async fn selective_phrase_reads_committed_windows(
+    #[case] filtered: bool,
+    #[values(2, 8)] num_partitions: u64,
+) -> Result<()> {
+    let dir = TempObjDir::default();
+    let object_store = Arc::new(ObjectStore::local());
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store.clone(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let mut expected = Vec::new();
+    for partition in 0..num_partitions {
+        // Span multiple posting blocks and small read windows. Row addresses
+        // are deliberately different from dense DocIds.
+        let rows = (0..645)
+            .map(|doc| {
+                let row = partition * 10_000 + doc * 2;
+                if doc % 3 == 0 && (!filtered || doc % 5 == 0) {
+                    expected.push(row);
+                }
+                if doc % 3 == 0 {
+                    ("alpha", "beta", row)
+                } else if doc % 3 == 1 {
+                    ("beta", "alpha", row)
+                } else {
+                    ("alpha", "gamma", row)
+                }
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition_with_position(&store, partition, &rows, true).await;
+    }
+    rewrite_selective_position_encoding(&store, 0..num_partitions).await?;
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        object_store,
+        dir.clone(),
+        Arc::new(LanceCache::with_capacity(1 << 20)),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    let (index, _cache) = load_prewarmed_index(
+        store,
+        (0..num_partitions).collect(),
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".into(), "beta".into()],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::default()
+            .with_limit(Some(2000))
+            .with_phrase_slop(Some(0)),
+    );
+    let mask = if filtered {
+        RowAddrMask::from_allowed(
+            (0..num_partitions)
+                .flat_map(|part| {
+                    (0..645)
+                        .filter(|doc| doc % 5 == 0)
+                        .map(move |doc| part * 10_000 + doc * 2)
+                })
+                .collect(),
+        )
+    } else {
+        RowAddrMask::default()
+    };
+    let request = ModernSearchRequest {
+        impact_scorer: Arc::new(index.bm25_base_scorer(&tokens, &params, None).await?),
+        tokens,
+        params,
+        operator: Operator::And,
+        mask: Arc::new(mask),
+        metrics: Arc::new(NoOpMetricsCollector),
+        limit: 2000,
+        initial_score_floor: None,
+        term_ids: None,
+    };
+    // An ordinary full-position WAND reference bypasses the selective entry
+    // point regardless of process feature flags, with the same corpus scorer.
+    let mut reference = Vec::new();
+    for part in &index.partitions {
+        let documents = part.docs.modern().unwrap();
+        let lengths = documents.lengths().await?;
+        let visibility = documents.visibility(request.mask.clone(), false).await?;
+        let fetched = part
+            .fetch_posting_lists(
+                &request.tokens,
+                &request.params,
+                Operator::And,
+                request.metrics.as_ref(),
+                PostingLoadOptions::cache_aware_exact(),
+                None,
+            )
+            .await?
+            .unwrap();
+        let loaded = fetched.into_loaded(&request.tokens, request.impact_scorer.as_ref())?;
+        let idf = idf_by_position(&loaded.postings, request.impact_scorer.as_ref());
+        let docs = ModernWandDocuments::filtered(&lengths, &visibility);
+        let candidates = Wand::new(
+            Operator::And,
+            loaded.postings.into_iter(),
+            &docs,
+            request.impact_scorer.clone(),
+        )
+        .search(&request.params, request.metrics.as_ref())?;
+        for (doc, score) in rescore_partition_candidates(
+            PartitionCandidates {
+                idf_by_position: idf,
+                grouped_expansions: Vec::new(),
+                candidates,
+            },
+            request.impact_scorer.as_ref(),
+        ) {
+            let row = documents.resolve_document_keys(&[doc]).await?[0].0;
+            reference.push((row, score));
+        }
+    }
+    reference.sort_unstable_by_key(|hit| hit.0);
+    assert_eq!(
+        reference.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+        expected
+    );
+    // Vary the window key, then revisit a surviving plan on the same cache.
+    for window_bytes in [16, 32, 16] {
+        let selected = index
+            .try_selective_phrase_search_with_config(
+                request.clone(),
+                selective_positions::SearchConfig { window_bytes },
+            )
+            .await?
+            .unwrap();
+        let mut actual = Vec::new();
+        for Reverse(hit) in selected {
+            let row = index.partitions[hit.document.partition_ordinal()]
+                .docs
+                .modern()
+                .unwrap()
+                .resolve_document_keys(&[hit.document.doc_id])
+                .await?[0]
+                .0;
+            actual.push((row, hit.score.0));
+        }
+        actual.sort_unstable_by_key(|hit| hit.0);
+        assert_eq!(actual, reference, "window {window_bytes}");
+    }
+    // Partition-local collectors publish their kth score globally. A bounded
+    // global top-k must retain a valid cutoff tie across physical partitions.
+    let mut limited = request;
+    limited.limit = 1;
+    limited.params = Arc::new(limited.params.as_ref().clone().with_limit(Some(1)));
+    let hits = index
+        .try_selective_phrase_search_with_config(
+            limited,
+            selective_positions::SearchConfig { window_bytes: 16 },
+        )
+        .await?
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    let hit = &hits[0].0;
+    let row = index.partitions[hit.document.partition_ordinal()]
+        .docs
+        .modern()
+        .unwrap()
+        .resolve_document_keys(&[hit.document.doc_id])
+        .await?[0]
+        .0;
+    assert!(expected.contains(&row));
+    assert_eq!(hit.score.0, reference[0].1);
+    Ok(())
+}

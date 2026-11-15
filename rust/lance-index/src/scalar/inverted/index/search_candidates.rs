@@ -29,6 +29,7 @@ pub(super) fn idf_by_position(postings: &[PostingIterator], scorer: &MemBM25Scor
     idf_by_position
 }
 
+#[derive(Clone)]
 pub(super) struct ModernSearchRequest<'a> {
     pub(super) tokens: Arc<Tokens>,
     pub(super) params: Arc<FtsSearchParams>,

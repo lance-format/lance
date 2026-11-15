@@ -245,8 +245,24 @@ impl StructuralFileSink {
         &mut self,
         mut encoding_tasks: FuturesOrdered<EncodeTask>,
     ) -> Result<()> {
+        // Encoding futures can already own work in the shared CPU pool.
+        // Dropping them on the first error would detach that work. Stop writes
+        // after failure but retain and drain every accepted encoder join.
+        let mut first_error = None;
         while let Some(encoding_task) = encoding_tasks.next().await {
-            self.write_page(encoding_task?).await?;
+            if first_error.is_some() {
+                continue;
+            }
+            let result = match encoding_task {
+                Ok(page) => self.write_page(page).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         // Reaps any upload that has already failed so the error is attributed to
         // this batch. This does not wait for in-flight uploads; see
@@ -933,6 +949,20 @@ mod tests {
     use lance_core::datatypes::Schema;
 
     use super::EncodingPipeline;
+
+    #[tokio::test]
+    async fn page_encoder_failure_drains_remaining_work() {
+        let store = lance_io::object_store::ObjectStore::memory();
+        let writer = store
+            .create(&object_store::path::Path::from("failure.lance"))
+            .await
+            .unwrap();
+        let mut sink = super::StructuralFileSink::new(writer);
+        crate::writer::writer_tests::assert_page_encoder_failure_drains(move |tasks| async move {
+            sink.write_pages(tasks).await
+        })
+        .await;
+    }
 
     /// `analysis: struct<changed: bool>` where the child is declared
     /// non-nullable, built with a nullable child so the array can carry the
