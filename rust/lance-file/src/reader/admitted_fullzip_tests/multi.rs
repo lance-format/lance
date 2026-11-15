@@ -409,6 +409,7 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
 async fn queued_batch_owns_all_columns_and_credit(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
+    #[values(false, true)] partial: bool,
     #[values("delivered", "cancelled", "dropped", "undelivered", "error")] outcome: &str,
 ) {
     let (_fs, mut reader) = fixture_batches(version, lite, batches(), 1).await;
@@ -418,9 +419,10 @@ async fn queued_batch_owns_all_columns_and_credit(
     let budget = AllocationBudget::new(4096);
     let peer = budget.try_reserve(1024).unwrap();
     let mut scan = reader
-        .open_admitted_fullzip_scan(0..7, budget.clone(), 3072, 3)
+        .open_admitted_fullzip_scan(0..7, budget.clone(), if partial { 4096 } else { 3072 }, 3)
         .await
-        .unwrap();
+        .unwrap()
+        .with_partial_workspace(partial);
     let queued = RefCell::new(None);
     let entered = tokio::sync::Notify::new();
     let dispatches = AtomicUsize::new(0);
@@ -483,6 +485,96 @@ async fn queued_batch_owns_all_columns_and_credit(
     }
     assert_eq!(budget.reserved(), peer.len());
     drop(peer);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn partial_workspace_progresses_while_another_file_retains_output(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] partial: bool,
+) {
+    let (_fs_a, reader_a) = fixture_arrays(version, lite, vec![array(17, 1)]).await;
+    let arrays = [array(31, 1), array(32, 1)];
+    let expected = arrow_select::concat::concat(&[arrays[0].as_ref(), arrays[1].as_ref()]).unwrap();
+    let (_fs_b, reader_b) = fixture_arrays(version, lite, arrays.to_vec()).await;
+    let stats = IoStats::new();
+    let reader_b = reader_b.with_io_stats(stats.recorder());
+    let budget = AllocationBudget::new(4096);
+    let mut a = reader_a
+        .open_admitted_fullzip_scan(0..1, budget.clone(), 4096, 1)
+        .await
+        .unwrap();
+    let FullZipScanOutcome::Batch { batch, .. } = a.try_next().await.unwrap() else {
+        panic!("first file must complete one row")
+    };
+    assert_eq!(
+        batch.column(0).to_data(),
+        array(17, 1).slice(0, 1).to_data()
+    );
+    let mut held = Some(batch.column(0).slice(0, 1));
+    drop((batch, a, reader_a));
+    let held_bytes = budget.reserved();
+    assert!(held_bytes > 0 && held_bytes < 4095);
+    let mut b = reader_b
+        .open_admitted_fullzip_scan(0..expected.len() as u64, budget.clone(), 4096, 4)
+        .await
+        .unwrap()
+        .with_partial_workspace(partial);
+    // Exhaustion must remain a finite refusal with no partial output or cursor
+    // advancement, even when the smaller workspace cannot hold a minimal row.
+    let blocker = budget.try_reserve(4095 - held_bytes).unwrap();
+    assert!(matches!(
+        b.try_next().await.unwrap(),
+        FullZipScanOutcome::NeedsCapacity
+    ));
+    assert_eq!(b.position(), 0);
+    assert_eq!(stats.snapshot().iops, 0);
+    assert_eq!(budget.reserved(), 4095);
+    drop(blocker);
+    if !partial {
+        // Preserve default exact-workspace semantics for existing callers.
+        assert!(matches!(
+            b.try_next().await.unwrap(),
+            FullZipScanOutcome::NeedsCapacity
+        ));
+        assert_eq!(b.position(), 0);
+        assert_eq!(stats.snapshot().iops, 0);
+        drop(held.take());
+    }
+    let retained = budget.reserved();
+    let mut next = 0;
+    loop {
+        match b.try_next().await.unwrap() {
+            FullZipScanOutcome::Batch { rows, batch } => {
+                assert_eq!(rows.start, next);
+                assert!(rows.end > rows.start && rows.end <= expected.len() as u64);
+                assert_eq!(
+                    batch.column(0).to_data(),
+                    expected.slice(next as usize, batch.num_rows()).to_data()
+                );
+                next = rows.end;
+                assert!(budget.reserved() <= 4096);
+                drop(batch);
+                assert_eq!(budget.reserved(), retained);
+            }
+            FullZipScanOutcome::Finished => break,
+            FullZipScanOutcome::NeedsCapacity => {
+                panic!("second file's row must fit available credit")
+            }
+        }
+    }
+    assert_eq!(next, expected.len() as u64);
+    assert!(stats.snapshot().iops > 0);
+    if partial {
+        assert_eq!(budget.reserved(), held_bytes);
+        assert!(
+            held.is_some(),
+            "the slow first consumer must still own its output"
+        );
+    }
+    drop((held, b));
     assert_eq!(budget.reserved(), 0);
 }
 

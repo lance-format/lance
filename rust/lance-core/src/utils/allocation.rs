@@ -61,6 +61,40 @@ impl AllocationBudget {
             bytes,
         })
     }
+
+    /// Atomically reserve available credit up to `maximum`, without waiting.
+    /// Returns `None` for a zero maximum or an exhausted pool. The caller must
+    /// plan against the returned length, which may be smaller than requested.
+    /// This never grows a workspace already holding input. Drop a failed attempt
+    /// before retrying; it does not guarantee fairness between competing callers.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// let budget = AllocationBudget::new(4096);
+    /// let held = budget.try_reserve(1024).unwrap();
+    /// let work = budget.try_reserve_up_to(4096).unwrap();
+    /// assert_eq!(work.len(), 3072);
+    /// assert!(budget.try_reserve_up_to(1).is_none());
+    /// drop((held, work));
+    /// assert_eq!(budget.reserved(), 0);
+    /// ```
+    pub fn try_reserve_up_to(self: &Arc<Self>, maximum: usize) -> Option<Reservation> {
+        let previous = self
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let bytes = self.limit.checked_sub(used)?.min(maximum);
+                if bytes == 0 {
+                    None
+                } else {
+                    used.checked_add(bytes)
+                }
+            })
+            .ok()?;
+        Some(Reservation {
+            budget: self.clone(),
+            bytes: (self.limit - previous).min(maximum),
+        })
+    }
 }
 
 /// Exclusive credit for one workspace. Splitting transfers credit without charging twice.
@@ -220,6 +254,58 @@ impl AsMut<[u8]> for ReservedBuffer {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::zero(0, None)]
+    #[case::smaller(17, Some(17))]
+    #[case::larger(64, Some(41))]
+    #[case::maximum(usize::MAX, Some(41))]
+    fn available_workspaces_preserve_shared_owner_credit(
+        #[case] maximum: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let budget = AllocationBudget::new(64);
+        let held = budget.try_reserve(23).unwrap().allocate().unwrap().freeze();
+        let alias = held.slice(0..1);
+        drop(held);
+        let work = budget.try_reserve_up_to(maximum);
+        assert_eq!(work.as_ref().map(Reservation::len), expected);
+        assert_eq!(budget.reserved(), 23 + expected.unwrap_or(0));
+        drop(work);
+        assert_eq!(budget.reserved(), 23);
+        drop(alias);
+        assert_eq!(budget.reserved(), 0);
+        let all = budget.try_reserve_up_to(64).unwrap();
+        assert_eq!(all.len(), 64);
+        assert!(budget.try_reserve_up_to(1).is_none());
+        drop(all);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn available_workspaces_are_atomic_under_contention() {
+        let budget = AllocationBudget::new(10000);
+        let start = std::sync::Barrier::new(4);
+        let workspaces = std::thread::scope(|scope| {
+            let jobs = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        budget.try_reserve_up_to(4096)
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .filter_map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut sizes = workspaces.iter().map(Reservation::len).collect::<Vec<_>>();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [1808, 4096, 4096]);
+        assert_eq!(budget.reserved(), 10000);
+        drop(workspaces);
+        assert_eq!(budget.reserved(), 0);
+    }
 
     #[rstest]
     #[case::empty(0)]

@@ -56,6 +56,7 @@ pub struct FullZipScan {
     schema: Arc<ArrowSchema>,
     budget: Arc<AllocationBudget>,
     workspace_bytes: usize,
+    is_partial_workspace_enabled: bool,
     max_rows: u64,
     end: u64,
     cursor: u64,
@@ -230,6 +231,7 @@ impl FileReader {
             schema,
             budget,
             workspace_bytes,
+            is_partial_workspace_enabled: false,
             max_rows,
             end: rows.end,
             cursor: rows.start,
@@ -266,6 +268,34 @@ impl FullZipColumn {
 }
 
 impl FullZipScan {
+    /// Allow an attempt to use currently available credit below its configured
+    /// workspace size. This lets a file make progress while another file's output
+    /// still retains part of the shared budget. The entire smaller workspace is
+    /// admitted atomically before I/O; dependent work never waits for more credit.
+    ///
+    /// Disabled by default. Enabling can produce smaller batches and more prefix
+    /// attempts/reads; performance is not qualified. If even one row cannot fit,
+    /// `try_next` returns `NeedsCapacity` without advancing, never EOF. The caller
+    /// still owns drain/replan scheduling and fairness between competing scans.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{Result, utils::allocation::AllocationBudget};
+    /// use lance_file::reader::FileReader;
+    /// async fn scan(reader: &FileReader, budget: Arc<AllocationBudget>) -> Result<()> {
+    ///     let mut scan = reader.open_admitted_fullzip_scan(
+    ///         0..reader.num_rows(), budget, 65536, 1024).await?
+    ///         .with_partial_workspace(true);
+    ///     let outcome = scan.try_next().await?;
+    ///     drop(outcome); // consume or drain before requesting more
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn with_partial_workspace(mut self, is_enabled: bool) -> Self {
+        self.is_partial_workspace_enabled = is_enabled;
+        self
+    }
+
     /// The next file-local top-level row; unchanged on refusal, error or cancellation.
     pub fn position(&self) -> u64 {
         self.cursor
@@ -338,7 +368,12 @@ impl FullZipScan {
         }
         let mut rows = self.cursor..end;
         loop {
-            let Some(workspace) = self.budget.try_reserve(self.workspace_bytes) else {
+            let workspace = if self.is_partial_workspace_enabled {
+                self.budget.try_reserve_up_to(self.workspace_bytes)
+            } else {
+                self.budget.try_reserve(self.workspace_bytes)
+            };
+            let Some(workspace) = workspace else {
                 return Ok(FullZipScanOutcome::NeedsCapacity);
             };
             let batch = self
