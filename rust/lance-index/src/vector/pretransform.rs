@@ -22,7 +22,10 @@ use super::ivf::storage::IvfModel;
 use super::pca::PcaModel;
 use super::quantizer::{QuantizationType, Quantizer};
 use super::v3::subindex::SubIndexType;
-use super::{PartitionSearchControl, PreparedPartitionSearchHandle, Query, VectorIndex};
+use super::{
+    PartitionRowDistances, PartitionSearchControl, PreparedPartitionRows,
+    PreparedPartitionSearchHandle, Query, VectorIndex,
+};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::{Index, IndexType};
@@ -127,6 +130,30 @@ impl VectorIndex for PreTransformIndex {
         self.inner
             .search_in_partition(partition_id, &query, pre_filter, metrics)
             .await
+    }
+
+    async fn prepare_partition_rows(
+        &self,
+        partition_id: usize,
+        queries: &[Query],
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionRows> {
+        let queries = queries
+            .iter()
+            .map(|query| self.transformed_query(query))
+            .collect::<Result<Vec<_>>>()?;
+        self.inner
+            .prepare_partition_rows(partition_id, &queries, pre_filter, metrics)
+            .await
+    }
+
+    fn score_prepared_partition_rows(
+        &self,
+        prepared: PreparedPartitionRows,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PartitionRowDistances> {
+        self.inner.score_prepared_partition_rows(prepared, metrics)
     }
 
     async fn prepare_partition_search(
@@ -338,6 +365,8 @@ mod tests {
         find_partitions: usize,
         search_partitions: usize,
         search_in_partition: usize,
+        prepare_partition_rows: usize,
+        score_prepared_partition_rows: usize,
         prepare: usize,
         execute_prepared: usize,
     }
@@ -445,6 +474,30 @@ mod tests {
             self.calls.lock().unwrap().search_in_partition += 1;
             self.record_query(query);
             Ok(Self::result_batch())
+        }
+
+        async fn prepare_partition_rows(
+            &self,
+            _partition_id: usize,
+            queries: &[Query],
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<PreparedPartitionRows> {
+            self.calls.lock().unwrap().prepare_partition_rows += 1;
+            queries.iter().for_each(|query| self.record_query(query));
+            Ok(PreparedPartitionRows {
+                size_bytes: 0,
+                handle: Box::new(()),
+            })
+        }
+
+        fn score_prepared_partition_rows(
+            &self,
+            _prepared: PreparedPartitionRows,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<PartitionRowDistances> {
+            self.calls.lock().unwrap().score_prepared_partition_rows += 1;
+            Ok(PartitionRowDistances::default())
         }
 
         async fn prepare_partition_search(
@@ -655,6 +708,31 @@ mod tests {
 
         assert_eq!(inner.calls.lock().unwrap().search_in_partition, 1);
         assert_transformed_query(&inner.queries.lock().unwrap()[0], &query, &model);
+    }
+
+    #[tokio::test]
+    async fn partition_row_scoring_transforms_every_query_once() {
+        let (index, inner, model) = decorated();
+        let queries = [query(), query()];
+
+        let prepared = index
+            .prepare_partition_rows(3, &queries, Arc::new(NoFilter), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        index
+            .score_prepared_partition_rows(prepared, &NoOpMetricsCollector)
+            .unwrap();
+
+        {
+            let calls = inner.calls.lock().unwrap();
+            assert_eq!(calls.prepare_partition_rows, 1);
+            assert_eq!(calls.score_prepared_partition_rows, 1);
+        }
+        let recorded = inner.queries.lock().unwrap();
+        assert_eq!(recorded.len(), queries.len());
+        for (actual, original) in recorded.iter().zip(&queries) {
+            assert_transformed_query(actual, original, &model);
+        }
     }
 
     #[tokio::test]

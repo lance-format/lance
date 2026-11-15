@@ -56,7 +56,12 @@ use lance_core::{Error, Result};
 
 use crate::planner::Planner;
 
-const ANY_ELEMENT: &str = "any_element";
+mod lambda;
+
+pub use lambda::rewrite_element_lambdas;
+
+/// The name `any_element` is registered under.
+pub const ANY_ELEMENT: &str = "any_element";
 
 /// Compiled predicates kept per process; the cache is cleared when it is full.
 const MAX_COMPILED: usize = 1024;
@@ -124,6 +129,25 @@ fn first_non_immutable_function(expr: &Expr) -> Result<Option<String>> {
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found)
+}
+
+/// The predicate of an `any_element` call, given its second argument: the
+/// string literal, or `None` when the argument is anything else.
+pub fn any_element_predicate(arg: &Expr) -> Option<&str> {
+    match arg {
+        Expr::Literal(value, _) => predicate_str(value),
+        _ => None,
+    }
+}
+
+/// Parse and optimize `predicate` over the elements of `list_type` exactly as
+/// `any_element` does before evaluating it, so an index can plan the same
+/// expression the scan evaluates.
+///
+/// Fails, with the error `any_element` reports, when `list_type` is not a list
+/// of structs or the predicate does not plan over the element fields.
+pub fn plan_element_predicate(list_type: &DataType, predicate: &str) -> Result<Expr> {
+    parse_element_predicate(&Planner::new(element_schema(list_type)?), predicate)
 }
 
 fn predicate_str(value: &ScalarValue) -> Option<&str> {
@@ -514,6 +538,65 @@ mod tests {
         );
     }
 
+    /// The lambda form plans to the same `any_element` call, so it gets the
+    /// same answers, literal handling and Substrait encoding.
+    #[rstest]
+    #[case::same_element(
+        "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)",
+        Q1
+    )]
+    #[case::inclusive_float_bound(
+        "array_any_match(detections, d -> d.label = 'car' AND d.confidence >= 0.9)",
+        "any_element(detections, 'label = ''car'' AND confidence >= 0.9')"
+    )]
+    #[case::alias_and_null_test(
+        "any_match(detections, (x) -> x.confidence IS NULL)",
+        "any_element(detections, 'confidence IS NULL')"
+    )]
+    #[case::negated_with_row_column(
+        "NOT array_any_match(detections, d -> d['label'] IN ('person', 'truck')) AND width > 1920",
+        "NOT any_element(detections, '`label` IN (''person'', ''truck'')') AND width > 1920"
+    )]
+    fn test_lambda_form_is_any_element(#[case] lambda: &str, #[case] call: &str) {
+        let planner = Planner::new(schema(false));
+        assert_eq!(
+            planner.parse_filter(lambda).unwrap(),
+            planner.parse_filter(call).unwrap()
+        );
+        assert_eq!(eval(lambda, false), eval(call, false));
+    }
+
+    /// A deep chain below `NOT` is balanced before the recursive visitors
+    /// reach it, and its lambda calls are still rewritten: if they were not,
+    /// the filter could not be parsed.
+    #[test]
+    fn test_deep_filter_with_lambda_calls() {
+        let lambda = "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)";
+        let chain = std::iter::repeat_n(lambda, 1000)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert_eq!(
+            eval(&format!("NOT ({chain})"), false),
+            BooleanArray::from(vec![T, F, T, N, F, N, N, T, F])
+        );
+    }
+
+    /// A deep predicate inside the lambda body is balanced before the body is
+    /// cloned, checked and printed, all of which recurse over the AST.
+    #[test]
+    fn test_deep_lambda_body() {
+        let predicate = std::iter::repeat_n("d.label = 'car'", 1000)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert_eq!(
+            eval(
+                &format!("array_any_match(detections, d -> {predicate})"),
+                false
+            ),
+            BooleanArray::from(vec![T, T, F, N, T, N, T, T, T])
+        );
+    }
+
     #[test]
     fn test_predicate_forms() {
         // >=, IN, BETWEEN, IS NULL and OR inside the element predicate.
@@ -603,6 +686,10 @@ mod tests {
         assert_eq!(
             eval("any_element(detections, 'details.label IS NULL')"),
             BooleanArray::from(vec![T, T, F, F])
+        );
+        assert_eq!(
+            eval("array_any_match(detections, d -> d.details.label = 'car')"),
+            BooleanArray::from(vec![N, N, T, F])
         );
     }
 
