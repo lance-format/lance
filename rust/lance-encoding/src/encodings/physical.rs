@@ -20,6 +20,8 @@ pub mod dictionary;
 pub mod fsst;
 pub mod general;
 pub mod packed;
+#[cfg(feature = "pcodec")]
+pub mod pcodec;
 pub mod range;
 pub mod rle;
 pub(crate) mod sequence;

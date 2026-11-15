@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import atexit
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterable, Optional, Union
@@ -15,6 +15,8 @@ class CachedDataset:
         stream: Iterable[pa.RecordBatch],
         cache: Optional[Union[str, Path, bool]] = None,
     ):
+        # TemporaryDirectory owns its exit finalizer. Retaining this cache in an
+        # atexit callback would also retain discarded caches' source streams.
         self.cache_dir: Optional[TemporaryDirectory] = None
         if cache is None or cache is True:
             self.cache_dir = TemporaryDirectory(
@@ -30,8 +32,6 @@ class CachedDataset:
         self.cache_file = None
         self.stream = stream
         self.finished_origin_stream = False
-
-        atexit.register(lambda x: x.close(), self)
 
     def close(self):
         """Close the dataset and delete tmp files"""
@@ -51,18 +51,32 @@ class CachedDataset:
         self.close()
 
     def __iter__(self):
+        if self.finished_origin_stream and self.cache_file is None:
+            return
         if self.cache_file is None:
             # First iteration.
-            writer: Optional[pa.ipc.RecordBatchFileWriter] = None
-            for batch in self.stream:
-                if writer is None:
-                    self.cache_file = Path(self.cache_dir.name) / "cache.arrow"
-                    writer = pa.ipc.new_stream(str(self.cache_file), batch.schema)
-                writer.write(batch)
-                yield batch
-                del batch
-            writer.close()
-            self.finished_origin_stream = True
+            writer: Optional[pa.ipc.RecordBatchStreamWriter] = None
+            try:
+                with ExitStack() as resources:
+                    for batch in self.stream:
+                        if writer is None:
+                            self.cache_file = Path(self.cache_dir.name) / "cache.arrow"
+                            # Closing the IPC writer does not close its sink.
+                            sink = resources.enter_context(
+                                pa.OSFile(str(self.cache_file), "wb")
+                            )
+                            writer = resources.enter_context(
+                                pa.ipc.new_stream(sink, batch.schema)
+                            )
+                        writer.write(batch)
+                        yield batch
+                        del batch
+                self.finished_origin_stream = True
+            finally:
+                if not self.finished_origin_stream:
+                    # Partial caches cannot be replayed. Close the writer and sink
+                    # before removing their directory, including on Windows.
+                    self.close()
         else:
             # Follow up iteration
             if not self.finished_origin_stream:

@@ -305,6 +305,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         cache : str or bool, optional
             If set true, the dataset will be cached on disk from the first iteration.
             The following iterations will read from the cache.
+            An interrupted first iteration discards its partial cache; the next
+            iteration rebuilds it from the source. Interrupting a later iteration
+            preserves the completed cache.
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
@@ -405,7 +408,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
             elif self.shard_granularity == "fragment":
                 sampler = ShardedFragmentSampler(rank, world_size)
             else:
-                raise ValueError("Invalid shard_granularity: {}")
+                raise ValueError(f"Invalid shard_granularity: {self.shard_granularity}")
         else:
             sampler = self.sampler
 
@@ -416,6 +419,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
             ]
 
         stream: Iterable[pa.RecordBatch]
+        if (
+            self.cached_ds is not None
+            and not self.cached_ds.finished_origin_stream
+            and self.cached_ds.cache_dir is None
+        ):
+            # The first cache fill was cancelled and its partial files removed.
+            # Build a new scanner rather than reuse the interrupted source stream.
+            self.cached_ds = None
         if self.cached_ds:
             stream = self.cached_ds
         else:
@@ -528,22 +539,23 @@ def get_safe_loader(dataset, batch_size=32, num_workers=4, **kwargs):
         **kwargs: Additional DataLoader arguments. Note:
                  - Forces 'spawn' context for Windows compatibility
                  - Sets persistent_workers=True by default
+                 - Both defaults apply only when num_workers > 0
                  - User-provided args override defaults
 
     Returns:
         Configured DataLoader instance with process-safe settings
     """
 
-    # Force spawn context for Windows/multiprocessing compatibility
-    ctx = torch.multiprocessing.get_context("spawn")
-
-    # Configure default parameters with process safety
-    loader_args = {
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "persistent_workers": kwargs.pop("persistent_workers", True),
-        "multiprocessing_context": ctx,
-        **kwargs,  # User-provided arguments take priority
-    }
+    loader_args = {"batch_size": batch_size, "num_workers": num_workers}
+    # DataLoader rejects persistent_workers=True and multiprocessing_context
+    # when num_workers == 0, so only set them for multi-process loading.
+    if num_workers > 0:
+        loader_args["persistent_workers"] = True
+        # Force spawn context for Windows/multiprocessing compatibility
+        loader_args["multiprocessing_context"] = torch.multiprocessing.get_context(
+            "spawn"
+        )
+    # User-provided arguments take priority
+    loader_args.update(kwargs)
 
     return torch.utils.data.DataLoader(dataset, **loader_args)

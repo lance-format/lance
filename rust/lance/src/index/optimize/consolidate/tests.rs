@@ -4,10 +4,13 @@
 use super::*;
 use crate::dataset::WriteParams;
 use crate::index::{CreateIndexBuilder, vector::VectorIndexParams};
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
 };
 use arrow_schema::{DataType, Field, Schema};
+use chrono::DateTime;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -423,6 +426,99 @@ async fn concurrent_delete_and_append_reuses_staged_output(#[case] stable: bool)
         .await
         .unwrap();
     assert_query(&dataset, BASE + SMALL - 16 + 96).await;
+}
+
+#[tokio::test]
+async fn commit_with_mixed_precision() {
+    const ROWS: usize = 64;
+    // Share manifest bytes across independent sessions and avoid the
+    // platform-dependent ETags of local file commits.
+    const URI: &str = "shared-memory://consolidation-timestamp-precision/";
+    let first = batch(0, ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(first.clone())], first.schema()),
+        URI,
+        None,
+    )
+    .await
+    .unwrap();
+    append(&mut dataset, ROWS, ROWS).await;
+
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    let created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+    let mut sources = Vec::new();
+    for fragment in 0..2 {
+        let mut segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name(NAME.to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        segment.created_at = Some(created_at);
+        sources.push(segment);
+    }
+    // Commit the supplied timestamp so the cache retains a known sub-millisecond value.
+    let transaction = TransactionBuilder::new(
+        dataset.version_id(),
+        Operation::CreateIndex {
+            new_indices: sources,
+            removed_indices: vec![],
+        },
+    )
+    .build();
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let options = OptimizeOptions::consolidate(2 * ROWS as u64);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    let results = execute(&dataset, &plan).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].replaces.len(), 2);
+    let output = results[0].segment.uuid;
+
+    let mut concurrent = Dataset::open(URI).await.unwrap();
+    append(&mut concurrent, 2 * ROWS, ROWS).await;
+    dataset.checkout_latest().await.unwrap();
+    let planned = dataset.checkout_version(plan.read_version).await.unwrap();
+    let cached_segments = segments(&planned).await;
+    let persisted_segments = segments(&dataset).await;
+    assert_eq!(cached_segments.len(), 2);
+    assert_eq!(persisted_segments.len(), 2);
+    let persisted_created_at = DateTime::from_timestamp_millis(created_at.timestamp_millis());
+    for cached in &cached_segments {
+        let persisted = persisted_segments
+            .iter()
+            .find(|segment| segment.uuid == cached.uuid)
+            .expect("append preserves the source segment");
+        assert_eq!(cached.created_at, Some(created_at));
+        assert_eq!(persisted.created_at, persisted_created_at);
+        let mut expected = cached.clone();
+        expected.created_at = persisted_created_at;
+        assert_eq!(&expected, persisted);
+    }
+
+    commit_optimize_indices(&mut dataset, results, &options)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version_id(), concurrent.version_id() + 1);
+    let committed = segments(&dataset).await;
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].uuid, output);
+    assert_eq!(
+        committed[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+
+    let query = first["vector"].as_fixed_size_list().value(0);
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query.as_ref(), 1)
+        .unwrap()
+        .fast_search();
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
 }
 
 #[tokio::test]
