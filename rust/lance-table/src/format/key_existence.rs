@@ -288,9 +288,17 @@ impl KeyExistenceFilter {
         // Parse the bloom filter once for the whole batch instead of rebuilding
         // it for every row.
         let parsed = self.parse()?;
+        // Logical nulls also cover a dictionary key that points at a null value.
+        let nulls: Vec<_> = columns
+            .iter()
+            .map(|column| column.logical_nulls())
+            .collect();
         let mut present = Vec::with_capacity(num_rows);
         for row_idx in 0..num_rows {
-            if columns.iter().any(|column| column.is_null(row_idx)) {
+            if nulls
+                .iter()
+                .any(|nulls| nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx)))
+            {
                 present.push(false);
                 continue;
             }
@@ -443,9 +451,9 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
         }
         // The other primary key types map onto the existing variants: widened
         // integers, IEEE bit patterns, or raw bytes. A column's type is fixed,
-        // so each encoding is injective within a column. A type that falls
-        // through to `None` leaves the inserted-rows filter empty, and then
-        // concurrent inserts of the same key do not conflict.
+        // so keys the merge join tells apart get different bytes. A type that
+        // falls through to `None` leaves the inserted-rows filter empty, and
+        // then concurrent inserts of the same key do not conflict.
         DataType::Int8 => {
             let arr = array.as_primitive::<arrow_array::types::Int8Type>();
             KeyValue::Int64(arr.value(row_idx) as i64)
@@ -462,17 +470,33 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
             let arr = array.as_primitive::<arrow_array::types::UInt16Type>();
             KeyValue::UInt64(arr.value(row_idx) as u64)
         }
+        // The merge join treats -0.0 and 0.0 as the same key, so both zeros
+        // share one encoding.
         DataType::Float16 => {
-            let arr = array.as_primitive::<arrow_array::types::Float16Type>();
-            KeyValue::UInt64(arr.value(row_idx).to_bits() as u64)
+            let value = array
+                .as_primitive::<arrow_array::types::Float16Type>()
+                .value(row_idx);
+            KeyValue::UInt64(if value.to_f32() == 0.0 {
+                0
+            } else {
+                value.to_bits() as u64
+            })
         }
         DataType::Float32 => {
-            let arr = array.as_primitive::<arrow_array::types::Float32Type>();
-            KeyValue::UInt64(arr.value(row_idx).to_bits() as u64)
+            let value = array
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .value(row_idx);
+            KeyValue::UInt64(if value == 0.0 {
+                0
+            } else {
+                value.to_bits() as u64
+            })
         }
         DataType::Float64 => {
-            let arr = array.as_primitive::<arrow_array::types::Float64Type>();
-            KeyValue::UInt64(arr.value(row_idx).to_bits())
+            let value = array
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(row_idx);
+            KeyValue::UInt64(if value == 0.0 { 0 } else { value.to_bits() })
         }
         DataType::Boolean => {
             let arr = array.as_any().downcast_ref::<BooleanArray>()?;
@@ -517,6 +541,23 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
                     .value(row_idx),
                 TimeUnit::Nanosecond => array
                     .as_primitive::<arrow_array::types::TimestampNanosecondType>()
+                    .value(row_idx),
+            };
+            KeyValue::Int64(value)
+        }
+        DataType::Duration(unit) => {
+            let value = match unit {
+                TimeUnit::Second => array
+                    .as_primitive::<arrow_array::types::DurationSecondType>()
+                    .value(row_idx),
+                TimeUnit::Millisecond => array
+                    .as_primitive::<arrow_array::types::DurationMillisecondType>()
+                    .value(row_idx),
+                TimeUnit::Microsecond => array
+                    .as_primitive::<arrow_array::types::DurationMicrosecondType>()
+                    .value(row_idx),
+                TimeUnit::Nanosecond => array
+                    .as_primitive::<arrow_array::types::DurationNanosecondType>()
                     .value(row_idx),
             };
             KeyValue::Int64(value)
@@ -629,10 +670,10 @@ mod tests {
     use arrow_array::types::ArrowPrimitiveType;
     use arrow_array::{
         BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
-        DictionaryArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, RecordBatch, StringArray, StringViewArray, StructArray,
-        Time32SecondArray, Time64MicrosecondArray, TimestampNanosecondArray, UInt8Array,
-        UInt16Array,
+        DictionaryArray, DurationMicrosecondArray, FixedSizeBinaryArray, Float16Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, RecordBatch, StringArray,
+        StringViewArray, StructArray, Time32SecondArray, Time64MicrosecondArray,
+        TimestampNanosecondArray, UInt8Array, UInt16Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{Field, Schema};
@@ -1087,6 +1128,10 @@ mod tests {
         Arc::new(TimestampNanosecondArray::from(vec![100, 200]).with_timezone("UTC")),
         KeyValue::Int64(200)
     )]
+    #[case::duration(
+        Arc::new(DurationMicrosecondArray::from(vec![100, 200])),
+        KeyValue::Int64(200)
+    )]
     #[case::decimal128(
         Arc::new(Decimal128Array::from(vec![1, 2])),
         KeyValue::Binary(2i128.to_le_bytes().to_vec())
@@ -1138,8 +1183,32 @@ mod tests {
         );
         let batch = RecordBatch::try_from_iter([("id", Arc::new(array) as ArrayRef)]).unwrap();
         let on_columns = vec!["id".to_string()];
-        assert!(extract_key_value_from_batch(&batch, 0, &on_columns).is_some());
+        let key = extract_key_value_from_batch(&batch, 0, &on_columns).unwrap();
         assert_eq!(extract_key_value_from_batch(&batch, 1, &on_columns), None);
+
+        let mut builder = KeyExistenceFilterBuilder::new(vec![0]);
+        builder.insert(key).unwrap();
+        assert_eq!(
+            builder
+                .build()
+                .might_contain_columns(batch.columns())
+                .unwrap(),
+            vec![true, false]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::float16(Arc::new(Float16Array::from(vec![HalfFloat::from_f32(0.0), HalfFloat::from_f32(-0.0)])))]
+    #[case::float32(Arc::new(Float32Array::from(vec![0.0, -0.0])))]
+    #[case::float64(Arc::new(Float64Array::from(vec![0.0, -0.0])))]
+    fn test_extract_signed_zero_keys_match(#[case] array: ArrayRef) {
+        // The merge join matches -0.0 with 0.0, so they must be the same key.
+        let batch = RecordBatch::try_from_iter([("id", array)]).unwrap();
+        let on_columns = vec!["id".to_string()];
+        assert_eq!(
+            extract_key_value_from_batch(&batch, 0, &on_columns),
+            extract_key_value_from_batch(&batch, 1, &on_columns)
+        );
     }
 
     /// The conflict check concurrent merge-inserts run: disjoint inserted keys

@@ -896,6 +896,7 @@ async fn test_inserted_rows_filter_bloom_conflict_detection_concurrent() {
 #[case::date32(DataType::Date32)]
 #[case::timestamp(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None))]
 #[case::decimal128(DataType::Decimal128(18, 2))]
+#[case::duration(DataType::Duration(arrow_schema::TimeUnit::Microsecond))]
 #[case::binary(DataType::Binary)]
 #[case::large_binary(DataType::LargeBinary)]
 #[case::fixed_size_binary(DataType::FixedSizeBinary(32))]
