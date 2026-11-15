@@ -12,6 +12,7 @@ use crate::scalar::inverted::wand::selective_phrase::{
 mod read_ahead;
 use read_ahead::ReadAhead;
 mod partition_search;
+mod resources;
 
 // Kept opt-in until exact-head CI and matched low-cache VM qualification.
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -169,6 +170,17 @@ struct PreparedPositions {
 }
 
 impl PreparedPositions {
+    fn window_demand(&self) -> Result<resources::WindowDemand> {
+        let current = self.window_ends.iter().try_fold(0_u64, |largest, &end| {
+            let (_, _, range) = self.window_bounds(end - 1)?;
+            Ok::<_, Error>(largest.max(range.end - range.start))
+        })?;
+        Ok(resources::WindowDemand {
+            current,
+            total: self.value.len(),
+        })
+    }
+
     fn block_range(&self, index: usize) -> Result<Range<u64>> {
         let start = self.offsets.get(index).copied().ok_or_else(|| {
             Error::index(format!(
@@ -290,7 +302,6 @@ impl InvertedPartition {
         tokens: &Tokens,
         term_ids: Option<PartitionTermIds<'_>>,
         window_bytes: u64,
-        encoded_budget: u64,
     ) -> Result<Option<Vec<PreparedPositions>>> {
         let inverted = &self.inverted_list;
         let PositionsLayout::SharedStream(codec) = inverted.positions_layout else {
@@ -359,7 +370,7 @@ impl InvertedPartition {
                 &offsets.0,
                 value.len(),
                 window_bytes,
-                encoded_budget / tokens.len() as u64,
+                MAX_PARTITION_WINDOW_BYTES / tokens.len() as u64,
             )?
             else {
                 return Ok(None);
@@ -410,25 +421,17 @@ impl InvertedIndex {
             if !eligible(&request) {
                 return Ok(None);
             }
-            let selected = self
-                .partitions
-                .iter()
-                .enumerate()
-                .filter(|(_, part)| part.may_match_tokens(&request.tokens, request.operator, true))
-                .collect::<Vec<_>>();
-            let resources = partition_search::search_resources(
-                get_num_compute_intensive_cpus(),
-                selected.len().max(1),
-                request.tokens.len(),
-                config.window_bytes,
-            )?;
-            let clause_budget = resources.partition_bytes / request.tokens.len() as u64;
+            let clause_budget = MAX_PARTITION_WINDOW_BYTES / request.tokens.len() as u64;
             if config.window_bytes == 0 || config.window_bytes > clause_budget {
                 return Err(Error::invalid_input(format!(
                     "selective window {} must be positive and fit clause budget {clause_budget}",
                     config.window_bytes
                 )));
             }
+            let selected =
+                self.partitions.iter().enumerate().filter(|(_, part)| {
+                    part.may_match_tokens(&request.tokens, request.operator, true)
+                });
             // Decide all encoding support before loading/consuming postings or
             // publishing a competitive floor. A None cleanly selects ordinary search.
             let mut preparations = Vec::new();
@@ -442,14 +445,9 @@ impl InvertedIndex {
                             return Ok(None);
                         }
                         Ok::<_, Error>(
-                            part.prepare_selective_positions(
-                                &tokens,
-                                ids,
-                                config.window_bytes,
-                                resources.partition_bytes,
-                            )
-                            .await?
-                            .map(|positions| (ordinal, part.clone(), positions)),
+                            part.prepare_selective_positions(&tokens, ids, config.window_bytes)
+                                .await?
+                                .map(|positions| (ordinal, part.clone(), positions)),
                         )
                     }
                     .boxed(),
@@ -462,14 +460,44 @@ impl InvertedIndex {
             let Some(prepared) = prepared.into_iter().collect::<Option<Vec<_>>>() else {
                 return Ok(None);
             };
+            let demands = prepared
+                .iter()
+                .map(|(_, _, positions)| {
+                    positions
+                        .iter()
+                        .map(PreparedPositions::window_demand)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let working_bytes = demands
+                .iter()
+                .map(|demands| resources::working_bytes(demands))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            let resources = resources::search_resources(
+                get_num_compute_intensive_cpus(),
+                prepared.len().max(1),
+                working_bytes.max(1),
+            )?;
+            let budgets = demands
+                .iter()
+                .map(|demands| resources::allocate_bytes(demands, resources.partition_bytes))
+                .collect::<Result<Vec<_>>>()?;
+            let Some(budgets) = budgets.into_iter().collect::<Option<Vec<_>>>() else {
+                // Even current windows must fit before consuming postings or
+                // publishing a score floor; otherwise use ordinary search.
+                return Ok(None);
+            };
             let shared = Arc::new(AtomicU32::new(
                 request
                     .initial_score_floor
                     .unwrap_or(f32::NEG_INFINITY)
                     .to_bits(),
             ));
-            let loads = stream::iter(prepared)
-                .map(|(ordinal, part, positions)| {
+            let loads = stream::iter(prepared.into_iter().zip(budgets))
+                .map(|((ordinal, part, positions), window_budgets)| {
                     let shared = shared.clone();
                     // Own the request across suspension; erase the future here
                     // rather than borrowing through the outer stream closure.
@@ -508,7 +536,7 @@ impl InvertedIndex {
                             lengths,
                             visibility: Arc::new(visibility),
                             shared,
-                            encoded_budget: resources.partition_bytes,
+                            window_budgets,
                         }))
                     }
                     .boxed()
@@ -517,8 +545,9 @@ impl InvertedIndex {
                 .buffer_unordered(2)
                 .try_filter_map(|search| futures::future::ready(Ok(search)))
                 .map_ok(|search| search.run().boxed());
-            // Every active search uses the same allowance for preparation and
-            // read-ahead; their sum cannot exceed this query's encoded budget.
+            // Admission uses the largest actual working set across matching
+            // partitions. Current and predicted windows share each allocation;
+            // active allocations stay within the encoded query budget.
             let mut results = loads.try_buffer_unordered(resources.active_partitions);
             let mut ranked = BinaryHeap::new();
             while let Some((ordinal, scored)) = results.try_next().await? {
@@ -619,6 +648,26 @@ mod tests {
             cache: WeakLanceCache::from(cache),
             window_bytes: POSITION_WINDOW_BYTES,
         }
+    }
+
+    #[test]
+    fn selective_phrase_demand_reserves_whole_groups_without_io() -> Result<()> {
+        let cache = LanceCache::no_cache();
+        let value = binary_value(false, false);
+        let mut plan = prepared(value.clone(), &cache);
+        assert_eq!(plan.window_demand()?.current, 8);
+        // The largest codec block is eight bytes, but grouping its predecessor
+        // with it requires twelve. Admission must reserve the whole group.
+        plan.window_ends = vec![2, 3];
+        let demand = plan.window_demand()?;
+        assert_eq!(demand.current, 12);
+        assert_eq!(demand.total, 16);
+        assert!(resources::allocate_bytes(&[demand], 11)?.is_none());
+        assert_eq!(resources::allocate_bytes(&[demand], 12)?, Some(vec![12]));
+        plan.window_ends = vec![3];
+        assert_eq!(plan.window_demand()?.current, 16);
+        assert_eq!(value.calls.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 
     #[rstest::rstest]
