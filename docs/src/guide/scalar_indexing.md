@@ -22,6 +22,7 @@ The workflows below cover the Python (`pylance`), Rust (`lance`), and Java (`org
 | `NGRAM` | Substring search in text | `contains(column, 'substring')` | May return candidates that need rechecking; use `INVERTED` for BM25 search |
 | `BLOOMFILTER` | Membership-oriented equality checks | Equality and inequality filters | Inexact and limited predicate support |
 | `FM` | Exact substring search, including one-character patterns | `contains(column, 'substring')` | Specialized index; use scalar indexes for ordinary comparisons |
+| `LISTELEMENT` (experimental) | Fields of the elements of a `list<struct>` column, such as object detections | `any_element(column, 'predicate')`, see [Filtering on elements of a list of structs](read_and_write.md#filtering-on-elements-of-a-list-of-structs) | The predicate must fix the first key |
 
 B-tree is the usual default for scalar columns. Choose bitmap for genuinely low-cardinality columns, and zone maps when data is sorted or nearly sorted. See [Performance Guide](performance.md#indexes) for resource tradeoffs.
 

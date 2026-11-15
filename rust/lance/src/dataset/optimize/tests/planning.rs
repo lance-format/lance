@@ -2675,7 +2675,25 @@ async fn test_soft_source_budget_admits_one_oversized_task() {
         source_budget_mode: SourceBudgetMode::Soft,
         ..Default::default()
     };
-    let plan = plan_compaction(&dataset, &opts).await.unwrap();
+    let result = DefaultCompactionPlanner::new(opts)
+        .unwrap()
+        .plan_with_budget(&dataset)
+        .await
+        .unwrap();
+    let plan = result.plan;
+    let summary = result.source_budget;
+    assert_eq!(summary.selected_source_rows, 250);
+    assert_eq!(summary.selected_source_fragments, 3);
+    assert!(summary.selected_source_bytes.is_some_and(|bytes| bytes > 1));
+    assert!(summary.budget_exhausted());
+    assert_eq!(
+        summary.limiting_budgets,
+        vec![
+            SourceBudgetLimit::Fragments,
+            SourceBudgetLimit::Rows,
+            SourceBudgetLimit::Bytes
+        ]
+    );
 
     assert_eq!(plan.num_tasks(), 1);
     assert_eq!(plan.tasks()[0].fragments.len(), 3);
@@ -2711,8 +2729,15 @@ async fn test_soft_source_budget_missing_first_task_size() {
         source_budget_mode: SourceBudgetMode::Soft,
         ..Default::default()
     };
-    let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    let (selected, summary) =
+        limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
     assert_eq!(selected.len(), 1);
+    assert_eq!(summary.selected_tasks, 1);
+    assert!(summary.budget_exhausted());
+    assert!(!summary.is_blocked());
+    assert_eq!(summary.selected_source_bytes, None);
+    assert_eq!(summary.next_task_source_bytes, None);
+    assert_eq!(summary.limiting_budgets, vec![SourceBudgetLimit::Bytes]);
 }
 
 #[tokio::test]
@@ -2751,8 +2776,15 @@ async fn test_soft_source_budget_keeps_prefix_before_unknown_later_task() {
         source_budget_mode: SourceBudgetMode::Soft,
         ..Default::default()
     };
-    let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    let (selected, summary) =
+        limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
     assert_eq!(selected.len(), 1);
+    assert_eq!(summary.selected_tasks, 1);
+    assert!(summary.budget_exhausted());
+    assert!(!summary.is_blocked());
+    assert!(summary.selected_source_bytes.is_some_and(|bytes| bytes > 0));
+    assert_eq!(summary.next_task_source_bytes, None);
+    assert_eq!(summary.limiting_budgets, vec![SourceBudgetLimit::Bytes]);
 }
 
 #[tokio::test]
@@ -2789,8 +2821,16 @@ async fn test_soft_source_budget_stops_after_oversized_first_task() {
         source_budget_mode: SourceBudgetMode::Soft,
         ..Default::default()
     };
-    let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    let (selected, summary) =
+        limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
     assert_eq!(selected.len(), 1);
+    assert_eq!(summary.selected_tasks, 1);
+    assert!(summary.budget_exhausted());
+    assert!(!summary.is_blocked());
+    assert_eq!(summary.selected_source_rows, 2);
+    assert!(summary.selected_source_bytes.is_some_and(|bytes| bytes > 0));
+    assert_eq!(summary.next_task_source_bytes, None);
+    assert_eq!(summary.limiting_budgets, vec![SourceBudgetLimit::Rows]);
 }
 
 #[tokio::test]
@@ -2825,7 +2865,13 @@ async fn test_soft_source_budget_uses_cumulative_totals_after_first_task() {
     let hard_selected =
         limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap();
     let soft_selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
-    assert_eq!(hard_selected.len(), 2);
+    assert_eq!(hard_selected.0.len(), 2);
+    assert_eq!(hard_selected.1.selected_source_rows, 4);
+    assert_eq!(hard_selected.1.next_task_source_rows, Some(2));
+    assert_eq!(
+        hard_selected.1.limiting_budgets,
+        vec![SourceBudgetLimit::Rows]
+    );
     assert_eq!(soft_selected, hard_selected);
 }
 
@@ -3081,4 +3127,366 @@ async fn byte_full_fragment_preserves_small_runs_on_both_sides() {
         plan.compaction_tasks()
             .all(|task| task.task.fragments.iter().all(|f| f.id != middle_id))
     );
+}
+
+#[tokio::test]
+async fn test_source_budget_progress_and_blocked_diagnostics() {
+    // Whole tasks fit the run cap and drain over separate atomic commits.
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(5), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_rows: Some(200),
+        ..Default::default()
+    };
+    let mut committed = 0;
+    loop {
+        let result = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .plan_with_budget(&dataset)
+            .await
+            .unwrap();
+        assert!(result.source_budget.selected_source_rows <= 200);
+        assert!(!result.source_budget.is_blocked());
+        if result.plan.num_tasks() == 0 {
+            break;
+        }
+        assert_eq!(result.plan.options.target_rows_per_fragment, 100);
+        let mut results = Vec::new();
+        for task in result.plan.compaction_tasks() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        committed += 1;
+        assert!(committed <= 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 250);
+    }
+    assert_eq!(committed, 2);
+
+    // A task larger than the cap is held back whole, even when some of its
+    // source fragments fit. Report that boundary rather than a silent no-op.
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(3), FragmentRowCount(99))
+        .await
+        .unwrap();
+    let blocked = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_rows: Some(200),
+        ..options
+    })
+    .unwrap()
+    .plan_with_budget(&dataset)
+    .await
+    .unwrap();
+    assert_eq!(blocked.plan.num_tasks(), 0);
+    assert!(blocked.source_budget.is_blocked());
+    assert_eq!(
+        blocked.source_budget.limiting_budgets,
+        vec![SourceBudgetLimit::Rows]
+    );
+    assert_eq!(blocked.source_budget.next_task_source_rows, Some(297));
+    assert_eq!(blocked.source_budget.next_task_source_fragments, Some(3));
+}
+
+#[tokio::test]
+async fn test_source_budget_reports_remaining_work_and_live_rows() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 250,
+        max_source_rows: Some(270),
+        ..Default::default()
+    };
+    let result = DefaultCompactionPlanner::new(options)
+        .unwrap()
+        .plan_with_budget(&dataset)
+        .await
+        .unwrap();
+    assert!(result.source_budget.budget_exhausted());
+    assert!(!result.source_budget.is_blocked());
+    assert_eq!(result.source_budget.selected_tasks, 1);
+    assert_eq!(result.source_budget.selected_source_rows, 250);
+    assert!(result.source_budget.candidate_tasks > 1);
+    assert_eq!(result.source_budget.next_task_source_rows, Some(300));
+    assert_eq!(result.source_budget.next_task_source_fragments, Some(3));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ByteBudgetCase {
+    Unset,
+    BelowFirstTask,
+    FirstTask,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BudgetPlanningPath {
+    Ordinary,
+    Grouped,
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_soft_budget_report_admits_first_task_in_both_planning_paths(
+    #[values(BudgetPlanningPath::Ordinary, BudgetPlanningPath::Grouped)] path: BudgetPlanningPath,
+    #[values(2, 4)] fragments: u32,
+) {
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(fragments), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_rows: Some(99),
+        max_source_fragments: Some(1),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    })
+    .unwrap();
+    let result = match path {
+        BudgetPlanningPath::Ordinary => planner.plan_with_budget(&dataset).await,
+        BudgetPlanningPath::Grouped => {
+            let groups = dataset
+                .manifest
+                .fragments
+                .chunks(2)
+                .map(|fragments| CompactionGroup {
+                    fragments: fragments.to_vec(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                })
+                .collect();
+            planner.plan_groups_with_budget(&dataset, groups).await
+        }
+    }
+    .unwrap();
+    let summary = result.source_budget;
+    assert_eq!(result.plan.num_tasks(), 1);
+    assert_eq!(summary.candidate_tasks, fragments as usize / 2);
+    assert_eq!(summary.selected_tasks, 1);
+    assert_eq!(summary.selected_source_rows, 100);
+    assert_eq!(summary.selected_source_fragments, 2);
+    assert_eq!(summary.selected_source_bytes, None);
+    assert!(!summary.is_blocked());
+    assert_eq!(summary.budget_exhausted(), fragments == 4);
+    assert_eq!(
+        summary.next_task_source_rows,
+        (fragments == 4).then_some(100)
+    );
+    assert_eq!(
+        summary.next_task_source_fragments,
+        (fragments == 4).then_some(2)
+    );
+    assert_eq!(
+        summary.limiting_budgets,
+        if fragments == 4 {
+            vec![SourceBudgetLimit::Fragments, SourceBudgetLimit::Rows]
+        } else {
+            vec![]
+        }
+    );
+}
+
+#[rstest::rstest]
+#[case::rows(Some(99), None, ByteBudgetCase::Unset, vec![SourceBudgetLimit::Rows], 0)]
+#[case::fragments(None, Some(1), ByteBudgetCase::Unset, vec![SourceBudgetLimit::Fragments], 0)]
+#[case::bytes(None, None, ByteBudgetCase::BelowFirstTask, vec![SourceBudgetLimit::Bytes], 0)]
+#[case::all_limits(Some(99), Some(1), ByteBudgetCase::BelowFirstTask,
+    vec![SourceBudgetLimit::Fragments, SourceBudgetLimit::Rows, SourceBudgetLimit::Bytes], 0)]
+#[case::bytes_after_progress(None, None, ByteBudgetCase::FirstTask, vec![SourceBudgetLimit::Bytes], 1)]
+#[case::all_limits_after_progress(Some(100), Some(2), ByteBudgetCase::FirstTask,
+    vec![SourceBudgetLimit::Fragments, SourceBudgetLimit::Rows, SourceBudgetLimit::Bytes], 1)]
+#[case::unlimited(None, None, ByteBudgetCase::Unset, vec![], 2)]
+#[tokio::test]
+async fn test_source_budget_reports_limits_bytes_and_warning_context(
+    #[case] max_source_rows: Option<usize>,
+    #[case] max_source_fragments: Option<usize>,
+    #[case] byte_budget: ByteBudgetCase,
+    #[case] limiting_budgets: Vec<SourceBudgetLimit>,
+    #[case] selected_tasks: usize,
+    #[values(BudgetPlanningPath::Ordinary, BudgetPlanningPath::Grouped)] path: BudgetPlanningPath,
+) {
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(4), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        ..Default::default()
+    };
+    let unlimited = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan(&dataset)
+        .await
+        .unwrap();
+    assert_eq!(unlimited.num_tasks(), 2);
+    let task_bytes: Vec<u64> = unlimited
+        .tasks()
+        .iter()
+        .map(|task| {
+            task.fragments
+                .iter()
+                .flat_map(|fragment| &fragment.files)
+                .map(|file| file.file_size_bytes.get().unwrap().get())
+                .sum()
+        })
+        .collect();
+    assert!(task_bytes[0] > 1);
+    let options = CompactionOptions {
+        max_source_rows,
+        max_source_fragments,
+        max_source_bytes: match byte_budget {
+            ByteBudgetCase::Unset => None,
+            ByteBudgetCase::BelowFirstTask => Some(task_bytes[0] - 1),
+            ByteBudgetCase::FirstTask => Some(task_bytes[0]),
+        },
+        ..options
+    };
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
+    let result = match path {
+        BudgetPlanningPath::Ordinary => planner.plan_with_budget(&dataset).await,
+        BudgetPlanningPath::Grouped => {
+            let groups = dataset
+                .manifest
+                .fragments
+                .chunks(2)
+                .map(|fragments| CompactionGroup {
+                    fragments: fragments.to_vec(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                })
+                .collect();
+            planner.plan_groups_with_budget(&dataset, groups).await
+        }
+    }
+    .unwrap();
+    let summary = &result.source_budget;
+    assert_eq!(result.plan.num_tasks(), selected_tasks);
+    assert_eq!(summary.candidate_tasks, 2);
+    assert_eq!(summary.selected_tasks, selected_tasks);
+    assert_eq!(summary.selected_source_rows, selected_tasks * 100);
+    assert_eq!(summary.selected_source_fragments, selected_tasks * 2);
+    assert_eq!(
+        summary.selected_source_bytes,
+        options
+            .max_source_bytes
+            .map(|_| task_bytes[..selected_tasks].iter().sum())
+    );
+    assert_eq!(summary.limiting_budgets, limiting_budgets);
+    assert_eq!(summary.budget_exhausted(), selected_tasks < 2);
+    assert_eq!(summary.is_blocked(), selected_tasks == 0);
+    assert_eq!(
+        summary.next_task_source_rows,
+        (selected_tasks < 2).then_some(100)
+    );
+    assert_eq!(
+        summary.next_task_source_fragments,
+        (selected_tasks < 2).then_some(2)
+    );
+    assert_eq!(
+        summary.next_task_source_bytes,
+        options
+            .max_source_bytes
+            .and_then(|_| task_bytes.get(selected_tasks).copied())
+    );
+
+    let output = std::fs::read_to_string(logs.path()).unwrap();
+    if summary.is_blocked() {
+        for expected in [
+            "candidate_tasks=2".to_string(),
+            format!("max_source_rows={max_source_rows:?}"),
+            format!("max_source_fragments={max_source_fragments:?}"),
+            format!("max_source_bytes={:?}", options.max_source_bytes),
+            format!("limiting_budgets={limiting_budgets:?}"),
+            "first_task_source_rows=Some(100)".to_string(),
+            "first_task_source_fragments=Some(2)".to_string(),
+            format!(
+                "first_task_source_bytes={:?}",
+                summary.next_task_source_bytes
+            ),
+        ] {
+            assert!(output.contains(&expected), "missing {expected}: {output}");
+        }
+    } else {
+        assert!(
+            !output.contains("Compaction source budget cannot admit"),
+            "{output}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_grouped_budget_report_preserves_fragment_cutoff_before_byte_validation() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(4), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[2].files[0].file_size_bytes = Default::default();
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    let groups: Vec<_> = dataset
+        .manifest
+        .fragments
+        .chunks(2)
+        .map(|fragments| CompactionGroup {
+            fragments: fragments.to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        })
+        .collect();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_fragments: Some(2),
+        max_source_bytes: Some(u64::MAX),
+        ..Default::default()
+    };
+    let result = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan_groups_with_budget(&dataset, groups.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.plan.num_tasks(), 1);
+    assert_eq!(result.source_budget.candidate_tasks, 2);
+    assert_eq!(result.source_budget.selected_tasks, 1);
+    assert_eq!(result.source_budget.next_task_source_rows, Some(100));
+    assert_eq!(result.source_budget.next_task_source_fragments, Some(2));
+    assert_eq!(result.source_budget.next_task_source_bytes, None);
+    assert_eq!(
+        result.source_budget.limiting_budgets,
+        vec![SourceBudgetLimit::Fragments]
+    );
+    assert!(result.source_budget.budget_exhausted());
+
+    let error = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: None,
+        ..options
+    })
+    .unwrap()
+    .plan_groups_with_budget(&dataset, groups)
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("no size recorded"), "{error}");
 }
