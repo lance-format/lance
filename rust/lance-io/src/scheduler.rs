@@ -28,6 +28,10 @@ use crate::traits::Reader;
 use crate::utils::CachedFileSize;
 
 mod lite;
+mod read_into;
+
+use lance_core::utils::allocation::ReservedBuffer;
+use read_into::IoBuffer;
 
 // Don't log backpressure warnings until at least this many seconds have passed
 const BACKPRESSURE_MIN: u64 = 5;
@@ -564,7 +568,8 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
 struct IoTask {
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
-    when_done: Box<dyn FnOnce(Result<Bytes>, bool) + Send>,
+    buffer: Option<ReservedBuffer>,
+    when_done: Box<dyn FnOnce(Result<IoBuffer>, bool) + Send>,
     priority: u128,
     bypass_backpressure: bool,
     request_cancellation: Option<Arc<RequestCancellation>>,
@@ -645,7 +650,16 @@ impl IoTask {
     async fn run(self) {
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
-        let read = Self::read(self.reader.clone(), self.to_read.clone());
+        let read = match self.buffer {
+            Some(buffer) => Either::Left(read_into::read(
+                self.reader.clone(),
+                self.to_read.clone(),
+                buffer,
+            )),
+            None => Either::Right(
+                Self::read(self.reader.clone(), self.to_read.clone()).map_ok(IoBuffer::Bytes),
+            ),
+        };
         let bytes = if let Some(request_cancellation) = self.request_cancellation.clone() {
             tokio::select! {
                 biased;
@@ -948,10 +962,10 @@ impl Debug for ScanScheduler {
     }
 }
 
-struct Response {
+struct Response<T = Vec<Bytes>> {
     // `Option` so the caller can take the data out while the response (and its
     // backpressure refund on drop) stays intact.
-    data: Option<Result<Vec<Bytes>>>,
+    data: Option<Result<T>>,
     io_queue: Arc<IoQueue>,
     priority: u128,
     num_reqs: usize,
@@ -961,7 +975,7 @@ struct Response {
 // Refund the batch's backpressure reservation when the response is dropped, be
 // that on delivery or when a cancelled request's undelivered response is
 // discarded.  This releases the budget even if the caller drops the future early.
-impl Drop for Response {
+impl<T> Drop for Response<T> {
     fn drop(&mut self) {
         self.io_queue
             .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
@@ -1203,6 +1217,7 @@ impl ScanScheduler {
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
+                buffer: None,
                 priority,
                 bypass_backpressure,
                 when_done: Box::new(move |data, was_admitted| {
@@ -1214,7 +1229,7 @@ impl ScanScheduler {
                     {
                         let mut dest = dest.lock().unwrap();
                         let chunk = DataChunk {
-                            data,
+                            data: data.and_then(IoBuffer::into_bytes),
                             task_idx,
                             num_bytes: if was_admitted { num_bytes } else { 0 },
                             was_admitted,
@@ -1287,7 +1302,7 @@ impl ScanScheduler {
                     // answers without a request. Reaching a cloud store with
                     // one is an InvalidGetRange error there.
                     if requested_range.start == requested_range.end {
-                        return async { Ok(Bytes::new()) }.boxed();
+                        return async { Ok(IoBuffer::Bytes(Bytes::new())) }.boxed();
                     }
                     // IoTask::run publishes the counters behind
                     // iops_counter()/bytes_read_counter(), so this path has to
@@ -1303,6 +1318,7 @@ impl ScanScheduler {
                     async move {
                         let bytes = bytes_fut.await.map_err(Error::from)?;
                         validate_read_length(reader.path(), &requested_range, bytes)
+                            .map(IoBuffer::Bytes)
                     }
                     .boxed()
                 });
@@ -1314,7 +1330,7 @@ impl ScanScheduler {
                 if error_mode == SchedulerErrorMode::BestEffort {
                     let mut results = Vec::with_capacity(tasks.len());
                     for task in tasks {
-                        results.push(task.await?);
+                        results.push(task.await?.into_bytes()?);
                     }
                     return Ok(results);
                 }
@@ -1326,7 +1342,7 @@ impl ScanScheduler {
                     .map(|(task_idx, task)| async move { (task_idx, task.await) })
                     .collect();
                 while let Some((task_idx, result)) = pending_tasks.next().await {
-                    results[task_idx] = result?;
+                    results[task_idx] = result?.into_bytes()?;
                 }
                 Ok(results)
             }
@@ -1700,6 +1716,7 @@ mod tests {
                 path: Path::parse("test").unwrap(),
             }),
             to_read: 0..1,
+            buffer: None,
             when_done: Box::new(|_, _| {}),
             priority,
             bypass_backpressure,
@@ -1723,6 +1740,7 @@ mod tests {
                 path: Path::parse("test").unwrap(),
             }),
             to_read: 0..1,
+            buffer: None,
             when_done: Box::new(move |result, was_admitted| {
                 assert!(!was_admitted);
                 let error = result.unwrap_err();
@@ -3329,7 +3347,7 @@ mod tests {
     }
 
     /// Waits up to five seconds for `condition`, failing with `what` otherwise.
-    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    pub(super) async fn wait_until(what: &str, condition: impl Fn() -> bool) {
         let waited = timeout(Duration::from_secs(5), async {
             while !condition() {
                 tokio::time::sleep(Duration::from_millis(1)).await;

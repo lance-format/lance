@@ -21,15 +21,16 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: FullZip prefix retry boundaries
+      - name: Scheduled owned reads and ordinary queue regressions
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted::tests::read::prefix -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --doc try_read_decode_prefix_in -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib scheduler:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib reserved_read:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --doc submit_single_into -- --nocapture
       - name: Optional feature independence
         run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::unzip_admitted::tests::read::prefix -- --nocapture
+          cargo test --profile ci --locked -p lance-io --no-default-features --lib scheduler:: -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
-          cargo clippy --profile ci --locked -p lance-encoding --no-default-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-io --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-io --no-default-features --all-targets --no-deps -- -D warnings
