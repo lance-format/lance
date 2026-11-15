@@ -465,3 +465,4 @@ fn fullzip_unzip_invalid_request_preserves_credit(#[values(false, true)] invalid
 }
 
 mod read;
+mod widths;

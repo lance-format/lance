@@ -8,9 +8,7 @@ use std::ops::Range;
 use arrow_buffer::{Buffer, ScalarBuffer};
 use lance_core::{Error, Result, utils::allocation::Reservation};
 
-use super::{
-    FullZipScheduler, PerValueDecompressor, VariableFullZipDecodeTask, VariableFullZipDecoder,
-};
+use super::{FullZipScheduler, PerValueDecompressor, VariableFullZipDecodeTask};
 use crate::{
     buffer::LanceBuffer,
     compression::MiniBlockOutputLayout,
@@ -44,25 +42,6 @@ fn has_def(parser: ControlWordParser) -> bool {
     )
 }
 
-// Decode into scalars rather than using the ordinary parser's growing Vecs.
-fn levels(parser: ControlWordParser, src: &[u8]) -> Result<(u32, u32)> {
-    let width = parser.bytes_per_word();
-    let bytes = src
-        .get(..width)
-        .ok_or_else(|| Error::corrupt_file_named("FullZip", "truncated control word"))?;
-    let mut word = [0; 4];
-    word[..width].copy_from_slice(bytes);
-    let word = u32::from_le_bytes(word);
-    Ok(match parser {
-        ControlWordParser::BOTH8(shift, mask)
-        | ControlWordParser::BOTH16(shift, mask)
-        | ControlWordParser::BOTH32(shift, mask) => (word >> shift, word & mask),
-        ControlWordParser::REP8 | ControlWordParser::REP16 | ControlWordParser::REP32 => (word, 0),
-        ControlWordParser::DEF8 | ControlWordParser::DEF16 | ControlWordParser::DEF32 => (0, word),
-        ControlWordParser::NIL => (0, 0),
-    })
-}
-
 /// Walk complete row-aligned buffers; callbacks see only the requested rows.
 /// Validate all framing, including unselected tails, before admitting output.
 fn visit(
@@ -70,7 +49,7 @@ fn visit(
     data: &[impl AsRef<[u8]>],
     num_rows: u64,
     range: Range<u64>,
-    mut visitor: impl FnMut(u16, u16, bool, &[u8]) -> Result<()>,
+    visitor: impl FnMut(u16, u16, bool, &[u8]) -> Result<()>,
 ) -> Result<()> {
     if !matches!(
         scheduler.details.value_decompressor,
@@ -108,21 +87,75 @@ fn visit(
             "FullZip levels disagree with structural interpretation",
         ));
     }
+    // Dispatch once per buffer walk so neither framing width nor parser kind
+    // needs a dynamic branch for each value in both preflight and replay.
+    match scheduler.bits_per_offset {
+        32 => visit_control_width::<4>(scheduler, data, num_rows, range, visitor, max_rep, max_def),
+        64 => visit_control_width::<8>(scheduler, data, num_rows, range, visitor, max_rep, max_def),
+        _ => Err(Error::internal("validated FullZip offset width changed")),
+    }
+}
+
+fn visit_control_width<const OFFSET: usize>(
+    scheduler: &FullZipScheduler,
+    data: &[impl AsRef<[u8]>],
+    num_rows: u64,
+    range: Range<u64>,
+    visitor: impl FnMut(u16, u16, bool, &[u8]) -> Result<()>,
+    max_rep: u32,
+    max_def: u32,
+) -> Result<()> {
+    match scheduler.details.ctrl_word_parser.bytes_per_word() {
+        0 => visit_bytes::<0, OFFSET>(scheduler, data, num_rows, range, visitor, max_rep, max_def),
+        1 => visit_bytes::<1, OFFSET>(scheduler, data, num_rows, range, visitor, max_rep, max_def),
+        2 => visit_bytes::<2, OFFSET>(scheduler, data, num_rows, range, visitor, max_rep, max_def),
+        4 => visit_bytes::<4, OFFSET>(scheduler, data, num_rows, range, visitor, max_rep, max_def),
+        _ => Err(Error::internal("unsupported FullZip control word width")),
+    }
+}
+
+fn visit_bytes<const CONTROL: usize, const OFFSET: usize>(
+    scheduler: &FullZipScheduler,
+    data: &[impl AsRef<[u8]>],
+    num_rows: u64,
+    range: Range<u64>,
+    mut visitor: impl FnMut(u16, u16, bool, &[u8]) -> Result<()>,
+    max_rep: u32,
+    max_def: u32,
+) -> Result<()> {
+    let details = &scheduler.details;
     let parser = details.ctrl_word_parser;
-    let width = usize::from(scheduler.bits_per_offset / 8);
+    let (rep_shift, def_mask) = match parser {
+        ControlWordParser::BOTH8(shift, mask)
+        | ControlWordParser::BOTH16(shift, mask)
+        | ControlWordParser::BOTH32(shift, mask) => (u32::from(shift), u64::from(mask)),
+        ControlWordParser::REP8 | ControlWordParser::REP16 | ControlWordParser::REP32 => (0, 0),
+        ControlWordParser::DEF8 | ControlWordParser::DEF16 | ControlWordParser::DEF32 => {
+            (32, u64::from(u32::MAX))
+        }
+        ControlWordParser::NIL => (0, 0),
+    };
+    let has_rep = parser.has_rep();
     let mut rows = 0_u64;
     for buffer in data {
         let mut bytes = buffer.as_ref();
         let mut first = true;
         while !bytes.is_empty() {
-            let (rep, def) = levels(parser, bytes)?;
+            let control = bytes
+                .get(..CONTROL)
+                .ok_or_else(|| Error::corrupt_file_named("FullZip", "truncated control word"))?;
+            let mut word = [0; 8];
+            word[..CONTROL].copy_from_slice(control);
+            let word = u64::from_le_bytes(word);
+            let rep = (word >> rep_shift) as u32;
+            let def = (word & def_mask) as u32;
             if rep > max_rep || def > max_def {
                 return Err(Error::corrupt_file_named(
                     "FullZip",
                     "control level exceeds schema",
                 ));
             }
-            let new_row = !parser.has_rep() || rep == max_rep;
+            let new_row = !has_rep || rep == max_rep;
             if first && !new_row {
                 return Err(Error::corrupt_file_named(
                     "FullZip",
@@ -141,12 +174,16 @@ fn visit(
                     ));
                 }
             }
-            bytes = &bytes[parser.bytes_per_word()..];
+            bytes = &bytes[CONTROL..];
             let visible = def <= u32::from(details.max_visible_def);
             let value = if visible && def == 0 {
-                let length =
-                    VariableFullZipDecoder::parse_length(bytes, scheduler.bits_per_offset)?;
-                bytes = &bytes[width..];
+                let prefix = bytes.get(..OFFSET).ok_or_else(|| {
+                    Error::corrupt_file_named("FullZip", "truncated length prefix")
+                })?;
+                let mut length = [0; 8];
+                length[..OFFSET].copy_from_slice(prefix);
+                let length = u64::from_le_bytes(length);
+                bytes = &bytes[OFFSET..];
                 let length = usize::try_from(length).map_err(|_| {
                     Error::corrupt_file_named("FullZip", "item length exceeds addressable size")
                 })?;
