@@ -1392,7 +1392,7 @@ mod tests {
 
     use super::*;
 
-    use arrow::datatypes::Float64Type;
+    use arrow::datatypes::{Float64Type, Int64Type};
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
         StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -2225,6 +2225,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn test_array_literal_element_types() {
+        let float64 = |values: Vec<Option<f64>>| {
+            ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(values)])
+        };
+        let int64 = |values: Vec<Option<i64>>| {
+            ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(values)])
+        };
+        let empty = ListArray::new(
+            Arc::new(Field::new("item", DataType::Null, true)),
+            OffsetBuffer::from_lengths([0]),
+            arrow_array::new_empty_array(&DataType::Null),
+            None,
+        );
+        let cases = [
+            (
+                "[0, 0.5, 1]",
+                float64(vec![Some(0.0), Some(0.5), Some(1.0)]),
+            ),
+            ("[-1, 0.5]", float64(vec![Some(-1.0), Some(0.5)])),
+            ("[NULL, 1]", int64(vec![None, Some(1)])),
+            ("[1, NULL]", int64(vec![Some(1), None])),
+            ("[1, NULL, 0.5]", float64(vec![Some(1.0), None, Some(0.5)])),
+            ("[1, 2, 3]", int64(vec![Some(1), Some(2), Some(3)])),
+            ("[]", empty),
+        ];
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let planner = Planner::new(schema);
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(sql, expected)| {
+                let expected = Expr::Literal(ScalarValue::List(Arc::new(expected)), None);
+                match planner.parse_expr(sql) {
+                    Ok(actual) if actual == expected => None,
+                    Ok(actual) => Some(format!("{sql}: planned {actual:?}")),
+                    Err(err) => Some(format!("{sql}: {err}")),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn test_array_literal_rejects_incompatible_elements() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let planner = Planner::new(schema);
+
+        let err = planner.parse_expr("[1, 'a']").unwrap_err();
+
+        assert!(
+            err.to_string().contains("consistent datatype"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
