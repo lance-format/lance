@@ -6176,3 +6176,38 @@ async fn test_append_converts_map_string_representations() {
         [Some("v1"), None, Some("a value past the inline size")]
     );
 }
+
+/// An all-null dictionary has no values; it appends as nulls in every
+/// representation.
+#[rstest::rstest]
+#[case::into_utf8(DataType::Utf8)]
+#[case::into_large_utf8(DataType::LargeUtf8)]
+#[case::into_dictionary(dictionary_type(DataType::Int32, DataType::Utf8))]
+#[case::into_binary(DataType::Binary)]
+#[tokio::test]
+async fn test_append_converts_all_null_dictionary(#[case] table_type: DataType) {
+    let dataset = table_with_representation(&table_type).await;
+    let value_type = match &table_type {
+        DataType::Binary => DataType::LargeBinary,
+        _ => DataType::LargeUtf8,
+    };
+    let values = Arc::new(
+        arrow_array::DictionaryArray::<arrow_array::types::Int8Type>::try_new(
+            Int8Array::from(vec![None, None]),
+            arrow_array::new_empty_array(&value_type),
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let dataset = append_representation(
+        dataset,
+        ArrowField::new("value", values.data_type().clone(), true),
+        values,
+    )
+    .await
+    .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result["value"].slice(2, 2).null_count(), 2);
+}

@@ -337,6 +337,11 @@ fn referenced_value_bytes(array: &dyn Array) -> usize {
     match array.data_type() {
         DataType::Dictionary(_, _) => {
             let dictionary = array.as_any_dictionary();
+            // Only an all-null dictionary has no values, and it references no
+            // bytes. `normalized_keys` rejects an empty values array.
+            if dictionary.values().is_empty() {
+                return 0;
+            }
             let lengths = value_lengths(dictionary.values().as_ref());
             // The keys of null rows are arbitrary, and may index an empty
             // values array.
