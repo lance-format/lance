@@ -989,6 +989,14 @@ impl PostingListReader {
                     )
                 }
                 PositionsLayout::SharedStream(codec) => {
+                    if whole_positions::enabled() && !self.is_legacy_layout() {
+                        let reader = self.reader.get().await?;
+                        if let Some(stream) = whole_positions::try_read(
+                            reader.as_ref(), token_id, codec,
+                        ).await? {
+                            return Ok(Positions(CompressedPositionStorage::SharedStream(stream)));
+                        }
+                    }
                     let batch = self
                         .reader
                         .get().await?

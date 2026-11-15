@@ -2450,6 +2450,74 @@ async fn rewrite_selective_position_encoding(
     Ok(())
 }
 
+#[tokio::test]
+async fn selective_phrase_whole_positions_match_committed_arrow_streams() -> Result<()> {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::with_format_version(
+        Arc::new(ObjectStore::local()),
+        dir,
+        Arc::new(LanceCache::no_cache()),
+        lance_file::version::ConcreteFileVersion::V2_2,
+    ));
+    for partition_id in 0..2 {
+        let documents = (0..384)
+            .map(|row| {
+                let (left, right) = if row % 3 == 0 {
+                    ("alpha", "alpha")
+                } else if row % 3 == 1 {
+                    ("alpha", "beta")
+                } else {
+                    ("beta", "alpha")
+                };
+                (left, right, partition_id * 384 + row)
+            })
+            .collect::<Vec<_>>();
+        write_pair_partition_with_position(&store, partition_id, &documents, true).await;
+    }
+    rewrite_selective_position_encoding(&store, 0..2).await?;
+    let (index, _) = load_prewarmed_index(
+        store.clone(),
+        vec![0, 1],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    for partition in &index.partitions {
+        let inverted = &partition.inverted_list;
+        let PositionsLayout::SharedStream(codec) = inverted.positions_layout else {
+            panic!("fixture must use current shared position streams");
+        };
+        let reader = inverted.reader.get().await?;
+        for token_id in 0..inverted.len() as u32 {
+            let batch = reader
+                .read_range(
+                    token_id as usize..token_id as usize + 1,
+                    Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
+                )
+                .await?;
+            let offsets = batch[POSITION_BLOCK_OFFSET_COL].as_list::<i32>().value(0);
+            let expected = SharedPositionStream::from_arrow(
+                codec,
+                offsets.as_primitive::<UInt32Type>().values().to_vec(),
+                batch[COMPRESSED_POSITION_COL].as_binary::<i64>().clone(),
+            );
+            // Compare the entire encoded stream, not only rows selected by a
+            // query. This includes repeated positions and the partial tail.
+            assert!(expected.block_count() > 1);
+            for _ in 0..2 {
+                let actual = whole_positions::try_read(reader.as_ref(), token_id, codec)
+                    .await?
+                    .expect("mini-block fixture must support direct reads");
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    actual.size(),
+                    actual.bytes().len() + std::mem::size_of_val(actual.block_offsets()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[rstest::rstest]
 #[case::unfiltered(false)]
 #[case::filtered(true)]
