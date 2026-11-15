@@ -1,35 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Independent doc-ID slices sharing one physical partition's fetched inputs.
+//! Request-owned exact-phrase search over one physical partition.
 
 use super::*;
 
-pub(super) const MAX_ACTIVE_SLICES: usize = 8;
-const MAX_SLICES_PER_PARTITION: usize = 5;
+pub(super) const MAX_ACTIVE_PARTITIONS: usize = 4;
 
-/// Equal half-open ranges, independent of dataset row addresses and filtering.
-/// Statistics and scoring lengths remain those of the complete partition.
-pub(super) fn document_ranges(num_docs: usize, target_docs: usize) -> Result<Vec<Range<u64>>> {
-    if target_docs == 0 || num_docs as u64 > u64::from(u32::MAX) {
-        return Err(Error::invalid_input(format!(
-            "slice document count {num_docs} must fit dense DocIds and target {target_docs} must be positive"
-        )));
-    }
-    if num_docs == 0 {
-        return Ok(Vec::new());
-    }
-    let count = num_docs.div_ceil(target_docs).min(MAX_SLICES_PER_PARTITION);
-    let docs = num_docs as u64;
-    // count <= 5 and docs <= u32::MAX, so the products fit u64.
-    Ok((0..count)
-        .map(|index| index as u64 * docs / count as u64..(index as u64 + 1) * docs / count as u64)
-        .collect())
-}
-
-pub(super) struct SliceSearch {
+pub(super) struct PartitionSearch {
     pub(super) ordinal: usize,
-    pub(super) positions: Arc<[PreparedPositions]>,
+    pub(super) positions: Vec<PreparedPositions>,
     pub(super) fetched: FetchedPostings,
     pub(super) tokens: Arc<Tokens>,
     pub(super) params: Arc<FtsSearchParams>,
@@ -37,11 +17,10 @@ pub(super) struct SliceSearch {
     pub(super) impact_scorer: Arc<MemBM25Scorer>,
     pub(super) lengths: Arc<DocLengths>,
     pub(super) visibility: Arc<DocVisibility>,
-    pub(super) range: Range<u64>,
     pub(super) shared: Arc<AtomicU32>,
 }
 
-impl SliceSearch {
+impl PartitionSearch {
     pub(super) async fn run(self) -> Result<(usize, Vec<(DocId, f32)>)> {
         let Self {
             ordinal,
@@ -53,7 +32,6 @@ impl SliceSearch {
             impact_scorer,
             lengths,
             visibility,
-            range,
             shared,
         } = self;
         let query_tokens = tokens.clone();
@@ -61,12 +39,11 @@ impl SliceSearch {
         let limit = params
             .limit
             .ok_or_else(|| Error::internal("selective phrase lost its finite limit"))?;
-        let (mut search, idf, block_limits) = spawn_cpu(move || {
+        let (mut search, idf) = spawn_cpu(move || {
             let loaded = fetched.into_loaded(&query_tokens, scorer.as_ref())?;
             let idf = idf_by_position(&loaded.postings, scorer.as_ref());
-            let search = PhraseSearch::new(loaded.postings, limit)?.with_doc_range(range)?;
-            let block_limits = search.position_block_limits();
-            Ok::<_, Error>((search, idf, block_limits))
+            let search = PhraseSearch::new(loaded.postings, limit)?;
+            Ok::<_, Error>((search, idf))
         })
         .await?;
         let mut read_ahead = ReadAhead::new(positions.len());
@@ -128,20 +105,10 @@ impl SliceSearch {
                         // Current plus speculative encoded bytes share the
                         // original clause budget. Oversized neighbors skip
                         // speculation; offsets/scratch/cache/I/O are separate.
-                        let end_block = block_limits
-                            .iter()
-                            .find(|(token, _)| *token == plan.token_id)
-                            .map(|(_, limit)| *limit)
-                            .ok_or_else(|| {
-                                Error::internal("slice term has no position block bound")
-                            })?;
-                        let predictions = plan
-                            .read_ahead_blocks(&window, clause_budget)?
-                            .into_iter()
-                            .take_while(|blocks| blocks.start < end_block);
+                        let predictions = plan.read_ahead_blocks(&window, clause_budget)?;
                         read_ahead.schedule(
                             term,
-                            predictions.map(|blocks| {
+                            predictions.into_iter().map(|blocks| {
                                 let future = plan.read(blocks.start, metrics.as_ref()).boxed();
                                 (blocks, future)
                             }),
@@ -150,50 +117,6 @@ impl SliceSearch {
                     }
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[rstest::rstest]
-    #[case::empty(0, 10)]
-    #[case::single(1, 10)]
-    #[case::exact(10, 10)]
-    #[case::split(11, 10)]
-    #[case::cap(999, 1)]
-    #[case::max_domain(u32::MAX as usize, 250_000)]
-    fn selective_phrase_slice_ranges_cover_dense_docs(#[case] docs: usize, #[case] target: usize) {
-        let ranges = document_ranges(docs, target).unwrap();
-        assert_eq!(ranges.len(), docs.div_ceil(target).min(5));
-        if docs == 0 {
-            assert!(ranges.is_empty());
-            return;
-        }
-        assert_eq!(ranges.first().unwrap().start, 0);
-        assert_eq!(ranges.last().unwrap().end, docs as u64);
-        assert!(ranges.iter().all(|range| range.start < range.end));
-        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
-        let smallest = ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .min()
-            .unwrap();
-        assert!(
-            ranges
-                .iter()
-                .all(|range| range.end - range.start <= smallest + 1)
-        );
-    }
-
-    #[test]
-    fn selective_phrase_slice_ranges_reject_invalid_domain() {
-        for (docs, target) in [(1, 0), (u32::MAX as usize + 1, 1)] {
-            let error = document_ranges(docs, target).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }));
-            assert!(error.to_string().contains("must fit dense DocIds"));
         }
     }
 }

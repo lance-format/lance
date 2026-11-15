@@ -11,7 +11,7 @@ use crate::scalar::inverted::wand::selective_phrase::{
 
 mod read_ahead;
 use read_ahead::ReadAhead;
-mod sliced_search;
+mod partition_search;
 
 // Kept opt-in until exact-head CI and matched low-cache VM qualification.
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -24,28 +24,26 @@ pub(super) fn enabled() -> bool {
 
 // This bounds encoded blocks held by one partition search, not process RSS.
 // Postings, offsets, decode scratch, I/O buffers and other queries are separate.
-const MAX_LIVE_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LIVE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 // Search seed for the opt-in path, pending matched VM qualification.
-const POSITION_WINDOW_BYTES: u64 = 1024 * 1024;
+const POSITION_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 // Bound speculative request metadata even for arbitrarily small codec windows.
 // Encoded bytes have the stricter current-plus-predicted clause allowance.
 const MAX_PREDICTED_WINDOWS: usize = 7;
 const MAX_CLAUSES: usize = 16;
 const MAX_OFFSET_BYTES: usize = 1024 * 1024;
 
-/// Resource seeds for the opt-in reader, also allowing small CI fixtures to
-/// exercise real window and document-slice boundaries without huge payloads.
+/// Window target for the opt-in reader, also allowing small CI fixtures to
+/// exercise real window boundaries without huge payloads.
 #[derive(Clone, Copy)]
 pub(super) struct SearchConfig {
     pub(super) window_bytes: u64,
-    pub(super) target_docs: usize,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             window_bytes: POSITION_WINDOW_BYTES,
-            target_docs: 250_000,
         }
     }
 }
@@ -410,10 +408,10 @@ impl InvertedIndex {
                 return Ok(None);
             }
             let clause_budget = MAX_LIVE_WINDOW_BYTES / request.tokens.len() as u64;
-            if config.window_bytes == 0 || config.window_bytes > clause_budget || config.target_docs == 0 {
+            if config.window_bytes == 0 || config.window_bytes > clause_budget {
                 return Err(Error::invalid_input(format!(
-                    "selective window {} must fit clause budget {clause_budget}, and slice target {} must be positive",
-                    config.window_bytes, config.target_docs
+                    "selective window {} must be positive and fit clause budget {clause_budget}",
+                    config.window_bytes
                 )));
             }
             // Decide all encoding support before loading/consuming postings or
@@ -453,7 +451,8 @@ impl InvertedIndex {
                     .unwrap_or(f32::NEG_INFINITY)
                     .to_bits(),
             ));
-            let loads = stream::iter(prepared).map(|(ordinal, part, positions)| {
+            let loads = stream::iter(prepared)
+                .map(|(ordinal, part, positions)| {
                     let shared = shared.clone();
                     // Own the request across suspension; erase the future here
                     // rather than borrowing through the outer stream closure.
@@ -464,7 +463,7 @@ impl InvertedIndex {
                         })?;
                         let visibility = documents.visibility(request.mask.clone(), false).await?;
                         if !visibility.may_match().await? {
-                            return Ok::<Vec<sliced_search::SliceSearch>, Error>(Vec::new());
+                            return Ok::<Option<partition_search::PartitionSearch>, Error>(None);
                         }
                         let lengths = documents.lengths().await?;
                         let ids = request.term_ids.map(|ids| ids.partition(ordinal));
@@ -479,43 +478,31 @@ impl InvertedIndex {
                             )
                             .await?
                         else {
-                            return Ok::<Vec<sliced_search::SliceSearch>, Error>(Vec::new());
+                            return Ok::<Option<partition_search::PartitionSearch>, Error>(None);
                         };
-                        let ranges = sliced_search::document_ranges(documents.len(), config.target_docs)?;
-                        let positions: Arc<[PreparedPositions]> = positions.into();
-                        let visibility = Arc::new(visibility);
-                        let mut slices: Vec<sliced_search::SliceSearch> = Vec::with_capacity(ranges.len());
-                        for range in ranges {
-                            slices.push(sliced_search::SliceSearch {
-                                ordinal,
-                                positions: positions.clone(),
-                                fetched: fetched.clone(),
-                                tokens: request.tokens.clone(),
-                                params: request.params.clone(),
-                                metrics: request.metrics.clone(),
-                                impact_scorer: request.impact_scorer.clone(),
-                                lengths: lengths.clone(),
-                                visibility: visibility.clone(),
-                                range,
-                                shared: shared.clone(),
-                            });
-                        }
-                        Ok::<_, Error>(slices)
+                        Ok::<_, Error>(Some(partition_search::PartitionSearch {
+                            ordinal,
+                            positions,
+                            fetched,
+                            tokens: request.tokens.clone(),
+                            params: request.params.clone(),
+                            metrics: request.metrics.clone(),
+                            impact_scorer: request.impact_scorer.clone(),
+                            lengths,
+                            visibility: Arc::new(visibility),
+                            shared,
+                        }))
                     }
                     .boxed()
                 })
-                // Do not collect loaded partition payloads ahead of their slices.
+                // Keep loaded payloads bounded independently of index size.
                 .buffer_unordered(2)
-                .map_ok(|slices| {
-                    let slices = slices.into_iter().map(Ok::<_, Error>).collect::<Vec<_>>();
-                    stream::iter(slices)
-                })
-                .try_flatten()
-                .map_ok(|slice| slice.run().boxed());
-            // 8 active slices x 16MiB encoded payload preserves the 128MiB
-            // query ceiling; cached/shared inputs and scratch are separate.
+                .try_filter_map(|search| futures::future::ready(Ok(search)))
+                .map_ok(|search| search.run().boxed());
+            // Restore the pre-slicing policy: 4 x 32MiB encoded/query. Shared
+            // inputs, cache, scratch and I/O buffers remain separate budgets.
             let mut results = loads.try_buffer_unordered(
-                get_num_compute_intensive_cpus().min(sliced_search::MAX_ACTIVE_SLICES),
+                get_num_compute_intensive_cpus().min(partition_search::MAX_ACTIVE_PARTITIONS),
             );
             let mut ranked = BinaryHeap::new();
             while let Some((ordinal, scored)) = results.try_next().await? {

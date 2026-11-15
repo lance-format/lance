@@ -2454,7 +2454,7 @@ async fn rewrite_selective_position_encoding(
 #[case::unfiltered(false)]
 #[case::filtered(true)]
 #[tokio::test]
-async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) -> Result<()> {
+async fn selective_phrase_reads_committed_windows(#[case] filtered: bool) -> Result<()> {
     let dir = TempObjDir::default();
     let object_store = Arc::new(ObjectStore::local());
     let store = Arc::new(LanceIndexStore::with_format_version(
@@ -2465,8 +2465,8 @@ async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) 
     ));
     let mut expected = Vec::new();
     for partition in 0..2 {
-        // 645 docs make five unequal slices; boundaries cut through posting
-        // blocks. Row addresses are deliberately different from dense DocIds.
+        // Span multiple posting blocks and small read windows. Row addresses
+        // are deliberately different from dense DocIds.
         let rows = (0..645)
             .map(|doc| {
                 let row = partition * 10_000 + doc * 2;
@@ -2575,15 +2575,12 @@ async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) 
         reference.iter().map(|hit| hit.0).collect::<Vec<_>>(),
         expected
     );
-    // Vary the window key and slice plan on the same immutable files/cache.
-    for (target_docs, window_bytes) in [(150, 16), (usize::MAX, 32), (150, 32)] {
+    // Vary the window key, then revisit a surviving plan on the same cache.
+    for window_bytes in [16, 32, 16] {
         let selected = index
             .try_selective_phrase_search_with_config(
                 request.clone(),
-                selective_positions::SearchConfig {
-                    target_docs,
-                    window_bytes,
-                },
+                selective_positions::SearchConfig { window_bytes },
             )
             .await?
             .unwrap();
@@ -2599,23 +2596,17 @@ async fn selective_phrase_slices_read_committed_windows(#[case] filtered: bool) 
             actual.push((row, hit.score.0));
         }
         actual.sort_unstable_by_key(|hit| hit.0);
-        assert_eq!(
-            actual, reference,
-            "slice target {target_docs}, window {window_bytes}"
-        );
+        assert_eq!(actual, reference, "window {window_bytes}");
     }
-    // Slice-local collectors may publish their kth score globally. A bounded
-    // global top-k must retain a valid cutoff tie rather than prune all slices.
+    // Partition-local collectors publish their kth score globally. A bounded
+    // global top-k must retain a valid cutoff tie across physical partitions.
     let mut limited = request;
     limited.limit = 1;
     limited.params = Arc::new(limited.params.as_ref().clone().with_limit(Some(1)));
     let hits = index
         .try_selective_phrase_search_with_config(
             limited,
-            selective_positions::SearchConfig {
-                target_docs: 150,
-                window_bytes: 16,
-            },
+            selective_positions::SearchConfig { window_bytes: 16 },
         )
         .await?
         .unwrap();
