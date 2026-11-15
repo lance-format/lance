@@ -1,0 +1,284 @@
+name: Windows quantized-cache diagnostic
+
+# Diagnostic only. This workflow localizes the failing phase of the three
+# Windows nightly failures observed at 3c570b969c88fa2ad29f18199a3886ec4de3f8be
+# (run 43657826113, job 132640223080). It is not a repair, not a merge
+# candidate, and must not be merged.
+#
+# Trigger: pull_request only, narrowed to the two diagnostic paths and guarded
+# at job level by github.head_ref for the single diagnostic branch. There is no
+# push and no workflow_dispatch trigger, so opening/updating this PR is the only
+# way this workflow runs.
+#
+# The PR head carries only this workflow and the saved phase patch. The build
+# happens in a second checkout pinned to the exact red head, so later commits on
+# the PR branch cannot change what is built or run.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/windows-quantized-cache-diagnostic.yml
+      - ci/diagnostics/quantized-cache-phase-c029d999.patch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-quantized-cache-diagnostic-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    name: Quantized refinement cache lifecycle (3 cases, red head)
+    if: github.head_ref == 'xuanwo/diagnose-quantized-cache-windows-20261115'
+    runs-on: windows-latest
+    # Reuses the nightly windows-rust-tests timeout; the workspace build is the
+    # dominant cost and this job runs the same build graph.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: reproduction/rust
+    steps:
+      - name: Checkout diagnostic PR head (patch source)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout exact red head 3c570b96 (reproduction tree)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: 3c570b969c88fa2ad29f18199a3886ec4de3f8be
+          path: reproduction
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record runner image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "ImageOS=$env:ImageOS"
+          "ImageVersion=$env:ImageVersion"
+          "RUNNER_OS=$env:RUNNER_OS RUNNER_ARCH=$env:RUNNER_ARCH"
+          "OSVersion=$([System.Environment]::OSVersion.VersionString)"
+          $current = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          "ProductName=$($current.ProductName) DisplayVersion=$($current.DisplayVersion) CurrentBuild=$($current.CurrentBuild).$($current.UBR)"
+          "workspace=$env:GITHUB_WORKSPACE"
+          "run_id=$env:GITHUB_RUN_ID attempt=$env:GITHUB_RUN_ATTEMPT"
+
+      - name: Set up Rust cache for both checkouts
+        # Same cache action as the nightly Windows job. Both Cargo workspaces are
+        # listed because the diagnostic tree and the reproduction tree are
+        # separate checkouts with their own target directories.
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: |
+            . -> target
+            reproduction -> target
+
+      - name: Install Protoc v21.12
+        working-directory: C:\
+        run: |
+          New-Item -Path 'C:\protoc' -ItemType Directory
+          Set-Location C:\protoc
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
+          7z x protoc.zip
+          Add-Content $env:GITHUB_PATH "C:\protoc\bin"
+        shell: powershell
+
+      - name: Install cargo-nextest 0.9.129 (version used by the red run)
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest@0.9.129
+
+      - name: Verify red objects, patch oracle, and apply phase instrumentation
+        # bash (Git Bash) is used for byte-exact handling: the saved patch is
+        # read from the PR-head git object, never from the CRLF-converted
+        # worktree, and is applied to the reproduction checkout only.
+        working-directory: reproduction
+        shell: bash
+        env:
+          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          REPRO=$(git rev-parse --show-toplevel)
+          DIAG=$(dirname "$REPRO")
+          TEST_PATH="rust/lance/src/dataset/tests/dataset_scanner_knn.rs"
+          PATCH_BLOB_PATH="ci/diagnostics/quantized-cache-phase-c029d999.patch"
+          PATCH="../quantized-cache-phase-c029d999.patch"
+
+          cd "$REPRO"
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "reproduction_head=$HEAD_SHA"
+          echo "reproduction_subject=$(git log -1 --format=%s)"
+          DIAG_HEAD=$(git -C "$DIAG" rev-parse HEAD)
+          echo "diagnostic_head=$DIAG_HEAD"
+          echo "expected_diagnostic_head=$EXPECTED_DIAGNOSTIC_HEAD"
+          if [ "$HEAD_SHA" != "3c570b969c88fa2ad29f18199a3886ec4de3f8be" ]; then
+            echo "::error::unexpected reproduction head: $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$DIAG_HEAD" != "$EXPECTED_DIAGNOSTIC_HEAD" ]; then
+            echo "::error::diagnostic checkout is not the PR head: $DIAG_HEAD"
+            exit 1
+          fi
+
+          # Committed object identity. This reads HEAD:<path>, not the worktree
+          # file, so a CRLF checkout cannot shift these ids.
+          check_object() {
+            local path="$1" want="$2" got
+            got=$(git rev-parse "HEAD:$path")
+            echo "object=$path sha=$got"
+            if [ "$got" != "$want" ]; then
+              echo "::error::unexpected blob for $path: $got != $want"
+              exit 1
+            fi
+          }
+          check_object "rust/lance/src/dataset/tests/dataset_scanner_knn.rs" "1c62b04b68d064bde8c56e63c149de959a25cf7d"
+          check_object "rust/lance/src/session/index_caches.rs" "154b92c96c7f176b77546715a8d6616a1cb01d94"
+          check_object "rust/lance/src/io/exec/knn.rs" "c83d7fce94d0dab6f66c51a7f405cd3eb282ddf3"
+          check_object "rust/lance-core/src/cache/mod.rs" "06547ea350e4beeb2bc035f39cdb7fbc4dfb5d15"
+          check_object "Cargo.lock" "be54ca4a3271c5ddd2d33e867cb4ac3c16660d52"
+          check_object "rust/lance/Cargo.toml" "a4c2ac1179520c3d3cfdd26ff1342747392e53e3"
+
+          echo "toolchain_pin=$(grep -m1 '^channel' rust-toolchain.toml)"
+
+          # Patch oracle: extract the patch from the PR-head object and check the
+          # reviewed bytes before touching the reproduction worktree. The copy
+          # lives next to (not inside) the reproduction checkout.
+          PATCH_BLOB=$(git -C "$DIAG" rev-parse "HEAD:$PATCH_BLOB_PATH")
+          git -C "$DIAG" cat-file blob "$PATCH_BLOB" > "$PATCH"
+          PATCH_SHA=$(sha256sum "$PATCH" | cut -d' ' -f1)
+          echo "patch_blob=$PATCH_BLOB"
+          echo "patch_sha256=$PATCH_SHA"
+          if [ "$PATCH_SHA" != "729d181c113c3ca31b1b8fdb213c84d909ec40c31d4bb94eff963e0e13b149d6" ]; then
+            echo "::error::patch oracle mismatch: $PATCH_SHA"
+            exit 1
+          fi
+
+          # Normalize the runner scratch checkout to LF so the saved patch
+          # applies byte-for-byte. Nothing here is pushed or committed.
+          git config --local core.autocrlf false
+          git checkout -- "$TEST_PATH"
+          PRE=$(git hash-object --no-filters "$TEST_PATH")
+          echo "pre_apply_worktree_blob=$PRE"
+          if [ "$PRE" != "1c62b04b68d064bde8c56e63c149de959a25cf7d" ]; then
+            echo "::error::reproduction worktree is not the red test source: $PRE"
+            exit 1
+          fi
+
+          if ! git apply --check "$PATCH"; then
+            echo "::error::phase patch does not apply to the red head"
+            exit 1
+          fi
+          if ! git apply "$PATCH"; then
+            echo "::error::phase patch failed to apply"
+            exit 1
+          fi
+          POST=$(git hash-object --no-filters "$TEST_PATH")
+          echo "post_apply_worktree_blob=$POST"
+          if [ "$POST" != "341fa012412c4b9bd6a98394c66f4f01d2eee131" ]; then
+            echo "::error::unexpected post-patch test blob: $POST"
+            exit 1
+          fi
+          git diff --stat -- "$TEST_PATH"
+          git diff --numstat -- "$TEST_PATH"
+
+          # The post-patch blob already pins every byte; these greps are a
+          # readable cross-check that the 11 phase emissions and the original
+          # residency/correctness assertions survived.
+          for label in \
+            original_miss original_hit delete_miss delete_hit \
+            optimize_miss reindex_miss checkout_original_hit \
+            'compact_{target_rows_per_fragment}_miss' \
+            'compact_{target_rows_per_fragment}_hit'
+          do
+            if ! grep -qF "$label" "$TEST_PATH"; then
+              echo "::error::missing phase label: $label"
+              exit 1
+            fi
+          done
+          for assertion in \
+            'after.loads_started, before.loads_started' \
+            'after.loads_succeeded > before.loads_succeeded' \
+            'assert_eq!(after.hits, before.hits' \
+            'LanceCache::no_cache()'
+          do
+            if ! grep -qF "$assertion" "$TEST_PATH"; then
+              echo "::error::missing preserved assertion: $assertion"
+              exit 1
+            fi
+          done
+          echo "phase_labels=9_sites_11_phases assertions_preserved=ok"
+
+      - name: Record toolchain
+        run: |
+          "RUSTUP_TOOLCHAIN=$env:RUSTUP_TOOLCHAIN"
+          rustc --version --verbose
+          cargo --version
+          cargo nextest --version
+          protoc --version
+
+      - name: Build tests (workspace, same as nightly)
+        run: cargo nextest run --cargo-profile ci --locked --no-run
+
+      - name: Enumerate the three lifecycle selectors before running
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $filter = 'test(/dataset_scanner_knn::test_quantized_refinement_cache_snapshot_lifecycle::/)'
+          $raw = cargo nextest list --cargo-profile ci --locked --message-format json -E $filter | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "cargo nextest list failed with exit code $LASTEXITCODE" }
+          $raw | Set-Content -Path nextest-filtered.json
+
+          $doc = $raw | ConvertFrom-Json
+          if (-not $doc.'rust-suites') { throw "nextest list reported no rust-suites (zero tests listed)" }
+          $all = @()
+          foreach ($suite in $doc.'rust-suites'.PSObject.Properties) {
+            foreach ($case in $suite.Value.testcases.PSObject.Properties) {
+              $all += $case.Name
+            }
+          }
+          $prefix = 'dataset::tests::dataset_scanner_knn::test_quantized_refinement_cache_snapshot_lifecycle::'
+          $listed = @($all | Where-Object { $_.StartsWith($prefix) })
+          "listed_total=$($all.Count)"
+          "listed_lifecycle=$($listed.Count)"
+          $listed | ForEach-Object { "selector=$_" }
+
+          $expected = @(
+            'dataset::tests::dataset_scanner_knn::test_quantized_refinement_cache_snapshot_lifecycle::case_1_row_addresses',
+            'dataset::tests::dataset_scanner_knn::test_quantized_refinement_cache_snapshot_lifecycle::case_2_stable_row_ids',
+            'dataset::tests::dataset_scanner_knn::test_quantized_refinement_cache_snapshot_lifecycle::case_3_deferred_row_addresses'
+          )
+          if ($listed.Count -ne $expected.Count) {
+            throw "expected exactly $($expected.Count) lifecycle selectors, found $($listed.Count)"
+          }
+          foreach ($leaf in $expected) {
+            $hits = @($listed | Where-Object { $_ -eq $leaf -or $_.EndsWith("::$leaf") })
+            if ($hits.Count -ne 1) {
+              throw "expected selector not uniquely listed: $leaf (matches: $($hits.Count))"
+            }
+          }
+          "selector_assertion=ok expected_count=$($expected.Count)"
+
+      - name: Run the three lifecycle cases (default features, RUST_BACKTRACE=1)
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          "RUST_BACKTRACE=$env:RUST_BACKTRACE"
+          cargo nextest run --cargo-profile ci --locked --no-fail-fast --no-tests=fail --success-output immediate -E 'test(/dataset_scanner_knn::test_quantized_refinement_cache_snapshot_lifecycle::/)'
+
+      - name: Upload selector listing
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nextest-filtered-listing
+          path: reproduction/rust/nextest-filtered.json
+          if-no-files-found: warn
