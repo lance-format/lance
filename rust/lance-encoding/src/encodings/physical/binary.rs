@@ -1293,6 +1293,10 @@ impl PerValueCompressor for VariableEncoder {
 pub struct VariableDecoder {}
 
 impl VariablePerValueDecompressor for VariableDecoder {
+    fn try_reuse_admitted_input(&self, data: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+        crate::compression::variable::reuse(data)
+    }
+
     fn plan_decode(&self, data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
         crate::compression::variable::plan(data)
     }

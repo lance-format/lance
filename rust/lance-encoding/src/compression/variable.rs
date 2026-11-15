@@ -114,6 +114,22 @@ pub fn plan(data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
     })
 }
 
+pub fn reuse(data: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+    let (_, payload_bytes) = validate(data)?;
+    // Do not preserve visible trailing storage unnecessarily. The owner may
+    // still contain other slices, whose complete physical charge must follow it.
+    if payload_bytes != data.data.len() {
+        return Ok(None);
+    }
+    Ok(Some(DataBlock::VariableWidth(VariableWidthBlock {
+        data: data.data.clone(),
+        offsets: data.offsets.clone(),
+        bits_per_offset: data.bits_per_offset,
+        num_values: data.num_values,
+        block_info: BlockInfo::new(),
+    })))
+}
+
 pub fn decode(data: &VariableWidthBlock, workspace: &mut Reservation) -> Result<Option<DataBlock>> {
     let budget = plan(data)?;
     if budget.workspace_bytes > workspace.len() {

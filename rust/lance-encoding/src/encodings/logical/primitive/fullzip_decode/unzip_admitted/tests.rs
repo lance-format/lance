@@ -326,6 +326,85 @@ fn fullzip_range_unzip_bounds_physical_overlap_and_semantics(
 }
 
 #[rstest]
+fn owned_raw_unzip_reuses_only_charged_compact_values(
+    #[values(32, 64)] bits: u8,
+    #[values("flat", "nullable", "list", "deep")] kind: &str,
+    #[values(0..4, 1..3, 3..4, 4..4)] range: Range<u64>,
+) {
+    let f = fixture(bits, false, kind);
+    let selected = f.value_starts[range.start as usize]..f.value_starts[range.end as usize];
+    let level_range = f.level_starts[range.start as usize]..f.level_starts[range.end as usize];
+    let levels =
+        level_range.len() * 2 * (usize::from(f.rep.is_some()) + usize::from(f.def.is_some()));
+    let stage = f
+        .scheduler
+        .plan_unzip_range(std::slice::from_ref(&f.zipped), 4, range.clone())
+        .unwrap();
+    let physical = f.zipped.len() + 4 * 13 + 1;
+    let pool = AllocationBudget::new(physical + stage + levels);
+    let mut work = pool.try_reserve(physical + stage + levels).unwrap();
+    let (input, sibling, _) = charge(&f, &mut work);
+    let task = f
+        .scheduler
+        .try_unzip_owned_in(&input, 4, range, &mut work)
+        .unwrap()
+        .unwrap();
+    drop((input, sibling));
+    assert_eq!(work.len(), levels, "no room for a second copy of values");
+    let page = task.decode(&mut work).unwrap().unwrap();
+    assert!(work.is_empty());
+    assert_eq!(pool.reserved(), stage + levels);
+    let refs = f.values[selected.clone()]
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let (ty, expected) = if bits == 32 {
+        (DataType::Binary, BinaryArray::from_vec(refs).to_data())
+    } else {
+        (
+            DataType::LargeBinary,
+            LargeBinaryArray::from_vec(refs).to_data(),
+        )
+    };
+    let arrow = page.data.try_to_arrow_in(&ty, &mut work).unwrap().unwrap();
+    assert_eq!(arrow, expected);
+    // Even an empty Arrow slice retains the complete exact unzip allocation.
+    let alias = arrow.slice(0, 0);
+    drop((page, arrow, work));
+    assert_eq!(pool.reserved(), stage);
+    let peer = pool.try_reserve(physical + levels).unwrap();
+    assert!(pool.try_reserve(1).is_none());
+    drop(alias);
+    assert_eq!(pool.reserved(), peer.len());
+    drop(peer);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[rstest]
+#[case::insufficient_levels("nullable", false)]
+#[case::compressed_values("flat", true)]
+fn owned_unzip_refusal_releases_compact_input(#[case] kind: &str, #[case] fsst: bool) {
+    let f = fixture(32, fsst, kind);
+    let stage = f
+        .scheduler
+        .plan_unzip_range(std::slice::from_ref(&f.zipped), 4, 0..4)
+        .unwrap();
+    let physical = f.zipped.len() + 4 * 13 + 1;
+    let pool = AllocationBudget::new(physical + stage);
+    let mut work = pool.try_reserve(physical + stage).unwrap();
+    let (input, sibling, _) = charge(&f, &mut work);
+    let task = f
+        .scheduler
+        .try_unzip_owned_in(&input, 4, 0..4, &mut work)
+        .unwrap()
+        .unwrap();
+    drop((input, sibling));
+    assert!(work.is_empty());
+    assert!(task.decode(&mut work).unwrap().is_none());
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[rstest]
 #[case::truncated_word("word", "control word")]
 #[case::truncated_length("length", "length prefix")]
 #[case::long_value("payload", "item length")]

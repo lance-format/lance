@@ -12,7 +12,7 @@ use super::{FullZipScheduler, PerValueDecompressor, VariableFullZipDecodeTask};
 use crate::{
     buffer::LanceBuffer,
     compression::MiniBlockOutputLayout,
-    decoder::DecodePageTask,
+    decoder::{DecodePageTask, DecodedPage},
     repdef::{ControlWordParser, RepDefUnraveler, max_visible_level},
 };
 
@@ -25,6 +25,16 @@ struct Plan {
     rep: usize,
     def: usize,
     total: usize,
+}
+
+// Construction is private: all slices share exactly one newly admitted unzip
+// allocation. This proof must not be inferred from a generic task's visible size.
+pub(super) struct AdmittedUnzipTask(VariableFullZipDecodeTask);
+
+impl AdmittedUnzipTask {
+    pub(super) fn decode(self, workspace: &mut Reservation) -> Result<Option<DecodedPage>> {
+        super::admitted::decode_reusing_values(&self.0, workspace)
+    }
 }
 
 fn add(a: usize, b: usize) -> Result<usize> {
@@ -302,6 +312,18 @@ impl FullZipScheduler {
         range: Range<u64>,
         workspace: &mut Reservation,
     ) -> Result<Option<Box<dyn DecodePageTask>>> {
+        Ok(self
+            .try_unzip_owned_in(data, num_rows, range, workspace)?
+            .map(|task| Box::new(task.0) as Box<dyn DecodePageTask>))
+    }
+
+    pub(super) fn try_unzip_owned_in(
+        &self,
+        data: &[impl AsRef<[u8]>],
+        num_rows: u64,
+        range: Range<u64>,
+        workspace: &mut Reservation,
+    ) -> Result<Option<AdmittedUnzipTask>> {
         let plan = plan(self, data, num_rows, range.clone())?;
         let Some(mut output) = workspace.try_allocate(plan.total)? else {
             return Ok(None);
@@ -348,7 +370,7 @@ impl FullZipScheduler {
             return Err(Error::internal("validated variable FullZip codec changed"));
         };
         let storage = Buffer::from(output.freeze());
-        Ok(Some(Box::new(VariableFullZipDecodeTask {
+        Ok(Some(AdmittedUnzipTask(VariableFullZipDecodeTask {
             details: self.details.clone(),
             decompressor: codec.clone(),
             offsets: LanceBuffer::from(storage.slice_with_length(0, plan.offsets)),

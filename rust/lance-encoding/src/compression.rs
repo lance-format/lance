@@ -1543,6 +1543,27 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
 
+    /// Validate and reuse input that is already decoded, without allocating payload.
+    /// `None` means this codec cannot reuse it; errors still reject corrupt input.
+    /// Unlike `try_decompress_in`, this may retain the entire physical input owner,
+    /// including bytes outside the visible slices. The caller must keep that owner
+    /// charged until every output alias drops. Use only for a compact, admitted
+    /// intermediate when retaining its complete backing allocation is acceptable.
+    /// The default does not invoke the ordinary allocating decoder.
+    ///
+    /// ```
+    /// use lance_core::Result;
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     data::{DataBlock, VariableWidthBlock}};
+    /// fn reuse(codec: &dyn VariablePerValueDecompressor,
+    ///     charged: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+    ///     codec.try_reuse_admitted_input(charged)
+    /// }
+    /// ```
+    fn try_reuse_admitted_input(&self, _data: &VariableWidthBlock) -> Result<Option<DataBlock>> {
+        Ok(None)
+    }
+
     /// Visit decoded binary values without allocating payload or alignment copies.
     /// Validate the complete offset table before invoking any callback. Offsets
     /// start at zero, have the declared signed width and exactly `num_values + 1`

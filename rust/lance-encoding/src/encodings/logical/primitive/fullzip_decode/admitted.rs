@@ -11,7 +11,7 @@ use lance_core::{
 
 use super::VariableFullZipDecodeTask;
 use crate::{
-    data::{BlockInfo, VariableWidthBlock},
+    data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::DecodedPage,
     repdef::{ControlWordParser, RepDefUnraveler, max_visible_level},
 };
@@ -36,6 +36,31 @@ fn copy_levels(
 pub(super) fn decode(
     task: &VariableFullZipDecodeTask,
     workspace: &mut Reservation,
+) -> Result<Option<DecodedPage>> {
+    decode_with_values(task, workspace, None)
+}
+
+// Only the privately constructed admitted unzip task calls this. Its selected
+// values occupy a fresh, compact, charged allocation, not a view of an I/O page.
+pub(super) fn decode_reusing_values(
+    task: &VariableFullZipDecodeTask,
+    workspace: &mut Reservation,
+) -> Result<Option<DecodedPage>> {
+    let block = VariableWidthBlock {
+        data: task.data.clone(),
+        offsets: task.offsets.clone(),
+        bits_per_offset: task.bits_per_offset,
+        num_values: task.num_visible_items,
+        block_info: BlockInfo::new(),
+    };
+    let values = task.decompressor.try_reuse_admitted_input(&block)?;
+    decode_with_values(task, workspace, values)
+}
+
+fn decode_with_values(
+    task: &VariableFullZipDecodeTask,
+    workspace: &mut Reservation,
+    values: Option<DataBlock>,
 ) -> Result<Option<DecodedPage>> {
     // An empty selection still has the encoded structural streams. Keep their
     // presence so list reconstruction can emit its leading zero offset.
@@ -72,9 +97,12 @@ pub(super) fn decode(
         num_values: task.num_visible_items,
         block_info: BlockInfo::new(),
     };
-    let plan = task.decompressor.plan_decode(&block)?;
-    let required = plan
-        .workspace_bytes
+    let value_bytes = if values.is_some() {
+        0
+    } else {
+        task.decompressor.plan_decode(&block)?.workspace_bytes
+    };
+    let required = value_bytes
         .checked_add(rep.map_or(0, std::mem::size_of_val))
         .and_then(|n| n.checked_add(def.map_or(0, std::mem::size_of_val)))
         .ok_or_else(|| Error::invalid_input("FullZip workspace size overflows"))?;
@@ -86,7 +114,11 @@ pub(super) fn decode(
     let result = (|| {
         rep_output = copy_levels(rep, workspace)?;
         def_output = copy_levels(def, workspace)?;
-        let Some(data) = task.decompressor.try_decompress_in(&block, workspace)? else {
+        let data = match values {
+            Some(data) => Some(data),
+            None => task.decompressor.try_decompress_in(&block, workspace)?,
+        };
+        let Some(data) = data else {
             return Ok(None);
         };
         let repdef = RepDefUnraveler::from_admitted_levels(

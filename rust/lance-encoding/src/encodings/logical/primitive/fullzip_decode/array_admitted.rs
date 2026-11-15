@@ -141,6 +141,15 @@ impl Shape<'_> {
         let Some(page) = page else {
             return Ok(None);
         };
+        self.finish(page, count, workspace)
+    }
+
+    fn finish(
+        &self,
+        page: DecodedPage,
+        count: u64,
+        workspace: &mut Reservation,
+    ) -> Result<Option<ArrayRef>> {
         let Some(array) = self.materialize(page, workspace)? else {
             return Ok(None);
         };
@@ -164,7 +173,7 @@ pub(super) struct ArrayDecodeJob {
 
 impl ArrayDecodeJob {
     pub(super) fn decode(mut self) -> Result<(Reservation, Option<ArrayRef>)> {
-        let task = self.scheduler.try_unzip_buffers_in(
+        let task = self.scheduler.try_unzip_owned_in(
             std::slice::from_ref(&self.input),
             self.count,
             0..self.count,
@@ -172,11 +181,14 @@ impl ArrayDecodeJob {
         );
         self.input.recycle(&mut self.workspace)?;
         let array = match task? {
-            Some(task) => Shape::new(&self.scheduler, &self.data_type)?.decode(
-                task,
-                self.count,
-                &mut self.workspace,
-            )?,
+            Some(task) => match task.decode(&mut self.workspace)? {
+                Some(page) => Shape::new(&self.scheduler, &self.data_type)?.finish(
+                    page,
+                    self.count,
+                    &mut self.workspace,
+                )?,
+                None => None,
+            },
             None => None,
         };
         Ok((self.workspace, array))
@@ -241,6 +253,9 @@ impl FullZipScheduler {
     /// Cancellation after dispatch does not abort CPU work. Input and unused
     /// credit belong to the CPU job until it finishes; output aliases retain
     /// their own charge. No allocation wait or smaller-range retry occurs here.
+    /// Raw values reuse this job's compact, admitted unzip allocation. Its full
+    /// charge (including structural streams) follows every output alias; generic
+    /// task decoding still detaches values from arbitrary input owners.
     /// The read callback has the same owned-buffer contract as the inline API.
     ///
     /// ```

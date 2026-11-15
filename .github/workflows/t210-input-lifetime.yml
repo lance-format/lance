@@ -21,13 +21,24 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Typed raw offset chunks
+      - name: Owned raw decode and physical lifetime
         env:
           LANCE_CPU_THREADS: 1
         run: |
           cargo test --profile ci --locked -p lance-encoding --lib compression::variable::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::admitted::tests -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::variable::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::unzip_admitted::tests::owned_ -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::unzip_admitted::tests::read::cpu -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --doc try_reuse_admitted_input -- --nocapture
+      - name: File cursor composition
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip -- --nocapture
+          cargo test --profile ci --locked -p lance-file --example admitted_fullzip -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding -p lance-file --all-features --all-targets --no-deps -- -D warnings

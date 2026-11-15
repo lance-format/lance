@@ -172,6 +172,9 @@ fn raw_per_value_rejects_complete_invalid_offsets_before_admission(
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert!(error.to_string().contains("offset"));
     assert_eq!(callbacks, 0);
+    let error = codec.try_reuse_admitted_input(&input).unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("offset"));
 }
 
 #[rstest]
@@ -191,6 +194,49 @@ fn raw_per_value_invalid_geometry_keeps_credit(
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains(message));
     assert_eq!(work.len(), 16);
+    let error = codec.try_reuse_admitted_input(&input).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message));
+}
+
+#[rstest]
+fn raw_reuse_keeps_complete_physical_owner(
+    #[values(32, 64)] bits: u8,
+    #[values(false, true)] trailing: bool,
+) {
+    let (codec, mut input) = fixture(bits, &[b"payload".to_vec(), vec![]]);
+    if trailing {
+        input.data = LanceBuffer::from(b"payload-unused".to_vec());
+    }
+    let physical = input.offsets.len() + 3 + input.data.len() + 37;
+    let pool = AllocationBudget::new(physical);
+    let mut work = pool.try_reserve(physical).unwrap();
+    let (input, sibling, actual) = charge_per_value(input, 0, &mut work);
+    assert_eq!(actual, physical);
+    assert!(work.is_empty());
+    let reused = codec.try_reuse_admitted_input(&input).unwrap();
+    if trailing {
+        assert!(
+            reused.is_none(),
+            "visible unused storage requires detachment"
+        );
+        drop((input, sibling, work));
+    } else {
+        let DataBlock::VariableWidth(output) = reused.unwrap() else {
+            panic!("expected raw variable output")
+        };
+        assert_eq!(output.data.as_ref(), b"payload");
+        assert_eq!(output.data.as_ptr(), input.data.as_ptr());
+        assert_eq!(output.offsets.as_ptr(), input.offsets.as_ptr());
+        let alias = output.data.slice_with_length(1, 1);
+        drop((input, sibling, output, work));
+        // A one-byte slice must retain the complete charged owner, including
+        // coalescing gaps which are invisible through the slice length.
+        assert_eq!(pool.reserved(), physical);
+        assert!(pool.try_reserve(1).is_none());
+        drop(alias);
+    }
+    assert_eq!(pool.reserved(), 0);
 }
 
 #[rstest]
