@@ -123,14 +123,18 @@ pub(crate) fn validate_segment_index_details(
     Ok(())
 }
 
-/// Whether bounded optimize can merge several segments of this kind without
-/// rescanning the table. LabelList's pure segment merge is supported even though
-/// its ordinary append path cannot merge several old segments with a new stream.
+/// Whether optimize can fold several segments of this kind into one without
+/// rescanning the table: vector, BTree, Bitmap, NGram and RTree
+/// (`merge_scalar_indices`), Inverted (`InvertedIndex::merge_segments`), and
+/// LabelList (`merge_label_list_indices`). LabelList's pure merge is supported
+/// even though its ordinary append path cannot merge several old segments with
+/// a new stream.
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
     segment_has_vector_details(segment)
         || segment_has_btree_details(segment)
         || segment_has_bitmap_details(segment)
         || segment_has_ngram_details(segment)
+        || (cfg!(feature = "geo") && segment_has_rtree_details(segment))
         || segment_has_inverted_details(segment)
         || segment_has_label_list_details(segment)
 }

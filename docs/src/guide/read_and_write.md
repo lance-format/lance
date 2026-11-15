@@ -669,6 +669,34 @@ Lance rewrites it to the `any_element` call above, so the two behave the same.
 has one parameter, and its body may only refer to that parameter's fields.
 Other lambdas, such as in `array_filter`, are not supported in filters.
 
+A `listelement` scalar index on the list column answers `any_element` filters
+from the index. Its `keys` name the element fields it indexes, in order:
+
+```python
+from lance.indices import IndexConfig
+
+dataset.create_scalar_index(
+    "detections",
+    IndexConfig(index_type="listelement", parameters={"keys": ["label", "confidence"]}),
+)
+```
+
+The index is used when the predicate fixes the first key with `=`, `IN` or
+`IS NULL`. Conditions on further keys narrow the search: equalities on a prefix
+of the keys, then one range on the next key. When the predicate has conditions
+the index cannot answer, such as one on a field that is not a key, the rows the
+index finds are rechecked with `any_element` itself, so the index never changes
+the result. Keys may be booleans, integers, floats, dates, timestamps, strings
+or binaries. The index follows its key fields through renames. If a key field
+is dropped or changes type, queries stop using the index and scan instead; drop
+and recreate it.
+
+!!! warning "Experimental"
+
+    The `listelement` index is an experimental format feature. Its files may
+    change incompatibly; after such a change the index must be rebuilt, but the
+    data itself is never rewritten.
+
 ### Random read
 
 One distinct feature of Lance, as columnar format, is that it allows you to read random samples quickly.

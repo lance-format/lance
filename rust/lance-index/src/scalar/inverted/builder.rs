@@ -34,7 +34,7 @@ use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -315,7 +315,7 @@ impl InvertedIndexBuilder {
         self.progress
             .stage_start("tokenize_docs", None, "rows")
             .await?;
-        let mut files = self.update_index(new_data, dest_store).await?;
+        let files = self.update_index(new_data, dest_store).await?;
 
         if let Some(
             OldIndexDataFilter::Fragments { to_remove, .. }
@@ -326,8 +326,12 @@ impl InvertedIndexBuilder {
         }
 
         self.progress.stage_complete("tokenize_docs").await?;
-        files.extend(self.write(dest_store).await?);
-        Ok(files)
+        let options = if self.partitions.is_empty() {
+            FinalizeOptions::copy_only()
+        } else {
+            FinalizeOptions::default()
+        };
+        self.write(dest_store, files, options).await
     }
 
     pub async fn update_from_segments(
@@ -359,8 +363,8 @@ impl InvertedIndexBuilder {
         files.extend(self.update_index(new_data, dest_store).await?);
         self.progress.stage_complete("tokenize_docs").await?;
 
-        files.extend(self.write(dest_store).await?);
-        Ok(files)
+        self.write(dest_store, files, FinalizeOptions::default())
+            .await
     }
 
     async fn merge_existing_segments(
@@ -855,70 +859,215 @@ impl InvertedIndexBuilder {
         Ok(files)
     }
 
-    async fn write(&self, dest_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
+    async fn write(
+        &self,
+        dest_store: &dyn IndexStore,
+        mut files: Vec<IndexFile>,
+        options: FinalizeOptions,
+    ) -> Result<Vec<IndexFile>> {
         let mut partitions = Vec::with_capacity(self.partitions.len() + self.new_partitions.len());
         partitions.extend_from_slice(&self.partitions);
         partitions.extend_from_slice(&self.new_partitions);
         partitions.sort_unstable();
 
-        self.progress
-            .stage_start(
-                "copy_partitions",
-                Some(partitions.len() as u64),
-                "partitions",
-            )
-            .await?;
-        let mut copied = 0;
-        let mut files = Vec::new();
         let target = self.partition_write_target();
-        for part in self.partitions.iter() {
-            files.push(
-                self.src_store
-                    .as_ref()
-                    .expect("existing partitions require a source store")
-                    .copy_index_file_to(
-                        &token_file_path(*part),
-                        &target.token_path(*part),
-                        dest_store,
+        // Distributed workers leave consolidation to their shared finalizer.
+        let obsolete =
+            if target == PartitionWriteTarget::Final && options.consolidate_small_partitions {
+                self.consolidate_updated_partitions(dest_store, &mut partitions, &mut files)
+                    .await?
+            } else {
+                self.progress
+                    .stage_start(
+                        "copy_partitions",
+                        Some(partitions.len() as u64),
+                        "partitions",
                     )
-                    .await?,
-            );
-            files.push(
-                self.src_store
-                    .as_ref()
-                    .expect("existing partitions require a source store")
-                    .copy_index_file_to(
-                        &posting_file_path(*part),
-                        &target.posting_path(*part),
-                        dest_store,
-                    )
-                    .await?,
-            );
-            files.push(
-                self.src_store
-                    .as_ref()
-                    .expect("existing partitions require a source store")
-                    .copy_index_file_to(&doc_file_path(*part), &target.doc_path(*part), dest_store)
-                    .await?,
-            );
-            copied += 1;
-            self.progress
-                .stage_progress("copy_partitions", copied)
-                .await?;
-        }
-        for _part in self.new_partitions.iter() {
-            copied += 1;
-            self.progress
-                .stage_progress("copy_partitions", copied)
-                .await?;
-        }
-        self.progress.stage_complete("copy_partitions").await?;
-
+                    .await?;
+                let mut copied = 0;
+                for part in &self.partitions {
+                    let source = self.src_store.as_ref().ok_or_else(|| {
+                        Error::internal("existing partitions require a source store")
+                    })?;
+                    for suffix in PARTITION_FILE_SUFFIXES {
+                        files.push(
+                            source
+                                .copy_index_file_to(
+                                    &partition_file_path(*part, suffix),
+                                    &target.file_path(*part, suffix),
+                                    dest_store,
+                                )
+                                .await?,
+                        );
+                    }
+                    copied += 1;
+                    self.progress
+                        .stage_progress("copy_partitions", copied)
+                        .await?;
+                }
+                for _ in &self.new_partitions {
+                    copied += 1;
+                    self.progress
+                        .stage_progress("copy_partitions", copied)
+                        .await?;
+                }
+                self.progress.stage_complete("copy_partitions").await?;
+                Vec::new()
+            };
         files.extend(
             self.write_metadata_with_progress(dest_store, &partitions)
                 .await?,
         );
+        delete_index_files_best_effort(&dest_store.clone_arc(), obsolete).await;
         Ok(files)
+    }
+
+    async fn consolidate_updated_partitions(
+        &self,
+        dest_store: &dyn IndexStore,
+        partitions: &mut Vec<u64>,
+        files: &mut Vec<IndexFile>,
+    ) -> Result<Vec<String>> {
+        self.progress
+            .stage_start("copy_partitions", None, "partitions")
+            .await?;
+        let mut copied = 0;
+        let mut input_files = files.clone();
+        let mut source_partitions = BTreeSet::new();
+        for &id in &self.partitions {
+            let source = self
+                .src_store
+                .as_ref()
+                .ok_or_else(|| Error::internal("existing partitions require a source store"))?;
+            let mut source_files = Vec::with_capacity(PARTITION_FILE_SUFFIXES.len());
+            for suffix in PARTITION_FILE_SUFFIXES {
+                let path = partition_file_path(id, suffix);
+                let reader = source.open_index_file(&path).await?;
+                let Some(size_bytes) = reader.file_size_bytes() else {
+                    break;
+                };
+                source_files.push(IndexFile { path, size_bytes });
+            }
+            if source_files.len() == PARTITION_FILE_SUFFIXES.len() {
+                // Read merge inputs in their original store. Copying them to
+                // the destination first adds a full read/write pass on S3.
+                source_partitions.insert(id);
+                input_files.extend(source_files);
+            } else {
+                // Custom readers may not expose stored sizes. Preserve the
+                // previous copy path to obtain exact sizes for planning.
+                for suffix in PARTITION_FILE_SUFFIXES {
+                    let path = partition_file_path(id, suffix);
+                    let file = source.copy_index_file_to(&path, &path, dest_store).await?;
+                    input_files.push(file.clone());
+                    files.push(file);
+                }
+                copied += 1;
+                self.progress
+                    .stage_progress("copy_partitions", copied)
+                    .await?;
+            }
+        }
+        let memory_limit_bytes =
+            resolve_worker_memory_limit_bytes(&self.params, resolve_num_workers(&self.params));
+        let total_budget_bytes = finalize_budget_bytes(&self.params, memory_limit_bytes);
+        let (candidate_max_stored_bytes, group_max_decoded_bytes) =
+            consolidation_limits(memory_limit_bytes, total_budget_bytes);
+        let plan = plan_finalize(
+            partition_file_sizes(partitions, &input_files, PartitionWriteTarget::Final)?,
+            candidate_max_stored_bytes,
+            group_max_decoded_bytes,
+        );
+        for &(id, _) in &plan.copies {
+            if source_partitions.contains(&id) {
+                let source = self
+                    .src_store
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("existing partitions require a source store"))?;
+                for suffix in PARTITION_FILE_SUFFIXES {
+                    let path = partition_file_path(id, suffix);
+                    files.push(source.copy_index_file_to(&path, &path, dest_store).await?);
+                }
+                copied += 1;
+                self.progress
+                    .stage_progress("copy_partitions", copied)
+                    .await?;
+            }
+        }
+        self.progress.stage_complete("copy_partitions").await?;
+        if plan.groups.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Inputs already use final paths, so outputs need disjoint ids until
+        // the new metadata is durable. Large partitions keep their original ids
+        // and files; only members of a merge group are decoded and rewritten.
+        let mut next_id = partitions
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::index("FTS partition id overflow".to_owned()))?;
+        *partitions = plan.copies.iter().map(|(old_id, _)| *old_id).collect();
+        let total_files = plan
+            .groups
+            .iter()
+            .map(|group| group.members.len())
+            .sum::<usize>()
+            * PARTITION_FILE_SUFFIXES.len();
+        self.progress
+            .stage_start("remap_partition_files", Some(total_files as u64), "files")
+            .await?;
+        let progress = FileProgress {
+            completed: tokio::sync::Mutex::new(0),
+            progress: self.progress.clone(),
+        };
+        // Copies have already completed; one merge group at a time shares the
+        // same budget and decoded-size guard as distributed finalization.
+        let budget = FinalizeBudget::new(total_budget_bytes, 0);
+        let mut obsolete = Vec::with_capacity(total_files);
+        for mut group in plan.groups {
+            let end = next_id
+                .checked_add(group.members.len() as u64)
+                .ok_or_else(|| Error::index("FTS partition id overflow".to_owned()))?;
+            group.reserved_ids = next_id..end;
+            next_id = end;
+            for member in &group.members {
+                // Never delete files in the immutable source index. Only
+                // newly written or fallback-copied destination inputs expire.
+                if !source_partitions.contains(&member.old_id) {
+                    for suffix in PARTITION_FILE_SUFFIXES {
+                        obsolete.push(partition_file_path(member.old_id, suffix));
+                    }
+                }
+            }
+            let (ids, merged_files) = consolidate_group(
+                dest_store.clone_arc(),
+                group,
+                &budget,
+                memory_limit_bytes,
+                self.token_set_format,
+                &progress,
+                match &self.src_store {
+                    Some(store) => ConsolidationSource::Incremental {
+                        store,
+                        partitions: &source_partitions,
+                    },
+                    None => ConsolidationSource::Stored(PartitionWriteTarget::Final),
+                },
+            )
+            .await?;
+            partitions.extend(ids);
+            files.extend(merged_files);
+        }
+        partitions.sort_unstable();
+        obsolete.sort_unstable();
+        files.retain(|file| obsolete.binary_search(&file.path).is_err());
+        self.progress
+            .stage_complete("remap_partition_files")
+            .await?;
+        Ok(obsolete)
     }
 }
 
@@ -1312,7 +1461,7 @@ impl InnerBuilder {
         // accumulates enough data to flush an encoded column, the flush also needs
         // that pool. The parked producer and the starved consumer would then wait
         // on each other forever.
-        let producer = tokio::spawn(async move {
+        let producer = lance_core::utils::tokio::spawn(async move {
             let mut batch_builder = PostingListBatchBuilder::new(
                 schema_for_batches,
                 with_position,
@@ -2356,15 +2505,13 @@ impl FinalizeOptions {
 
 /// Planning estimate of decoded builder bytes per stored byte, as a ratio of
 /// `DECODED_PER_STORED_NUM / DECODED_PER_STORED_DEN`. Measured at 1.47-1.51
-/// on two corpora (positions on, v3 format). It sizes merge groups: a
-/// partition is a consolidation candidate while two of them are estimated to
-/// fit the worker limit together, so the candidate ceiling is
-/// `limit / (2 * ratio)`, and a group's members are estimated to fit the limit
-/// as one decoded builder. Partitions the build cut at the limit sit well
-/// above the ceiling and are copied. The stored size only plans; the decoded
-/// size is checked against the limit again while merging, as the build does
-/// when it splits partitions, and decoding itself cannot be interrupted, so
-/// the ceiling is what bounds one decode.
+/// on two corpora (positions on, v3 format). Partitions estimated below the
+/// effective target are candidates, including a larger partial partition
+/// that can still take a small tail. Candidates are packed into groups under
+/// that target; inputs at or above it are copied. Stored size only plans:
+/// decoded size is checked against the worker limit again while merging,
+/// and a group may produce multiple partitions. Decoding one input cannot be
+/// interrupted, so this estimate does not establish a hard memory cap.
 const DECODED_PER_STORED_NUM: u64 = 3;
 const DECODED_PER_STORED_DEN: u64 = 2;
 /// A merge group's working set is more than its decoded members: both inputs
@@ -2395,13 +2542,13 @@ fn estimated_merge_working_set_bytes(stored_bytes: u64) -> u64 {
 /// candidate may have, and the largest estimated decoded size of one group.
 /// A group is planned to the worker limit, but its working set must also fit
 /// the whole finalize budget, which a build with fewer workers than the
-/// working-set factor makes the tighter bound; the candidate ceiling follows
-/// the same cap so two candidates always fit one group.
+/// working-set factor makes the tighter bound. The candidate ceiling follows
+/// this effective target; candidates that cannot share a group are copied.
 fn consolidation_limits(memory_limit_bytes: u64, total_budget_bytes: u64) -> (u64, u64) {
     let group_max_decoded_bytes =
         memory_limit_bytes.min(total_budget_bytes * MERGE_WORKING_SET_DEN / MERGE_WORKING_SET_NUM);
     let candidate_max_stored_bytes =
-        group_max_decoded_bytes * DECODED_PER_STORED_DEN / (2 * DECODED_PER_STORED_NUM);
+        group_max_decoded_bytes * DECODED_PER_STORED_DEN / DECODED_PER_STORED_NUM;
     (candidate_max_stored_bytes, group_max_decoded_bytes)
 }
 
@@ -2844,10 +2991,11 @@ async fn read_staged_metadata(
     })
 }
 
-/// Pair every staged partition id with the sizes of its three files.
-fn staged_partitions(
+/// Pair every partition id with the sizes of its three files.
+fn partition_file_sizes(
     partition_ids: &[u64],
     index_files: &[IndexFile],
+    target: PartitionWriteTarget,
 ) -> Result<Vec<StagedPartition>> {
     let sizes: HashMap<&str, u64> = index_files
         .iter()
@@ -2861,11 +3009,10 @@ fn staged_partitions(
             let mut stored_bytes = 0u64;
             let mut max_file_bytes = 0u64;
             for suffix in PARTITION_FILE_SUFFIXES {
-                let path = staged_partition_file_path(old_id, suffix);
+                let path = target.file_path(old_id, suffix);
                 let size = *sizes.get(path.as_str()).ok_or_else(|| {
                     Error::invalid_input_source(
-                        format!("staged partition file {path} is missing from the index directory")
-                            .into(),
+                        format!("partition file {path} is missing from the index directory").into(),
                     )
                 })?;
                 stored_bytes += size;
@@ -2889,7 +3036,11 @@ async fn finalize_staged_partitions(
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
     let staged = read_staged_metadata(&store, part_metadata_files, &progress).await?;
-    let partitions = staged_partitions(&staged.partition_ids, index_files)?;
+    let partitions = partition_file_sizes(
+        &staged.partition_ids,
+        index_files,
+        PartitionWriteTarget::Staged,
+    )?;
 
     let num_workers = resolve_num_workers(&staged.params);
     let memory_limit_bytes = resolve_worker_memory_limit_bytes(&staged.params, num_workers);
@@ -2977,6 +3128,7 @@ async fn finalize_staged_partitions(
                 memory_limit_bytes,
                 token_set_format,
                 &file_progress,
+                ConsolidationSource::Stored(PartitionWriteTarget::Staged),
             )
             .await
         });
@@ -3023,7 +3175,15 @@ async fn finalize_staged_partitions(
     Ok(files)
 }
 
-/// Decode the group's staged partitions, merge them, and write the result to
+enum ConsolidationSource<'a> {
+    Stored(PartitionWriteTarget),
+    Incremental {
+        store: &'a Arc<dyn IndexStore>,
+        partitions: &'a BTreeSet<u64>,
+    },
+}
+
+/// Decode the group's partitions, merge them, and write the result to
 /// the final layout under the group's reserved ids. The decoded memory guard
 /// is the build's own: a merge that would reach the worker limit is written
 /// out first, so a group may produce more than one partition.
@@ -3034,6 +3194,7 @@ async fn consolidate_group(
     memory_limit_bytes: u64,
     token_set_format: TokenSetFormat,
     file_progress: &FileProgress,
+    source: ConsolidationSource<'_>,
 ) -> Result<(Vec<u64>, Vec<IndexFile>)> {
     let estimated_bytes = group
         .members
@@ -3047,12 +3208,26 @@ async fn consolidate_group(
     let mut files = Vec::new();
     let mut accumulated: Option<InnerBuilder> = None;
     for member in &group.members {
+        let (source_store, source_target) = match &source {
+            ConsolidationSource::Stored(target) => (&store, *target),
+            ConsolidationSource::Incremental {
+                store: source_store,
+                partitions,
+            } => (
+                if partitions.contains(&member.old_id) {
+                    *source_store
+                } else {
+                    &store
+                },
+                PartitionWriteTarget::Final,
+            ),
+        };
         let partition = InvertedPartition::load_with_paths(
-            store.clone(),
+            source_store.clone(),
             member.old_id,
-            &staged_partition_file_path(member.old_id, TOKENS_FILE),
-            &staged_partition_file_path(member.old_id, INVERT_LIST_FILE),
-            &staged_partition_file_path(member.old_id, DOCS_FILE),
+            &source_target.token_path(member.old_id),
+            &source_target.posting_path(member.old_id),
+            &source_target.doc_path(member.old_id),
             None,
             &LanceCache::no_cache(),
             token_set_format,
@@ -3060,11 +3235,11 @@ async fn consolidate_group(
         .await?;
         let builder = partition.into_builder().await?;
         tracing::info!(
-            staged_partition = member.old_id,
+            partition = member.old_id,
             stored_bytes = member.stored_bytes,
             decoded_bytes = builder.memory_size(),
             num_docs = builder.docs.len(),
-            "FTS finalize decoded a staged partition for consolidation"
+            "FTS finalize decoded a partition for consolidation"
         );
         // A decoded member's files are consumed as surely as a copied one's.
         file_progress
@@ -3179,6 +3354,7 @@ mod tests {
     use crate::Index;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
+    use crate::scalar::inverted::query::Operator;
     use crate::scalar::inverted::{MemBM25Scorer, Scorer};
     use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
     use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
@@ -3437,6 +3613,7 @@ mod tests {
     struct NoRenameStore {
         inner: Arc<dyn IndexStore>,
         final_delete_count: Option<Arc<AtomicUsize>>,
+        copy_count: Arc<AtomicUsize>,
     }
 
     impl NoRenameStore {
@@ -3444,6 +3621,7 @@ mod tests {
             Self {
                 inner,
                 final_delete_count: None,
+                copy_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -3451,6 +3629,7 @@ mod tests {
             Self {
                 inner,
                 final_delete_count: Some(Arc::new(AtomicUsize::new(0))),
+                copy_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -3515,6 +3694,7 @@ mod tests {
             name: &str,
             dest_store: &dyn IndexStore,
         ) -> Result<IndexFile> {
+            self.copy_count.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .copy_index_file(name, Self::unwrap_dest_store(dest_store))
                 .await
@@ -3526,6 +3706,7 @@ mod tests {
             new_name: &str,
             dest_store: &dyn IndexStore,
         ) -> Result<IndexFile> {
+            self.copy_count.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .copy_index_file_to(name, new_name, Self::unwrap_dest_store(dest_store))
                 .await
@@ -4139,7 +4320,13 @@ mod tests {
             Some(fragment_mask),
             RoaringBitmap::new(),
         );
-        builder.write(dest_store.as_ref()).await?;
+        builder
+            .write(
+                dest_store.as_ref(),
+                Vec::new(),
+                FinalizeOptions::copy_only(),
+            )
+            .await?;
 
         for partition_id in &partitions {
             assert_partition_file_markers(source_store.as_ref(), *partition_id, *partition_id)
@@ -4499,7 +4686,13 @@ mod tests {
             RoaringBitmap::new(),
         )
         .with_format_version(InvertedListFormatVersion::V1);
-        builder.write(dest_store.as_ref()).await?;
+        builder
+            .write(
+                dest_store.as_ref(),
+                Vec::new(),
+                FinalizeOptions::copy_only(),
+            )
+            .await?;
 
         let metadata_reader = dest_store.open_index_file(METADATA_FILE).await?;
         let metadata = &metadata_reader.schema().metadata;
@@ -4584,7 +4777,7 @@ mod tests {
 
         let updated =
             InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache()).await?;
-        assert_eq!(updated.partitions.len(), 2);
+        assert_eq!(updated.partitions.len(), 1);
         for partition in &updated.partitions {
             assert_eq!(
                 partition.inverted_list.posting_tail_codec(),
@@ -6276,6 +6469,34 @@ mod tests {
         assert_eq!(ids, vec![(vec![1, 2], 1..3), (vec![3, 4], 3..5)]);
     }
 
+    #[rstest::rstest]
+    #[case::fill_below_target(900, vec![100, 400], vec![vec![0, 1]])]
+    #[case::five_into_two(600, vec![120; 5], vec![vec![0, 1, 2], vec![3, 4]])]
+    fn test_consolidation_groups_to_target(
+        #[case] target: u64,
+        #[case] sizes: Vec<u64>,
+        #[case] expected_groups: Vec<Vec<u64>>,
+    ) {
+        let (ceiling, group_max) = consolidation_limits(target, 4 * target);
+        let mut partitions = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(id, size)| staged_for_plan(id as u64, size))
+            .collect::<Vec<_>>();
+        // An input at the target and one above it must remain unchanged.
+        let at_target = target * 2 / 3;
+        partitions.push(staged_for_plan(100, at_target));
+        partitions.push(staged_for_plan(101, at_target + 1));
+        let plan = plan_finalize(partitions, ceiling, group_max);
+        assert_eq!(plan.copies, vec![(100, 0), (101, 1)]);
+        let groups = plan
+            .groups
+            .iter()
+            .map(|group| group.members.iter().map(|member| member.old_id).collect())
+            .collect::<Vec<Vec<u64>>>();
+        assert_eq!(groups, expected_groups);
+    }
+
     /// A build with fewer workers than the working-set factor makes the
     /// finalize budget the tighter bound on a merge group.
     #[test]
@@ -6463,6 +6684,240 @@ mod tests {
         let mut hits = row_ids.into_iter().zip(scores).collect::<Vec<_>>();
         hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         hits
+    }
+
+    #[rstest::rstest]
+    #[case::v2_update(InvertedListFormatVersion::V2, false)]
+    #[case::v3_update(InvertedListFormatVersion::V3, false)]
+    #[case::v2_merge(InvertedListFormatVersion::V2, true)]
+    #[case::v3_merge(InvertedListFormatVersion::V3, true)]
+    #[tokio::test]
+    async fn test_incremental_single_rows_consolidate_small_partitions(
+        #[case] format_version: InvertedListFormatVersion,
+        #[case] merge_segment: bool,
+    ) -> Result<()> {
+        let params = consolidation_params()
+            .num_workers(1)
+            .format_version(format_version);
+        let root = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let mut previous: Option<Arc<InvertedIndex>> = None;
+        let mut previous_store: Option<Arc<NoRenameStore>> = None;
+        let mut batches = Vec::new();
+        for step in 0..8u32 {
+            let text = match step {
+                2 => None,
+                4 => Some(""),
+                _ => Some("common text"),
+            };
+            let batch = arrow_array::record_batch!(
+                ("doc", Utf8, [text]),
+                (
+                    "_rowid",
+                    UInt64,
+                    [u64::from(RowAddress::new_from_parts(step, 0))]
+                )
+            )?;
+            batches.push(batch.clone());
+            let store = Arc::new(NoRenameStore::new(Arc::new(LanceIndexStore::new(
+                object_store.clone(),
+                root.obj_path().join(step.to_string()),
+                Arc::new(LanceCache::no_cache()),
+            ))));
+            if step == 1 && !merge_segment {
+                // Retry after partition outputs exist but metadata publication
+                // fails. The source must remain usable, and the retry below
+                // must return exactly the final live files.
+                let failed_input = Box::pin(RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    stream::iter(vec![Ok(batch.clone())]),
+                ));
+                let source = previous.as_ref().unwrap();
+                let error = source
+                    .update(failed_input, &FailMetadataStore::new(store.clone()), None)
+                    .await
+                    .err()
+                    .expect("metadata publication should fail");
+                assert!(matches!(error, Error::Internal { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected metadata write failure")
+                );
+                assert_eq!(
+                    consolidation_search(source, &["common"], Operator::Or, false)
+                        .await
+                        .len(),
+                    1,
+                );
+            }
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch)]),
+            ));
+            let files = if let Some(index) = &previous {
+                if merge_segment {
+                    InvertedIndex::merge_segments(
+                        std::slice::from_ref(index),
+                        input,
+                        store.as_ref(),
+                        &[None],
+                        noop_progress(),
+                    )
+                    .await?
+                    .files
+                } else {
+                    index.update(input, store.as_ref(), None).await?.files
+                }
+            } else {
+                InvertedIndexBuilder::new(params.clone())
+                    .update(input, store.as_ref(), None)
+                    .await?
+            };
+            let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache()).await?;
+            if let Some(source) = &previous_store {
+                assert_eq!(
+                    source.copy_count.load(Ordering::SeqCst),
+                    if text.is_none_or(str::is_empty) { 3 } else { 0 },
+                    "copy the lone retained partition for an empty append; read merge inputs directly at step {step}",
+                );
+            }
+            assert_eq!(index.partition_count(), 1, "after append {step}");
+            let expected_ids = (0..=step)
+                .filter(|row| ![2, 4].contains(row))
+                .map(|row| u64::from(RowAddress::new_from_parts(row, 0)))
+                .collect::<Vec<_>>();
+            let actual =
+                consolidation_search(&index, &["common", "text"], Operator::And, true).await;
+            assert_eq!(
+                actual.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                expected_ids
+            );
+            let mut listed = store.list_files_with_sizes().await?;
+            let mut returned = files;
+            listed.sort_by(|a, b| a.path.cmp(&b.path));
+            returned.sort_by(|a, b| a.path.cmp(&b.path));
+            assert_eq!(
+                listed, returned,
+                "return only live files after append {step}"
+            );
+            previous = Some(index);
+            previous_store = Some(store);
+        }
+        let reference_store = Arc::new(LanceIndexStore::new(
+            object_store,
+            root.obj_path().join("reference"),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let input = Box::pin(RecordBatchStreamAdapter::new(
+            batches[0].schema(),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        InvertedIndexBuilder::new(params)
+            .update(input, reference_store.as_ref(), None)
+            .await?;
+        let reference = InvertedIndex::load(reference_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(
+            consolidation_search(previous.as_ref().unwrap(), &["common"], Operator::Or, false)
+                .await,
+            consolidation_search(&reference, &["common"], Operator::Or, false).await,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_incremental_consolidation_preserves_large_partition_files() -> Result<()> {
+        let params = consolidation_params().num_workers(1).memory_limit_mb(1);
+        let source_dir = TempDir::default();
+        let dest_dir = TempDir::default();
+        let source = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            source_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // Distinct, poorly compressible terms make the first partition exceed
+        // the candidate byte ceiling without a large row-count fixture.
+        let text = (0..16384u64)
+            .map(|i| format!("{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut builder = InvertedIndexBuilder::new(params.clone().memory_limit_mb(4));
+        let mut original_files = Vec::new();
+        for batch in [
+            make_doc_batch(&text, 0),
+            make_doc_batch("common text", RowAddress::new_from_parts(1, 0).into()),
+        ] {
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch)]),
+            ));
+            original_files.extend(builder.update_index(input, source.as_ref()).await?);
+        }
+        assert_eq!(builder.new_partitions, vec![0, 1]);
+        builder.write_metadata(source.as_ref(), &[0, 1]).await?;
+        let sizes = partition_file_sizes(&[0, 1], &original_files, PartitionWriteTarget::Final)?;
+        let (ceiling, _) = consolidation_limits(1 << 20, 1 << 20);
+        assert!(sizes[0].stored_bytes >= ceiling);
+        assert!(sizes[1].stored_bytes < ceiling);
+
+        let index = InvertedIndex::load(source.clone(), None, &LanceCache::no_cache()).await?;
+        let batch = make_doc_batch("common text", RowAddress::new_from_parts(2, 0).into());
+        let input = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        // Build limits are runtime inputs, not persisted index parameters. An
+        // existing large partition can predate this smaller maintenance budget.
+        InvertedIndexBuilder::from_existing_index(
+            params,
+            Some(source.clone()),
+            vec![0, 1],
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        )
+        .with_format_version(builder.format_version)
+        .update(input, dest.as_ref(), None)
+        .await?;
+        let updated = InvertedIndex::load(dest.clone(), None, &LanceCache::no_cache()).await?;
+        assert_eq!(
+            updated.partition_count(),
+            2,
+            "merge the two small partitions only"
+        );
+        assert_eq!(
+            consolidation_search(&updated, &["common", "text"], Operator::And, true)
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![
+                u64::from(RowAddress::new_from_parts(1, 0)),
+                u64::from(RowAddress::new_from_parts(2, 0)),
+            ],
+        );
+        for suffix in PARTITION_FILE_SUFFIXES {
+            let path = partition_file_path(0, suffix);
+            assert_eq!(
+                std::fs::read(source_dir.std_path().join(&path))?,
+                std::fs::read(dest_dir.std_path().join(&path))?,
+                "large partition must be copied byte for byte: {path}",
+            );
+        }
+        assert_eq!(index.partition_count(), 2);
+        assert_eq!(
+            consolidation_search(&index, &["common"], Operator::Or, false)
+                .await
+                .len(),
+            1,
+            "the old index remains readable and unchanged",
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -6662,7 +7117,11 @@ mod tests {
         let staged =
             read_staged_metadata(&store_dyn, &metadata_files(&index_files), &noop_progress())
                 .await?;
-        let members = staged_partitions(&staged.partition_ids, &index_files)?;
+        let members = partition_file_sizes(
+            &staged.partition_ids,
+            &index_files,
+            PartitionWriteTarget::Staged,
+        )?;
         assert_eq!(members.len(), 3);
         let group = ConsolidationGroup {
             members,
@@ -6683,6 +7142,7 @@ mod tests {
             1,
             staged.token_set_format,
             &file_progress,
+            ConsolidationSource::Stored(PartitionWriteTarget::Staged),
         )
         .await?;
         assert_eq!(ids, vec![10, 11, 12]);

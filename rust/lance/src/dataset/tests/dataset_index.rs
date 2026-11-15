@@ -605,6 +605,12 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "value = 6.5",
         "value BETWEEN 6.5 AND 7.5",
         "value IN (6.5, 7)",
+        // So are comparisons of the column cast to a float.
+        "CAST(value AS double) > 6.5",
+        "TRY_CAST(value AS double) = 7.0",
+        "NOT (CAST(value AS double) <= 7.0)",
+        "CAST(value AS double) BETWEEN 6.5 AND 7.5",
+        "CAST(value AS double) IN (6.5, 7.0)",
     ] {
         let mut indexed_scan = dataset.scan();
         indexed_scan
@@ -9725,6 +9731,46 @@ async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
     .unwrap();
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "MaterializeIndex");
+}
+
+/// A negated filter answered by the index on a legacy-storage dataset with
+/// stable row ids, restricted to one fragment: the index's block list spans
+/// every fragment, so it is longer than the scanned fragment.
+#[tokio::test]
+async fn test_not_equal_filter_on_fragment_subset_legacy_stable_row_ids() {
+    let reader = gen_batch()
+        .col("c", array::cycle::<UInt64Type>(vec![0, 1]))
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["c"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![dataset.get_fragment(0).unwrap().metadata().clone()])
+        .filter("c != 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert_contains!(&plan, "MaterializeIndex");
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 5);
 }
 
 #[tokio::test]

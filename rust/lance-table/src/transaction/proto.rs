@@ -10,6 +10,7 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
+use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
@@ -189,11 +190,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -410,6 +411,19 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::CompositeOperation(_)) => {
+                // This version of Lance recognizes action-based transactions
+                // (Transaction V2) but has no support for them yet: reject on
+                // load, fail-closed. Because
+                // load_and_sort_new_transactions collects transactions with
+                // try_collect, a concurrent V2 commit in the conflict window
+                // aborts the whole commit rather than being silently skipped.
+                // Do NOT make this parsing lenient.
+                return Err(Error::not_supported(
+                    "action-based transactions (Transaction V2) are not supported \
+                     by this version of Lance; please upgrade",
+                ));
+            }
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
             None => Operation::Unknown {},
@@ -581,11 +595,14 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                new_indices: new_indices
+                    .iter()
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .iter()
-                    .map(pb::IndexMetadata::from)
-                    .collect(),
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
             }),
             Operation::Merge {
                 fragments,
@@ -664,19 +681,17 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                config_updates: config_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                config_updates: config_updates.as_ref().map(pb_actions::UpdateMap::from),
                 table_metadata_updates: table_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 schema_metadata_updates: schema_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 field_metadata_updates: field_metadata_updates
                     .iter()
                     .map(|(field_id, update_map)| {
-                        (*field_id, pb::transaction::UpdateMap::from(update_map))
+                        (*field_id, pb_actions::UpdateMap::from(update_map))
                     })
                     .collect(),
                 // Leave old fields empty - we only write new-style fields
@@ -791,13 +806,13 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     }
 }
 
-impl From<&UpdateMap> for pb::transaction::UpdateMap {
+impl From<&UpdateMap> for pb_actions::UpdateMap {
     fn from(update_map: &UpdateMap) -> Self {
         Self {
             update_entries: update_map
                 .update_entries
                 .iter()
-                .map(|entry| pb::transaction::UpdateMapEntry {
+                .map(|entry| pb_actions::UpdateMapEntry {
                     key: entry.key.clone(),
                     value: entry.value.clone(),
                 })
@@ -807,8 +822,8 @@ impl From<&UpdateMap> for pb::transaction::UpdateMap {
     }
 }
 
-impl From<&pb::transaction::UpdateMap> for UpdateMap {
-    fn from(pb_update_map: &pb::transaction::UpdateMap) -> Self {
+impl From<&pb_actions::UpdateMap> for UpdateMap {
+    fn from(pb_update_map: &pb_actions::UpdateMap) -> Self {
         Self {
             update_entries: pb_update_map
                 .update_entries
@@ -836,8 +851,131 @@ impl TryFrom<&Transaction> for crate::format::Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::CoveringContract;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::test_support::sample_index_metadata;
+
+    #[rstest::rstest]
+    #[case::suffix(CoveringContract::Suffix, vec![7, 11], vec![11], vec![7])]
+    #[case::keys_only(CoveringContract::Independent, vec![7], vec![11], vec![7])]
+    #[case::carries_its_key(CoveringContract::Independent, vec![7], vec![7, 11], vec![7])]
+    #[case::tail_shaped(CoveringContract::Independent, vec![7, 11], vec![11], vec![7, 11])]
+    fn test_create_index_entries_roundtrip_in_the_suffix_layout(
+        #[case] contract: CoveringContract,
+        #[case] stored_fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] keys: Vec<i32>,
+    ) {
+        let mut stored = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        stored.fields = stored_fields;
+        stored.covering_fields = covering_fields.clone();
+        let entry = IndexMetadata::from_manifest_proto(stored, contract).unwrap();
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![entry],
+            },
+            None,
+        );
+
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        let Some(pb::transaction::Operation::CreateIndex(written)) = &message.operation else {
+            panic!("expected CreateIndex, got {:?}", message.operation);
+        };
+        let suffix_layout = [keys.as_slice(), &covering_fields].concat();
+        for entry in written.new_indices.iter().chain(&written.removed_indices) {
+            assert_eq!(entry.fields, suffix_layout);
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Suffix).unwrap();
+        }
+
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = Transaction::try_from(message).unwrap().operation
+        else {
+            panic!("expected CreateIndex");
+        };
+        for entry in new_indices.iter().chain(&removed_indices) {
+            assert_eq!(entry.keyed_fields(), keys);
+            assert_eq!(entry.covering_fields, covering_fields);
+        }
+    }
+
+    /// Appending the carried fields to an entry with no keys would write one
+    /// that reads back keyed on its carried field.
+    #[test]
+    fn test_create_index_entry_without_keys_is_not_encoded() {
+        let entry = IndexMetadata {
+            fields: vec![],
+            covering_fields: vec![11],
+            ..sample_index_metadata("covered")
+        };
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let error = pb::Transaction::try_from(&transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("at least one field must remain indexed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A transaction file holds only the suffix layout, so decoding one refuses
+    /// an entry that only a manifest under the independent contract may store.
+    #[rstest::rstest]
+    #[case::keys_only(vec![7], vec![11], "covering fields [11] but [11] are not among its fields [7]")]
+    #[case::no_key(vec![11], vec![11], "covering fields [11] but its fields are [11]; at least one field must remain indexed")]
+    #[case::carried_field_not_last(vec![7, 11], vec![7], "covering fields [7] which are not the trailing entries of [7, 11]")]
+    fn test_create_index_entry_outside_the_suffix_layout_is_refused(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_error: &str,
+    ) {
+        let mut entry = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        entry.fields = fields.clone();
+        entry.covering_fields = covering_fields;
+        let manifest_entry =
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Independent)
+                .unwrap();
+        assert_eq!(manifest_entry.keyed_fields(), fields);
+
+        for create_index in [
+            pb::transaction::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![],
+            },
+            pb::transaction::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![entry],
+            },
+        ] {
+            let error = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::CreateIndex(create_index)),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "expected InvalidInput, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error}"
+            );
+        }
+    }
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -935,5 +1073,42 @@ mod tests {
 
         let message = pb::transaction::rewrite::RewrittenIndex::from(&rewritten_index);
         assert_eq!(RewrittenIndex::try_from(&message).unwrap(), rewritten_index);
+    }
+
+    #[test]
+    fn test_composite_operation_rejected_on_load() {
+        // This version of Lance does not yet support action-based transactions
+        // (Transaction V2). Loading one must fail closed
+        // (never be silently skipped or leniently parsed), so that a concurrent
+        // V2 commit in the conflict window aborts an in-flight commit.
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::CompositeOperation(
+                pb_actions::CompositeOperation {
+                    steps: vec![pb_actions::UserStep {
+                        description: "append batch".to_string(),
+                        actions: vec![pb_actions::Action {
+                            action: Some(pb_actions::action::Action::AddFragment(
+                                pb_actions::AddFragment {
+                                    id: Some(pb_actions::Ref {
+                                        kind: Some(pb_actions::r#ref::Kind::Local(0)),
+                                    }),
+                                    physical_rows: 1,
+                                    ..Default::default()
+                                },
+                            )),
+                        }],
+                    }],
+                },
+            )),
+            ..Default::default()
+        };
+
+        let err = Transaction::try_from(message).unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
     }
 }
