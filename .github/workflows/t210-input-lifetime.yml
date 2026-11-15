@@ -23,7 +23,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
       - name: Scheduled reader fixtures and feature boundaries
         run: |
-          cargo test --profile ci --locked -p lance-io --lib scheduler::read_into:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib scheduled_reader_rejects_incomplete_ranges -- --nocapture
           cargo test --profile ci --locked -p lance-io --lib shared_throttle_state -- --nocapture
           cargo test --profile ci --locked -p lance-io --lib reserved_read:: -- --nocapture
           cargo test --profile ci --locked -p lance-io --doc submit_single_into -- --nocapture

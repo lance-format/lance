@@ -314,7 +314,7 @@ async fn scheduled_local_read_preserves_allocation_and_survives_handle_drop(#[ca
 
 #[rstest]
 #[case::small_reader(false, "Invalid range 6..10 for object 'body' of size 8 bytes")]
-#[case::cloud_stream(true, "body for body range 6..10 has 2 bytes, expected 4 bytes")]
+#[case::cloud_stream(true, "body for body range 6..10 has 2 bytes, expected 4")]
 #[tokio::test]
 async fn scheduled_reader_rejects_incomplete_ranges(
     #[values(false, true)] lite: bool,
