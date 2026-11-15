@@ -11,6 +11,7 @@ use lance_core::{
     Error, Result,
     utils::{
         allocation::{AllocationBudget, Reservation},
+        deletion::DeletionVector,
         tokio::spawn_cpu,
     },
 };
@@ -35,7 +36,7 @@ pub enum FullZipScanOutcome {
     /// The cursor is unchanged. Drain retained output or replan before retrying;
     /// this also covers a minimal row that cannot fit the configured workspace.
     NeedsCapacity,
-    /// Every row in the requested range has been returned.
+    /// Every non-deleted row in the requested physical range has been returned.
     Finished,
 }
 
@@ -60,6 +61,8 @@ pub struct FullZipScan {
     read_len: u64,
     end: u64,
     cursor: u64,
+    deleted_rows: Option<Arc<DeletionVector>>,
+    has_started: bool,
 }
 
 #[derive(Debug)]
@@ -101,8 +104,10 @@ impl FileReader {
     /// Other layouts, Blob descriptors, structural-only projections and structs
     /// return errors instead of switching to ordinary unadmitted decoding.
     /// Existing version-specific projection validation and read length are used.
-    /// This API takes physical file-row ranges; it does not apply query filters,
-    /// deletion vectors, takes or dataset-level row IDs. Ordinary scans are unchanged.
+    /// This API takes physical file-row ranges and starts without deletion
+    /// handling; use [`FullZipScan::with_deleted_rows`] to bind a snapshot. It
+    /// does not apply query filters, takes or dataset-level row IDs. Ordinary
+    /// scans are unchanged.
     ///
     /// `max_rows` limits a single batch, never the total selection. A batch ends
     /// at the earliest projected page boundary, or earlier when its complete
@@ -237,6 +242,8 @@ impl FileReader {
             read_len,
             end: rows.end,
             cursor: rows.start,
+            deleted_rows: None,
+            has_started: false,
         })
     }
 }
@@ -293,11 +300,66 @@ impl FullZipColumn {
 }
 
 impl FullZipScan {
+    /// Exclude deleted physical file-row offsets before reading payload.
+    ///
+    /// Bind the snapshot before the first `try_next` attempt, including a refused
+    /// or cancelled attempt. It then applies to all forward ranges. Nonempty
+    /// snapshots require at most 2^32 file rows and every deleted offset must be
+    /// within that file. The caller must establish that these are the file's
+    /// physical offsets, not stable row IDs or logical post-deletion positions.
+    ///
+    /// Each batch covers one contiguous live interval and reports its physical
+    /// range. All-deleted suffixes finish without I/O or credit. Refusal, errors
+    /// and cancellation preserve the cursor, including leading deleted rows.
+    /// No mask, filtered payload or full list of live ranges is allocated. The
+    /// supplied shared deletion metadata is outside the payload budget.
+    ///
+    /// This removes rows; it does not implement make-deletions-null or remap a
+    /// logical range/limit. Opening still validates all selected page layouts.
+    /// Fragmented deletions can reduce batch sizes and increase I/O; performance
+    /// is not qualified. Ordinary fragment/scanner execution is unchanged.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{Result, utils::deletion::DeletionVector};
+    /// use lance_file::reader::FullZipScan;
+    /// fn exclude(scan: FullZipScan) -> Result<FullZipScan> {
+    ///     scan.with_deleted_rows(Arc::new([2_u32, 5].into_iter().collect::<DeletionVector>()))
+    /// }
+    /// ```
+    pub fn with_deleted_rows(mut self, deleted: Arc<DeletionVector>) -> Result<Self> {
+        if self.has_started {
+            return Err(Error::invalid_input(
+                "FullZip deletion snapshot must be bound before the first read attempt",
+            ));
+        }
+        if deleted.is_empty() {
+            self.deleted_rows = None;
+        } else {
+            let has_invalid_offset = match deleted.as_ref() {
+                DeletionVector::NoDeletions => false,
+                DeletionVector::Set(set) => set.iter().any(|row| u64::from(*row) >= self.read_len),
+                DeletionVector::Bitmap(bitmap) => bitmap
+                    .max()
+                    .is_some_and(|row| u64::from(row) >= self.read_len),
+            };
+            if self.read_len > u64::from(u32::MAX) + 1 || has_invalid_offset {
+                return Err(Error::invalid_input(format!(
+                    "FullZip deleted offsets require a file length within 2^32 and offsets below {}",
+                    self.read_len
+                )));
+            }
+            self.deleted_rows = Some(deleted);
+        }
+        Ok(self)
+    }
+
     /// Combine disjoint columns from row-aligned files into one admitted cursor.
     ///
     /// Both cursors must use the same shared budget, workspace size, partial-mode
     /// setting and maximum batch rows. Their physical file length, next row and
-    /// selected end must match. Output fields follow `self` then `other`; duplicate
+    /// selected end must match, with either no deletions or the same shared
+    /// deletion snapshot. Output fields follow `self` then `other`; duplicate
     /// names and conflicting schema metadata are rejected. This consumes both
     /// cursors, including on error, but never reads payload or releases their
     /// previously returned Arrow aliases.
@@ -310,7 +372,7 @@ impl FullZipScan {
     ///
     /// The caller must establish physical row alignment. Matching lengths alone
     /// do not prove that unrelated files represent the same rows. This does not
-    /// apply fragment overlays, deletions, stable row IDs or query filters, and
+    /// apply fragment overlays, stable row IDs or query filters, and
     /// does not adopt this path in ordinary fragment/scanner execution.
     ///
     /// ```
@@ -322,6 +384,16 @@ impl FullZipScan {
     /// }
     /// ```
     pub fn try_merge(mut self, other: Self) -> Result<Self> {
+        let same_deletions = match (&self.deleted_rows, &other.deleted_rows) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        };
+        if !same_deletions {
+            return Err(Error::invalid_input(
+                "FullZip merge requires the same shared deletion snapshot",
+            ));
+        }
         if !Arc::ptr_eq(&self.budget, &other.budget)
             || self.workspace_bytes != other.workspace_bytes
             || self.is_partial_workspace_enabled != other.is_partial_workspace_enabled
@@ -351,6 +423,7 @@ impl FullZipScan {
                 .map_err(|error| Error::invalid_input(format!("FullZip merge schema: {error}")))?;
         self.columns.extend(other.columns);
         self.schema = Arc::new(schema);
+        self.has_started |= other.has_started;
         Ok(self)
     }
 
@@ -367,7 +440,8 @@ impl FullZipScan {
     /// Each `try_next` batch stays inside the active range. `Finished` means that
     /// range is complete; the caller owns the selection iterator and decides
     /// whether to advance again or finish. No whole-selection list is retained.
-    /// This does not implement filters, deletion vectors or arbitrary-order takes.
+    /// A bound deletion snapshot still applies. This does not implement query
+    /// filters, logical range remapping or arbitrary-order takes.
     ///
     /// ```
     /// use lance_core::Result;
@@ -500,14 +574,21 @@ impl FullZipScan {
         Run: FnMut(BatchDecodeJob) -> Done,
         Done: Future<Output = Result<Option<RecordBatch>>>,
     {
-        if self.cursor == self.end {
+        self.has_started = true;
+        let live = match &self.deleted_rows {
+            Some(deleted) => next_live_range(deleted, self.cursor..self.end),
+            None => (self.cursor < self.end).then_some(self.cursor..self.end),
+        };
+        let Some(live) = live else {
+            // No await or allocation: there is no outstanding row to deliver.
+            self.cursor = self.end;
             return Ok(FullZipScanOutcome::Finished);
-        }
-        let mut end = self.cursor + self.max_rows.min(self.end - self.cursor);
+        };
+        let mut end = live.start + self.max_rows.min(live.end - live.start);
         for column in &mut self.columns {
-            end = end.min(column.select(self.cursor)?);
+            end = end.min(column.select(live.start)?);
         }
-        let mut rows = self.cursor..end;
+        let mut rows = live.start..end;
         loop {
             let workspace = if self.is_partial_workspace_enabled {
                 self.budget.try_reserve_up_to(self.workspace_bytes)
@@ -532,5 +613,90 @@ impl FullZipScan {
             }
             rows.end = rows.start + count / 2;
         }
+    }
+}
+
+// Snapshot binding validates the u32 domain. Return only the first live run;
+// never materialize a complement bitmap or enumerate a large deleted prefix.
+fn next_live_range(deleted: &DeletionVector, mut rows: Range<u64>) -> Option<Range<u64>> {
+    if rows.is_empty() {
+        return None;
+    }
+    match deleted {
+        DeletionVector::NoDeletions => Some(rows),
+        DeletionVector::Set(set) => {
+            while rows.start < rows.end && set.contains(&(rows.start as u32)) {
+                rows.start += 1;
+            }
+            rows.end = set
+                .iter()
+                .map(|row| u64::from(*row))
+                .filter(|row| rows.contains(row))
+                .min()
+                .unwrap_or(rows.end);
+            (!rows.is_empty()).then_some(rows)
+        }
+        DeletionVector::Bitmap(bitmap) => {
+            let mut iter = bitmap.range(rows.start as u32..=(rows.end - 1) as u32);
+            if let Some(run) = iter.next_range() {
+                if u64::from(*run.start()) > rows.start {
+                    rows.end = u64::from(*run.start());
+                } else {
+                    rows.start = u64::from(*run.end()) + 1;
+                    rows.end = iter.next().map(u64::from).unwrap_or(rows.end);
+                }
+            }
+            (!rows.is_empty()).then_some(rows)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::empty(0..0)]
+    #[case::small(0..24)]
+    #[case::container_boundary(65530..65555)]
+    #[case::u32_boundary(u64::from(u32::MAX) - 24..u64::from(u32::MAX) + 1)]
+    fn live_ranges_match_independent_membership(#[case] rows: Range<u64>) {
+        let offsets = rows
+            .clone()
+            .filter(|row| (row - rows.start) % 7 < 4)
+            .map(|row| row as u32)
+            .collect::<Vec<_>>();
+        for deleted in [
+            DeletionVector::NoDeletions,
+            DeletionVector::Set(offsets.iter().copied().collect()),
+            DeletionVector::Bitmap(offsets.iter().copied().collect()),
+        ] {
+            let expected = rows
+                .clone()
+                .filter(|row| !deleted.contains(*row as u32))
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            let mut start = rows.start;
+            while let Some(live) = next_live_range(&deleted, start..rows.end) {
+                assert!(live.start >= start && live.start < live.end && live.end <= rows.end);
+                actual.extend(live.clone());
+                start = live.end;
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn large_deleted_run_does_not_expand_the_complement() {
+        let mut deleted = DeletionVector::Bitmap(Default::default());
+        if let DeletionVector::Bitmap(bitmap) = &mut deleted {
+            bitmap.insert_range(0..1_000_000);
+        }
+        assert_eq!(
+            next_live_range(&deleted, 0..1_000_001),
+            Some(1_000_000..1_000_001)
+        );
+        assert_eq!(next_live_range(&deleted, 19..65540), None);
     }
 }

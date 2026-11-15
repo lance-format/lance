@@ -21,12 +21,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Cross-file column admission
+      - name: Deleted physical rows and compound admission
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc try_merge -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc with_deleted_rows -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |

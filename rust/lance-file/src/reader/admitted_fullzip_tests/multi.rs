@@ -9,7 +9,7 @@ use std::{
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
     Result,
-    utils::{allocation::ReservedBuffer, tokio::spawn_cpu},
+    utils::{allocation::ReservedBuffer, deletion::DeletionVector, tokio::spawn_cpu},
 };
 
 use super::*;
@@ -1019,4 +1019,211 @@ async fn merged_files_reject_incompatible_cursors_before_io(
     drop(held);
     assert_eq!(budget.reserved(), 0);
     assert_eq!(other_budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn deleted_rows_preserve_physical_selection_and_compound_retry(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] bitmap: bool,
+) {
+    let input = batches();
+    let expected = arrow_select::concat::concat_batches(&input[0].schema(), &input[..5]).unwrap();
+    let labels = input[..5]
+        .iter()
+        .map(|batch| batch.project(&[0]).unwrap())
+        .collect();
+    let frames = input[..5]
+        .iter()
+        .map(|batch| batch.project(&[1]).unwrap())
+        .collect();
+    let (_left_fs, left) = fixture_batches(version, lite, labels, 1).await;
+    let (_right_fs, right) = fixture_batches(version, !lite, frames, 1).await;
+    let stats = IoStats::new();
+    let left = left.with_io_stats(stats.recorder());
+    let right = right.with_io_stats(stats.recorder());
+    let mode = Arc::new(AtomicUsize::new(1));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let right = right.with_scheduler(Arc::new(LaterColumnIo {
+        inner: right.core.scheduler.clone(),
+        second_buffers: right.metadata().column_infos[0]
+            .page_infos
+            .iter()
+            .flat_map(|page| {
+                page.buffer_offsets_and_sizes
+                    .iter()
+                    .map(|(offset, len)| *offset..*offset + *len)
+            })
+            .collect(),
+        mode: mode.clone(),
+        second_reads: reads.clone(),
+        entered: entered.clone(),
+    }));
+    let offsets = [
+        0, 1, 2, 6, 7, 8, 9, 14, 15, 16, 17, 18, 19, 20, 26, 27, 33, 34,
+    ];
+    let deleted = Arc::new(if bitmap {
+        DeletionVector::Bitmap(offsets.into_iter().collect())
+    } else {
+        DeletionVector::Set(offsets.into_iter().collect())
+    });
+    let budget = AllocationBudget::new(4096);
+    let a = left
+        .open_admitted_fullzip_scan(0..13, budget.clone(), 4096, 8)
+        .await
+        .unwrap()
+        .with_deleted_rows(deleted.clone())
+        .unwrap();
+    let b = right
+        .open_admitted_fullzip_scan(0..13, budget.clone(), 4096, 8)
+        .await
+        .unwrap()
+        .with_deleted_rows(deleted.clone())
+        .unwrap();
+    let mut scan = a.try_merge(b).unwrap();
+    assert_eq!(stats.snapshot().iops, 0);
+    let held = budget.try_reserve(4096).unwrap();
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        FullZipScanOutcome::NeedsCapacity
+    ));
+    assert_eq!(
+        scan.position(),
+        0,
+        "refusal must not commit leading deletions"
+    );
+    assert_eq!(stats.snapshot().iops, 0);
+    drop(held);
+    {
+        let future = scan.try_next();
+        tokio::pin!(future);
+        tokio::select! {
+            _ = entered.notified() => (),
+            result = &mut future => panic!("later file must wait: {result:?}"),
+        }
+        assert!(budget.reserved() > 0 && budget.reserved() <= 4096);
+    }
+    assert_eq!(scan.position(), 0);
+    assert_eq!(budget.reserved(), 0);
+    mode.store(2, Ordering::Relaxed);
+    reads.store(0, Ordering::Relaxed);
+    let error = scan.try_next().await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }));
+    assert!(error.to_string().contains("later-column failure"));
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert_eq!(scan.position(), 0);
+    assert_eq!(budget.reserved(), 0);
+    mode.store(0, Ordering::Relaxed);
+    for selection in [0..13, 14..21, 22..35] {
+        if scan.position() != selection.start {
+            scan.advance_to_range(selection.clone()).unwrap();
+        }
+        let expected_rows = selection
+            .clone()
+            .filter(|row| !offsets.contains(&(*row as u32)))
+            .collect::<Vec<_>>();
+        let mut actual_rows = Vec::new();
+        let all_deleted = expected_rows.is_empty();
+        let before = stats.snapshot().iops;
+        // A completely deleted interval must finish even if all credit is held.
+        let held = all_deleted.then(|| budget.try_reserve(4096).unwrap());
+        loop {
+            match scan.try_next().await.unwrap() {
+                FullZipScanOutcome::Batch { rows, batch } => {
+                    assert!(!all_deleted);
+                    assert!(rows.start >= selection.start && rows.end <= selection.end);
+                    assert_batch(&batch, &rows, &expected);
+                    actual_rows.extend(rows.clone());
+                    assert_eq!(scan.position(), rows.end);
+                    let alias = batch.column(1).slice(0, 1);
+                    drop(batch);
+                    assert!(budget.reserved() > 0 && budget.reserved() <= 4096);
+                    let before = stats.snapshot().iops;
+                    if rows.end < selection.end
+                        && (rows.end..selection.end).any(|row| !offsets.contains(&(row as u32)))
+                    {
+                        assert!(matches!(
+                            scan.try_next().await.unwrap(),
+                            FullZipScanOutcome::NeedsCapacity
+                        ));
+                        assert_eq!(scan.position(), rows.end);
+                        assert_eq!(stats.snapshot().iops, before);
+                    }
+                    drop(alias);
+                    assert_eq!(budget.reserved(), 0);
+                }
+                FullZipScanOutcome::Finished => break,
+                FullZipScanOutcome::NeedsCapacity => panic!("live row must fit after output drain"),
+            }
+        }
+        assert_eq!(actual_rows, expected_rows);
+        assert_eq!(scan.position(), selection.end);
+        if all_deleted {
+            assert_eq!(stats.snapshot().iops, before);
+            assert_eq!(budget.reserved(), 4096);
+        }
+        drop(held);
+        assert_eq!(budget.reserved(), 0);
+    }
+}
+
+#[rstest]
+#[case::outside("outside", "offsets below")]
+#[case::after_attempt("after_attempt", "before the first read")]
+#[case::different_snapshot("different_snapshot", "same shared deletion")]
+#[case::missing_snapshot("missing_snapshot", "same shared deletion")]
+#[tokio::test]
+async fn deleted_rows_reject_invalid_or_unaligned_snapshots(
+    #[case] invalid: &str,
+    #[case] message: &str,
+) {
+    let (fs, reader) = fixture_batches(ConcreteFileVersion::V2_3, false, batches(), 1).await;
+    let left = project(&fs, &reader, &[0]).await;
+    let right = project(&fs, &reader, &[1]).await;
+    let stats = IoStats::new();
+    let left = left.with_io_stats(stats.recorder());
+    let right = right.with_io_stats(stats.recorder());
+    let budget = AllocationBudget::new(4096);
+    let held = budget.try_reserve(4096).unwrap();
+    let deleted = Arc::new([0_u32, 2].into_iter().collect::<DeletionVector>());
+    let mut a = left
+        .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, 4)
+        .await
+        .unwrap();
+    let error = match invalid {
+        "outside" => a
+            .with_deleted_rows(Arc::new([reader.num_rows() as u32].into_iter().collect()))
+            .unwrap_err(),
+        "after_attempt" => {
+            assert!(matches!(
+                a.try_next().await.unwrap(),
+                FullZipScanOutcome::NeedsCapacity
+            ));
+            assert_eq!(a.position(), 0);
+            a.with_deleted_rows(deleted).unwrap_err()
+        }
+        _ => {
+            let a = a.with_deleted_rows(deleted.clone()).unwrap();
+            let mut b = right
+                .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, 4)
+                .await
+                .unwrap();
+            if invalid == "different_snapshot" {
+                // Even equal values cannot establish that both callers supplied
+                // the same immutable fragment snapshot.
+                b = b
+                    .with_deleted_rows(Arc::new(deleted.as_ref().clone()))
+                    .unwrap();
+            }
+            a.try_merge(b).unwrap_err()
+        }
+    };
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message), "{error}");
+    assert_eq!(stats.snapshot().iops, 0);
+    assert_eq!(budget.reserved(), 4096);
+    drop(held);
+    assert_eq!(budget.reserved(), 0);
 }
