@@ -46,8 +46,8 @@ pub mod retention;
 
 // Two independent decisions share the name `Verdict`: expiry decides whether a
 // version is kept, file_verdict decides whether a listed file is kept.
-use expiry::{ThinningAnchor, ThinningCandidate, ThinningSurvivors, VersionExpiry};
 use expiry::Verdict as ExpiryVerdict;
+use expiry::{ThinningAnchor, ThinningCandidate, ThinningSurvivors, VersionExpiry};
 use file_verdict::{FileReference, ListedFile, Verdict as FileVerdict};
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
