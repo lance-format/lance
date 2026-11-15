@@ -10,7 +10,7 @@ use crate::scalar::IndexBinaryReader;
 // retains the Arrow fallback for diagnosing supported current-layout reads.
 // Unsupported encodings and frozen legacy layouts keep their existing readers.
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("LANCE_FTS_DIRECT_POSITIONS").map_or(true, |value| value == "1")
+    std::env::var_os("LANCE_FTS_DIRECT_POSITIONS").is_none_or(|value| value == "1")
 });
 
 // Bound staging for one complete value without changing ordinary posting I/O.
