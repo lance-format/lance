@@ -3637,6 +3637,9 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
     /// returns exclusive structural credit to this workspace. On success, copied
     /// intermediate values refund the global pool when dropped; reserve later
     /// stages separately rather than assuming that credit is recycled here.
+    /// Variable FullZip tasks preflight decoded values and copied dense levels
+    /// together. Their prior unzip/input allocations must already be charged;
+    /// this method does not make the ordinary FullZip input stage bounded.
     fn try_decode_in(
         &self,
         _workspace: &mut lance_core::utils::allocation::Reservation,

@@ -37,6 +37,7 @@ use super::{
     StructuralPageScheduler,
 };
 
+mod admitted;
 mod structure;
 
 #[derive(Debug, Clone, Copy)]
@@ -1681,6 +1682,13 @@ struct VariableFullZipDecodeTask {
 }
 
 impl DecodePageTask for VariableFullZipDecodeTask {
+    fn try_decode_in(
+        &self,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DecodedPage>> {
+        admitted::decode(self, workspace)
+    }
+
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let block = VariableWidthBlock {
             data: self.data,

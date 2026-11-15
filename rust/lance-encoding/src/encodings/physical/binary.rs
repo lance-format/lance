@@ -1291,6 +1291,14 @@ impl PerValueCompressor for VariableEncoder {
 pub struct VariableDecoder {}
 
 impl VariablePerValueDecompressor for VariableDecoder {
+    fn visit_binary_values(
+        &self,
+        data: &VariableWidthBlock,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        crate::compression::variable::visit(data, visitor)
+    }
+
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
     }

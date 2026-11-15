@@ -21,17 +21,18 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # FSST primitives passed at df5e9780f and physical default admission at
-      # 219a0327f. Check all users of the corrected Binary framing fixture and
-      # finish the feature/API stages skipped by the invalid u16 fixture.
-      - name: Validate Binary framing and FSST task composition
-        run: cargo test --profile ci --locked -p lance-encoding --lib admitted::tests::binary -- --nocapture
-      - name: Validate FSST without optional codecs
+      # MiniBlock FSST and framing are qualified at 3ccffae5a. Validate the new
+      # per-value API and already-drained FullZip task without replaying those suites.
+      - name: Validate FSST per-value and FullZip admission
         run: |
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib physical::fsst::admitted::tests -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib admitted::tests::binary::fsst -- --nocapture
-      - name: Validate public borrowed traversal API example
-        run: cargo test --profile ci --locked -p lance-encoding --doc visit_binary_values -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib per_value_admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::admitted::tests -- --nocapture
+      - name: Validate per-value admission without optional codecs
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib per_value_admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::admitted::tests -- --nocapture
+      - name: Validate public per-value admission API example
+        run: cargo test --profile ci --locked -p lance-encoding --doc VariablePerValueDecompressor::try_decompress_in -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |

@@ -35,6 +35,7 @@ use crate::{
 use super::binary::BinaryMiniBlockEncoder;
 
 mod admitted;
+mod per_value_admitted;
 
 pub(crate) fn map_fsst_error(err: std::io::Error) -> Error {
     match err.kind() {
@@ -212,6 +213,21 @@ impl FsstPerValueDecompressor {
 }
 
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
+    fn plan_decode(
+        &self,
+        data: &VariableWidthBlock,
+    ) -> Result<crate::compression::PerValueDecodeBudget> {
+        per_value_admitted::plan(self, data)
+    }
+
+    fn try_decompress_in(
+        &self,
+        data: &VariableWidthBlock,
+        workspace: &mut lance_core::utils::allocation::Reservation,
+    ) -> Result<Option<DataBlock>> {
+        per_value_admitted::decode(self, data, workspace)
+    }
+
     fn allocates_output(&self) -> bool {
         true
     }
@@ -386,6 +402,9 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         }))
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 #[cfg(test)]
 mod tests {

@@ -96,6 +96,7 @@ pub mod levels;
 pub(crate) mod prepared;
 pub(crate) mod prepared_unsigned;
 pub(crate) mod unsigned;
+pub(crate) mod variable;
 pub use layout::MiniBlockOutputLayout;
 pub use prepared::PreparedMiniBlockRange;
 pub use prepared_unsigned::PreparedUnsigned;
@@ -110,6 +111,18 @@ pub struct MiniBlockDecodeBudget {
     /// Bytes retained by the result after codec scratch is recycled.
     pub output_bytes: usize,
     /// Maximum additional bytes simultaneously needed, including output and scratch.
+    pub workspace_bytes: usize,
+}
+
+/// Payload required to decode an already unzipped variable-width block.
+/// Input allocations must already be charged, including offsets and any shared
+/// backing storage. This excludes unzipping, structural reconstruction and
+/// allocator/codec metadata. The plan applies only to the validated codec/input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerValueDecodeBudget {
+    /// Bytes retained by the decoded values and their offsets.
+    pub output_bytes: usize,
+    /// Maximum additional payload bytes needed, including output and scratch.
     pub workspace_bytes: usize,
 }
 
@@ -1529,6 +1542,53 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Visit decoded binary values without allocating payload or alignment copies.
+    /// Validate the complete offset table before invoking any callback. Offsets
+    /// start at zero, have the declared signed width and exactly `num_values + 1`
+    /// entries; trailing unused data is allowed. Borrowed values last only for the
+    /// callback. Unsupported codecs must not fall back to allocating decode.
+    fn visit_binary_values(
+        &self,
+        _data: &VariableWidthBlock,
+        _visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "per-value codec has no borrowed binary traversal",
+        ))
+    }
+
+    /// Validate all values and price complete output/scratch without allocating payload.
+    fn plan_decode(&self, _data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
+        Err(Error::not_supported("per-value codec has no admitted plan"))
+    }
+
+    /// Decode into an explicit workspace. Insufficient credit returns `None`,
+    /// preserving the input and workspace. Published aliases retain their charge
+    /// until final drop; exclusive scratch is recycled on refusal/error. Input
+    /// allocations must already be charged. Ordinary decode is never a fallback.
+    ///
+    /// ```
+    /// use lance_core::{Result, utils::allocation::AllocationBudget};
+    /// use lance_encoding::{compression::VariablePerValueDecompressor,
+    ///     data::{DataBlock, VariableWidthBlock}};
+    /// fn decode(codec: &dyn VariablePerValueDecompressor, input: &VariableWidthBlock)
+    ///     -> Result<Option<DataBlock>> {
+    ///     let plan = codec.plan_decode(input)?;
+    ///     let pool = AllocationBudget::new(plan.workspace_bytes);
+    ///     let mut work = pool.try_reserve(plan.workspace_bytes).unwrap();
+    ///     codec.try_decompress_in(input, &mut work)
+    /// }
+    /// ```
+    fn try_decompress_in(
+        &self,
+        _data: &VariableWidthBlock,
+        _workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        Err(Error::not_supported(
+            "per-value codec has no admitted decoder",
+        ))
+    }
 
     /// Whether every buffer returned by `decompress` is newly allocated, never a
     /// view of the input, on all paths.
