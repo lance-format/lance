@@ -4379,6 +4379,8 @@ impl FragmentReader {
 
 #[cfg(test)]
 mod tests {
+    mod admitted_ranges;
+
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt64Type;

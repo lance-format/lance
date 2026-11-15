@@ -17,25 +17,24 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc for Lance all-features lint
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Verify exact source
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Admitted lineage and deletion markers
+      - name: Logical marker ranges and fragment equivalence
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-file --lib queued_batch_owns_all_columns_and_credit -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::multi::row_ -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::multi::deleted_rows -- --nocapture
           cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::multi::logical_ -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib finite_files_wait_for_shared_capacity_and_drain_forward_selections -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc with_row_ -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc PhysicalRowIdSource -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc PhysicalRowVersionSource -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib invalid_marker_configuration_preserves_no_io -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc advance_to_live_range -- --nocapture
           cargo test --profile ci --locked -p lance-file --doc with_deleted_rows_as_nulls -- --nocapture
-          cargo test --profile ci --locked -p lance-table --lib admitted_row_ids -- --nocapture
+          cargo test --profile ci --locked -p lance --lib admitted_logical_range_matches_fragment_markers -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-file -p lance-table --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

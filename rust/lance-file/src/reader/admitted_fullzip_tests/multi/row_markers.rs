@@ -211,7 +211,7 @@ async fn marker_bitmap_is_admitted_before_payload(#[values(false, true)] empty: 
 #[case::missing("missing", "generated row ID or row address")]
 #[case::invalid("invalid", "offsets below")]
 #[case::started("started", "before the first read")]
-#[case::logical("logical", "physical ranges")]
+#[case::logical("logical", "within 6 live rows")]
 #[tokio::test]
 async fn invalid_marker_configuration_preserves_no_io(#[case] kind: &str, #[case] message: &str) {
     let (_fs, reader) = fixture_batches(
@@ -252,7 +252,7 @@ async fn invalid_marker_configuration_preserves_no_io(#[case] kind: &str, #[case
                 .unwrap()
                 .with_deleted_rows_as_nulls(deleted)
                 .unwrap();
-            let error = scan.advance_to_live_range(0..2).unwrap_err();
+            let error = scan.advance_to_live_range(0..7).unwrap_err();
             assert_eq!(scan.position(), 0);
             assert!(matches!(
                 scan.try_next().await.unwrap(),

@@ -536,10 +536,16 @@ impl FullZipScan {
     /// the deletion snapshot even before the first read. Empty intervals read
     /// nothing, including an empty selection at EOF or in an all-deleted file.
     ///
-    /// Returned batches still report physical row ranges and never contain
-    /// deleted rows. This does not evaluate query filters, map stable row IDs or
-    /// allocate system columns. No full live-row list or complement bitmap is
-    /// built. Ordinary fragment/scanner execution is unchanged.
+    /// Returned batches report physical row ranges. Filtering mode excludes
+    /// deleted rows. Marker mode retains deleted rows between the first and last
+    /// selected live row, with null identifiers and unchanged payload/version
+    /// values. Its output can therefore exceed `rows.len()`, matching the
+    /// physical span used by a fragment's logical read. Leading/trailing deleted
+    /// rows outside that span are not selected.
+    ///
+    /// This does not evaluate query filters or map stable row IDs. Selection
+    /// itself allocates no system columns, full live-row list or complement
+    /// bitmap. Ordinary fragment/scanner execution is unchanged.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -555,11 +561,6 @@ impl FullZipScan {
     /// }
     /// ```
     pub fn advance_to_live_range(&mut self, rows: Range<u64>) -> Result<()> {
-        if self.deletion_mode == DeletionMode::MarkNull {
-            return Err(Error::invalid_input(
-                "FullZip deletion markers require physical ranges, not live-row selections",
-            ));
-        }
         let deleted = self.deleted_rows.as_deref();
         let live_count = self.read_len - deleted_prefix_count(deleted, self.read_len);
         if rows.start > rows.end || rows.end > live_count {

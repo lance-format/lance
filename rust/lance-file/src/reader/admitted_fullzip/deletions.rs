@@ -24,9 +24,11 @@ impl FullZipScan {
     /// Snapshot identity/domain rules match [`Self::with_deleted_rows`]. This
     /// replaces any previously configured filtering snapshot.
     ///
-    /// Use physical selections with [`Self::advance_to_range`]. Live-row range
-    /// mapping is rejected in this mode rather than changing the requested row
-    /// domain. This does not adopt the cursor in ordinary fragment/scanner reads.
+    /// Use [`Self::advance_to_range`] for physical selections, or
+    /// [`Self::advance_to_live_range`] to map live-row endpoints and include any
+    /// deleted rows between them. The latter can return more physical rows than
+    /// its requested live-row count. This does not adopt the cursor in ordinary
+    /// fragment/scanner reads.
     ///
     /// ```
     /// use std::sync::Arc;

@@ -15,6 +15,7 @@ use lance_core::{
 use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
 
+mod logical_markers;
 mod row_ids;
 mod row_markers;
 mod row_versions;
