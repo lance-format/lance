@@ -53,7 +53,7 @@ pub use field::{
     StructuralCompositeDecodeArrayTask, StructuralPrimitiveFieldDecoder,
     StructuralPrimitiveFieldScheduler,
 };
-pub use fullzip_decode::FullZipScheduler;
+pub use fullzip_decode::{DecodedFullZipPrefix, FullZipScheduler};
 pub use miniblock_decode::MiniBlockScheduler;
 pub use structural_encoder::{PrimitivePageEncoding, PrimitiveStructuralEncoder};
 

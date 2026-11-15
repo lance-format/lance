@@ -3,15 +3,27 @@
 
 //! Read only selected FullZip rows using one already admitted workspace.
 
-use std::{future::Future, ops::Range};
+use std::{future::Future, ops::Range, sync::Arc};
 
 use lance_core::{
     Error, Result,
-    utils::allocation::{Reservation, ReservedBuffer},
+    utils::allocation::{AllocationBudget, Reservation, ReservedBuffer},
 };
 
 use super::FullZipScheduler;
-use crate::decoder::DecodePageTask;
+use crate::decoder::{DecodePageTask, DecodedPage};
+
+/// A successfully decoded, nonempty prefix of requested top-level rows.
+///
+/// See [`FullZipScheduler::try_read_decode_prefix_in`] for bounded retries and
+/// a usage example. The values and levels keep their allocation charges until
+/// their final owners drop; Arrow/structural reconstruction needs separate credit.
+pub struct DecodedFullZipPrefix {
+    /// Exact page-row interval represented by `page`; advance only to this end.
+    pub rows: Range<u64>,
+    /// Decoded leaf values and repetition/definition levels for those rows.
+    pub page: DecodedPage,
+}
 
 async fn fill<F, Fut>(
     read: &mut F,
@@ -40,6 +52,85 @@ fn endpoint(buffer: &ReservedBuffer) -> u64 {
 }
 
 impl FullZipScheduler {
+    /// Read and decode a fitting prefix without keeping failed attempts alive.
+    /// Each attempt reserves `workspace_bytes` atomically from the shared budget.
+    /// Admission refusal at input, unzip or codec output releases the entire
+    /// attempt before halving its row count. Corruption/reader/unsupported errors
+    /// propagate without retrying a smaller prefix that could hide bad input.
+    ///
+    /// `Some` always makes progress and identifies exactly which rows succeeded.
+    /// `None` means current credit is unavailable or even the one-row attempt
+    /// cannot fit this workspace; it is never EOF. Keep the original cursor and
+    /// drain outstanding results or replan. No waiting or credit increase occurs
+    /// while holding inputs. This is a finite size search, not a fairness policy.
+    /// A generous workspace keeps the requested batch intact rather than forcing
+    /// one-row output. Repeated reads/decodes can cost CPU/I/O; performance is not
+    /// qualified by this API's payload admission guarantee.
+    ///
+    /// `rows` must be nonempty and within this page. On success only the returned
+    /// values/levels retain credit; input, unzip and unused workspace are released.
+    /// Read callbacks obey [`Self::try_read_unzip_range_in`]'s ownership contract.
+    /// Transport/cache, metadata and later materialization are still separate.
+    ///
+    /// ```
+    /// use std::{future::Future, ops::Range, sync::Arc};
+    /// use lance_core::{Result, utils::allocation::{AllocationBudget, ReservedBuffer}};
+    /// use lance_encoding::encodings::logical::primitive::{FullZipScheduler, DecodedFullZipPrefix};
+    /// async fn next<F, Fut>(scheduler: &FullZipScheduler, remaining: Range<u64>,
+    ///     budget: &Arc<AllocationBudget>, read: F) -> Result<Option<DecodedFullZipPrefix>>
+    /// where F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+    ///       Fut: Future<Output = Result<ReservedBuffer>> {
+    ///     // Advance remaining.start only to a returned prefix's rows.end.
+    ///     scheduler.try_read_decode_prefix_in(remaining, budget, 65536, read).await
+    /// }
+    /// ```
+    pub async fn try_read_decode_prefix_in<F, Fut>(
+        &self,
+        rows: Range<u64>,
+        budget: &Arc<AllocationBudget>,
+        workspace_bytes: usize,
+        mut read: F,
+    ) -> Result<Option<DecodedFullZipPrefix>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        self.plan_unzip_range(&[], 0, 0..0)?;
+        if rows.start >= rows.end || rows.end > self.rows_in_page || workspace_bytes == 0 {
+            return Err(Error::invalid_input(
+                "FullZip prefix requires nonempty page rows and workspace",
+            ));
+        }
+        let mut candidate = rows;
+        loop {
+            let Some(mut workspace) = budget.try_reserve(workspace_bytes) else {
+                return Ok(None);
+            };
+            let page = if let Some(task) = self
+                .try_read_unzip_range_in(candidate.clone(), &mut workspace, &mut read)
+                .await?
+            {
+                task.try_decode_in(&mut workspace)?
+            } else {
+                None
+            };
+            // The task is gone before reacquiring credit; on success its decoded
+            // payload has an independent owner, on refusal nothing is retained.
+            drop(workspace);
+            if let Some(page) = page {
+                return Ok(Some(DecodedFullZipPrefix {
+                    rows: candidate,
+                    page,
+                }));
+            }
+            let count = candidate.end - candidate.start;
+            if count == 1 {
+                return Ok(None);
+            }
+            candidate.end = candidate.start + count / 2;
+        }
+    }
+
     /// Read and unzip selected variable-width rows with pre-reserved credit.
     /// One small allocation is reused for both repetition-index endpoints and
     /// recycled before the data read. Only the selected row-aligned data is read;

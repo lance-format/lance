@@ -42,6 +42,8 @@ mod read_admitted;
 mod structure;
 mod unzip_admitted;
 
+pub use read_admitted::DecodedFullZipPrefix;
+
 #[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
     buf_position: u64,
