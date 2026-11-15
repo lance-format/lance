@@ -62,8 +62,10 @@ pub struct VectorQueryProto {
     pub dist_q_c: ::core::option::Option<f32>,
     #[prost(int32, optional, tag = "13")]
     pub query_parallelism: ::core::option::Option<i32>,
-    /// Query-time approximation mode. Currently only affects RQ-quantized vector
-    /// indexes, such as IVF_RQ. Other index types ignore this setting.
+    /// Query-time approximation mode. Currently affects RQ-quantized vector
+    /// indexes (such as IVF_RQ) and HNSW sub-index searches that exclude rows
+    /// (for example through a prefilter or deletions), where Fast enables the
+    /// ACORN traversal. Other index types ignore this setting.
     #[prost(enumeration = "VectorApproxMode", tag = "14")]
     pub approx_mode: i32,
     /// Which covering columns the index must materialize for this query. Absent means
@@ -170,14 +172,18 @@ impl ::prost::Name for AnnIvfPartitionExecProto {
 }
 /// Query-time approximation mode for vector search.
 ///
-/// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-/// Other index types ignore this setting.
+/// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where Fast enables the ACORN traversal. Other index types
+/// ignore this setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum VectorApproxMode {
     /// Use all RQ bits for query-time scoring with u8-quantized lookup tables.
     Normal = 0,
     /// Use only one RQ bit for query-time scoring, even for multi-bit indexes.
+    /// On HNSW sub-indexes, also enable the ACORN traversal for searches that
+    /// exclude rows.
     Fast = 1,
     /// Use all RQ bits for query-time scoring with u16-quantized lookup tables
     /// to reduce estimator quantization error.
@@ -501,5 +507,267 @@ impl FtsQueryLeafKind {
             "FTS_QUERY_LEAF_KIND_PHRASE" => Some(Self::Phrase),
             _ => None,
         }
+    }
+}
+/// Runtime diagnostics across JNI, never persisted in a Lance dataset.
+/// Optional numeric fields distinguish unavailable measurements from measured zero.
+/// Durations use nanoseconds, storage and memory measurements use bytes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeAnalysisReport {
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub execution: ::core::option::Option<MergeExecutionReport>,
+    #[prost(string, tag = "3")]
+    pub write_mode: ::prost::alloc::string::String,
+    /// Complete change statistics; absent after failed execution.
+    #[prost(message, optional, tag = "4")]
+    pub stats: ::core::option::Option<MergeChangeStats>,
+    /// Existing fragments modified/removed; absent without a complete transaction.
+    #[prost(uint64, optional, tag = "5")]
+    pub fragments_touched: ::core::option::Option<u64>,
+    /// Logical scan visits, including repeated reads; absent without a scan producer.
+    #[prost(uint64, optional, tag = "6")]
+    pub target_rows_read: ::core::option::Option<u64>,
+    /// Fragment scan visits, not distinct fragments; absent without a scan producer.
+    #[prost(uint64, optional, tag = "7")]
+    pub fragments_read: ::core::option::Option<u64>,
+    /// Absent if failure prevented observing whether a probe ran.
+    #[prost(bool, optional, tag = "8")]
+    pub index_used: ::core::option::Option<bool>,
+    /// Distinct selected segment UUIDs; zero for non-indexed, absent if index use is unknown.
+    #[prost(uint64, optional, tag = "9")]
+    pub join_index_segments: ::core::option::Option<u64>,
+    /// Actual join-node time, overlapping write time; absent without a join producer.
+    #[prost(uint64, optional, tag = "10")]
+    pub join_duration_ns: ::core::option::Option<u64>,
+    /// Join output before merge actions; absent without an output-row producer.
+    #[prost(uint64, optional, tag = "11")]
+    pub joined_rows: ::core::option::Option<u64>,
+    /// Distinct mapped target addresses, an upper bound on matches; absent without a mapper.
+    #[prost(uint64, optional, tag = "12")]
+    pub mapped_target_rows: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "13")]
+    pub operator_spills: ::core::option::Option<MergeSpillUsage>,
+    #[prost(message, optional, tag = "14")]
+    pub replay_spills: ::core::option::Option<MergeSpillUsage>,
+    /// Absent when the route has no diagnostic scratch owner.
+    #[prost(message, optional, tag = "15")]
+    pub scratch_spills: ::core::option::Option<MergeSpillUsage>,
+    #[prost(message, repeated, tag = "16")]
+    pub subplans: ::prost::alloc::vec::Vec<MergeAnalysisSubplan>,
+    #[prost(message, repeated, tag = "17")]
+    pub joins: ::prost::alloc::vec::Vec<MergePhysicalJoin>,
+    /// Inclusive merge sink duration; overlaps join time. Absent if never measured.
+    #[prost(uint64, optional, tag = "18")]
+    pub merge_write_duration_ns: ::core::option::Option<u64>,
+}
+impl ::prost::Name for MergeAnalysisReport {
+    const NAME: &'static str = "MergeAnalysisReport";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeAnalysisReport".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeAnalysisReport".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeExecutionReport {
+    #[prost(string, tag = "1")]
+    pub plan: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub outcome: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub error: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "4")]
+    pub elapsed_ns: u64,
+    /// Maximum concurrent DataFusion pool reservations; absent without a tracked pool.
+    #[prost(uint64, optional, tag = "5")]
+    pub pool_peak_reserved_bytes: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "6")]
+    pub counts: ::prost::alloc::vec::Vec<MergeMetric>,
+    #[prost(message, repeated, tag = "7")]
+    pub times: ::prost::alloc::vec::Vec<MergeMetric>,
+    #[prost(message, repeated, tag = "8")]
+    pub operators: ::prost::alloc::vec::Vec<MergeOperatorMetrics>,
+}
+impl ::prost::Name for MergeExecutionReport {
+    const NAME: &'static str = "MergeExecutionReport";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeExecutionReport".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeExecutionReport".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeMetric {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// count, gauge, peak_memory_bytes, or time_ns. Counts retain producer-specific units.
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub value: u64,
+    #[prost(uint64, optional, tag = "4")]
+    pub partition: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "5")]
+    pub labels: ::prost::alloc::vec::Vec<MergeMetricLabel>,
+}
+impl ::prost::Name for MergeMetric {
+    const NAME: &'static str = "MergeMetric";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeMetric".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeMetric".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MergeMetricLabel {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub value: ::prost::alloc::string::String,
+}
+impl ::prost::Name for MergeMetricLabel {
+    const NAME: &'static str = "MergeMetricLabel";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeMetricLabel".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeMetricLabel".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeOperatorMetrics {
+    #[prost(uint64, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<u64>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub metrics: ::prost::alloc::vec::Vec<MergeMetric>,
+}
+impl ::prost::Name for MergeOperatorMetrics {
+    const NAME: &'static str = "MergeOperatorMetrics";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeOperatorMetrics".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeOperatorMetrics".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MergePhysicalJoin {
+    #[prost(uint64, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<u64>,
+    #[prost(string, tag = "2")]
+    pub strategy: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub partition_mode: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub join_type: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub subplan_id: u64,
+}
+impl ::prost::Name for MergePhysicalJoin {
+    const NAME: &'static str = "MergePhysicalJoin";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergePhysicalJoin".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergePhysicalJoin".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeAnalysisSubplan {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(string, tag = "2")]
+    pub purpose: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub execution: ::core::option::Option<MergeExecutionReport>,
+    #[prost(message, repeated, tag = "4")]
+    pub joins: ::prost::alloc::vec::Vec<MergePhysicalJoin>,
+}
+impl ::prost::Name for MergeAnalysisSubplan {
+    const NAME: &'static str = "MergeAnalysisSubplan";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeAnalysisSubplan".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeAnalysisSubplan".into()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MergeChangeStats {
+    #[prost(uint64, tag = "1")]
+    pub num_inserted_rows: u64,
+    #[prost(uint64, tag = "2")]
+    pub num_updated_rows: u64,
+    #[prost(uint64, tag = "3")]
+    pub num_deleted_rows: u64,
+    #[prost(uint64, tag = "4")]
+    pub bytes_written: u64,
+    #[prost(uint64, tag = "5")]
+    pub num_files_written: u64,
+    #[prost(uint64, tag = "6")]
+    pub num_skipped_duplicates: u64,
+}
+impl ::prost::Name for MergeChangeStats {
+    const NAME: &'static str = "MergeChangeStats";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeChangeStats".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeChangeStats".into()
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MergeSpillUsage {
+    /// Every absent field denotes a measurement unsupported by this producer.
+    #[prost(uint64, optional, tag = "1")]
+    pub spill_count: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub bytes_written: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub bytes_read: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub write_duration_ns: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "5")]
+    pub read_duration_ns: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub rows: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
+    pub accepted_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "8")]
+    pub charged_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "9")]
+    pub peak_charged_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "10")]
+    pub live_files: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "11")]
+    pub files_created: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "12")]
+    pub quota_failures: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "13")]
+    pub cleanup_failures: ::core::option::Option<u64>,
+}
+impl ::prost::Name for MergeSpillUsage {
+    const NAME: &'static str = "MergeSpillUsage";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.MergeSpillUsage".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.MergeSpillUsage".into()
     }
 }

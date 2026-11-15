@@ -1337,3 +1337,121 @@ async fn packed_parent_data_replacement_races_have_expected_outcomes(
     }
     assert!(race.attempts.load(Ordering::SeqCst) > 0);
 }
+
+/// An index build staged over fragments that no committed index covers yet
+/// commits past a deferred compaction that rewrites exactly those fragments.
+#[rstest]
+#[case::merged(true)]
+#[case::unmerged(false)]
+#[tokio::test]
+async fn test_staged_fts_commits_past_a_deferred_compaction_of_unindexed_fragments(
+    #[case] merge: bool,
+) {
+    use lance_index::scalar::InvertedIndexParams;
+
+    fn text_batch(start: i32, rows: i32) -> RecordBatch {
+        let ids: Vec<i32> = (start..start + rows).collect();
+        let text: Vec<String> = ids.iter().map(|id| format!("doc {id} word{id}")).collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("text", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(arrow_array::StringArray::from(text)),
+            ],
+        )
+        .unwrap()
+    }
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    // Indexed base fragments of 12 rows: already at the compaction target.
+    let batch = text_batch(0, 48);
+    let params = WriteParams {
+        max_rows_per_file: 12,
+        ..Default::default()
+    };
+    let mut table = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(params),
+    )
+    .await
+    .unwrap();
+    let fts = InvertedIndexParams::default();
+    table
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &fts,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Small unindexed appends.
+    let batch = text_batch(1000, 24);
+    let params = WriteParams {
+        max_rows_per_file: 6,
+        ..Default::default()
+    };
+    table
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+    // An index build stages a segment over the unindexed fragments.
+    let mut builder = open_in_new_session(uri).await;
+    let indexed = coverage(uri, "text_idx").await;
+    let unindexed: Vec<u32> = builder
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u32)
+        .filter(|id| !indexed.contains(*id))
+        .collect();
+    assert_eq!(unindexed.len(), 4);
+    let segment = builder
+        .create_index_builder(&["text"], IndexType::Inverted, &fts)
+        .name("text_idx".to_string())
+        .replace(true)
+        .fragments(unindexed.clone())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let segments = if merge {
+        vec![
+            builder
+                .merge_existing_index_segments(vec![segment])
+                .await
+                .unwrap(),
+        ]
+    } else {
+        vec![segment]
+    };
+
+    // A deferred compaction folds exactly those fragments.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 12,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    let metrics = compact_files(&mut table, options, None).await.unwrap();
+    assert_eq!(metrics.fragments_removed, 4);
+    let remaining: Vec<u32> = table
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u32)
+        .collect();
+    assert!(unindexed.iter().all(|id| !remaining.contains(id)));
+
+    builder
+        .commit_existing_index_segments("text_idx", "text", segments)
+        .await
+        .unwrap();
+}

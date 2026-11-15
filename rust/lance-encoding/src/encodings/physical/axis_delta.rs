@@ -187,12 +187,58 @@ impl AxisLayout {
                 "AxisDelta buffer does not match its tensor shape",
             ));
         }
-        let mut output = data.data.as_ref().to_vec();
-        if decode {
-            self.transform_values::<true>(&mut output);
-        } else {
-            self.transform_values::<false>(&mut output);
+
+        let apply = |bytes: &mut [u8]| {
+            if decode {
+                self.transform_values::<true>(bytes);
+            } else {
+                self.transform_values::<false>(bytes);
+            }
+        };
+
+        let buf = std::mem::replace(&mut data.data, LanceBuffer::empty()).into_buffer();
+        let buf = match buf.into_mutable() {
+            Ok(mut mutable) => {
+                apply(mutable.as_slice_mut());
+                data.data = LanceBuffer::from(arrow_buffer::Buffer::from(mutable));
+                return Ok(());
+            }
+            Err(buf) => buf,
+        };
+
+        macro_rules! try_in_place_vec {
+            ($buf:expr, $ty:ty) => {
+                match $buf.into_vec::<$ty>() {
+                    Ok(mut vec) => {
+                        apply(bytemuck::cast_slice_mut::<$ty, u8>(&mut vec));
+                        data.data = LanceBuffer::reinterpret_vec(vec);
+                        return Ok(());
+                    }
+                    Err(buf) => buf,
+                }
+            };
         }
+
+        let buf = try_in_place_vec!(buf, u8);
+        let buf = match self.element_bytes {
+            1 => try_in_place_vec!(buf, i8),
+            2 => {
+                let buf = try_in_place_vec!(buf, u16);
+                try_in_place_vec!(buf, i16)
+            }
+            4 => {
+                let buf = try_in_place_vec!(buf, u32);
+                try_in_place_vec!(buf, i32)
+            }
+            8 => {
+                let buf = try_in_place_vec!(buf, u64);
+                try_in_place_vec!(buf, i64)
+            }
+            _ => unreachable!("validated element width"),
+        };
+
+        let mut output = buf.as_slice().to_vec();
+        apply(&mut output);
         data.data = LanceBuffer::from(output);
         Ok(())
     }
@@ -703,6 +749,7 @@ mod tests {
                 }
                 assert_eq!(&actual[offset..end], expected);
                 // Decode independently generated scalar bytes with SIMD.
+                // SAFETY: the same buffer and layout as the encode call above.
                 unsafe {
                     x86_64::transform::<true>(
                         &mut actual[offset..end],
@@ -1108,5 +1155,45 @@ mod tests {
         let error = AxisDeltaDecompressor::try_new(&d).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("validity"));
+    }
+
+    #[test]
+    fn transforms_unique_buffers_in_place_and_clones_shared() {
+        let layout = AxisLayout {
+            axis_length: 8,
+            inner_stride: 1,
+            elements: 8,
+            element_bytes: 4,
+        };
+        let orig_vals: Vec<i32> = (0..16).map(|i| i * 7 + 3).collect();
+        let orig_bytes: Vec<u8> = bytemuck::cast_slice(&orig_vals).to_vec();
+
+        // Uniquely owned Vec<u8>-backed buffer should transform in place without reallocating.
+        let mut unique_block = FixedWidthDataBlock {
+            data: LanceBuffer::from(orig_bytes.clone()),
+            bits_per_value: 32 * 8,
+            num_values: 2,
+            block_info: crate::data::BlockInfo::new(),
+        };
+        let ptr_before = unique_block.data.as_ptr();
+        layout.transform(&mut unique_block, false).unwrap();
+        assert_eq!(unique_block.data.as_ptr(), ptr_before);
+        layout.transform(&mut unique_block, true).unwrap();
+        assert_eq!(unique_block.data.as_ptr(), ptr_before);
+        assert_eq!(unique_block.data.as_ref(), orig_bytes.as_slice());
+
+        // Shared buffer must copy-on-write without mutating the shared view.
+        let shared = LanceBuffer::reinterpret_vec(orig_vals);
+        let mut shared_block = FixedWidthDataBlock {
+            data: shared.clone(),
+            bits_per_value: 32 * 8,
+            num_values: 2,
+            block_info: crate::data::BlockInfo::new(),
+        };
+        layout.transform(&mut shared_block, false).unwrap();
+        assert_ne!(shared_block.data.as_ptr(), shared.as_ptr());
+        assert_eq!(shared.as_ref(), orig_bytes.as_slice());
+        layout.transform(&mut shared_block, true).unwrap();
+        assert_eq!(shared_block.data.as_ref(), orig_bytes.as_slice());
     }
 }

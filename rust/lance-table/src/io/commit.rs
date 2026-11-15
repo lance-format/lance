@@ -1672,12 +1672,19 @@ impl CommitHandler for RenameCommitHandler {
             Ok(_) => {
                 // Successfully committed
                 write_version_hint(object_store, base_path, manifest.version).await;
+                // Without an atomic rename the store publishes by copying, so the
+                // staging object's token need not describe the final path.
+                let published = object_store
+                    .inner
+                    .head(&path)
+                    .await
+                    .map_err(|error| CommitError::OtherError(error.into()))?;
                 Ok(ManifestLocation {
                     version: manifest.version,
                     path,
                     size: Some(res.size as u64),
                     naming_scheme,
-                    e_tag: None, // Re-name can change e-tag.,
+                    e_tag: published.e_tag,
                     identity: None,
                     last_modified: None,
                 })
