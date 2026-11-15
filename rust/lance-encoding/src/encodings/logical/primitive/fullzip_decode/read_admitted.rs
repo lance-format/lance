@@ -158,6 +158,9 @@ impl FullZipScheduler {
     /// Repetition-index endpoints are read together when their span is at most
     /// 4 KiB and fits the existing workspace. Otherwise one entry allocation is
     /// reused for two reads. Index scratch is recycled before the data read.
+    /// A whole small page with an adjacent index can use one combined read,
+    /// capped at 256 KiB. Both the read and exact data copy are admitted before
+    /// I/O; index/gap scratch is freed before unzip, preserving later headroom.
     /// Only the selected row-aligned data is read;
     /// it overlaps unzip output, then is recycled before this method returns.
     /// Index coalescing gaps are charged in full; no ordinary allocating decoder
@@ -256,10 +259,53 @@ impl FullZipScheduler {
         };
         let first = index_range(rows.start)?;
         let last = index_range(rows.end)?;
-        self.data_buf_position
+        let data_end = self
+            .data_buf_position
             .checked_add(self.data_buf_size)
             .ok_or_else(|| Error::invalid_input("FullZip data address overflows"))?;
         let width = index.bytes_per_value as usize;
+        // Full-page geometry is known without reading endpoints. Still validate
+        // them from storage before using the payload. Limit both over-read and
+        // async copy work; pre-admit the copy so this never raises the minimum
+        // workspace for a later decode or retains index scratch through unzip.
+        if rows.start == 0
+            && rows.end == self.rows_in_page
+            && first.start >= data_end
+            && first.start - data_end <= 4096
+        {
+            let combined_len = last.end - self.data_buf_position;
+            if combined_len <= 256 * 1024
+                && combined_len
+                    .checked_add(self.data_buf_size)
+                    .is_some_and(|needed| needed <= workspace.len() as u64)
+            {
+                let combined_len = combined_len as usize;
+                let data_len = self.data_buf_size as usize;
+                let Some(mut input) = workspace.try_allocate(data_len)? else {
+                    return Err(Error::internal("pre-admitted FullZip data copy refused"));
+                };
+                let Some(combined) = workspace.try_allocate(combined_len)? else {
+                    return Err(Error::internal(
+                        "pre-admitted FullZip combined read refused",
+                    ));
+                };
+                let combined = fill(&mut read, self.data_buf_position..last.end, combined).await?;
+                let index_offset = (first.start - self.data_buf_position) as usize;
+                let start = endpoint(&combined.as_ref()[index_offset..index_offset + width]);
+                let end = endpoint(&combined.as_ref()[combined_len - width..]);
+                if start != 0 || end != self.data_buf_size || start >= end {
+                    return Err(Error::corrupt_file_named(
+                        "FullZip",
+                        "invalid repetition index endpoints",
+                    ));
+                }
+                input
+                    .as_mut()
+                    .copy_from_slice(&combined.as_ref()[..data_len]);
+                combined.recycle(workspace)?;
+                return Ok(Some(input));
+            }
+        }
         // Avoid a second storage round trip for nearby endpoints. The fixed
         // cap bounds over-read independently of page/selection size; using only
         // existing workspace preserves progress at the original minimum budget.

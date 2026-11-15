@@ -665,8 +665,8 @@ async fn admitted_file_array_materialization_error_is_not_a_smaller_prefix() {
     assert!(error.to_string().contains("cannot contain nulls"));
     assert_eq!(
         stats.snapshot().iops,
-        2,
-        "one combined index read plus payload; no smaller retry"
+        1,
+        "one combined page/index read; no smaller retry"
     );
     assert_eq!(budget.reserved(), 0);
 }

@@ -48,11 +48,18 @@ fn reader(
 }
 
 fn source(f: &mut Fixture) -> Arc<Vec<u8>> {
+    // Keep separate index/payload coverage even when whole-page reads can use
+    // the compact fast path. Compact geometry has its own complete-path cases.
+    source_with_gap(f, 8192)
+}
+
+fn source_with_gap(f: &mut Fixture, gap: usize) -> Arc<Vec<u8>> {
     let mut bytes = vec![0; 37];
     bytes.extend_from_slice(f.zipped.as_ref());
+    bytes.resize(bytes.len() + gap, 0);
     bytes.extend_from_slice(f.index.as_ref());
     f.scheduler.data_buf_position += 37;
-    f.scheduler.rep_index.as_mut().unwrap().buf_position += 37;
+    f.scheduler.rep_index.as_mut().unwrap().buf_position += (37 + gap) as u64;
     bytes.extend_from_slice(&[0; 19]);
     Arc::new(bytes)
 }
@@ -400,5 +407,6 @@ async fn corrupt_selected_payload_recycles_exclusive_read() {
 }
 
 mod coalesce;
+mod compact;
 mod cpu;
 mod prefix;
