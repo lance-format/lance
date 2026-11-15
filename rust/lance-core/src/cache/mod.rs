@@ -643,6 +643,13 @@ impl LanceCache {
         self.state.backend.capacity_bytes()
     }
 
+    /// Change the backend's weighted capacity, evicting entries as needed.
+    ///
+    /// Backends that cannot resize after construction return an error.
+    pub fn set_capacity(&self, capacity: usize) -> Result<()> {
+        self.state.backend.set_capacity(capacity)
+    }
+
     /// Largest admissible RAM entry, if reported by the backend. An admitted
     /// entry remains subject to ordinary cache eviction.
     ///

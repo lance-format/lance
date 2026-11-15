@@ -737,10 +737,13 @@ impl MemTableFlusher {
                 }
                 FlushOutcome::Wrote(index_meta) => {
                     // Queries find a generation's index by name and field.
-                    if index_meta.name != spec.name || index_meta.fields != spec.field_ids {
+                    if index_meta.name != spec.name || index_meta.keyed_fields() != spec.field_ids {
                         return Err(Error::internal(format!(
                             "index '{}' on fields {:?} recorded its file as '{}' on fields {:?}",
-                            spec.name, spec.field_ids, index_meta.name, index_meta.fields
+                            spec.name,
+                            spec.field_ids,
+                            index_meta.name,
+                            index_meta.keyed_fields()
                         )));
                     }
                     created.push(*index_meta);
@@ -1536,12 +1539,13 @@ mod tests {
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
     }
 
-    /// The deletion vector and the flushed indexes address one fragment, so a flush
-    /// whose Int8 dictionary column holds more values than the keys address must not
-    /// start a second data file. One page holds all of them here, so the encoder
-    /// rejects it.
+    /// A rejected insert must leave the generation flushable as one fragment.
+    #[rstest]
+    #[case::indexed("indexed")]
+    #[case::batch_only("batch_only")]
+    #[case::batches_only("batches_only")]
     #[tokio::test]
-    async fn test_flush_rejects_dictionary_overflow_instead_of_splitting() {
+    async fn test_dictionary_capacity_rejected_before_insert(#[case] mode: &str) {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let manifest_store = Arc::new(ShardManifestStore::new(
@@ -1553,9 +1557,8 @@ mod tests {
         ));
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
-        let id_field = create_pk_schema().field(0).clone();
         let schema = Arc::new(ArrowSchema::new(vec![
-            id_field,
+            create_pk_schema().field(0).clone(),
             Field::new(
                 "name",
                 DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -1563,34 +1566,59 @@ mod tests {
             ),
         ]));
         let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
-        // Two batches of 100 values each: 200 distinct values in all, more than the
-        // 128 Int8 keys address.
-        let mut durable = 0;
-        for batch_index in 0..2 {
+        let batch = |start| {
             let values =
-                StringArray::from_iter_values((0..100).map(|i| format!("v{batch_index}_{i}")));
+                StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
             let names = DictionaryArray::<Int8Type>::try_new(
                 (0..100).collect::<Int8Array>(),
                 Arc::new(values),
             )
             .unwrap();
-            let ids = Int32Array::from_iter_values(batch_index * 100..batch_index * 100 + 100);
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(names)]).unwrap();
-            durable = memtable.insert(batch).await.unwrap() + 1;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(start..start + 100)),
+                    Arc::new(names),
+                ],
+            )
+            .unwrap()
+        };
+        memtable.insert(batch(0)).await.unwrap();
+        let pk_bytes = memtable.pk_bytes();
+        let error = match mode {
+            "indexed" => memtable.insert(batch(100)).await.map(|_| ()),
+            "batch_only" => memtable.insert_batch_only(batch(100)).await.map(|_| ()),
+            "batches_only" => memtable
+                .insert_batches_only(vec![batch(100)])
+                .await
+                .map(|_| ()),
+            _ => unreachable!(),
         }
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("200 distinct encoded values"));
+        assert!(error.to_string().contains("capacity of 128"));
+        assert_eq!(memtable.row_count(), 100);
+        assert_eq!(memtable.batch_count(), 1);
+        assert_eq!(memtable.pk_bytes(), pk_bytes);
 
-        let flusher =
-            MemTableFlusher::new(store, base_path, base_uri, "", shard_id, manifest_store);
-        let error = flusher
-            .flush(&memtable, epoch, 1, durable)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::InvalidInput { .. })
-                && error.to_string().contains("widen the dictionary key type"),
-            "unexpected error: {error}"
+        let flusher = MemTableFlusher::new(
+            store,
+            base_path,
+            base_uri.clone(),
+            "",
+            shard_id,
+            manifest_store,
         );
+        let result = flusher.flush(&memtable, epoch, 1, 1).await.unwrap();
+        let uri = format!("{base_uri}/_mem_wal/{shard_id}/{}", result.sstable.path);
+        let dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let scanned = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(scanned.num_rows(), 100);
+        let expected = batch(0);
+        assert_eq!(&scanned["id"], &expected["id"]);
+        assert_eq!(&scanned["name"], &expected["name"]);
     }
 
     /// Flushing a memtable with a primary-key index writes a standalone sidecar
