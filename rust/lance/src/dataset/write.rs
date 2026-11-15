@@ -68,6 +68,7 @@ pub mod delete;
 pub(crate) mod dictionary_budget;
 mod insert;
 pub mod merge_insert;
+mod representation;
 mod retry;
 pub(crate) mod seeds;
 pub mod update;

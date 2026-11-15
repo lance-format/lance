@@ -46,6 +46,7 @@ pub mod inserted_rows;
 
 use inserted_rows::KeyExistenceFilter;
 
+use super::representation::TableRepresentation;
 use super::{
     TargetBaseInfo, WriteMode, WriteParams, validate_and_resolve_target_bases_with_primary,
 };
@@ -62,10 +63,10 @@ use datafusion::common::{Column as DFColumn, TableReference};
 use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
-    execution::context::SessionContext,
+    execution::{SessionStateBuilder, TaskContext, context::SessionContext},
     logical_expr::{self, Expr, JoinType},
     physical_plan::{
-        ExecutionPlan, SendableRecordBatchStream,
+        ExecutionPlan, SendableRecordBatchStream, execute_stream,
         joins::{HashJoinExec, PartitionMode, SortMergeJoinExec},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
@@ -666,6 +667,58 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
     let schema = stream.schema();
     let partition = Arc::new(OneShotPartitionStream::new(stream));
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
+}
+
+/// Present a merge source with its string and binary columns in the target
+/// table's representations, converted as each scan reads them.
+///
+/// Returns the provider unchanged when no column needs converting, so a
+/// source that already matches keeps its partitions and statistics.
+fn source_in_table_representation(
+    provider: Arc<dyn TableProvider>,
+    target: &lance_core::datatypes::Schema,
+) -> Result<Arc<dyn TableProvider>> {
+    let Some(representation) = TableRepresentation::try_new(provider.schema().as_ref(), target)
+    else {
+        return Ok(provider);
+    };
+    let schema = representation.schema().clone();
+    let partition = Arc::new(TableRepresentationPartitionStream {
+        provider,
+        representation,
+    });
+    Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
+}
+
+/// Scans a merge source and converts each batch to the target table's
+/// representations.
+#[derive(Debug)]
+struct TableRepresentationPartitionStream {
+    provider: Arc<dyn TableProvider>,
+    representation: TableRepresentation,
+}
+
+impl PartitionStream for TableRepresentationPartitionStream {
+    fn schema(&self) -> &Arc<Schema> {
+        self.representation.schema()
+    }
+
+    fn execute(&self, context: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let provider = self.provider.clone();
+        let input_schema = provider.schema();
+        let input = stream::once(async move {
+            let state = SessionStateBuilder::new()
+                .with_config(context.session_config().clone())
+                .with_runtime_env(context.runtime_env())
+                .build();
+            let plan = provider.scan(&state, None, &[], None).await?;
+            execute_stream(plan, context)
+        })
+        .try_flatten();
+        self.representation
+            .clone()
+            .convert_stream(Box::pin(RecordBatchStreamAdapter::new(input_schema, input)))
+    }
 }
 
 /// Scans source partitions sequentially and removes duplicate non-null keys.
