@@ -2454,7 +2454,10 @@ async fn rewrite_selective_position_encoding(
 #[case::unfiltered(false)]
 #[case::filtered(true)]
 #[tokio::test]
-async fn selective_phrase_reads_committed_windows(#[case] filtered: bool) -> Result<()> {
+async fn selective_phrase_reads_committed_windows(
+    #[case] filtered: bool,
+    #[values(2, 8)] num_partitions: u64,
+) -> Result<()> {
     let dir = TempObjDir::default();
     let object_store = Arc::new(ObjectStore::local());
     let store = Arc::new(LanceIndexStore::with_format_version(
@@ -2464,7 +2467,7 @@ async fn selective_phrase_reads_committed_windows(#[case] filtered: bool) -> Res
         lance_file::version::ConcreteFileVersion::V2_2,
     ));
     let mut expected = Vec::new();
-    for partition in 0..2 {
+    for partition in 0..num_partitions {
         // Span multiple posting blocks and small read windows. Row addresses
         // are deliberately different from dense DocIds.
         let rows = (0..645)
@@ -2484,7 +2487,7 @@ async fn selective_phrase_reads_committed_windows(#[case] filtered: bool) -> Res
             .collect::<Vec<_>>();
         write_pair_partition_with_position(&store, partition, &rows, true).await;
     }
-    rewrite_selective_position_encoding(&store, 0..2).await?;
+    rewrite_selective_position_encoding(&store, 0..num_partitions).await?;
     let store = Arc::new(LanceIndexStore::with_format_version(
         object_store,
         dir.clone(),
@@ -2493,7 +2496,7 @@ async fn selective_phrase_reads_committed_windows(#[case] filtered: bool) -> Res
     ));
     let (index, _cache) = load_prewarmed_index(
         store,
-        vec![0, 1],
+        (0..num_partitions).collect(),
         InvertedIndexParams::default().with_position(true),
     )
     .await;
@@ -2508,7 +2511,7 @@ async fn selective_phrase_reads_committed_windows(#[case] filtered: bool) -> Res
     );
     let mask = if filtered {
         RowAddrMask::from_allowed(
-            (0..2)
+            (0..num_partitions)
                 .flat_map(|part| {
                     (0..645)
                         .filter(|doc| doc % 5 == 0)

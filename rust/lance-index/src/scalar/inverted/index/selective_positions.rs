@@ -24,7 +24,9 @@ pub(super) fn enabled() -> bool {
 
 // This bounds encoded blocks held by one partition search, not process RSS.
 // Postings, offsets, decode scratch, I/O buffers and other queries are separate.
-const MAX_LIVE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PARTITION_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+// Query-owned current/predicted encoded windows only; cache and I/O are separate.
+const MAX_QUERY_WINDOW_BYTES: u64 = 128 * 1024 * 1024;
 // Search seed for the opt-in path, pending matched VM qualification.
 const POSITION_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 // Bound speculative request metadata even for arbitrarily small codec windows.
@@ -288,6 +290,7 @@ impl InvertedPartition {
         tokens: &Tokens,
         term_ids: Option<PartitionTermIds<'_>>,
         window_bytes: u64,
+        encoded_budget: u64,
     ) -> Result<Option<Vec<PreparedPositions>>> {
         let inverted = &self.inverted_list;
         let PositionsLayout::SharedStream(codec) = inverted.positions_layout else {
@@ -356,7 +359,7 @@ impl InvertedPartition {
                 &offsets.0,
                 value.len(),
                 window_bytes,
-                MAX_LIVE_WINDOW_BYTES / tokens.len() as u64,
+                encoded_budget / tokens.len() as u64,
             )?
             else {
                 return Ok(None);
@@ -407,7 +410,19 @@ impl InvertedIndex {
             if !eligible(&request) {
                 return Ok(None);
             }
-            let clause_budget = MAX_LIVE_WINDOW_BYTES / request.tokens.len() as u64;
+            let selected = self
+                .partitions
+                .iter()
+                .enumerate()
+                .filter(|(_, part)| part.may_match_tokens(&request.tokens, request.operator, true))
+                .collect::<Vec<_>>();
+            let resources = partition_search::search_resources(
+                get_num_compute_intensive_cpus(),
+                selected.len().max(1),
+                request.tokens.len(),
+                config.window_bytes,
+            )?;
+            let clause_budget = resources.partition_bytes / request.tokens.len() as u64;
             if config.window_bytes == 0 || config.window_bytes > clause_budget {
                 return Err(Error::invalid_input(format!(
                     "selective window {} must be positive and fit clause budget {clause_budget}",
@@ -417,10 +432,7 @@ impl InvertedIndex {
             // Decide all encoding support before loading/consuming postings or
             // publishing a competitive floor. A None cleanly selects ordinary search.
             let mut preparations = Vec::new();
-            for (ordinal, part) in self.partitions.iter().enumerate() {
-                if !part.may_match_tokens(&request.tokens, request.operator, true) {
-                    continue;
-                }
+            for (ordinal, part) in selected {
                 let part = part.clone();
                 let tokens = request.tokens.clone();
                 let ids = request.term_ids.map(|ids| ids.partition(ordinal));
@@ -430,9 +442,14 @@ impl InvertedIndex {
                             return Ok(None);
                         }
                         Ok::<_, Error>(
-                            part.prepare_selective_positions(&tokens, ids, config.window_bytes)
-                                .await?
-                                .map(|positions| (ordinal, part.clone(), positions)),
+                            part.prepare_selective_positions(
+                                &tokens,
+                                ids,
+                                config.window_bytes,
+                                resources.partition_bytes,
+                            )
+                            .await?
+                            .map(|positions| (ordinal, part.clone(), positions)),
                         )
                     }
                     .boxed(),
@@ -491,6 +508,7 @@ impl InvertedIndex {
                             lengths,
                             visibility: Arc::new(visibility),
                             shared,
+                            encoded_budget: resources.partition_bytes,
                         }))
                     }
                     .boxed()
@@ -499,11 +517,9 @@ impl InvertedIndex {
                 .buffer_unordered(2)
                 .try_filter_map(|search| futures::future::ready(Ok(search)))
                 .map_ok(|search| search.run().boxed());
-            // Restore the pre-slicing policy: 4 x 32MiB encoded/query. Shared
-            // inputs, cache, scratch and I/O buffers remain separate budgets.
-            let mut results = loads.try_buffer_unordered(
-                get_num_compute_intensive_cpus().min(partition_search::MAX_ACTIVE_PARTITIONS),
-            );
+            // Every active search uses the same allowance for preparation and
+            // read-ahead; their sum cannot exceed this query's encoded budget.
+            let mut results = loads.try_buffer_unordered(resources.active_partitions);
             let mut ranked = BinaryHeap::new();
             while let Some((ordinal, scored)) = results.try_next().await? {
                 for (doc_id, score) in scored {
