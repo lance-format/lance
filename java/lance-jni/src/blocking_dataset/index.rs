@@ -602,7 +602,7 @@ fn inner_commit_existing_index_segments<'local>(
 
     let committed = {
         let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         block_on(dataset_guard.inner.commit_existing_index_segments(
             &index_name,
             &column,
