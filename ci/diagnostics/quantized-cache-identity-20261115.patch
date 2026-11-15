@@ -1,0 +1,348 @@
+diff --git a/rust/lance/src/dataset/tests/dataset_scanner_knn.rs b/rust/lance/src/dataset/tests/dataset_scanner_knn.rs
+index 1c62b04b6..7ec24ee2f 100644
+--- a/rust/lance/src/dataset/tests/dataset_scanner_knn.rs
++++ b/rust/lance/src/dataset/tests/dataset_scanner_knn.rs
+@@ -3081,6 +3081,53 @@ async fn refinement_cache_activity(dataset: &Dataset) -> CacheActivity {
+         .unwrap_or_default()
+ }
+ 
++// Diagnostic-only residency view. Units follow the cache diagnostics contract:
++// capacity/size values are accounted weighted bytes (key footprint + declared
++// entry size), and num_entries is the resident entry count, not a count of
++// logical keys. Aggregate occupancy cannot prove that one specific key is
++// resident; the scan path prints a non-counting per-key peek for that.
++async fn refinement_cache_residency(dataset: &Dataset) -> String {
++    let diagnostics = dataset
++        .index_cache
++        .diagnostics_by_type(CacheSnapshotMode::Refreshed)
++        .await;
++    let backend = diagnostics.backend;
++    let qrf = diagnostics
++        .by_type
++        .as_ref()
++        .and_then(|by_type| by_type.occupancy.as_ref())
++        .and_then(|occupancy| {
++            occupancy
++                .types
++                .iter()
++                .find(|entry| entry.type_name == "QuantizedRefinementResult")
++        });
++    match qrf {
++        Some(qrf) => format!(
++            "capacity_bytes={:?} backend_num_entries={:?} backend_size_bytes={:?} \
++             backend_write_attempts={:?} backend_size_removals={:?} \
++             qrf_num_entries={} qrf_size_bytes={}",
++            backend.capacity_bytes,
++            backend.num_entries,
++            backend.size_bytes,
++            backend.write_attempts,
++            backend.size_removals,
++            qrf.num_entries,
++            qrf.size_bytes,
++        ),
++        None => format!(
++            "capacity_bytes={:?} backend_num_entries={:?} backend_size_bytes={:?} \
++             backend_write_attempts={:?} backend_size_removals={:?} \
++             qrf_num_entries=<absent> qrf_size_bytes=<absent>",
++            backend.capacity_bytes,
++            backend.num_entries,
++            backend.size_bytes,
++            backend.write_attempts,
++            backend.size_removals,
++        ),
++    }
++}
++
+ fn refinement_scan(dataset: &Dataset) -> Scanner {
+     let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+     let mut scan = dataset.scan();
+@@ -3130,24 +3177,53 @@ async fn cross_column_refinement_scan(
+ 
+ // Compare the actual rows and distance bits against the same snapshot with its
+ // result cache disabled. Counters alone cannot detect stale rankings.
+-async fn assert_refinement_cache(dataset: &Dataset, expect_hit: bool) -> RecordBatch {
++// Diagnostic-only stderr probe; the allow disappears with the probe.
++#[allow(clippy::print_stderr)]
++async fn assert_refinement_cache_phase(
++    dataset: &Dataset,
++    expect_hit: bool,
++    phase: &str,
++) -> RecordBatch {
+     let before = refinement_cache_activity(dataset).await;
+     let result = refinement_scan(dataset).try_into_batch().await.unwrap();
+     let after = refinement_cache_activity(dataset).await;
++    eprintln!("phase={phase} before={before:?} after={after:?}");
++    eprintln!(
++        "phase={phase} residency={}",
++        refinement_cache_residency(dataset).await
++    );
+     if expect_hit {
+-        assert!(after.hits > before.hits);
+-        assert_eq!(after.loads_started, before.loads_started);
++        if after.hits <= before.hits {
++            let bt = std::backtrace::Backtrace::force_capture();
++            panic!(
++                "phase={phase} expected hit: before={before:?} after={after:?}\nbacktrace:\n{bt}"
++            );
++        }
++        assert_eq!(
++            after.loads_started, before.loads_started,
++            "phase={phase} loads_started changed: before={before:?} after={after:?}"
++        );
+     } else {
+-        assert_eq!(after.hits, before.hits);
+-        assert!(after.loads_succeeded > before.loads_succeeded);
++        assert_eq!(
++            after.hits, before.hits,
++            "phase={phase} unexpected hit: before={before:?} after={after:?}"
++        );
++        assert!(
++            after.loads_succeeded > before.loads_succeeded,
++            "phase={phase} expected load: before={before:?} after={after:?}"
++        );
+     }
+     let mut uncached = dataset.clone();
+     uncached.index_cache = Arc::new(DSIndexCache(LanceCache::no_cache()));
+     let reference = refinement_scan(&uncached).try_into_batch().await.unwrap();
+-    assert_eq!(result, reference);
++    assert_eq!(result, reference, "phase={phase} cached result differs");
+     result
+ }
+ 
++async fn assert_refinement_cache(dataset: &Dataset, expect_hit: bool) -> RecordBatch {
++    assert_refinement_cache_phase(dataset, expect_hit, "unlabeled").await
++}
++
+ #[rstest]
+ #[case::branch(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).branch = Some("other".to_string()))]
+ #[case::incarnation(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).transaction_file = Some("new-transaction.txn".to_string()))]
+@@ -3291,13 +3367,13 @@ async fn test_quantized_refinement_cache_snapshot_lifecycle(
+         .unwrap();
+     fixture.make_rq_vector_index(8).await.unwrap();
+     let original_version = fixture.dataset.version().version;
+-    let original = assert_refinement_cache(&fixture.dataset, false).await;
+-    assert_refinement_cache(&fixture.dataset, true).await;
++    let original = assert_refinement_cache_phase(&fixture.dataset, false, "original_miss").await;
++    assert_refinement_cache_phase(&fixture.dataset, true, "original_hit").await;
+ 
+     fixture.dataset.delete("i = 0").await.unwrap();
+-    let deleted = assert_refinement_cache(&fixture.dataset, false).await;
++    let deleted = assert_refinement_cache_phase(&fixture.dataset, false, "delete_miss").await;
+     assert!(!batch_row_ids(&deleted).contains(&0));
+-    assert_refinement_cache(&fixture.dataset, true).await;
++    assert_refinement_cache_phase(&fixture.dataset, true, "delete_hit").await;
+ 
+     for target_rows_per_fragment in [150, 500] {
+         let version = fixture.dataset.version().version;
+@@ -3317,8 +3393,10 @@ async fn test_quantized_refinement_cache_snapshot_lifecycle(
+             fixture.dataset.version().version > version,
+             "compaction must commit a new snapshot"
+         );
+-        assert_refinement_cache(&fixture.dataset, false).await;
+-        assert_refinement_cache(&fixture.dataset, true).await;
++        let miss_phase = format!("compact_{target_rows_per_fragment}_miss");
++        let hit_phase = format!("compact_{target_rows_per_fragment}_hit");
++        assert_refinement_cache_phase(&fixture.dataset, false, &miss_phase).await;
++        assert_refinement_cache_phase(&fixture.dataset, true, &hit_phase).await;
+     }
+ 
+     fixture.append_new_data().await.unwrap();
+@@ -3344,16 +3422,19 @@ async fn test_quantized_refinement_cache_snapshot_lifecycle(
+         .optimize_indices(&OptimizeOptions::append())
+         .await
+         .unwrap();
+-    assert_refinement_cache(&fixture.dataset, false).await;
++    assert_refinement_cache_phase(&fixture.dataset, false, "optimize_miss").await;
+ 
+     fixture.make_rq_vector_index(8).await.unwrap();
+-    assert_refinement_cache(&fixture.dataset, false).await;
++    assert_refinement_cache_phase(&fixture.dataset, false, "reindex_miss").await;
+     let old = fixture
+         .dataset
+         .checkout_version(original_version)
+         .await
+         .unwrap();
+-    assert_eq!(assert_refinement_cache(&old, true).await, original);
++    assert_eq!(
++        assert_refinement_cache_phase(&old, true, "checkout_original_hit").await,
++        original
++    );
+ }
+ 
+ #[rstest]
+diff --git a/rust/lance/src/io/exec/knn.rs b/rust/lance/src/io/exec/knn.rs
+index c83d7fce9..a41b564fd 100644
+--- a/rust/lance/src/io/exec/knn.rs
++++ b/rust/lance/src/io/exec/knn.rs
+@@ -42,6 +42,7 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
+ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
+ use itertools::Itertools;
+ use lance_core::ROW_ID;
++use lance_core::cache::CacheKey;
+ use lance_core::utils::futures::FinallyStreamExt;
+ use lance_core::{
+     ROW_ID_FIELD,
+@@ -2089,6 +2090,8 @@ fn effective_query_parallelism_for(
+ 
+ impl ANNIvfSubIndexExec {
+     #[allow(clippy::too_many_arguments)]
++    // Diagnostic-only stderr probe; the allow disappears with the probe.
++    #[allow(clippy::print_stderr)]
+     async fn search_partition(
+         index: Arc<dyn VectorIndex>,
+         query: Query,
+@@ -2105,6 +2108,34 @@ impl ANNIvfSubIndexExec {
+                 partition_id: part_id,
+                 dist_q_c: query.dist_q_c,
+             };
++            // Diagnostic-only (never merged): the exact key material of this
++            // partition lookup plus a non-counting residency probe, so a miss is
++            // attributable without changing hit/miss statistics or eviction order.
++            eprintln!(
++                "qrf_lookup query_identity={:?} partition_id={} dist_q_c_bits={:#010x} \
++                 entry_identity={} resident_before={} controls column={:?} k={} \
++                 minimum_nprobes={} maximum_nprobes={:?} ef={:?} refine_factor={:?} \
++                 lower_bound={:?} upper_bound={:?} search_effort_bits={:#010x} \
++                 query_parallelism={} use_index={} metric_type={:?} approx_mode={:?}",
++                key.identity,
++                key.partition_id,
++                key.dist_q_c.to_bits(),
++                key.key(),
++                cache.cache.peek_resident_with_key(&key).await,
++                query.column,
++                query.k,
++                query.minimum_nprobes,
++                query.maximum_nprobes,
++                query.ef,
++                query.refine_factor,
++                query.lower_bound,
++                query.upper_bound,
++                query.search_effort.to_bits(),
++                query.query_parallelism,
++                query.use_index,
++                query.metric_type,
++                query.approx_mode,
++            );
+             let result = cache
+                 .cache
+                 .get_or_insert_with_key(key, || async {
+diff --git a/rust/lance/src/session/index_caches.rs b/rust/lance/src/session/index_caches.rs
+index 154b92c96..e34e3bedf 100644
+--- a/rust/lance/src/session/index_caches.rs
++++ b/rust/lance/src/session/index_caches.rs
+@@ -82,6 +82,8 @@ pub(crate) struct QuantizedRefinementCache {
+ }
+ 
+ impl QuantizedRefinementCache {
++    // Diagnostic-only stderr probe; the allow disappears with the probe.
++    #[allow(clippy::print_stderr)]
+     pub async fn for_segment(
+         dataset: &crate::Dataset,
+         index: &IndexMetadata,
+@@ -101,13 +103,18 @@ impl QuantizedRefinementCache {
+         {
+             return Ok(None);
+         }
++        // Diagnostic-only (never merged): bind the stores once so the same
++        // values can be printed next to the hashed identity.
++        let root_store = dataset.object_store(None).await?;
++        let index_store = dataset.object_store_for_index(index).await?;
++        let indice_files_dir = dataset.indice_files_dir(index)?;
+         let mut builder = KeyBuilder::new(
+             CacheNamespace::root(),
+             QuantizedRefinementKey::type_name(),
+             QuantizedRefinementKey::schema(),
+         );
+         builder.write_str(dataset.uri());
+-        builder.write_str(&dataset.object_store(None).await?.store_prefix);
++        builder.write_str(&root_store.store_prefix);
+         builder.write_str(location.path.as_ref());
+         builder.write_u64(manifest.version);
+         builder.write_u64(options.result_count as u64);
+@@ -131,9 +138,8 @@ impl QuantizedRefinementCache {
+                 None => builder.write_none(),
+             }
+         }
+-        let store = dataset.object_store_for_index(index).await?;
+-        builder.write_str(&store.store_prefix);
+-        builder.write_str(dataset.indice_files_dir(index)?.as_ref());
++        builder.write_str(&index_store.store_prefix);
++        builder.write_str(indice_files_dir.as_ref());
+         write_index_identity(&mut builder, &index.uuid, None);
+         // The authoritative manifest generation binds both FRI contents and
+         // the segment's effective coverage. Never reuse rankings across snapshots,
+@@ -141,13 +147,73 @@ impl QuantizedRefinementCache {
+         if !write_query_vector(&mut builder, original_query) {
+             return Ok(None);
+         }
++        let base_identity = builder.finish();
++        // Diagnostic-only (never merged): print every hashed identity input and
++        // the 16-byte base identity. The lookup key adds resolved query controls
++        // and the partition fields; both are printed by the scan path.
++        eprintln!(
++            "qrf_identity uri={:?} root_store_prefix={:?} manifest_path={:?} \
++             manifest_version={} result_count={} exact_factor={:?} branch={:?} \
++             transaction_file={:?} manifest_etag={:?} index_store_prefix={:?} \
++             indice_files_dir={:?} index_uuid={} query_key_len={} query_key_dtype={:?} \
++             query_key_bits={} base_identity={:?} manifest_size_not_hashed={:?}",
++            dataset.uri(),
++            root_store.store_prefix,
++            location.path.as_ref(),
++            manifest.version,
++            options.result_count,
++            options.exact_factor,
++            manifest.branch.as_deref(),
++            manifest.transaction_file.as_deref(),
++            location.e_tag.as_deref(),
++            index_store.store_prefix,
++            indice_files_dir.as_ref(),
++            index.uuid,
++            original_query.key.len(),
++            original_query.key.data_type(),
++            diagnostic_query_key_bits(original_query),
++            base_identity,
++            location.size,
++        );
+         Ok(Some(Self {
+             cache: dataset.index_cache.0.clone(),
+-            identity: builder.finish(),
++            identity: base_identity,
+         }))
+     }
+ }
+ 
++/// Diagnostic-only: canonical bits of the query vector that the base identity
++/// binds. Only used by the identity print above; never part of the API.
++fn diagnostic_query_key_bits(query: &Query) -> String {
++    match query.key.data_type() {
++        DataType::Float16 => query
++            .key
++            .as_primitive::<arrow_array::types::Float16Type>()
++            .values()
++            .iter()
++            .map(|value| format!("{:04x}", value.to_bits()))
++            .collect::<Vec<_>>()
++            .join(","),
++        DataType::Float32 => query
++            .key
++            .as_primitive::<arrow_array::types::Float32Type>()
++            .values()
++            .iter()
++            .map(|value| format!("{:08x}", value.to_bits()))
++            .collect::<Vec<_>>()
++            .join(","),
++        DataType::Float64 => query
++            .key
++            .as_primitive::<arrow_array::types::Float64Type>()
++            .values()
++            .iter()
++            .map(|value| format!("{:016x}", value.to_bits()))
++            .collect::<Vec<_>>()
++            .join(","),
++        other => format!("<unsupported:{other:?}>"),
++    }
++}
++
+ pub(crate) struct QuantizedRefinementKey {
+     pub identity: InternalCacheKey,
+     pub partition_id: usize,

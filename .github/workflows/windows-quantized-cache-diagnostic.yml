@@ -10,7 +10,7 @@ name: Windows quantized-cache diagnostic
 # push and no workflow_dispatch trigger, so opening/updating this PR is the only
 # way this workflow runs.
 #
-# The PR head carries only this workflow and the saved phase patch. The build
+# The PR head carries only this workflow and the saved identity-probe patch. The build
 # happens in a second checkout pinned to the exact red head, so later commits on
 # the PR branch cannot change what is built or run.
 
@@ -21,7 +21,7 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - .github/workflows/windows-quantized-cache-diagnostic.yml
-      - ci/diagnostics/quantized-cache-phase-c029d999.patch
+      - ci/diagnostics/quantized-cache-identity-20261115.patch
 
 permissions:
   contents: read
@@ -97,7 +97,7 @@ jobs:
         with:
           tool: nextest@0.9.129
 
-      - name: Verify red objects, patch oracle, and apply phase instrumentation
+      - name: Verify red objects, patch oracle, and apply identity instrumentation
         # bash (Git Bash) is used for byte-exact handling: the saved patch is
         # read from the PR-head git object, never from the CRLF-converted
         # worktree, and is applied to the reproduction checkout only.
@@ -111,8 +111,11 @@ jobs:
           REPRO=$(git rev-parse --show-toplevel)
           DIAG=$(dirname "$REPRO")
           TEST_PATH="rust/lance/src/dataset/tests/dataset_scanner_knn.rs"
-          PATCH_BLOB_PATH="ci/diagnostics/quantized-cache-phase-c029d999.patch"
-          PATCH="../quantized-cache-phase-c029d999.patch"
+          KNN_PATH="rust/lance/src/io/exec/knn.rs"
+          INDEX_CACHE_PATH="rust/lance/src/session/index_caches.rs"
+          TEST_PATHS=("$TEST_PATH" "$KNN_PATH" "$INDEX_CACHE_PATH")
+          PATCH_BLOB_PATH="ci/diagnostics/quantized-cache-identity-20261115.patch"
+          PATCH="../quantized-cache-identity-20261115.patch"
 
           cd "$REPRO"
           HEAD_SHA=$(git rev-parse HEAD)
@@ -158,7 +161,7 @@ jobs:
           PATCH_SHA=$(sha256sum "$PATCH" | cut -d' ' -f1)
           echo "patch_blob=$PATCH_BLOB"
           echo "patch_sha256=$PATCH_SHA"
-          if [ "$PATCH_SHA" != "729d181c113c3ca31b1b8fdb213c84d909ec40c31d4bb94eff963e0e13b149d6" ]; then
+          if [ "$PATCH_SHA" != "60ba37148bb5ef10461495600809baa263e314a8526f64c9773deb53a3d5f2d9" ]; then
             echo "::error::patch oracle mismatch: $PATCH_SHA"
             exit 1
           fi
@@ -166,7 +169,9 @@ jobs:
           # Normalize the runner scratch checkout to LF so the saved patch
           # applies byte-for-byte. Nothing here is pushed or committed.
           git config --local core.autocrlf false
-          git checkout -- "$TEST_PATH"
+          for path in "${TEST_PATHS[@]}"; do
+            git checkout -- "$path"
+          done
           PRE=$(git hash-object --no-filters "$TEST_PATH")
           echo "pre_apply_worktree_blob=$PRE"
           if [ "$PRE" != "1c62b04b68d064bde8c56e63c149de959a25cf7d" ]; then
@@ -175,21 +180,27 @@ jobs:
           fi
 
           if ! git apply --check "$PATCH"; then
-            echo "::error::phase patch does not apply to the red head"
+            echo "::error::identity patch does not apply to the red head"
             exit 1
           fi
           if ! git apply "$PATCH"; then
-            echo "::error::phase patch failed to apply"
+            echo "::error::identity patch failed to apply"
             exit 1
           fi
-          POST=$(git hash-object --no-filters "$TEST_PATH")
-          echo "post_apply_worktree_blob=$POST"
-          if [ "$POST" != "341fa012412c4b9bd6a98394c66f4f01d2eee131" ]; then
-            echo "::error::unexpected post-patch test blob: $POST"
-            exit 1
-          fi
-          git diff --stat -- "$TEST_PATH"
-          git diff --numstat -- "$TEST_PATH"
+          check_post() {
+            local path="$1" want="$2" got
+            got=$(git hash-object --no-filters "$path")
+            echo "post_apply_worktree_blob=$path sha=$got"
+            if [ "$got" != "$want" ]; then
+              echo "::error::unexpected post-patch blob for $path: $got != $want"
+              exit 1
+            fi
+          }
+          check_post "$TEST_PATH" "7ec24ee2f09dcdbf1dce19f2b200846f362ec3c7"
+          check_post "$KNN_PATH" "a41b564fd1cf9df325fa64f1281b1e2cfabb0531"
+          check_post "$INDEX_CACHE_PATH" "e34e3bedf80877433a2a74b074b8420b3906cbd6"
+          git diff --stat -- "${TEST_PATHS[@]}"
+          git diff --numstat -- "${TEST_PATHS[@]}"
 
           # The post-patch blob already pins every byte; these greps are a
           # readable cross-check that the 11 phase emissions and the original
@@ -217,6 +228,18 @@ jobs:
             fi
           done
           echo "phase_labels=9_sites_11_phases assertions_preserved=ok"
+          check_marker() {
+            local path="$1" marker="$2"
+            if ! grep -qF "$marker" "$path"; then
+              echo "::error::missing diagnostic marker $marker in $path"
+              exit 1
+            fi
+          }
+          check_marker "$INDEX_CACHE_PATH" "qrf_identity"
+          check_marker "$KNN_PATH" "qrf_lookup"
+          check_marker "$KNN_PATH" "peek_resident_with_key"
+          check_marker "$TEST_PATH" "refinement_cache_residency"
+          echo "identity_probes=base_identity,entry_key,resident_before residency_units=bytes,entries"
 
       - name: Record toolchain
         run: |
