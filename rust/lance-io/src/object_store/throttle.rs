@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::Arc;
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
+use std::sync::{LazyLock, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,6 +51,7 @@ use tracing::{debug, warn};
 
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 use crate::object_store::ObjectStoreParams;
 
 /// Match ObjectStore's documented delete concurrency to bound in-flight operations
@@ -578,6 +581,7 @@ impl AimdThrottleState {
         })
     }
 
+    #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
     fn downgrade(&self) -> WeakThrottleState {
         WeakThrottleState {
             read: Arc::downgrade(&self.read),
@@ -590,6 +594,7 @@ impl AimdThrottleState {
 
 /// A cache entry of [`SHARED_THROTTLE_STATES`]: alive exactly as long as some
 /// store still holds the budgets, since a store keeps all four.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 struct WeakThrottleState {
     read: Weak<OperationThrottle>,
     write: Weak<OperationThrottle>,
@@ -597,6 +602,7 @@ struct WeakThrottleState {
     list: Weak<OperationThrottle>,
 }
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 impl WeakThrottleState {
     fn upgrade(&self) -> Option<AimdThrottleState> {
         Some(AimdThrottleState {
@@ -612,6 +618,7 @@ impl WeakThrottleState {
 /// registry caches stores under. The AIMD contract is one budget per bucket, so
 /// stores that are split further, one per dataset in the `dataset` metrics label
 /// mode, must share the bucket's budget rather than each getting a full one.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 static SHARED_THROTTLE_STATES: LazyLock<
     std::sync::Mutex<HashMap<(String, ObjectStoreParams), WeakThrottleState>>,
 > = LazyLock::new(Default::default);
@@ -619,6 +626,7 @@ static SHARED_THROTTLE_STATES: LazyLock<
 /// The throttle state for a store of `store_prefix` built with `params`: the one
 /// its sibling stores already use, or a fresh one. `None` when throttling is
 /// disabled by the params.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) fn shared_throttle_state(
     store_prefix: &str,
     params: &ObjectStoreParams,

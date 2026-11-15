@@ -66,7 +66,17 @@ pub(crate) mod opendal_store;
 pub mod providers;
 pub(crate) mod read_dir;
 pub mod storage_options;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "aws",
+        feature = "azure",
+        feature = "gcp",
+        feature = "oss",
+        feature = "huggingface",
+        feature = "tos",
+    )
+))]
 pub(crate) mod test_utils;
 pub mod throttle;
 mod tracing;

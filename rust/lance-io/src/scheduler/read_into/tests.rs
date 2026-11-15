@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use crate::scheduler::tests::wait_until;
+use crate::{object_reader::CloudObjectReader, scheduler::tests::wait_until};
 use lance_core::{
     cache::{Context, DeepSizeOf},
     utils::allocation::AllocationBudget,
@@ -313,24 +313,36 @@ async fn scheduled_local_read_preserves_allocation_and_survives_handle_drop(#[ca
 }
 
 #[rstest]
-#[case::standard(false)]
-#[case::lite(true)]
+#[case::small_reader(false, "Invalid range 6..10 for object 'body' of size 8 bytes")]
+#[case::cloud_stream(true, "body for body range 6..10 has 2 bytes, expected 4 bytes")]
 #[tokio::test]
-async fn scheduled_cloud_stream_validates_short_reads(#[case] lite: bool) {
+async fn scheduled_reader_rejects_incomplete_ranges(
+    #[values(false, true)] lite: bool,
+    #[case] cloud_stream: bool,
+    #[case] expected_message: &str,
+) {
     let store = Arc::new(ObjectStore::memory());
     let path = Path::from("body");
     store.put(&path, b"abcdefgh").await.unwrap();
     let scheduler = ScanScheduler::new(
-        store,
+        store.clone(),
         SchedulerConfig {
             io_buffer_size_bytes: 8,
             use_lite_scheduler: Some(lite),
         },
     );
-    let file = scheduler
-        .open_file(&path, &CachedFileSize::unknown())
-        .await
-        .unwrap();
+    // open_file chooses SmallReader for this tiny object. Use the actual cloud
+    // reader explicitly to cover streamed-body validation as well as that path.
+    let file = if cloud_stream {
+        scheduler.open_reader(Arc::new(
+            CloudObjectReader::new(store.inner.clone(), path.clone(), 4096, Some(8), 0).unwrap(),
+        ))
+    } else {
+        scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+    };
     let budget = AllocationBudget::new(4);
     let output = file
         .submit_single_into(1..5, 0, budget.try_reserve(4).unwrap().allocate().unwrap())
@@ -343,7 +355,7 @@ async fn scheduled_cloud_stream_validates_short_reads(#[case] lite: bool) {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::IO { .. }));
-    assert!(error.to_string().contains("expected 4"));
+    assert!(error.to_string().contains(expected_message), "{error}");
     assert_eq!(budget.reserved(), 0);
     assert_eq!(scheduler.reserved_bytes(), 0);
 }

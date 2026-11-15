@@ -21,14 +21,16 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Scheduled owned reads and ordinary queue regressions
+      - name: Scheduled reader fixtures and feature boundaries
         run: |
-          cargo test --profile ci --locked -p lance-io --lib scheduler:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib scheduler::read_into:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --lib shared_throttle_state -- --nocapture
           cargo test --profile ci --locked -p lance-io --lib reserved_read:: -- --nocapture
           cargo test --profile ci --locked -p lance-io --doc submit_single_into -- --nocapture
       - name: Optional feature independence
         run: |
           cargo test --profile ci --locked -p lance-io --no-default-features --lib scheduler:: -- --nocapture
+          cargo test --profile ci --locked -p lance-io --no-default-features --lib shared_throttle_state -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
