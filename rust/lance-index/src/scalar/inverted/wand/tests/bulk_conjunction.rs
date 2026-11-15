@@ -187,7 +187,7 @@ fn test_bulk_and_matches_classic(
         rows
     };
 
-    let run = |mode| {
+    let run_with = |mode, portable_merge_kernels| {
         let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let mut wand = Wand::new(
             Operator::And,
@@ -197,12 +197,18 @@ fn test_bulk_and_matches_classic(
         )
         .with_bulk_and_mode(mode)
         .with_shared_threshold(shared_floor.clone());
+        if portable_merge_kernels {
+            wand = wand.with_portable_merge_kernels();
+        }
         let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
         let used_bulk = wand.bulk_and_searches > 0;
         ((rows, shared_floor.load(Ordering::Relaxed)), used_bulk)
     };
 
+    let run = |mode| run_with(mode, false);
+
     let (bulk, bulk_used) = run(BulkAndMode::On);
+    let (bulk_portable, _) = run_with(BulkAndMode::On, true);
     let (classic, classic_used) = run(BulkAndMode::Off);
     let (auto, auto_used) = run(BulkAndMode::Auto);
     assert!(bulk_used, "on should use bulk conjunction search");
@@ -210,6 +216,7 @@ fn test_bulk_and_matches_classic(
     assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
     assert!(!bulk.0.is_empty(), "test corpus should produce matches");
     assert_eq!(bulk, classic);
+    assert_eq!(bulk_portable, classic, "portable merge kernels");
     assert_eq!(auto, classic);
 }
 
