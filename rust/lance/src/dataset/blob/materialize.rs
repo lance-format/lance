@@ -811,7 +811,6 @@ async fn materialize_blob_v2_descriptors(
         let file = locator.locate(&blob, row_addr).await?;
         entries.push(BlobEntry {
             selection_index: idx,
-            row_address: row_addr,
             file,
             requested_range: None,
         });

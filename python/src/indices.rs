@@ -696,8 +696,7 @@ pub struct PyIndexSegmentDescription {
     /// The id of the dataset base path that stores this segment
     /// (None when the segment is stored in the dataset's default base path)
     pub base_id: Option<i64>,
-    /// The ids of the fields whose values this segment carries but is not keyed on.
-    /// Always the trailing entries of the segment's fields.
+    /// The ids of the fields whose values this segment carries.
     pub covering_fields: Vec<i32>,
 }
 

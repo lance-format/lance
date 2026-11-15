@@ -1939,7 +1939,7 @@ pub struct Transaction {
     /// a newer writer, and must treat it as unknown rather than fail.
     #[prost(
         oneof = "transaction::Operation",
-        tags = "100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115"
+        tags = "100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116"
     )]
     pub operation: ::core::option::Option<transaction::Operation>,
 }
@@ -2277,91 +2277,6 @@ pub mod transaction {
             "/lance.table.Transaction.Clone".into()
         }
     }
-    /// Exact set of key hashes for conflict detection.
-    /// Used when the number of inserted rows is small.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct ExactKeySetFilter {
-        /// 64-bit hashes of the inserted row keys.
-        #[prost(uint64, repeated, tag = "1")]
-        pub key_hashes: ::prost::alloc::vec::Vec<u64>,
-    }
-    impl ::prost::Name for ExactKeySetFilter {
-        const NAME: &'static str = "ExactKeySetFilter";
-        const PACKAGE: &'static str = "lance.table";
-        fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.ExactKeySetFilter".into()
-        }
-        fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.ExactKeySetFilter".into()
-        }
-    }
-    /// Bloom filter for key existence tests.
-    /// Used when the number of rows is large.
-    #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct BloomFilter {
-        /// Bitset backing the bloom filter (SBBF format).
-        #[prost(bytes = "vec", tag = "1")]
-        pub bitmap: ::prost::alloc::vec::Vec<u8>,
-        /// Number of bits in the bitmap.
-        #[prost(uint32, tag = "2")]
-        pub num_bits: u32,
-        /// Number of items the filter was sized for.
-        /// Used for intersection validation (filters with different sizes cannot be compared).
-        /// Default: 8192
-        #[prost(uint64, tag = "3")]
-        pub number_of_items: u64,
-        /// False positive probability the filter was sized for.
-        /// Used for intersection validation (filters with different parameters cannot be compared).
-        /// Default: 0.00057
-        #[prost(double, tag = "4")]
-        pub probability: f64,
-    }
-    impl ::prost::Name for BloomFilter {
-        const NAME: &'static str = "BloomFilter";
-        const PACKAGE: &'static str = "lance.table";
-        fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.BloomFilter".into()
-        }
-        fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.BloomFilter".into()
-        }
-    }
-    /// A filter for checking key existence in set of rows inserted by a merge insert operation.
-    /// Only created when the merge insert's ON columns match the schema's unenforced primary key.
-    /// The presence of this filter indicates strict primary key conflict detection should be used.
-    /// Can use either an exact set (for small row counts) or a Bloom filter (for large row counts).
-    #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct KeyExistenceFilter {
-        /// Field IDs of columns participating in the key (must match unenforced primary key).
-        #[prost(int32, repeated, tag = "1")]
-        pub field_ids: ::prost::alloc::vec::Vec<i32>,
-        /// The underlying data structure storing the key hashes.
-        #[prost(oneof = "key_existence_filter::Data", tags = "2, 3")]
-        pub data: ::core::option::Option<key_existence_filter::Data>,
-    }
-    /// Nested message and enum types in `KeyExistenceFilter`.
-    pub mod key_existence_filter {
-        /// The underlying data structure storing the key hashes.
-        #[derive(Clone, PartialEq, ::prost::Oneof)]
-        pub enum Data {
-            /// Exact set of key hashes (used for small number of rows).
-            #[prost(message, tag = "2")]
-            Exact(super::ExactKeySetFilter),
-            /// Bloom filter (used for large number of rows).
-            #[prost(message, tag = "3")]
-            Bloom(super::BloomFilter),
-        }
-    }
-    impl ::prost::Name for KeyExistenceFilter {
-        const NAME: &'static str = "KeyExistenceFilter";
-        const PACKAGE: &'static str = "lance.table";
-        fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.KeyExistenceFilter".into()
-        }
-        fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.KeyExistenceFilter".into()
-        }
-    }
     /// Serialized as sorted distinct local physical row offsets within the fragment (0-based).
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct UInt32List {
@@ -2407,7 +2322,7 @@ pub mod transaction {
         /// Filter for checking existence of keys in newly inserted rows, used for conflict detection.
         /// Only tracks keys from INSERT operations during merge insert, not updates.
         #[prost(message, optional, tag = "8")]
-        pub inserted_rows: ::core::option::Option<KeyExistenceFilter>,
+        pub inserted_rows: ::core::option::Option<crate::format::pb_actions::KeyExistenceFilter>,
         /// Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
         /// Deprecated: use updated_fragment_offset_bitmaps (field 10) instead.
         #[prost(map = "uint64, message", tag = "9")]
@@ -2433,57 +2348,19 @@ pub mod transaction {
             "/lance.table.Transaction.Update".into()
         }
     }
-    /// An entry for a map update. If value is not set, the key will be removed from the map.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct UpdateMapEntry {
-        /// The key of the map entry to update.
-        #[prost(string, tag = "1")]
-        pub key: ::prost::alloc::string::String,
-        /// The value to set for the key.
-        #[prost(string, optional, tag = "2")]
-        pub value: ::core::option::Option<::prost::alloc::string::String>,
-    }
-    impl ::prost::Name for UpdateMapEntry {
-        const NAME: &'static str = "UpdateMapEntry";
-        const PACKAGE: &'static str = "lance.table";
-        fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.UpdateMapEntry".into()
-        }
-        fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.UpdateMapEntry".into()
-        }
-    }
-    #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct UpdateMap {
-        #[prost(message, repeated, tag = "1")]
-        pub update_entries: ::prost::alloc::vec::Vec<UpdateMapEntry>,
-        /// If true, the map will be replaced entirely with the new entries.
-        /// If false, the new entries will be merged with the existing map.
-        #[prost(bool, tag = "2")]
-        pub replace: bool,
-    }
-    impl ::prost::Name for UpdateMap {
-        const NAME: &'static str = "UpdateMap";
-        const PACKAGE: &'static str = "lance.table";
-        fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.UpdateMap".into()
-        }
-        fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.UpdateMap".into()
-        }
-    }
     /// An operation that updates the table config, table metadata, schema metadata,
     /// or field metadata.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct UpdateConfig {
         #[prost(message, optional, tag = "6")]
-        pub config_updates: ::core::option::Option<UpdateMap>,
+        pub config_updates: ::core::option::Option<crate::format::pb_actions::UpdateMap>,
         #[prost(message, optional, tag = "7")]
-        pub table_metadata_updates: ::core::option::Option<UpdateMap>,
+        pub table_metadata_updates: ::core::option::Option<crate::format::pb_actions::UpdateMap>,
         #[prost(message, optional, tag = "8")]
-        pub schema_metadata_updates: ::core::option::Option<UpdateMap>,
+        pub schema_metadata_updates: ::core::option::Option<crate::format::pb_actions::UpdateMap>,
         #[prost(map = "int32, message", tag = "9")]
-        pub field_metadata_updates: ::std::collections::HashMap<i32, UpdateMap>,
+        pub field_metadata_updates:
+            ::std::collections::HashMap<i32, crate::format::pb_actions::UpdateMap>,
         /// Deprecated -------------------------------
         #[prost(map = "string, string", tag = "1")]
         pub upsert_values: ::std::collections::HashMap<
@@ -2729,6 +2606,14 @@ pub mod transaction {
         UpdateBases(UpdateBases),
         #[prost(message, tag = "115")]
         DataOverlay(DataOverlay),
+        /// Action-based transaction (Transaction V2). See actions.proto.
+        ///
+        /// Lance before v14.0.0 fails to decode this arm when it reads the
+        /// transaction history or checks a concurrent commit for conflicts. It
+        /// can still open and scan the table, since the inline transaction is in a
+        /// manifest field it ignores (#9482).
+        #[prost(message, tag = "116")]
+        CompositeOperation(crate::format::pb_actions::CompositeOperation),
     }
 }
 impl ::prost::Name for Transaction {
