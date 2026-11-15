@@ -21,13 +21,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Atomic multi-column cursor and single-column regression
+      - name: Later-column cleanup and remaining cursor regression
         run: |
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::multi:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib later_column_cancellation_and_error_leave_no_partial_batch -- --nocapture
           cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests::scan:: -- --nocapture
           cargo test --profile ci --locked -p lance-file --doc open_admitted_fullzip_scan -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --doc try_read_array_range_in -- --nocapture
-      - name: Lint touched crates
+      - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-encoding -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings

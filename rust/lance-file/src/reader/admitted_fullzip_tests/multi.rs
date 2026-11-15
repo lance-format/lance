@@ -261,6 +261,7 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, 7)
         .await
         .unwrap();
+    let peer;
     {
         let future = scan.try_next();
         tokio::pin!(future);
@@ -268,9 +269,20 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
             _ = entered.notified() => (),
             result = &mut future => panic!("gated later column completed: {result:?}"),
         }
+        // The first column's retired unzip allocation has already refunded
+        // shared credit. Its output and this pending read remain charged.
+        let active = budget.reserved();
+        assert!(active > 0 && active < 4096);
+        peer = budget.try_reserve(4096 - active).unwrap();
         assert_eq!(budget.reserved(), 4096);
     }
     assert_eq!(scan.position(), 0);
+    assert_eq!(
+        budget.reserved(),
+        peer.len(),
+        "cancellation must preserve unrelated credit"
+    );
+    drop(peer);
     assert_eq!(budget.reserved(), 0);
     mode.store(2, Ordering::Relaxed);
     second_reads.store(0, Ordering::Relaxed);
