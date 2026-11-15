@@ -291,6 +291,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         cache : str or bool, optional
             If set true, the dataset will be cached on disk from the first iteration.
             The following iterations will read from the cache.
+            An interrupted first iteration discards its partial cache; the next
+            iteration rebuilds it from the source. Interrupting a later iteration
+            preserves the completed cache.
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
@@ -402,6 +405,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
             ]
 
         stream: Iterable[pa.RecordBatch]
+        if (
+            self.cached_ds is not None
+            and not self.cached_ds.finished_origin_stream
+            and self.cached_ds.cache_dir is None
+        ):
+            # The first cache fill was cancelled and its partial files removed.
+            # Build a new scanner rather than reuse the interrupted source stream.
+            self.cached_ds = None
         if self.cached_ds:
             stream = self.cached_ds
         else:
