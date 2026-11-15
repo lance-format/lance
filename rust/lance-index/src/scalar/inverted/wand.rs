@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use itertools::Itertools;
 use lance_core::Result;
+use lance_core::utils::cpu::{Dispatch, Kernel};
 use smallvec::SmallVec;
 
 use crate::metrics::MetricsCollector;
@@ -322,6 +323,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
     #[cfg(test)]
+    portable_merge_kernels: bool,
+    #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
@@ -443,6 +446,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
             #[cfg(test)]
+            portable_merge_kernels: false,
+            #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
@@ -469,6 +474,29 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
         self
+    }
+
+    /// Test hook: run the bulk-AND merges with their portable kernels, which
+    /// an AVX2 host would otherwise never select.
+    #[cfg(test)]
+    fn with_portable_merge_kernels(mut self) -> Self {
+        self.portable_merge_kernels = true;
+        self
+    }
+
+    /// The bulk-AND merge kernel `dispatch` selects for this host, or its
+    /// portable kernel when a test asks for it.
+    #[inline(always)]
+    fn merge_kernel<F: Copy>(&self, dispatch: &'static Dispatch<F>) -> Kernel<F> {
+        #[cfg(test)]
+        if self.portable_merge_kernels {
+            return dispatch
+                .candidates()
+                .last()
+                .and_then(|portable| portable.kernel())
+                .expect("the last candidate needs no CPU features");
+        }
+        dispatch.get()
     }
 
     /// Test hook for old/new score-first parity in one process.
