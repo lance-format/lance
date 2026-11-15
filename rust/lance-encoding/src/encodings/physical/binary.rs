@@ -15,8 +15,9 @@ use byteorder::{ByteOrder, LittleEndian};
 use prost::Message;
 
 use crate::compression::{
-    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
-    create_fixed_width_block_decompressor, infer_fixed_width_block_bits, require_block_payload,
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, PerValueDecodeBudget,
+    VariablePerValueDecompressor, create_fixed_width_block_decompressor,
+    infer_fixed_width_block_bits, require_block_payload,
 };
 
 use crate::buffer::LanceBuffer;
@@ -32,6 +33,7 @@ use crate::format::metadata::CompressiveEncoding;
 use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 
+use lance_core::utils::allocation::Reservation;
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
 
@@ -1291,6 +1293,18 @@ impl PerValueCompressor for VariableEncoder {
 pub struct VariableDecoder {}
 
 impl VariablePerValueDecompressor for VariableDecoder {
+    fn plan_decode(&self, data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
+        crate::compression::variable::plan(data)
+    }
+
+    fn try_decompress_in(
+        &self,
+        data: &VariableWidthBlock,
+        workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        crate::compression::variable::decode(data, workspace)
+    }
+
     fn visit_binary_values(
         &self,
         data: &VariableWidthBlock,

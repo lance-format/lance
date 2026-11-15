@@ -21,9 +21,15 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      # Per-value FSST and FullZip test steps passed at 02946458c. The only
-      # source correction changes redundant item visibility inside crate-private
-      # modules. Keep the original run's test/API evidence; check both lint builds.
+      - name: Raw per-value output and FullZip composition
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib compression::variable::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fsst::per_value_admitted::tests -- --nocapture
+      - name: Optional feature independence
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib compression::variable::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::admitted::tests -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |

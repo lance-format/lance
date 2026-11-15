@@ -11,12 +11,21 @@ use rstest::rstest;
 
 use super::*;
 use crate::{
-    compression::{PerValueDecodeBudget, VariablePerValueDecompressor},
+    compression::{
+        DecompressionStrategy, DefaultDecompressionStrategy, PerValueDecodeBudget,
+        VariablePerValueDecompressor,
+    },
     data::DataBlock,
     decoder::DecodePageTask,
     encodings::{
-        logical::primitive::fullzip_decode::{FullZipDecodeDetails, PerValueDecompressor},
-        physical::fsst::test_utils::{charge_per_value, per_value_fixture},
+        logical::primitive::{
+            fullzip::{PerValueCompressor, PerValueDataBlock},
+            fullzip_decode::{FullZipDecodeDetails, PerValueDecompressor},
+        },
+        physical::{
+            binary::VariableEncoder,
+            fsst::test_utils::{charge_per_value, per_value_fixture},
+        },
     },
     repdef::{CompositeRepDefUnraveler, ControlWordParser, DefinitionInterpretation as Meaning},
 };
@@ -33,12 +42,34 @@ fn levels(values: &[u16], work: &mut Reservation) -> ScalarBuffer<u16> {
 }
 
 #[rstest]
-fn fullzip_fsst_admits_value_and_structural_overlap(
+#[case::fsst_passthrough("fsst_passthrough")]
+#[case::fsst_compressed("fsst_compressed")]
+#[case::raw("raw")]
+fn fullzip_admits_value_and_structural_overlap(
+    #[case] kind: &str,
     #[values(32, 64)] bits: u8,
-    #[values(false, true)] compressed: bool,
     #[values(false, true)] nested: bool,
 ) {
-    let (codec, input, values, _) = per_value_fixture(bits, compressed);
+    let (codec, input, values) = if kind == "raw" {
+        let values = vec![b"ab".to_vec(), vec![], b"cd".to_vec(), b"e".to_vec()];
+        let refs = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let block = if bits == 32 {
+            DataBlock::from_array(BinaryArray::from_vec(refs))
+        } else {
+            DataBlock::from_array(LargeBinaryArray::from_vec(refs))
+        };
+        let (encoded, description) = VariableEncoder::default().compress(block).unwrap();
+        let PerValueDataBlock::Variable(input) = encoded else {
+            panic!("expected raw variable values");
+        };
+        let codec = DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(&description)
+            .unwrap();
+        (codec, input, values)
+    } else {
+        let (codec, input, values, _) = per_value_fixture(bits, kind == "fsst_compressed");
+        (codec, input, values)
+    };
     let output_bytes = 5 * usize::from(bits / 8) + values.iter().map(Vec::len).sum::<usize>();
     let level_bytes = if nested { 24 } else { 0 };
     let needed = output_bytes + level_bytes;

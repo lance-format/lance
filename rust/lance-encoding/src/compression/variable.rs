@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Borrow already unzipped values without materializing aligned offsets.
+//! Borrow or admit already unzipped raw values without alignment scratch.
 
-use lance_core::{Error, Result};
+use arrow_buffer::Buffer;
+use lance_core::{Error, Result, utils::allocation::Reservation};
 
-use crate::data::VariableWidthBlock;
+use super::{MiniBlockOutputLayout, PerValueDecodeBudget};
+use crate::{
+    buffer::LanceBuffer,
+    data::{BlockInfo, DataBlock, VariableWidthBlock},
+};
 
 fn offset(bytes: &[u8], index: usize, width: usize) -> u64 {
     let mut word = [0_u8; 8];
@@ -13,10 +18,10 @@ fn offset(bytes: &[u8], index: usize, width: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
-pub fn visit(
-    data: &VariableWidthBlock,
-    visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
+// Return offset width, entry count and logical payload length only after the
+// entire table is validated. In particular, an invalid tail cannot be hidden
+// by an empty workspace or by a callback failing on an earlier value.
+fn validate(data: &VariableWidthBlock) -> Result<(usize, usize, usize)> {
     let width = match data.bits_per_offset {
         32 => 4,
         64 => 8,
@@ -51,6 +56,14 @@ pub fn visit(
         }
         previous = next;
     }
+    Ok((width, count, previous as usize))
+}
+
+pub fn visit(
+    data: &VariableWidthBlock,
+    visitor: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let (width, count, _) = validate(data)?;
     for i in 0..count - 1 {
         let start = offset(&data.offsets, i, width) as usize;
         let end = offset(&data.offsets, i + 1, width) as usize;
@@ -58,3 +71,53 @@ pub fn visit(
     }
     Ok(())
 }
+
+pub fn plan(data: &VariableWidthBlock) -> Result<PerValueDecodeBudget> {
+    let (_, _, payload_bytes) = validate(data)?;
+    let output_bytes = data
+        .offsets
+        .len()
+        .checked_add(payload_bytes)
+        .ok_or_else(|| Error::invalid_input("binary output allocation size overflows"))?;
+    MiniBlockOutputLayout::VariableWidth {
+        bits_per_offset: data.bits_per_offset,
+    }
+    .validate_range_bytes(data.num_values, output_bytes)?;
+    Ok(PerValueDecodeBudget {
+        output_bytes,
+        workspace_bytes: output_bytes,
+    })
+}
+
+pub fn decode(data: &VariableWidthBlock, workspace: &mut Reservation) -> Result<Option<DataBlock>> {
+    let budget = plan(data)?;
+    if budget.workspace_bytes > workspace.len() {
+        return Ok(None);
+    }
+    let mut offsets = workspace
+        .try_allocate(data.offsets.len())?
+        .ok_or_else(|| Error::internal("binary offsets exceeded complete admission"))?;
+    let payload_bytes = budget.output_bytes - data.offsets.len();
+    let mut values = match workspace.try_allocate(payload_bytes) {
+        Ok(Some(values)) => values,
+        other => {
+            offsets.recycle(workspace)?;
+            return other.map(|_| None);
+        }
+    };
+    // The caller keeps the complete input owner charged during these copies.
+    // Owning exact output allocations detaches partial results from coalesced
+    // input backing and trailing unused bytes; no alignment copy is needed.
+    offsets.as_mut().copy_from_slice(&data.offsets);
+    values.as_mut().copy_from_slice(&data.data[..payload_bytes]);
+    Ok(Some(DataBlock::VariableWidth(VariableWidthBlock {
+        data: LanceBuffer::from(Buffer::from(values.freeze())),
+        offsets: LanceBuffer::from(Buffer::from(offsets.freeze())),
+        bits_per_offset: data.bits_per_offset,
+        num_values: data.num_values,
+        block_info: BlockInfo::new(),
+    })))
+}
+
+#[cfg(test)]
+mod tests;
