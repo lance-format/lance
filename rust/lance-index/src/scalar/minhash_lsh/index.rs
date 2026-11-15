@@ -190,6 +190,10 @@ pub struct MinHashLshIndex {
     pub(super) window_pages: usize,
     cache: WeakLanceCache,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Whether this segment's stored row identifiers are physical row
+    /// addresses (format version [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] or
+    /// later) or row ids (an older segment, still supported for reading).
+    results_are_row_addresses: bool,
 }
 
 impl std::fmt::Debug for MinHashLshIndex {
@@ -221,15 +225,24 @@ fn metadata_value<'a>(
 }
 
 /// Checks that `reader` is `file` of a segment built from `params`: the exact
-/// schema, the details repeated in the metadata and the layout version.
+/// schema, the details repeated in the metadata and a supported layout
+/// version. Returns the parsed version.
+///
+/// `expected_schema` takes whether the reader's own schema already has a
+/// `_rowaddr` field (vs `_rowid`) -- the signatures file's row-identifier
+/// field name depends on the segment's format version, but inspecting the
+/// schema directly sidesteps needing the version (from metadata, checked
+/// only after the schema itself) to pick which schema to check against.
 fn check_index_file(
     reader: &dyn IndexReader,
     file: &str,
-    expected: &Schema,
+    expected_schema: impl Fn(bool) -> SchemaRef,
     params: &MinHashLshIndexParams,
-) -> Result<()> {
+) -> Result<u32> {
     let corrupt = |message: String| Error::corrupt_file_named(file, message);
-    let expected = lance_core::datatypes::Schema::try_from(expected)?;
+    let row_addr_domain = reader.schema().field(ROW_ADDR).is_some();
+    let expected =
+        lance_core::datatypes::Schema::try_from(expected_schema(row_addr_domain).as_ref())?;
     reader
         .schema()
         .check_compatible(&expected, &SchemaCompareOptions::default())
@@ -250,7 +263,7 @@ fn check_index_file(
             "index file details {file_params:?} do not match index details {params:?}"
         )));
     }
-    Ok(())
+    Ok(index_version)
 }
 
 impl MinHashLshIndex {
@@ -266,13 +279,27 @@ impl MinHashLshIndex {
             store.open_index_file(SIGNATURES_FILENAME)
         )?;
 
-        check_index_file(bands.as_ref(), BANDS_FILENAME, &BANDS_SCHEMA, &params)?;
-        check_index_file(
-            signatures.as_ref(),
-            SIGNATURES_FILENAME,
-            &signatures_schema(params.num_hashes as i32),
+        let bands_version = check_index_file(
+            bands.as_ref(),
+            BANDS_FILENAME,
+            |_| BANDS_SCHEMA.clone(),
             &params,
         )?;
+        let signatures_version = check_index_file(
+            signatures.as_ref(),
+            SIGNATURES_FILENAME,
+            |row_addr_domain| signatures_schema(params.num_hashes as i32, row_addr_domain),
+            &params,
+        )?;
+        if bands_version != signatures_version {
+            return Err(Error::corrupt_file_named(
+                SIGNATURES_FILENAME,
+                format!(
+                    "format version {signatures_version} does not match {BANDS_FILENAME}'s version {bands_version}"
+                ),
+            ));
+        }
+        let results_are_row_addresses = signatures_version >= MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION;
 
         let metadata = &bands.schema().metadata;
         let corrupt = |message: String| Error::corrupt_file_named(BANDS_FILENAME, message);
@@ -334,6 +361,7 @@ impl MinHashLshIndex {
             window_pages: (rows_per_batch(BAND_ROW_BYTES) / page_rows).max(1),
             cache: WeakLanceCache::from(cache),
             frag_reuse_index,
+            results_are_row_addresses,
         }))
     }
 
@@ -383,6 +411,7 @@ impl MinHashLshIndex {
         )
         .map(move |batch| {
             let batch = batch?;
+            let id_col = signature_id_col(&batch)?;
             let (stored_ids, _) = signature_columns(&batch, num_hashes)?;
             let mut row_ids = Vec::with_capacity(batch.num_rows());
             let selected = BooleanArray::from_iter(stored_ids.values().iter().map(|&stored| {
@@ -398,7 +427,7 @@ impl MinHashLshIndex {
             }));
             let filtered = filter_record_batch(&batch, &selected)?;
             let mut columns = filtered.columns().to_vec();
-            columns[filtered.schema().index_of(ROW_ID)?] = Arc::new(UInt64Array::from(row_ids));
+            columns[filtered.schema().index_of(id_col)?] = Arc::new(UInt64Array::from(row_ids));
             Ok(RecordBatch::try_new(filtered.schema(), columns)?)
         })
         .boxed()
@@ -416,6 +445,13 @@ impl MinHashLshIndex {
     fn created_index(&self, files: Vec<IndexFile>) -> Result<CreatedIndex> {
         Ok(CreatedIndex {
             index_details: self.params.details_any()?,
+            // `rebuild_from` (the sole writer behind remap/update/merge)
+            // always stamps the file itself with MINHASH_LSH_INDEX_VERSION,
+            // regardless of this segment's own domain -- unlike NGram/RTree,
+            // there is no legacy physical layout it can reproduce. Report
+            // that same version here instead of `self.results_are_row_addresses`'s
+            // (possibly stale, pre-rebuild) domain, so the manifest entry
+            // never disagrees with the file a loader actually reads.
             index_version: MINHASH_LSH_INDEX_VERSION,
             files,
         })
@@ -450,11 +486,45 @@ impl MinHashLshIndex {
 
     /// Like [`Self::search_text`] for a signature computed by
     /// [`Self::query_signature`] on any segment with the same parameters.
+    ///
+    /// The index stores physical row addresses, so `mask` selects addresses
+    /// and the hits report them.
     pub async fn search_signature(
         &self,
         query: &QuerySignature,
         limit: usize,
         mask: &RowAddrMask,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<MinHashHit>> {
+        self.search_signature_impl(query, limit, mask, None, metrics)
+            .await
+    }
+
+    /// Like [`Self::search_signature`] for a caller whose `mask` and results
+    /// are in the row-id domain (a dataset with stable row ids).
+    ///
+    /// `row_addr_to_row_id` translates each candidate's stored row address,
+    /// before `mask` is applied, into the row id it is filtered and reported
+    /// by; a candidate it translates to `None` (e.g. a deleted row) is
+    /// skipped, so it never displaces a live row from the top `limit`.
+    pub async fn search_signature_as_row_ids(
+        &self,
+        query: &QuerySignature,
+        limit: usize,
+        mask: &RowAddrMask,
+        row_addr_to_row_id: &RowAddrToRowId,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<MinHashHit>> {
+        self.search_signature_impl(query, limit, mask, Some(row_addr_to_row_id), metrics)
+            .await
+    }
+
+    async fn search_signature_impl(
+        &self,
+        query: &QuerySignature,
+        limit: usize,
+        mask: &RowAddrMask,
+        row_addr_to_row_id: Option<&RowAddrToRowId>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         if query.signature.len() != self.params.num_hashes as usize {
@@ -471,8 +541,15 @@ impl MinHashLshIndex {
         if buckets.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.refine(&mut buckets, &query.signature, limit, mask, metrics)
-            .await
+        self.refine(
+            &mut buckets,
+            &query.signature,
+            limit,
+            mask,
+            row_addr_to_row_id,
+            metrics,
+        )
+        .await
     }
 
     /// Locate the bucket of every band key and position a cursor at its
@@ -792,6 +869,7 @@ impl MinHashLshIndex {
         query: &[SignatureValue],
         limit: usize,
         mask: &RowAddrMask,
+        row_addr_to_row_id: Option<&RowAddrToRowId>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         let num_hashes = query.len();
@@ -802,6 +880,7 @@ impl MinHashLshIndex {
             query,
             mask,
             remapper: self.frag_reuse_index.as_deref(),
+            row_addr_to_row_id,
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
         let missing = scorer.hits.missing();
@@ -1377,16 +1456,24 @@ struct Scorer<'a> {
     query: &'a [SignatureValue],
     mask: &'a RowAddrMask,
     remapper: Option<&'a dyn RowIdRemapper>,
+    row_addr_to_row_id: Option<&'a RowAddrToRowId>,
 }
 
 impl Scorer<'_> {
-    fn score(&mut self, row_id: u64, signature: &[SignatureValue]) {
-        let row_id = match self.remapper {
-            Some(remapper) => match remapper.remap_row_id(row_id) {
+    fn score(&mut self, row_addr: u64, signature: &[SignatureValue]) {
+        let row_addr = match self.remapper {
+            Some(remapper) => match remapper.remap_row_id(row_addr) {
+                Some(row_addr) => row_addr,
+                None => return,
+            },
+            None => row_addr,
+        };
+        let row_id = match self.row_addr_to_row_id {
+            Some(row_addr_to_row_id) => match row_addr_to_row_id(row_addr) {
                 Some(row_id) => row_id,
                 None => return,
             },
-            None => row_id,
+            None => row_addr,
         };
         if !self.mask.selected(row_id) {
             return;
@@ -1419,6 +1506,28 @@ fn doc_id_ranges(doc_ids: impl Iterator<Item = u32>) -> Vec<Range<usize>> {
 
 /// Extract the row id column and the flattened signature values of a batch
 /// read from `signatures.lance`.
+/// The row-identifier column of a `signatures.lance` batch: `_rowaddr` from
+/// format version 1 onward, `_rowid` for a segment persisted before it.
+/// Determined from the batch itself (each segment carries exactly one of the
+/// two), not from the caller, so every reader of a resident or cached batch
+/// uses the name that batch actually has.
+fn signature_id_col(batch: &RecordBatch) -> Result<&'static str> {
+    let corrupt = |message: String| Error::corrupt_file_named(SIGNATURES_FILENAME, message);
+    match (
+        batch.column_by_name(ROW_ADDR).is_some(),
+        batch.column_by_name(ROW_ID).is_some(),
+    ) {
+        (true, false) => Ok(ROW_ADDR),
+        (false, true) => Ok(ROW_ID),
+        (true, true) => Err(corrupt(format!(
+            "both {ROW_ADDR} and {ROW_ID} columns present"
+        ))),
+        (false, false) => Err(corrupt(format!(
+            "missing UInt64 column {ROW_ADDR} or {ROW_ID}"
+        ))),
+    }
+}
+
 pub(super) fn signature_columns(
     batch: &RecordBatch,
     num_hashes: usize,
@@ -1429,11 +1538,12 @@ pub(super) fn signature_columns(
             "num_hashes {num_hashes} is outside 1..={MAX_NUM_HASHES}"
         )));
     }
+    let id_col = signature_id_col(batch)?;
     let row_ids = batch
-        .column_by_name(ROW_ID)
+        .column_by_name(id_col)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
         .filter(|row_ids| row_ids.null_count() == 0)
-        .ok_or_else(|| corrupt(format!("{ROW_ID} is not a non-null UInt64 column")))?;
+        .ok_or_else(|| corrupt(format!("{id_col} is not a non-null UInt64 column")))?;
     let signatures = batch
         .column_by_name(SIGNATURE_COL)
         .and_then(|column| column.as_fixed_size_list_opt())
@@ -1644,8 +1754,12 @@ impl ScalarIndex for MinHashLshIndex {
         self.created_index(files)
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.results_are_row_addresses
+    }
+
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1656,6 +1770,14 @@ impl ScalarIndex for MinHashLshIndex {
 /// Merge segments into one new segment in `dest_store`, keeping only the rows
 /// each segment's filter selects. Every segment must have been built with the
 /// same parameters.
+///
+/// Like [`ScalarIndex::update`] and [`ScalarIndex::remap`], this always writes
+/// the current (row-address-domain) format and copies each source's stored
+/// identifiers as-is. A source persisted before
+/// [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] stores row ids, which equal row
+/// addresses only on a dataset without stable row ids; on a dataset with
+/// stable row ids the caller must rebuild such a segment instead of passing it
+/// here, or its matches are silently lost.
 pub async fn merge_minhash_indices(
     sources: &[(&MinHashLshIndex, Option<&OldIndexDataFilter>)],
     dest_store: &dyn IndexStore,
@@ -1705,7 +1827,7 @@ mod cache_tests {
 
     fn signature_batch(row_ids: Vec<u64>, signatures: Vec<u16>, num_hashes: i32) -> RecordBatch {
         RecordBatch::try_new(
-            signatures_schema(num_hashes),
+            signatures_schema(num_hashes, true),
             vec![
                 Arc::new(UInt64Array::from(row_ids)),
                 Arc::new(FixedSizeListArray::new(
@@ -1870,7 +1992,7 @@ mod cache_tests {
     #[case::too_wide(MAX_NUM_HASHES as i32 + 1)]
     fn signature_chunk_cache_rejects_invalid_width(#[case] num_hashes: i32) {
         assert_invalid_batch::<SignatureChunk>(
-            RecordBatch::new_empty(signatures_schema(num_hashes)),
+            RecordBatch::new_empty(signatures_schema(num_hashes, true)),
             "num_hashes",
         );
     }
@@ -2156,7 +2278,7 @@ mod selection_tests {
         let details = builder.params().details_any().unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),

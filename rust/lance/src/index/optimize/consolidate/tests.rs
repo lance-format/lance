@@ -4,13 +4,19 @@
 use super::*;
 use crate::dataset::WriteParams;
 use crate::index::{CreateIndexBuilder, vector::VectorIndexParams};
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
 };
 use arrow_schema::{DataType, Field, Schema};
+use chrono::DateTime;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+use lance_index::vector::quantizer::Quantization;
 use lance_index::{IndexType, vector::ivf::IvfBuildParams};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;
@@ -63,6 +69,20 @@ async fn append(dataset: &mut Dataset, start: usize, rows: usize) {
 }
 
 async fn fixture(uri: &str, stable: bool) -> Dataset {
+    let params = VectorIndexParams::with_ivf_pq_params(
+        MetricType::Cosine,
+        IvfBuildParams::new(2),
+        PQBuildParams {
+            num_bits: 4,
+            num_sub_vectors: 2,
+            ..Default::default()
+        },
+    );
+    fixture_with(uri, stable, &params).await
+}
+
+/// Three segments, one per fragment, each trained on its own fragment.
+async fn fixture_with(uri: &str, stable: bool, params: &VectorIndexParams) -> Dataset {
     let first = batch(0, BASE);
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(first.clone())], first.schema()),
@@ -76,19 +96,10 @@ async fn fixture(uri: &str, stable: bool) -> Dataset {
     .unwrap();
     append(&mut dataset, BASE, SMALL).await;
     append(&mut dataset, BASE + SMALL, SMALL).await;
-    let params = VectorIndexParams::with_ivf_pq_params(
-        MetricType::Cosine,
-        IvfBuildParams::new(2),
-        PQBuildParams {
-            num_bits: 4,
-            num_sub_vectors: 2,
-            ..Default::default()
-        },
-    );
     let mut segments = Vec::new();
     for fragment in 0..3 {
         segments.push(
-            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, params)
                 .name(NAME.to_string())
                 .fragments(vec![fragment])
                 .execute_uncommitted()
@@ -418,6 +429,99 @@ async fn concurrent_delete_and_append_reuses_staged_output(#[case] stable: bool)
 }
 
 #[tokio::test]
+async fn commit_with_mixed_precision() {
+    const ROWS: usize = 64;
+    // Share manifest bytes across independent sessions and avoid the
+    // platform-dependent ETags of local file commits.
+    const URI: &str = "shared-memory://consolidation-timestamp-precision/";
+    let first = batch(0, ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(first.clone())], first.schema()),
+        URI,
+        None,
+    )
+    .await
+    .unwrap();
+    append(&mut dataset, ROWS, ROWS).await;
+
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    let created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+    let mut sources = Vec::new();
+    for fragment in 0..2 {
+        let mut segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name(NAME.to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        segment.created_at = Some(created_at);
+        sources.push(segment);
+    }
+    // Commit the supplied timestamp so the cache retains a known sub-millisecond value.
+    let transaction = TransactionBuilder::new(
+        dataset.version_id(),
+        Operation::CreateIndex {
+            new_indices: sources,
+            removed_indices: vec![],
+        },
+    )
+    .build();
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let options = OptimizeOptions::consolidate(2 * ROWS as u64);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    let results = execute(&dataset, &plan).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].replaces.len(), 2);
+    let output = results[0].segment.uuid;
+
+    let mut concurrent = Dataset::open(URI).await.unwrap();
+    append(&mut concurrent, 2 * ROWS, ROWS).await;
+    dataset.checkout_latest().await.unwrap();
+    let planned = dataset.checkout_version(plan.read_version).await.unwrap();
+    let cached_segments = segments(&planned).await;
+    let persisted_segments = segments(&dataset).await;
+    assert_eq!(cached_segments.len(), 2);
+    assert_eq!(persisted_segments.len(), 2);
+    let persisted_created_at = DateTime::from_timestamp_millis(created_at.timestamp_millis());
+    for cached in &cached_segments {
+        let persisted = persisted_segments
+            .iter()
+            .find(|segment| segment.uuid == cached.uuid)
+            .expect("append preserves the source segment");
+        assert_eq!(cached.created_at, Some(created_at));
+        assert_eq!(persisted.created_at, persisted_created_at);
+        let mut expected = cached.clone();
+        expected.created_at = persisted_created_at;
+        assert_eq!(&expected, persisted);
+    }
+
+    commit_optimize_indices(&mut dataset, results, &options)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version_id(), concurrent.version_id() + 1);
+    let committed = segments(&dataset).await;
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].uuid, output);
+    assert_eq!(
+        committed[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+
+    let query = first["vector"].as_fixed_size_list().value(0);
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query.as_ref(), 1)
+        .unwrap()
+        .fast_search();
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
+}
+
+#[tokio::test]
 async fn concurrent_source_replacement_requires_replanning() {
     let dir = TempStrDir::default();
     let mut dataset = fixture(&dir, false).await;
@@ -577,4 +681,301 @@ async fn additional_deletions_reuse_staged_output(#[case] stable: bool) {
     );
     assert_eq!(files(&dir, uuid), staged_files);
     assert_query(&dataset, BASE + 2 * SMALL - 2).await;
+}
+
+async fn indexed_rows(dataset: &Dataset, segment: &IndexMetadata) -> u64 {
+    dataset
+        .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap()
+        .num_rows()
+}
+
+fn select(segments: &[&IndexMetadata]) -> OptimizeOptions {
+    OptimizeOptions::consolidate_selected(
+        NAME,
+        segments.iter().map(|segment| segment.uuid).collect(),
+    )
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn selected_segments_with_different_models_are_retrained(#[case] stable: bool) {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, stable).await;
+    let old = segments(&dataset).await;
+    let newest_files = files(&dir, old[2].uuid);
+    dataset
+        .delete(&format!("id < {} OR id = {BASE}", BASE / 2))
+        .await
+        .unwrap();
+    let live = (BASE / 2 + SMALL - 1) as u64;
+    // The old segments still hold entries for the deleted rows.
+    assert_eq!(
+        indexed_rows(&dataset, &old[0]).await + indexed_rows(&dataset, &old[1]).await,
+        (BASE + SMALL) as u64
+    );
+
+    let mut models = Vec::new();
+    for segment in &old {
+        models.push(model(&dataset, segment).await);
+    }
+    let options = select(&[&old[0], &old[1]]);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    assert_eq!(plan.merges[0].replaces, vec![old[0].uuid, old[1].uuid]);
+    // One model trained for the selection, outside the manifest.
+    let trained = plan.tasks[0].reference.uuid;
+    assert!(plan.tasks.iter().all(|task| task.reference.uuid == trained));
+    assert!(old.iter().all(|segment| segment.uuid != trained));
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    assert_eq!(new[0], old[2]);
+    assert_eq!(files(&dir, old[2].uuid), newest_files);
+    assert_eq!(indexed_rows(&dataset, &new[1]).await, live);
+    let retrained = model(&dataset, &new[1]).await;
+    assert!(models.iter().all(|source| *source != retrained));
+    // Sized from the selected rows, not copied from a source's two partitions.
+    let index = dataset
+        .open_vector_index("vector", &new[1].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(index.ivf_model().num_partitions(), 1);
+    assert_query(&dataset, live as usize + SMALL).await;
+}
+
+#[tokio::test]
+async fn a_retrained_rq_selection_keeps_the_shared_rotation() {
+    let dir = TempStrDir::default();
+    let shared = RabitQuantizer::new_with_rotation::<arrow_array::types::Float32Type>(
+        RQBuildParams::default().num_bits,
+        DIM as i32,
+        RQRotationType::default(),
+    )
+    .metadata(None);
+    let params = VectorIndexParams::with_ivf_rq_params(
+        MetricType::Cosine,
+        IvfBuildParams::new(2),
+        RQBuildParams {
+            rotation: Some(shared.clone()),
+            ..Default::default()
+        },
+    );
+    let mut dataset = fixture_with(&dir, false, &params).await;
+    let rotation = async |dataset: &Dataset, segment: &IndexMetadata| {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let quantizer: RabitQuantizer = index.quantizer().try_into().unwrap();
+        let metadata = quantizer.metadata_ref();
+        (
+            metadata.fast_rotation_signs.clone(),
+            metadata.rotate_mat.as_ref().map(|matrix| matrix.to_data()),
+            index.ivf_model().centroids_array().unwrap().to_data(),
+        )
+    };
+    let expected = (
+        shared.fast_rotation_signs.clone(),
+        shared.rotate_mat.as_ref().map(|matrix| matrix.to_data()),
+    );
+    let old = segments(&dataset).await;
+    let source = rotation(&dataset, &old[1]).await;
+    assert_eq!((source.0.clone(), source.1.clone()), expected);
+
+    dataset
+        .optimize_indices(&select(&[&old[1], &old[2]]))
+        .await
+        .unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    let output = rotation(&dataset, &new[1]).await;
+    // Retrained centroids, under the rotation every segment shares.
+    assert_ne!(output.2, source.2);
+    assert_eq!((output.0, output.1), expected);
+    assert_query(&dataset, BASE + 2 * SMALL).await;
+}
+
+#[tokio::test]
+async fn a_shared_model_selection_keeps_its_model() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    // An append is encoded under the newest model, so it shares old[2]'s.
+    append(&mut dataset, BASE + 2 * SMALL, SMALL).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let appended = segments(&dataset).await[3].clone();
+    let shared = model(&dataset, &old[2]).await;
+    assert_eq!(model(&dataset, &appended).await, shared);
+
+    let options = select(&[&old[2], &appended]);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.reference.uuid == appended.uuid)
+    );
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 3);
+    assert_eq!(model(&dataset, &new[2]).await, shared);
+    assert_query(&dataset, BASE + 3 * SMALL).await;
+}
+
+#[tokio::test]
+async fn a_selection_packs_its_output_and_splits_a_segment() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    dataset
+        .optimize_indices(&select(&[&old[1], &old[2]]))
+        .await
+        .unwrap();
+    let merged = segments(&dataset).await[1].clone();
+    assert_eq!(indexed_rows(&dataset, &merged).await, 2 * SMALL as u64);
+    let merged_model = model(&dataset, &merged).await;
+
+    // One segment shares its own model, so splitting it keeps that model.
+    let options = select(&[&merged]).max_rows_per_segment(Some(SMALL as u64));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 2);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 3);
+    assert_eq!(new[0], old[0]);
+    for output in &new[1..] {
+        assert_eq!(indexed_rows(&dataset, output).await, SMALL as u64);
+        assert_eq!(model(&dataset, output).await, merged_model);
+    }
+    assert_query(&dataset, BASE + 2 * SMALL).await;
+}
+
+#[tokio::test]
+async fn deleted_rows_do_not_count_toward_the_segment_limit() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let half = SMALL / 2;
+    dataset
+        .delete(&format!(
+            "(id >= {BASE} AND id < {}) OR (id >= {} AND id < {})",
+            BASE + half,
+            BASE + SMALL,
+            BASE + SMALL + half
+        ))
+        .await
+        .unwrap();
+    // Two fragments of SMALL physical rows hold SMALL live rows: one output.
+    let options = select(&[&old[1], &old[2]]).max_rows_per_segment(Some(SMALL as u64));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    assert_eq!(indexed_rows(&dataset, &new[1]).await, SMALL as u64);
+    assert_query(&dataset, BASE + SMALL).await;
+}
+
+#[tokio::test]
+async fn a_fragment_larger_than_the_limits_is_an_output_of_its_own() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let limit = Some(SMALL as u64 / 2);
+    let options = select(&[&old[1], &old[2]])
+        .max_rows_per_task(limit)
+        .max_rows_per_segment(limit);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 2);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 3);
+    for output in &new[1..] {
+        assert_eq!(indexed_rows(&dataset, output).await, SMALL as u64);
+    }
+    assert_query(&dataset, BASE + 2 * SMALL).await;
+}
+
+#[tokio::test]
+async fn a_selected_segment_already_removed_is_skipped() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    // Deleting all of a segment's rows removes the segment.
+    dataset
+        .delete(&format!("id >= {BASE} AND id < {}", BASE + SMALL))
+        .await
+        .unwrap();
+    let plan = plan_optimize_indices(&dataset, &select(&[&old[1], &old[2]]))
+        .await
+        .unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    assert_eq!(plan.merges[0].replaces, vec![old[2].uuid]);
+
+    let plan = plan_optimize_indices(&dataset, &select(&[&old[1]]))
+        .await
+        .unwrap();
+    assert!(plan.tasks.is_empty() && plan.merges.is_empty());
+}
+
+#[tokio::test]
+async fn a_selection_commits_over_concurrent_deletes_and_appends() {
+    let dir = TempStrDir::default();
+    let dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let options = select(&[&old[0], &old[1]]);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    let results = execute(&dataset, &plan).await;
+    let output = results[0].segment.uuid;
+
+    let mut concurrent = dataset.clone();
+    concurrent.delete("id < 16").await.unwrap();
+    append(&mut concurrent, BASE + 2 * SMALL, 64).await;
+    concurrent
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let appended = segments(&dataset).await.last().unwrap().clone();
+    commit_optimize_indices(&mut dataset, results, &options)
+        .await
+        .unwrap();
+
+    let committed = segments(&dataset).await;
+    assert_eq!(committed.len(), 3);
+    assert!(committed.contains(&old[2]) && committed.contains(&appended));
+    assert!(committed.iter().any(|segment| segment.uuid == output
+        && segment.fragment_bitmap == Some(RoaringBitmap::from_iter([0, 1]))));
+    assert_query(&dataset, BASE + 2 * SMALL - 16 + 64).await;
+}
+
+#[tokio::test]
+async fn invalid_selections_are_rejected() {
+    let dir = TempStrDir::default();
+    let dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let mut unnamed = select(&[&old[0]]);
+    unnamed.index_names = None;
+    let mut budgeted = select(&[&old[0]]);
+    budgeted.max_rows_to_consolidate = Some(4 * BASE as u64);
+    for invalid in [
+        unnamed,
+        select(&[&old[0], &old[0]]),
+        select(&[]),
+        select(&[&old[0]]).index_names(vec![NAME.to_string(), "other".to_string()]),
+        budgeted,
+        select(&[&old[0]]).num_indices_to_merge(Some(1)),
+        select(&[&old[0]]).max_rows_per_segment(Some(0)),
+        OptimizeOptions::consolidate(BASE as u64).max_rows_per_segment(Some(SMALL as u64)),
+    ] {
+        let error = plan_optimize_indices(&dataset, &invalid).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
 }
