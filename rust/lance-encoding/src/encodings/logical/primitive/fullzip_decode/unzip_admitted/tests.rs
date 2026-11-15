@@ -67,6 +67,11 @@ struct Fixture {
 
 fn fixture(bits: u8, fsst: bool, kind: &str) -> Fixture {
     let values = vec![vec![b'a'; 16384], vec![], vec![b'b'; 16384], vec![]];
+    fixture_with_values(bits, fsst, kind, values)
+}
+
+fn fixture_with_values(bits: u8, fsst: bool, kind: &str, values: Vec<Vec<u8>>) -> Fixture {
+    assert_eq!(values.len(), 4);
     let (rep, def, meanings, value_starts, level_starts) = match kind {
         "flat" => (
             None,

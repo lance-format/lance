@@ -119,12 +119,75 @@ async fn prefixes_complete_all_rows_under_one_fixed_budget(
     } else if !tight {
         assert_eq!(batches, 1);
     }
-    if fsst && tight && start == 0 {
-        let (input, stage, decoded) = sizes(&f, 0..4);
-        // This exercises refusal after read/unzip, when expansion exceeds credit.
-        assert!(input + stage <= limit);
-        assert!(stage + decoded > limit);
+}
+
+#[rstest]
+#[tokio::test]
+async fn compressed_prefix_retries_after_codec_output_refusal(
+    #[values(32, 64)] bits: u8,
+    #[values("flat", "nullable", "list", "deep")] kind: &str,
+) {
+    // FSST samples complete strings. Both long values must share a vocabulary
+    // so sampling either one compresses the other instead of escaping most bytes.
+    // Keep the original skewed fixture above: it validates a different boundary.
+    let first = b"abcdefgh".repeat(2048);
+    let mut second = first.clone();
+    *second.last_mut().unwrap() = b'Z';
+    let mut f = fixture_with_values(bits, true, kind, vec![first, vec![], second, vec![]]);
+    let source = source(&mut f);
+    let limit = (0..4).map(|row| envelope(&f, row..row + 1)).max().unwrap();
+    let (input, stage, decoded) = sizes(&f, 0..4);
+    assert!(input + stage <= limit);
+    assert!(stage + decoded > limit);
+    let budget = AllocationBudget::new(limit);
+    let mut work = budget.try_reserve(limit).unwrap();
+    let task = f
+        .scheduler
+        .try_read_unzip_range_in(
+            0..4,
+            &mut work,
+            reader(source.clone(), Arc::default(), Fault::None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.len(), limit - stage);
+    for _ in 0..2 {
+        assert!(task.try_decode_in(&mut work).unwrap().is_none());
+        assert_eq!(work.len(), limit - stage);
+        assert_eq!(budget.reserved(), limit);
     }
+    drop((task, work));
+    assert_eq!(budget.reserved(), 0);
+
+    let mut cursor = 0;
+    let mut batches = 0;
+    while cursor < 4 {
+        let reads = Arc::new(Reads::default());
+        let result = f
+            .scheduler
+            .try_read_decode_prefix_in(
+                cursor..4,
+                &budget,
+                limit,
+                reader(source.clone(), reads.clone(), Fault::None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.rows.start, cursor);
+        assert!(result.rows.end > cursor && result.rows.end <= 4);
+        assert!(reads.0.lock().unwrap().len() <= 9);
+        if cursor == 0 {
+            assert!(result.rows.end < 4);
+            assert!(reads.0.lock().unwrap().len() > 3);
+        }
+        cursor = result.rows.end;
+        validate(&f, result, &budget);
+        batches += 1;
+    }
+    assert_eq!(cursor, 4);
+    assert!(batches > 1);
 }
 
 #[rstest]
