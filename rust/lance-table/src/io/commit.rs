@@ -809,8 +809,13 @@ pub fn list_detached_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
+    let versions_dir = base_path.clone().join(VERSIONS_DIR);
+    // Detached names sort after every attached manifest and temporary file, so
+    // stores that support a start offset skip those on the server.
+    let offset = versions_dir.clone().join(DETACHED_VERSION_PREFIX);
     object_store
-        .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
+        .list_with_offset(Some(&versions_dir), &offset)
+        .map_err(Error::from)
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -2506,9 +2511,16 @@ mod tests {
         let base = Path::from("base");
         let versions_dir = base.clone().join(VERSIONS_DIR);
 
-        // Create some regular manifests
+        // Create some regular manifests, under both naming schemes, and the other
+        // files that live next to them.
         for version in [1, 2, 3] {
-            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            for scheme in [ManifestNamingScheme::V1, ManifestNamingScheme::V2] {
+                let path = scheme.manifest_path(&base, version);
+                object_store.put(&path, b"".as_slice()).await.unwrap();
+            }
+        }
+        for name in [".tmp_1.manifest_abc", VERSION_HINT_FILE] {
+            let path = versions_dir.clone().join(name);
             object_store.put(&path, b"".as_slice()).await.unwrap();
         }
 

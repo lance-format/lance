@@ -147,9 +147,12 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
 
 /// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
 ///
-/// Address-domain index results are always positive allow-lists (`AtMost`), so
-/// a block-list here would mean a boolean op was applied before translation,
-/// which is unsupported.
+/// Address-domain index results are almost always positive allow-lists
+/// (`AtMost`); a non-empty block-list here would mean a boolean op was
+/// applied before translation, which is unsupported. The one exception is an
+/// empty block-list (`AtLeast(empty)`, e.g. NGram's "cannot tell, scan
+/// everything" result for an untokenizable query): blocking nothing is the
+/// same set of rows in either domain, so it needs no translation.
 async fn translate_addr_mask_to_row_ids(
     dataset: &Dataset,
     mask: NullableRowAddrMask,
@@ -158,6 +161,9 @@ async fn translate_addr_mask_to_row_ids(
         NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
             translate_addr_set_to_row_ids(dataset, set).await?,
         )),
+        NullableRowAddrMask::BlockList(set) if set.is_empty() => {
+            Ok(NullableRowAddrMask::BlockList(set))
+        }
         NullableRowAddrMask::BlockList(_) => Err(Error::internal(
             "cannot translate a block-list address mask to the row-id domain",
         )),
@@ -232,13 +238,33 @@ impl ScalarIndexExec {
     /// Address-domain results are restricted before translation to stable row ids. Native
     /// row-id results can still cover other fragments, so the consumer remains responsible
     /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// Codecs can inspect this setting with [`Self::fragment_scope`].
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) {
+    /// let exec = exec.with_fragment_scope([1].into_iter().collect());
+    /// assert!(exec.fragment_scope().unwrap().contains(1));
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    /// Codecs can inspect this setting with [`Self::segment_uuids`].
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use uuid::Uuid;
+    /// # fn selected(exec: ScalarIndexExec, uuid: Uuid) {
+    /// let exec = exec.with_segment_uuids(Arc::new(HashSet::from([uuid])));
+    /// assert!(exec.segment_uuids().unwrap().contains(&uuid));
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
     }
@@ -256,6 +282,20 @@ impl ScalarIndexExec {
     /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
+    }
+
+    /// Fragment scope used for index loading and address-to-row-ID translation.
+    /// `None` searches every selected segment. Native row-ID results are not bounded by this scope.
+    /// See [`Self::with_fragment_scope`] for an example.
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
+    /// Explicit scalar segment selection to preserve across a codec round trip.
+    /// `None` searches all committed segments whose coverage intersects the scope.
+    /// See [`Self::with_segment_uuids`] for an example.
+    pub fn segment_uuids(&self) -> Option<&Arc<HashSet<uuid::Uuid>>> {
+        self.segment_uuids.as_ref()
     }
 
     #[async_recursion]
@@ -958,13 +998,20 @@ impl ExecutionPlan for MapIndexExec {
         // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
+        let mut metrics = IndexMetrics::new(&self.metrics, partition);
+        if let Some(scope) = context
+            .session_config()
+            .get_extension::<crate::dataset::write::merge_insert::analysis::AnalysisScope>(
+        ) {
+            metrics = metrics.with_segment_tracking(scope.segments.clone());
+        }
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
             partition,
             self.dataset.clone(),
             self.lookups.clone(),
-            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            Arc::new(metrics),
             self.metrics.clone(),
             candidate_reservation,
         );
@@ -977,6 +1024,10 @@ impl ExecutionPlan for MapIndexExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -1200,8 +1251,11 @@ async fn row_ids_for_mask(
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                capacity -= block_list.len().expect("unknown block list len") as usize;
+                let capacity: usize = sequences.iter().map(|seq| seq.len() as usize).sum();
+                // The block list comes from the whole index, so it can name more
+                // rows than `fragments` holds when the scan covers a subset.
+                let capacity = capacity
+                    .saturating_sub(block_list.len().expect("unknown block list len") as usize);
                 let mut row_ids = Vec::with_capacity(capacity);
                 for sequence in sequences {
                     row_ids.extend(
@@ -1639,6 +1693,52 @@ mod tests {
             .unwrap();
         assert!(scoped.is_exact());
         assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
+    }
+
+    /// An empty block-list (e.g. NGram's "cannot tell, scan everything" result
+    /// for an untokenizable query -- see `test_basic_ngram_index`'s "too short"
+    /// cases) blocks the same set of rows in either domain, so it passes
+    /// through unchanged; any other block-list is unsupported and must error.
+    #[tokio::test]
+    async fn test_translate_addr_mask_to_row_ids_block_list() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..4).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::empty());
+        let translated = super::translate_addr_mask_to_row_ids(&dataset, empty)
+            .await
+            .unwrap();
+        assert!(matches!(
+            translated,
+            NullableRowAddrMask::BlockList(set) if set.is_empty()
+        ));
+
+        let mut selected = RowAddrTreeMap::new();
+        selected.insert(RowAddress::new_from_parts(0, 0).into());
+        let non_empty = NullableRowAddrMask::BlockList(NullableRowAddrSet::new(
+            selected,
+            RowAddrTreeMap::new(),
+        ));
+        let err = super::translate_addr_mask_to_row_ids(&dataset, non_empty)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot translate a block-list address mask"),
+            "{err}"
+        );
     }
 
     #[rstest]

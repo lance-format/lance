@@ -70,7 +70,7 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexExt, IndexParams, loading::DatasetIndexInternalExt};
+use super::{IndexParams, loading::DatasetIndexInternalExt};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset};
@@ -1280,8 +1280,9 @@ pub(crate) async fn build_vector_index(
     .await
 }
 
-/// Train a vector index's IVF model and quantizer from the whole table and
-/// write a segment that carries that model and no rows.
+/// Train a vector index's IVF model and quantizer from the whole table, or
+/// from `fragment_ids` alone, and write a segment that carries that model and
+/// no rows.
 ///
 /// A distributed rebuild hands this segment to every build task as the model
 /// to encode against; the segment itself is never committed.
@@ -1293,6 +1294,7 @@ pub(crate) async fn build_vector_model_segment(
     uuid: Uuid,
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+    fragment_ids: Option<&[u32]>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
@@ -1303,7 +1305,7 @@ pub(crate) async fn build_vector_model_segment(
         params,
         frag_reuse_index,
         progress,
-        None,
+        fragment_ids,
         true,
     )
     .await
@@ -2171,14 +2173,19 @@ pub(crate) async fn open_cache_reader(
     }
 }
 
-#[instrument(level = "debug", skip(dataset, reader))]
+#[instrument(
+    level = "debug",
+    skip(dataset, index_meta, reader),
+    fields(uuid = %index_meta.uuid)
+)]
 pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
-    uuid: &Uuid,
+    index_meta: &IndexMetadata,
     reader: V1FileReader,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
+    let uuid = &index_meta.uuid;
     let index_metadata = reader
         .schema()
         .metadata
@@ -2188,13 +2195,10 @@ pub(crate) async fn open_vector_index_v2(
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
     let frag_reuse_uuid = crate::index::loading::frag_reuse_cache_scope(&dataset).await;
-    // Load the index metadata to get the correct index directory
-    let index_meta = dataset
-        .load_index(uuid)
-        .await?
-        .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-    let index_dir = dataset.indice_files_dir(&index_meta)?;
-    let object_store = dataset.object_store_for_index(&index_meta).await?;
+    // From the caller's metadata, not the listing: a segment a commit is
+    // about to publish is not listed yet.
+    let index_dir = dataset.indice_files_dir(index_meta)?;
+    let object_store = dataset.object_store_for_index(index_meta).await?;
     let file_sizes = index_meta.file_size_map();
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {

@@ -348,6 +348,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(dataset::blob::read_blob_files))?;
+    m.add_wrapped(wrap_pyfunction!(dataset::blob::read_blob_file_ranges))?;
     m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
@@ -365,6 +367,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(otel::register_lance_metrics_recorder))?;
     m.add_wrapped(wrap_pyfunction!(otel::lance_metrics_catalog))?;
     m.add_wrapped(wrap_pyfunction!(otel::snapshot_lance_metrics))?;
+    m.add_wrapped(wrap_pyfunction!(otel::set_memory_observation))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;

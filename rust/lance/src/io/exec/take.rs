@@ -466,7 +466,7 @@ impl TakeStream {
                 let batch = batch?;
                 let this = self.clone();
                 Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                    lance_core::utils::tokio::spawn(this.map_batch(batch, batch_index as u32))
                         .map(|res| res.unwrap()),
                 )
             })
