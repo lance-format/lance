@@ -34,7 +34,9 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
+mod selection;
 pub mod writer;
+pub(crate) use selection::OverlayReadSelection;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -840,26 +842,24 @@ fn apply_struct_validities(
 /// Open the overlay readers a specific read needs and return the per-field plans to
 /// merge, pruned to that read.
 ///
-/// `offsets_in_frag` are the rows the read will return. An overlay whose coverage is
+/// `selection` describes the read without expanding range rows. An overlay whose coverage is
 /// disjoint from those rows contributes nothing, so it is dropped and its file is
 /// never opened — a `take` that misses an overlay's cells pays no IO for it. Each
 /// surviving file is opened once, concurrently, projected to the covered fields; the
 /// value bytes are still not read here (the per-batch [`merge_overlay_batch`] fetches
 /// only the values it needs).
-pub async fn resolve_overlays(
+pub(crate) async fn resolve_overlays(
     planner: &OverlayReadPlanner,
-    offsets_in_frag: &[u32],
+    selection: &OverlayReadSelection,
     fragment: &FileFragment,
     read_config: &FragReadConfig,
 ) -> Result<Vec<LoadedAtomicField>> {
-    let read_offsets = read_offsets_bitmap(offsets_in_frag);
-
     // A file is opened only if some atomic field it covers has cells among the requested rows.
     // This is the row-selection pruning: overlays outside the read are skipped.
     let mut file_needed = vec![false; planner.files.len()];
     for atomic_field in &planner.atomic_fields {
         for overlay in &atomic_field.overlays_newest_first {
-            if !overlay.coverage.is_disjoint(&read_offsets) {
+            if selection.intersects(&overlay.coverage) {
                 file_needed[overlay.file] = true;
             }
         }
@@ -914,21 +914,6 @@ pub async fn resolve_overlays(
         }
     }
     Ok(plans)
-}
-
-/// The set of `offset_in_frag` a read will return, as a bitmap for cheap
-/// intersection against overlay coverages. Contiguous scans build a single range;
-/// arbitrary `take` offsets (small batches) are inserted individually.
-fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
-    let mut bitmap = RoaringBitmap::new();
-    match contiguous_frag_start(offsets_in_frag) {
-        Some(start) => {
-            let end = (start as u64 + offsets_in_frag.len() as u64).min(u32::MAX as u64) as u32;
-            bitmap.insert_range(start..end);
-        }
-        None => bitmap.extend(offsets_in_frag.iter().copied()),
-    }
-    bitmap
 }
 
 /// Resolve overlays for one base batch: route each relevant atomic field against the
