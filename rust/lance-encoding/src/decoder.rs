@@ -1661,11 +1661,11 @@ pub struct ReadBatchTask {
 
 /// The top-level column context attached to decode errors.
 #[derive(Debug, Clone)]
-pub struct ColumnContext {
+pub(crate) struct ColumnContext {
     /// The name of the top-level column.
-    pub name: String,
+    pub(crate) name: String,
     /// The Lance field id of the top-level column.
-    pub id: i32,
+    pub(crate) id: i32,
 }
 
 /// An error wrapper that adds column context to decoding errors.
@@ -1675,7 +1675,7 @@ pub struct ColumnContext {
 /// and keeps the underlying message visible:
 ///
 /// ```text
-/// failed to decode column 'age' (id 7): number out of range
+/// failed to decode column 'age' (id 7): LanceError(Arrow): malformed page layout
 /// ```
 ///
 /// The underlying error is also exposed through [`std::error::Error::source`].
@@ -1687,17 +1687,6 @@ pub struct DecodeColumnError {
     pub field_id: i32,
     /// The underlying decode error.
     pub source: Error,
-}
-
-impl DecodeColumnError {
-    /// Create a wrapper for a decode failure on `field`.
-    pub fn new(field: &Field, source: Error) -> Self {
-        Self {
-            field_name: field.name.clone(),
-            field_id: field.id,
-            source,
-        }
-    }
 }
 
 impl std::fmt::Display for DecodeColumnError {
@@ -1759,8 +1748,9 @@ fn has_column_context(err: &Error) -> bool {
 /// Attach column context to a decode error.
 ///
 /// `CorruptFile` keeps its variant and gets the column context on its inner
-/// source, because callers match on that variant and Python maps it to
-/// `ValueError`. User-input errors are left untouched for the same reason.
+/// source, because callers match on that variant to identify corruption.
+/// Invalid-input and not-supported errors are left untouched so callers keep
+/// seeing those categories.
 pub(crate) fn with_column_context(field_name: &str, field_id: i32, source: Error) -> Error {
     if has_column_context(&source) {
         return source;
@@ -4339,14 +4329,13 @@ mod tests {
         }
     }
 
-    struct CorruptFileDecodeTask;
+    struct FailingDecodeTask {
+        source: Error,
+    }
 
-    impl DecodeArrayTask for CorruptFileDecodeTask {
+    impl DecodeArrayTask for FailingDecodeTask {
         fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
-            Err(Error::corrupt_file_named(
-                "some_file",
-                "malformed sparse page",
-            ))
+            Err(self.source)
         }
     }
 
@@ -4354,6 +4343,39 @@ mod tests {
     fn with_column_context_leaves_invalid_input_untouched() {
         let err = with_column_context("age", 7, Error::invalid_input("bad value"));
         assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn with_column_context_leaves_not_supported_untouched() {
+        let err = with_column_context("age", 7, Error::not_supported("unsupported page"));
+        assert!(matches!(err, Error::NotSupported { .. }));
+    }
+
+    #[test]
+    fn with_column_context_preserves_first_leaf_context() {
+        let inner = with_column_context("zip", 9, Error::internal("bad page"));
+        let outer = with_column_context("address", 2, inner);
+
+        assert!(
+            outer
+                .to_string()
+                .contains("failed to decode column 'zip' (id 9)"),
+            "unexpected error: {outer}"
+        );
+        assert!(
+            !outer
+                .to_string()
+                .contains("failed to decode column 'address' (id 2)"),
+            "outer context must not replace the first leaf: {outer}"
+        );
+        let context = std::error::Error::source(&outer)
+            .expect("wrapped error should expose the first-leaf context");
+        assert!(
+            std::error::Error::source(context)
+                .expect("first-leaf context should expose the decode error")
+                .to_string()
+                .contains("bad page")
+        );
     }
 
     #[test]
@@ -4387,12 +4409,12 @@ mod tests {
         let err = DecodeColumnError {
             field_name: "age".to_string(),
             field_id: 7,
-            source: Error::invalid_input("number out of range"),
+            source: Error::arrow("malformed page layout"),
         };
         let display = err.to_string();
         assert!(
             display.starts_with(
-                "failed to decode column 'age' (id 7): Invalid user input: number out of range"
+                "failed to decode column 'age' (id 7): LanceError(Arrow): malformed page layout"
             ),
             "unexpected display: {display}"
         );
@@ -4410,7 +4432,7 @@ mod tests {
             std::error::Error::source(wrapper)
                 .expect("column context should expose the decode error")
                 .to_string()
-                .contains("number out of range")
+                .contains("malformed page layout")
         );
     }
 
@@ -4418,6 +4440,7 @@ mod tests {
     struct FailingDecodePageDecoder {
         data_type: DataType,
         num_rows: u64,
+        source: Option<Error>,
     }
 
     impl LogicalPageDecoder for FailingDecodePageDecoder {
@@ -4438,8 +4461,12 @@ mod tests {
         }
 
         fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+            let source = self
+                .source
+                .take()
+                .expect("failing decode page should only be drained once");
             Ok(NextDecodeTask {
-                task: Box::new(CorruptFileDecodeTask),
+                task: Box::new(FailingDecodeTask { source }),
                 num_rows,
             })
         }
@@ -4449,13 +4476,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn decode_task_error_is_wrapped_with_column_context() {
-        let fields = Fields::from(vec![ArrowField::new("age", DataType::Int32, false)]);
-        let root = SimpleStructDecoder::new(fields, 1).with_column_contexts(vec![ColumnContext {
-            name: "age".to_string(),
-            id: 7,
-        }]);
+    async fn decode_task_error(root: SimpleStructDecoder, source: Error) -> Error {
         let (tx, rx) = unbounded_channel();
         tx.send(Ok(DecoderMessage {
             scheduled_so_far: 1,
@@ -4463,6 +4484,7 @@ mod tests {
                 decoder: Box::new(FailingDecodePageDecoder {
                     data_type: DataType::Int32,
                     num_rows: 1,
+                    source: Some(source),
                 }),
                 path: VecDeque::from([0]),
             })],
@@ -4471,33 +4493,79 @@ mod tests {
         drop(tx);
 
         let mut stream = BatchDecodeStream::new(rx, 1, 1, root).into_stream();
-        let err = stream
+        stream
             .next()
             .await
             .expect("stream should emit a decode task")
             .task
             .await
-            .expect_err("decode task should fail");
+            .expect_err("decode task should fail")
+    }
+
+    fn age_column_root() -> SimpleStructDecoder {
+        SimpleStructDecoder::new(
+            Fields::from(vec![ArrowField::new("age", DataType::Int32, false)]),
+            1,
+        )
+        .with_column_contexts(vec![ColumnContext {
+            name: "age".to_string(),
+            id: 7,
+        }])
+    }
+
+    #[tokio::test]
+    async fn decode_task_corrupt_file_error_preserves_variant_and_column_context() {
+        let err = decode_task_error(
+            age_column_root(),
+            Error::corrupt_file_named("miniblock", "malformed sparse page"),
+        )
+        .await;
 
         assert!(
             matches!(err, Error::CorruptFile { .. }),
             "corrupt-file variant must be preserved, got: {err}"
         );
+        assert!(
+            err.to_string().contains(
+                "Encountered corrupt file miniblock: failed to decode column 'age' (id 7): \
+                 malformed sparse page"
+            ),
+            "unexpected error: {err}"
+        );
         let context = std::error::Error::source(&err)
             .expect("corrupt-file error should expose the column context");
         let inner = std::error::Error::source(context)
             .expect("column context should expose the decode error");
-        // Evidence for the PR: a genuine decode failure before and after the context wrapper.
-        println!("decode error before context: {inner}");
-        println!("decode error with context: {context}");
-        assert!(
-            context
-                .to_string()
-                .starts_with("failed to decode column 'age' (id 7): malformed sparse page"),
-            "unexpected context: {context}"
-        );
         assert!(
             inner.to_string().contains("malformed sparse page"),
+            "unexpected source: {inner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_task_internal_error_is_wrapped_with_column_context() {
+        let err =
+            decode_task_error(age_column_root(), Error::internal("unexpected page layout")).await;
+
+        assert!(
+            matches!(err, Error::Wrapped { .. }),
+            "internal decode failures must be wrapped, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("failed to decode column 'age' (id 7)"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("unexpected page layout"),
+            "underlying cause must stay visible: {err}"
+        );
+        let context = std::error::Error::source(&err)
+            .expect("wrapped error should expose the column context");
+        let inner = std::error::Error::source(context)
+            .expect("column context should expose the decode error");
+        assert!(
+            inner.to_string().contains("unexpected page layout"),
             "unexpected source: {inner}"
         );
     }

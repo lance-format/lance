@@ -267,7 +267,7 @@ impl StructuralStructDecoder {
     }
 
     /// Attach top-level column context so decode errors name the failing column.
-    pub fn with_column_contexts(mut self, contexts: Vec<ColumnContext>) -> Self {
+    pub(crate) fn with_column_contexts(mut self, contexts: Vec<ColumnContext>) -> Self {
         self.column_contexts = Some(contexts.into());
         self
     }
