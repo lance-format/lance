@@ -1206,8 +1206,8 @@ mod tests {
         let batch = RecordBatch::try_from_iter([("id", array)]).unwrap();
         let on_columns = vec!["id".to_string()];
         assert_eq!(
-            extract_key_value_from_batch(&batch, 0, &on_columns),
-            extract_key_value_from_batch(&batch, 1, &on_columns)
+            extract_key_value_from_batch(&batch, 0, &on_columns).unwrap(),
+            extract_key_value_from_batch(&batch, 1, &on_columns).unwrap()
         );
     }
 
