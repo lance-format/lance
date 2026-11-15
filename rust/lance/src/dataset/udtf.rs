@@ -283,11 +283,13 @@ mod tests {
     use arrow::compute::concat_batches;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
+    use arrow_array::record_batch;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
     use arrow_array::{
         Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
+    use datafusion::common::DataFusionError;
     use datafusion::prelude::SessionContext;
     use lance_index::IndexType;
     use lance_index::scalar::InvertedIndexParams;
@@ -477,14 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_query_udtf_rejects_score_column() {
-        let batch = RecordBatch::try_from_iter([
-            (
-                "text",
-                Arc::new(StringArray::from(vec!["a cat"])) as ArrayRef,
-            ),
-            ("_score", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
-        ])
-        .unwrap();
+        let batch = record_batch!(("text", Utf8, ["a cat"]), ("_score", Int32, [1])).unwrap();
         let schema = batch.schema();
         let data = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
@@ -502,6 +497,7 @@ mod tests {
             .sql(r#"SELECT * FROM fts('t', '{"match": {"column": "text", "terms": "cat"}}')"#)
             .await
             .unwrap_err();
+        assert!(matches!(err, DataFusionError::Plan(_)), "{err}");
         assert!(
             err.to_string()
                 .contains("conflicts with the dataset column"),
