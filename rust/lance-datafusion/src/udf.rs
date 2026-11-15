@@ -17,8 +17,12 @@ use std::sync::Arc;
 
 pub use lance_datafusion_exec::udf::{CONTAINS_TOKENS_UDF, json};
 
+mod element;
 #[cfg(feature = "geo")]
 mod geo;
+
+pub(crate) use element::rewrite_element_lambdas;
+pub use element::{ANY_ELEMENT, any_element_predicate, plan_element_predicate};
 
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
@@ -34,6 +38,8 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_get_bool_udf());
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
+    // Predicates on the elements of a list<struct> column
+    ctx.register_udf(element::any_element_udf());
     // GEO functions
     #[cfg(feature = "geo")]
     {

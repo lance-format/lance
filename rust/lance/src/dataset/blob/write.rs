@@ -814,6 +814,19 @@ impl BlobPreprocessor {
             return Ok((mapped.base_id, mapped.relative_path));
         }
 
+        if self
+            .external_base_resolver
+            .as_ref()
+            .is_some_and(|resolver| {
+                resolver.unregistered_external_blob_policy
+                    == crate::session::UnregisteredExternalBlobPolicy::Deny
+            })
+        {
+            return Err(Error::invalid_input(
+                "Remote tables only support external blobs under registered storage bases",
+            ));
+        }
+
         if self.allow_external_blob_outside_bases {
             let normalized = normalize_external_absolute_uri(uri)?;
             return Ok((0, normalized));
