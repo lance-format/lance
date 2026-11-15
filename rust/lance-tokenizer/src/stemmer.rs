@@ -145,6 +145,11 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<'_, T> {
             return false;
         }
         let token = self.tail.token_mut();
+        // English Snowball returns before its prelude for fewer than three
+        // characters. Fewer than three UTF-8 bytes is a conservative subset.
+        if token.text.len() < 3 && self.stemmer.algorithm() == Algorithm::English {
+            return true;
+        }
         // Snowball handles very short tokens cheaply; hashing and copying
         // them into the dictionary can cost more than stemming them directly.
         if self.cache.is_none() || !(3..=MAX_CACHED_TOKEN_BYTES).contains(&token.text.len()) {
@@ -201,6 +206,32 @@ mod tests {
     use crate::{
         Language, RawTokenizer, SimpleTokenizer, Stemmer, TextAnalyzer, Token, TokenStream,
     };
+
+    #[test]
+    fn test_short_english_tokens_are_unchanged() {
+        let reference = frostem::Stemmer::new(Language::English.algorithm());
+        let mut analyzer = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(Stemmer::default())
+            .build();
+        // Exhaust all valid UTF-8 strings shorter than three bytes, including
+        // punctuation, upper case, control characters and multibyte letters.
+        let texts = std::iter::once(String::new())
+            .chain((0..=0x7f).map(|value| char::from(value).to_string()))
+            .chain((0..=0x7f).flat_map(|first| {
+                (0..=0x7f).map(move |second| format!("{}{}", char::from(first), char::from(second)))
+            }))
+            .chain(
+                (0x80..=0x7ff)
+                    .filter_map(char::from_u32)
+                    .map(|ch| ch.to_string()),
+            );
+        for text in texts {
+            assert_eq!(reference.stem(&text), text);
+            let mut stream = analyzer.token_stream(&text);
+            assert_eq!(stream.next().unwrap().text, text);
+            assert!(!stream.advance());
+        }
+    }
 
     #[test]
     fn test_repeated_stems_keep_each_occurrence_position() {
