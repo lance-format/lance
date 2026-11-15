@@ -43,7 +43,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -56,6 +56,204 @@ use lance_core::{Error, Result};
 
 use crate::object_writer::WriteResult;
 use crate::traits::{ByteStream, Reader, Writer};
+
+#[cfg(feature = "metrics")]
+struct AggregateUsage {
+    charged_bytes: u64,
+    live_files: u64,
+}
+
+// Keep accounting even without a recorder. Serialize changes with publication
+// so an older snapshot cannot overwrite a newer gauge value.
+#[cfg(feature = "metrics")]
+static AGGREGATE_USAGE: Mutex<AggregateUsage> = Mutex::new(AggregateUsage {
+    charged_bytes: 0,
+    live_files: 0,
+});
+
+#[cfg(feature = "metrics")]
+impl AggregateUsage {
+    fn publish(&self) {
+        metrics::gauge!("lance_spill_charged_bytes").set(self.charged_bytes as f64);
+        metrics::gauge!("lance_spill_live_files").set(self.live_files as f64);
+    }
+}
+
+/// Describe scratch metrics to the installed recorder, including their units.
+///
+/// Exporters should call this after installing their recorder. Series have no
+/// operation or dataset labels; per-operation details belong in [`SpillUsage`].
+/// Also publishes current aggregate storage usage, including spills that predate
+/// recorder installation.
+#[cfg(feature = "metrics")]
+pub fn describe_metrics() {
+    metrics::describe_histogram!(
+        "lance_spill_io_duration_seconds",
+        metrics::Unit::Seconds,
+        "Scratch local I/O duration, excluding blocking-pool queue wait."
+    );
+    for (name, description) in [
+        (
+            "lance_spill_accepted_bytes_total",
+            "Scratch bytes accepted, including buffered writes.",
+        ),
+        (
+            "lance_spill_write_bytes_total",
+            "Scratch bytes successfully written by local I/O.",
+        ),
+        (
+            "lance_spill_read_bytes_total",
+            "Scratch bytes read, including repeated consumption.",
+        ),
+    ] {
+        metrics::describe_counter!(name, metrics::Unit::Bytes, description);
+    }
+    for (name, description) in [
+        (
+            "lance_spill_files_created_total",
+            "Scratch paths allocated.",
+        ),
+        (
+            "lance_spill_quota_failures_total",
+            "Scratch write quota rejections.",
+        ),
+        (
+            "lance_spill_cleanup_failures_total",
+            "Scratch cleanup failures, including retries.",
+        ),
+    ] {
+        metrics::describe_counter!(name, metrics::Unit::Count, description);
+    }
+    metrics::describe_gauge!(
+        "lance_spill_charged_bytes",
+        metrics::Unit::Bytes,
+        "Accepted scratch bytes retained until successful deletion."
+    );
+    metrics::describe_gauge!(
+        "lance_spill_live_files",
+        metrics::Unit::Count,
+        "Scratch paths not yet reclaimed."
+    );
+    AGGREGATE_USAGE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .publish();
+}
+
+/// Cumulative scratch traffic and retained storage for one store or explicit scope.
+///
+/// A snapshot is observational, not atomic across fields. Accepted bytes include
+/// buffered writes; transferred bytes count successful local I/O. Repeated reads
+/// count again. These exclude DataFusion operator and replay spills.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpillUsage {
+    /// Bytes accepted by the writer, including writes later aborted or failed.
+    pub accepted_bytes: u64,
+    /// Bytes successfully written by local I/O tasks.
+    pub bytes_written: u64,
+    /// Bytes returned by successful local reads, including repeated reads.
+    pub bytes_read: u64,
+    /// Cumulative local write I/O time, excluding blocking-pool queue wait.
+    pub write_duration: Duration,
+    /// Cumulative local read I/O time, excluding blocking-pool queue wait.
+    pub read_duration: Duration,
+    /// Accepted bytes retained until deletion succeeds, even without a disk cap.
+    pub charged_bytes: u64,
+    /// Maximum simultaneous accepted bytes retained in this scope.
+    pub peak_charged_bytes: u64,
+    /// Scratch paths allocated and not yet successfully reclaimed.
+    pub live_files: u64,
+    /// Total scratch paths allocated in this scope.
+    pub files_created: u64,
+    /// Write reservations rejected by the shared disk quota.
+    pub quota_failures: u64,
+    /// Failed file/directory deletion attempts, including retries.
+    pub cleanup_failures: u64,
+}
+
+/// Operation-owned scratch accounting. Handles can outlive the operation report.
+#[derive(Debug, Default)]
+pub struct SpillMetrics {
+    accepted_bytes: AtomicU64,
+    bytes_written: AtomicU64,
+    bytes_read: AtomicU64,
+    write_time_ns: AtomicU64,
+    read_time_ns: AtomicU64,
+    charged_bytes: AtomicU64,
+    peak_charged_bytes: AtomicU64,
+    live_files: AtomicU64,
+    files_created: AtomicU64,
+    quota_failures: AtomicU64,
+    cleanup_failures: AtomicU64,
+}
+
+impl SpillMetrics {
+    fn allocated(&self) {
+        self.live_files.fetch_add(1, Ordering::Relaxed);
+        self.files_created.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            metrics::counter!("lance_spill_files_created_total").increment(1);
+            let mut aggregate = AGGREGATE_USAGE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            aggregate.live_files += 1;
+            aggregate.publish();
+        }
+    }
+    /// Read cumulative traffic and current retained storage; a fresh scope reports zero.
+    pub fn snapshot(&self) -> SpillUsage {
+        SpillUsage {
+            accepted_bytes: self.accepted_bytes.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            write_duration: Duration::from_nanos(self.write_time_ns.load(Ordering::Relaxed)),
+            read_duration: Duration::from_nanos(self.read_time_ns.load(Ordering::Relaxed)),
+            charged_bytes: self.charged_bytes.load(Ordering::Relaxed),
+            peak_charged_bytes: self.peak_charged_bytes.load(Ordering::Relaxed),
+            live_files: self.live_files.load(Ordering::Relaxed),
+            files_created: self.files_created.load(Ordering::Relaxed),
+            quota_failures: self.quota_failures.load(Ordering::Relaxed),
+            cleanup_failures: self.cleanup_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn accept(&self, bytes: u64) {
+        self.accepted_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let current = self.charged_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak_charged_bytes
+            .fetch_max(current, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            metrics::counter!("lance_spill_accepted_bytes_total").increment(bytes);
+            let mut aggregate = AGGREGATE_USAGE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            aggregate.charged_bytes += bytes;
+            aggregate.publish();
+        }
+    }
+
+    fn reclaimed(&self, bytes: u64) {
+        self.charged_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.live_files.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        {
+            let mut aggregate = AGGREGATE_USAGE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            aggregate.charged_bytes -= bytes;
+            aggregate.live_files -= 1;
+            aggregate.publish();
+        }
+    }
+
+    fn cleanup_failed(&self) {
+        self.cleanup_failures.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        metrics::counter!("lance_spill_cleanup_failures_total").increment(1);
+    }
+}
 
 /// A factory for scratch storage.
 ///
@@ -148,24 +346,36 @@ impl AsyncWrite for SpillWriter {
                 "spill write requested after shutdown",
             )));
         }
-        let Some(quota) = &this.backing.quota else {
-            return Pin::new(this.inner.as_mut()).poll_write(cx, buf);
-        };
         // Reserve up-front for the bytes we intend to write, then release the
         // remainder the inner writer did not accept so the reservation tracks
         // bytes actually buffered (and, for a write-once file, the file size).
-        if let Err(e) = quota.try_reserve(buf.len() as u64) {
+        if let Some(quota) = &this.backing.quota
+            && let Err(e) = quota.try_reserve(buf.len() as u64)
+        {
+            this.backing
+                .metrics
+                .quota_failures
+                .fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "metrics")]
+            metrics::counter!("lance_spill_quota_failures_total").increment(1);
             return Poll::Ready(Err(io::Error::other(e)));
         }
         let poll = Pin::new(this.inner.as_mut()).poll_write(cx, buf);
         match &poll {
             Poll::Ready(Ok(n)) => {
-                quota.release((buf.len() - *n) as u64);
+                if let Some(quota) = &this.backing.quota {
+                    quota.release((buf.len() - *n) as u64);
+                }
                 this.backing
                     .accepted
                     .fetch_add(*n as u64, Ordering::Relaxed);
+                this.backing.metrics.accept(*n as u64);
             }
-            _ => quota.release(buf.len() as u64),
+            _ => {
+                if let Some(quota) = &this.backing.quota {
+                    quota.release(buf.len() as u64);
+                }
+            }
         }
         poll
     }
@@ -216,13 +426,14 @@ impl Writer for SpillWriter {
 /// attempted after the store and all backing owners are dropped.
 pub struct LocalSpillStore {
     /// Created on first spill. Backstop cleanup is attempted on the last drop.
-    temp_dir: Mutex<Option<Arc<SpillDirectory>>>,
+    temp_dir: Arc<Mutex<Option<Arc<SpillDirectory>>>>,
     file_counter: Arc<AtomicU64>,
     /// Byte budget shared across every handle, enforced while writing.
     quota: Option<DiskQuota>,
     /// Directory the scratch directory is created in; `None` is the OS temp
     /// directory.
     parent_dir: Option<PathBuf>,
+    metrics: Arc<SpillMetrics>,
 }
 
 /// Create `path` without creating its parents. On Unix, request mode `0o700`,
@@ -283,6 +494,36 @@ fn create_temp_dir(parent_dir: Option<&std::path::Path>) -> Result<tempfile::Tem
 }
 
 impl LocalSpillStore {
+    /// Allocate an independent accounting scope sharing this store's directory and quota.
+    ///
+    /// Give the returned store to one operation, then retain [`Self::metrics`] to
+    /// observe delayed cleanup. Concurrent scopes never use snapshot subtraction.
+    /// The parent store's metrics cover only spills allocated directly through it.
+    ///
+    /// ```
+    /// # use lance_io::spill::LocalSpillStore;
+    /// # fn example() -> lance_core::Result<()> {
+    /// let shared = LocalSpillStore::with_cap(1024)?;
+    /// let operation = shared.scope();
+    /// assert_eq!(operation.metrics().snapshot().charged_bytes, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scope(&self) -> Self {
+        Self {
+            temp_dir: self.temp_dir.clone(),
+            file_counter: self.file_counter.clone(),
+            quota: self.quota.clone(),
+            parent_dir: self.parent_dir.clone(),
+            metrics: Arc::new(SpillMetrics::default()),
+        }
+    }
+
+    /// Retain the accounting handle independently of store and file lifetimes.
+    pub fn metrics(&self) -> Arc<SpillMetrics> {
+        self.metrics.clone()
+    }
+
     /// Create a store with no disk cap.
     ///
     /// Construction does not touch the filesystem; the scratch directory is
@@ -348,10 +589,11 @@ impl LocalSpillStore {
 impl Default for LocalSpillStore {
     fn default() -> Self {
         Self {
-            temp_dir: Mutex::new(None),
+            temp_dir: Arc::new(Mutex::new(None)),
             file_counter: Arc::new(AtomicU64::new(0)),
             quota: None,
             parent_dir: None,
+            metrics: Arc::new(SpillMetrics::default()),
         }
     }
 }
@@ -374,7 +616,9 @@ impl SpillStore for LocalSpillStore {
             accepted: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             directory: temp_dir,
+            metrics: self.metrics.clone(),
         });
+        self.metrics.allocated();
         let write_backing = backing.clone();
         let inner = tokio::task::spawn_blocking(move || {
             // Recreate the scratch directory and its immediate parent after
@@ -453,7 +697,24 @@ impl AsyncWrite for LocalSpillWriter {
         let file = self.file.clone();
         self.pending = Some(tokio::task::spawn_blocking(move || {
             let mut handle = &file.file;
-            handle.write_all(&bytes)
+            let start = Instant::now();
+            let result = handle.write_all(&bytes);
+            let elapsed = start.elapsed();
+            file._backing
+                .metrics
+                .write_time_ns
+                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            #[cfg(feature = "metrics")]
+            metrics::histogram!("lance_spill_io_duration_seconds", "operation" => "write")
+                .record(elapsed.as_secs_f64());
+            result?;
+            file._backing
+                .metrics
+                .bytes_written
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            #[cfg(feature = "metrics")]
+            metrics::counter!("lance_spill_write_bytes_total").increment(bytes.len() as u64);
+            Ok(())
         }));
         self.position = position;
         Poll::Ready(Ok(buf.len()))
@@ -496,6 +757,7 @@ struct PendingCleanup {
     path: PathBuf,
     quota: Option<DiskQuota>,
     bytes: u64,
+    metrics: Arc<SpillMetrics>,
 }
 
 impl PendingCleanup {
@@ -504,6 +766,7 @@ impl PendingCleanup {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => {
+                self.metrics.cleanup_failed();
                 tracing::warn!(path = %self.path.display(), error = %err, "spill cleanup failed; retaining disk quota");
                 return false;
             }
@@ -511,6 +774,7 @@ impl PendingCleanup {
         if let Some(quota) = &self.quota {
             quota.release(self.bytes);
         }
+        self.metrics.reclaimed(self.bytes);
         true
     }
 }
@@ -550,9 +814,18 @@ impl Drop for SpillDirectory {
                         if let Some(quota) = cleanup.quota {
                             quota.release(cleanup.bytes);
                         }
+                        cleanup.metrics.reclaimed(cleanup.bytes);
                     }
                 }
                 Err(err) => {
+                    for cleanup in self
+                        .pending
+                        .get_mut()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .iter()
+                    {
+                        cleanup.metrics.cleanup_failed();
+                    }
                     tracing::warn!(path = %path.display(), error = %err, "spill directory cleanup failed")
                 }
             }
@@ -567,6 +840,7 @@ struct SpillBacking {
     accepted: AtomicU64,
     finished: AtomicBool,
     directory: Arc<SpillDirectory>,
+    metrics: Arc<SpillMetrics>,
 }
 
 impl Drop for SpillBacking {
@@ -575,6 +849,7 @@ impl Drop for SpillBacking {
             path: self.fs_path.clone(),
             quota: self.quota.clone(),
             bytes: self.accepted.load(Ordering::Relaxed),
+            metrics: self.metrics.clone(),
         };
         if !cleanup.try_cleanup() {
             self.directory
@@ -636,10 +911,27 @@ impl SpillReadFile {
                 // Keep both the file and quota in the blocking closure, whose
                 // lifetime can exceed the future awaiting its result.
                 let mut bytes = vec![0; range.len()];
+                let start = Instant::now();
                 #[cfg(unix)]
-                self.file.read_exact_at(&mut bytes, range.start as u64)?;
+                let result = self.file.read_exact_at(&mut bytes, range.start as u64);
                 #[cfg(windows)]
-                crate::local::read_exact_at(self.file.clone(), &mut bytes, range.start as u64)?;
+                let result =
+                    crate::local::read_exact_at(self.file.clone(), &mut bytes, range.start as u64);
+                let elapsed = start.elapsed();
+                self._backing
+                    .metrics
+                    .read_time_ns
+                    .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+                #[cfg(feature = "metrics")]
+                metrics::histogram!("lance_spill_io_duration_seconds", "operation" => "read")
+                    .record(elapsed.as_secs_f64());
+                result?;
+                self._backing
+                    .metrics
+                    .bytes_read
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                #[cfg(feature = "metrics")]
+                metrics::counter!("lance_spill_read_bytes_total").increment(bytes.len() as u64);
                 Ok(Bytes::from(bytes))
             }))
             .await
@@ -718,8 +1010,143 @@ impl Reader for SpillReader {
 mod tests {
     use super::*;
     use crate::object_store::ObjectStore;
+    #[cfg(feature = "metrics")]
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rstest::rstest;
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(feature = "metrics")]
+    #[rstest]
+    #[case::on_reclaim(false)]
+    #[case::on_describe(true)]
+    #[test]
+    fn test_late_recorder_spill_gauges(#[case] describe: bool) {
+        // Isolate process-wide accounting and recorder installation from other tests.
+        if std::env::var_os("LANCE_LATE_SPILL_RECORDER_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env("LANCE_LATE_SPILL_RECORDER_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let first = LocalSpillStore::new().unwrap();
+                let second = LocalSpillStore::with_cap(16).unwrap();
+                let (writer, first_spill) = first.new_spill().await.unwrap();
+                finish_writer(writer, b"hello").await.unwrap();
+                let (writer, second_spill) = second.new_spill().await.unwrap();
+                finish_writer(writer, b"abc").await.unwrap();
+
+                let recorder = DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                assert!(metrics::set_global_recorder(recorder).is_ok());
+                let assert_gauges = |bytes: u64, files: u64| {
+                    let recorded = snapshotter.snapshot().into_vec();
+                    for (name, expected) in [
+                        ("lance_spill_charged_bytes", bytes),
+                        ("lance_spill_live_files", files),
+                    ] {
+                        let value = recorded.iter().find_map(|(key, _, _, value)| {
+                            if key.key().name() != name {
+                                return None;
+                            }
+                            assert!(key.key().labels().next().is_none());
+                            match value {
+                                DebugValue::Gauge(value) => Some(value.0),
+                                _ => None,
+                            }
+                        });
+                        assert_eq!(value, Some(expected as f64), "{name}");
+                    }
+                };
+                if describe {
+                    describe_metrics();
+                    assert_gauges(8, 2);
+                }
+                drop(first_spill);
+                assert_eq!(first.metrics().snapshot().charged_bytes, 0);
+                assert_gauges(3, 1);
+
+                let scoped = second.scope();
+                let (writer, scoped_spill) = scoped.new_spill().await.unwrap();
+                finish_writer(writer, b"another").await.unwrap();
+                assert_eq!(second.metrics().snapshot().charged_bytes, 3);
+                assert_eq!(scoped.metrics().snapshot().charged_bytes, 7);
+                assert_gauges(10, 2);
+                drop(second_spill);
+                assert_gauges(7, 1);
+                drop(scoped_spill);
+                assert_eq!(scoped.metrics().snapshot().charged_bytes, 0);
+                assert_eq!(scoped.metrics().snapshot().live_files, 0);
+                assert_gauges(0, 0);
+            });
+    }
+
+    #[rstest]
+    #[case::uncapped(None)]
+    #[case::capped(Some(100))]
+    #[tokio::test]
+    async fn test_scoped_spill_usage(
+        #[case] cap: Option<u64>,
+        #[values(false, true)] has_parent_dir: bool,
+    ) {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let store = match cap {
+            Some(cap) => LocalSpillStore::with_cap(cap).unwrap(),
+            None => LocalSpillStore::new().unwrap(),
+        };
+        let store = if has_parent_dir {
+            store.with_parent_dir(parent_dir.path())
+        } else {
+            store
+        };
+        let first = store.scope();
+        let second = store.scope();
+        let metrics = first.metrics();
+        assert_eq!(metrics.snapshot(), SpillUsage::default());
+        let (writer, spill) = first.new_spill().await.unwrap();
+        let directory = first.ensure_temp_dir().unwrap();
+        if has_parent_dir {
+            assert_eq!(
+                directory.path().parent(),
+                Some(parent_dir.path().canonicalize().unwrap().as_path())
+            );
+        }
+        finish_writer(writer, b"hello").await.unwrap();
+        let (other_writer, other_spill) = second.new_spill().await.unwrap();
+        assert!(Arc::ptr_eq(&directory, &second.ensure_temp_dir().unwrap()));
+        finish_writer(other_writer, b"other operation")
+            .await
+            .unwrap();
+        let reader = spill.reader().await.unwrap();
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), b"hello");
+        assert_eq!(reader.get_range(1..4).await.unwrap().as_ref(), b"ell");
+        let usage = metrics.snapshot();
+        assert_eq!(usage.accepted_bytes, 5);
+        assert_eq!(usage.bytes_written, 5);
+        assert_eq!(usage.bytes_read, 8);
+        assert_eq!(usage.charged_bytes, 5);
+        assert_eq!(usage.peak_charged_bytes, 5);
+        assert_eq!(usage.files_created, 1);
+        assert_eq!(usage.live_files, 1);
+        assert_eq!(second.metrics().snapshot().bytes_written, 15);
+        assert_eq!(store.metrics().snapshot(), SpillUsage::default());
+        drop(first);
+        drop(spill);
+        assert_eq!(metrics.snapshot().charged_bytes, 5);
+        drop(reader);
+        assert_eq!(metrics.snapshot().charged_bytes, 0);
+        assert_eq!(metrics.snapshot().live_files, 0);
+        assert_eq!(metrics.snapshot().bytes_written, 5);
+        drop(other_spill);
+        assert_eq!(second.metrics().snapshot().charged_bytes, 0);
+    }
 
     /// Write `data` to a fresh writer and shut it down.
     async fn finish_writer(mut writer: Box<dyn Writer>, data: &[u8]) -> Result<()> {
@@ -1107,6 +1534,13 @@ mod tests {
             Error::DiskCapExceeded { cap_bytes: 100, .. }
         ));
         assert_eq!(quota.used.load(Ordering::Relaxed), 80);
+        let usage = store.metrics().snapshot();
+        assert_eq!(usage.accepted_bytes, 80);
+        assert_eq!(usage.bytes_written, 80);
+        assert_eq!(usage.charged_bytes, 80);
+        assert_eq!(usage.peak_charged_bytes, 80);
+        assert_eq!(usage.live_files, 1);
+        assert_eq!(usage.quota_failures, 1);
         if writer_first {
             drop(writer);
             assert_eq!(quota.used.load(Ordering::Relaxed), 80);
@@ -1120,6 +1554,12 @@ mod tests {
             drop(writer);
         }
         assert_eq!(quota.used.load(Ordering::Relaxed), 0);
+        let usage = store.metrics().snapshot();
+        assert_eq!(usage.charged_bytes, 0);
+        assert_eq!(usage.live_files, 0);
+        assert_eq!(usage.accepted_bytes, if writer_first { 80 } else { 100 });
+        assert_eq!(usage.bytes_written, usage.accepted_bytes);
+        assert_eq!(usage.peak_charged_bytes, usage.accepted_bytes);
         let (writer, spill) = store.new_spill().await.unwrap();
         finish_writer(writer, &[0; 100]).await.unwrap();
         drop(spill);
@@ -1201,6 +1641,8 @@ mod tests {
             drop(spill);
             let quota = store.quota.as_ref().unwrap();
             assert_eq!(quota.used.load(Ordering::Relaxed), 100);
+            assert_eq!(store.metrics().snapshot().charged_bytes, 100);
+            assert_eq!(store.metrics().snapshot().bytes_read, 0);
             release.send(()).unwrap();
             blocker.await.unwrap();
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -1210,6 +1652,8 @@ mod tests {
             })
             .await
             .unwrap();
+            assert_eq!(store.metrics().snapshot().bytes_read, 100);
+            assert_eq!(store.metrics().snapshot().charged_bytes, 0);
             let (writer, _spill) = store.new_spill().await.unwrap();
             finish_writer(writer, &[0; 100]).await.unwrap();
         });
@@ -1237,6 +1681,12 @@ mod tests {
             drop(spill);
             let quota = store.quota.as_ref().unwrap();
             assert_eq!(quota.used.load(Ordering::Relaxed), 100);
+            let pending = store.metrics().snapshot();
+            assert_eq!(pending.accepted_bytes, 100);
+            assert_eq!(pending.charged_bytes, 100);
+            assert_eq!(pending.peak_charged_bytes, 100);
+            assert_eq!(pending.bytes_written, 0);
+            assert_eq!(pending.live_files, 1);
             release.send(()).unwrap();
             blocker.await.unwrap();
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -1246,6 +1696,10 @@ mod tests {
             })
             .await
             .unwrap();
+            let reclaimed = store.metrics().snapshot();
+            assert_eq!(reclaimed.charged_bytes, 0);
+            assert_eq!(reclaimed.live_files, 0);
+            assert_eq!(reclaimed.bytes_written, 100);
             let (writer, _spill) = store.new_spill().await.unwrap();
             finish_writer(writer, &[0; 100]).await.unwrap();
         });
@@ -1260,18 +1714,25 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let quota = store.quota.as_ref().unwrap();
         quota.try_reserve(100).unwrap();
+        store.metrics.allocated();
+        store.metrics.accept(100);
         drop(SpillBacking {
             fs_path: path.clone(),
             quota: Some(quota.clone()),
             accepted: AtomicU64::new(100),
             finished: AtomicBool::new(false),
             directory: directory.clone(),
+            metrics: store.metrics.clone(),
         });
         assert_eq!(quota.used.load(Ordering::Relaxed), 100);
+        assert_eq!(store.metrics.snapshot().charged_bytes, 100);
+        assert_eq!(store.metrics.snapshot().cleanup_failures, 1);
         assert_eq!(directory.pending.lock().unwrap().len(), 1);
         std::fs::remove_dir(&path).unwrap();
         store.ensure_temp_dir().unwrap();
         assert_eq!(quota.used.load(Ordering::Relaxed), 0);
+        assert_eq!(store.metrics.snapshot().charged_bytes, 0);
+        assert_eq!(store.metrics.snapshot().live_files, 0);
         assert!(directory.pending.lock().unwrap().is_empty());
         quota.try_reserve(100).unwrap();
         quota.release(100);
@@ -1362,12 +1823,14 @@ mod tests {
     ) {
         let store = LocalSpillStore::with_cap(100).unwrap();
         let quota = store.quota.as_ref().unwrap().clone();
+        store.metrics.allocated();
         let backing = Arc::new(SpillBacking {
             fs_path: store.ensure_temp_dir().unwrap().path().join("controlled"),
             quota: Some(quota.clone()),
             accepted: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             directory: store.ensure_temp_dir().unwrap(),
+            metrics: store.metrics.clone(),
         });
         let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter { outcome }),
@@ -1376,7 +1839,10 @@ mod tests {
         let buffer = [0; 40];
         let _result = futures::poll!(std::pin::pin!(writer.write(&buffer)));
         assert_eq!(quota.used.load(Ordering::Relaxed), accepted);
+        assert_eq!(store.metrics.snapshot().accepted_bytes, accepted);
+        assert_eq!(store.metrics.snapshot().charged_bytes, accepted);
         drop(writer);
         assert_eq!(quota.used.load(Ordering::Relaxed), 0);
+        assert_eq!(store.metrics.snapshot().charged_bytes, 0);
     }
 }

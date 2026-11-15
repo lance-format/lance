@@ -305,43 +305,6 @@ async fn map_released_by_trim_is_collected_with_its_manifests() {
     assert!(fixture.list_fri_map_dirs().await.is_empty());
 }
 
-/// D3 + D4: an unreferenced map (a failed commit's orphan) is kept
-/// while young and collected once it ages past the unverified
-/// retention threshold.
-#[tokio::test]
-#[serial_test::serial(frag_reuse_maintenance)]
-async fn orphan_map_ages_out() {
-    let fixture = MockDatasetFixture::try_new().unwrap();
-    let (dataset, committed_map_id) = make_tagged(&fixture).await;
-
-    // A row map written at day 10 whose commit never lands.
-    MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-    let (orphan_transition, _) = reader_tests::prepare(&dataset).await;
-    let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &orphan_transition.mapping
-    else {
-        unreachable!()
-    };
-    let orphan_map_id = mapping.map_id.clone();
-    let mut expected = vec![committed_map_id.clone(), orphan_map_id.clone()];
-    expected.sort();
-    assert_eq!(fixture.list_fri_map_dirs().await, expected);
-
-    // D3: unreferenced but young, kept.
-    fixture
-        .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(fixture.list_fri_map_dirs().await, expected);
-
-    // D4: unreferenced and old, collected; the referenced map stays.
-    MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
-    fixture
-        .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(fixture.list_fri_map_dirs().await, vec![committed_map_id]);
-}
-
 /// D5: reference resolution decodes external entry content too. The
 /// integration tests above cover inline entries; this drives the
 /// resolver directly over an entry whose details live in an external

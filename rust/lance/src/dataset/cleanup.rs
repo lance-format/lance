@@ -14,6 +14,8 @@
 //!   fragment in a valid manifest file then it will be deleted.
 //! * Unreferenced delete files - If a delete file is not referenced by
 //!   any fragment in a valid manifest file then it will be deleted.
+//! * Unreferenced transaction files - If a transaction file is not referenced
+//!   by any valid manifest file then it will be deleted.
 //! * Unreferenced index files - If an index file is not referenced by
 //!   any valid manifest file then it will be deleted.
 //! * Orphaned staging manifests - If a staging manifest is not recorded by
@@ -38,8 +40,10 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+mod file_verdict;
 pub mod retention;
 
+use file_verdict::{FileReference, ListedFile, Verdict};
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
@@ -188,20 +192,6 @@ impl CleanupCandidateFile {
             size_bytes: file.size_bytes,
         }
     }
-}
-
-fn cleanup_file(
-    path: Path,
-    kind: CleanupFileKind,
-    unverified: bool,
-    size_bytes: u64,
-) -> Option<CleanupFile> {
-    Some(CleanupFile {
-        path,
-        kind,
-        unverified,
-        size_bytes,
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -499,30 +489,20 @@ struct CleanupInspection {
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
     latest_deleted_manifest_time: Option<DateTime<Utc>>,
-    /// Set when an expired manifest was classified from the listing instead of read, so
-    /// its commit time is unknown and the listing cutoff cannot be trusted.
-    skipped_expired_manifest_read: bool,
 }
 
 impl CleanupInspection {
-    /// Cutoff for `read_dir_all(..., unmodified_since)`.
+    /// Retained-manifest floor of the cutoff for `read_dir_all(..., unmodified_since)`.
     ///
-    /// Listing only files with `last_modified <= earliest_retained` is valid
-    /// when the working set is a time suffix: every retained version is newer
-    /// than every deleted one. A tagged old version (or any other sparse
-    /// retain) pulls that cutoff backwards, so files from newer deleted
-    /// versions are never listed. Their manifests are still removed, which
-    /// permanently orphans the data files ([#8705](https://github.com/lance-format/lance/issues/8705)).
-    ///
-    /// When a deleted manifest is newer than the earliest retained one, drop
-    /// the cutoff and scan the whole subtree — the same approach already used
-    /// for `_indices/`.
+    /// When every retained version is newer than every deleted one, the files of
+    /// deleted versions are all at or below this floor. A tagged old version (or
+    /// any other sparse retain) pulls it below files of newer deleted versions
+    /// ([#8705](https://github.com/lance-format/lance/issues/8705)), so the cutoff
+    /// is dropped then, as for `_indices/`. Callers raise it to the unverified
+    /// threshold, since files no manifest references can be newer than the floor.
+    /// Only meaningful when `delete_unverified` is off: the fast path in
+    /// `process_manifest_file` does not record commit times.
     fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
-        if self.skipped_expired_manifest_read {
-            // At least one deleted manifest's commit time was never read, so the
-            // comparison below cannot be made safely. Scan everything.
-            return None;
-        }
         match (
             self.earliest_retained_manifest_time,
             self.latest_deleted_manifest_time,
@@ -1388,10 +1368,8 @@ impl<'a> CleanupTask<'a> {
                     .retired_records
                     .insert(location.version, identity);
             }
-            // Without the commit time there is nothing to compare against the retained
-            // side, so give up the listing cutoff and scan the whole subtree. Missing a
-            // file would orphan it permanently; an extra listing only costs time.
-            inspection.skipped_expired_manifest_read = true;
+            // The commit time stays unknown, which is safe because `delete_unverified`
+            // lists without a cutoff.
             return Ok(());
         }
 
@@ -1738,15 +1716,17 @@ impl<'a> CleanupTask<'a> {
         // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
-        let unmodified_since = inspection.listing_unmodified_since();
-        // Data files owned by no manifest can be newer than the retained
-        // manifest floor. List through the moving verification threshold so
-        // they become candidates once old enough, or list all data files when
-        // the caller explicitly permits deleting unverified files.
-        let data_unmodified_since = if self.policy.delete_unverified {
+        // Files owned by no manifest, such as those of a failed commit, can be
+        // newer than the retained manifest floor. List through the moving
+        // verification threshold so they become candidates once old enough, or
+        // list everything when the caller explicitly permits deleting unverified
+        // files.
+        let unmodified_since = if self.policy.delete_unverified {
             None
         } else {
-            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+            inspection
+                .listing_unmodified_since()
+                .map(|cutoff| cutoff.max(verification_threshold))
         };
         let mut streams = vec![
             // Staging manifests can be newer than the latest retained manifest,
@@ -1754,11 +1734,8 @@ impl<'a> CleanupTask<'a> {
             // paths are revalidated against the commit handler instead.
             build_listing_stream(self.dataset.versions_dir(), None),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
-            build_listing_stream(
-                self.dataset.base.clone().join("_blobs"),
-                data_unmodified_since,
-            ),
+            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            build_listing_stream(self.dataset.base.clone().join("_blobs"), unmodified_since),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -2304,30 +2281,14 @@ impl<'a> CleanupTask<'a> {
         inspection: &CleanupInspection,
     ) -> Result<Option<CleanupFile>> {
         let path = obj_meta.location;
-        let relative_path = remove_prefix(&path, &self.dataset.base);
-        let size_bytes = obj_meta.size;
-        if relative_path.as_ref().starts_with("_versions/.tmp") {
-            // This is a temporary manifest file.
-            //
-            // If the file is old (or the user has verified there are no writes in progress) then
-            // it must be leftover from a failed tx.
-            if maybe_in_progress {
-                return Ok(None);
-            } else {
-                return Ok(cleanup_file(
-                    path,
-                    CleanupFileKind::TemporaryManifest,
-                    true,
-                    size_bytes,
-                ));
-            }
-        }
-        if let Some(version) = staging_manifest_version(&relative_path) {
+        let Some(file) = ListedFile::classify(&remove_prefix(&path, &self.dataset.base)) else {
+            return Ok(None);
+        };
+        let is_referenced = match file.reference {
             // Bulk manifest enumeration may fall back to object listing, which
             // omits an external store's staging-shaped authoritative path.
-            if maybe_in_progress
-                || self
-                    .dataset
+            FileReference::StagingManifest { version } if !maybe_in_progress => {
+                self.dataset
                     .commit_handler
                     .is_manifest_path_authoritative(
                         &self.dataset.base,
@@ -2336,279 +2297,21 @@ impl<'a> CleanupTask<'a> {
                         self.dataset.object_store.inner.as_ref(),
                     )
                     .await?
-            {
-                return Ok(None);
             }
-            return Ok(cleanup_file(
-                path,
-                CleanupFileKind::TemporaryManifest,
-                true,
-                size_bytes,
-            ));
-        }
-        if relative_path.as_ref().starts_with("_fri") {
-            // Row maps are referenced by map id (`_fri/<map_id>/...`) from
-            // tagged FRI entries, resolved in `resolve_frag_reuse_map_ids`.
-            // The same lifecycle as `_indices/`: kept while some retained
-            // manifest references the map; deletable immediately when only
-            // expiring manifests reference it; an unreferenced map (a failed
-            // commit's orphan, or one released by an already-expired history)
-            // ages past the unverified-retention threshold first, which also
-            // protects a just-written map whose commit has not landed yet.
-            if let Some(map_id) = relative_path.parts().nth(1) {
-                if inspection
-                    .referenced_files
-                    .frag_reuse_map_ids
-                    .contains(map_id.as_ref())
-                {
-                    return Ok(None);
-                } else if !maybe_in_progress {
-                    return Ok(cleanup_file(path, CleanupFileKind::Index, true, size_bytes));
-                } else if inspection
-                    .verified_files
-                    .frag_reuse_map_ids
-                    .contains(map_id.as_ref())
-                {
-                    return Ok(cleanup_file(
-                        path,
-                        CleanupFileKind::Index,
-                        false,
-                        size_bytes,
-                    ));
-                }
-            }
-            return Ok(None);
-        }
-        if relative_path.as_ref().starts_with("_indices") {
-            // Indices are referenced by UUID so we need to examine the UUID
-            // portion of the path.
-            if let Some(uuid) = relative_path.parts().nth(1) {
-                if inspection
-                    .referenced_files
-                    .index_uuids
-                    .contains(uuid.as_ref())
-                {
-                    return Ok(None);
-                } else if !maybe_in_progress {
-                    return Ok(cleanup_file(path, CleanupFileKind::Index, true, size_bytes));
-                } else if inspection
-                    .verified_files
-                    .index_uuids
-                    .contains(uuid.as_ref())
-                {
-                    return Ok(cleanup_file(
-                        path,
-                        CleanupFileKind::Index,
-                        false,
-                        size_bytes,
-                    ));
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-        match path.extension() {
-            Some("lance") => {
-                if relative_path.as_ref().starts_with("data") {
-                    if inspection
-                        .referenced_files
-                        .data_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(None)
-                    } else if !maybe_in_progress {
-                        Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
-                    } else if inspection
-                        .verified_files
-                        .data_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    // If a .lance file isn't in the data directory we err on the side of leaving it alone
-                    Ok(None)
-                }
-            }
-            Some("blob") => {
-                if inspection
-                    .referenced_files
-                    .managed_blob_paths
-                    .contains(&relative_path)
-                {
-                    return Ok(None);
-                }
-                if !relative_path
-                    .parts()
-                    .next()
-                    .is_some_and(|part| is_managed_blob_directory(part.as_ref()))
-                {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-                if relative_path
-                    .parts()
-                    .next()
-                    .is_some_and(|part| part.as_ref() == "_blobs")
-                {
-                    let verified = inspection
-                        .verified_files
-                        .managed_blob_paths
-                        .contains(&relative_path);
-                    return if verified || !maybe_in_progress {
-                        Ok(cleanup_file(
-                            path,
-                            CleanupFileKind::Data,
-                            !verified,
-                            size_bytes,
-                        ))
-                    } else {
-                        Ok(None)
-                    };
-                }
-                // Blob v2 sidecar files are keyed by the data file stem:
-                //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
-                //
-                // These files are not referenced directly by the manifest.  Instead, treat them
-                // as referenced if their parent data file is referenced.
-                let mut parts = relative_path.parts();
-                let data_dir = parts.next();
-                let data_file_key = parts.next();
-                let blob_file = parts.next();
-                // Be conservative: only handle the expected 3-part layout.
-                if !matches!(data_dir, Some(dir) if dir.as_ref() == "data")
-                    || data_file_key.is_none()
-                    || blob_file.is_none()
-                {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-                if parts.next().is_some() {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-
-                let data_file_key = data_file_key.expect("checked is_some");
-                let Ok(parent_data_path) =
-                    Path::parse(format!("data/{}.lance", data_file_key.as_ref()))
-                else {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        derived_parent = format!("data/{}.lance", data_file_key.as_ref()),
-                        "Will not garbage collect blob file because derived parent data file path is invalid"
-                    );
-                    return Ok(None);
-                };
-
-                if inspection
-                    .referenced_files
-                    .data_paths
-                    .contains(&parent_data_path)
-                {
-                    Ok(None)
-                } else if !maybe_in_progress {
-                    Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
-                } else if inspection
-                    .verified_files
-                    .data_paths
-                    .contains(&parent_data_path)
-                    || inspection
-                        .verified_files
-                        .managed_blob_paths
-                        .contains(&relative_path)
-                {
-                    Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
-                } else {
-                    Ok(None)
-                }
-            }
-            Some("manifest") => {
-                // We already scanned the manifest files
-                Ok(None)
-            }
-            Some("arrow") | Some("bin") => {
-                if relative_path.as_ref().starts_with("_deletions") {
-                    if inspection
-                        .referenced_files
-                        .delete_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(None)
-                    } else if !maybe_in_progress {
-                        Ok(cleanup_file(
-                            path,
-                            CleanupFileKind::Deletion,
-                            true,
-                            size_bytes,
-                        ))
-                    } else if inspection
-                        .verified_files
-                        .delete_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(cleanup_file(
-                            path,
-                            CleanupFileKind::Deletion,
-                            false,
-                            size_bytes,
-                        ))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
-            Some("txn") => {
-                if relative_path.as_ref().starts_with(TRANSACTIONS_DIR) {
-                    if inspection
-                        .referenced_files
-                        .tx_paths
-                        .contains(&relative_path)
-                    {
-                        Ok(None)
-                    } else if !maybe_in_progress
-                        || inspection.verified_files.tx_paths.contains(&relative_path)
-                    {
-                        let unverified =
-                            !inspection.verified_files.tx_paths.contains(&relative_path);
-                        Ok(cleanup_file(
-                            path,
-                            CleanupFileKind::Transaction,
-                            unverified,
-                            size_bytes,
-                        ))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    Ok(None)
-                }
-            }
-            // Local writers stage files in their destination directory before renaming
-            // them. These temporary files are never referenced by a manifest, even
-            // when they are inside a referenced blob sidecar directory.
-            _ if relative_path.as_ref().starts_with("data/")
-                && path
-                    .filename()
-                    .is_some_and(|filename| filename.starts_with(".tmp"))
-                && !maybe_in_progress =>
-            {
-                Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
-            }
-            _ => Ok(None),
-        }
+            _ => inspection.referenced_files.contains(&file.reference),
+        };
+        let is_verified = inspection.verified_files.contains(&file.reference);
+        Ok(
+            match Verdict::decide(is_referenced, is_verified, maybe_in_progress) {
+                Verdict::Keep => None,
+                Verdict::Delete { unverified } => Some(CleanupFile {
+                    path,
+                    kind: file.kind,
+                    unverified,
+                    size_bytes: obj_meta.size,
+                }),
+            },
+        )
     }
 
     async fn find_referenced_branches(&self) -> Result<Vec<(String, u64)>> {
@@ -3116,7 +2819,9 @@ pub struct CleanupPolicy {
     pub before_version: Option<u64>,
     /// If not none, cleanup only the specified versions.
     pub versions: Option<HashSet<u64>>,
-    /// If true, delete unverified data files even if they are recent
+    /// If true, delete files that no manifest references, such as the data,
+    /// transaction and deletion files of a failed commit, even if they are recent.
+    /// Only safe when no other operation is in progress on the dataset.
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
     pub error_if_tagged_old_versions: bool,
@@ -3595,7 +3300,7 @@ mod tests {
         },
         index::vector::VectorIndexParams,
     };
-    use all_asserts::{assert_gt, assert_lt};
+    use all_asserts::assert_gt;
     use arrow::compute;
     use arrow_array::{
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
@@ -5368,47 +5073,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_unreferenced_data_files() {
-        // We should clean up data files that are only referenced
-        // by old versions.  This can happen, for example, due to
-        // an overwrite
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        fixture.overwrite_some_data().await.unwrap();
-
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-
-        let before_count = fixture.count_files().await.unwrap();
-
-        let removed = fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
-            .await
-            .unwrap();
-
-        let after_count = fixture.count_files().await.unwrap();
-        assert_eq!(removed.old_versions, 1);
-        assert_eq!(removed.data_files_removed, 1);
-        assert_eq!(
-            removed.bytes_removed,
-            before_count.num_bytes - after_count.num_bytes
-        );
-
-        // There should be one less data file
-        assert_lt!(after_count.num_data_files, before_count.num_data_files);
-        // And one less manifest file
-        assert_lt!(
-            after_count.num_manifest_files,
-            before_count.num_manifest_files
-        );
-        assert_lt!(after_count.num_tx_files, before_count.num_tx_files);
-
-        assert_gt!(after_count.num_manifest_files, 0);
-        assert_gt!(after_count.num_data_files, 0);
-        // We should keep referenced tx files
-        assert_gt!(after_count.num_tx_files, 0);
-    }
-
-    #[tokio::test]
     async fn cleanup_ignores_old_manifest_removed_after_listing() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -5515,34 +5179,55 @@ mod tests {
         assert_eq!(removed.bytes_removed, explanation.stats.bytes_removed);
     }
 
+    /// The keep/delete rule is unit tested in `file_verdict`; this checks the listing
+    /// feeds it, and that manifests record each kind under the key its path maps to.
     #[tokio::test]
-    async fn every_removed_file_kind_contributes_its_bytes() {
-        // Each kind must contribute its size to `bytes_removed`, not merely increment its
-        // per-kind counter. Index files dominate some tables, so an undercount there makes
-        // cleanup look far less effective than it is; deletion and transaction files are
-        // individually small but numerous.
+    async fn cleanup_keeps_and_removes_every_file_kind() {
         let fixture = MockDatasetFixture::try_new().unwrap();
+        // The only data column is a vector, so deletes filter on the row id.
+        let delete_some_rows = async || {
+            let dataset = fixture.open().await.unwrap();
+            let fragment_id = dataset.manifest.fragments[0].id;
+            fixture
+                .delete_data(&format!("_rowid < {}", (fragment_id << 32) + 20))
+                .await
+                .unwrap();
+        };
         fixture.create_some_data().await.unwrap();
         fixture.create_some_index().await.unwrap();
-        // Produces a deletion file that the overwrite below then orphans. The only data
-        // column here is a vector, so delete on the row id instead.
-        fixture.delete_data("_rowid < 20").await.unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        delete_some_rows().await;
         // Overwrite drops the index and the old fragments, leaving all of it unreferenced.
         fixture.overwrite_some_data().await.unwrap();
+        fixture.create_some_index().await.unwrap();
+        delete_some_rows().await;
+        let rows_before = fixture.count_rows().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
         let before = fixture.count_files().await.unwrap();
         let removed = fixture.run_cleanup(utc_now()).await.unwrap();
         let after = fixture.count_files().await.unwrap();
 
-        assert_gt!(removed.index_files_removed, 0);
-        assert_gt!(removed.deletion_files_removed, 0);
-        assert_gt!(removed.transaction_files_removed, 0);
-        assert_gt!(removed.data_files_removed, 0);
-        assert_gt!(removed.old_versions, 0);
-        // The whole point: reported bytes match the storage delta exactly with every kind
-        // in the mix, so no kind is silently contributing zero.
+        assert_eq!(removed.old_versions, 5);
+        assert_eq!(removed.data_files_removed, 1);
+        // An IVF_PQ index stores two files: the index and its quantized storage.
+        assert_eq!(removed.index_files_removed, 2);
+        assert_eq!(removed.deletion_files_removed, 1);
+        assert_eq!(removed.transaction_files_removed, 5);
+        // Reported bytes match the storage delta exactly with every kind in the mix, so
+        // no kind is silently contributing zero.
         assert_eq!(removed.bytes_removed, before.num_bytes - after.num_bytes);
+        assert_eq!(
+            after,
+            FileCounts {
+                num_data_files: 1,
+                num_manifest_files: 1,
+                num_index_files: 2,
+                num_delete_files: 1,
+                num_tx_files: 1,
+                num_bytes: after.num_bytes,
+            }
+        );
+        assert_eq!(fixture.count_rows().await.unwrap(), rows_before);
     }
 
     #[rstest]
@@ -5709,41 +5394,6 @@ mod tests {
         assert!(data_dir.exists());
         assert!(retained_dir.exists());
         assert_eq!(in_progress_dir.exists(), should_preserve);
-    }
-
-    #[tokio::test]
-    async fn do_not_cleanup_newer_data() {
-        // Even though an old manifest is removed the data files should
-        // remain if they are still referenced by newer manifests
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-        fixture.append_some_data().await.unwrap();
-        fixture.append_some_data().await.unwrap();
-
-        let before_count = fixture.count_files().await.unwrap();
-
-        // 3 versions
-        assert_eq!(before_count.num_data_files, 3);
-        assert_eq!(before_count.num_manifest_files, 3);
-
-        let before = utc_now() - TimeDelta::try_days(7).unwrap();
-        let removed = fixture.run_cleanup(before).await.unwrap();
-
-        let after_count = fixture.count_files().await.unwrap();
-
-        assert_eq!(removed.old_versions, 1);
-        assert_eq!(
-            removed.bytes_removed,
-            before_count.num_bytes - after_count.num_bytes
-        );
-
-        // The data files should all remain since they are referenced by
-        // the latest version
-        assert_eq!(after_count.num_data_files, 3);
-        // Only the oldest manifest file should be removed
-        assert_eq!(after_count.num_manifest_files, 2);
-        assert_eq!(after_count.num_tx_files, 2);
     }
 
     #[rstest]
@@ -6388,12 +6038,25 @@ mod tests {
         let (field, column) = values.finish().unwrap().into_parts();
         let schema = Arc::new(managed_blob_schema(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        // The write below loads the child through base 7, so the managed-blob
+        // writer needs an explicit region to skip the live S3 region lookup.
+        let storage_options = HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("aws_access_key_id".to_string(), "test".to_string()),
+            ("aws_secret_access_key".to_string(), "test".to_string()),
+        ]);
         Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
             child.uri(),
             Some(WriteParams {
                 mode: WriteMode::Overwrite,
                 data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                store_params: Some(ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(storage_options.clone()),
+                    )),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         )
@@ -6403,11 +6066,7 @@ mod tests {
         parent.update_config([("revision", "3")]).await.unwrap();
 
         let parent = DatasetBuilder::from_uri(uri.as_str())
-            .with_storage_options(HashMap::from([
-                ("region".to_string(), "us-east-1".to_string()),
-                ("aws_access_key_id".to_string(), "test".to_string()),
-                ("aws_secret_access_key".to_string(), "test".to_string()),
-            ]))
+            .with_storage_options(storage_options)
             .load()
             .await
             .unwrap();
@@ -6834,80 +6493,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_old_index() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        fixture.create_some_index().await.unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-        fixture.overwrite_some_data().await.unwrap();
-
-        let before_count = fixture.count_files().await.unwrap();
-        // we store 2 files (index and quantized storage) for each index
-        assert_eq!(before_count.num_index_files, 2);
-        // Two user data files
-        assert_eq!(before_count.num_data_files, 2);
-        // Creating an index creates a new manifest so there are 3 total
-        assert_eq!(before_count.num_manifest_files, 3);
-
-        let before = utc_now() - TimeDelta::try_days(8).unwrap();
-        let removed = fixture.run_cleanup(before).await.unwrap();
-
-        let after_count = fixture.count_files().await.unwrap();
-        assert_eq!(removed.old_versions, 2);
-        assert_eq!(
-            removed.bytes_removed,
-            before_count.num_bytes - after_count.num_bytes
-        );
-
-        assert_eq!(after_count.num_index_files, 0);
-        assert_eq!(after_count.num_data_files, 1);
-        assert_eq!(after_count.num_manifest_files, 1);
-        assert_eq!(after_count.num_tx_files, 1);
-    }
-
-    #[tokio::test]
-    async fn clean_old_delete_files() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        let mut data_gen = BatchGenerator::new().col(Box::new(
-            IncrementingInt32::new().named("filter_me".to_owned()),
-        ));
-
-        fixture.create_with_data(data_gen.batch(16)).await.unwrap();
-        fixture.append_data(data_gen.batch(16)).await.unwrap();
-        // This will keep some data from the appended file and should
-        // completely remove the first file
-        fixture.delete_data("filter_me < 20").await.unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-        fixture.overwrite_data(data_gen.batch(16)).await.unwrap();
-        // This will delete half of the last fragment
-        fixture.delete_data("filter_me >= 40").await.unwrap();
-
-        let before_count = fixture.count_files().await.unwrap();
-        assert_eq!(before_count.num_data_files, 3);
-        assert_eq!(before_count.num_delete_files, 2);
-        assert_eq!(before_count.num_manifest_files, 5);
-
-        let before = utc_now() - TimeDelta::try_days(8).unwrap();
-        let removed = fixture.run_cleanup(before).await.unwrap();
-
-        let after_count = fixture.count_files().await.unwrap();
-        assert_eq!(removed.old_versions, 3);
-        assert_eq!(
-            removed.bytes_removed,
-            before_count.num_bytes - after_count.num_bytes
-        );
-
-        assert_eq!(after_count.num_data_files, 1);
-        assert_eq!(after_count.num_delete_files, 1);
-        assert_eq!(after_count.num_manifest_files, 2);
-        assert_eq!(after_count.num_tx_files, 2);
-
-        // Ensure we can still read the dataset
-        let row_count_after = fixture.count_rows().await.unwrap();
-        assert_eq!(row_count_after, 8);
-    }
-
-    #[tokio::test]
     async fn cleanup_collects_removed_file_metrics() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         let row_count = 512;
@@ -7228,27 +6813,6 @@ mod tests {
             kept.contains(&overlay_path),
             "the overlay's data file must be in the keep set, got {kept:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn dont_clean_index_data_files() {
-        // Indexes have .lance files in them that are not referenced
-        // by any fragment.  We need to make sure the cleanup routine
-        // doesn't over-zealously delete these
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-        fixture.create_some_data().await.unwrap();
-        fixture.create_some_index().await.unwrap();
-
-        let before_count = fixture.count_files().await.unwrap();
-        let before = utc_now() - TimeDelta::try_days(8).unwrap();
-        let removed = fixture.run_cleanup(before).await.unwrap();
-        assert_eq!(removed.old_versions, 0);
-        assert_eq!(removed.bytes_removed, 0);
-
-        let after_count = fixture.count_files().await.unwrap();
-
-        assert_eq!(before_count, after_count);
     }
 
     #[tokio::test]
@@ -7735,35 +7299,6 @@ mod tests {
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 1);
         assert_eq!(after_count.num_tx_files, 1);
-    }
-
-    #[tokio::test]
-    async fn dont_cleanup_in_progress_write() {
-        // We should not cleanup data files newer than our threshold as they might
-        // belong to in-progress writes
-
-        // For testing purposes we actually create these files with a failed write
-        // but the cleanup routine has no way of detecting this.  They should look
-        // just like an in-progress write.
-        let mut fixture = MockDatasetFixture::try_new().unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-        fixture.create_some_data().await.unwrap();
-        fixture.block_commits();
-        assert!(fixture.append_some_data().await.is_err());
-
-        let before_count = fixture.count_files().await.unwrap();
-
-        let removed = fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(removed.old_versions, 0);
-        assert_eq!(removed.bytes_removed, 0);
-        assert_eq!(removed.data_files_removed, 0);
-
-        let after_count = fixture.count_files().await.unwrap();
-        assert_eq!(before_count, after_count);
     }
 
     #[tokio::test]
