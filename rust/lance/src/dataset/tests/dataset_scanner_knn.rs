@@ -61,6 +61,79 @@ use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
 #[rstest]
+#[case::created("_row_created_at_version")]
+#[case::updated("_row_last_updated_at_version")]
+#[tokio::test]
+async fn test_knn_version_projection(
+    #[case] version_column: &str,
+    #[values(false, true)] with_data: bool,
+) {
+    let data = RecordBatch::try_from_iter([
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])) as ArrayRef,
+        ),
+        (
+            "vec",
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(vec![
+                        0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0,
+                    ]),
+                    2,
+                )
+                .unwrap(),
+            ) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.slice(0, 3))], data.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(data.slice(3, 3))], data.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &Float32Array::from(vec![2.25, 0.0]), 3)
+        .unwrap();
+    scanner.use_index(false).with_row_id();
+    let columns = if with_data {
+        vec!["i", version_column]
+    } else {
+        vec![version_column]
+    };
+    scanner.project(&columns).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[2, 3, 1]
+    );
+    assert_eq!(
+        batch[version_column].as_primitive::<UInt64Type>().values(),
+        &[1, 2, 1]
+    );
+    if with_data {
+        assert_eq!(batch["i"].as_primitive::<Int32Type>().values(), &[2, 3, 1]);
+    }
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_knn_nodes(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
