@@ -55,7 +55,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use crossbeam_skiplist::SkipMap;
-use fst::{Map, Streamer};
+use fst::automaton::{Automaton, Levenshtein, Str};
+use fst::{IntoStreamer, Map, Streamer};
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -695,6 +696,38 @@ pub fn levenshtein_distance(a: &str, b: &str) -> u32 {
     prev_row[n]
 }
 
+/// Longest ASCII term, in bytes, that fuzzy expansion builds a Levenshtein
+/// automaton for. The work per automaton state grows with the term length,
+/// and with two edits `fst` already gives up at about 50 bytes for most terms,
+/// so a longer term scans the dictionary.
+const FUZZY_AUTOMATON_MAX_TERM_BYTES: usize = 64;
+
+/// Prefixed partition terms per automaton state that fuzzy expansion may
+/// build. Building a state costs about as much as an edit distance or two, so
+/// with more than a few hundred such terms, a build that reaches this limit
+/// and falls back costs at most about as much as the edit distances the
+/// fallback then computes.
+const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
+
+/// Most automaton states fuzzy expansion builds, `fst`'s default limit for
+/// `Levenshtein::new`.
+const FUZZY_AUTOMATON_MAX_STATES: usize = 10_000;
+
+/// The Levenshtein automaton that expands `term` over partitions holding
+/// `prefixed_terms` terms with the required prefix, or `None` to check those
+/// terms one by one instead. `fst`'s automaton can miss matches for a non-ASCII
+/// term (lance-index keeps its own Unicode automaton for those), and building
+/// one for a long term or for few terms with the prefix can cost far more
+/// than the scan it replaces.
+fn fuzzy_automaton(term: &str, max_distance: u32, prefixed_terms: usize) -> Option<Levenshtein> {
+    let state_limit =
+        (prefixed_terms / FUZZY_AUTOMATON_TERMS_PER_STATE).min(FUZZY_AUTOMATON_MAX_STATES);
+    if !term.is_ascii() || term.len() > FUZZY_AUTOMATON_MAX_TERM_BYTES || state_limit == 0 {
+        return None;
+    }
+    Levenshtein::new_with_limit(term, max_distance, state_limit).ok()
+}
+
 fn char_prefix(term: &str, prefix_length: u32) -> &str {
     if prefix_length == 0 {
         return "";
@@ -703,6 +736,18 @@ fn char_prefix(term: &str, prefix_length: u32) -> &str {
         .nth(prefix_length as usize)
         .map(|(idx, _)| &term[..idx])
         .unwrap_or(term)
+}
+
+// Counts dictionary terms whose edit distance `expand_fuzzy_term` computed for
+// a partition, so tests can tell an automaton search from a dictionary scan.
+#[cfg(test)]
+thread_local! {
+    static FUZZY_DISTANCES_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_fuzzy_distance_computed() {
+    FUZZY_DISTANCES_COMPUTED.with(|count| count.set(count.get() + 1));
 }
 
 fn query_tokens_to_vec(tokens: &Tokens) -> Vec<String> {
@@ -2746,14 +2791,49 @@ impl FtsMemIndex {
                 matches.insert(key.to_string(), dist);
             }
         }
+        // A partition's dictionary is an FST, so a Levenshtein automaton
+        // yields only the terms within `max_distance`, as the committed index
+        // does. Without one, every partition term with the prefix is checked.
+        let prefixed_terms = st
+            .partitions
+            .iter()
+            .map(|p| p.count_terms_with_prefix(prefix))
+            .sum();
+        let automaton = fuzzy_automaton(term, max_distance, prefixed_terms);
         for p in st.partitions.iter() {
-            for key in p.collect_terms() {
-                if !key.starts_with(prefix) {
-                    continue;
+            match &automaton {
+                Some(automaton) => {
+                    let mut stream = p
+                        .term_fst
+                        .search(automaton.intersection(Str::new(prefix).starts_with()))
+                        .into_stream();
+                    // Matches stream in term order, and only the
+                    // `max_expansions` smallest are kept overall.
+                    let mut kept = 0;
+                    while kept < max_expansions
+                        && let Some((key, _)) = stream.next()
+                    {
+                        let key = std::str::from_utf8(key).expect("FTS terms are UTF-8");
+                        #[cfg(test)]
+                        count_fuzzy_distance_computed();
+                        matches.insert(key.to_string(), levenshtein_distance(term, key));
+                        kept += 1;
+                    }
                 }
-                let dist = levenshtein_distance(term, key.as_ref());
-                if dist <= max_distance {
-                    matches.insert(key.to_string(), dist);
+                None => {
+                    let mut stream = p
+                        .term_fst
+                        .search(Str::new(prefix).starts_with())
+                        .into_stream();
+                    while let Some((key, _)) = stream.next() {
+                        let key = std::str::from_utf8(key).expect("FTS terms are UTF-8");
+                        #[cfg(test)]
+                        count_fuzzy_distance_computed();
+                        let dist = levenshtein_distance(term, key);
+                        if dist <= max_distance {
+                            matches.insert(key.to_string(), dist);
+                        }
+                    }
                 }
             }
         }
@@ -4467,7 +4547,7 @@ impl Partition {
     }
 
     /// All terms, indexed by term id (recovered from the FST). Used by the
-    /// flush, merge, and fuzzy-expansion paths; not on the hot search path.
+    /// flush and merge paths; not on the hot search path.
     fn collect_terms(&self) -> Vec<Arc<str>> {
         let mut out: Vec<Arc<str>> = vec![Arc::from(""); self.term_fst.len()];
         let mut stream = self.term_fst.stream();
@@ -4475,6 +4555,29 @@ impl Partition {
             out[id as usize] = Arc::from(std::str::from_utf8(key).expect("utf8 term"));
         }
         out
+    }
+
+    /// Number of terms that start with `prefix`. Term ids are dense and follow
+    /// term order, so this is the difference between the ids of the first
+    /// terms at or after `prefix` and after every term with it, found without
+    /// walking the terms in between.
+    fn count_terms_with_prefix(&self, prefix: &str) -> usize {
+        if prefix.is_empty() {
+            return self.term_fst.len();
+        }
+        let first_id_at_or_after = |key: &[u8]| {
+            self.term_fst
+                .range()
+                .ge(key)
+                .into_stream()
+                .next()
+                .map_or(self.term_fst.len(), |(_, id)| id as usize)
+        };
+        // A UTF-8 term never contains the byte 0xFF, so every term with the
+        // prefix sorts before the prefix followed by 0xFF.
+        let mut end = prefix.as_bytes().to_vec();
+        end.push(0xFF);
+        first_id_at_or_after(&end) - first_id_at_or_after(prefix.as_bytes())
     }
 
     /// Exact upper bound on a term's BM25 contribution to any doc: the max over
@@ -6850,6 +6953,185 @@ mod tests {
 
         let matches = index.expand_fuzzy("a", 10, 3);
         assert!(matches.len() <= 3);
+    }
+
+    #[rstest]
+    #[case::two_edits("bravo", 2, 10_000, true)]
+    #[case::small_dictionary("bravo", 2, 100, false)]
+    #[case::no_partitions("bravo", 2, 0, false)]
+    #[case::non_ascii("café", 1, usize::MAX, false)]
+    #[case::longest_term(
+        "bravobravobravobravobravobravobravobravobravobravobravobravobrav",
+        1,
+        usize::MAX,
+        true
+    )]
+    #[case::too_long(
+        "bravobravobravobravobravobravobravobravobravobravobravobravobravo",
+        1,
+        usize::MAX,
+        false
+    )]
+    #[case::too_many_states("bravobravobravob", 3, usize::MAX, false)]
+    fn test_fuzzy_automaton_bounds(
+        #[case] term: &str,
+        #[case] max_distance: u32,
+        #[case] prefixed_terms: usize,
+        #[case] builds: bool,
+    ) {
+        assert_eq!(
+            fuzzy_automaton(term, max_distance, prefixed_terms).is_some(),
+            builds
+        );
+    }
+
+    #[rstest]
+    #[case::empty("", 7)]
+    #[case::shared("bra", 3)]
+    #[case::whole_term("brave", 2)]
+    #[case::longer_than_a_term("bravest", 0)]
+    #[case::before_all("a", 0)]
+    #[case::between_terms("zz", 0)]
+    #[case::shared_with_non_ascii_term("caf", 2)]
+    #[case::non_ascii("ü", 1)]
+    #[case::after_all("ž", 0)]
+    fn test_count_terms_with_prefix(#[case] prefix: &str, #[case] expected: usize) {
+        let terms = [
+            "banana", "brava", "brave", "bravery", "cafe", "café", "über",
+        ];
+        let mut docs = DocSet::default();
+        docs.append(0, terms.len() as u32);
+        let entries = terms
+            .iter()
+            .map(|term| (Arc::from(*term), vec![(0, 1, vec![0])]))
+            .collect();
+        let partition = build_partition(entries, docs);
+        assert_eq!(partition.count_terms_with_prefix(prefix), expected);
+    }
+
+    /// Partitions expand an ASCII term with a Levenshtein automaton over their
+    /// term FST; the result must equal a scan of every dictionary term,
+    /// including non-ASCII terms, prefix lengths, and a `max_expansions` cap.
+    #[rstest]
+    #[case::one_edit("cafe", 1, 0, 50, 2_000, true)]
+    #[case::two_edits("bravo", 2, 0, 50, 2_000, true)]
+    #[case::prefix("bravo", 2, 1, 50, 2_000, true)]
+    #[case::capped("cafe", 2, 0, 3, 2_000, true)]
+    #[case::non_ascii_query("café", 1, 0, 50, 2_000, false)]
+    // Too few terms to pay for building the automaton.
+    #[case::small_dictionary("bravo", 2, 0, 50, 0, false)]
+    // Plenty of terms, but few of them with the prefix.
+    #[case::few_prefixed_terms("cafe", 2, 1, 50, 2_000, false)]
+    fn test_expand_fuzzy_matches_dictionary_scan(
+        #[case] term: &str,
+        #[case] max_distance: u32,
+        #[case] prefix_length: u32,
+        #[case] max_expansions: usize,
+        #[case] fillers_per_partition: usize,
+        #[case] uses_automaton: bool,
+    ) {
+        let schema = create_test_schema();
+        let params = InvertedIndexParams::default()
+            .ascii_folding(false)
+            .stem(false)
+            .remove_stop_words(false);
+        let mut index = FtsMemIndex::with_params(1, "description".to_string(), params)
+            .with_freeze_threshold_rows(1);
+        let rows = [
+            "cafe café cave care face cafes bravo brave bravos grave crave",
+            "cafe cake safe caff brava bravi bravo drove über uber naïve naive banana cucumber",
+            "zebra cafeteria calf cage bravado bravery bravobravobravo",
+        ];
+        let batch = |text: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec![text])),
+                ],
+            )
+            .unwrap()
+        };
+        // Far from every query term, these only grow the dictionary, and the
+        // set of terms starting with "b".
+        let fillers: Vec<String> = (0..fillers_per_partition)
+            .map(|i| format!("b{i:05}"))
+            .collect();
+        let fillers = fillers.join(" ");
+        // The first two rows freeze into separate partitions, the third stays
+        // in the tail.
+        index
+            .insert(&batch(&format!("{} {fillers}", rows[0])), 0)
+            .unwrap();
+        index
+            .insert(&batch(&format!("{} {fillers}", rows[1])), 1)
+            .unwrap();
+        index.freeze_threshold_rows = usize::MAX;
+        index.insert(&batch(rows[2]), 2).unwrap();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 2);
+
+        let prefix = char_prefix(term, prefix_length);
+        let mut dictionary: BTreeMap<String, u32> = BTreeMap::new();
+        let tail_terms = st.tail.terms.iter().map(|entry| entry.key().to_string());
+        let partition_terms = st
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.collect_terms())
+            .map(|key| key.to_string());
+        for key in tail_terms.chain(partition_terms) {
+            let distance = levenshtein_distance(term, &key);
+            if key.starts_with(prefix) && distance <= max_distance {
+                dictionary.insert(key, distance);
+            }
+        }
+        let expected: Vec<(String, u32)> = dictionary.into_iter().take(max_expansions).collect();
+        assert!(!expected.is_empty());
+
+        FUZZY_DISTANCES_COMPUTED.with(|count| count.set(0));
+        let expanded =
+            index.expand_fuzzy_term(&st, term, max_distance, prefix_length, max_expansions, true);
+        assert_eq!(expanded, expected);
+
+        // The automaton reaches only the matching partition terms; the
+        // fallback scans every partition term with the prefix.
+        let partition_matches: usize = st
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .collect_terms()
+                    .iter()
+                    .filter(|key| {
+                        key.starts_with(prefix) && levenshtein_distance(term, key) <= max_distance
+                    })
+                    .count()
+                    .min(max_expansions)
+            })
+            .sum();
+        let partition_terms: usize = st
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .collect_terms()
+                    .iter()
+                    .filter(|key| key.starts_with(prefix))
+                    .count()
+            })
+            .sum();
+        // Otherwise the count cannot tell the two paths apart.
+        assert_ne!(partition_matches, partition_terms);
+        let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
+        assert_eq!(
+            fuzzy_automaton(term, max_distance, partition_terms).is_some(),
+            uses_automaton
+        );
+        if uses_automaton {
+            assert_eq!(computed, partition_matches);
+        } else {
+            assert_eq!(computed, partition_terms);
+        }
     }
 
     #[test]
