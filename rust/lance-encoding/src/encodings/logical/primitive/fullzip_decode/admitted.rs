@@ -13,7 +13,7 @@ use super::VariableFullZipDecodeTask;
 use crate::{
     data::{BlockInfo, VariableWidthBlock},
     decoder::DecodedPage,
-    repdef::{RepDefUnraveler, max_visible_level},
+    repdef::{ControlWordParser, RepDefUnraveler, max_visible_level},
 };
 
 fn copy_levels(
@@ -37,8 +37,18 @@ pub(super) fn decode(
     task: &VariableFullZipDecodeTask,
     workspace: &mut Reservation,
 ) -> Result<Option<DecodedPage>> {
-    let rep = (!task.rep.is_empty()).then_some(task.rep.as_ref());
-    let def = (!task.def.is_empty()).then_some(task.def.as_ref());
+    // An empty selection still has the encoded structural streams. Keep their
+    // presence so list reconstruction can emit its leading zero offset.
+    let parser = task.details.ctrl_word_parser;
+    let has_def = !matches!(
+        parser,
+        ControlWordParser::NIL
+            | ControlWordParser::REP8
+            | ControlWordParser::REP16
+            | ControlWordParser::REP32
+    );
+    let rep = (parser.has_rep() || !task.rep.is_empty()).then_some(task.rep.as_ref());
+    let def = (has_def || !task.def.is_empty()).then_some(task.def.as_ref());
     RepDefUnraveler::validate_dense_levels(rep, def, &task.details.def_meaning)?;
     let max_visible = max_visible_level(&task.details.def_meaning);
     if task.details.max_visible_def != max_visible {

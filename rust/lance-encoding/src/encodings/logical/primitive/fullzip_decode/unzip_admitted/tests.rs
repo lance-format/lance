@@ -244,7 +244,7 @@ fn fullzip_range_unzip_bounds_physical_overlap_and_semantics(
     let mut work = pool.try_reserve(stage_bytes + decode_bytes).unwrap();
     let task = f
         .scheduler
-        .try_unzip_range_in(&input, 4, range.clone(), &mut work)
+        .try_unzip_range_in(&input, 4, range, &mut work)
         .unwrap()
         .unwrap();
     assert_eq!(work.len(), decode_bytes);

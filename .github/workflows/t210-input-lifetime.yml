@@ -24,10 +24,12 @@ jobs:
       - name: Selected FullZip unzip and task composition
         run: |
           cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::admitted::tests -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --doc try_unzip_range_in -- --nocapture
       - name: Optional feature independence
         run: |
           cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::unzip_admitted::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib fullzip_decode::admitted::tests -- --nocapture
       - name: Lint touched crate
         if: ${{ !cancelled() }}
         run: |
