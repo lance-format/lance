@@ -35,6 +35,8 @@ use crate::{
     writer::FileWriterOptions,
 };
 
+mod scan;
+
 fn array(page: usize, depth: usize) -> ArrayRef {
     let values = (0..8)
         .map(|row| match row {
@@ -88,14 +90,6 @@ async fn fixture_arrays(
     lite: bool,
     arrays: Vec<ArrayRef>,
 ) -> (FsFixture, FileReader) {
-    let mut fs = FsFixture::default();
-    fs.scheduler = ScanScheduler::new(
-        fs.object_store.clone(),
-        SchedulerConfig {
-            io_buffer_size_bytes: 1024,
-            use_lite_scheduler: Some(lite),
-        },
-    );
     let schema = Arc::new(Schema::new(vec![
         Field::new("payload", arrays[0].data_type().clone(), true).with_metadata(HashMap::from([
             (
@@ -107,9 +101,27 @@ async fn fixture_arrays(
     let batches = arrays
         .into_iter()
         .map(|array| RecordBatch::try_new(schema.clone(), vec![array]))
-        .collect::<Vec<_>>();
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    fixture_batches(version, lite, batches).await
+}
+
+async fn fixture_batches(
+    version: ConcreteFileVersion,
+    lite: bool,
+    batches: Vec<RecordBatch>,
+) -> (FsFixture, FileReader) {
+    let mut fs = FsFixture::default();
+    fs.scheduler = ScanScheduler::new(
+        fs.object_store.clone(),
+        SchedulerConfig {
+            io_buffer_size_bytes: 1024,
+            use_lite_scheduler: Some(lite),
+        },
+    );
+    let schema = batches[0].schema();
     write_lance_file(
-        RecordBatchIterator::new(batches, schema),
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
         &fs,
         version,
         FileWriterOptions {

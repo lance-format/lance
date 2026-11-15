@@ -124,6 +124,24 @@ impl<'a> Shape<'a> {
 }
 
 impl FullZipScheduler {
+    /// Validate the Arrow shape and structural unzip metadata without I/O.
+    /// This does not validate payload framing or data-dependent codec support.
+    /// File-level cursors use this before returning any batch from a selection.
+    ///
+    /// ```
+    /// use arrow_schema::DataType;
+    /// use lance_core::Result;
+    /// use lance_encoding::encodings::logical::primitive::FullZipScheduler;
+    /// fn validate(decoder: &FullZipScheduler, ty: &DataType) -> Result<()> {
+    ///     decoder.validate_array_type(ty)
+    /// }
+    /// ```
+    pub fn validate_array_type(&self, data_type: &DataType) -> Result<()> {
+        Shape::new(self, data_type)?;
+        self.plan_unzip_range(&[], 0, 0..0)?;
+        Ok(())
+    }
+
     /// Read a fitting prefix and finish its Arrow reconstruction in one admission.
     ///
     /// Supports Binary/Utf8/LargeBinary/LargeUtf8 leaves nested in List/LargeList.
