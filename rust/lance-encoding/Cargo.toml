@@ -38,7 +38,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 bytemuck.workspace = true
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
-zstd = { version = "0.14", optional = true }
+zstd = { version = "0.14", optional = true, features = ["experimental"] }
 # The Pcodec spec pins the chunk payload to the format written by pco 1.0.
 pco = { version = "~1.0.4", optional = true }
 

@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! General per-value decode with exact output and caller-owned codec context.
+
+use arrow_buffer::Buffer;
+use lance_core::{Error, Result, utils::allocation::Reservation};
+
+use super::CompressionScheme;
+use crate::{
+    buffer::LanceBuffer,
+    compression::{MiniBlockOutputLayout, PerValueDecodeBudget, variable},
+    data::{BlockInfo, DataBlock, VariableWidthBlock},
+};
+
+fn context_bytes(scheme: CompressionScheme) -> Result<usize> {
+    match scheme {
+        CompressionScheme::None => Ok(0),
+        #[cfg(feature = "lz4")]
+        CompressionScheme::Lz4 => Ok(0),
+        #[cfg(feature = "zstd")]
+        CompressionScheme::Zstd => {
+            // SAFETY: this pure size query has no pointer arguments or allocations.
+            Ok(unsafe { ::zstd::zstd_safe::zstd_sys::ZSTD_estimateDCtxSize() })
+        }
+        _ => Err(Error::not_supported(
+            "general per-value codec is not enabled",
+        )),
+    }
+}
+
+// Empty slots represent empty/null values and have no codec frame. Nonempty
+// frames retain the current writer's framing; no unadmitted fallback is used.
+fn frame(scheme: CompressionScheme, input: &[u8]) -> Result<(&[u8], usize)> {
+    if input.is_empty() {
+        return Ok((input, 0));
+    }
+    match scheme {
+        CompressionScheme::None => Ok((input, input.len())),
+        #[cfg(feature = "lz4")]
+        CompressionScheme::Lz4 => {
+            let prefix = input.get(..4).ok_or_else(|| {
+                Error::invalid_input("LZ4 per-value frame is missing its length prefix")
+            })?;
+            let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
+            super::admitted::validate_lz4(input, len)?;
+            Ok((input, len))
+        }
+        #[cfg(feature = "zstd")]
+        CompressionScheme::Zstd => {
+            let raw = super::zstd::ZstdBufferCompressor::new(0).is_raw_stream_format(input);
+            let (compressed, declared) = if raw {
+                (input, None)
+            } else {
+                let prefix = input.get(..8).ok_or_else(|| {
+                    Error::invalid_input("Zstd per-value frame is missing its length prefix")
+                })?;
+                (
+                    &input[8..],
+                    Some(u64::from_le_bytes(prefix.try_into().unwrap())),
+                )
+            };
+            let frame_size = ::zstd::zstd_safe::find_frame_compressed_size(compressed)
+                .map_err(|code| Error::invalid_input(::zstd::zstd_safe::get_error_name(code)))?;
+            if frame_size != compressed.len() {
+                return Err(Error::not_supported(
+                    "admitted per-value Zstd requires one complete frame",
+                ));
+            }
+            let content = ::zstd::zstd_safe::get_frame_content_size(compressed)
+                .map_err(|_| Error::invalid_input("invalid Zstd content size"))?;
+            if let (Some(declared), Some(content)) = (declared, content)
+                && declared != content
+            {
+                return Err(Error::invalid_input(
+                    "Zstd prefix disagrees with frame content size",
+                ));
+            }
+            let len = declared.or(content).ok_or_else(|| {
+                Error::not_supported("admitted raw Zstd needs a known frame content size")
+            })?;
+            let len = usize::try_from(len)
+                .map_err(|_| Error::invalid_input("Zstd output length does not fit usize"))?;
+            Ok((compressed, len))
+        }
+        _ => Err(Error::not_supported(
+            "general per-value codec is not enabled",
+        )),
+    }
+}
+
+pub(super) fn plan(
+    scheme: CompressionScheme,
+    data: &VariableWidthBlock,
+) -> Result<PerValueDecodeBudget> {
+    let scratch = context_bytes(scheme)?;
+    let mut payload = 0_usize;
+    variable::visit(data, &mut |input| {
+        payload = payload
+            .checked_add(frame(scheme, input)?.1)
+            .ok_or_else(|| Error::invalid_input("general per-value output size overflows"))?;
+        Ok(())
+    })?;
+    let output_bytes = payload
+        .checked_add(data.offsets.len())
+        .ok_or_else(|| Error::invalid_input("general per-value allocation size overflows"))?;
+    MiniBlockOutputLayout::VariableWidth {
+        bits_per_offset: data.bits_per_offset,
+    }
+    .validate_range_bytes(data.num_values, output_bytes)?;
+    let workspace_bytes = output_bytes
+        .checked_add(scratch)
+        .ok_or_else(|| Error::invalid_input("general per-value workspace size overflows"))?;
+    Ok(PerValueDecodeBudget {
+        output_bytes,
+        workspace_bytes,
+    })
+}
+
+#[cfg(feature = "zstd")]
+fn zstd_into(input: &[u8], output: &mut [u8], context: &mut [u8]) -> Result<()> {
+    use ::zstd::zstd_safe::zstd_sys;
+    // SAFETY: Reservation supplies exclusive, 64-byte-aligned storage, sized by
+    // ZSTD_estimateDCtxSize. It outlives the context and synchronous decode. Input,
+    // output and context are disjoint live slices. Static DCtx never allocates or
+    // resizes; it errors if more memory is needed. No dictionary/streaming/legacy
+    // context is installed. Reinitialization permits scratch reuse across values.
+    let written = unsafe {
+        let ctx = zstd_sys::ZSTD_initStaticDCtx(context.as_mut_ptr().cast(), context.len());
+        if ctx.is_null() {
+            return Err(Error::internal("Zstd rejected the admitted static context"));
+        }
+        zstd_sys::ZSTD_decompressDCtx(
+            ctx,
+            output.as_mut_ptr().cast(),
+            output.len(),
+            input.as_ptr().cast(),
+            input.len(),
+        )
+    };
+    // SAFETY: the return-code predicate has no pointer arguments.
+    if unsafe { zstd_sys::ZSTD_isError(written) } != 0 {
+        return Err(Error::invalid_input(::zstd::zstd_safe::get_error_name(
+            written,
+        )));
+    }
+    if written != output.len() {
+        return Err(Error::invalid_input(
+            "Zstd produced a different per-value length",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_frame(
+    scheme: CompressionScheme,
+    input: &[u8],
+    output: &mut [u8],
+    _context: &mut [u8],
+) -> Result<()> {
+    match scheme {
+        CompressionScheme::None => {
+            output.copy_from_slice(input);
+            Ok(())
+        }
+        #[cfg(feature = "lz4")]
+        CompressionScheme::Lz4 => super::admitted::lz4_into(input, output),
+        #[cfg(feature = "zstd")]
+        CompressionScheme::Zstd => zstd_into(input, output, _context),
+        _ => Err(Error::not_supported(
+            "general per-value codec is not enabled",
+        )),
+    }
+}
+
+pub(super) fn decode(
+    scheme: CompressionScheme,
+    data: &VariableWidthBlock,
+    workspace: &mut Reservation,
+) -> Result<Option<DataBlock>> {
+    let budget = plan(scheme, data)?;
+    if budget.workspace_bytes > workspace.len() {
+        return Ok(None);
+    }
+    let mut offsets = workspace
+        .try_allocate(data.offsets.len())?
+        .ok_or_else(|| Error::internal("general offsets exceeded complete admission"))?;
+    let mut values = match workspace.try_allocate(budget.output_bytes - data.offsets.len()) {
+        Ok(Some(value)) => value,
+        other => {
+            offsets.recycle(workspace)?;
+            return other.map(|_| None);
+        }
+    };
+    let mut context = match workspace.try_allocate(budget.workspace_bytes - budget.output_bytes) {
+        Ok(Some(context)) => context,
+        other => {
+            offsets.recycle(workspace)?;
+            values.recycle(workspace)?;
+            return other.map(|_| None);
+        }
+    };
+    let width = usize::from(data.bits_per_offset / 8);
+    offsets.as_mut()[..width].fill(0);
+    let mut row = 0;
+    let mut written = 0;
+    let result = variable::visit(data, &mut |input| {
+        let (compressed, len) = frame(scheme, input)?;
+        let end = written + len; // the immutable input was fully checked by plan
+        let output = &mut values.as_mut()[written..end];
+        if !input.is_empty() {
+            decode_frame(scheme, compressed, output, context.as_mut())?;
+        }
+        written = end;
+        row += 1;
+        offsets.as_mut()[row * width..(row + 1) * width]
+            .copy_from_slice(&(written as u64).to_le_bytes()[..width]);
+        Ok(())
+    });
+    context.recycle(workspace)?;
+    if let Err(error) = result {
+        offsets.recycle(workspace)?;
+        values.recycle(workspace)?;
+        return Err(error);
+    }
+    Ok(Some(DataBlock::VariableWidth(VariableWidthBlock {
+        data: LanceBuffer::from(Buffer::from(values.freeze())),
+        offsets: LanceBuffer::from(Buffer::from(offsets.freeze())),
+        bits_per_offset: data.bits_per_offset,
+        num_values: data.num_values,
+        block_info: BlockInfo::new(),
+    })))
+}
+
+#[cfg(test)]
+mod tests;

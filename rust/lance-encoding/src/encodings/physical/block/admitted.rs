@@ -32,6 +32,19 @@ pub(super) fn lz4(
     expected: usize,
     workspace: &mut Reservation,
 ) -> Result<Option<ReservedBuffer>> {
+    validate_lz4(input, expected)?;
+    let Some(mut output) = workspace.try_allocate(expected)? else {
+        return Ok(None);
+    };
+    if let Err(error) = lz4_into(input, output.as_mut()) {
+        output.recycle(workspace)?;
+        return Err(error);
+    }
+    Ok(Some(output))
+}
+
+#[cfg(feature = "lz4")]
+pub(super) fn validate_lz4(input: &[u8], expected: usize) -> Result<()> {
     let prefix: [u8; 4] = input
         .get(..4)
         .and_then(|prefix| prefix.try_into().ok())
@@ -54,14 +67,18 @@ pub(super) fn lz4(
             "LZ4 frame exceeds the codec's size bounds",
         ));
     }
-    let Some(mut output) = workspace.try_allocate(expected)? else {
-        return Ok(None);
-    };
+    Ok(())
+}
+
+#[cfg(feature = "lz4")]
+pub(super) fn lz4_into(input: &[u8], output: &mut [u8]) -> Result<()> {
+    let expected = output.len();
+    validate_lz4(input, expected)?;
     // lz4 1.28.1 calls LZ4_decompress_safe (no dictionary/context allocation).
     // It writes only to this caller-owned slice. Errors may leave a partial prefix,
     // so recycle the exclusive buffer before exposing either bytes or an error.
-    let decoded = ::lz4::block::decompress_to_buffer(input, None, output.as_mut());
-    let result = match decoded {
+    let decoded = ::lz4::block::decompress_to_buffer(input, None, output);
+    match decoded {
         Ok(written) if written == expected => Ok(()),
         Ok(written) => Err(Error::invalid_input(format!(
             "LZ4 produced {written} bytes, expected {expected}"
@@ -69,12 +86,7 @@ pub(super) fn lz4(
         Err(error) => Err(Error::invalid_input(format!(
             "LZ4 decompression error: {error}"
         ))),
-    };
-    if let Err(error) = result {
-        output.recycle(workspace)?;
-        return Err(error);
     }
-    Ok(Some(output))
 }
 
 #[cfg(test)]

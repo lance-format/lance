@@ -45,6 +45,7 @@ use crate::{
 };
 
 mod admitted;
+mod per_value_admitted;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompressionConfig {
@@ -302,7 +303,7 @@ mod zstd {
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
-        fn is_raw_stream_format(&self, input_buf: &[u8]) -> bool {
+        pub(super) fn is_raw_stream_format(&self, input_buf: &[u8]) -> bool {
             if input_buf.len() < 8 {
                 return true; // can't be length prefixed format if less than 8 bytes
             }
@@ -1163,6 +1164,21 @@ impl PerValueCompressor for CompressedBufferEncoder {
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    fn plan_decode(
+        &self,
+        data: &VariableWidthBlock,
+    ) -> Result<crate::compression::PerValueDecodeBudget> {
+        per_value_admitted::plan(self.compressor.config().scheme(), data)
+    }
+
+    fn try_decompress_in(
+        &self,
+        data: &VariableWidthBlock,
+        workspace: &mut Reservation,
+    ) -> Result<Option<DataBlock>> {
+        per_value_admitted::decode(self.compressor.config().scheme(), data, workspace)
+    }
+
     fn allocates_output(&self) -> bool {
         true
     }

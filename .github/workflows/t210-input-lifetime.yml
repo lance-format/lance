@@ -26,7 +26,14 @@ jobs:
           LANCE_CPU_THREADS: 1
         run: |
           cargo test --profile ci --locked -p lance-file --example admitted_fullzip -- --nocapture
+      - name: General per-value admission and shared buffer regressions
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib encodings::physical::block:: -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --no-default-features --lib encodings::physical::block:: -- --nocapture
       - name: Lint touched crate and harness
         if: ${{ !cancelled() }}
         run: |
           cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding --all-features --all-targets --no-deps -- -D warnings

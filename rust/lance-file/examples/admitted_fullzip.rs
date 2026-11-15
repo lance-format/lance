@@ -452,7 +452,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn writer_and_both_readers_validate_all_payloads(
-        #[values(64, 8192)] bytes: usize,
+        #[values(64, 8192, 131072)] bytes: usize,
         #[values(false, true)] lite: bool,
     ) {
         let tmp = TempDir::default();
@@ -462,7 +462,11 @@ mod tests {
             admitted: false,
             expected_rows: 32,
             max_rows: 8,
-            workspace: 512 * 1024,
+            workspace: if bytes > 8192 {
+                4 * 1024 * 1024
+            } else {
+                512 * 1024
+            },
             value_bytes: bytes,
             full_verify: true,
             delay_ms: 0,
