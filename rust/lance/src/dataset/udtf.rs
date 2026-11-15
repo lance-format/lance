@@ -7,12 +7,15 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion_expr::{Expr, TableType};
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::projection::ProjectionExec;
 use lance_arrow::SchemaExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::SCORE_FIELD;
 use lance_index::scalar::inverted::parser::from_json;
+use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -37,22 +40,27 @@ impl FtsTableProvider {
         with_row_id: bool,
         with_row_addr: bool,
         ordered: bool,
-    ) -> Self {
-        let mut full_schema = Schema::from(dataset.schema())
-            .try_with_column(SCORE_FIELD.clone())
-            .unwrap();
+    ) -> datafusion::common::Result<Self> {
+        let dataset_schema = Schema::from(dataset.schema());
+        if dataset_schema.column_with_name(SCORE_COL).is_some() {
+            return Err(DataFusionError::Plan(format!(
+                "fts() returns a {SCORE_COL} column, which conflicts with the dataset column \
+                 of the same name"
+            )));
+        }
+        let mut full_schema = dataset_schema.try_with_column(SCORE_FIELD.clone())?;
         if with_row_id {
-            full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
+            full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone())?;
         }
         if with_row_addr {
-            full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+            full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
         }
-        Self {
+        Ok(Self {
             dataset,
             fts_query,
             full_schema: Arc::new(full_schema),
             ordered,
-        }
+        })
     }
 }
 
@@ -75,8 +83,6 @@ impl TableProvider for FtsTableProvider {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
         scan.full_text_search(self.fts_query.clone())?;
-        // Project exactly the requested columns, in the requested order, so
-        // the plan's schema is the one DataFusion asked for.
         let columns: Vec<&str> = match projection {
             Some(projection) => projection
                 .iter()
@@ -109,7 +115,27 @@ impl TableProvider for FtsTableProvider {
         scan.limit(limit.map(|l| l as i64), None)?;
         scan.scan_in_order(self.ordered);
 
-        scan.create_plan().await.map_err(DataFusionError::from)
+        // DataFusion reads the scan's output by position, so it must have
+        // exactly the requested columns. A list-element query also outputs
+        // `_doc_index`, which this table does not expose.
+        let plan = scan.create_plan().await.map_err(DataFusionError::from)?;
+        let plan_schema = plan.schema();
+        if plan_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .eq(columns.iter().copied())
+        {
+            return Ok(plan);
+        }
+        let exprs = columns
+            .iter()
+            .map(|name| {
+                let column = Column::new_with_schema(name, plan_schema.as_ref())?;
+                Ok((Arc::new(column) as Arc<dyn PhysicalExpr>, name.to_string()))
+            })
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
+        Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
     }
 }
 
@@ -198,7 +224,7 @@ impl TableFunctionImpl for FtsQueryUDTF {
             with_row_id,
             with_row_addr,
             ordered,
-        );
+        )?;
         Ok(Arc::new(provider))
     }
 }
@@ -255,15 +281,17 @@ mod tests {
     use crate::dataset::udtf::{FtsQueryUDTFBuilder, parse_query_options};
     use crate::index::DatasetIndexExt;
     use arrow::compute::concat_batches;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
     use arrow_array::{
-        Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_index::IndexType;
     use lance_index::scalar::InvertedIndexParams;
+    use lance_index::scalar::inverted::DocumentGranularity;
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -378,6 +406,107 @@ mod tests {
         let results = sql(format!("SELECT _score FROM {fts}")).await;
         assert_eq!(results[0].num_columns(), 1);
         assert_eq!(results[0]["_score"].data_type(), &DataType::Float32);
+    }
+
+    #[tokio::test]
+    async fn test_fts_query_udtf_list_element() {
+        // A list-element query also outputs `_doc_index`, which the table
+        // does not expose.
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for row in [&["cat fish", "dog"][..], &["bird"], &["fish"]] {
+            for value in row {
+                tags.values().append_value(value);
+            }
+            tags.append(true);
+        }
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+            ("tags", Arc::new(tags.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let mut data = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        data.create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
+            true,
+        )
+        .await
+        .unwrap();
+        let ctx = SessionContext::new();
+        let udtf = FtsQueryUDTFBuilder::builder()
+            .register_table("t", Arc::new(data))
+            .build();
+        ctx.register_udtf("fts", Arc::new(udtf));
+        let fts = r#"fts('t', '{"match": {"column": "tags", "terms": "fish", "document_granularity": "list_element"}}')"#;
+
+        let results = ctx
+            .sql(&format!("SELECT count(*) AS n FROM {fts}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(results[0]["n"].as_primitive::<Int64Type>().value(0), 2);
+
+        let results = ctx
+            .sql(&format!("SELECT * FROM {fts} ORDER BY id"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let results = concat_batches(&results[0].schema(), &results).unwrap();
+        let schema = results.schema();
+        let names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(names, ["id", "tags", "_score"]);
+        assert_eq!(results["id"].as_primitive::<Int32Type>().values(), &[1, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_fts_query_udtf_rejects_score_column() {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "text",
+                Arc::new(StringArray::from(vec!["a cat"])) as ArrayRef,
+            ),
+            ("_score", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let data = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let ctx = SessionContext::new();
+        let udtf = FtsQueryUDTFBuilder::builder()
+            .register_table("t", Arc::new(data))
+            .build();
+        ctx.register_udtf("fts", Arc::new(udtf));
+        let err = ctx
+            .sql(r#"SELECT * FROM fts('t', '{"match": {"column": "text", "terms": "cat"}}')"#)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicts with the dataset column"),
+            "{err}"
+        );
     }
 
     #[rstest]
