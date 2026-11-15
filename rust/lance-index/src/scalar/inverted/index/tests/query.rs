@@ -2455,7 +2455,7 @@ async fn selective_phrase_whole_positions_match_committed_arrow_streams() -> Res
     let dir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::with_format_version(
         Arc::new(ObjectStore::local()),
-        dir,
+        dir.clone(),
         Arc::new(LanceCache::no_cache()),
         lance_file::version::ConcreteFileVersion::V2_2,
     ));
