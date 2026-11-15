@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::selective_phrase::{PhraseProgress, PhraseSearch, PositionWindow};
 use super::tests::{UnitScorer, generate_posting_list_with_positions};
 use super::*;
 use crate::metrics::NoOpMetricsCollector;
@@ -387,5 +388,126 @@ fn selective_phrase_doc_ranges_preserve_membership_and_scores(
     let error = search.with_doc_range(0..400).err().unwrap();
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("after search starts"));
+    Ok(())
+}
+
+/// A failed rare-term alignment proves the whole phrase false. The much
+/// larger final clause must not require position I/O in that case.
+#[rstest]
+fn selective_phrase_does_not_read_a_rejected_follower(
+    #[values(PositionStreamCodec::VarintDocDelta, PositionStreamCodec::PackedDelta)]
+    codec: PositionStreamCodec,
+    #[values(false, true)] matches: bool,
+) -> Result<()> {
+    let docs = unit_length_docs(1);
+    let positions = [
+        vec![0],
+        vec![if matches { 1 } else { 3 }],
+        (0..2048).map(|index| index * 3 + 2).collect::<Vec<_>>(),
+    ];
+    let build = || {
+        positions
+            .iter()
+            .enumerate()
+            .map(|(term, values)| {
+                let mut list =
+                    generate_posting_list_with_positions(vec![0], vec![values.clone()], 1.0, true);
+                let PostingList::Compressed(list) = &mut list else {
+                    unreachable!()
+                };
+                let mut bytes = Vec::new();
+                encode_position_stream_block_into(
+                    values,
+                    &[values.len() as u32],
+                    codec,
+                    &mut bytes,
+                )
+                .unwrap();
+                list.positions = Some(CompressedPositionStorage::SharedStream(
+                    SharedPositionStream::new(codec, vec![0], bytes::Bytes::from(bytes)),
+                ));
+                PostingIterator::with_query_weight(
+                    "term".into(),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    PostingList::Compressed(list.clone()),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let params = FtsSearchParams::default()
+        .with_limit(Some(10))
+        .with_phrase_slop(Some(0));
+    let metrics = NoOpMetricsCollector;
+    let mut ordinary = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+        .with_bulk_and_mode(BulkAndMode::Off);
+    let expected = ordinary.search(&params, &metrics)?;
+    assert_eq!(expected.len(), usize::from(matches));
+    let sources = build()
+        .into_iter()
+        .map(|posting| {
+            let PostingList::Compressed(list) = posting.list else {
+                unreachable!()
+            };
+            let Some(CompressedPositionStorage::SharedStream(stream)) = list.positions else {
+                unreachable!()
+            };
+            (posting.token_id, stream)
+        })
+        .collect::<Vec<_>>();
+    let mut search = PhraseSearch::new(build(), 10)?;
+    let floor = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+    let mut read_final_clause = false;
+    let actual = loop {
+        match search.advance(&docs, UnitScorer, floor.clone(), &metrics)? {
+            PhraseProgress::Done(hits) => break hits,
+            PhraseProgress::Read(requests) => {
+                for request in requests {
+                    assert!(
+                        matches || request.token_id != 2,
+                        "a rejected rare-term alignment must not read the final clause"
+                    );
+                    read_final_clause |= request.token_id == 2;
+                    let source = &sources
+                        .iter()
+                        .find(|(token, _)| *token == request.token_id)
+                        .unwrap()
+                        .1;
+                    search.supply(
+                        request,
+                        PositionWindow {
+                            first_block: 0,
+                            codec,
+                            offsets: Arc::from(vec![0].into_boxed_slice()),
+                            bytes: Arc::from(source.bytes()),
+                        },
+                    )?;
+                }
+            }
+        }
+    };
+    assert_eq!(read_final_clause, matches);
+    assert_eq!(actual.len(), usize::from(matches));
+    assert_eq!(
+        actual
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>()
+    );
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(actual.document, expected.document);
+        assert_eq!(actual.doc_length, expected.doc_length);
+        let mut actual_freqs = actual.freqs.clone();
+        let mut expected_freqs = expected.freqs.clone();
+        actual_freqs.sort_unstable();
+        expected_freqs.sort_unstable();
+        assert_eq!(actual_freqs, expected_freqs);
+    }
     Ok(())
 }
