@@ -44,13 +44,24 @@ async fn admitted_scan_advances_without_reading_skipped_pages(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
 ) {
-    let constant: ArrayRef = Arc::new(LargeBinaryArray::from_vec(vec![b"same"; 8]));
+    // Repeated binary values use dense FullZip in v2.3. All-null values instead
+    // produce an unsupported layout in both versions, independently of the
+    // cursor's validation: structural ConstantLayout or planar sparse structure.
+    let unsupported: ArrayRef = Arc::new(LargeBinaryArray::new_null(8));
     let (_fs, reader) = fixture_arrays(
         version,
         lite,
-        vec![array(0, 0), array(1, 0), array(2, 0), constant],
+        vec![array(0, 0), array(1, 0), array(2, 0), unsupported],
     )
     .await;
+    match &reader.metadata().column_infos[0].page_infos[3].encoding {
+        PageEncoding::Structural(layout) => assert!(matches!(
+            &layout.layout,
+            Some(lance_encoding::format::metadata::page_layout::Layout::ConstantLayout(_))
+        )),
+        PageEncoding::Planar(layout) => assert!(layout.sparse().is_some()),
+        PageEncoding::Legacy(_) => panic!("fixture must use a current-format layout"),
+    }
     let skipped_buffers = reader.metadata().column_infos[0].page_infos[1]
         .buffer_offsets_and_sizes
         .iter()
