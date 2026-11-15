@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::{Result, utils::allocation::ReservedBuffer};
+use lance_core::{
+    Result,
+    utils::{allocation::ReservedBuffer, tokio::spawn_cpu},
+};
 
 use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
@@ -259,8 +265,8 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         entered: entered.clone(),
     }));
     let budget = AllocationBudget::new(4096);
-    // Establish independent credit before the scan. A completed raw column may
-    // reuse its charged unzip owner rather than refunding temporary storage.
+    // Independent credit must survive a failed compound attempt, regardless of
+    // whether earlier columns are still prepared input or retained raw output.
     let peer = budget.try_reserve(1024).unwrap();
     let mut scan = reader
         .open_admitted_fullzip_scan(0..7, budget.clone(), 3072, max_rows)
@@ -273,7 +279,7 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
             _ = entered.notified() => (),
             result = &mut future => panic!("gated later column completed: {result:?}"),
         }
-        // The earlier output, pending read and remaining workspace stay charged
+        // Earlier input, the pending read and remaining workspace stay charged
         // independently of the peer. No intermediate refund is required.
         let active = budget.reserved();
         assert!(active > peer.len() && active <= 4096);
@@ -303,6 +309,88 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
     assert_eq!(rows, 0..max_rows);
     assert_batch(&batch, &rows, &batches()[0]);
     drop(batch);
+    assert_eq!(budget.reserved(), peer.len());
+    drop(peer);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn queued_batch_owns_all_columns_and_credit(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values("delivered", "cancelled", "dropped", "undelivered", "error")] outcome: &str,
+) {
+    let (_fs, mut reader) = fixture_batches(version, lite, batches(), 1).await;
+    if outcome == "error" {
+        Arc::make_mut(&mut reader.core.base_projection.schema).fields[1].nullable = false;
+    }
+    let budget = AllocationBudget::new(4096);
+    let peer = budget.try_reserve(1024).unwrap();
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..7, budget.clone(), 3072, 3)
+        .await
+        .unwrap();
+    let queued = RefCell::new(None);
+    let entered = tokio::sync::Notify::new();
+    let dispatches = AtomicUsize::new(0);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut receiver = Some(receiver);
+    let mut future = Box::pin(scan.try_next_with(|job| {
+        dispatches.fetch_add(1, Ordering::SeqCst);
+        *queued.borrow_mut() = Some(job);
+        entered.notify_one();
+        let receiver = receiver.take().expect("one complete batch fits");
+        async move { receiver.await.unwrap() }
+    }));
+    tokio::select! {
+        _ = entered.notified() => (),
+        result = &mut future => panic!("queued batch completed: {result:?}"),
+    }
+    let job = queued.borrow_mut().take().unwrap();
+    assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.reserved(), 4096);
+    assert!(budget.try_reserve(1).is_none());
+    match outcome {
+        "delivered" => {
+            sender.send(spawn_cpu(move || job.decode()).await).unwrap();
+            let FullZipScanOutcome::Batch { rows, batch } = future.await.unwrap() else {
+                panic!("both columns must be delivered in one batch")
+            };
+            assert_eq!(rows, 0..3);
+            assert_eq!(scan.position(), 3);
+            assert_batch(&batch, &rows, &batches()[0]);
+            let alias = batch.column(1).slice(0, 1);
+            drop(batch);
+            assert!(budget.reserved() > peer.len());
+            drop(alias);
+        }
+        "undelivered" => {
+            sender.send(spawn_cpu(move || job.decode()).await).unwrap();
+            assert!(budget.reserved() > peer.len());
+            drop(future);
+            assert_eq!(scan.position(), 0);
+        }
+        _ => {
+            drop(future);
+            assert_eq!(scan.position(), 0);
+            assert_eq!(budget.reserved(), 4096, "queued job still owns input");
+            if outcome == "dropped" {
+                drop(job);
+            } else {
+                let result = spawn_cpu(move || job.decode()).await;
+                if outcome == "error" {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, Error::Arrow { .. }));
+                    assert!(error.to_string().contains("non-nullable"));
+                } else {
+                    let batch = result.unwrap().unwrap();
+                    assert_batch(&batch, &(0..3), &batches()[0]);
+                    drop(batch);
+                }
+            }
+        }
+    }
     assert_eq!(budget.reserved(), peer.len());
     drop(peer);
     assert_eq!(budget.reserved(), 0);

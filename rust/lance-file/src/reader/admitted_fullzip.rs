@@ -3,14 +3,22 @@
 
 //! Demand-driven FullZip cursor with one admission for all projected columns.
 
-use std::{ops::Range, sync::Arc};
+use std::{future::Future, ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use lance_core::{Error, Result, utils::allocation::AllocationBudget};
+use lance_core::{
+    Error, Result,
+    utils::{
+        allocation::{AllocationBudget, Reservation},
+        tokio::spawn_cpu,
+    },
+};
 use lance_encoding::{
-    EncodingsIo, compression::DefaultDecompressionStrategy, decoder::ColumnInfo,
-    encodings::logical::primitive::FullZipScheduler,
+    EncodingsIo,
+    compression::DefaultDecompressionStrategy,
+    decoder::ColumnInfo,
+    encodings::logical::primitive::{FullZipArrayInput, FullZipScheduler},
 };
 
 use super::FileReader;
@@ -36,8 +44,9 @@ pub enum FullZipScanOutcome {
 /// The same shared allocation budget covers each operation through final Arrow
 /// reconstruction. Retained output keeps its charge. This is not a process RSS
 /// limit: file metadata, transport/cache and allocator overhead are excluded.
-/// Unzip/decode/Arrow reconstruction run on the CPU pool. Repeated prefix attempts
-/// and dispatch overhead are not performance qualified.
+/// Each batch prepares charged column inputs asynchronously, then runs all
+/// unzip/decode/Arrow reconstruction in one CPU job. Input overlap stays within
+/// the same workspace. Prefix attempts and dispatch are not performance qualified.
 /// Dropping a pending `try_next` leaves the cursor unchanged; backend operations
 /// that outlive cancellation retain their allocation owners until access stops.
 #[derive(Debug)]
@@ -58,6 +67,26 @@ struct FullZipColumn {
     page_index: usize,
     page_start: u64,
     decoder: Option<Arc<FullZipScheduler>>,
+}
+
+pub(super) struct BatchDecodeJob {
+    inputs: Vec<FullZipArrayInput>,
+    schema: Arc<ArrowSchema>,
+    workspace: Reservation,
+}
+
+impl BatchDecodeJob {
+    pub(super) fn decode(mut self) -> Result<Option<RecordBatch>> {
+        let mut arrays = Vec::with_capacity(self.inputs.len());
+        for input in self.inputs {
+            let Some(array) = input.decode_in(&mut self.workspace)? else {
+                // Drop earlier output and all remaining inputs before replanning.
+                return Ok(None);
+            };
+            arrays.push(array);
+        }
+        Ok(Some(RecordBatch::try_new(self.schema, arrays)?))
+    }
 }
 
 impl FileReader {
@@ -242,12 +271,17 @@ impl FullZipScan {
         self.cursor
     }
 
-    async fn try_read_batch_in(
+    async fn try_read_batch_in<Run, Done>(
         &self,
         rows: Range<u64>,
-        mut workspace: lance_core::utils::allocation::Reservation,
-    ) -> Result<Option<RecordBatch>> {
-        let mut arrays = Vec::with_capacity(self.columns.len());
+        mut workspace: Reservation,
+        dispatch: &mut Run,
+    ) -> Result<Option<RecordBatch>>
+    where
+        Run: FnMut(BatchDecodeJob) -> Done,
+        Done: Future<Output = Result<Option<RecordBatch>>>,
+    {
+        let mut inputs = Vec::with_capacity(self.columns.len());
         for (column, field) in self.columns.iter().zip(self.schema.fields()) {
             let decoder = column
                 .decoder
@@ -255,28 +289,46 @@ impl FullZipScan {
                 .ok_or_else(|| Error::internal("missing FullZip decoder"))?;
             let priority = column.column.page_infos[column.page_index].priority;
             let local = (rows.start - column.page_start)..(rows.end - column.page_start);
-            let (remaining, array) = decoder
+            let input = decoder
                 .clone()
-                .try_read_array_range_on_cpu(
+                .prepare_array_range_in(
                     local,
                     field.data_type().clone(),
-                    workspace,
+                    &mut workspace,
                     |range, buffer| self.io.submit_single_into(range, priority, buffer),
                 )
                 .await?;
-            workspace = remaining;
-            let Some(array) = array else {
-                // Earlier columns must drop before the outer retry admits again.
+            let Some(input) = input else {
+                // Prepared inputs must drop before the outer retry admits again.
                 return Ok(None);
             };
-            arrays.push(array);
+            inputs.push(input);
         }
-        Ok(Some(RecordBatch::try_new(self.schema.clone(), arrays)?))
+        dispatch(BatchDecodeJob {
+            inputs,
+            schema: self.schema.clone(),
+            workspace,
+        })
+        .await
     }
 
     /// Attempt one complete batch. Never waits for allocation credit.
     /// Call again after consuming/dropping a batch, or after resolving a refusal.
     pub async fn try_next(&mut self) -> Result<FullZipScanOutcome> {
+        self.try_next_with(|job| spawn_cpu(move || job.decode()))
+            .await
+    }
+
+    // An owned handoff lets cancellation tests control the queue without parking
+    // a CPU worker. Every retry transfers the whole batch's input and workspace.
+    pub(super) async fn try_next_with<Run, Done>(
+        &mut self,
+        mut dispatch: Run,
+    ) -> Result<FullZipScanOutcome>
+    where
+        Run: FnMut(BatchDecodeJob) -> Done,
+        Done: Future<Output = Result<Option<RecordBatch>>>,
+    {
         if self.cursor == self.end {
             return Ok(FullZipScanOutcome::Finished);
         }
@@ -289,7 +341,9 @@ impl FullZipScan {
             let Some(workspace) = self.budget.try_reserve(self.workspace_bytes) else {
                 return Ok(FullZipScanOutcome::NeedsCapacity);
             };
-            let batch = self.try_read_batch_in(rows.clone(), workspace).await?;
+            let batch = self
+                .try_read_batch_in(rows.clone(), workspace, &mut dispatch)
+                .await?;
             if let Some(batch) = batch {
                 // No await follows the commit: cancellation cannot consume rows
                 // without returning the complete, aligned batch to the caller.

@@ -163,39 +163,112 @@ impl Shape<'_> {
     }
 }
 
-pub(super) struct ArrayDecodeJob {
+/// Charged input for one exact FullZip row range, ready for CPU decoding.
+/// Construct with [`FullZipScheduler::prepare_array_range_in`]. Several columns
+/// may be read into the same workspace before dispatching one pure CPU job.
+/// Dropping this input refunds its physical charge, including after cancellation.
+#[derive(Debug)]
+pub struct FullZipArrayInput {
     scheduler: Arc<FullZipScheduler>,
     input: ReservedBuffer,
     data_type: DataType,
     count: u64,
+}
+
+impl FullZipArrayInput {
+    /// Consume input and decode using the remainder of its original workspace.
+    /// Performs no I/O, pool dispatch or allocation wait. `None` means the entire
+    /// compound attempt must be dropped and replanned, never EOF. Reused raw
+    /// output keeps the full compact allocation charged through its last alias.
+    /// Errors consume input; previously decoded sibling columns remain the
+    /// caller's responsibility. See [`FullZipScheduler::prepare_array_range_in`].
+    pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {
+        let task = self.scheduler.try_unzip_owned_in(
+            std::slice::from_ref(&self.input),
+            self.count,
+            0..self.count,
+            workspace,
+        );
+        self.input.recycle(workspace)?;
+        let array = match task? {
+            Some(task) => match task.decode(workspace)? {
+                Some(page) => Shape::new(&self.scheduler, &self.data_type)?
+                    .finish(page, self.count, workspace)?,
+                None => None,
+            },
+            None => None,
+        };
+        Ok(array)
+    }
+}
+
+pub(super) struct ArrayDecodeJob {
+    input: FullZipArrayInput,
     workspace: Reservation,
 }
 
 impl ArrayDecodeJob {
     pub(super) fn decode(mut self) -> Result<(Reservation, Option<ArrayRef>)> {
-        let task = self.scheduler.try_unzip_owned_in(
-            std::slice::from_ref(&self.input),
-            self.count,
-            0..self.count,
-            &mut self.workspace,
-        );
-        self.input.recycle(&mut self.workspace)?;
-        let array = match task? {
-            Some(task) => match task.decode(&mut self.workspace)? {
-                Some(page) => Shape::new(&self.scheduler, &self.data_type)?.finish(
-                    page,
-                    self.count,
-                    &mut self.workspace,
-                )?,
-                None => None,
-            },
-            None => None,
-        };
+        let array = self.input.decode_in(&mut self.workspace)?;
         Ok((self.workspace, array))
     }
 }
 
 impl FullZipScheduler {
+    /// Read an exact nonempty row range into charged input without dispatching
+    /// CPU work. This separates asynchronous I/O from batch-wide CPU decoding.
+    /// Use the same workspace for every column's input, unzip, codec and Arrow
+    /// reconstruction; all input remains charged while other columns are read.
+    /// `None` is admission refusal. Drop all prepared inputs and the remainder
+    /// before replanning; never wait for more credit while holding this attempt.
+    /// Shape/range errors precede I/O; payload validation occurs during decode.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_schema::DataType;
+    /// use lance_core::{Result, utils::{allocation::Reservation, tokio::spawn_cpu}};
+    /// use lance_encoding::{EncodingsIo,
+    ///     encodings::logical::primitive::FullZipScheduler};
+    /// async fn decode(scheduler: Arc<FullZipScheduler>, io: &dyn EncodingsIo,
+    ///     mut work: Reservation) -> Result<()> {
+    ///     let input = scheduler.prepare_array_range_in(0..1, DataType::Binary,
+    ///         &mut work, |range, out| io.submit_single_into(range, 0, out)).await?;
+    ///     if let Some(input) = input {
+    ///         let array = spawn_cpu(move || input.decode_in(&mut work)).await?;
+    ///         drop(array); // consume before admitting the next operation
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn prepare_array_range_in<F, Fut>(
+        self: Arc<Self>,
+        rows: Range<u64>,
+        data_type: DataType,
+        workspace: &mut Reservation,
+        read: F,
+    ) -> Result<Option<FullZipArrayInput>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        Shape::new(&self, &data_type)?;
+        if rows.start >= rows.end || rows.end > self.rows_in_page {
+            return Err(Error::invalid_input(
+                "FullZip array requires a nonempty range within the page",
+            ));
+        }
+        let count = rows.end - rows.start;
+        let Some(input) = self.read_selected_range(rows, workspace, read).await? else {
+            return Ok(None);
+        };
+        Ok(Some(FullZipArrayInput {
+            scheduler: self,
+            input,
+            data_type,
+            count,
+        }))
+    }
+
     /// Read one exact nonempty row range and reconstruct it within an existing
     /// reservation. Unlike the prefix API, this never shrinks the selection or
     /// acquires more credit. A caller composing columns can admit one complete
@@ -306,24 +379,13 @@ impl FullZipScheduler {
         Run: FnOnce(ArrayDecodeJob) -> Done,
         Done: Future<Output = Result<(Reservation, Option<ArrayRef>)>>,
     {
-        Shape::new(&self, &data_type)?;
-        if rows.start >= rows.end || rows.end > self.rows_in_page {
-            return Err(Error::invalid_input(
-                "FullZip array requires a nonempty range within the page",
-            ));
-        }
-        let count = rows.end - rows.start;
-        let Some(input) = self.read_selected_range(rows, &mut workspace, read).await? else {
+        let Some(input) = self
+            .prepare_array_range_in(rows, data_type, &mut workspace, read)
+            .await?
+        else {
             return Ok((workspace, None));
         };
-        dispatch(ArrayDecodeJob {
-            scheduler: self,
-            input,
-            data_type,
-            count,
-            workspace,
-        })
-        .await
+        dispatch(ArrayDecodeJob { input, workspace }).await
     }
 
     /// Validate the Arrow shape and structural unzip metadata without I/O.
