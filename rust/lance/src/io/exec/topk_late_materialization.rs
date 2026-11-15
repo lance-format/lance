@@ -519,6 +519,7 @@ mod tests {
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::when;
     use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::execution_plan::reset_plan_states;
     use datafusion::prelude::{SessionContext, col as logical_col, lit};
     use datafusion_functions::core::expr_fn::arrow_metadata;
     use datafusion_physical_expr::expressions::{col, is_null};
@@ -771,7 +772,7 @@ mod tests {
         if !has_scope {
             assert!(!Arc::ptr_eq(&rewritten, &plan));
         }
-        let expected = run(plan).await;
+        let expected = run(reset_plan_states(plan).unwrap()).await;
         assert_eq!(
             expected["key"]
                 .as_primitive::<arrow_array::types::Int32Type>()
@@ -779,7 +780,7 @@ mod tests {
                 .as_ref(),
             expected_keys,
         );
-        assert_eq!(run(rewritten).await, expected);
+        assert_eq!(run(reset_plan_states(rewritten).unwrap()).await, expected);
     }
 
     #[cfg(feature = "substrait")]
