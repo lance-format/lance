@@ -2730,6 +2730,9 @@ impl EncodedBatchReaderExt for EncodedBatch {
 }
 
 #[cfg(test)]
+mod admitted_fullzip_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},

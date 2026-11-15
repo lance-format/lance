@@ -31,6 +31,15 @@ impl LanceEncodingsIo {
 }
 
 impl EncodingsIo for LanceEncodingsIo {
+    fn submit_single_into(
+        &self,
+        range: std::ops::Range<u64>,
+        priority: u64,
+        output: lance_core::utils::allocation::ReservedBuffer,
+    ) -> BoxFuture<'static, lance_core::Result<lance_core::utils::allocation::ReservedBuffer>> {
+        self.scheduler.submit_single_into(range, priority, output)
+    }
+
     fn io_buffer_size(&self) -> Option<u64> {
         Some(self.scheduler.io_buffer_size())
     }

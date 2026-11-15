@@ -77,6 +77,29 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
             .boxed()
     }
 
+    /// Fill one caller-owned allocation through this service's scheduling policy.
+    ///
+    /// The allocation must already be admitted and exactly match the range length.
+    /// Return it unchanged and exclusive, so a decoder can recycle it into its
+    /// workspace. Cancellation must keep it alive until underlying I/O stops using
+    /// it. No new payload allocation, coalescing or splitting is implied by this API;
+    /// opaque transport/cache allocations remain outside the caller's budget.
+    ///
+    /// Services must opt in explicitly. Falling back to `submit_single` would both
+    /// allocate an unadmitted payload and lose exclusive ownership accounting.
+    fn submit_single_into(
+        &self,
+        _range: Range<u64>,
+        _priority: u64,
+        output: lance_core::utils::allocation::ReservedBuffer,
+    ) -> BoxFuture<'static, Result<lance_core::utils::allocation::ReservedBuffer>> {
+        drop(output);
+        futures::future::ready(Err(lance_core::Error::not_supported(
+            "encoding I/O does not support admitted reads",
+        )))
+        .boxed()
+    }
+
     /// Returns a version of this I/O service that bypasses backpressure for all requests.
     ///
     /// This is intended for indirect I/O (e.g. fetching items after decoding offsets) where

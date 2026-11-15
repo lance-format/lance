@@ -21,18 +21,10 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Scheduled reader fixtures and feature boundaries
+      - name: Actual file and admitted page composition
         run: |
-          cargo test --profile ci --locked -p lance-io --lib scheduled_reader_rejects_incomplete_ranges -- --nocapture
-          cargo test --profile ci --locked -p lance-io --lib shared_throttle_state -- --nocapture
-          cargo test --profile ci --locked -p lance-io --lib reserved_read:: -- --nocapture
-          cargo test --profile ci --locked -p lance-io --doc submit_single_into -- --nocapture
-      - name: Optional feature independence
-        run: |
-          cargo test --profile ci --locked -p lance-io --no-default-features --lib scheduler:: -- --nocapture
-          cargo test --profile ci --locked -p lance-io --no-default-features --lib shared_throttle_state -- --nocapture
-      - name: Lint touched crate
+          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests:: -- --nocapture
+      - name: Lint touched crates
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-io --all-features --all-targets --no-deps -- -D warnings
-          cargo clippy --profile ci --locked -p lance-io --no-default-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding -p lance-file --all-features --all-targets --no-deps -- -D warnings
