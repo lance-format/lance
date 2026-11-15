@@ -147,6 +147,8 @@ impl ObjectStoreProvider for FileStoreProvider {
 
         Ok(ObjectStore {
             inner: Arc::new(inner),
+            external_blob_inner: None,
+            _external_blob_origin: None,
             local_dir_operations,
             local_fsync,
             scheme: base_path.scheme().to_owned(),
@@ -262,6 +264,8 @@ mod tests {
         });
         ObjectStore {
             inner: Arc::new(inner),
+            external_blob_inner: None,
+            _external_blob_origin: None,
             local_dir_operations: Some(local_dir_operations),
             local_fsync: false,
             scheme: "file".to_owned(),

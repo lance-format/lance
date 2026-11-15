@@ -101,6 +101,13 @@ fn stored_bitmap(indices: &[IndexMetadata]) -> RoaringBitmap {
         .unwrap()
 }
 
+enum IndexCommitMode {
+    Immediate,
+    Staged,
+    LatestHandle,
+    Uri,
+}
+
 #[rstest::rstest]
 #[case::indexed_payload("text", true)]
 #[case::preserved_join_key("i", false)]
@@ -110,7 +117,13 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
     #[case] indexed_column: &str,
     #[case] is_withdrawn: bool,
     #[values(false, true)] is_tagged: bool,
-    #[values(false, true)] is_staged: bool,
+    #[values(
+        IndexCommitMode::Immediate,
+        IndexCommitMode::Staged,
+        IndexCommitMode::LatestHandle,
+        IndexCommitMode::Uri
+    )]
+    commit_mode: IndexCommitMode,
 ) {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
@@ -120,8 +133,15 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
         dataset
     };
     let read_version = stale.version().version;
+    let needs_retained_snapshot = matches!(
+        commit_mode,
+        IndexCommitMode::LatestHandle | IndexCommitMode::Uri
+    );
+    if needs_retained_snapshot {
+        stale.tags().create("build", read_version).await.unwrap();
+    }
     let fragments = stale.fragments().iter().map(|f| f.id as u32).collect();
-    let segment = if is_staged {
+    let segment = if !matches!(commit_mode, IndexCommitMode::Immediate) {
         Some(
             stage(&stale, indexed_column, IndexType::BTree, fragments)
                 .await
@@ -159,19 +179,42 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
             CleanupPolicyBuilder::default()
                 .versions((1..=rewrite_version).collect())
                 .unwrap()
+                .error_if_tagged_old_versions(false)
                 .build(),
         )
         .execute()
         .await
         .unwrap();
-    assert_eq!(stats.old_versions, rewrite_version);
+    assert_eq!(
+        stats.old_versions,
+        rewrite_version - u64::from(needs_retained_snapshot)
+    );
     assert_eq!(stale.version().version, read_version);
 
     if let Some(segment) = segment {
-        stale
-            .commit_existing_index_segments("idx", indexed_column, vec![segment])
-            .await
-            .unwrap();
+        if needs_retained_snapshot {
+            let transaction = Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![segment],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let builder = match commit_mode {
+                IndexCommitMode::LatestHandle => {
+                    crate::dataset::CommitBuilder::new(Arc::new(latest))
+                }
+                IndexCommitMode::Uri => crate::dataset::CommitBuilder::new(dir.as_str()),
+                _ => unreachable!(),
+            };
+            builder.execute(transaction).await.unwrap();
+        } else {
+            stale
+                .commit_existing_index_segments("idx", indexed_column, vec![segment])
+                .await
+                .unwrap();
+        }
     } else {
         stale
             .create_index(

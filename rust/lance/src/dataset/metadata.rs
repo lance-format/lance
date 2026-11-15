@@ -109,6 +109,30 @@ impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
     }
 }
 
+/// `earlier` followed by an update() of `later` on the same map, as one update.
+fn chain_update(earlier: UpdateMap, later: Vec<UpdateMapEntry>) -> UpdateMap {
+    let mut update_entries = earlier.update_entries;
+    if !earlier.replace {
+        update_entries.extend(later);
+        return UpdateMap {
+            update_entries,
+            replace: false,
+        };
+    }
+    // A replace ignores entries without a value, so a later deletion has to
+    // drop the key from the replacement rather than be appended to it.
+    for entry in later {
+        update_entries.retain(|existing| existing.key != entry.key);
+        if entry.value.is_some() {
+            update_entries.push(entry);
+        }
+    }
+    UpdateMap {
+        update_entries,
+        replace: true,
+    }
+}
+
 #[derive(Debug)]
 pub struct UpdateFieldMetadataBuilder<'a> {
     dataset: &'a mut Dataset,
@@ -132,11 +156,17 @@ impl<'a> UpdateFieldMetadataBuilder<'a> {
         replace: bool,
     ) -> Result<Self> {
         let field_id = field.into().into_id(self.dataset.schema())?;
-        let values = UpdateMap {
-            update_entries: values.into_iter().map(Into::into).collect(),
-            replace,
+        let entries = values.into_iter().map(Into::into).collect();
+        // Calls for the same field combine in order into their net effect on
+        // the field's metadata. A replace() discards whatever came before it.
+        let update = match self.field_metadata_updates.remove(&field_id) {
+            Some(earlier) if !replace => chain_update(earlier, entries),
+            _ => UpdateMap {
+                update_entries: entries,
+                replace,
+            },
         };
-        self.field_metadata_updates.insert(field_id, values);
+        self.field_metadata_updates.insert(field_id, update);
         Ok(self)
     }
     pub fn update<'b>(
@@ -787,6 +817,71 @@ mod tests {
         assert_eq!(
             nested_field.metadata.get("nested_key"),
             Some(&"nested_value".to_string())
+        );
+    }
+
+    /// Chained calls for one field, by path or by id, apply in order.
+    #[rstest]
+    #[case::update_then_update(false, false, &[("k0", "base"), ("k1", "a"), ("k2", "b")])]
+    #[case::replace_then_update(true, false, &[("k1", "a"), ("k2", "b")])]
+    #[case::update_then_replace(false, true, &[("k2", "b")])]
+    #[case::replace_then_replace(true, true, &[("k2", "b")])]
+    #[tokio::test]
+    async fn test_update_field_metadata_chained_on_one_field(
+        #[case] first_replaces: bool,
+        #[case] second_replaces: bool,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let mut dataset = test_dataset_nested().await;
+        dataset
+            .update_field_metadata()
+            .update("name", [("k0", "base"), ("gone", "x")])
+            .unwrap()
+            .await
+            .unwrap();
+        let name_id = dataset.schema().field("name").unwrap().id;
+
+        let first = [("k1", Some("a")), ("gone", None)];
+        let second = [("k2", Some("b")), ("k1", None), ("k1", Some("a"))];
+        let builder = dataset.update_field_metadata();
+        let builder = if first_replaces {
+            builder.replace("name", first)
+        } else {
+            builder.update("name", first)
+        }
+        .unwrap();
+        let builder = if second_replaces {
+            builder.replace(name_id, [("k2", "b")])
+        } else {
+            builder.update(name_id, second)
+        }
+        .unwrap();
+        builder.await.unwrap();
+
+        let metadata = &dataset.schema().field("name").unwrap().metadata;
+        let expected: HashMap<String, String> = expected
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(metadata, &expected);
+    }
+
+    /// A deletion chained after a replace() removes the key it replaced in.
+    #[tokio::test]
+    async fn test_update_field_metadata_deletes_after_a_replace() {
+        let mut dataset = test_dataset_nested().await;
+        dataset
+            .update_field_metadata()
+            .replace("name", [("k1", "a"), ("k2", "b")])
+            .unwrap()
+            .update("name", [("k1", None::<&str>)])
+            .unwrap()
+            .await
+            .unwrap();
+        let metadata = &dataset.schema().field("name").unwrap().metadata;
+        assert_eq!(
+            metadata,
+            &HashMap::from([("k2".to_string(), "b".to_string())])
         );
     }
 
