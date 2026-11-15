@@ -1069,8 +1069,8 @@ fn index_matches_type(
     if index_type == IndexType::Scalar
         && let Some(scalar_params) = params.as_any().downcast_ref::<ScalarIndexParams>()
     {
-        // "fts" is accepted as an alias of "inverted", which is the name the
-        // committed index records.
+        // "fts" is accepted as an alias of "inverted", the plugin name derived
+        // from the committed index's details type.
         let requested = scalar_params.index_type.to_lowercase();
         let requested = if requested == "fts" {
             "inverted".to_string()
@@ -1500,6 +1500,7 @@ mod tests {
             .execute()
             .await
             .unwrap_err();
+        assert!(matches!(err, Error::Index { .. }), "{err}");
         assert!(
             err.to_string()
                 .contains("already exists, please specify a different name or use replace=True"),
