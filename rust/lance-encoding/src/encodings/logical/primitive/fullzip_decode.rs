@@ -39,6 +39,7 @@ use super::{
 
 mod admitted;
 mod structure;
+mod unzip_admitted;
 
 #[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
