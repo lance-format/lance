@@ -354,7 +354,7 @@ fn owned_raw_unzip_reuses_only_charged_compact_values(
     let page = task.decode(&mut work).unwrap().unwrap();
     assert!(work.is_empty());
     assert_eq!(pool.reserved(), stage + levels);
-    let refs = f.values[selected.clone()]
+    let refs = f.values[selected]
         .iter()
         .map(Vec::as_slice)
         .collect::<Vec<_>>();

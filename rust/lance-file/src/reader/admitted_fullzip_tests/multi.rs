@@ -259,11 +259,13 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         entered: entered.clone(),
     }));
     let budget = AllocationBudget::new(4096);
+    // Establish independent credit before the scan. A completed raw column may
+    // reuse its charged unzip owner rather than refunding temporary storage.
+    let peer = budget.try_reserve(1024).unwrap();
     let mut scan = reader
-        .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, max_rows)
+        .open_admitted_fullzip_scan(0..7, budget.clone(), 3072, max_rows)
         .await
         .unwrap();
-    let peer;
     {
         let future = scan.try_next();
         tokio::pin!(future);
@@ -271,12 +273,10 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
             _ = entered.notified() => (),
             result = &mut future => panic!("gated later column completed: {result:?}"),
         }
-        // The first column's retired unzip allocation has already refunded
-        // shared credit. Its output and this pending read remain charged.
+        // The earlier output, pending read and remaining workspace stay charged
+        // independently of the peer. No intermediate refund is required.
         let active = budget.reserved();
-        assert!(active > 0 && active < 4096);
-        peer = budget.try_reserve(4096 - active).unwrap();
-        assert_eq!(budget.reserved(), 4096);
+        assert!(active > peer.len() && active <= 4096);
     }
     assert_eq!(scan.position(), 0);
     assert_eq!(
@@ -284,8 +284,6 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         peer.len(),
         "cancellation must preserve unrelated credit"
     );
-    drop(peer);
-    assert_eq!(budget.reserved(), 0);
     mode.store(2, Ordering::Relaxed);
     second_reads.store(0, Ordering::Relaxed);
     let error = scan.try_next().await.unwrap_err();
@@ -297,7 +295,7 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         "errors must not trigger a smaller retry"
     );
     assert_eq!(scan.position(), 0);
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(budget.reserved(), peer.len());
     mode.store(0, Ordering::Relaxed);
     let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
         panic!("retry must return original complete rows")
@@ -305,6 +303,8 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
     assert_eq!(rows, 0..max_rows);
     assert_batch(&batch, &rows, &batches()[0]);
     drop(batch);
+    assert_eq!(budget.reserved(), peer.len());
+    drop(peer);
     assert_eq!(budget.reserved(), 0);
 }
 
