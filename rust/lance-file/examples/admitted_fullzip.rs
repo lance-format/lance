@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    io::Write,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -93,7 +94,7 @@ fn batch(start: u64, rows: usize, bytes: usize) -> Result<RecordBatch> {
                 lists.values().append_value([]);
                 continue;
             }
-            for (i, chunk) in value.chunks_exact_mut(8).enumerate() {
+            for (i, chunk) in value.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 chunk.copy_from_slice(&word(row, frame, i).to_le_bytes());
             }
             lists.values().append_value(&value);
@@ -209,8 +210,8 @@ impl Sink {
                     }
                     self.payload_bytes += value.len() as u64;
                     if full {
-                        for (j, chunk) in value.chunks_exact(8).enumerate() {
-                            let actual = u64::from_le_bytes(chunk.try_into().unwrap());
+                        for (j, chunk) in value.as_chunks::<8>().0.iter().enumerate() {
+                            let actual = u64::from_le_bytes(*chunk);
                             if actual != word(row, frame, j) {
                                 return Err(invalid("payload content mismatch"));
                             }
@@ -360,7 +361,7 @@ async fn main() -> Result<()> {
                 number(&args[5])?,
             )
             .await?;
-            println!("{{\"write_complete\":true}}");
+            writeln!(std::io::stdout().lock(), "{{\"write_complete\":true}}")?;
         }
         Some("read") if args.len() == 11 => {
             let admitted = match args[3].as_str() {
@@ -392,7 +393,8 @@ async fn main() -> Result<()> {
                 },
             )
             .await?;
-            println!(
+            writeln!(
+                std::io::stdout().lock(),
                 "{{\"rows\":{},\"payload_bytes\":{},\"fingerprint\":{},\"full_verify\":{},\"batches\":{},\"first_batch_ms\":{},\"wall_ms\":{},\"sink_ms\":{},\"iops\":{},\"read_bytes\":{}}}",
                 report.sink.rows,
                 report.sink.payload_bytes,
@@ -404,7 +406,7 @@ async fn main() -> Result<()> {
                 report.sink_ms,
                 report.iops,
                 report.read_bytes
-            );
+            )?;
         }
         _ => {
             return Err(invalid(
