@@ -3470,8 +3470,8 @@ struct JoinResult {
 struct SplitResult {
     new_centroids: FixedSizeListArray,
     affected_partitions: HashSet<usize>,
-    /// Logical rows the split reindexed; their old entries leave the
-    /// unaffected partitions.
+    /// For a multivector column, every row found in the affected partitions;
+    /// their entries leave the unaffected partitions. Empty otherwise.
     reindexed_row_ids: Arc<HashSet<u64>>,
     shuffle_reader: Arc<dyn ShuffleReader>,
 }
@@ -4691,7 +4691,9 @@ mod tests {
             .await
             .unwrap();
 
-        let append = multivector_batch(&vec![vec![C0]; APPENDED_ROWS], 0);
+        // The appended rows also put a vector in F, so F holds entries of
+        // reshuffled rows from both the old index and the new data.
+        let append = multivector_batch(&vec![vec![C0, CF]; APPENDED_ROWS], 0);
         let mut dataset = InsertBuilder::new(Arc::new(dataset))
             .with_params(&WriteParams {
                 mode: WriteMode::Append,
@@ -4716,7 +4718,7 @@ mod tests {
             ivf.num_partitions()
         );
         let total_vectors = C0_SINGLE_ROWS
-            + APPENDED_ROWS
+            + APPENDED_ROWS * 2
             + MULTIVECTOR_ROWS * 2
             + (centers.len() - 1) * OTHER_PARTITION_ROWS;
         assert_eq!(
