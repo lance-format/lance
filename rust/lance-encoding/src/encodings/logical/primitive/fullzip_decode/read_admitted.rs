@@ -45,9 +45,9 @@ where
     Ok(output)
 }
 
-fn endpoint(buffer: &ReservedBuffer) -> u64 {
+fn endpoint(buffer: &[u8]) -> u64 {
     let mut value = [0; 8];
-    value[..buffer.capacity()].copy_from_slice(buffer.as_ref());
+    value[..buffer.len()].copy_from_slice(buffer);
     u64::from_le_bytes(value)
 }
 
@@ -155,10 +155,13 @@ impl FullZipScheduler {
     }
 
     /// Read and unzip selected variable-width rows with pre-reserved credit.
-    /// One small allocation is reused for both repetition-index endpoints and
-    /// recycled before the data read. Only the selected row-aligned data is read;
+    /// Repetition-index endpoints are read together when their span is at most
+    /// 4 KiB and fits the existing workspace. Otherwise one entry allocation is
+    /// reused for two reads. Index scratch is recycled before the data read.
+    /// Only the selected row-aligned data is read;
     /// it overlaps unzip output, then is recycled before this method returns.
-    /// No full-page index, coalescing gap or ordinary allocating decoder is used.
+    /// Index coalescing gaps are charged in full; no ordinary allocating decoder
+    /// or unbounded full-page index load is used.
     ///
     /// `read` must fill the supplied allocation exactly and return it unchanged,
     /// without retaining aliases. It must keep the allocation alive until any
@@ -256,13 +259,34 @@ impl FullZipScheduler {
         self.data_buf_position
             .checked_add(self.data_buf_size)
             .ok_or_else(|| Error::invalid_input("FullZip data address overflows"))?;
-        let Some(index_buffer) = workspace.try_allocate(index.bytes_per_value as usize)? else {
-            return Ok(None);
+        let width = index.bytes_per_value as usize;
+        // Avoid a second storage round trip for nearby endpoints. The fixed
+        // cap bounds over-read independently of page/selection size; using only
+        // existing workspace preserves progress at the original minimum budget.
+        const MAX_INDEX_SPAN: u64 = 4096;
+        let span = last.end - first.start;
+        let combined = if span <= MAX_INDEX_SPAN {
+            workspace.try_allocate(span as usize)?
+        } else {
+            None
         };
-        let index_buffer = fill(&mut read, first, index_buffer).await?;
-        let start = endpoint(&index_buffer);
-        let index_buffer = fill(&mut read, last, index_buffer).await?;
-        let end = endpoint(&index_buffer);
+        let (start, end, index_buffer) = if let Some(index_buffer) = combined {
+            let index_buffer = fill(&mut read, first.start..last.end, index_buffer).await?;
+            let bytes = index_buffer.as_ref();
+            (
+                endpoint(&bytes[..width]),
+                endpoint(&bytes[bytes.len() - width..]),
+                index_buffer,
+            )
+        } else {
+            let Some(index_buffer) = workspace.try_allocate(width)? else {
+                return Ok(None);
+            };
+            let index_buffer = fill(&mut read, first, index_buffer).await?;
+            let start = endpoint(index_buffer.as_ref());
+            let index_buffer = fill(&mut read, last, index_buffer).await?;
+            (start, endpoint(index_buffer.as_ref()), index_buffer)
+        };
         index_buffer.recycle(workspace)?;
         if start >= end
             || end > self.data_buf_size

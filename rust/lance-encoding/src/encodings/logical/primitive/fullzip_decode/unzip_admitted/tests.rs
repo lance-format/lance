@@ -71,14 +71,17 @@ fn fixture(bits: u8, fsst: bool, kind: &str) -> Fixture {
 }
 
 fn fixture_with_values(bits: u8, fsst: bool, kind: &str, values: Vec<Vec<u8>>) -> Fixture {
-    assert_eq!(values.len(), 4);
+    let rows = values.len();
+    if kind != "flat" {
+        assert_eq!(rows, 4);
+    }
     let (rep, def, meanings, value_starts, level_starts) = match kind {
         "flat" => (
             None,
             None,
             vec![Meaning::AllValidItem],
-            vec![0, 1, 2, 3, 4],
-            vec![0, 1, 2, 3, 4],
+            (0..=rows).collect(),
+            (0..=rows).collect(),
         ),
         "nullable" => (
             None,
@@ -127,7 +130,7 @@ fn fixture_with_values(bits: u8, fsst: bool, kind: &str, values: Vec<Vec<u8>>) -
         block,
         SerializedRepDefs::new(rep.clone(), def.clone(), meanings.clone()),
         0,
-        4,
+        rows as u64,
     )
     .unwrap();
     let PageEncoding::Structural(description) = page.description else {
@@ -148,12 +151,12 @@ fn fixture_with_values(bits: u8, fsst: bool, kind: &str, values: Vec<Vec<u8>>) -
     let scheduler = FullZipScheduler::try_new(
         &locations,
         0,
-        4,
+        rows as u64,
         &layout,
         &DefaultDecompressionStrategy::default(),
     )
     .unwrap();
-    let row_offsets = ByteUnpacker::new(page.data[1].clone(), page.data[1].len() / 5)
+    let row_offsets = ByteUnpacker::new(page.data[1].clone(), page.data[1].len() / (rows + 1))
         .map(|offset| usize::try_from(offset).unwrap())
         .collect();
     Fixture {

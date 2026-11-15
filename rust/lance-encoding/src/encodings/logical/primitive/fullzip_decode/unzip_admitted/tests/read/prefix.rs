@@ -193,7 +193,7 @@ async fn compressed_prefix_retries_after_codec_output_refusal(
 #[rstest]
 #[tokio::test]
 async fn prefix_cancellation_and_errors_release_entire_attempt(
-    #[values(0, 1, 2)] at: usize,
+    #[values(0, 1)] at: usize,
     #[values(false, true)] cancel: bool,
 ) {
     let mut f = fixture(32, true, "deep");
@@ -317,7 +317,7 @@ async fn corrupt_later_row_is_not_hidden_by_smaller_prefix_retry() {
     };
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert!(error.to_string().contains("item length"));
-    assert_eq!(reads.0.lock().unwrap().len(), 3);
+    assert_eq!(reads.0.lock().unwrap().len(), 2);
     assert_eq!(budget.reserved(), 0);
 }
 

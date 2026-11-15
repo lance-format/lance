@@ -116,7 +116,7 @@ async fn array_cpu_dispatch_preserves_selected_values(
     let array = array.unwrap();
     assert_eq!(array.to_data(), expected);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(reads.0.lock().unwrap().len(), 3);
+    assert_eq!(reads.0.lock().unwrap().len(), 2);
     let alias = array.slice(1, 1);
     drop((array, work));
     let retained = budget.reserved();

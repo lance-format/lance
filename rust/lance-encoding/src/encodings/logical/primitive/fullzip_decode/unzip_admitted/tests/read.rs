@@ -114,8 +114,6 @@ async fn selected_reads_recycle_input_before_decode(
     } else {
         vec![
             index.buf_position + rows.start * entry as u64
-                ..index.buf_position + (rows.start + 1) * entry as u64,
-            index.buf_position + rows.end * entry as u64
                 ..index.buf_position + (rows.end + 1) * entry as u64,
             37 + f.row_offsets[rows.start as usize] as u64
                 ..37 + f.row_offsets[rows.end as usize] as u64,
@@ -167,8 +165,8 @@ async fn read_stage_refusal_restores_workspace(
     let (input, unzip, _) = sizes(&f, 0..4);
     let (available, calls) = match stage {
         "index" => (f.index.len() / 5 - 1, 0),
-        "input" => (input - 1, 2),
-        _ => (input + unzip - 1, 3),
+        "input" => (input - 1, 1),
+        _ => (input + unzip - 1, 2),
     };
     let budget = AllocationBudget::new(available);
     let mut work = budget.try_reserve(available).unwrap();
@@ -196,7 +194,7 @@ async fn read_stage_refusal_restores_workspace(
 #[rstest]
 #[tokio::test]
 async fn read_error_and_cancellation_release_active_owner(
-    #[values(0, 1, 2)] at: usize,
+    #[values(0, 1)] at: usize,
     #[values(false, true)] cancel: bool,
 ) {
     let mut f = fixture(32, false, "deep");
@@ -243,6 +241,7 @@ async fn invalid_index_is_rejected_before_payload_read(
     #[case] start: u64,
     #[case] end: u64,
     #[case] small: bool,
+    #[values(false, true)] combined: bool,
 ) {
     let mut f = fixture(32, false, "flat");
     let mut source = source(&mut f);
@@ -259,8 +258,9 @@ async fn invalid_index_is_rejected_before_payload_read(
     let offset = index.buf_position as usize + row as usize * width;
     Arc::make_mut(&mut source)[offset..offset + width]
         .copy_from_slice(&value.to_le_bytes()[..width]);
-    let budget = AllocationBudget::new(width);
-    let mut work = budget.try_reserve(width).unwrap();
+    let available = if combined { f.index.len() } else { width };
+    let budget = AllocationBudget::new(available);
+    let mut work = budget.try_reserve(available).unwrap();
     let reads = Arc::new(Reads::default());
     let result = f
         .scheduler
@@ -275,8 +275,8 @@ async fn invalid_index_is_rejected_before_payload_read(
     };
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert!(error.to_string().contains("repetition index endpoints"));
-    assert_eq!(reads.0.lock().unwrap().len(), 2);
-    assert_eq!(work.len(), width);
+    assert_eq!(reads.0.lock().unwrap().len(), if combined { 1 } else { 2 });
+    assert_eq!(work.len(), available);
 }
 
 #[tokio::test]
@@ -290,7 +290,7 @@ async fn slow_reader_does_not_block_finite_peers() {
     let mut slow = Box::pin(f.scheduler.try_read_unzip_range_in(
         0..4,
         &mut slow_work,
-        reader(source.clone(), Arc::default(), Fault::Pending(2)),
+        reader(source.clone(), Arc::default(), Fault::Pending(1)),
     ));
     assert!(poll!(slow.as_mut()).is_pending());
     for _ in 0..3 {
@@ -399,5 +399,6 @@ async fn corrupt_selected_payload_recycles_exclusive_read() {
     assert_eq!(budget.reserved(), 0);
 }
 
+mod coalesce;
 mod cpu;
 mod prefix;
