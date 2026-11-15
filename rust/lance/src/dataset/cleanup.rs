@@ -5878,12 +5878,25 @@ mod tests {
         let (field, column) = values.finish().unwrap().into_parts();
         let schema = Arc::new(managed_blob_schema(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        // The write below loads the child through base 7, so the managed-blob
+        // writer needs an explicit region to skip the live S3 region lookup.
+        let storage_options = HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("aws_access_key_id".to_string(), "test".to_string()),
+            ("aws_secret_access_key".to_string(), "test".to_string()),
+        ]);
         Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
             child.uri(),
             Some(WriteParams {
                 mode: WriteMode::Overwrite,
                 data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                store_params: Some(ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(storage_options.clone()),
+                    )),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         )
@@ -5893,11 +5906,7 @@ mod tests {
         parent.update_config([("revision", "3")]).await.unwrap();
 
         let parent = DatasetBuilder::from_uri(uri.as_str())
-            .with_storage_options(HashMap::from([
-                ("region".to_string(), "us-east-1".to_string()),
-                ("aws_access_key_id".to_string(), "test".to_string()),
-                ("aws_secret_access_key".to_string(), "test".to_string()),
-            ]))
+            .with_storage_options(storage_options)
             .load()
             .await
             .unwrap();
