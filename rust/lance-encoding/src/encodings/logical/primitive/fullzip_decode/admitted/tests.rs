@@ -181,7 +181,9 @@ fn fullzip_failure_recycles_structural_credit(#[values(false, true)] fail: bool)
     for _ in 0..2 {
         let result = task.try_decode_in(&mut work);
         if fail {
-            let error = result.unwrap_err();
+            let Err(error) = result else {
+                panic!("expected the injected codec error");
+            };
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("injected codec error"));
         } else {
