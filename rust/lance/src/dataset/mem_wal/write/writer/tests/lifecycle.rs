@@ -25,12 +25,18 @@ use rstest::rstest;
 /// whose mandatory PK sidecar has not been written yet.
 #[tokio::test]
 async fn test_pk_only_flush_waits_for_index_apply() {
-    let (writer, mut handler, message, temp) = pending_pk_flush().await;
+    let (writer, mut handler, message, temp, controls) = pending_pk_flush_observable().await;
     let TriggerMemTableFlush::Flush { memtable, .. } = &message;
     let memtable = memtable.clone();
     let schema = create_pk_test_schema();
     let indexes = memtable.indexes_arc().unwrap();
     assert_eq!(indexes.indexed_count(), 0);
+
+    let attempts_before = controls.sstable_attempts();
+    assert_eq!(
+        attempts_before, 0,
+        "the fixture must not write a generation before the flush"
+    );
     let mut flush = Box::pin(handler.handle(message));
     assert_waiting_for_cursor(flush.as_mut(), writer.wal_flusher.cursors());
     assert!(
@@ -42,7 +48,13 @@ async fn test_pk_only_flush_waits_for_index_apply() {
             .sstables
             .is_empty()
     );
+    assert_eq!(
+        controls.sstable_attempts(),
+        attempts_before,
+        "the flush must not write a generation before its PK index is applied"
+    );
 
+    controls.hold_sstable_puts();
     apply_index_range(
         writer.wal_flusher.cursors(),
         TriggerIndexApply {
@@ -53,10 +65,43 @@ async fn test_pk_only_flush_waits_for_index_apply() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), flush)
+
+    // Apply must release the cursor wait, but the generation write is held at
+    // the store boundary, so completion here would mean the flush skipped it.
+    tokio::select! {
+        result = &mut flush => {
+            panic!("flush finished before its gated generation write: {result:?}")
+        }
+        gate = tokio::time::timeout(Duration::from_secs(30), async {
+            while controls.sstable_attempts() == attempts_before {
+                tokio::task::yield_now().await;
+            }
+        }) => {
+            gate.expect("flush did not reach its generation write after applying its PK index")
+        }
+    }
+    assert!(
+        writer
+            .manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .sstables
+            .is_empty(),
+        "the flush must not publish before its generation write completes"
+    );
+
+    controls.release_sstable_puts();
+    tokio::time::timeout(Duration::from_secs(60), &mut flush)
         .await
-        .expect("flush did not finish after applying its PK index")
+        .expect("flush did not complete after releasing its generation write")
         .unwrap();
+    assert_eq!(
+        writer.manifest().await.unwrap().unwrap().sstables.len(),
+        1,
+        "the completed flush must publish its SSTable"
+    );
+
     let base_uri = format!("file://{}", temp.path().display());
     assert_eq!(
         read_sstable_ids_via_lsm(&writer, schema, &base_uri, writer.config.shard_id, None,).await,

@@ -489,6 +489,8 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         Ok(ObjectStore {
             scheme: "goosefs".to_string(),
             inner: opendal_store,
+            external_blob_inner: None,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             block_size,

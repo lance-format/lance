@@ -171,6 +171,38 @@ impl ObjectStoreRegistry {
         }
     }
 
+    /// Remove providers before sharing this registry with a session.
+    ///
+    /// Consuming `self` prevents races with in-flight store creation. All cached
+    /// store bindings are discarded so re-registering a scheme cannot resurrect
+    /// an earlier provider's store, even when schemes share a cache prefix.
+    /// Existing store handles held by callers remain usable; this is a
+    /// construction-time restriction, not revocation of issued handles.
+    /// Unknown schemes are ignored. Returns an error if a registry lock is poisoned.
+    ///
+    /// ```
+    /// use lance_io::object_store::ObjectStoreRegistry;
+    /// # fn configured() -> lance_core::Result<()> {
+    /// let registry = ObjectStoreRegistry::default()
+    ///     .without_providers(["file", "file-object-store", "file+uring"])?;
+    /// assert!(registry.get_provider("file").is_none());
+    /// assert!(registry.get_provider("memory").is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn without_providers(
+        mut self,
+        schemes: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self> {
+        let providers = self.providers.get_mut().ok().expect_ok()?;
+        for scheme in schemes {
+            providers.remove(scheme.as_ref());
+        }
+        self.active_stores.get_mut().ok().expect_ok()?.clear();
+        self.building.get_mut().ok().expect_ok()?.clear();
+        Ok(self)
+    }
+
     /// Set the smallest cache size at which [`Self::get_store()`] sweeps out
     /// dead entries (default [`DEFAULT_MIN_PRUNE_THRESHOLD`]); `0` disables the
     /// sweep. Applies to the whole registry, i.e. to every dataset sharing the
@@ -563,6 +595,43 @@ mod tests {
     use crate::scheduler::SCHEDULER_ERROR_MODE_STORAGE_OPTION;
     use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
     use rstest::rstest;
+
+    #[tokio::test]
+    async fn test_without_providers_discards_cached_bindings() {
+        let registry = ObjectStoreRegistry::default();
+        let params = ObjectStoreParams::default();
+        let memory_uri = Url::parse("memory://").unwrap();
+        let memory = registry
+            .get_store(memory_uri.clone(), &params)
+            .await
+            .unwrap();
+        let file_uri = Url::parse("file-object-store:///tmp").unwrap();
+        let file = registry.get_store(file_uri.clone(), &params).await.unwrap();
+        let registry = registry
+            .without_providers(["file", "file-object-store", "file+uring", "absent"])
+            .unwrap();
+        assert!(registry.active_stores().is_empty());
+        for scheme in ["file", "file-object-store", "file+uring"] {
+            assert!(registry.get_provider(scheme).is_none());
+            let uri = Url::parse(&format!("{scheme}:///tmp")).unwrap();
+            let error = registry.get_store(uri.clone(), &params).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("No object store provider found"));
+            let error = registry.new_store(uri, &params).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("No object store provider found"));
+        }
+        // Re-registering cannot revive a binding created by the old provider.
+        registry.insert(
+            "file-object-store",
+            Arc::new(SchedulerModeIgnoringStoreProvider),
+        );
+        let replacement = registry.get_store(file_uri, &params).await.unwrap();
+        assert!(!Arc::ptr_eq(&file, &replacement));
+        let reopened = registry.get_store(memory_uri, &params).await.unwrap();
+        assert!(!Arc::ptr_eq(&memory, &reopened));
+        assert_eq!(reopened.scheme(), "memory");
+    }
 
     #[derive(Debug)]
     struct DummyProvider;

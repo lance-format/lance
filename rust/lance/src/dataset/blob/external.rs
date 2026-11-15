@@ -9,12 +9,13 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use lance_arrow::FieldExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, uri_to_url};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use url::Url;
 
 use crate::blob::{blob_v2_shape_error, validate_prepared_blob_array};
+use crate::session::UnregisteredExternalBlobPolicy;
 use lance_core::datatypes::BlobV2Layout;
 use lance_core::{Error, Result};
 
@@ -36,6 +37,7 @@ pub(in crate::dataset) struct ExternalBaseCandidate {
 pub(in crate::dataset) struct ExternalBaseResolver {
     candidates: Vec<ExternalBaseCandidate>,
     pub(in crate::dataset) registered_base_ids: RoaringBitmap,
+    pub(in crate::dataset) unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
     store_registry: Arc<ObjectStoreRegistry>,
 }
 
@@ -48,6 +50,7 @@ impl ExternalBaseResolver {
             registered_base_ids: candidates.iter().map(|base| base.base_id).collect(),
             candidates,
             store_registry,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
         }
     }
 
@@ -55,6 +58,14 @@ impl ExternalBaseResolver {
         &self,
         uri: &str,
     ) -> Result<Option<ResolvedExternalBase>> {
+        let url = uri_to_url(uri)?;
+        // A missing provider cannot resolve any registered base. Let controlled
+        // reference writes report the session policy instead of a registry error.
+        if self.unregistered_external_blob_policy == UnregisteredExternalBlobPolicy::Deny
+            && self.store_registry.get_provider(url.scheme()).is_none()
+        {
+            return Ok(None);
+        }
         let uri_path = ObjectStore::extract_path_from_uri(self.store_registry.clone(), uri)?;
 
         let mut best_match: Option<(usize, ResolvedExternalBase)> = None;

@@ -98,14 +98,15 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
 
     // Which index this takes depends on the layout, because arrow's extenders
-    // disagree about who applies `ArrayData::offset()`. The bit-packed one adds
-    // it to the raw values buffer itself, so an offset-applied index there
-    // reads from twice the offset and runs off the end of the buffer. Every
-    // other layout either reads through an already-offset-applied view or
-    // forwards the index to children carrying their own offsets, and takes the
-    // absolute index it has always been given.
+    // disagree about who applies `ArrayData::offset()`. The boolean and
+    // fixed-size-list ones add it themselves (the latter since arrow 59.3.2),
+    // so an offset-applied index there reads from twice the offset and runs
+    // off the end of the buffer. Every other layout either reads through an
+    // already-offset-applied view or, like struct, forwards the index to
+    // children that do not carry the parent's offset, and takes the absolute
+    // index.
     let start = match data.data_type() {
-        DataType::Boolean => 0,
+        DataType::Boolean | DataType::FixedSizeList(..) => 0,
         _ => data.offset(),
     };
     // The copy holds no more data than the valid source array, so offsets cannot overflow.
@@ -191,9 +192,8 @@ mod tests {
         // `ArrayData::slice` records the offset on the parent and leaves the
         // child whole -- a shape `FixedSizeListArray::slice` never produces,
         // but a legal one this public helper can be handed directly. Arrow's
-        // extender forwards `start * size` to that unsliced child and adds
-        // nothing, so the index it gets has to be the absolute one; this is
-        // here to stop the boolean fix from being generalised over it.
+        // extender adds that offset itself before scaling by the list size,
+        // so it has to be given the index relative to the slice.
         let child = Int32Array::from(vec![10, 11, 20, 21]).to_data();
         let field = Arc::new(Field::new_list_field(DataType::Int32, false));
         let data = ArrayDataBuilder::new(DataType::FixedSizeList(field, 2))
@@ -209,11 +209,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_sliced_struct_of_fixed_size_list_reaches_the_right_values() {
-        // Slicing raw struct data pushes the window into the struct's children,
-        // and a fixed-size-list child takes it as its own parent offset with
-        // its values left whole. Two levels of offset, and the absolute index
-        // has to remain right through both of them.
+    fn raw_parent_offset_struct_of_fixed_size_list_reaches_the_right_values() {
+        // A struct window held as the parent offset over whole children (the
+        // shape `StructArray::from` reads), with a fixed-size-list child: the
+        // struct extender forwards the absolute index, and the list scales it
+        // by its size into its own whole values.
         let values = Int32Array::from(vec![10, 11, 20, 21, 30, 31]).to_data();
         let item = Arc::new(Field::new_list_field(DataType::Int32, false));
         let list = ArrayDataBuilder::new(DataType::FixedSizeList(item, 2))
@@ -223,13 +223,13 @@ mod tests {
             .unwrap();
         let field = Arc::new(Field::new("l", list.data_type().clone(), false));
         let data = ArrayDataBuilder::new(DataType::Struct(vec![field].into()))
-            .len(3)
+            .len(1)
+            .offset(2)
             .add_child_data(list)
             .build()
             .unwrap();
-        let sliced = data.slice(2, 1);
 
-        let copied = super::deep_copy_array_data_sliced(&sliced);
+        let copied = super::deep_copy_array_data_sliced(&data);
         let copied_values = Int32Array::from(copied.child_data()[0].child_data()[0].clone());
         assert_eq!(copied_values.values().as_ref(), &[30, 31]);
     }
