@@ -54,12 +54,14 @@ pub(super) async fn try_read(
 
 async fn read_payload(value: &dyn IndexBinaryReader) -> Result<bytes::Bytes> {
     let expected = value.len();
-    let buffers = value.read_slices(&[0..expected]).await?;
-    let [buffer] = buffers.as_slice() else {
-        return Err(Error::index(format!(
-            "whole positions read returned {} buffers, expected 1",
-            buffers.len(),
-        )));
+    let mut buffers = value.read_slices(&[0..expected]).await?;
+    let buffer = match buffers.len() {
+        1 => buffers.remove(0),
+        count => {
+            return Err(Error::index(format!(
+                "whole positions read returned {count} buffers, expected 1",
+            )));
+        }
     };
     if buffer.len() as u64 != expected {
         return Err(Error::index(format!(
@@ -67,10 +69,16 @@ async fn read_payload(value: &dyn IndexBinaryReader) -> Result<bytes::Bytes> {
             buffer.len(),
         )));
     }
-    // Even a unique Bytes can have a custom owner retaining a much larger
-    // coalesced allocation. Copy the selected value before caching it, just as
-    // the Arrow fallback does when compact standard ownership is unproven.
-    Ok(bytes::Bytes::copy_from_slice(buffer))
+    // Split large I/O ranges are already reconstructed into an owned Vec.
+    // Consuming Bytes recovers that allocation, copying custom/shared owners.
+    // Vec exposes the full allocation capacity, including a hidden prefix:
+    // uniqueness or BytesMut's remaining capacity alone cannot certify this.
+    let owned = Vec::<u8>::from(buffer);
+    Ok(if owned.capacity() == owned.len() {
+        bytes::Bytes::from(owned)
+    } else {
+        bytes::Bytes::copy_from_slice(&owned)
+    })
 }
 
 #[cfg(test)]
@@ -144,6 +152,59 @@ mod tests {
                 .upgrade()
                 .is_none()
         );
+    }
+
+    #[derive(Debug)]
+    struct OwnedValue {
+        bytes: std::sync::Mutex<Option<bytes::Bytes>>,
+        len: u64,
+    }
+
+    #[async_trait]
+    impl IndexBinaryReader for OwnedValue {
+        fn len(&self) -> u64 {
+            self.len
+        }
+
+        async fn read_slices(&self, slices: &[Range<u64>]) -> Result<Vec<bytes::Bytes>> {
+            assert_eq!(slices, &[0..self.len]);
+            Ok(vec![self.bytes.lock().unwrap().take().unwrap()])
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::reconstructed(0, 0, false, true)]
+    #[case::hidden_prefix(1024, 0, false, false)]
+    #[case::spare_capacity(0, 1024, false, false)]
+    #[case::shared(0, 0, true, false)]
+    #[tokio::test]
+    async fn selective_phrase_whole_payload_preserves_only_compact_ownership(
+        #[case] prefix: usize,
+        #[case] spare: usize,
+        #[case] shared: bool,
+        #[case] reuse: bool,
+    ) {
+        let len = 128;
+        let mut owned = Vec::with_capacity(prefix + len + spare);
+        owned.extend((0..prefix + len).map(|value| value as u8));
+        let bytes = bytes::Bytes::from(owned).slice(prefix..prefix + len);
+        let original = bytes.as_ptr();
+        let expected = bytes.to_vec();
+        let alias = shared.then(|| bytes.clone());
+        let value = OwnedValue {
+            bytes: std::sync::Mutex::new(Some(bytes)),
+            len: len as u64,
+        };
+        let payload = read_payload(&value).await.unwrap();
+        assert_eq!(payload.as_ref(), expected);
+        assert_eq!(payload.as_ptr() == original, reuse);
+        if let Some(alias) = alias {
+            assert_eq!(alias.as_ref(), expected);
+        }
+        // Consuming the result exposes its complete standard allocation, not
+        // the remaining span of a sliced mutable view.
+        let owned = Vec::<u8>::from(payload);
+        assert_eq!(owned.capacity(), owned.len());
     }
 
     #[rstest::rstest]
