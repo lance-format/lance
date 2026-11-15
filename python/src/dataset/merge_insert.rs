@@ -9,14 +9,15 @@ use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::{
-    MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode, MergeStats,
-    UncommittedMergeInsert, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
-    transaction::Transaction,
+    MergeInsertAnalysis, MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode,
+    MergeInsertWriteStrategy, MergeStats, UncommittedMergeInsert, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, transaction::Transaction,
 };
+use lance_datafusion::exec::{ExecutionMetricValue, ExecutionOutcome};
 use lance_datafusion::utils::reader_to_stream;
 use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::{PyDict, PyList, PyString};
 
 use crate::error::PythonErrorExt;
 use crate::rt;
@@ -421,6 +422,61 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    pub fn _analyze_plan_report<'py>(
+        &self,
+        py: Python<'py>,
+        new_data: &Bound<PyAny>,
+        is_materialized: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let reader = convert_reader(new_data)?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let report = if is_materialized {
+            let batches = reader
+                .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            rt().block_on(Some(py), job.analyze_plan_report_batches(batches))?
+        } else {
+            rt().block_on(Some(py), job.analyze_plan_report(reader_to_stream(reader)))?
+        }
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Self::build_analysis_report(report, py)
+    }
+
+    pub fn _analyze_plan_report_dataset<'py>(
+        &self,
+        py: Python<'py>,
+        source: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self.builder.clone().try_build().infer_error()?;
+        let report = rt()
+            .spawn(Some(py), async move {
+                job.analyze_plan_report_dataset(source).await
+            })?
+            .infer_error()?;
+        Self::build_analysis_report(report, py)
+    }
+
+    pub fn _analyze_plan_report_replayable<'py>(
+        &self,
+        py: Python<'py>,
+        schema: PyArrowType<ArrowSchema>,
+        factory: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let provider = replayable_provider(Arc::new(schema.0), factory)?;
+        let job = self.builder.clone().try_build().infer_error()?;
+        let report = rt()
+            .spawn(Some(py), async move {
+                job.analyze_plan_report_provider(provider).await
+            })?
+            .infer_error()?;
+        Self::build_analysis_report(report, py)
+    }
+
     /// Mark MemWAL SSTables as compacted into the base table.
     ///
     /// Call this when executing a merge_insert that compacts MemWAL SSTables.
@@ -443,6 +499,175 @@ impl MergeInsertBuilder {
 }
 
 impl MergeInsertBuilder {
+    fn build_analysis_report(
+        report: MergeInsertAnalysis,
+        py: Python<'_>,
+    ) -> PyResult<Bound<'_, PyDict>> {
+        let wire = report.to_proto();
+        let dict = Self::build_execution_report(report.execution, py)?;
+        dict.set_item("operation_id", report.operation_id.to_string())?;
+        dict.set_item(
+            "write_mode",
+            match report.write_mode {
+                MergeInsertWriteStrategy::DeleteOnly => "delete_only",
+                MergeInsertWriteStrategy::RewriteRows => "rewrite_rows",
+                MergeInsertWriteStrategy::RewriteColumns => "rewrite_columns",
+            },
+        )?;
+        dict.set_item("fragments_touched", report.fragments_touched)?;
+        if let Some(stats) = report.stats {
+            let values = Self::build_stats(&stats, py)?;
+            values.set_item("bytes_written", stats.bytes_written)?;
+            values.set_item("num_files_written", stats.num_files_written)?;
+            values.set_item("num_skipped_duplicates", stats.num_skipped_duplicates)?;
+            dict.set_item("stats", values)?;
+        } else {
+            dict.set_item("stats", py.None())?;
+        }
+        dict.set_item("joins", Self::build_joins(report.joins, py)?)?;
+        dict.set_item("target_rows_read", report.target_rows_read)?;
+        dict.set_item("fragments_read", report.fragments_read)?;
+        dict.set_item("index_used", report.index_used)?;
+        dict.set_item("join_index_segments", report.join_index_segments)?;
+        dict.set_item(
+            "join_duration_ns",
+            report.join_duration.map(|v| v.as_nanos()),
+        )?;
+        dict.set_item("joined_rows", report.joined_rows)?;
+        dict.set_item(
+            "merge_write_duration_ns",
+            report.merge_write_duration.map(|v| v.as_nanos()),
+        )?;
+        dict.set_item("mapped_target_rows", report.mapped_target_rows)?;
+        for (name, usage) in [
+            ("operator_spills", wire.operator_spills),
+            ("replay_spills", wire.replay_spills),
+            ("scratch_spills", wire.scratch_spills),
+        ] {
+            if let Some(usage) = usage {
+                let values = PyDict::new(py);
+                for (field, value) in [
+                    ("spill_count", usage.spill_count),
+                    ("bytes_written", usage.bytes_written),
+                    ("bytes_read", usage.bytes_read),
+                    ("write_duration_ns", usage.write_duration_ns),
+                    ("read_duration_ns", usage.read_duration_ns),
+                    ("rows", usage.rows),
+                    ("accepted_bytes", usage.accepted_bytes),
+                    ("charged_bytes", usage.charged_bytes),
+                    ("peak_charged_bytes", usage.peak_charged_bytes),
+                    ("live_files", usage.live_files),
+                    ("files_created", usage.files_created),
+                    ("quota_failures", usage.quota_failures),
+                    ("cleanup_failures", usage.cleanup_failures),
+                ] {
+                    values.set_item(field, value)?;
+                }
+                dict.set_item(name, values)?;
+            } else {
+                dict.set_item(name, py.None())?;
+            }
+        }
+        let subplans = PyList::empty(py);
+        for subplan in report.subplans {
+            let node = Self::build_execution_report(subplan.execution, py)?;
+            node.set_item("id", subplan.id)?;
+            node.set_item("purpose", subplan.purpose)?;
+            node.set_item("joins", Self::build_joins(subplan.joins, py)?)?;
+            subplans.append(node)?;
+        }
+        dict.set_item("subplans", subplans)?;
+        Ok(dict)
+    }
+
+    fn build_execution_report(
+        execution: lance_datafusion::exec::ExecutionAnalysis,
+        py: Python<'_>,
+    ) -> PyResult<Bound<'_, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("plan", execution.plan)?;
+        dict.set_item(
+            "outcome",
+            match execution.outcome {
+                ExecutionOutcome::Complete => "complete",
+                ExecutionOutcome::Failed => "failed",
+                ExecutionOutcome::Cancelled => "cancelled",
+            },
+        )?;
+        dict.set_item("error", execution.error)?;
+        dict.set_item("elapsed_ns", execution.elapsed.as_nanos())?;
+        dict.set_item(
+            "pool_peak_reserved_bytes",
+            execution.pool_peak_reserved_bytes,
+        )?;
+        let counts = PyDict::new(py);
+        let summary = execution.summary;
+        for (name, value) in summary.all_counts {
+            counts.set_item(name, value)?;
+        }
+        counts.set_item("iops", summary.iops)?;
+        counts.set_item("requests", summary.requests)?;
+        counts.set_item("bytes_read", summary.bytes_read)?;
+        counts.set_item("indices_loaded", summary.indices_loaded)?;
+        counts.set_item("parts_loaded", summary.parts_loaded)?;
+        counts.set_item("index_comparisons", summary.index_comparisons)?;
+        dict.set_item("counts", counts)?;
+        dict.set_item("times_ns", summary.all_times)?;
+        let operators = PyList::empty(py);
+        for operator in execution.operators {
+            let node = PyDict::new(py);
+            node.set_item("path", operator.path)?;
+            node.set_item("name", operator.name)?;
+            let metrics = PyList::empty(py);
+            for metric in operator.metrics {
+                let value = PyDict::new(py);
+                value.set_item("name", metric.name)?;
+                value.set_item("partition", metric.partition)?;
+                value.set_item("labels", metric.labels)?;
+                let (kind, number) = match metric.value {
+                    ExecutionMetricValue::Count(value) => ("count", value as u128),
+                    ExecutionMetricValue::Gauge(value) => ("gauge", value as u128),
+                    ExecutionMetricValue::PeakMemoryBytes(value) => {
+                        ("peak_memory_bytes", value as u128)
+                    }
+                    ExecutionMetricValue::Time(value) => ("time_ns", value.as_nanos()),
+                };
+                value.set_item("kind", kind)?;
+                value.set_item("value", number)?;
+                metrics.append(value)?;
+            }
+            node.set_item("metrics", metrics)?;
+            operators.append(node)?;
+        }
+        dict.set_item("operators", operators)?;
+        Ok(dict)
+    }
+
+    fn build_joins(
+        values: Vec<lance::dataset::MergeInsertJoin>,
+        py: Python<'_>,
+    ) -> PyResult<Bound<'_, PyList>> {
+        let joins = PyList::empty(py);
+        for join in values {
+            let value = PyDict::new(py);
+            value.set_item("path", join.path)?;
+            value.set_item("subplan_id", join.subplan_id)?;
+            value.set_item("join_type", format!("{:?}", join.join_type))?;
+            match join.strategy {
+                lance::dataset::MergeInsertJoinStrategy::Hash(mode) => {
+                    value.set_item("strategy", "hash")?;
+                    value.set_item("partition_mode", format!("{mode:?}"))?;
+                }
+                lance::dataset::MergeInsertJoinStrategy::SortMerge => {
+                    value.set_item("strategy", "sort_merge")?;
+                    value.set_item("partition_mode", py.None())?;
+                }
+            }
+            joins.append(value)?;
+        }
+        Ok(joins)
+    }
+
     fn build_stats<'a>(stats: &MergeStats, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("num_inserted_rows", stats.num_inserted_rows)?;

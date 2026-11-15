@@ -1062,15 +1062,18 @@ impl InvertedIndex {
             .partitions
             .iter()
             .enumerate()
-            .filter(|(partition_ordinal, _)| {
-                term_ids.is_none_or(|term_ids| {
-                    token_ids_may_match(
-                        tokens.as_ref(),
-                        term_ids.partition(*partition_ordinal),
-                        operator,
-                        is_phrase_query,
-                    )
-                })
+            .filter(|(partition_ordinal, part)| {
+                term_ids.map_or_else(
+                    || part.may_match_tokens(tokens.as_ref(), operator, is_phrase_query),
+                    |term_ids| {
+                        token_ids_may_match(
+                            tokens.as_ref(),
+                            term_ids.partition(*partition_ordinal),
+                            operator,
+                            is_phrase_query,
+                        )
+                    },
+                )
             })
             .collect::<Vec<_>>();
         let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
@@ -1103,19 +1106,6 @@ impl InvertedIndex {
                         let partition_term_ids =
                             term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
-                            let Some(postings) = part
-                                .fetch_posting_lists(
-                                    tokens.as_ref(),
-                                    params.as_ref(),
-                                    operator,
-                                    metrics.as_ref(),
-                                    PostingLoadOptions::cache_aware_exact(),
-                                    partition_term_ids,
-                                )
-                                .await?
-                            else {
-                                return Result::Ok(None);
-                            };
                             let documents = part.docs.modern().ok_or_else(|| {
                                 Error::internal("modern index contains legacy partition documents")
                             })?;
@@ -1135,9 +1125,22 @@ impl InvertedIndex {
                                         .await?
                                 }
                             };
-                            if visibility.is_empty() {
+                            if !visibility.may_match().await? {
                                 return Result::Ok(None);
                             }
+                            let Some(postings) = part
+                                .fetch_posting_lists(
+                                    tokens.as_ref(),
+                                    params.as_ref(),
+                                    operator,
+                                    metrics.as_ref(),
+                                    PostingLoadOptions::cache_aware_exact(),
+                                    partition_term_ids,
+                                )
+                                .await?
+                            else {
+                                return Result::Ok(None);
+                            };
                             let lengths = match documents.cached_lengths() {
                                 Some(lengths) => lengths,
                                 None => documents.lengths().await?,

@@ -15,6 +15,7 @@
 //!
 //! FSST encoding is transparent.
 
+use fsst::fsst::FsstDecompressor;
 use lance_core::{Error, Result};
 
 use crate::{
@@ -40,6 +41,23 @@ pub(crate) fn map_fsst_error(err: std::io::Error) -> Error {
     }
 }
 
+pub(crate) type ParsedFsstDecompressor =
+    std::result::Result<Box<FsstDecompressor>, (std::io::ErrorKind, String)>;
+
+pub(crate) fn parse_fsst_symbol_table(symbol_table: &[u8]) -> ParsedFsstDecompressor {
+    FsstDecompressor::try_new(symbol_table)
+        .map(Box::new)
+        .map_err(|err| (err.kind(), err.to_string()))
+}
+
+#[inline]
+pub(crate) fn get_fsst_decompressor(parsed: &ParsedFsstDecompressor) -> Result<&FsstDecompressor> {
+    match parsed {
+        Ok(dec) => Ok(dec.as_ref()),
+        Err((kind, msg)) => Err(map_fsst_error(std::io::Error::new(*kind, msg.clone()))),
+    }
+}
+
 struct FsstCompressed {
     data: VariableWidthBlock,
     symbol_table: Vec<u8>,
@@ -49,27 +67,18 @@ impl FsstCompressed {
     fn fsst_compress(data: DataBlock) -> Result<Self> {
         match data {
             DataBlock::VariableWidth(variable_width) => {
+                let bytes_data = variable_width.data.as_ref();
+                let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
+
                 match variable_width.bits_per_offset {
                     32 => {
                         let offsets = variable_width.offsets.borrow_to_typed_slice::<i32>();
-                        let offsets_slice = offsets.as_ref();
-                        let bytes_data = variable_width.data.into_buffer();
-
-                        // prepare compression output buffer
-                        let mut dest_offsets = vec![0_i32; offsets_slice.len() * 2];
-                        let mut dest_values = vec![0_u8; bytes_data.len() * 2];
-                        let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
-
-                        // fsst compression
-                        fsst::fsst::compress(
+                        let (dest_values, dest_offsets) = fsst::fsst::compress_into(
                             &mut symbol_table,
-                            bytes_data.as_slice(),
-                            offsets_slice,
-                            &mut dest_values,
-                            &mut dest_offsets,
+                            bytes_data,
+                            offsets.as_ref(),
                         )?;
 
-                        // construct `DataBlock` for BinaryMiniBlockEncoder, we may want some `DataBlock` construct methods later
                         let compressed = VariableWidthBlock {
                             data: LanceBuffer::reinterpret_vec(dest_values),
                             bits_per_offset: 32,
@@ -85,24 +94,12 @@ impl FsstCompressed {
                     }
                     64 => {
                         let offsets = variable_width.offsets.borrow_to_typed_slice::<i64>();
-                        let offsets_slice = offsets.as_ref();
-                        let bytes_data = variable_width.data.into_buffer();
-
-                        // prepare compression output buffer
-                        let mut dest_offsets = vec![0_i64; offsets_slice.len() * 2];
-                        let mut dest_values = vec![0_u8; bytes_data.len() * 2];
-                        let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
-
-                        // fsst compression
-                        fsst::fsst::compress(
+                        let (dest_values, dest_offsets) = fsst::fsst::compress_into(
                             &mut symbol_table,
-                            bytes_data.as_slice(),
-                            offsets_slice,
-                            &mut dest_values,
-                            &mut dest_offsets,
+                            bytes_data,
+                            offsets.as_ref(),
                         )?;
 
-                        // construct `DataBlock` for BinaryMiniBlockEncoder, we may want some `DataBlock` construct methods later
                         let compressed = VariableWidthBlock {
                             data: LanceBuffer::reinterpret_vec(dest_values),
                             bits_per_offset: 64,
@@ -196,7 +193,7 @@ impl PerValueCompressor for FsstPerValueEncoder {
 
 #[derive(Debug)]
 pub struct FsstPerValueDecompressor {
-    symbol_table: LanceBuffer,
+    decompressor: ParsedFsstDecompressor,
     inner_decompressor: Box<dyn VariablePerValueDecompressor>,
 }
 
@@ -206,7 +203,7 @@ impl FsstPerValueDecompressor {
         inner_decompressor: Box<dyn VariablePerValueDecompressor>,
     ) -> Self {
         Self {
-            symbol_table,
+            decompressor: parse_fsst_symbol_table(symbol_table.as_ref()),
             inner_decompressor,
         }
     }
@@ -218,6 +215,8 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
     }
 
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        let decompressor = get_fsst_decompressor(&self.decompressor)?;
+
         // Step 1. Run inner decompressor
         let compressed_variable_data = self
             .inner_decompressor
@@ -226,34 +225,21 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
             .unwrap();
 
         // Step 2. FSST decompress
-        let bytes = compressed_variable_data.data.borrow_to_typed_slice::<u8>();
-        let bytes = bytes.as_ref();
+        let bytes = compressed_variable_data.data.as_ref();
+        let num_values = compressed_variable_data.num_values;
+        let num_offsets = (num_values + 1) as usize;
 
         match compressed_variable_data.bits_per_offset {
             32 => {
                 let offsets = compressed_variable_data
                     .offsets
                     .borrow_to_typed_slice::<i32>();
-                let offsets = offsets.as_ref();
-                let num_values = compressed_variable_data.num_values;
-
-                // The data will expand at most 8 times
-                // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
-                let mut decompress_offset_buf = vec![0i32; offsets.len()];
-                fsst::fsst::decompress(
-                    &self.symbol_table,
-                    bytes,
-                    offsets,
-                    &mut decompress_bytes_buf,
-                    &mut decompress_offset_buf,
-                )
-                .map_err(map_fsst_error)?;
+                let offsets = &offsets.as_ref()[..num_offsets.min(offsets.len())];
+                let (mut decompress_bytes_buf, decompress_offset_buf) = decompressor
+                    .decompress_into(bytes, offsets)
+                    .map_err(map_fsst_error)?;
                 // The values become the batch's buffer, so release the unused 8x headroom
                 decompress_bytes_buf.shrink_to_fit();
-
-                // Ensure the offsets array is trimmed to exactly num_values + 1 elements
-                decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
                     data: LanceBuffer::from(decompress_bytes_buf),
@@ -267,26 +253,12 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 let offsets = compressed_variable_data
                     .offsets
                     .borrow_to_typed_slice::<i64>();
-                let offsets = offsets.as_ref();
-                let num_values = compressed_variable_data.num_values;
-
-                // The data will expand at most 8 times
-                // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
-                let mut decompress_offset_buf = vec![0i64; offsets.len()];
-                fsst::fsst::decompress(
-                    &self.symbol_table,
-                    bytes,
-                    offsets,
-                    &mut decompress_bytes_buf,
-                    &mut decompress_offset_buf,
-                )
-                .map_err(map_fsst_error)?;
+                let offsets = &offsets.as_ref()[..num_offsets.min(offsets.len())];
+                let (mut decompress_bytes_buf, decompress_offset_buf) = decompressor
+                    .decompress_into(bytes, offsets)
+                    .map_err(map_fsst_error)?;
                 // The values become the batch's buffer, so release the unused 8x headroom
                 decompress_bytes_buf.shrink_to_fit();
-
-                // Ensure the offsets array is trimmed to exactly num_values + 1 elements
-                decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
                     data: LanceBuffer::from(decompress_bytes_buf),
@@ -319,7 +291,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
 
 #[derive(Debug)]
 pub struct FsstMiniBlockDecompressor {
-    symbol_table: LanceBuffer,
+    decompressor: ParsedFsstDecompressor,
     inner_decompressor: Box<dyn MiniBlockDecompressor>,
 }
 
@@ -329,7 +301,7 @@ impl FsstMiniBlockDecompressor {
         inner_decompressor: Box<dyn MiniBlockDecompressor>,
     ) -> Self {
         Self {
-            symbol_table: LanceBuffer::from_bytes(description.symbol_table.clone(), 1),
+            decompressor: parse_fsst_symbol_table(description.symbol_table.as_ref()),
             inner_decompressor,
         }
     }
@@ -352,64 +324,32 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     }
 
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
-        // Step 1. decompress data use `BinaryMiniBlockDecompressor`
-        // Extract the bits_per_offset from the binary encoding
+        let decompressor = get_fsst_decompressor(&self.decompressor)?;
+
+        // Step 1. decompress data using `BinaryMiniBlockDecompressor`
         let compressed_data_block = self.inner_decompressor.decompress(data, num_values)?;
         let DataBlock::VariableWidth(compressed_data_block) = compressed_data_block else {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
         };
 
-        // Step 2. FSST decompress
-        let bytes = &compressed_data_block.data;
+        // Step 2. FSST decompress using the pre-parsed symbol table
+        let bytes = compressed_data_block.data.as_ref();
+        let num_offsets = (num_values + 1) as usize;
         let (decompress_bytes_buf, decompress_offset_buf) =
             if compressed_data_block.bits_per_offset == 64 {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i64>();
-                let offsets = offsets.as_ref();
-
-                // The data will expand at most 8 times
-                // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
-                let mut decompress_offset_buf = vec![0i64; offsets.len()];
-                fsst::fsst::decompress(
-                    &self.symbol_table,
-                    bytes.as_ref(),
-                    offsets,
-                    &mut decompress_bytes_buf,
-                    &mut decompress_offset_buf,
-                )
-                .map_err(map_fsst_error)?;
-
-                // Ensure the offsets array is trimmed to exactly num_values + 1 elements
-                decompress_offset_buf.truncate((num_values + 1) as usize);
-
-                (
-                    decompress_bytes_buf,
-                    LanceBuffer::reinterpret_vec(decompress_offset_buf),
-                )
+                let offsets = &offsets.as_ref()[..num_offsets.min(offsets.len())];
+                let (bytes_buf, offset_buf) = decompressor
+                    .decompress_into(bytes, offsets)
+                    .map_err(map_fsst_error)?;
+                (bytes_buf, LanceBuffer::reinterpret_vec(offset_buf))
             } else {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
-                let offsets = offsets.as_ref();
-
-                // The data will expand at most 8 times
-                // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
-                let mut decompress_offset_buf = vec![0i32; offsets.len()];
-                fsst::fsst::decompress(
-                    &self.symbol_table,
-                    bytes.as_ref(),
-                    offsets,
-                    &mut decompress_bytes_buf,
-                    &mut decompress_offset_buf,
-                )
-                .map_err(map_fsst_error)?;
-
-                // Ensure the offsets array is trimmed to exactly num_values + 1 elements
-                decompress_offset_buf.truncate((num_values + 1) as usize);
-
-                (
-                    decompress_bytes_buf,
-                    LanceBuffer::reinterpret_vec(decompress_offset_buf),
-                )
+                let offsets = &offsets.as_ref()[..num_offsets.min(offsets.len())];
+                let (bytes_buf, offset_buf) = decompressor
+                    .decompress_into(bytes, offsets)
+                    .map_err(map_fsst_error)?;
+                (bytes_buf, LanceBuffer::reinterpret_vec(offset_buf))
             };
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {

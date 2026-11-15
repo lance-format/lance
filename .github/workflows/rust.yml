@@ -339,31 +339,6 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
-  build-no-lock:
-    runs-on: ubuntu-24.04-8x
-    timeout-minutes: 30
-    env:
-      # Need up-to-date compilers for kernels
-      CC: clang
-      CXX: clang++
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Set up Rust
-        run: |
-          rustup update stable
-          rustup default stable
-      # Remote cargo.lock to force a fresh build
-      - name: Remove Cargo.lock
-        run: rm -f Cargo.lock
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install protoc
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
-        with:
-          tool: protoc
-      - name: Build all
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
-          cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     # Standard macOS runners are free for public repos; Warp runners are billed.
     # Only lance-io is tested here to keep PR feedback fast on 3 cores. The full

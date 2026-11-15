@@ -383,6 +383,32 @@ impl Session {
         Ok(result)
     }
 
+    /// Resize the index cache, evicting entries as needed to fit
+    /// ``capacity_bytes``.
+    ///
+    /// Parameters
+    /// ----------
+    /// capacity_bytes : int
+    ///     New weighted capacity of the index cache in bytes.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the index cache backend does not support resizing.
+    pub fn set_index_cache_capacity(&self, capacity_bytes: usize) -> PyResult<()> {
+        self.inner
+            .set_index_cache_capacity(capacity_bytes)
+            .map_err(|e| PyValueError::new_err(format!("index_cache: {e}")))
+    }
+
+    /// Resize the metadata cache, evicting entries as needed to fit
+    /// ``capacity_bytes``. See :meth:`set_index_cache_capacity`.
+    pub fn set_metadata_cache_capacity(&self, capacity_bytes: usize) -> PyResult<()> {
+        self.inner
+            .set_metadata_cache_capacity(capacity_bytes)
+            .map_err(|e| PyValueError::new_err(format!("metadata_cache: {e}")))
+    }
+
     /// Return whether the other session is the same as this one.
     pub fn is_same_as(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
