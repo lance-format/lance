@@ -139,8 +139,10 @@ fn route_contiguous(
     coverages_newest_first: &[&RoaringBitmap],
 ) -> OverlayRouting {
     let mut offsets_in_overlay: Vec<Vec<u32>> = vec![Vec::new(); coverages_newest_first.len()];
-    // Indexed by offset_in_batch: which (overlay, fetch position) supplies the row.
-    let mut routed: Vec<Option<(usize, usize)>> = vec![None; len];
+    // Source zero is an unclaimed base row. Update the final interleave routing
+    // directly so a second row-sized table does not overlap its allocation.
+    let mut indices: Vec<(usize, usize)> = (0..len).map(|row| (0, row)).collect();
+    let mut any_overlay = false;
     let range_end = (frag_start as u64 + len as u64).min(u32::MAX as u64) as u32;
     let mut batch_range = RoaringBitmap::new();
     batch_range.insert_range(frag_start..range_end);
@@ -159,25 +161,13 @@ fn route_contiguous(
         };
         for (nth_in_batch, offset_in_frag) in covered_in_batch.iter().enumerate() {
             let offset_in_batch = (offset_in_frag - frag_start) as usize;
-            if routed[offset_in_batch].is_none() {
-                routed[offset_in_batch] = Some((k, offsets_in_overlay[k].len()));
+            if indices[offset_in_batch].0 == 0 {
+                indices[offset_in_batch] = (k + 1, offsets_in_overlay[k].len());
                 offsets_in_overlay[k].push(first_offset_in_overlay + nth_in_batch as u32);
+                any_overlay = true;
             }
         }
     }
-
-    let mut any_overlay = false;
-    let indices = routed
-        .into_iter()
-        .enumerate()
-        .map(|(offset_in_batch, routed)| match routed {
-            None => (0, offset_in_batch),
-            Some((k, fetch_pos)) => {
-                any_overlay = true;
-                (k + 1, fetch_pos)
-            }
-        })
-        .collect();
 
     OverlayRouting {
         indices,
@@ -1204,8 +1194,11 @@ mod tests {
         assert!(assemble_overlay_column(&base, &routing, &fetched).is_err());
     }
 
-    #[test]
-    fn test_contiguous_fast_path_matches_general() {
+    #[rstest::rstest]
+    #[case::low(0)]
+    #[case::container_boundary(65_520)]
+    #[case::fragment_end(u32::MAX - 128)]
+    fn test_contiguous_fast_path_matches_general(#[case] origin: u32) {
         // The contiguous fast path must produce byte-for-byte identical routing to
         // the general offset-major path for any contiguous batch. Fuzz a range of
         // fragment starts, lengths, overlay counts, and coverage densities —
@@ -1218,8 +1211,8 @@ mod tests {
             (state >> 33) as u32
         };
         for _ in 0..500 {
-            let frag_start = next() % 64;
-            let len = (next() % 48 + 1) as usize;
+            let frag_start = origin + next() % 64;
+            let len = (next() % 49) as usize;
             let num_overlays = (next() % 5) as usize;
             let coverages: Vec<RoaringBitmap> = (0..num_overlays)
                 .map(|_| {
