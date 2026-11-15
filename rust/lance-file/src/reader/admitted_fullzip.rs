@@ -3,7 +3,7 @@
 
 //! Demand-driven FullZip cursor with one admission for all projected columns.
 
-use std::{future::Future, ops::Range, sync::Arc};
+use std::{collections::HashSet, future::Future, ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -51,7 +51,6 @@ pub enum FullZipScanOutcome {
 /// that outlive cancellation retain their allocation owners until access stops.
 #[derive(Debug)]
 pub struct FullZipScan {
-    io: Arc<dyn EncodingsIo>,
     columns: Vec<FullZipColumn>,
     schema: Arc<ArrowSchema>,
     budget: Arc<AllocationBudget>,
@@ -65,6 +64,7 @@ pub struct FullZipScan {
 
 #[derive(Debug)]
 struct FullZipColumn {
+    io: Arc<dyn EncodingsIo>,
     column: Arc<ColumnInfo>,
     page_index: usize,
     page_start: u64,
@@ -220,6 +220,7 @@ impl FileReader {
                 ));
             }
             columns.push(FullZipColumn {
+                io: self.core.scheduler.clone(),
                 column,
                 page_index: 0,
                 page_start: 0,
@@ -227,7 +228,6 @@ impl FileReader {
             });
         }
         Ok(FullZipScan {
-            io: self.core.scheduler.clone(),
             columns,
             schema,
             budget,
@@ -293,6 +293,67 @@ impl FullZipColumn {
 }
 
 impl FullZipScan {
+    /// Combine disjoint columns from row-aligned files into one admitted cursor.
+    ///
+    /// Both cursors must use the same shared budget, workspace size, partial-mode
+    /// setting and maximum batch rows. Their physical file length, next row and
+    /// selected end must match. Output fields follow `self` then `other`; duplicate
+    /// names and conflicting schema metadata are rejected. This consumes both
+    /// cursors, including on error, but never reads payload or releases their
+    /// previously returned Arrow aliases.
+    ///
+    /// Each batch ends at the earliest page boundary across all files. One
+    /// reservation covers every input and output, and one CPU job reconstructs
+    /// the complete batch. It never retains one file's completed batch while
+    /// requesting another workspace for the next file. Cancellation or refusal
+    /// leaves the combined row position unchanged.
+    ///
+    /// The caller must establish physical row alignment. Matching lengths alone
+    /// do not prove that unrelated files represent the same rows. This does not
+    /// apply fragment overlays, deletions, stable row IDs or query filters, and
+    /// does not adopt this path in ordinary fragment/scanner execution.
+    ///
+    /// ```
+    /// use lance_core::Result;
+    /// use lance_file::reader::FullZipScan;
+    /// fn combine(labels: FullZipScan, frames: FullZipScan) -> Result<FullZipScan> {
+    ///     // Both files cover the same physical rows, with disjoint projections.
+    ///     labels.try_merge(frames)
+    /// }
+    /// ```
+    pub fn try_merge(mut self, other: Self) -> Result<Self> {
+        if !Arc::ptr_eq(&self.budget, &other.budget)
+            || self.workspace_bytes != other.workspace_bytes
+            || self.is_partial_workspace_enabled != other.is_partial_workspace_enabled
+            || self.max_rows != other.max_rows
+        {
+            return Err(Error::invalid_input(
+                "FullZip merge requires the same budget and workspace/partial/max_rows settings",
+            ));
+        }
+        if self.read_len != other.read_len || self.cursor != other.cursor || self.end != other.end {
+            return Err(Error::invalid_input(format!(
+                "FullZip merge requires aligned physical lengths and positions: left {}/{}..{}, right {}/{}..{}",
+                self.read_len, self.cursor, self.end, other.read_len, other.cursor, other.end
+            )));
+        }
+        let mut names = HashSet::new();
+        for field in self.schema.fields().iter().chain(other.schema.fields()) {
+            if !names.insert(field.name()) {
+                return Err(Error::invalid_input(format!(
+                    "FullZip merge requires disjoint field names: {}",
+                    field.name()
+                )));
+            }
+        }
+        let schema =
+            ArrowSchema::try_merge([self.schema.as_ref().clone(), other.schema.as_ref().clone()])
+                .map_err(|error| Error::invalid_input(format!("FullZip merge schema: {error}")))?;
+        self.columns.extend(other.columns);
+        self.schema = Arc::new(schema);
+        Ok(self)
+    }
+
     /// Reuse a drained cursor for another forward, non-overlapping file-row range.
     ///
     /// The current range must have been completely delivered. The next range
@@ -405,7 +466,7 @@ impl FullZipScan {
                     local,
                     field.data_type().clone(),
                     &mut workspace,
-                    |range, buffer| self.io.submit_single_into(range, priority, buffer),
+                    |range, buffer| column.io.submit_single_into(range, priority, buffer),
                 )
                 .await?;
             let Some(input) = input else {

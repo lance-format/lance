@@ -21,14 +21,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Shared capacity wakeups and finite file progress
+      - name: Cross-file column admission
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-core --lib utils::allocation -- --nocapture
-          cargo test --profile ci --locked -p lance-core --doc wait_for_capacity -- --nocapture
           cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc try_merge -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-core -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings

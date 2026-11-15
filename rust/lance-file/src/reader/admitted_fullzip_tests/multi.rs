@@ -824,3 +824,199 @@ async fn later_column_batch_error_refunds_all_columns(
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[rstest]
+#[tokio::test]
+async fn merged_files_share_workspace_across_boundaries_and_cancellation(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] partial: bool,
+) {
+    let input = batches();
+    let expected = arrow_select::concat::concat_batches(&input[0].schema(), &input[..6]).unwrap();
+    // Independent physical files with unequal page boundaries. The merged cursor
+    // must preserve row alignment, not zip batches with different row counts.
+    let labels = [0..4, 4..15, 15..42].map(|rows| {
+        expected
+            .slice(rows.start, rows.len())
+            .project(&[0])
+            .unwrap()
+    });
+    let frames = [0..9, 9..21, 21..42].map(|rows| {
+        expected
+            .slice(rows.start, rows.len())
+            .project(&[1])
+            .unwrap()
+    });
+    let (_left_fs, left) = fixture_batches(version, lite, labels.into(), 1).await;
+    let (_right_fs, right) = fixture_batches(version, !lite, frames.into(), 1).await;
+    let left_stats = IoStats::new();
+    let right_stats = IoStats::new();
+    let left = left.with_io_stats(left_stats.recorder());
+    let right = right.with_io_stats(right_stats.recorder());
+    let mode = Arc::new(AtomicUsize::new(1));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let right = right.with_scheduler(Arc::new(LaterColumnIo {
+        inner: right.core.scheduler.clone(),
+        second_buffers: right.metadata().column_infos[0]
+            .page_infos
+            .iter()
+            .flat_map(|page| {
+                page.buffer_offsets_and_sizes
+                    .iter()
+                    .map(|(offset, len)| *offset..*offset + *len)
+            })
+            .collect(),
+        mode: mode.clone(),
+        second_reads: reads.clone(),
+        entered: entered.clone(),
+    }));
+    let budget = AllocationBudget::new(4096);
+    // Retain real payload from an unrelated file throughout cancellation/error.
+    let (_peer_fs, peer_reader) = fixture_arrays(version, lite, vec![array(29, 1)]).await;
+    let mut peer_scan = peer_reader
+        .open_admitted_fullzip_scan(0..1, budget.clone(), 4096, 1)
+        .await
+        .unwrap();
+    let FullZipScanOutcome::Batch { batch, .. } = peer_scan.try_next().await.unwrap() else {
+        panic!("peer must fit")
+    };
+    let peer = batch.column(0).slice(0, 1);
+    drop((batch, peer_scan));
+    let retained = budget.reserved();
+    assert!(retained > 0 && retained < 4096);
+    let workspace = if partial { 4096 } else { 4096 - retained };
+    let a = left
+        .open_admitted_fullzip_scan(3..13, budget.clone(), workspace, 8)
+        .await
+        .unwrap()
+        .with_partial_workspace(partial);
+    let b = right
+        .open_admitted_fullzip_scan(3..13, budget.clone(), workspace, 8)
+        .await
+        .unwrap()
+        .with_partial_workspace(partial);
+    let mut scan = a.try_merge(b).unwrap();
+    assert_eq!(left_stats.snapshot().iops, 0);
+    assert_eq!(right_stats.snapshot().iops, 0);
+    assert_eq!(budget.reserved(), retained);
+    for selection in [3..13, 17..35] {
+        if scan.position() != selection.start {
+            scan.advance_to_range(selection.clone()).unwrap();
+        }
+        mode.store(1, Ordering::Relaxed);
+        let _ = entered.notified().now_or_never();
+        {
+            let future = scan.try_next();
+            tokio::pin!(future);
+            tokio::select! {
+                _ = entered.notified() => (),
+                result = &mut future => panic!("later file must be gated: {result:?}"),
+            }
+            assert!(left_stats.snapshot().iops > 0);
+            let active = budget.reserved();
+            assert!(active > retained && active <= 4096);
+        }
+        assert_eq!(scan.position(), selection.start);
+        assert_eq!(budget.reserved(), retained);
+        mode.store(2, Ordering::Relaxed);
+        reads.store(0, Ordering::Relaxed);
+        let error = scan.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("later-column failure"));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(scan.position(), selection.start);
+        assert_eq!(budget.reserved(), retained);
+        mode.store(0, Ordering::Relaxed);
+        let mut next = selection.start;
+        loop {
+            match scan.try_next().await.unwrap() {
+                FullZipScanOutcome::Batch { rows, batch } => {
+                    assert_eq!(rows.start, next);
+                    assert!(rows.end > next && rows.end <= selection.end);
+                    for boundary in [4, 9, 15, 21, 42] {
+                        assert!(rows.end <= boundary || rows.start >= boundary);
+                    }
+                    assert_batch(&batch, &rows, &expected);
+                    next = rows.end;
+                    let alias = batch.column(1).slice(0, 1);
+                    drop(batch);
+                    assert!(budget.reserved() > retained && budget.reserved() <= 4096);
+                    tokio::task::yield_now().await;
+                    drop(alias);
+                    assert_eq!(budget.reserved(), retained);
+                }
+                FullZipScanOutcome::Finished => break,
+                FullZipScanOutcome::NeedsCapacity => panic!("compound row must fit beside peer"),
+            }
+        }
+        assert_eq!(next, selection.end);
+    }
+    assert_eq!(peer.to_data(), array(29, 1).slice(0, 1).to_data());
+    drop(peer);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[case::budget("budget", "same budget")]
+#[case::workspace("workspace", "workspace/partial/max_rows")]
+#[case::partial("partial", "workspace/partial/max_rows")]
+#[case::max_rows("max_rows", "workspace/partial/max_rows")]
+#[case::position("position", "aligned physical")]
+#[case::end("end", "aligned physical")]
+#[case::length("length", "aligned physical")]
+#[case::duplicate("duplicate", "disjoint field names")]
+#[tokio::test]
+async fn merged_files_reject_incompatible_cursors_before_io(
+    #[case] invalid: &str,
+    #[case] message: &str,
+) {
+    let input = batches();
+    let (fs, reader) = fixture_batches(ConcreteFileVersion::V2_3, false, input.clone(), 1).await;
+    let (short_fs, shorter) =
+        fixture_batches(ConcreteFileVersion::V2_3, true, input[..2].to_vec(), 1).await;
+    let left = project(&fs, &reader, &[0]).await;
+    let right = match invalid {
+        "duplicate" => project(&fs, &reader, &[0]).await,
+        "length" => project(&short_fs, &shorter, &[1]).await,
+        _ => project(&fs, &reader, &[1]).await,
+    };
+    let stats = IoStats::new();
+    let left = left.with_io_stats(stats.recorder());
+    let right = right.with_io_stats(stats.recorder());
+    let budget = AllocationBudget::new(4096);
+    let held = budget.try_reserve(4096).unwrap();
+    let other_budget = if invalid == "budget" {
+        AllocationBudget::new(4096)
+    } else {
+        budget.clone()
+    };
+    let a = left
+        .open_admitted_fullzip_scan(0..7, budget.clone(), 4096, 4)
+        .await
+        .unwrap();
+    let range = match invalid {
+        "position" => 1..7,
+        "end" => 0..6,
+        _ => 0..7,
+    };
+    let b = right
+        .open_admitted_fullzip_scan(
+            range,
+            other_budget.clone(),
+            if invalid == "workspace" { 2048 } else { 4096 },
+            if invalid == "max_rows" { 8 } else { 4 },
+        )
+        .await
+        .unwrap()
+        .with_partial_workspace(invalid == "partial");
+    let error = a.try_merge(b).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message), "{error}");
+    assert_eq!(stats.snapshot().iops, 0);
+    assert_eq!(budget.reserved(), 4096);
+    drop(held);
+    assert_eq!(budget.reserved(), 0);
+    assert_eq!(other_budget.reserved(), 0);
+}
