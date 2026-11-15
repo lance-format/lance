@@ -97,7 +97,7 @@ pub struct StemmerFilter<T> {
 }
 
 // Keep the cache local to each analyzer worker instead of copying a populated
-// dictionary when flat search clones its tokenizer for the next batch.
+// dictionary when flat search or index construction clones its tokenizer.
 impl<T: Clone> Clone for StemmerFilter<T> {
     fn clone(&self) -> Self {
         Self {
@@ -130,11 +130,14 @@ pub struct StemmerTokenStream<'a, T> {
 // the ordinary stemming path, including when no RemoveLongFilter is present.
 const MAX_CACHED_STEMS: usize = 1024;
 const MAX_CACHED_TOKEN_BYTES: usize = 64;
+// Retire the dictionary when fewer than 45% of cacheable inputs repeat in a
+// window. A low hit rate can cost more than calling Snowball directly.
 const CACHE_SAMPLE_TOKENS: usize = 1024;
 
 #[derive(Default)]
 struct StemCache {
-    stems: HashMap<String, String>,
+    // None records an unchanged token, so a hit can retain the input buffer.
+    stems: HashMap<String, Option<String>>,
     lookups: usize,
     hits: usize,
 }
@@ -178,7 +181,9 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<'_, T> {
             cache.lookups += 1;
             if let Some(stemmed) = cache.stems.get(token.text.as_str()) {
                 cache.hits += 1;
-                token.text.clone_from(stemmed);
+                if let Some(stemmed) = stemmed {
+                    token.text.clone_from(stemmed);
+                }
                 return true;
             }
         }
@@ -189,7 +194,11 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<'_, T> {
             if cache.stems.len() == MAX_CACHED_STEMS {
                 cache.stems.clear();
             }
-            cache.stems.insert(token.text.clone(), stemmed.to_string());
+            let cached = match &stemmed {
+                Cow::Owned(stemmed) => Some(stemmed.clone()),
+                Cow::Borrowed(_) => None,
+            };
+            cache.stems.insert(token.text.clone(), cached);
         }
         if let Cow::Owned(stemmed) = stemmed {
             token.text = stemmed;
@@ -272,6 +281,8 @@ mod tests {
     #[case::danish(Language::Danish, "hestens")]
     #[case::dutch(Language::Dutch, "paarden")]
     #[case::english(Language::English, "running")]
+    #[case::english_unchanged(Language::English, "pear")]
+    #[case::english_unicode(Language::English, "café")]
     #[case::finnish(Language::Finnish, "taloissa")]
     #[case::french(Language::French, "chevaux")]
     #[case::german(Language::German, "häusern")]
