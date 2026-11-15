@@ -58,6 +58,7 @@ pub struct FullZipScan {
     workspace_bytes: usize,
     is_partial_workspace_enabled: bool,
     max_rows: u64,
+    read_len: u64,
     end: u64,
     cursor: u64,
 }
@@ -233,6 +234,7 @@ impl FileReader {
             workspace_bytes,
             is_partial_workspace_enabled: false,
             max_rows,
+            read_len,
             end: rows.end,
             cursor: rows.start,
         })
@@ -240,6 +242,29 @@ impl FileReader {
 }
 
 impl FullZipColumn {
+    // Validate a future interval without changing the current decoder cache or
+    // reading payload. Pages wholly inside the skipped gap are irrelevant.
+    fn validate_range(&self, rows: &Range<u64>, data_type: &DataType) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut page_start = self.page_start;
+        for page in self.column.page_infos.iter().skip(self.page_index) {
+            if page_start >= rows.end {
+                break;
+            }
+            let page_end = page_start.checked_add(page.num_rows).ok_or_else(|| {
+                Error::corrupt_file_named("FullZip", "column row count overflows")
+            })?;
+            if page_end > rows.start {
+                FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {})?
+                    .validate_array_type(data_type)?;
+            }
+            page_start = page_end;
+        }
+        Ok(())
+    }
+
     // Select metadata only. Advancing this cache never consumes logical rows.
     fn select(&mut self, cursor: u64) -> Result<u64> {
         loop {
@@ -268,6 +293,61 @@ impl FullZipColumn {
 }
 
 impl FullZipScan {
+    /// Reuse a drained cursor for another forward, non-overlapping file-row range.
+    ///
+    /// The current range must have been completely delivered. The next range
+    /// must start at or after its end and stay within the projected file length.
+    /// Empty ranges are allowed. Invalid or unsupported selections leave the
+    /// cursor unchanged. All selected page layouts are validated before switching;
+    /// payload/codec errors can still occur when the range is read.
+    ///
+    /// This only updates metadata. It neither reads ahead nor drains retained
+    /// output: aliases from earlier ranges still charge the same shared budget.
+    /// Each `try_next` batch stays inside the active range. `Finished` means that
+    /// range is complete; the caller owns the selection iterator and decides
+    /// whether to advance again or finish. No whole-selection list is retained.
+    /// This does not implement filters, deletion vectors or arbitrary-order takes.
+    ///
+    /// ```
+    /// use lance_core::Result;
+    /// use lance_file::reader::{FullZipScan, FullZipScanOutcome};
+    /// async fn consume(scan: &mut FullZipScan) -> Result<()> {
+    ///     // The caller has already drained the current range ending at row 10.
+    ///     scan.advance_to_range(20..30)?;
+    ///     loop {
+    ///         match scan.try_next().await? {
+    ///             FullZipScanOutcome::Batch { batch, .. } => drop(batch),
+    ///             FullZipScanOutcome::Finished => return Ok(()),
+    ///             FullZipScanOutcome::NeedsCapacity => {
+    ///                 return Err(lance_core::Error::io("drain or replan required"));
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub fn advance_to_range(&mut self, rows: Range<u64>) -> Result<()> {
+        if self.cursor != self.end {
+            return Err(Error::invalid_input(format!(
+                "FullZip range must be drained before advancing: next row {}, end {}",
+                self.cursor, self.end
+            )));
+        }
+        if rows.start > rows.end || rows.start < self.end || rows.end > self.read_len {
+            return Err(Error::invalid_input(format!(
+                "FullZip next range {}..{} must be ordered, start at or after {}, and end within {} rows",
+                rows.start, rows.end, self.end, self.read_len
+            )));
+        }
+        for (column, field) in self.columns.iter().zip(self.schema.fields()) {
+            column.validate_range(&rows, field.data_type())?;
+        }
+        // Commit only after every projected column validates, with no await or
+        // payload ownership change between validation and cursor replacement.
+        self.cursor = rows.start;
+        self.end = rows.end;
+        Ok(())
+    }
+
     /// Allow an attempt to use currently available credit below its configured
     /// workspace size. This lets a file make progress while another file's output
     /// still retains part of the shared budget. The entire smaller workspace is

@@ -388,55 +388,68 @@ async fn later_column_cancellation_and_error_leave_no_partial_batch(
         .await
         .unwrap()
         .with_partial_workspace(partial);
-    {
-        let future = scan.try_next();
-        tokio::pin!(future);
-        tokio::select! {
-            _ = entered.notified() => (),
-            result = &mut future => panic!("gated later column completed: {result:?}"),
+    for selection in [start..end, end + 4..end + 15] {
+        if scan.position() != selection.start {
+            scan.advance_to_range(selection.clone()).unwrap();
         }
-        // Earlier input, the pending read and remaining workspace stay charged
-        // independently of the peer. No intermediate refund is required.
-        let active = budget.reserved();
-        assert!(active > peer_bytes && active <= 4096);
-    }
-    assert_eq!(scan.position(), start);
-    assert_eq!(
-        budget.reserved(),
-        peer_bytes,
-        "cancellation must preserve unrelated credit"
-    );
-    mode.store(2, Ordering::Relaxed);
-    second_reads.store(0, Ordering::Relaxed);
-    let error = scan.try_next().await.unwrap_err();
-    assert!(matches!(error, Error::IO { .. }));
-    assert!(error.to_string().contains("later-column failure"));
-    assert_eq!(
-        second_reads.load(Ordering::Relaxed),
-        1,
-        "errors must not trigger a smaller retry"
-    );
-    assert_eq!(scan.position(), start);
-    assert_eq!(budget.reserved(), peer_bytes);
-    mode.store(0, Ordering::Relaxed);
-    let mut next = start;
-    loop {
-        match scan.try_next().await.unwrap() {
-            FullZipScanOutcome::Batch { rows, batch } => {
-                assert_eq!(rows.start, next);
-                assert!(rows.end > next && rows.end <= end);
-                assert_batch(&batch, &rows, &expected);
-                next = rows.end;
-                assert_eq!(scan.position(), next);
-                assert!(budget.reserved() <= 4096);
-                drop(batch);
-                assert_eq!(budget.reserved(), peer_bytes);
+        let start = selection.start;
+        let end = selection.end;
+        mode.store(1, Ordering::Relaxed);
+        // Completed reads can leave one notification permit. It must not stand
+        // in for observing the next gated read after advancing the selection.
+        let _ = entered.notified().now_or_never();
+        {
+            let future = scan.try_next();
+            tokio::pin!(future);
+            tokio::select! {
+                _ = entered.notified() => (),
+                result = &mut future => panic!("gated later column completed: {result:?}"),
             }
-            FullZipScanOutcome::Finished => break,
-            FullZipScanOutcome::NeedsCapacity => panic!("one row must fit beside retained peer"),
+            // Earlier input, the pending read and remaining workspace stay charged
+            // independently of the peer. No intermediate refund is required.
+            let active = budget.reserved();
+            assert!(active > peer_bytes && active <= 4096);
         }
+        assert_eq!(scan.position(), start);
+        assert_eq!(
+            budget.reserved(),
+            peer_bytes,
+            "cancellation must preserve unrelated credit"
+        );
+        mode.store(2, Ordering::Relaxed);
+        second_reads.store(0, Ordering::Relaxed);
+        let error = scan.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("later-column failure"));
+        assert_eq!(
+            second_reads.load(Ordering::Relaxed),
+            1,
+            "errors must not trigger a smaller retry"
+        );
+        assert_eq!(scan.position(), start);
+        assert_eq!(budget.reserved(), peer_bytes);
+        mode.store(0, Ordering::Relaxed);
+        let mut next = start;
+        loop {
+            match scan.try_next().await.unwrap() {
+                FullZipScanOutcome::Batch { rows, batch } => {
+                    assert_eq!(rows.start, next);
+                    assert!(rows.end > next && rows.end <= end);
+                    assert_batch(&batch, &rows, &expected);
+                    next = rows.end;
+                    assert_eq!(scan.position(), next);
+                    assert!(budget.reserved() <= 4096);
+                    drop(batch);
+                    assert_eq!(budget.reserved(), peer_bytes);
+                }
+                FullZipScanOutcome::Finished => break,
+                FullZipScanOutcome::NeedsCapacity => {
+                    panic!("one row must fit beside retained peer")
+                }
+            }
+        }
+        assert_eq!(next, end);
     }
-    assert_eq!(next, end);
     assert_eq!(peer.to_data(), array(17, 1).slice(0, 1).to_data());
     drop(peer);
     assert_eq!(budget.reserved(), 0);

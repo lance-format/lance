@@ -1,13 +1,165 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{Result, utils::allocation::ReservedBuffer};
 
 use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
+
+#[derive(Debug)]
+struct RangeIo {
+    inner: Arc<dyn EncodingsIo>,
+    reads: Arc<Mutex<Vec<Range<u64>>>>,
+}
+
+impl EncodingsIo for RangeIo {
+    fn submit_request(
+        &self,
+        _ranges: Vec<Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<bytes::Bytes>>> {
+        async { Err(Error::io("unexpected unadmitted payload read")) }.boxed()
+    }
+
+    fn submit_single_into(
+        &self,
+        range: Range<u64>,
+        priority: u64,
+        output: ReservedBuffer,
+    ) -> BoxFuture<'static, Result<ReservedBuffer>> {
+        self.reads.lock().unwrap().push(range.clone());
+        self.inner.submit_single_into(range, priority, output)
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_scan_advances_without_reading_skipped_pages(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+) {
+    let constant: ArrayRef = Arc::new(LargeBinaryArray::from_vec(vec![b"same"; 8]));
+    let (_fs, reader) = fixture_arrays(
+        version,
+        lite,
+        vec![array(0, 0), array(1, 0), array(2, 0), constant],
+    )
+    .await;
+    let skipped_buffers = reader.metadata().column_infos[0].page_infos[1]
+        .buffer_offsets_and_sizes
+        .iter()
+        .map(|(offset, len)| *offset..*offset + *len)
+        .collect::<Vec<_>>();
+    assert!(
+        skipped_buffers.iter().any(|range| !range.is_empty()),
+        "skipped page must have physical input to exclude"
+    );
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = reader.with_scheduler(Arc::new(RangeIo {
+        inner: reader.core.scheduler.clone(),
+        reads: reads.clone(),
+    }));
+    let budget = AllocationBudget::new(8192);
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..4, budget.clone(), 8192, 8)
+        .await
+        .unwrap();
+    assert!(reads.lock().unwrap().is_empty());
+    let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
+        panic!("first range must fit")
+    };
+    assert_eq!(rows, 0..4);
+    assert_eq!(batch.column(0).to_data(), array(0, 0).slice(0, 4).to_data());
+    let held = batch.column(0).slice(0, 1);
+    drop(batch);
+    let held_bytes = budget.reserved();
+    let count = reads.lock().unwrap().len();
+    assert!(held_bytes > 0);
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        FullZipScanOutcome::Finished
+    ));
+    // A bad next selection must not alter a drained cursor or retained output.
+    let error = scan.advance_to_range(24..25).unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("FullZip"));
+    assert_eq!(scan.position(), 4);
+    assert_eq!(budget.reserved(), held_bytes);
+    scan.advance_to_range(17..22).unwrap();
+    assert_eq!(scan.position(), 17);
+    assert_eq!(reads.lock().unwrap().len(), count);
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        FullZipScanOutcome::NeedsCapacity
+    ));
+    assert_eq!(scan.position(), 17);
+    assert_eq!(reads.lock().unwrap().len(), count);
+    drop(held);
+    let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
+        panic!("second selected range must fit after drain")
+    };
+    assert_eq!(rows, 17..22);
+    assert_eq!(batch.column(0).to_data(), array(2, 0).slice(1, 5).to_data());
+    drop(batch);
+    assert_eq!(budget.reserved(), 0);
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        FullZipScanOutcome::Finished
+    ));
+    for read in reads.lock().unwrap().iter() {
+        assert!(
+            skipped_buffers
+                .iter()
+                .all(|gap| read.end <= gap.start || gap.end <= read.start)
+        );
+    }
+}
+
+#[tokio::test]
+async fn admitted_scan_rejects_invalid_advance_without_changing_selection() {
+    let (_fs, reader) = fixture(ConcreteFileVersion::V2_2, false, 0, 1).await;
+    let stats = IoStats::new();
+    let reader = reader.with_io_stats(stats.recorder());
+    let budget = AllocationBudget::new(8192);
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..1, budget.clone(), 8192, 1)
+        .await
+        .unwrap();
+    let error = scan.advance_to_range(3..4).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("must be drained"));
+    assert_eq!(scan.position(), 0);
+    assert_eq!(stats.snapshot().iops, 0);
+    let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
+        panic!("invalid advance must leave the original row selected")
+    };
+    assert_eq!(rows, 0..1);
+    assert_eq!(batch.column(0).to_data(), array(0, 0).slice(0, 1).to_data());
+    drop(batch);
+    let reads = stats.snapshot().iops;
+    for rows in [0..2, Range { start: 4, end: 3 }, 7..9, u64::MAX..u64::MAX] {
+        let error = scan.advance_to_range(rows).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("FullZip next range"));
+        assert_eq!(scan.position(), 1);
+    }
+    for empty in [1, 5, 8] {
+        scan.advance_to_range(empty..empty).unwrap();
+        assert_eq!(scan.position(), empty);
+        assert!(matches!(
+            scan.try_next().await.unwrap(),
+            FullZipScanOutcome::Finished
+        ));
+    }
+    assert_eq!(stats.snapshot().iops, reads);
+    assert_eq!(budget.reserved(), 0);
+}
 
 #[rstest]
 #[tokio::test]
