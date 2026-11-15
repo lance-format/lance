@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::reader::PhysicalRowIdSource;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
-use lance_table::rowids::RowIdSequence;
 
 use super::*;
 
-fn stable_ids(count: usize) -> (Vec<u64>, Arc<RowIdSequence>) {
-    // Separate segments and non-contiguous, non-monotonic values distinguish
+#[derive(Debug)]
+struct RowIds(Vec<u64>);
+
+impl PhysicalRowIdSource for RowIds {
+    fn num_rows(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn select_range(&self, rows: Range<usize>) -> Result<Box<dyn Iterator<Item = u64> + '_>> {
+        let values = self
+            .0
+            .get(rows)
+            .ok_or_else(|| Error::invalid_input("invalid test row range"))?;
+        Ok(Box::new(values.iter().copied()))
+    }
+}
+
+fn stable_ids(count: usize) -> (Vec<u64>, Arc<dyn PhysicalRowIdSource>) {
+    // Non-contiguous, non-monotonic values distinguish
     // physical offsets from stable identities across deletion/range boundaries.
     let ids = (0..count)
         .map(|i| {
@@ -20,11 +37,63 @@ fn stable_ids(count: usize) -> (Vec<u64>, Arc<RowIdSequence>) {
             }
         })
         .collect::<Vec<_>>();
-    let mut sequence = RowIdSequence::new();
-    for chunk in ids.chunks(7) {
-        sequence.extend(RowIdSequence::try_from_iter(chunk.iter().copied()).unwrap());
+    let sequence = Arc::new(RowIds(ids.clone()));
+    (ids, sequence)
+}
+
+#[derive(Debug)]
+struct WrongCardinality {
+    extra: bool,
+}
+
+impl PhysicalRowIdSource for WrongCardinality {
+    fn num_rows(&self) -> u64 {
+        7
     }
-    (ids, Arc::new(sequence))
+
+    fn select_range(&self, rows: Range<usize>) -> Result<Box<dyn Iterator<Item = u64> + '_>> {
+        let count = if self.extra {
+            rows.len() + 1
+        } else {
+            rows.len() - 1
+        };
+        Ok(Box::new(0..count as u64))
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn row_source_cardinality_errors_release_complete_attempt(
+    #[values(false, true)] extra: bool,
+) {
+    let (_fs, reader) = fixture_batches(
+        ConcreteFileVersion::V2_3,
+        false,
+        vec![batches().remove(0)],
+        1,
+    )
+    .await;
+    let budget = AllocationBudget::new(4096);
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..3, budget.clone(), 4096, 3)
+        .await
+        .unwrap()
+        .with_row_id(7, Some(Arc::new(WrongCardinality { extra })))
+        .unwrap();
+    let error = scan.try_next().await.unwrap_err();
+    if extra {
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("exceeded physical selection"));
+    } else {
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("ended before physical selection")
+        );
+    }
+    assert_eq!(scan.position(), 0);
+    assert_eq!(budget.reserved(), 0);
 }
 
 #[rstest]

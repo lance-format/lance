@@ -27,7 +27,9 @@ jobs:
         run: |
           cargo test --profile ci --locked -p lance-file --lib admitted_fullzip -- --nocapture
           cargo test --profile ci --locked -p lance-file --doc with_row_ -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc PhysicalRowIdSource -- --nocapture
+          cargo test --profile ci --locked -p lance-table --lib admitted_row_ids -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file -p lance-table --all-features --all-targets --no-deps -- -D warnings

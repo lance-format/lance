@@ -26,6 +26,7 @@ use super::FileReader;
 use crate::version::ConcreteFileVersion;
 
 mod row_ids;
+pub use row_ids::PhysicalRowIdSource;
 use row_ids::{PreparedRowIds, RowIdColumns};
 
 /// One step of an admitted file cursor. Refusal and EOF are deliberately distinct.

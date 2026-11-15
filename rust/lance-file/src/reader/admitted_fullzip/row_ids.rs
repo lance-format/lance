@@ -3,7 +3,7 @@
 
 //! Generated row columns share the batch admission and retain their own charges.
 
-use std::{ops::Range, sync::Arc};
+use std::{fmt::Debug, ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, UInt64Array};
 use arrow_buffer::{Buffer, ScalarBuffer};
@@ -12,14 +12,39 @@ use lance_core::{
     Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result,
     utils::{address::RowAddress, allocation::Reservation},
 };
-use lance_table::rowids::RowIdSequence;
 
 use super::FullZipScan;
+
+/// Immutable mapping from physical file-row positions to stable row IDs.
+///
+/// Implement this in the layer that owns row metadata. The file reader does not
+/// depend on table serialization or row ID encodings. Values are streamed into
+/// admitted output; implementations must use bounded iterator state over their
+/// shared metadata, without collecting an output array or blocking for I/O/credit.
+/// The mapping and physical length must remain unchanged for the source lifetime.
+///
+/// ```
+/// use std::sync::Arc;
+/// use lance_core::Result;
+/// use lance_file::reader::{FullZipScan, PhysicalRowIdSource};
+/// fn attach(scan: FullZipScan, source: Arc<dyn PhysicalRowIdSource>) -> Result<FullZipScan> {
+///     scan.with_row_id(7, Some(source))
+/// }
+/// ```
+pub trait PhysicalRowIdSource: Debug + Send + Sync {
+    /// Physical rows covered, including deleted positions.
+    fn num_rows(&self) -> u64;
+
+    /// Return exactly one ID per physical position, in the requested order.
+    /// Invalid or reversed bounds must return an error, never silently clip.
+    /// The file reader also checks iterator cardinality before delivering a batch.
+    fn select_range(&self, rows: Range<usize>) -> Result<Box<dyn Iterator<Item = u64> + '_>>;
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct RowIdColumns {
     fragment_id: u32,
-    sequence: Option<Arc<RowIdSequence>>,
+    sequence: Option<Arc<dyn PhysicalRowIdSource>>,
     has_row_id: bool,
     has_row_address: bool,
 }
@@ -48,27 +73,26 @@ impl FullZipScan {
     /// ```
     /// use std::sync::Arc;
     /// use lance_core::Result;
-    /// use lance_file::reader::FullZipScan;
-    /// use lance_table::rowids::RowIdSequence;
-    /// fn attach(scan: FullZipScan, ids: Arc<RowIdSequence>) -> Result<FullZipScan> {
+    /// use lance_file::reader::{FullZipScan, PhysicalRowIdSource};
+    /// fn attach(scan: FullZipScan, ids: Arc<dyn PhysicalRowIdSource>) -> Result<FullZipScan> {
     ///     scan.with_row_id(7, Some(ids))?.with_row_address(7)
     /// }
     /// ```
     pub fn with_row_id(
         mut self,
         fragment_id: u32,
-        sequence: Option<Arc<RowIdSequence>>,
+        sequence: Option<Arc<dyn PhysicalRowIdSource>>,
     ) -> Result<Self> {
         self.validate_row_columns(fragment_id)?;
         if self.row_ids.as_ref().is_some_and(|ids| ids.has_row_id) {
             return Err(Error::invalid_input("FullZip row ID is already configured"));
         }
         if let Some(sequence) = &sequence
-            && sequence.len() != self.read_len
+            && sequence.num_rows() != self.read_len
         {
             return Err(Error::invalid_input(format!(
                 "FullZip row ID sequence length {} differs from physical length {}",
-                sequence.len(),
+                sequence.num_rows(),
                 self.read_len
             )));
         }
@@ -218,7 +242,7 @@ impl PreparedRowIds {
                 row_array(
                     &mut self.credit,
                     self.rows.len(),
-                    sequence.select(self.rows.clone()),
+                    sequence.select_range(self.rows.clone())?,
                 )?
             } else {
                 addresses
@@ -250,7 +274,9 @@ fn row_array(
         slot.copy_from_slice(&value.to_ne_bytes());
     }
     if values.next().is_some() {
-        return Err(Error::internal("row column exceeded physical selection"));
+        return Err(Error::invalid_input(
+            "row ID source exceeded physical selection",
+        ));
     }
     let values = ScalarBuffer::new(Buffer::from(buffer.freeze()), 0, count);
     Ok(Arc::new(UInt64Array::new(values, None)))
