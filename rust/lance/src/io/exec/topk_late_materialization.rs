@@ -36,8 +36,9 @@
 //! A [`TakeExec`] or row-stream [`FilteredReadExec`] in the chain (the
 //! scanner's own late materialization behind a filter) is dropped: the take
 //! above the sort fetches its columns instead.
-//! Row-stream reads with a physical row selection prevent the rewrite, since
-//! dropping them would remove a restriction that must apply before sorting.
+//! Row-stream reads with a fragment or physical row selection prevent the
+//! rewrite, since dropping them would remove a restriction that must apply
+//! before sorting.
 //!
 //! Rebuilding the read and fetching deferred columns can replace the planner's
 //! field metadata with the dataset's storage metadata. Projections under the new
@@ -175,12 +176,15 @@ impl TopKLateMaterialization {
                 if read.row_stream_input().is_none() {
                     break;
                 }
+                if read.options().fragments.is_some() {
+                    return Err("row-stream read has a fragment selection".into());
+                }
                 if read.options().physical_row_addr_prefilter.is_some() {
                     return Err("row-stream read has a physical row selection".into());
                 }
-                // Row-stream reads take every input row: their constructor
-                // rejects filters, scan ranges, and deleted rows, and the
-                // guard above excludes physical row selections.
+                // Unrestricted row-stream reads take every input row: their
+                // constructor rejects filters, scan ranges, and deleted rows,
+                // and the guards above exclude fragment and physical row selections.
                 dropped_takes.push(read.dataset().clone());
             } else if let Some(take) = current.downcast_ref::<TakeExec>() {
                 dropped_takes.push(take.dataset().clone());
@@ -515,7 +519,7 @@ mod tests {
     use datafusion::common::DFSchema;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::when;
-    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::{collect, execution_plan::reset_plan_states};
     use datafusion::prelude::{SessionContext, col as logical_col, lit};
     use datafusion_functions::core::expr_fn::arrow_metadata;
     use datafusion_physical_expr::expressions::{col, is_null};
@@ -724,6 +728,50 @@ mod tests {
             .unwrap();
         assert_eq!(takes, 1);
         assert_eq!(run(rewritten).await, run(plan).await);
+    }
+
+    #[rstest]
+    #[case::first_fragment(Some(1), &[8, 5, 3])]
+    #[case::two_fragments(Some(2), &[9, 8, 5])]
+    #[case::empty(Some(0), &[])]
+    #[case::unrestricted(None, &[9, 8, 7])]
+    #[tokio::test]
+    async fn preserves_row_stream_fragment_scope(
+        #[case] fragment_count: Option<usize>,
+        #[case] expected_keys: &[i32],
+        #[values(false, true)] has_stable_row_ids: bool,
+        #[values(false, true)] is_partitioned: bool,
+    ) {
+        let dataset = dataset(has_stable_row_ids, false).await;
+        let projection = dataset
+            .empty_projection()
+            .union_columns(["key"], OnMissing::Error)
+            .unwrap()
+            .with_row_id();
+        let source: Arc<dyn ExecutionPlan> = Arc::new(
+            FilteredReadExec::try_new(dataset.clone(), FilteredReadOptions::new(projection), None)
+                .unwrap(),
+        );
+        let projection = dataset
+            .empty_projection()
+            .union_columns(["key", "wide", "other"], OnMissing::Error)
+            .unwrap();
+        let mut options = FilteredReadOptions::new(projection);
+        if let Some(count) = fragment_count {
+            // The source reads every fragment; only this intermediate read
+            // restricts which rows reach the sort.
+            options = options.with_fragments(Arc::new(dataset.fragments()[..count].to_vec()));
+        }
+        let selected = FilteredReadExec::try_new(dataset, options, Some(source)).unwrap();
+        let plan = top_k(Arc::new(selected), is_partitioned);
+        let rewritten = optimize(&TopKLateMaterialization::new(), &plan);
+
+        let expected = run(reset_plan_states(plan.clone()).unwrap()).await;
+        let keys: ArrayRef = Arc::new(Int32Array::from(expected_keys.to_vec()));
+        assert_eq!(&expected["key"], &keys);
+        let actual = run(reset_plan_states(rewritten.clone()).unwrap()).await;
+        assert_eq!(actual, expected);
+        assert_eq!(Arc::ptr_eq(&rewritten, &plan), fragment_count.is_some());
     }
 
     #[cfg(feature = "substrait")]
