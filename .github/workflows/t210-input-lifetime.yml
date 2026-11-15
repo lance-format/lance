@@ -25,12 +25,17 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Compact overlay selection and fragment composition
+      - name: Verify overlay diagnostic fixtures and complete results
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance --lib dataset::overlay::selection::tests -- --nocapture
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read -- --nocapture
+          cargo build --profile ci --locked -p lance --example overlay_selection
+          for version in 2.2 2.3; do
+            fixture="$RUNNER_TEMP/t210-overlay-$version"
+            target/ci/examples/overlay_selection prepare "$fixture" 8193 4 "$version"
+            target/ci/examples/overlay_selection verify "$fixture" full 256
+            target/ci/examples/overlay_selection verify "$fixture" ranges 17
+          done
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
