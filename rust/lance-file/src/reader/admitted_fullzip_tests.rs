@@ -411,12 +411,13 @@ async fn admitted_file_reconstruction_refuses_after_successful_decode(
 ) {
     // Many empty/null large lists have tiny value data but large final offsets.
     // This distinguishes reconstruction refusal from the existing codec refusal.
+    // Distinct visible leaves avoid the writer's earlier Constant-page selection.
     let mut offsets = vec![0_i64; 65];
-    offsets[64] = 1;
+    offsets[64] = 2;
     let expected: ArrayRef = Arc::new(LargeListArray::new(
         Arc::new(Field::new("item", DataType::LargeBinary, true)),
         OffsetBuffer::new(offsets.into()),
-        Arc::new(LargeBinaryArray::from_vec(vec![b"leaf"])),
+        Arc::new(LargeBinaryArray::from_vec(vec![b"leaf", b"tail"])),
         Some(NullBuffer::from(
             (0..64)
                 .map(|row| row % 3 != 0 || row == 63)
@@ -426,6 +427,11 @@ async fn admitted_file_reconstruction_refuses_after_successful_decode(
     let (_fs, reader) =
         fixture_arrays(ConcreteFileVersion::V2_2, lite, vec![expected.clone()]).await;
     let page = &reader.metadata().column_infos[0].page_infos[0];
+    assert!(
+        matches!(&page.encoding, PageEncoding::Structural(layout)
+            if matches!(&layout.layout, Some(lance_encoding::format::metadata::page_layout::Layout::FullZipLayout(_)))),
+        "fixture must exercise the writer's actual FullZip layout"
+    );
     let budget = AllocationBudget::new(640);
     let raw = prefix(&reader, page, 0..64, &budget, 640).await.unwrap();
     assert_eq!(
