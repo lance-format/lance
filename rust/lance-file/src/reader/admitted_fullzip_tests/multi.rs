@@ -66,6 +66,96 @@ fn assert_batch(batch: &RecordBatch, rows: &Range<u64>, expected: &RecordBatch) 
     }
 }
 
+// This independently composes the public per-column API. It is the bounded
+// reference for the compound cursor's progress, not an unadmitted fallback.
+async fn sequential_row(reader: &FileReader, bytes: usize) -> Option<RecordBatch> {
+    let budget = AllocationBudget::new(bytes);
+    let mut work = budget.try_reserve(bytes).unwrap();
+    let schema = Arc::new(Schema::from(reader.schema().as_ref()));
+    let mut arrays = Vec::with_capacity(schema.fields().len());
+    for (column, field) in reader.metadata().column_infos.iter().zip(schema.fields()) {
+        let page = &column.page_infos[0];
+        let decoder = Arc::new(
+            FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {}).unwrap(),
+        );
+        let (remaining, output) = decoder
+            .try_read_array_range_on_cpu(0..1, field.data_type().clone(), work, |range, output| {
+                reader
+                    .core
+                    .scheduler
+                    .submit_single_into(range, page.priority, output)
+            })
+            .await
+            .unwrap();
+        work = remaining;
+        let Some(output) = output else {
+            drop((arrays, work));
+            assert_eq!(budget.reserved(), 0);
+            return None;
+        };
+        arrays.push(output);
+    }
+    let batch = RecordBatch::try_new(schema, arrays).unwrap();
+    drop(work);
+    Some(batch)
+}
+
+#[rstest]
+#[tokio::test]
+async fn batch_dispatch_preserves_feasible_single_row(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(2, 4)] columns: usize,
+) {
+    let source = batches().remove(0);
+    let schema = Arc::new(Schema::new(
+        (0..columns)
+            .map(|i| {
+                source
+                    .schema()
+                    .field(1)
+                    .clone()
+                    .with_name(format!("frames{i}"))
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let expected = RecordBatch::try_new(
+        schema,
+        (0..columns).map(|_| source.column(1).clone()).collect(),
+    )
+    .unwrap();
+    let (_fs, reader) = fixture_batches(version, false, vec![expected.clone()], 1).await;
+    // Find a feasible workspace through the public per-column operation, without
+    // deriving a byte formula from either implementation. Each probe releases
+    // its output before the next; this does not measure timing or process RSS.
+    let (mut low, mut high) = (0, 8192);
+    let batch = sequential_row(&reader, high).await.unwrap();
+    assert_batch(&batch, &(0..1), &expected);
+    drop(batch);
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if let Some(batch) = sequential_row(&reader, mid).await {
+            assert_batch(&batch, &(0..1), &expected);
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let budget = AllocationBudget::new(high);
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..1, budget.clone(), high, 1)
+        .await
+        .unwrap();
+    let outcome = scan.try_next().await.unwrap();
+    let FullZipScanOutcome::Batch { rows, batch } = outcome else {
+        panic!("{columns} columns fit sequentially within {high} bytes, got {outcome:?}")
+    };
+    assert_eq!(rows, 0..1);
+    assert_batch(&batch, &rows, &expected);
+    drop(batch);
+    assert_eq!(budget.reserved(), 0);
+    assert_eq!(scan.position(), 1);
+}
+
 #[rstest]
 #[tokio::test]
 async fn multi_column_prefixes_align_pages_and_keep_one_budget(
