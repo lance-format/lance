@@ -245,10 +245,62 @@ def test_sharded_batch_sampler_filter_small_batches(tmp_path: Path, world_size):
     assert seen == [list(range(rank, 10, world_size)) for rank in range(world_size)]
 
 
-def test_sharded_batch_sampler_filter_no_match(tmp_path: Path):
+@pytest.mark.parametrize("randomize", [False, True])
+def test_sharded_batch_sampler_filter_no_match(tmp_path: Path, randomize):
     ds = lance.write_dataset(pa.table({"id": range(10)}), tmp_path / "data.lance")
-    sampler = ShardedBatchSampler(rank=0, world_size=2)
+    sampler = ShardedBatchSampler(rank=0, world_size=2, randomize=randomize)
     assert list(sampler(ds, columns=["id"], filter="id > 100")) == []
+
+
+@pytest.mark.parametrize("randomize", [False, True])
+def test_sharded_batch_sampler_filter_sparse_shard(tmp_path: Path, randomize):
+    # Three matches spread over six rows: with a world size of four, rank 3 owns
+    # no row and rank 0 owns exactly one.
+    ds = lance.write_dataset(
+        pa.table({"id": range(6), "seg": [f"s{i % 2}" for i in range(6)]}),
+        tmp_path / "data.lance",
+    )
+    filter = "seg = 's1'"
+
+    empty_batches = list(
+        ShardedBatchSampler(rank=3, world_size=4, randomize=randomize)(
+            ds, columns=["id"], filter=filter
+        )
+    )
+    assert empty_batches == []
+
+    batches = list(
+        ShardedBatchSampler(rank=0, world_size=4, randomize=randomize)(
+            ds, columns=["id"], filter=filter
+        )
+    )
+    assert all(isinstance(batch, pa.RecordBatch) for batch in batches)
+    assert [batch["id"].to_pylist() for batch in batches] == [[1]]
+
+
+def test_sharded_batch_sampler_filter_one_row_fragments(tmp_path: Path):
+    # One row per fragment makes every scan batch shorter than the world size, so
+    # a rank's initial offset has to carry across several batches.
+    ds = lance.write_dataset(
+        pa.table({"id": range(8)}), tmp_path / "data.lance", max_rows_per_file=1
+    )
+    world_size = 4
+    shards = {}
+    for rank in range(world_size):
+        batches = list(
+            ShardedBatchSampler(rank=rank, world_size=world_size)(
+                ds, columns=["id"], filter="id >= 0", batch_size=1
+            )
+        )
+        assert all(isinstance(batch, pa.RecordBatch) for batch in batches)
+        assert all(batch.num_rows > 0 for batch in batches)
+        shards[rank] = [i for batch in batches for i in batch["id"].to_pylist()]
+
+    assert shards == {
+        rank: list(range(rank, 8, world_size)) for rank in range(world_size)
+    }
+    # The per-rank shards are disjoint and cover the filtered stream.
+    assert sorted(i for ids in shards.values() for i in ids) == list(range(8))
 
 
 def test_edge_cases():
