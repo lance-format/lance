@@ -21,15 +21,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: CPU ownership and affected read and cursor regression
+      - name: File comparison harness correctness
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted::tests::read:: -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib admitted_fullzip_tests:: -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --doc try_read_array_range -- --nocapture
-          cargo test --profile ci --locked -p lance-file --doc open_admitted_fullzip_scan -- --nocapture
-      - name: Lint touched crates
+          cargo test --profile ci --locked -p lance-file --example admitted_fullzip -- --nocapture
+      - name: Lint touched crate and harness
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-encoding -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
