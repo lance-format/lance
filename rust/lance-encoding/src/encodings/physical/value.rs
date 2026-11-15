@@ -320,7 +320,7 @@ struct PerValueFslValidityIter {
 /// It's easier than mini-block.  All we need to do is flatten the FSL layers into a single buffer.
 /// This includes any validity buffers we encounter on the way.
 impl ValueEncoder {
-    fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> CompressiveEncoding {
+    pub(crate) fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> CompressiveEncoding {
         let mut inner = fsl.child.as_ref();
         let mut has_validity = false;
         if let DataBlock::Nullable(nullable) = inner {
@@ -709,6 +709,61 @@ impl MiniBlockDecompressor for ValueDecompressor {
 
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
+    }
+
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        if self.layers.is_empty() && self.bits_per_item > 0 && self.bits_per_item.is_multiple_of(8)
+        {
+            if range.start > range.end || range.end > num_values {
+                return Err(Error::corrupt_file_named(
+                    "mini-block",
+                    format!(
+                        "Flat mini-block selection {:?} exceeds {} values in chunk",
+                        range, num_values
+                    ),
+                ));
+            }
+            if data.len() != 1 {
+                return Err(Error::invalid_input(format!(
+                    "Flat/FSL mini-block has {} buffers, expected 1",
+                    data.len()
+                )));
+            }
+            validate_fixed_buffer(&data[0], num_values, self.bits_per_item)?;
+            let bytes_per_value = (self.bits_per_item / 8) as usize;
+            let start_byte = (range.start as usize) * bytes_per_value;
+            let len_bytes = ((range.end - range.start) as usize) * bytes_per_value;
+            let sliced = data
+                .into_iter()
+                .next()
+                .unwrap()
+                .slice_with_length(start_byte, len_bytes);
+            return Ok(self.buffer_to_block(sliced, range.end - range.start));
+        }
+
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "mini-block",
+                format!(
+                    "Flat/FSL mini-block selection {:?} exceeds {} values in chunk",
+                    range, num_values
+                ),
+            ));
+        }
+        let block = MiniBlockDecompressor::decompress(self, data, num_values)?;
+        if range == (0..num_values) {
+            return Ok(block);
+        }
+        let estimated_bytes =
+            MiniBlockDecompressor::decoded_size_bytes(self, range.end - range.start).unwrap_or(64);
+        let mut builder = crate::data::DataBlockBuilder::with_capacity_estimate(estimated_bytes);
+        builder.append(&block, range)?;
+        Ok(builder.finish())
     }
 
     fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {

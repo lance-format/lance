@@ -1619,6 +1619,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_substrait_roundtrip_any_element() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            list_of_struct(
+                "detections",
+                vec![
+                    Field::new("label", DataType::Utf8, true),
+                    Field::new("confidence", DataType::Float32, true),
+                ],
+            ),
+        ]));
+        // The decoder resolves the function by name in the caller's session.
+        let ctx = SessionContext::new();
+        crate::udf::register_functions(&ctx);
+        let state = ctx.state();
+        let any_element = state.scalar_functions()["any_element"].clone();
+        let expr = any_element.call(vec![
+            col("detections"),
+            lit("label = 'car' AND confidence > 0.9"),
+        ]);
+
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &state).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &state)
+            .await
+            .unwrap();
+        assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
     async fn test_parse_substrait_with_pyarrow_list_struct_names() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),

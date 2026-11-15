@@ -6,7 +6,10 @@
 use std::{
     collections::HashMap,
     num::NonZero,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use arrow_array::RecordBatch;
@@ -18,7 +21,7 @@ use datafusion_execution::{
     TaskContext,
     config::SessionConfig,
     disk_manager::DiskManagerBuilder,
-    memory_pool::{FairSpillPool, TrackConsumersPool},
+    memory_pool::{FairSpillPool, MemoryPool, PeakRecordingPool, TrackConsumersPool},
     runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
@@ -28,14 +31,16 @@ use datafusion_physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
     display::DisplayableExecutionPlan,
     execution_plan::{Boundedness, CardinalityEffect, EmissionType},
+    metrics::MetricValue,
     sorts::sort_preserving_merge::SortPreservingMergeExec,
     stream::RecordBatchStreamAdapter,
 };
 
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
+    memory::{Component, register_component},
     utils::{
         futures::FinallyStreamExt,
         tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
@@ -48,7 +53,7 @@ use crate::{
     utils::{
         BYTES_READ_METRIC, INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC,
         INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC, MetricsExt,
-        PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        PARTS_LOADED_METRIC, PEAK_RESERVED_BYTES_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -197,6 +202,214 @@ impl ExecutionPlan for OneShotExec {
 
 /// Callback for reporting statistics after a scan
 pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + Sync>;
+
+/// Terminal state at the diagnostics finalization boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionOutcome {
+    /// The output stream was exhausted successfully.
+    Complete,
+    /// Execution returned an error; measurements describe partial work.
+    Failed,
+    /// The consumer dropped the stream before exhaustion; work may still be stopping.
+    Cancelled,
+}
+
+/// Measurements captured once when a diagnostic stream ends, fails, or is dropped.
+#[derive(Clone, Debug)]
+pub struct ExecutionDiagnostics {
+    /// First execution error, absent on successful exhaustion or early drop without error.
+    pub error: Option<String>,
+    /// Whether output was completely consumed.
+    pub outcome: ExecutionOutcome,
+    /// Independently measured wall time since starting execution.
+    pub elapsed: Duration,
+    /// Compatible count/time aggregation, possibly partial.
+    pub summary: ExecutionSummaryCounts,
+    /// Individual operator measurements, including unaggregated memory peaks.
+    pub operators: Vec<OperatorMetrics>,
+}
+
+/// Receives exactly one terminal report per successfully created diagnostic stream.
+pub type ExecutionDiagnosticsCallback = Arc<dyn Fn(&ExecutionDiagnostics) + Send + Sync>;
+
+struct DiagnosticStream {
+    error: Option<String>,
+    stream: SendableRecordBatchStream,
+    plan: Arc<dyn ExecutionPlan>,
+    started: Instant,
+    callback: Option<ExecutionDiagnosticsCallback>,
+}
+
+impl DiagnosticStream {
+    fn finish(&mut self, outcome: ExecutionOutcome) {
+        if let Some(callback) = self.callback.take() {
+            let mut summary = ExecutionSummaryCounts::default();
+            collect_execution_metrics(self.plan.as_ref(), &mut summary);
+            callback(&ExecutionDiagnostics {
+                error: self.error.clone(),
+                outcome,
+                elapsed: self.started.elapsed(),
+                summary,
+                operators: collect_operator_metrics(self.plan.as_ref()),
+            });
+        }
+    }
+}
+
+impl Stream for DiagnosticStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = this.stream.as_mut().poll_next(cx);
+        match &result {
+            Poll::Ready(None) => this.finish(ExecutionOutcome::Complete),
+            Poll::Ready(Some(Err(error))) => {
+                this.error = Some(error.to_string());
+                this.finish(ExecutionOutcome::Failed);
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
+impl Drop for DiagnosticStream {
+    fn drop(&mut self) {
+        self.finish(ExecutionOutcome::Cancelled);
+    }
+}
+
+/// Execute with terminal diagnostics without changing the existing scan callback contract.
+///
+/// The callback runs once on exhaustion, the first stream error, or early drop.
+/// Failure/cancellation snapshots may precede background task shutdown and are
+/// explicitly partial. No callback is made when starting execution fails.
+/// The callback must not panic. This API adds no sampler or process metric labels.
+pub fn execute_plan_with_diagnostics(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    context: Arc<TaskContext>,
+    callback: ExecutionDiagnosticsCallback,
+) -> Result<SendableRecordBatchStream> {
+    let started = Instant::now();
+    let stream = execute_plan_with_context(plan.clone(), options, context)?;
+    let schema = stream.schema();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        DiagnosticStream {
+            error: None,
+            stream,
+            plan,
+            started,
+            callback: Some(callback),
+        },
+    )))
+}
+
+/// A numeric operator measurement, without aggregation across partitions or nodes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionMetricValue {
+    /// Cumulative events, rows, or bytes, as identified by the metric name.
+    Count(usize),
+    /// A current value or high-water mark. Peaks must not be summed into a query peak.
+    Gauge(usize),
+    /// Operator peak accounted memory, in bytes. This is not a query-wide peak.
+    PeakMemoryBytes(usize),
+    /// Accumulated stage time; concurrent stages can overlap.
+    Time(Duration),
+}
+
+/// One measurement at its original operator and partition boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionMetric {
+    /// Producer-defined name, including the unit for byte measurements.
+    pub name: String,
+    /// Partition number, or `None` for an operator-wide measurement.
+    pub partition: Option<usize>,
+    /// Producer labels, retained independently of process metric export.
+    pub labels: Vec<(String, String)>,
+    /// Typed value. Missing measurements are omitted rather than filled with zero.
+    pub value: ExecutionMetricValue,
+}
+
+/// Metrics for a single node in a physical execution plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorMetrics {
+    /// Child indices from the root; distinguishes repeated instances of the same operator.
+    pub path: Vec<usize>,
+    /// [`ExecutionPlan::name`] of the producer.
+    pub name: String,
+    /// Numeric measurements. Unsupported custom metrics and timestamps are omitted.
+    pub metrics: Vec<ExecutionMetric>,
+}
+
+/// Snapshot numeric metrics while preserving operator identity, kind, and partition.
+///
+/// An empty metric list means the operator exposes no supported measurements.
+/// Gauge values are never aggregated. Use [`collect_execution_metrics`] for the
+/// compatible count/time summary.
+pub fn collect_operator_metrics(plan: &dyn ExecutionPlan) -> Vec<OperatorMetrics> {
+    fn visit(plan: &dyn ExecutionPlan, path: Vec<usize>, output: &mut Vec<OperatorMetrics>) {
+        let metrics = plan
+            .metrics()
+            .map(|metrics| {
+                metrics
+                    .iter()
+                    .filter_map(|metric| {
+                        let value = match metric.value() {
+                            MetricValue::OutputRows(count)
+                            | MetricValue::OutputBytes(count)
+                            | MetricValue::OutputBatches(count)
+                            | MetricValue::SpillCount(count)
+                            | MetricValue::SpilledBytes(count)
+                            | MetricValue::SpilledRows(count)
+                            | MetricValue::Count { count, .. } => {
+                                ExecutionMetricValue::Count(count.value())
+                            }
+                            MetricValue::PeakMemoryUsage { gauge, .. } => {
+                                ExecutionMetricValue::PeakMemoryBytes(gauge.value())
+                            }
+                            MetricValue::CurrentMemoryUsage(gauge)
+                            | MetricValue::Gauge { gauge, .. } => {
+                                ExecutionMetricValue::Gauge(gauge.value())
+                            }
+                            MetricValue::ElapsedCompute(time) | MetricValue::Time { time, .. } => {
+                                ExecutionMetricValue::Time(
+                                    Duration::from_nanos(time.value() as u64),
+                                )
+                            }
+                            _ => return None,
+                        };
+                        Some(ExecutionMetric {
+                            name: metric.value().name().to_owned(),
+                            partition: metric.partition(),
+                            labels: metric
+                                .labels()
+                                .iter()
+                                .map(|label| (label.name().to_owned(), label.value().to_owned()))
+                                .collect(),
+                            value,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        output.push(OperatorMetrics {
+            path: path.clone(),
+            name: plan.name().to_owned(),
+            metrics,
+        });
+        for (index, child) in plan.children().into_iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            visit(child.as_ref(), child_path, output);
+        }
+    }
+    let mut output = Vec::new();
+    visit(plan, Vec::new(), &mut output);
+    output
+}
 
 #[derive(Default, Clone)]
 pub struct LanceExecutionOptions {
@@ -365,7 +578,43 @@ pub fn new_runtime_env(options: &LanceExecutionOptions) -> Arc<RuntimeEnv> {
     }
     // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
     // reservations. This bypasses the configured pool limit, not actual RAM limits.
-    runtime_env_builder.build_arc().unwrap()
+    let runtime_env = runtime_env_builder.build_arc().unwrap();
+    // The pool rather than the environment: every reservation holds its pool,
+    // so the pool and the bytes reserved in it can outlive the environment.
+    register_component(
+        Component::DataFusionPool,
+        &runtime_env.memory_pool,
+        pool_reserved_bytes,
+    );
+    runtime_env
+}
+
+fn pool_reserved_bytes(pool: &(dyn MemoryPool + 'static)) -> u64 {
+    pool.reserved() as u64
+}
+
+/// Gives the execution that `task_context` runs a memory pool of its own, a
+/// [`PeakRecordingPool`] over the pool that the context has, when `options`
+/// asks for the summary of the execution: as a `lance::execution` event or
+/// through `options.execution_stats_callback`. A pool tells only how much is
+/// reserved now, and the pool of a session serves every plan that the session
+/// runs, so the summary takes the peak of the execution from the wrapper, see
+/// [`ExecutionSummaryCounts::peak_reserved_bytes`].
+///
+/// The wrapper only records: it passes every reservation on to the pool it
+/// wraps, which still enforces the limit and decides when operators spill.
+pub fn track_execution_memory(
+    task_context: TaskContext,
+    options: &LanceExecutionOptions,
+) -> TaskContext {
+    if options.skip_logging && options.execution_stats_callback.is_none() {
+        return task_context;
+    }
+    // A clone keeps the session's caches untouched, while
+    // `RuntimeEnvBuilder::build` would reset their limits on every execution.
+    let mut runtime = RuntimeEnv::clone(&task_context.runtime_env());
+    runtime.memory_pool = Arc::new(PeakRecordingPool::new(Arc::clone(&runtime.memory_pool)));
+    task_context.with_runtime(Arc::new(runtime))
 }
 
 /// Returns a new task context to execute one plan with `options`.
@@ -383,11 +632,10 @@ pub fn new_task_context(options: &LanceExecutionOptions) -> Result<Arc<TaskConte
                 ))
             })?;
     }
-    Ok(Arc::new(
-        TaskContext::default()
-            .with_session_config(session_config)
-            .with_runtime(new_runtime_env(options)),
-    ))
+    let task_context = TaskContext::default()
+        .with_session_config(session_config)
+        .with_runtime(new_runtime_env(options));
+    Ok(Arc::new(track_execution_memory(task_context, options)))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -421,6 +669,21 @@ pub struct ExecutionSummaryCounts {
 }
 
 impl ExecutionSummaryCounts {
+    /// Operator spill files produced, or `None` when no producer registered the metric.
+    pub fn spill_count(&self) -> Option<usize> {
+        self.all_counts.get("spill_count").copied()
+    }
+
+    /// Bytes written by DataFusion spill operators, excluding replay and scratch files.
+    /// `None` means unmeasured; `Some(0)` means a producer measured no spilling.
+    pub fn spilled_bytes(&self) -> Option<usize> {
+        self.all_counts.get("spilled_bytes").copied()
+    }
+
+    /// Rows written by DataFusion spill operators, or `None` when unmeasured.
+    pub fn spilled_rows(&self) -> Option<usize> {
+        self.all_counts.get("spilled_rows").copied()
+    }
     /// Number of index cache page lookups where the loader was not executed
     /// (per-page granularity).
     ///
@@ -470,6 +733,20 @@ impl ExecutionSummaryCounts {
             .unwrap_or(0)
     }
 
+    /// The most bytes that the operators of the plan held reserved at once in
+    /// DataFusion's memory pool, or `None` when the plan ran in a task context
+    /// that [`track_execution_memory`] did not prepare.
+    ///
+    /// This is what the execution claimed against the limit of the pool, not
+    /// the memory it allocated. Operators reserve the buffers of sorts,
+    /// aggregations and joins and the batches that repartitioning queues, and a
+    /// sort that may spill also sets aside `sort_spill_reservation_bytes` for its
+    /// merge. A plan whose operators reserve nothing reports 0. Lance's own read
+    /// buffers are not reserved in the pool.
+    pub fn peak_reserved_bytes(&self) -> Option<usize> {
+        self.all_counts.get(PEAK_RESERVED_BYTES_METRIC).copied()
+    }
+
     /// Ratio of index cache hits to total lookups. Returns `0.0` when no lookups
     /// were recorded in this scan.
     ///
@@ -494,6 +771,18 @@ impl ExecutionSummaryCounts {
 
 pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
+        // These are specialized DataFusion variants, excluded by iter_counts().
+        for metric in metrics.iter() {
+            if let MetricValue::SpillCount(count)
+            | MetricValue::SpilledBytes(count)
+            | MetricValue::SpilledRows(count) = metric.value()
+            {
+                *counts
+                    .all_counts
+                    .entry(metric.value().name().to_owned())
+                    .or_default() += count.value();
+            }
+        }
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
                 IOPS_METRIC => counts.iops += count.value(),
@@ -541,13 +830,22 @@ pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut Executio
     }
 }
 
-fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutionOptions) {
+fn report_plan_summary_metrics(
+    plan: &dyn ExecutionPlan,
+    options: &LanceExecutionOptions,
+    peak_reserved_bytes: Option<usize>,
+) {
     let output_rows = plan
         .metrics()
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
     collect_execution_metrics(plan, &mut counts);
+    if let Some(peak_reserved_bytes) = peak_reserved_bytes {
+        counts
+            .all_counts
+            .insert(PEAK_RESERVED_BYTES_METRIC.to_string(), peak_reserved_bytes);
+    }
     if !options.skip_logging {
         tracing::info!(
             target: TRACE_EXECUTION,
@@ -562,6 +860,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
             index_comparisons = counts.index_comparisons,
             index_cache_hits = counts.index_cache_hits(),
             index_cache_misses = counts.index_cache_misses(),
+            peak_reserved_bytes,
         );
     }
     if let Some(callback) = options.execution_stats_callback.as_ref() {
@@ -614,7 +913,8 @@ pub fn execute_plan(
 }
 
 /// Executes a plan under `task_context`, reporting its metrics through `options`
-/// once the stream finishes.
+/// once the stream finishes. The report has the peak memory reservation of the
+/// execution when [`track_execution_memory`] prepared `task_context`.
 ///
 /// A plan with more than one partition is merged into one.
 pub fn execute_plan_with_context(
@@ -647,12 +947,15 @@ pub fn execute_plan_with_context(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
+    let memory_pool = Arc::clone(task_context.memory_pool());
     let stream = plan.execute(0, task_context)?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
         if !options.skip_logging || options.execution_stats_callback.is_some() {
-            report_plan_summary_metrics(plan.as_ref(), &options);
+            let peak_reserved_bytes = PeakRecordingPool::from_pool(memory_pool.as_ref())
+                .map(PeakRecordingPool::peak_reserved);
+            report_plan_summary_metrics(plan.as_ref(), &options, peak_reserved_bytes);
         }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -885,9 +1188,203 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit};
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+    use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
     use datafusion_physical_plan::sorts::sort::SortExec;
     use futures::TryStreamExt;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::complete(ExecutionOutcome::Complete, true, true)]
+    #[case::error_then_drop(ExecutionOutcome::Failed, true, false)]
+    #[case::error_then_eof(ExecutionOutcome::Failed, true, true)]
+    #[case::cancelled(ExecutionOutcome::Cancelled, true, false)]
+    #[case::unpolled_drop(ExecutionOutcome::Cancelled, false, false)]
+    #[tokio::test]
+    async fn test_terminal_diagnostics(
+        #[case] expected: ExecutionOutcome,
+        #[case] poll: bool,
+        #[case] exhaust: bool,
+    ) {
+        let batch = record_batch!(("x", Int32, [1])).unwrap();
+        let schema = batch.schema();
+        let batches = if expected == ExecutionOutcome::Failed {
+            vec![
+                Ok(batch),
+                Err(DataFusionError::Execution("source failure".to_owned())),
+            ]
+        } else {
+            vec![Ok(batch)]
+        };
+        let plan = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches),
+        ))));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let output = reports.clone();
+        let exhausted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let original = exhausted.clone();
+        let options = LanceExecutionOptions {
+            execution_stats_callback: Some(Arc::new(move |_| {
+                original.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })),
+            ..Default::default()
+        };
+        let context = new_task_context(&options).unwrap();
+        let mut stream = execute_plan_with_diagnostics(
+            plan,
+            options,
+            context,
+            Arc::new(move |report| {
+                output.lock().unwrap().push(report.clone());
+            }),
+        )
+        .unwrap();
+        if poll {
+            assert!(stream.next().await.unwrap().is_ok());
+        }
+        if expected == ExecutionOutcome::Failed {
+            assert!(stream.next().await.unwrap().is_err());
+        }
+        if exhaust {
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        }
+        drop(stream);
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, expected);
+        assert_eq!(
+            exhausted.load(std::sync::atomic::Ordering::Relaxed),
+            usize::from(exhaust)
+        );
+        assert_eq!(
+            reports[0].error.is_some(),
+            expected == ExecutionOutcome::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_diagnostics_start_failure() {
+        let plan = Arc::new(OneShotExec::from_batch(
+            record_batch!(("x", Int32, [1])).unwrap(),
+        ));
+        drop(plan.execute(0, Arc::new(TaskContext::default())).unwrap());
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let output = reports.clone();
+        let result = execute_plan_with_diagnostics(
+            plan,
+            LanceExecutionOptions::default(),
+            Arc::new(TaskContext::default()),
+            Arc::new(move |report| output.lock().unwrap().push(report.clone())),
+        );
+        let error = result.err().unwrap();
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains("already been executed"));
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct MetricTestExec {
+        input: Arc<dyn ExecutionPlan>,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl DisplayAs for MetricTestExec {
+        fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "MetricTestExec")
+        }
+    }
+
+    impl ExecutionPlan for MetricTestExec {
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<TreeNodeRecursion>,
+        ) -> datafusion_common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+        fn name(&self) -> &str {
+            "MetricTestExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                input: children[0].clone(),
+                metrics: self.metrics.clone(),
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> datafusion_common::Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+        fn metrics(&self) -> Option<datafusion_physical_plan::metrics::MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+    }
+
+    #[rstest]
+    #[case::no_spill(0, 0)]
+    #[case::spilled(2, 128)]
+    fn test_spill_metrics_preserve_availability_and_operator_peaks(
+        #[case] spill_count: usize,
+        #[case] spilled_bytes: usize,
+    ) {
+        let batch = record_batch!(("x", Int32, [2, 1])).unwrap();
+        let input = Arc::new(OneShotExec::from_batch(batch));
+        let metrics = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics).spill_count(0).add(spill_count);
+        MetricBuilder::new(&metrics)
+            .spilled_bytes(0)
+            .add(spilled_bytes);
+        MetricBuilder::new(&metrics).spilled_rows(0).add(4);
+        MetricBuilder::new(&metrics)
+            .spilled_bytes(1)
+            .add(spilled_bytes / 2);
+        MetricBuilder::new(&metrics)
+            .peak_memory_usage("peak_mem_used", 0)
+            .set(1024);
+        MetricBuilder::new(&metrics)
+            .peak_memory_usage("peak_mem_used", 1)
+            .set(512);
+        let plan = MetricTestExec { input, metrics };
+        let mut counts = ExecutionSummaryCounts::default();
+        assert_eq!(counts.spill_count(), None);
+        collect_execution_metrics(&plan, &mut counts);
+        assert_eq!(counts.spill_count(), Some(spill_count));
+        assert_eq!(
+            counts.spilled_bytes(),
+            Some(spilled_bytes + spilled_bytes / 2)
+        );
+        assert_eq!(counts.spilled_rows(), Some(4));
+        assert!(!counts.all_counts.contains_key("peak_mem_used"));
+        let operators = collect_operator_metrics(&plan);
+        assert_eq!(operators[0].path, Vec::<usize>::new());
+        assert_eq!(operators[1].path, vec![0]);
+        let peaks: Vec<_> = operators[0]
+            .metrics
+            .iter()
+            .filter_map(|metric| {
+                if let ExecutionMetricValue::PeakMemoryBytes(bytes) = metric.value {
+                    Some((metric.partition, bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(peaks, vec![(Some(0), 1024), (Some(1), 512)]);
+    }
 
     #[test]
     fn test_new_task_context() {
@@ -930,6 +1427,62 @@ mod tests {
             })
             .collect();
         assert_eq!(reservations.len(), 3);
+
+        // Only an execution whose summary is reported, as an event or to a
+        // callback, tracks the peak of its reservations.
+        let tracked = |options: &LanceExecutionOptions| {
+            let task_ctx = new_task_context(options).unwrap();
+            PeakRecordingPool::from_pool(task_ctx.memory_pool().as_ref()).is_some()
+        };
+        assert!(tracked(&options));
+        let unreported = LanceExecutionOptions {
+            skip_logging: true,
+            ..options
+        };
+        assert!(!tracked(&unreported));
+        let callback: ExecutionStatsCallback = Arc::new(|_: &ExecutionSummaryCounts| {});
+        assert!(tracked(&LanceExecutionOptions {
+            execution_stats_callback: Some(callback),
+            ..unreported
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_forced_sort_spill_is_collected() {
+        let batch = record_batch!(("x", Int32, (0..128).rev().collect::<Vec<i32>>())).unwrap();
+        let batches: Vec<_> = (0..128).map(|_| Ok(batch.clone())).collect();
+        let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter(batches),
+        )));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+            col("x", &batch.schema()).unwrap(),
+        )])
+        .unwrap();
+        let plan = Arc::new(SortExec::new(ordering, Arc::new(input)));
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(64 * 1024),
+            target_partition: Some(1),
+            batch_size: Some(128),
+            ..Default::default()
+        };
+        let mut output = execute_plan(plan.clone(), options).unwrap();
+        let mut rows = 0;
+        let mut previous = 0;
+        while let Some(batch) = output.try_next().await.unwrap() {
+            for value in batch["x"].as_primitive::<Int32Type>().values() {
+                assert!(*value >= previous);
+                previous = *value;
+            }
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 128 * 128);
+        let mut counts = ExecutionSummaryCounts::default();
+        collect_execution_metrics(plan.as_ref(), &mut counts);
+        assert!(counts.spill_count().unwrap() > 0);
+        assert!(counts.spilled_bytes().unwrap() > 0);
+        assert!(counts.spilled_rows().unwrap() > 0);
     }
 
     #[rstest]
@@ -962,6 +1515,42 @@ mod tests {
             sorted["x"].as_primitive::<Int32Type>(),
             &Int32Array::from(vec![0, 1, 2, 3, 4, 5])
         );
+    }
+
+    /// The summary carries the peak of the reservations made through the task
+    /// context of the execution: 0 when there were none, unlike the `None` of
+    /// an execution that is not tracked.
+    #[rstest]
+    #[case::reserved(1000)]
+    #[case::nothing(0)]
+    #[tokio::test]
+    async fn test_execution_reports_its_peak_reservation(#[case] peak: usize) {
+        let summary = Arc::new(Mutex::new(None));
+        let options = LanceExecutionOptions {
+            execution_stats_callback: Some(Arc::new({
+                let summary = Arc::clone(&summary);
+                move |counts: &ExecutionSummaryCounts| {
+                    *summary.lock().unwrap() = Some(counts.clone());
+                }
+            })),
+            skip_logging: true,
+            ..Default::default()
+        };
+        let task_ctx = new_task_context(&options).unwrap();
+        // What an operator of the plan reserves at its peak and frees again.
+        let reservation = MemoryConsumer::new("operator").register(task_ctx.memory_pool());
+        reservation.grow(peak);
+        reservation.shrink(peak / 2);
+        drop(reservation);
+        let batch = record_batch!(("x", Int32, [1, 2, 3])).unwrap();
+        let plan = Arc::new(OneShotExec::from_batch(batch));
+        let _: Vec<RecordBatch> = execute_plan_with_context(plan, options, task_ctx)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let summary = summary.lock().unwrap().take().unwrap();
+        assert_eq!(summary.peak_reserved_bytes(), Some(peak));
     }
 
     #[tokio::test]
