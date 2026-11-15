@@ -124,6 +124,70 @@ impl<'a> Shape<'a> {
 }
 
 impl FullZipScheduler {
+    /// Read one exact nonempty row range and reconstruct it within an existing
+    /// reservation. Unlike the prefix API, this never shrinks the selection or
+    /// acquires more credit. A caller composing columns can admit one complete
+    /// workspace, keep every column aligned, then retry the whole batch smaller.
+    ///
+    /// `None` is refusal, not EOF. Drop the entire compound attempt (including
+    /// previously returned columns) and its reservation before retrying. A failed
+    /// reconstruction may release frozen intermediate credit to the shared pool
+    /// instead of restoring it to this exclusive reservation. Errors propagate;
+    /// no ordinary decode fallback or dependent allocation wait is introduced.
+    /// The supported types and I/O ownership contract match the prefix API.
+    ///
+    /// ```
+    /// use std::ops::Range;
+    /// use arrow_array::ArrayRef;
+    /// use arrow_schema::DataType;
+    /// use lance_core::{Result, utils::allocation::Reservation};
+    /// use lance_encoding::{EncodingsIo,
+    ///     encodings::logical::primitive::FullZipScheduler};
+    /// async fn column(decoder: &FullZipScheduler, io: &dyn EncodingsIo,
+    ///     rows: Range<u64>, ty: &DataType, work: &mut Reservation)
+    ///     -> Result<Option<ArrayRef>> {
+    ///     decoder.try_read_array_range_in(rows, ty, work,
+    ///         |range, output| io.submit_single_into(range, 0, output)).await
+    /// }
+    /// ```
+    pub async fn try_read_array_range_in<F, Fut>(
+        &self,
+        rows: Range<u64>,
+        data_type: &DataType,
+        workspace: &mut Reservation,
+        read: F,
+    ) -> Result<Option<ArrayRef>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
+        let shape = Shape::new(self, data_type)?;
+        if rows.start >= rows.end || rows.end > self.rows_in_page {
+            return Err(Error::invalid_input(
+                "FullZip array requires a nonempty range within the page",
+            ));
+        }
+        let count = rows.end - rows.start;
+        let Some(task) = self.try_read_unzip_range_in(rows, workspace, read).await? else {
+            return Ok(None);
+        };
+        let page = task.try_decode_in(workspace)?;
+        drop(task);
+        let Some(page) = page else {
+            return Ok(None);
+        };
+        let Some(array) = shape.materialize(page, workspace)? else {
+            return Ok(None);
+        };
+        if array.len() as u64 != count {
+            return Err(Error::corrupt_file_named(
+                "FullZip",
+                "reconstructed Arrow row count differs from selected page rows",
+            ));
+        }
+        Ok(Some(array))
+    }
+
     /// Validate the Arrow shape and structural unzip metadata without I/O.
     /// This does not validate payload framing or data-dependent codec support.
     /// File-level cursors use this before returning any batch from a selection.

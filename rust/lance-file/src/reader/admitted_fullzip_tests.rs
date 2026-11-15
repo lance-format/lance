@@ -35,6 +35,7 @@ use crate::{
     writer::FileWriterOptions,
 };
 
+mod multi;
 mod scan;
 
 fn array(page: usize, depth: usize) -> ArrayRef {
@@ -103,13 +104,14 @@ async fn fixture_arrays(
         .map(|array| RecordBatch::try_new(schema.clone(), vec![array]))
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
-    fixture_batches(version, lite, batches).await
+    fixture_batches(version, lite, batches, 1).await
 }
 
 async fn fixture_batches(
     version: ConcreteFileVersion,
     lite: bool,
     batches: Vec<RecordBatch>,
+    data_cache_bytes: u64,
 ) -> (FsFixture, FileReader) {
     let mut fs = FsFixture::default();
     fs.scheduler = ScanScheduler::new(
@@ -125,7 +127,7 @@ async fn fixture_batches(
         &fs,
         version,
         FileWriterOptions {
-            data_cache_bytes: Some(1),
+            data_cache_bytes: Some(data_cache_bytes),
             ..Default::default()
         },
     )

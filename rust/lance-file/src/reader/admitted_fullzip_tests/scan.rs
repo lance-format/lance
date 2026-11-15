@@ -157,17 +157,19 @@ async fn admitted_scan_respects_nonzero_projection_and_schema(
     ]));
     let batches = (0..2)
         .map(|page| {
-            RecordBatch::try_new(schema.clone(), vec![array(page + 10, 0), array(page, 0)]).unwrap()
+            // Deliberately unsupported outside the selected projection.
+            let other = Arc::new(LargeBinaryArray::from_vec(vec![b"constant"; 8]));
+            RecordBatch::try_new(schema.clone(), vec![other, array(page, 0)]).unwrap()
         })
         .collect();
-    let (fs, reader) = fixture_batches(version, false, batches).await;
+    let (fs, reader) = fixture_batches(version, false, batches, 1).await;
     let budget = AllocationBudget::new(8192);
     let error = reader
         .open_admitted_fullzip_scan(0..16, budget.clone(), 8192, 8)
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("one non-Blob leaf path"));
+    assert!(error.to_string().contains("dense FullZip page"));
     let mut schema = reader.core.base_projection.schema.as_ref().clone();
     schema.fields.remove(0);
     schema.fields[0].name = "renamed".to_string();
