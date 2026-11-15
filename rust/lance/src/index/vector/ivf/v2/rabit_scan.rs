@@ -40,10 +40,10 @@ use lance_index::vector::{
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
-    rotated_partition_centroid_slice,
+    global_heap_to_batch, rotated_partition_centroid_slice,
 };
 
-type RabitIndex = IVFIndex<FlatIndex, RabitQuantizer>;
+pub(super) type RabitIndex = IVFIndex<FlatIndex, RabitQuantizer>;
 
 /// Creates runtime execution state for an opened RaBitQ index with current plane storage.
 ///
@@ -366,13 +366,14 @@ impl RabitScanContext {
         let mut query = self.query.clone();
         query.dist_q_c = dist_q_c;
         self.index
-            .prepare_partition_without_prefilter_wait(
+            .prepare_partition(
                 partition_id,
                 Arc::new(query),
                 dist_q_c,
                 self.pre_filter.clone(),
                 self.metrics.as_ref(),
                 self.raw_query.clone(),
+                false,
             )
             .await
             .map(|prepared| RabitPreparedPartition(PreparedRabitPartition::Ordinary(prepared)))
@@ -547,14 +548,7 @@ impl RabitScanContext {
         match prepared.0 {
             PreparedRabitPartition::Ordinary(prepared) => {
                 self.index.scratch_pool.with_scratch(|scratch| {
-                    RabitIndex::accumulate_prepared_partition_search(
-                        self.index.use_query_residual,
-                        self.index.use_residual_scratch,
-                        prepared,
-                        heap,
-                        scratch,
-                        self.metrics.as_ref(),
-                    )
+                    prepared.accumulate_into(heap, scratch, self.metrics.as_ref())
                 })
             }
             PreparedRabitPartition::Planes { sign, ex } => {
@@ -731,6 +725,6 @@ impl RabitScanContext {
 
     /// Convert the final native heap to the standard vector result schema.
     pub fn finish(&self, heap: BinaryHeap<OrderedNode<u64>>) -> Result<RecordBatch> {
-        RabitIndex::global_heap_to_batch(heap, self.metrics.as_ref())
+        global_heap_to_batch(heap, self.metrics.as_ref())
     }
 }

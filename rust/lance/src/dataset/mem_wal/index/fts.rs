@@ -5406,10 +5406,10 @@ impl FtsMemIndexPlugin {
         schema: &LanceSchema,
         index_meta: &IndexMetadata,
     ) -> Result<ResolvedIndex> {
-        let [field_id] = index_meta.fields.as_slice() else {
+        let [field_id] = index_meta.keyed_fields() else {
             return Err(Error::invalid_input(format!(
                 "index '{name}' covers {} columns, but this kind covers exactly one",
-                index_meta.fields.len()
+                index_meta.keyed_fields().len()
             )));
         };
 

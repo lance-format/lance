@@ -21,12 +21,16 @@ use arrow::compute::can_cast_types;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_cast::cast_with_options;
+use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::Expr;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{
+    Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION, Schema,
+};
 use lance_core::utils::parse::str_is_truthy;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
@@ -37,6 +41,13 @@ use lance_table::format::{Fragment, overlay::TOMBSTONE_FIELD_ID};
 pub mod optimize;
 
 use optimize::{ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer};
+
+/// Field metadata that declares the unenforced primary and clustering keys.
+const KEY_METADATA: [&str; 3] = [
+    LANCE_UNENFORCED_PRIMARY_KEY,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+];
 
 async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
     let field = dataset.schema().field(path).ok_or_else(|| {
@@ -183,6 +194,8 @@ pub struct BatchInfo {
 ///
 /// This is used to determine if a UDF has already been run on a given input,
 /// and to store the results of a UDF for future use.
+/// Implementations must preserve batch schema metadata and fragment metadata:
+/// they identify the input for which a saved result is valid.
 pub trait UDFCheckpointStore: Send + Sync {
     fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>>;
     fn insert_batch(&self, info: BatchInfo, batch: RecordBatch) -> Result<()>;
@@ -374,7 +387,8 @@ pub(super) async fn add_columns_to_fragments(
                 read_columns,
                 udf.mapper,
                 batch_size,
-                udf.result_checkpoint,
+                udf.result_checkpoint
+                    .map(|cache| (cache, udf.output_schema.clone())),
                 None,
             )
             .await?;
@@ -751,13 +765,86 @@ struct AddColumnFragments {
     fragments_to_cleanup: Vec<Fragment>,
 }
 
+const UDF_CHECKPOINT_CONTEXT: &str = "lance:udf_checkpoint_context";
+
+fn checkpoint_context(
+    fragment: &FileFragment,
+    read_columns: Option<&[String]>,
+    batch_size: Option<u32>,
+    output_schema: &ArrowSchema,
+) -> Result<String> {
+    let dataset = fragment.dataset();
+    let mut source = fragment.metadata().clone();
+    // Reads can populate these hints without changing the fragment's input.
+    for file in source.files.iter_mut().chain(
+        source
+            .overlays
+            .iter_mut()
+            .map(|overlay| &mut overlay.data_file),
+    ) {
+        file.file_size_bytes = Default::default();
+        file.file_metadata_size_bytes = None;
+    }
+    // IPC orders schema metadata keys and covers every supported Arrow type.
+    let schemas = [ArrowSchema::from(dataset.schema()), output_schema.clone()].map(|schema| {
+        IpcDataGenerator::default()
+            .schema_to_bytes_with_dictionary_tracker(
+                &schema,
+                &mut DictionaryTracker::new(false),
+                &IpcWriteOptions::default(),
+            )
+            .ipc_message
+    });
+    let base_paths = dataset
+        .manifest
+        .base_paths
+        .iter()
+        .map(|(id, base)| (id, (&base.path, &base.name, base.is_dataset_root)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut context = serde_json::json!({
+        "version": 1,
+        "dataset": dataset.uri(),
+        "read_version": dataset.version_id(),
+        "branch": dataset.branch_identifier.as_ref(),
+        "transaction_file": dataset.manifest.transaction_file,
+        "base_paths": base_paths,
+        "schemas": schemas,
+        "max_field_id": dataset.manifest.max_field_id(),
+        "fragment": source,
+        "read_columns": read_columns,
+        "batch_size": batch_size,
+        "default_batch_size": batch_size.is_none().then(super::scanner::get_default_batch_size),
+    });
+    context.sort_all_objects();
+    Ok(blake3::hash(&serde_json::to_vec(&context)?)
+        .to_hex()
+        .to_string())
+}
+
+fn validate_checkpoint_context(
+    value: Option<&String>,
+    expected: &str,
+    fragment_id: u64,
+) -> Result<Option<String>> {
+    let marker =
+        value.and_then(|value| serde_json::from_str::<(String, Option<String>)>(value).ok());
+    match marker {
+        Some((context, previous)) if context == expected => Ok(previous),
+        _ => Err(Error::invalid_input(format!(
+            "UDF checkpoint for fragment {fragment_id} is incompatible with this add_columns \
+             invocation. Resume with the original dataset snapshot, read_columns, output schema \
+             and batch_size, or use a new checkpoint store."
+        ))),
+    }
+}
+
 #[allow(clippy::type_complexity)]
 async fn add_columns_impl(
     fragments: &[FileFragment],
     read_columns: Option<Vec<String>>,
     mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
     batch_size: Option<u32>,
-    result_cache: Option<Arc<dyn UDFCheckpointStore>>,
+    result_cache: Option<(Arc<dyn UDFCheckpointStore>, Arc<ArrowSchema>)>,
     schemas: Option<(Schema, Schema)>,
 ) -> Result<AddColumnFragments> {
     let read_columns_ref = read_columns.as_deref();
@@ -767,9 +854,34 @@ async fn add_columns_impl(
     let mut fragments_to_cleanup = Vec::with_capacity(fragments.len());
 
     for fragment in fragments {
-        if let Some(cache) = &result_cache {
+        let result_cache = result_cache
+            .as_ref()
+            .map(|(cache, schema)| {
+                checkpoint_context(fragment, read_columns_ref, batch_size, schema)
+                    .map(|context| (cache, context))
+            })
+            .transpose()?;
+        if let Some((cache, context)) = &result_cache {
             let fragment_id = fragment.id() as u32;
-            let fragment = match cache.get_fragment(fragment_id) {
+            let cached = cache.get_fragment(fragment_id).and_then(|cached| {
+                cached
+                    .map(|mut cached| {
+                        let previous = validate_checkpoint_context(
+                            cached.metadata.get(UDF_CHECKPOINT_CONTEXT),
+                            context,
+                            fragment.id() as u64,
+                        )?;
+                        cached.metadata.remove(UDF_CHECKPOINT_CONTEXT);
+                        if let Some(previous) = previous {
+                            cached
+                                .metadata
+                                .insert(UDF_CHECKPOINT_CONTEXT.to_owned(), previous);
+                        }
+                        Ok(cached)
+                    })
+                    .transpose()
+            });
+            let fragment = match cached {
                 Ok(fragment) => fragment,
                 Err(e) => {
                     cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
@@ -802,12 +914,41 @@ async fn add_columns_impl(
                     batch_index,
                 };
 
-                let new_batch = if let Some(cache) = &result_cache {
-                    if let Some(batch) = cache.get_batch(&batch_info)? {
-                        batch
+                let new_batch = if let Some((cache, context)) = &result_cache {
+                    if let Some(mut cached) = cache.get_batch(&batch_info)? {
+                        let previous = validate_checkpoint_context(
+                            cached.schema().metadata().get(UDF_CHECKPOINT_CONTEXT),
+                            context,
+                            fragment.id() as u64,
+                        )?;
+                        cached.schema_metadata_mut().remove(UDF_CHECKPOINT_CONTEXT);
+                        if let Some(previous) = previous {
+                            cached
+                                .schema_metadata_mut()
+                                .insert(UDF_CHECKPOINT_CONTEXT.to_owned(), previous);
+                        }
+                        if cached.num_rows() != batch.num_rows() {
+                            return Err(Error::invalid_input(format!(
+                                "UDF checkpoint for fragment {}, batch {} is incompatible: \
+                                 cached rows {}, input rows {}",
+                                fragment.id(),
+                                batch_index,
+                                cached.num_rows(),
+                                batch.num_rows()
+                            )));
+                        }
+                        cached
                     } else {
                         let new_batch = mapper_ref(batch)?;
-                        cache.insert_batch(batch_info, new_batch.clone())?;
+                        let mut cached = new_batch.clone();
+                        let marker = serde_json::to_string(&(
+                            context,
+                            cached.schema().metadata().get(UDF_CHECKPOINT_CONTEXT),
+                        ))?;
+                        cached
+                            .schema_metadata_mut()
+                            .insert(UDF_CHECKPOINT_CONTEXT.to_owned(), marker);
+                        cache.insert_batch(batch_info, cached)?;
                         new_batch
                     }
                 } else {
@@ -821,11 +962,17 @@ async fn add_columns_impl(
             let new_fragment = updater.finish().await?;
             fragments_to_cleanup.push(new_fragment.clone());
 
-            if let Some(cache) = &result_cache {
+            if let Some((cache, context)) = &result_cache {
                 // Once the checkpoint store owns this fragment, retries may load
                 // it back instead of rewriting it. Removing it from the cleanup
                 // set avoids deleting data that has already been checkpointed.
-                cache.insert_fragment(new_fragment.clone())?;
+                let mut cached = new_fragment.clone();
+                let marker =
+                    serde_json::to_string(&(context, cached.metadata.get(UDF_CHECKPOINT_CONTEXT)))?;
+                cached
+                    .metadata
+                    .insert(UDF_CHECKPOINT_CONTEXT.to_owned(), marker);
+                cache.insert_fragment(cached)?;
                 fragments_to_cleanup.pop();
             }
 
@@ -1016,7 +1163,13 @@ pub(super) async fn alter_columns(
             tightens_nullability = true;
         }
 
-        let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
+        let field_dest = new_schema.mut_field_by_id(field_src.id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Column \"{}\" was already modified by an earlier type change. \
+                 Combine the changes in one alteration or use separate alter_columns calls",
+                alteration.path
+            ))
+        })?;
         if let Some(rename) = &alteration.rename {
             field_dest.name.clone_from(rename);
         }
@@ -1041,13 +1194,32 @@ pub(super) async fn alter_columns(
                 )));
             }
 
+            // A manifest stores each key both as a field property and as metadata, and
+            // either can be present alone. Let `Field::try_from` materialize the key
+            // from the reserved metadata, then prefer the source's cached position
+            // when it has one: that property is authoritative and survives metadata
+            // loss.
             let arrow_field = ArrowField::new(
                 field_dest.name.clone(),
                 data_type.clone(),
                 field_dest.nullable,
+            )
+            .with_metadata(
+                field_src
+                    .metadata
+                    .iter()
+                    .filter(|(key, _)| KEY_METADATA.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             );
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.try_set_id(field_src.parent_id, &mut next_field_id)?;
+            if let Some(position) = field_src.unenforced_primary_key_position {
+                field_dest.unenforced_primary_key_position = Some(position);
+            }
+            if let Some(position) = field_src.unenforced_clustering_key_position {
+                field_dest.unenforced_clustering_key_position = Some(position);
+            }
 
             cast_fields.push((field_src.clone(), field_dest.clone()));
         }
@@ -3515,13 +3687,21 @@ mod test {
             }
         }
 
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "checkpointed",
+            DataType::Int32,
+            true,
+        )]));
+        checkpointed_fragment.metadata.insert(
+            UDF_CHECKPOINT_CONTEXT.to_owned(),
+            serde_json::to_string(&(
+                checkpoint_context(&original_fragments[0], None, None, &output_schema)?,
+                None::<String>,
+            ))?,
+        );
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(|_| Err(Error::invalid_input("injected UDF failure"))),
-            output_schema: Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "checkpointed",
-                DataType::Int32,
-                true,
-            )])),
+            output_schema,
             result_checkpoint: Some(Arc::new(CheckpointedFragmentStore {
                 fragment: Mutex::new(Some(checkpointed_fragment)),
             })),
@@ -4140,7 +4320,14 @@ mod test {
             None,
         )
         .await?;
-        let cached_fragment = checkpoint_result.fragments[0].clone();
+        let mut cached_fragment = checkpoint_result.fragments[0].clone();
+        cached_fragment.metadata.insert(
+            UDF_CHECKPOINT_CONTEXT.to_owned(),
+            serde_json::to_string(&(
+                checkpoint_context(&dataset.get_fragments()[0], None, None, &checkpoint_schema)?,
+                None::<String>,
+            ))?,
+        );
 
         struct RequestCounter {
             pub get_batch_requests: Mutex<Vec<BatchInfo>>,
@@ -4148,6 +4335,7 @@ mod test {
             pub get_fragment_requests: Mutex<Vec<u32>>,
             pub insert_fragment_requests: Mutex<Vec<u32>>,
             pub cached_fragment: Fragment,
+            pub batch_context: String,
         }
 
         impl UDFCheckpointStore for RequestCounter {
@@ -4155,14 +4343,19 @@ mod test {
                 self.get_batch_requests.lock().unwrap().push(info.clone());
 
                 if info.fragment_id == 1 && info.batch_index == 0 {
-                    Ok(Some(RecordBatch::try_new(
+                    let mut batch = RecordBatch::try_new(
                         Arc::new(ArrowSchema::new(vec![ArrowField::new(
                             "double_id",
                             DataType::Int32,
                             false,
                         )])),
                         vec![Arc::new(Int32Array::from_iter_values(50..75))],
-                    )?))
+                    )?;
+                    batch.schema_metadata_mut().insert(
+                        UDF_CHECKPOINT_CONTEXT.to_owned(),
+                        serde_json::to_string(&(&self.batch_context, None::<String>))?,
+                    );
+                    Ok(Some(batch))
                 } else {
                     Ok(None)
                 }
@@ -4197,6 +4390,12 @@ mod test {
             get_fragment_requests: Mutex::default(),
             insert_fragment_requests: Mutex::default(),
             cached_fragment,
+            batch_context: checkpoint_context(
+                &dataset.get_fragments()[1],
+                None,
+                None,
+                &checkpoint_schema,
+            )?,
         });
 
         let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -6142,6 +6341,107 @@ mod test {
         assert_eq!(data["a"].as_ref(), &Int64Array::from(vec![1, 2]));
         assert_eq!(data["b"].as_ref(), &Int64Array::from(vec![10, 20]));
 
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::rename(ColumnAlteration::new("v".into()).rename("w".into()))]
+    #[case::nullability(ColumnAlteration::new("v".into()).set_nullable(true))]
+    #[case::cast(ColumnAlteration::new("v".into()).cast_to(DataType::Utf8))]
+    #[tokio::test]
+    async fn test_cast_then_alter_same_column(
+        #[case] mut following: ColumnAlteration,
+        #[values(false, true)] is_nested: bool,
+    ) -> Result<()> {
+        let values = record_batch!(("v", Utf8, [Some("x"), None]))?;
+        let batch = if is_nested {
+            following.path = "b.v".into();
+            RecordBatch::try_from_iter(vec![(
+                "b",
+                Arc::new(StructArray::from(values)) as ArrayRef,
+            )])?
+        } else {
+            values
+        };
+        let path = following.path.clone();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+        let original_schema = dataset.schema().clone();
+        let original_fragments = dataset.fragments().to_vec();
+        let original_version = dataset.version().version;
+
+        let error = dataset
+            .alter_columns(&[
+                ColumnAlteration::new(path.clone()).cast_to(DataType::LargeUtf8),
+                following,
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!("Column \"{path}\"")));
+        assert!(error.to_string().contains("earlier type change"));
+        assert_eq!(dataset.schema(), &original_schema);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(dataset.version().version, original_version);
+
+        let dataset = Dataset::open(&test_dir).await?;
+        assert_eq!(dataset.schema(), &original_schema);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(dataset.version().version, original_version);
+        assert_eq!(dataset.scan().try_into_batch().await?, batch);
+        dataset.validate().await?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::combined(vec![vec![
+        ColumnAlteration::new("v".into())
+            .cast_to(DataType::LargeUtf8)
+            .rename("w".into()),
+    ]])]
+    #[case::rename_then_cast(vec![vec![
+        ColumnAlteration::new("v".into()).rename("w".into()),
+        ColumnAlteration::new("v".into()).cast_to(DataType::LargeUtf8),
+    ]])]
+    #[case::separate_calls(vec![
+        vec![ColumnAlteration::new("v".into()).cast_to(DataType::LargeUtf8)],
+        vec![ColumnAlteration::new("v".into()).rename("w".into())],
+    ])]
+    #[tokio::test]
+    async fn test_cast_and_rename_same_column(
+        #[case] calls: Vec<Vec<ColumnAlteration>>,
+    ) -> Result<()> {
+        let batch = record_batch!(("v", Utf8, [Some("x"), None]))?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        for alterations in &calls {
+            dataset.alter_columns(alterations).await?;
+        }
+
+        let dataset = Dataset::open(&test_dir).await?;
+        let expected = record_batch!(("w", LargeUtf8, [Some("x"), None]))?;
+        assert_eq!(dataset.version().version, 1 + calls.len() as u64);
+        assert_eq!(dataset.scan().try_into_batch().await?, expected);
+        dataset.validate().await?;
         Ok(())
     }
 

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from __future__ import annotations
+
 import ctypes
 import io
 from dataclasses import dataclass
-from typing import IO, Any, Iterator, Optional, Union
+from typing import IO, Any, Iterator, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
@@ -26,6 +28,8 @@ from .lance import (
 from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
+from .lance import read_blob_file_ranges as _read_blob_file_ranges
+from .lance import read_blob_files as _read_blob_files
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
@@ -388,6 +392,146 @@ class BlobColumn:
 
     def __iter__(self) -> Iterator[IO[bytes]]:
         return BlobIterator(iter(self.blob_column))
+
+
+def _lance_blob_file(blob_file: Optional[BlobFile]) -> Optional[LanceBlobFile]:
+    if blob_file is None:
+        return None
+    if not isinstance(blob_file, BlobFile):
+        raise TypeError(
+            f"Expected a lance.BlobFile or None, got {type(blob_file).__name__}"
+        )
+    return blob_file.inner
+
+
+def read_blob_files(
+    blob_files: Sequence[Optional[BlobFile]],
+    *,
+    io_buffer_size: Optional[int] = None,
+    io_parallelism: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]:
+    """
+    Read whole blobs through :py:class:`lance.BlobFile` handles you already hold.
+
+    Row-based reads resolve descriptors on every call. Handles returned by
+    :py:meth:`lance.LanceDataset.take_blobs` already hold those descriptors.
+    When reading the same blobs repeatedly, take them once and pass them here:
+    each call then issues only the payload requests, planned, coalesced
+    across handles that share a backing file, and executed in Rust.
+
+    Every handle produces one result. Pass ``None`` for a null blob to get
+    ``None`` back.
+    Handles retain their resolved source and range across later dataset commits.
+    Referenced payload files must remain retained. External objects follow their
+    storage provider's consistency semantics. Reading does not move a handle's
+    cursor. A handle that is already closed when the read stream is created
+    raises ``ValueError``; closing it afterwards does not cancel reads that
+    were already planned. Empty and all-``None`` inputs issue no storage
+    requests.
+
+    Parameters
+    ----------
+    blob_files : Sequence[Optional[BlobFile]]
+        Handles returned by ``take_blobs``, or ``None`` for null blobs.
+    io_buffer_size : int, optional
+        Positive byte budget for planned physical reads. Defaults to the first
+        non-null handle's object store. One oversized request runs alone.
+    io_parallelism : int, optional
+        Maximum concurrent physical read plans. Must be positive.
+        Defaults to the first non-null handle's object store.
+    preserve_order : bool, optional
+        If True (the default), results follow the order of ``blob_files``.
+        If False, ``request_index`` still identifies every result.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        handles = dataset.take_blobs("images", indices=[0, 1, 2])
+        payloads = [data for _, data in lance.read_blob_files(handles)]
+
+    Returns
+    -------
+    results : List[Tuple[int, Optional[bytes]]]
+        One ``(request_index, data)`` pair per handle, where
+        ``request_index`` is the handle's position in ``blob_files``. Valid
+        empty blobs return ``b""``.
+    """
+    return _read_blob_files(
+        [_lance_blob_file(blob_file) for blob_file in blob_files],
+        io_buffer_size=io_buffer_size,
+        io_parallelism=io_parallelism,
+        preserve_order=preserve_order,
+    )
+
+
+def read_blob_file_ranges(
+    requests: Sequence[Tuple[Optional[BlobFile], int, int]],
+    *,
+    io_buffer_size: Optional[int] = None,
+    io_parallelism: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]:
+    """
+    Read blob-local byte ranges through :py:class:`lance.BlobFile` handles
+    you already hold.
+
+    Like :py:func:`read_blob_files`, this skips descriptor reads.
+    Each request is a ``(blob_file, offset, length)`` tuple. Repeat a handle
+    to read several ranges from one blob; ranges on the same backing file
+    are coalesced across handles.
+
+    Every request produces one result. A request whose handle is ``None``
+    returns ``None``, and its range is not checked against a blob size.
+    Empty ranges on a handle return ``b""`` without payload I/O. For every
+    request, offset plus length must fit in an unsigned 64-bit integer, and
+    a range on a handle must not extend beyond the blob's size. Handles are
+    read as described in :py:func:`read_blob_files`.
+
+    Parameters
+    ----------
+    requests : Sequence[Tuple[Optional[BlobFile], int, int]]
+        Complete ``(blob_file, offset, length)`` requests.
+    io_buffer_size : int, optional
+        Positive byte budget for planned physical reads. Defaults to the first
+        non-null handle's object store. One oversized request runs alone.
+    io_parallelism : int, optional
+        Maximum concurrent physical read plans. Must be positive.
+        Defaults to the first non-null handle's object store.
+    preserve_order : bool, optional
+        If True (the default), results follow request order. If False,
+        ``request_index`` still identifies every result.
+
+    Examples
+    --------
+    Read a shard index from the end of a blob, then two chunks from it:
+
+    .. code-block:: python
+
+        (shard,) = dataset.take_blobs("shards", indices=[7])
+        [(_, index)] = lance.read_blob_file_ranges(
+            [(shard, shard.size() - 1024, 1024)]
+        )
+        chunks = lance.read_blob_file_ranges(
+            [(shard, 0, 4096), (shard, 4096, 4096)]
+        )
+
+    Returns
+    -------
+    results : List[Tuple[int, Optional[bytes]]]
+        One ``(request_index, data)`` pair per request. The Python list
+        retains all returned payload bytes in memory.
+    """
+    return _read_blob_file_ranges(
+        [
+            (_lance_blob_file(blob_file), offset, length)
+            for blob_file, offset, length in requests
+        ],
+        io_buffer_size=io_buffer_size,
+        io_parallelism=io_parallelism,
+        preserve_order=preserve_order,
+    )
 
 
 class BlobFile(io.BufferedIOBase):

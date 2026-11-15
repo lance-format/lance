@@ -330,25 +330,32 @@ impl ShardMemory {
     /// valve throttles on, because throttling on grace-retained memory would
     /// stall the writer waiting for a sweeper tick. The two differ only when a
     /// grace is configured; under the default zero grace they are equal.
+    ///
+    /// The sum over the writers of the process is reported as the `mem_wal`
+    /// component of `lance_memory_component_bytes` while `LANCE_MEMORY_OBSERVE`
+    /// is on in a build with the `metrics` feature, once `ShardWriter::open`
+    /// has replayed the WAL.
     pub fn retained_bytes(&self) -> usize {
         match &self.source {
-            ShardMemorySource::MemTables(t) => {
-                let tables = t.load();
-                tables
-                    .active
-                    .as_ref()
-                    .map_or(0, InMemoryMemTableRef::resident_bytes)
-                    + tables
-                        .frozen
-                        .iter()
-                        .chain(tables.grace.iter())
-                        .map(InMemoryMemTableRef::resident_bytes)
-                        .sum::<usize>()
-            }
+            ShardMemorySource::MemTables(t) => Self::retained_in(&t.load()),
             ShardMemorySource::Queue(q) => q.queue_bytes(),
             #[cfg(test)]
             ShardMemorySource::Fake(f) => f(),
         }
+    }
+
+    /// [`Self::retained_bytes`] of one published set of resident memtables.
+    pub(super) fn retained_in(tables: &ResidentMemTables) -> usize {
+        tables
+            .active
+            .as_ref()
+            .map_or(0, InMemoryMemTableRef::resident_bytes)
+            + tables
+                .frozen
+                .iter()
+                .chain(tables.grace.iter())
+                .map(InMemoryMemTableRef::resident_bytes)
+                .sum::<usize>()
     }
 
     /// What could reclaim memory here while a writer waits on it.

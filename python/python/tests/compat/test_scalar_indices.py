@@ -9,6 +9,7 @@ BLOOMFILTER, JSON, FTS) created with one version of Lance can be read
 and written by other versions.
 """
 
+import dataclasses
 import os
 import shutil
 from pathlib import Path
@@ -811,6 +812,114 @@ class NgramIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
+@compat_test(min_version="0.39.0")
+class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
+    """Test NGRAM forward/backward compatibility across the row-address-domain
+    format change.
+
+    min_version is 0.39.0, not NgramIndex's 0.36.0, because this test's whole
+    point is an old build correctly ignoring an index format version newer
+    than it understands -- and that mechanism itself was only introduced in
+    0.39.0 (#4906). Before that, an old build doesn't inspect index_version
+    at all and will happily misuse a too-new NGRAM index.
+
+    NGRAM was changed to store physical row addresses (``_rowaddr``) instead
+    of row ids, which bumped its on-disk format version to 1. This dataset
+    enables stable row ids, so the two domains genuinely differ and updating
+    a pre-change segment must rebuild it rather than merge new data into it
+    (a merge would otherwise silently combine row ids and row addresses in
+    the same column). This test checks the full story:
+
+    - An old-format (row-id domain) NGRAM index is loaded and used correctly
+      by the current build.
+    - Updating it (inserting rows, then optimizing) with the current build
+      keeps both old and new rows queryable.
+    - Stable readers that do not support the updated index must ignore it and
+      answer correctly via a full scan. Readers from 15.0.0 onward must use
+      it. Stable writers without the row-address capability must reject
+      inserts and unsafe updates without changing the dataset.
+
+    Without stable row ids the current build keeps writing format version 0,
+    which NgramIndex above checks every build keeps using.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0"
+        )
+
+    def create(self):
+        """Create a stable-row-id dataset with an NGRAM index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "ngram": pa.array([f"word{i}" for i in range(1000)]),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+            enable_stable_row_ids=True,
+        )
+        dataset.create_scalar_index("ngram", "NGRAM")
+
+    def _assert_queryable(self, expect_index_used: bool):
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="contains(ngram, 'word7')")
+        # word7, word70-79, word700-799 = 111 results
+        assert table.num_rows == 111
+
+        explain = ds.scanner(filter="contains(ngram, 'word7')").explain_plan()
+        used_index = "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+        if expect_index_used:
+            assert used_index, "expected the NGRAM index to be used"
+        else:
+            assert not used_index, (
+                "an older build must not use an NGRAM index in a format it "
+                "does not understand -- it should fall back to a full scan"
+            )
+
+    def check_read(self):
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
+
+    def check_write(self):
+        """Fence old writers; verify current writes and index maintenance."""
+        ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
+        word = f"word{new_key}"
+        data = pa.table(
+            {
+                "idx": pa.array([new_key]),
+                "ngram": pa.array([word]),
+            }
+        )
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
+        ds.insert(data)
+        # For the current build updating a legacy row-id-domain segment,
+        # this must rebuild (not merge) the index -- see the class docstring.
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        # A row-count match alone would still pass if the rebuild silently
+        # left the column unindexed (a full scan gives the same counts), so
+        # also check the rebuilt index is actually used.
+        self._assert_queryable(expect_index_used=True)
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter=f"contains(ngram, '{word}')")
+        assert table.num_rows == 1
+
+
 @compat_test(min_version="0.36.0")
 class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
     """Test ZONEMAP and BLOOMFILTER index compatibility (introduced in 0.36.0)."""
@@ -1131,3 +1240,89 @@ class FtsIndex(UpgradeDowngradeTest):
         if method_name in {"create", "check_write"}:
             return {"LANCE_FTS_FORMAT_VERSION": "1"}
         return {}
+
+
+class CoveredBTreeIndex(UpgradeDowngradeTest):
+    """A BTREE index on `a` that carries `b`, in either covering layout.
+
+    The suffix layout, `fields=[a, b]`, stays readable by releases that know
+    covered indices. The keys-only layout, `fields=[a]` carrying `a` and `b`,
+    needs feature flag 1 << 13, which those releases must refuse.
+    """
+
+    def __init__(self, path: Path, keys_only: bool):
+        self.path = path
+        self.keys_only = keys_only
+
+    def declaration(self) -> dict[str, list[int]]:
+        fields = lance.dataset(self.path).lance_schema.fields()
+        ids = {field.name(): field.id() for field in fields}
+        a_id, b_id = ids["a"], ids["b"]
+        if self.keys_only:
+            return {"fields": [a_id], "covering_fields": [a_id, b_id]}
+        return {"fields": [a_id, b_id], "covering_fields": [b_id]}
+
+    def create(self):
+        shutil.rmtree(self.path, ignore_errors=True)
+        dataset = lance.write_dataset(
+            pa.table({"a": pa.array(range(16)), "b": pa.array(range(16))}),
+            self.path,
+            data_storage_version="2.1",
+        )
+        dataset.create_scalar_index("a", "BTREE")
+        plain = dataset.get_transactions(1)[0].operation.new_indices[0]
+        covered = dataclasses.replace(plain, **self.declaration())
+        lance.LanceDataset.commit(
+            self.path,
+            lance.LanceOperation.CreateIndex(
+                new_indices=[covered], removed_indices=[plain]
+            ),
+            read_version=dataset.version,
+        )
+
+    def check_read(self):
+        lance.dataset(self.path).count_rows()
+
+    def check_commit_then_drop_transactions(self):
+        dataset = lance.dataset(self.path)
+        committed = dataset.read_transaction(dataset.version - 1).operation
+        dropped = dataset.read_transaction(dataset.version).operation
+        declaration = self.declaration()
+        for index in committed.new_indices + dropped.removed_indices:
+            carried = index.covering_fields
+            assert carried == declaration["covering_fields"]
+            assert index.fields[: len(index.fields) - len(carried)] == [
+                declaration["fields"][0]
+            ]
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("keys_only", [False, True], ids=["suffix", "keys_only"])
+def test_independent_covering_fields_with_older_release(
+    venv_factory, tmp_path, keys_only
+):
+    case = CoveredBTreeIndex(tmp_path / "data.lance", keys_only)
+    case.create()
+    segment = lance.dataset(case.path).describe_indices()[0].segments[0]
+    assert segment.covering_fields == case.declaration()["covering_fields"]
+    case.check_read()
+
+    older = venv_factory.get_venv("13.0.0")
+    if keys_only:
+        with pytest.raises(RuntimeError, match="cannot be read by this version"):
+            older.execute_method(case, "check_read")
+    else:
+        older.execute_method(case, "check_read")
+
+
+@pytest.mark.compat
+def test_keys_only_index_transactions_with_older_release(venv_factory, tmp_path):
+    case = CoveredBTreeIndex(tmp_path / "data.lance", keys_only=True)
+    case.create()
+    dataset = lance.dataset(case.path)
+    dataset.drop_index(dataset.describe_indices()[0].name)
+    case.check_commit_then_drop_transactions()
+
+    venv_factory.get_venv("13.0.0").execute_method(
+        case, "check_commit_then_drop_transactions"
+    )

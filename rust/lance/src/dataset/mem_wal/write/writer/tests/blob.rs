@@ -9,10 +9,101 @@ use crate::blob::blob_v2_layout;
 use crate::dataset::mem_wal::test_util::failing_memory_store;
 use crate::dataset::mem_wal::wal::WalTailer;
 use crate::dataset::mem_wal::write::test_support::*;
-use arrow_array::{Array, Float32Array, StructArray, UInt8Array, UInt32Array};
+use arrow_array::types::Int8Type;
+use arrow_array::{
+    Array, ArrayRef, DictionaryArray, Float32Array, StructArray, UInt8Array, UInt32Array,
+};
 use lance_core::datatypes::{BlobKind, BlobV2Layout};
 use object_store::ObjectStoreExt;
 use rstest::rstest;
+
+#[tokio::test]
+async fn test_dictionary_capacity_rejection_preserves_shared_blob_pack() {
+    let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+    let shard_id = Uuid::new_v4();
+    let batch = |start, dictionary_start, payload: &[u8]| {
+        let blobs = (0..100)
+            .map(|_| BlobTestValue::Bytes(payload.to_vec()))
+            .collect::<Vec<_>>();
+        let batch = create_blob_v2_batch(start, &blobs);
+        let values = (dictionary_start..dictionary_start + 100)
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>();
+        let names = values
+            .iter()
+            .map(String::as_str)
+            .collect::<DictionaryArray<Int8Type>>();
+        let schema = batch.schema();
+        let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+        fields.push(Arc::new(arrow_schema::Field::new(
+            "name",
+            names.data_type().clone(),
+            true,
+        )));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(names) as ArrayRef);
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+    };
+    let first = batch(0, 0, b"first");
+    let writer = ShardWriter::open(
+        store.clone(),
+        base_path.clone(),
+        base_uri,
+        ShardWriterConfig {
+            shard_id,
+            durable_write: true,
+            max_wal_buffer_size: usize::MAX,
+            max_wal_flush_interval: Some(Duration::from_secs(60)),
+            ..Default::default()
+        },
+        first.schema(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let (_, first_watcher) = writer.put_no_wait(vec![first]).await.unwrap();
+    let error = writer
+        .put_no_wait(vec![batch(100, 100, b"reject")])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("capacity of 128"));
+    // A capacity error must neither abandon the earlier pack nor poison the writer.
+    let (_, second_watcher) = writer
+        .put_no_wait(vec![batch(100, 0, b"later")])
+        .await
+        .unwrap();
+    let fence = writer.force_freeze_active().await.unwrap();
+    first_watcher.unwrap().wait().await.unwrap();
+    second_watcher.unwrap().wait().await.unwrap();
+    fence.wait().await.unwrap();
+
+    let entry = WalTailer::new(store.clone(), base_path.clone(), "", shard_id)
+        .read_entry(1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.batches.len(), 2);
+    let target = entry.target.unwrap();
+    let data_dir = target
+        .generation_path(&base_path, "", &shard_id)
+        .join(DATA_DIR);
+    let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
+    assert_eq!(sidecars.len(), 1);
+    let payload = store
+        .inner
+        .get(&sidecars[0])
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        payload.as_ref(),
+        [b"first".repeat(100), b"later".repeat(100)].concat()
+    );
+    writer.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn test_durable_blob_puts_share_pack_until_wal_flush() {

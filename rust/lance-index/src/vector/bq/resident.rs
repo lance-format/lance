@@ -1059,15 +1059,38 @@ mod tests {
         slot
     }
 
+    /// A loaded slot the process-wide registry does not hold, so a test sees
+    /// only the references it creates itself.
+    fn unregistered_slot(rows: usize) -> Arc<ResidentSlot> {
+        let slot = Arc::new(ResidentSlot::default());
+        slot.store.set(test_store(rows)).unwrap();
+        slot
+    }
+
+    /// A handle on `slot` through the in-index-cache path, without putting
+    /// `slot` in the process-wide registry.
+    async fn handle_on_slot(
+        cache: &LanceCache,
+        file: &IndexFileKey,
+        slot: &Arc<ResidentSlot>,
+        lifetime: ResidentLifetime,
+    ) -> ResidentColumns {
+        let preopen = ResidentColumns {
+            slot: slot.clone(),
+            charge: None,
+            cached: OnceCell::new(),
+        };
+        ResidentColumns::in_index_cache(cache, file, Some(preopen), lifetime).await
+    }
+
     fn test_cache() -> LanceCache {
         LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(1 << 20)))
     }
 
-    /// Handles of one file share its store while any holds it, and a store
-    /// no handle or cache holds is freed, so the next handle gets a new one;
-    /// the same path in another bucket is another file.
+    /// Handles of one file share its store while any holds it; the same path
+    /// in another bucket is another file.
     #[test]
-    fn slot_registry_shares_live_store_and_frees_dropped() {
+    fn slot_registry_shares_live_store() {
         let file = test_file("slot-registry");
         let store = ResidentColumns::shared(&file);
         let shared = ResidentColumns::shared(&file);
@@ -1080,12 +1103,28 @@ mod tests {
         ));
         store.slot.store.set(test_store(10)).unwrap();
         assert!(resident_store_is_live(&file));
-        let held = Arc::downgrade(&store.slot);
-        drop((store, shared));
-        assert!(held.upgrade().is_none());
-        assert!(!resident_store_is_live(&file));
-        let reopened = ResidentColumns::shared(&file);
-        assert_eq!(reopened.loaded_bytes(), None);
+    }
+
+    /// The registry holds its values weakly: a dropped value is not retained
+    /// and the next caller gets a new one. A registry of the test's own keeps
+    /// process-wide observers out of the observation.
+    #[test]
+    fn weak_registry_frees_dropped_values() {
+        let registry: LazyLock<WeakRegistry<IndexFileKey, ResidentSlot>> =
+            LazyLock::new(Default::default);
+        let file = test_file("weak-registry");
+        let slot = shared_by_key(&registry, &file, Arc::default);
+        slot.store.set(test_store(10)).unwrap();
+        let held = Arc::downgrade(&slot);
+        let shared = shared_by_key(&registry, &file, Arc::default);
+        assert!(Arc::ptr_eq(&slot, &shared));
+        drop((slot, shared));
+        assert!(
+            held.upgrade().is_none(),
+            "the registry must not retain data"
+        );
+        let reopened = shared_by_key(&registry, &file, Arc::default);
+        assert!(!reopened.is_loaded());
     }
 
     /// The cache entry of a store is charged its heap memory: what its
@@ -1112,12 +1151,11 @@ mod tests {
     #[tokio::test]
     async fn in_index_cache_retains_idle_store() {
         let file = test_file("in-index-cache");
-        let slot = loaded_slot(&file, 1000);
+        let slot = unregistered_slot(1000);
         let held = Arc::downgrade(&slot);
         let cache = test_cache();
         let key = ResidentColumnsKey::new(&file);
-        let handle =
-            ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Index).await;
+        let handle = handle_on_slot(&cache, &file, &slot, ResidentLifetime::Index).await;
         assert!(cache.get_with_key(&key).await.is_some());
         let clone = handle.clone();
         drop((handle, clone, slot));
@@ -1128,7 +1166,7 @@ mod tests {
         cache.clear().await;
         assert!(
             held.upgrade().is_none(),
-            "the weak registry must not retain data"
+            "clearing the cache releases the store"
         );
     }
 
@@ -1136,7 +1174,6 @@ mod tests {
     async fn live_store_is_evictable_and_reused_after_eviction() {
         let file = test_file("active-eviction");
         let slot = loaded_slot(&file, 1000);
-        let held = Arc::downgrade(&slot);
         let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(8192)));
         let key = ResidentColumnsKey::new(&file);
         let handle =
@@ -1168,7 +1205,7 @@ mod tests {
         assert!(values.values().iter().all(|value| *value == 1.0));
         drop((handle, reopened));
         cache.clear().await;
-        assert!(held.upgrade().is_none());
+        assert!(!cache.peek_resident_with_key(&key).await);
     }
 
     /// A store of `rows` rows of `columns`, each a name and a value width
@@ -1229,14 +1266,18 @@ mod tests {
         let file = test_file("preopen-evicted");
         let cache = test_cache();
         let key = ResidentColumnsKey::new(&file);
-        let slot = loaded_slot(&file, 1000);
-        let handle =
-            ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Index).await;
+        let slot = unregistered_slot(1000);
         let held = Arc::downgrade(&slot);
-        drop((handle, slot));
-        let preopen = ResidentColumns::shared(&file);
+        let handle = handle_on_slot(&cache, &file, &slot, ResidentLifetime::Index).await;
+        drop(handle);
         cache.clear().await;
         assert!(!cache.peek_resident_with_key(&key).await);
+        let preopen = ResidentColumns {
+            slot: slot.clone(),
+            charge: None,
+            cached: OnceCell::new(),
+        };
+        drop(slot);
         let handle =
             ResidentColumns::in_index_cache(&cache, &file, Some(preopen), ResidentLifetime::Index)
                 .await;
@@ -1251,18 +1292,16 @@ mod tests {
     #[tokio::test]
     async fn resident_lifetime_process_keeps_store_alive() {
         let file = test_file("process-lifetime");
-        let slot = loaded_slot(&file, 1000);
+        let slot = unregistered_slot(1000);
         let held = Arc::downgrade(&slot);
         let cache = test_cache();
-        let handle =
-            ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Process).await;
+        let handle = handle_on_slot(&cache, &file, &slot, ResidentLifetime::Process).await;
         drop((handle, slot));
         cache.clear().await;
         let slot = held
             .upgrade()
             .expect("the process owns the store after eviction");
-        let reopened =
-            ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Process).await;
+        let reopened = handle_on_slot(&cache, &file, &slot, ResidentLifetime::Process).await;
         assert!(Arc::ptr_eq(&reopened.slot, &slot));
         PROCESS_STORES.lock().unwrap().remove(&file);
         drop((slot, reopened));
