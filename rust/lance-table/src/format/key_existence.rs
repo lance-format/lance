@@ -18,7 +18,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
     RecordBatch, StringArray, StructArray,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
@@ -412,6 +412,10 @@ pub fn extract_key_value_from_batch(
 
 fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
     let v = match array.data_type() {
+        DataType::Boolean => {
+            let arr = array.as_boolean();
+            KeyValue::UInt64(u64::from(arr.value(row_idx)))
+        }
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>()?;
             KeyValue::String(arr.value(row_idx).to_string())
@@ -420,21 +424,109 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
             let arr = array.as_any().downcast_ref::<LargeStringArray>()?;
             KeyValue::String(arr.value(row_idx).to_string())
         }
+        DataType::Utf8View => {
+            let arr = array.as_string_view();
+            KeyValue::String(arr.value(row_idx).to_string())
+        }
         DataType::UInt64 => {
             let arr = array.as_primitive::<arrow_array::types::UInt64Type>();
             KeyValue::UInt64(arr.value(row_idx))
-        }
-        DataType::Int64 => {
-            let arr = array.as_primitive::<arrow_array::types::Int64Type>();
-            KeyValue::Int64(arr.value(row_idx))
         }
         DataType::UInt32 => {
             let arr = array.as_primitive::<arrow_array::types::UInt32Type>();
             KeyValue::UInt64(arr.value(row_idx) as u64)
         }
+        DataType::UInt16 => {
+            let arr = array.as_primitive::<arrow_array::types::UInt16Type>();
+            KeyValue::UInt64(arr.value(row_idx) as u64)
+        }
+        DataType::UInt8 => {
+            let arr = array.as_primitive::<arrow_array::types::UInt8Type>();
+            KeyValue::UInt64(arr.value(row_idx) as u64)
+        }
+        DataType::Int64 => {
+            let arr = array.as_primitive::<arrow_array::types::Int64Type>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
         DataType::Int32 => {
             let arr = array.as_primitive::<arrow_array::types::Int32Type>();
             KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Int16 => {
+            let arr = array.as_primitive::<arrow_array::types::Int16Type>();
+            KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Int8 => {
+            let arr = array.as_primitive::<arrow_array::types::Int8Type>();
+            KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Date32 => {
+            let arr = array.as_primitive::<arrow_array::types::Date32Type>();
+            KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Date64 => {
+            let arr = array.as_primitive::<arrow_array::types::Date64Type>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Time32(TimeUnit::Second) => {
+            let arr = array.as_primitive::<arrow_array::types::Time32SecondType>();
+            KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            let arr = array.as_primitive::<arrow_array::types::Time32MillisecondType>();
+            KeyValue::Int64(arr.value(row_idx) as i64)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let arr = array.as_primitive::<arrow_array::types::Time64MicrosecondType>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            let arr = array.as_primitive::<arrow_array::types::Time64NanosecondType>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let arr = array.as_primitive::<arrow_array::types::TimestampSecondType>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let arr = array.as_primitive::<arrow_array::types::TimestampMillisecondType>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let arr = array.as_primitive::<arrow_array::types::TimestampMicrosecondType>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = array.as_primitive::<arrow_array::types::TimestampNanosecondType>();
+            KeyValue::Int64(arr.value(row_idx))
+        }
+        DataType::Decimal128(_, _) => {
+            let arr = array.as_primitive::<arrow_array::types::Decimal128Type>();
+            KeyValue::Binary(arr.value(row_idx).to_le_bytes().to_vec())
+        }
+        DataType::Decimal256(_, _) => {
+            let arr = array.as_primitive::<arrow_array::types::Decimal256Type>();
+            KeyValue::Binary(arr.value(row_idx).to_le_bytes().to_vec())
+        }
+        DataType::Float32 => {
+            let val = array
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .value(row_idx);
+            if val.is_nan() {
+                return None;
+            }
+            let bits = if val == 0.0 { 0u32 } else { val.to_bits() };
+            KeyValue::UInt64(u64::from(bits))
+        }
+        DataType::Float64 => {
+            let val = array
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(row_idx);
+            if val.is_nan() {
+                return None;
+            }
+            let bits = if val == 0.0 { 0u64 } else { val.to_bits() };
+            KeyValue::UInt64(bits)
         }
         DataType::Binary => {
             let arr = array.as_any().downcast_ref::<BinaryArray>()?;
@@ -442,6 +534,10 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
         }
         DataType::LargeBinary => {
             let arr = array.as_any().downcast_ref::<LargeBinaryArray>()?;
+            KeyValue::Binary(arr.value(row_idx).to_vec())
+        }
+        DataType::BinaryView => {
+            let arr = array.as_binary_view();
             KeyValue::Binary(arr.value(row_idx).to_vec())
         }
         DataType::FixedSizeBinary(_) => {
@@ -500,7 +596,14 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::builder::{Int32Builder, ListBuilder, StringBuilder};
-    use arrow_array::{FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{
+        BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+        FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        RecordBatch, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array,
+    };
+    use arrow_buffer::i256;
     use arrow_schema::{Field, Schema};
 
     #[rstest::rstest]
@@ -938,5 +1041,150 @@ mod tests {
         assert_eq!(a.intersects(&b).unwrap(), (false, false));
         let shared = filter((1_000_000..1_000_500).chain([17]));
         assert!(shared.intersects(&a).unwrap().0);
+    }
+
+    #[test]
+    fn test_extract_key_value_extended_primary_key_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("i8", DataType::Int8, false),
+            Field::new("i16", DataType::Int16, false),
+            Field::new("u8", DataType::UInt8, false),
+            Field::new("u16", DataType::UInt16, false),
+            Field::new("uuid", DataType::FixedSizeBinary(4), false),
+            Field::new("bview", DataType::BinaryView, false),
+            Field::new("view", DataType::Utf8View, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(vec![false, true])),
+                Arc::new(Int8Array::from(vec![1, 2])),
+                Arc::new(Int16Array::from(vec![7, 8])),
+                Arc::new(UInt8Array::from(vec![3, 4])),
+                Arc::new(UInt16Array::from(vec![9, 10])),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(
+                        vec![[1u8, 2, 3, 4], [1, 2, 3, 5]].into_iter(),
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(BinaryViewArray::from(vec![
+                    b"x".as_slice(),
+                    b"y".as_slice(),
+                ])),
+                Arc::new(StringViewArray::from(vec!["alpha", "beta"])),
+                Arc::new(Date32Array::from(vec![19_000, 19_001])),
+            ],
+        )
+        .unwrap();
+
+        for col in [
+            "flag", "i8", "i16", "u8", "u16", "uuid", "bview", "view", "day",
+        ] {
+            let cols = vec![col.to_string()];
+            let k0 = extract_key_value_from_batch(&batch, 0, &cols).unwrap();
+            let k1 = extract_key_value_from_batch(&batch, 1, &cols).unwrap();
+            assert_ne!(k0, k1, "keys for {col} must be distinct");
+        }
+    }
+
+    #[test]
+    fn test_float_signed_zero_nan_timestamp_and_decimal_key_equality() {
+        let float_schema = Arc::new(Schema::new(vec![
+            Field::new("f32", DataType::Float32, false),
+            Field::new("f64", DataType::Float64, false),
+        ]));
+        let float_batch = RecordBatch::try_new(
+            float_schema,
+            vec![
+                Arc::new(Float32Array::from(vec![-0.0_f32, 0.0_f32, f32::NAN])),
+                Arc::new(Float64Array::from(vec![-0.0_f64, 0.0_f64, f64::NAN])),
+            ],
+        )
+        .unwrap();
+
+        for col in ["f32", "f64"] {
+            let cols = vec![col.to_string()];
+            let neg_zero = extract_key_value_from_batch(&float_batch, 0, &cols).unwrap();
+            let pos_zero = extract_key_value_from_batch(&float_batch, 1, &cols).unwrap();
+            assert_eq!(neg_zero, pos_zero);
+            assert_eq!(neg_zero.hash_value(), pos_zero.hash_value());
+            assert!(extract_key_value_from_batch(&float_batch, 2, &cols).is_none());
+        }
+
+        let ts_schema = Arc::new(Schema::new(vec![
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(
+                "ts_us_utc",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(
+                "ts_us_offset",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("d128", DataType::Decimal128(18, 2), false),
+            Field::new("d256", DataType::Decimal256(38, 4), false),
+        ]));
+        let ts_batch = RecordBatch::try_new(
+            ts_schema,
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![100, 101])),
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![100_000, 100_001]).with_timezone("UTC"),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        1_700_000_000_000_000,
+                        1_700_000_000_000_001,
+                    ])
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        1_700_000_000_000_000,
+                        1_700_000_000_000_001,
+                    ])
+                    .with_timezone("+00:00"),
+                ),
+                Arc::new(TimestampNanosecondArray::from(vec![42, 43])),
+                Arc::new(
+                    Decimal128Array::from(vec![12_345_i128, -12_345_i128])
+                        .with_precision_and_scale(18, 2)
+                        .unwrap(),
+                ),
+                Arc::new(
+                    Decimal256Array::from(vec![i256::from_i128(99_999), i256::from_i128(-99_999)])
+                        .with_precision_and_scale(38, 4)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_key_value_from_batch(&ts_batch, 0, &["ts_us_utc".to_string()]).unwrap(),
+            extract_key_value_from_batch(&ts_batch, 0, &["ts_us_offset".to_string()]).unwrap(),
+        );
+        for col in ["ts_s", "ts_ms", "ts_us_utc", "ts_ns", "d128", "d256"] {
+            let cols = vec![col.to_string()];
+            let first = extract_key_value_from_batch(&ts_batch, 0, &cols).unwrap();
+            let second = extract_key_value_from_batch(&ts_batch, 1, &cols).unwrap();
+            assert_ne!(first, second, "distinct {col} values must not collide");
+            assert_ne!(first.hash_value(), second.hash_value());
+        }
     }
 }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use arrow_array::Int16Array;
 use arrow_array::record_batch;
 use arrow_array::types::Int32Type;
 use lance_core::utils::address::RowAddress;
@@ -259,6 +260,60 @@ async fn test_concurrent_insert_same_new_key(
         assert_eq!(found.num_rows(), 1);
         assert_eq!(found["value"].as_primitive::<UInt32Type>().value(0), 2);
     }
+}
+
+#[tokio::test]
+async fn test_concurrent_insert_same_new_int16_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int16, false).with_metadata(HashMap::from([(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        )])),
+        Field::new("value", DataType::UInt32, false),
+    ]));
+    let make_batch = |ids: Vec<i16>, value: u32| {
+        let len = ids.len();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int16Array::from(ids)),
+                Arc::new(UInt32Array::from(vec![value; len])),
+            ],
+        )
+        .unwrap()
+    };
+    let dataset = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![make_batch(vec![0, 1, 2, 3], 0)])
+            .await
+            .unwrap(),
+    );
+    let build_job = || {
+        MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(false)
+            .conflict_retries(0)
+            .try_build()
+            .unwrap()
+    };
+
+    let b1 = build_job();
+    let b2 = build_job();
+    let (_, stats) = b1
+        .execute_batches(vec![make_batch(vec![42], 1)])
+        .await
+        .unwrap();
+    assert_eq!(stats.num_inserted_rows, 1);
+    let error = b2
+        .execute_batches(vec![make_batch(vec![42], 2)])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::TooMuchWriteContention { .. }),
+        "{error:?}"
+    );
 }
 
 #[rstest::rstest]
