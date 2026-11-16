@@ -108,7 +108,14 @@ async fn sparse_take_preflights_all_selected_pages(
         .err()
         .unwrap();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("FullZip"));
+    // v2.2's all-null Constant page has no byte scalar. v2.3 emits a
+    // planar sparse layout. Both must fail preflight without payload reads.
+    let expected_reason = if version == ConcreteFileVersion::V2_2 {
+        "admitted Constant pages require a stored byte scalar"
+    } else {
+        "expected a dense FullZip page"
+    };
+    assert!(error.to_string().contains(expected_reason));
     assert!(
         reads.lock().unwrap().is_empty(),
         "later selected layout must fail before earlier reads"
