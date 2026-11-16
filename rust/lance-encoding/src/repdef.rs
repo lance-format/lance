@@ -290,7 +290,8 @@ fn apply_inner_validity_in_place(defs: &mut [u16], validity: &BooleanBuffer, nul
 }
 
 /// Packs `defs[i] <= cmp` into little-endian bits, four output bytes per 32
-/// levels. Levels after the last whole 32-level chunk are left to the caller.
+/// levels. Packs only whole 32-level chunks that `out` has room for; the
+/// caller handles any remaining levels.
 type PackDefLeFn = unsafe fn(&[u16], u16, &mut [u8]);
 
 lance_core::dispatch! {
@@ -365,8 +366,8 @@ fn append_def_le_bitmap(validity: &mut BooleanBufferBuilder, def_levels: &[u16],
         validity.advance(def_levels.len());
         let dst = &mut validity.as_slice_mut()[byte_start..];
         let (chunks, rem) = def_levels.as_chunks::<32>();
-        let (dst, dst_tail) = dst.split_at_mut(chunks.len() * 4);
-        pack.call(chunks.as_flattened(), cmp, dst);
+        let (dst_chunks, dst_tail) = dst.split_at_mut(chunks.len() * 4);
+        pack.call(chunks.as_flattened(), cmp, dst_chunks);
         if !rem.is_empty() {
             let tail_bytes = pack_def_le_bits(rem, cmp).to_le_bytes();
             let num_tail_bytes = rem.len().div_ceil(8);
@@ -380,9 +381,9 @@ fn append_def_le_bitmap(validity: &mut BooleanBufferBuilder, def_levels: &[u16],
         let mut packed = [0u8; WORDS_PER_BATCH * 8];
         let (chunks, rem) = def_levels.as_chunks::<64>();
         for batch in chunks.chunks(WORDS_PER_BATCH) {
-            let packed = &mut packed[..batch.len() * 8];
-            pack.call(batch.as_flattened(), cmp, packed);
-            for word in packed.as_chunks::<8>().0 {
+            let batch_bytes = &mut packed[..batch.len() * 8];
+            pack.call(batch.as_flattened(), cmp, batch_bytes);
+            for word in batch_bytes.as_chunks::<8>().0 {
                 validity.append_word(u64::from_le_bytes(*word), 64);
             }
         }
@@ -3217,7 +3218,7 @@ impl ControlWordParser {
 
 #[cfg(test)]
 mod tests {
-    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 
     use crate::encodings::logical::primitive::sparse::{
         SparsePositionPlan, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
@@ -4606,6 +4607,22 @@ mod tests {
             kernel.call(&defs, cmp, &mut actual);
             assert_eq!(actual, expected, "{} len={len} cmp={cmp}", candidate.name());
         }
+    }
+
+    /// Byte-aligned and unaligned appends, the latter spanning several packing
+    /// batches, a partial batch and a remainder word.
+    #[rstest::rstest]
+    fn test_append_def_le_bitmap_matches_reference(#[values(0, 3, 8)] prefix_bits: usize) {
+        let defs: Vec<u16> = (0..2 * 1024 + 64 + 5).map(|i| (i * 7 % 5) as u16).collect();
+        let cmp = 2;
+        let mut builder = BooleanBufferBuilder::new(0);
+        builder.append_n(prefix_bits, true);
+        super::append_def_le_bitmap(&mut builder, &defs, cmp);
+        let expected: Vec<bool> = std::iter::repeat_n(true, prefix_bits)
+            .chain(defs.iter().map(|&d| d <= cmp))
+            .collect();
+        let actual: Vec<bool> = builder.finish().iter().collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

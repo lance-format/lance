@@ -164,7 +164,8 @@ impl AxisLayout {
     }
 
     fn transform_values<const DECODE: bool>(self, bytes: &mut [u8]) {
-        // Spans shorter than one vector have no SIMD path in any kernel.
+        // Short spans skip the dispatch: the vector kernels would hand them
+        // back to this scalar loop anyway.
         if self.axis_length * self.inner_stride * self.element_bytes < 16 {
             self.transform_scalar::<DECODE>(bytes);
             return;
@@ -766,11 +767,13 @@ mod tests {
             let input: Vec<u8> = (0..3 * layout.row_bytes()).map(|_| rng.random()).collect();
             let mut expected = input.clone();
             layout.transform_scalar::<false>(&mut expected);
+            // The two dispatches list matching candidates in the same order.
             for (encode, decode) in ENCODE_SPANS
                 .candidates()
                 .iter()
                 .zip(DECODE_SPANS.candidates())
             {
+                assert_eq!(encode.features(), decode.features());
                 let (Some(encode_kernel), Some(decode_kernel)) = (encode.kernel(), decode.kernel())
                 else {
                     continue;
