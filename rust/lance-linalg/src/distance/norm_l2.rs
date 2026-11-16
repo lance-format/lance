@@ -191,9 +191,6 @@ mod half_c {
     };
 }
 
-/// L2 norm of one vector.
-type NormKernel<T> = unsafe fn(&[T]) -> f32;
-
 impl Normalize for f32 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
