@@ -3727,6 +3727,9 @@ mod tests {
         check_no_index(&index_info, "json_extract(json, 'name') = 'foo'");
         check_no_index(&index_info, "json_extract(json, 'name') = '\"foo\"'");
         check_no_index(&index_info, "json_extract(json, 'name') < 'foo'");
+        // The typed JSONPath functions are not routed to the index either.
+        check_no_index(&index_info, "json_extract_string(json, 'name') = 'foo'");
+        check_no_index(&index_info, "json_extract_string(json, '$.name') = 'foo'");
         // Root-prefixed and nested JSONPath expressions do not have the same
         // semantics as the typed accessors' literal key argument.
         check_no_index(&index_info, "json_get_string(json, '$.name') = 'foo'");

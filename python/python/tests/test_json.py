@@ -391,6 +391,46 @@ def test_json_get_functions():
         assert result.num_rows == 2  # Alice (95.5) and Charlie ("92" -> 92.0)
 
 
+def test_json_extract_typed_functions():
+    """Test json_extract_* functions for typed JSONPath extraction."""
+    json_data = [
+        {"user": {"profile": {"name": "Alice"}, "age": 30, "active": True, "score": 95.5}},
+        {"user": {"profile": {"name": "Bob"}, "age": 25, "active": False, "score": 87.3}},
+        {"user": {"profile": {"name": "Charlie"}, "age": "35", "tags": ["a", "b"]}},
+        {"user": None},
+    ]
+    table = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "data": pa.array([json.dumps(d) for d in json_data], type=pa.json_()),
+        }
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds_path = Path(tmpdir) / "json_extract_typed_test.lance"
+        lance.write_dataset(table, ds_path)
+        dataset = lance.dataset(ds_path)
+
+        cases = [
+            ("json_extract_string(data, '$.user.profile.name') = 'Bob'", [2]),
+            ("json_extract_int(data, '$.user.age') > 28", [1, 3]),
+            ("json_extract_bool(data, '$.user.active')", [1]),
+            ("json_extract_float(data, '$.user.score') > 90", [1]),
+            # A path matching a container converts to null.
+            ("json_extract_string(data, '$.user.tags') IS NULL", [1, 2, 3, 4]),
+            ("json_extract_string(data, '$.user.tags[1]') = 'b'", [3]),
+        ]
+        for predicate, expected in cases:
+            result = dataset.to_table(filter=predicate)
+            sql = (
+                dataset.sql(f"SELECT * FROM dataset WHERE {predicate}")
+                .build()
+                .to_batch_records()
+            )
+            assert result == pa.Table.from_batches(sql), predicate
+            assert result["id"].to_pylist() == expected, predicate
+
+
 def test_nested_json_access():
     """Test accessing nested JSON structures."""
     json_data = [
