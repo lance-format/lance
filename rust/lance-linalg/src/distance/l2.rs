@@ -927,12 +927,21 @@ mod x86 {
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx512(x, y));
             }
-            // With the key the same length as each vector, the pair kernel's
-            // `min` folds away, which frees registers in the per-vector loop.
-            let x = &x[..dimension];
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = l2_f64_avx512(x, y);
+            // Out of line, so the fixed-width arms above leave this loop's
+            // registers alone: inlined next to them, the pair kernel's tail
+            // length was reloaded from the stack on every vector, +8% at
+            // dimension 32.
+            #[inline(never)]
+            #[target_feature(enable = "avx512f")]
+            fn rows(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+                // With the key the same length as each vector, the pair kernel's
+                // `min` folds away, which frees registers in the per-vector loop.
+                let x = &x[..dimension];
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = l2_f64_avx512(x, y);
+                }
             }
+            rows(x, batch, dimension, output)
         }
     }
 
@@ -951,11 +960,17 @@ mod x86 {
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx_fma(x, y));
             }
-            // See `l2_batch_f64_avx512` for slicing the key.
-            let x = &x[..dimension];
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = l2_f64_avx_fma(x, y);
+            // Out of line: see `l2_batch_f64_avx512`.
+            #[inline(never)]
+            #[target_feature(enable = "avx,fma")]
+            fn rows(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+                // See `l2_batch_f64_avx512` for slicing the key.
+                let x = &x[..dimension];
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = l2_f64_avx_fma(x, y);
+                }
             }
+            rows(x, batch, dimension, output)
         }
     }
 
@@ -974,11 +989,17 @@ mod x86 {
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx(x, y));
             }
-            // See `l2_batch_f64_avx512` for slicing the key.
-            let x = &x[..dimension];
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = l2_f64_avx(x, y);
+            // Out of line: see `l2_batch_f64_avx512`.
+            #[inline(never)]
+            #[target_feature(enable = "avx")]
+            fn rows(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+                // See `l2_batch_f64_avx512` for slicing the key.
+                let x = &x[..dimension];
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = l2_f64_avx(x, y);
+                }
             }
+            rows(x, batch, dimension, output)
         }
     }
 
