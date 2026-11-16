@@ -52,6 +52,7 @@ metrics-util.workspace = true
 rstest.workspace = true
 tokio-stream.workspace = true
 tracing-mock.workspace = true
+tracing = { workspace = true, features = ["log"] }
 
 [features]
 # Capture Rust backtraces in error types. When disabled (the default),

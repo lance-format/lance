@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_index::{
     FtsPrewarmResult, IndexCriteria, IndexDescription, IndexParams, IndexType, PrewarmOptions,
     frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index, mem_wal::MEM_WAL_INDEX_NAME,
@@ -1280,6 +1281,13 @@ impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
 
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
+        let scope = OperationScope::start(ObservedOperation::OptimizeIndices, || None)?;
+        let stages = scope.stages();
+        // The builders the optimization runs, the planner's included, report
+        // their stages into it.
+        let options = optimize::observing_options(&stages, options);
+
+        let plan_stage = stages.start("plan");
         // Grouped from the complete list so a name's segments are all accounted
         // for. A segment this build cannot read is still coverage, and merging
         // against a group whose coverage is only partly visible would commit a
@@ -1292,13 +1300,18 @@ impl DatasetIndexExt for Dataset {
         let Some(plan) = optimize::plan_optimize_indices_or_skip(
             self,
             &indices,
-            options,
+            &options,
             optimize::OptimizeExecution::Local,
         )
         .await?
         else {
+            plan_stage.complete();
+            scope.finish();
             return Ok(());
         };
+        plan_stage.complete();
+
+        let build_stage = stages.start("build_segments");
         let mut built = Vec::with_capacity(plan.tasks.len());
         for task in &plan.tasks {
             built.extend(
@@ -1306,6 +1319,9 @@ impl DatasetIndexExt for Dataset {
                     .await?,
             );
         }
+        build_stage.complete();
+
+        let merge_stage = stages.start("merge_segments");
         let mut merged = Vec::with_capacity(plan.merges.len());
         for merge in &plan.merges {
             merged.extend(
@@ -1314,8 +1330,13 @@ impl DatasetIndexExt for Dataset {
                     .await?,
             );
         }
+        merge_stage.complete();
 
         // Without results this still commits when MemWAL catch-up needs it.
-        optimize::commit_optimize_indices(self, merged, options).await
+        let commit_stage = stages.start("commit");
+        optimize::commit_optimize_indices(self, merged, &options).await?;
+        commit_stage.complete();
+        scope.finish();
+        Ok(())
     }
 }

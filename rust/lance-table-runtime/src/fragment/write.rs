@@ -4,6 +4,7 @@
 use arrow_schema::Schema as ArrowSchema;
 use futures::StreamExt;
 use lance_core::datatypes::Schema;
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::{Error, Result};
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
@@ -118,6 +119,8 @@ impl<'a> FragmentCreateBuilder<'a> {
         source: impl StreamingWriteSource,
         id: Option<u64>,
     ) -> Result<Fragment> {
+        let scope = OperationScope::start(ObservedOperation::Write, || None)?;
+        let stage = scope.stages().start("write_fragments");
         let (stream, schema) = self.get_stream_and_schema(source).await?;
         let version = self
             .write_params
@@ -127,11 +130,14 @@ impl<'a> FragmentCreateBuilder<'a> {
             validate_row_limits(version, params)?;
         }
         let id = id.unwrap_or_default();
-        if version == ConcreteFileVersion::V1 {
+        let fragment = if version == ConcreteFileVersion::V1 {
             self.write_v1_impl(stream, schema, id).await
         } else {
             Box::pin(self.write_current_impl(version, stream, schema, id)).await
-        }
+        }?;
+        stage.complete();
+        scope.finish();
+        Ok(fragment)
     }
 
     /// Write multi fragment which separated by max_rows_per_file.
@@ -139,8 +145,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<Vec<Fragment>> {
+        let scope = OperationScope::start(ObservedOperation::Write, || None)?;
+        let stage = scope.stages().start("write_fragments");
         let (stream, schema) = self.get_stream_and_schema(source).await?;
-        self.write_fragments_v2_impl(stream, schema).await
+        let fragments = self.write_fragments_v2_impl(stream, schema).await?;
+        stage.complete();
+        scope.finish();
+        Ok(fragments)
     }
 
     async fn write_current_impl(

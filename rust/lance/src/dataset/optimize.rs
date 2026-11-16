@@ -83,6 +83,7 @@
 //! they can be committed in any order.
 use std::sync::Arc;
 
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_table_runtime::optimize as runtime;
 use serde::{Deserialize, Serialize};
@@ -151,13 +152,21 @@ pub async fn compact_files_with_planner(
 ) -> Result<CompactionMetrics> {
     let remap_options =
         remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
     let plan = planner.plan(dataset).await?;
     let bindings = LanceCompactionHooks::new(dataset, Some(remap_options.as_ref()));
     let mut table = dataset.table_view().to_table();
-    let result =
-        runtime::execute_compaction_plan(&mut table, plan.into(), &bindings.runtime()).await;
+    let result = runtime::execute_compaction_plan_with_stages(
+        &mut table,
+        plan.into(),
+        &bindings.runtime(),
+        &scope.stages(),
+    )
+    .await;
     (dataset.table_state, dataset.manifest, dataset.refs) = table.into_parts();
-    result
+    let metrics = result?;
+    scope.finish();
+    Ok(metrics)
 }
 
 /// Commit the results of file compaction.

@@ -14,6 +14,7 @@ mod dataset_fts_plan_state;
 mod dataset_geo;
 mod dataset_index;
 mod dataset_io;
+mod dataset_memory_switch;
 mod dataset_merge_update;
 mod dataset_migrations;
 mod dataset_overlay_index_masking;
