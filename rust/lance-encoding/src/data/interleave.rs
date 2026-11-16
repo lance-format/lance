@@ -3,6 +3,7 @@
 
 //! Byte-array assembly with one admitted physical output owner.
 
+use std::alloc::Layout;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -10,12 +11,94 @@ use arrow_array::{
     cast::AsArray,
     types::{ByteArrayType, GenericBinaryType, GenericStringType},
 };
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer, bit_util};
+use arrow_buffer::{
+    BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer, alloc::ALIGNMENT, bit_util,
+};
 use arrow_schema::DataType;
 use lance_core::{Error, Result, utils::allocation::Reservation};
 
+mod nested;
 #[cfg(test)]
 mod tests;
+
+pub use nested::try_interleave_nested_binary_in;
+
+// Recreate a selection for each planning/materialization pass. Nested lists
+// expand child ranges lazily instead of allocating one routing entry per child.
+trait Selection {
+    fn iter(&self) -> Box<dyn Iterator<Item = (usize, usize)> + '_>;
+}
+
+struct RootSelection<'a>(&'a [(usize, usize)]);
+
+impl Selection for RootSelection<'_> {
+    fn iter(&self) -> Box<dyn Iterator<Item = (usize, usize)> + '_> {
+        Box::new(self.0.iter().copied())
+    }
+}
+
+struct BytePlan {
+    rows: usize,
+    offset_width: usize,
+    offset_bytes: usize,
+    value_bytes: usize,
+    validity_bytes: usize,
+    total_bytes: usize,
+}
+
+impl BytePlan {
+    fn new<O: OffsetSizeTrait>(rows: usize, value_bytes: usize, has_nulls: bool) -> Result<Self> {
+        let offset_count = add(rows, 1)?;
+        let offset_width = std::mem::size_of::<O>();
+        let offset_bytes = offset_count
+            .checked_mul(offset_width)
+            .ok_or_else(|| invalid("offset size overflows"))?;
+        let validity_bytes = if has_nulls { rows.div_ceil(8) } else { 0 };
+        let total_bytes = add(add(offset_bytes, value_bytes)?, validity_bytes)?;
+        Layout::from_size_align(total_bytes, ALIGNMENT)
+            .map_err(|_| invalid("output exceeds addressable allocation size"))?;
+        Ok(Self {
+            rows,
+            offset_width,
+            offset_bytes,
+            value_bytes,
+            validity_bytes,
+            total_bytes,
+        })
+    }
+
+    fn finish<O: OffsetSizeTrait>(
+        &self,
+        output: Buffer,
+    ) -> (OffsetBuffer<O>, Buffer, Option<NullBuffer>) {
+        // The reserved base is Arrow-aligned, and the plan checked the layout.
+        // Both materializers write initialized, monotonic, representable offsets.
+        let offsets = OffsetBuffer::new(ScalarBuffer::<O>::new(
+            output.slice_with_length(0, self.offset_bytes),
+            0,
+            self.rows + 1,
+        ));
+        let values = output.slice_with_length(self.offset_bytes, self.value_bytes);
+        let nulls = (self.validity_bytes != 0).then(|| {
+            NullBuffer::new(BooleanBuffer::new(
+                output.slice_with_length(self.offset_bytes + self.value_bytes, self.validity_bytes),
+                0,
+                self.rows,
+            ))
+        });
+        (offsets, values, nulls)
+    }
+
+    fn write_offset(&self, bytes: &mut [u8], index: usize, value: usize) {
+        let offset = &mut bytes[(index + 1) * self.offset_width..(index + 2) * self.offset_width];
+        // Arrow's sealed offsets are i32/i64; planning checked representability.
+        if self.offset_width == 8 {
+            offset.copy_from_slice(&(value as i64).to_ne_bytes());
+        } else {
+            offset.copy_from_slice(&(value as i32).to_ne_bytes());
+        }
+    }
+}
 
 /// Interleave Binary, LargeBinary, Utf8 or LargeUtf8 into an admitted allocation.
 ///
@@ -30,7 +113,8 @@ mod tests;
 /// Every output buffer alias retains its full charge until the last alias drops.
 /// Reserve input/output overlap before dependent reads: inputs and routing
 /// metadata are borrowed, and this function does not admit them retroactively.
-/// Array/Arc headers and allocator overhead are outside this payload budget.
+/// Planning/iterator metadata, Array/Arc headers and allocator overhead are
+/// outside this payload budget.
 pub fn try_interleave_binary_in(
     arrays: &[&dyn Array],
     indices: &[(usize, usize)],
@@ -39,11 +123,14 @@ pub fn try_interleave_binary_in(
     let first = arrays
         .first()
         .ok_or_else(|| invalid("sources must not be empty"))?;
+    let selection = RootSelection(indices);
     match first.data_type() {
-        DataType::Binary => interleave::<GenericBinaryType<i32>>(arrays, indices, workspace),
-        DataType::LargeBinary => interleave::<GenericBinaryType<i64>>(arrays, indices, workspace),
-        DataType::Utf8 => interleave::<GenericStringType<i32>>(arrays, indices, workspace),
-        DataType::LargeUtf8 => interleave::<GenericStringType<i64>>(arrays, indices, workspace),
+        DataType::Binary => interleave::<GenericBinaryType<i32>>(arrays, &selection, workspace),
+        DataType::LargeBinary => {
+            interleave::<GenericBinaryType<i64>>(arrays, &selection, workspace)
+        }
+        DataType::Utf8 => interleave::<GenericStringType<i32>>(arrays, &selection, workspace),
+        DataType::LargeUtf8 => interleave::<GenericStringType<i64>>(arrays, &selection, workspace),
         data_type => Err(Error::not_supported(format!(
             "admitted byte interleave does not support {data_type}"
         ))),
@@ -71,16 +158,29 @@ fn source<T: ByteArrayType>(array: &dyn Array) -> Result<&GenericByteArray<T>> {
 
 fn interleave<T: ByteArrayType>(
     arrays: &[&dyn Array],
-    indices: &[(usize, usize)],
+    selection: &dyn Selection,
     workspace: &mut Reservation,
 ) -> Result<Option<ArrayRef>> {
+    let plan = plan_bytes::<T>(arrays, selection)?;
+    if plan.total_bytes > workspace.len() {
+        return Ok(None);
+    }
+    build_bytes::<T>(arrays, selection, &plan, workspace).map(Some)
+}
+
+fn plan_bytes<T: ByteArrayType>(
+    arrays: &[&dyn Array],
+    selection: &dyn Selection,
+) -> Result<BytePlan> {
     // Validate even unselected sources without allocating a typed reference list.
     for array in arrays {
         source::<T>(*array)?;
     }
     let mut value_bytes = 0;
     let mut has_nulls = false;
-    for &(array_index, row) in indices {
+    let mut rows = 0;
+    for (array_index, row) in selection.iter() {
+        rows = add(rows, 1)?;
         let array = arrays.get(array_index).ok_or_else(|| {
             invalid(format!(
                 "source {array_index} exceeds {} sources",
@@ -107,63 +207,39 @@ fn interleave<T: ByteArrayType>(
             T::DATA_TYPE
         )));
     }
-    let offset_count = add(indices.len(), 1)?;
-    let offset_width = std::mem::size_of::<T::Offset>();
-    let offset_bytes = offset_count
-        .checked_mul(offset_width)
-        .ok_or_else(|| invalid("offset size overflows"))?;
-    let validity_start = add(offset_bytes, value_bytes)?;
-    let validity_bytes = if has_nulls {
-        indices.len().div_ceil(8)
-    } else {
-        0
-    };
-    let total_bytes = add(validity_start, validity_bytes)?;
-    let Some(mut output) = workspace.try_allocate(total_bytes)? else {
-        return Ok(None);
-    };
+    BytePlan::new::<T::Offset>(rows, value_bytes, has_nulls)
+}
+
+fn build_bytes<T: ByteArrayType>(
+    arrays: &[&dyn Array],
+    selection: &dyn Selection,
+    plan: &BytePlan,
+    workspace: &mut Reservation,
+) -> Result<ArrayRef> {
+    let mut output = workspace
+        .try_allocate(plan.total_bytes)?
+        .ok_or_else(|| Error::internal("admitted interleave exceeded its complete output plan"))?;
 
     let bytes = output.as_mut();
     let mut value_end = 0;
-    for (index, &(array_index, row)) in indices.iter().enumerate() {
+    for (index, (array_index, row)) in selection.iter().enumerate() {
         let array = source::<T>(arrays[array_index])?;
         if array.is_valid(row) {
             let value: &[u8] = array.value(row).as_ref();
             // The first pass checked the sum and every selected source/row.
             let next_end = value_end + value.len();
-            bytes[offset_bytes + value_end..offset_bytes + next_end].copy_from_slice(value);
+            bytes[plan.offset_bytes + value_end..plan.offset_bytes + next_end]
+                .copy_from_slice(value);
             value_end = next_end;
-            if has_nulls {
-                bit_util::set_bit(&mut bytes[validity_start..], index);
+            if plan.validity_bytes != 0 {
+                bit_util::set_bit(&mut bytes[plan.offset_bytes + plan.value_bytes..], index);
             }
         }
-        let offset = &mut bytes[(index + 1) * offset_width..(index + 2) * offset_width];
-        // ByteArrayType is sealed to i32/i64 offsets. The first pass verified
-        // representability; byte writes avoid an unaligned mutable cast.
-        if T::Offset::IS_LARGE {
-            offset.copy_from_slice(&(value_end as i64).to_ne_bytes());
-        } else {
-            offset.copy_from_slice(&(value_end as i32).to_ne_bytes());
-        }
+        plan.write_offset(bytes, index, value_end);
     }
 
-    let output = Buffer::from(output.freeze());
-    // The reserved base is Arrow-aligned, offsets start at zero, and the fully
-    // initialized monotonic offsets fit the checked layout and value payload.
-    let offsets = OffsetBuffer::new(ScalarBuffer::<T::Offset>::new(
-        output.slice_with_length(0, offset_bytes),
-        0,
-        offset_count,
-    ));
-    let values = output.slice_with_length(offset_bytes, value_bytes);
-    let nulls = has_nulls.then(|| {
-        NullBuffer::new(BooleanBuffer::new(
-            output.slice_with_length(validity_start, validity_bytes),
-            0,
-            indices.len(),
-        ))
-    });
-    Ok(Some(Arc::new(GenericByteArray::<T>::try_new(
+    let (offsets, values, nulls) = plan.finish::<T::Offset>(Buffer::from(output.freeze()));
+    Ok(Arc::new(GenericByteArray::<T>::try_new(
         offsets, values, nulls,
-    )?)))
+    )?))
 }

@@ -25,11 +25,11 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted byte interleave ownership and semantics
+      - name: Verify byte and nested-list interleave ownership and semantics
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib data::interleave::tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib data::interleave:: -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |

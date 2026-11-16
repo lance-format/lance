@@ -45,7 +45,7 @@ mod admitted;
 mod concat;
 mod interleave;
 
-pub use interleave::try_interleave_binary_in;
+pub use interleave::{try_interleave_binary_in, try_interleave_nested_binary_in};
 
 /// A data block with no buffers where everything is null
 ///
