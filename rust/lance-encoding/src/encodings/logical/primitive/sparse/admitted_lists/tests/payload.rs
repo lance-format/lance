@@ -351,3 +351,25 @@ async fn nested_payload_counts_keep_each_selected_child_domain() {
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[tokio::test]
+async fn metadata_delta_counts_need_no_payload_buffer() {
+    let values = [1_u64, 2, 4];
+    let encoding = EncodingUtils::delta(64, 1, EncodingUtils::range(64, 1, 1));
+    let (mut page, source) = payload_page(&values, encoding, 0, false);
+    page.buffer_offsets_and_sizes = Arc::from([]);
+    let scheduler =
+        AdmittedBytePageScheduler::try_from_page(&page, &DefaultDecompressionStrategy::default())
+            .unwrap();
+    let budget = AllocationBudget::new(256);
+    let mut work = budget.try_reserve(256).unwrap();
+    let input = scheduler
+        .prepare_array_range_in(2..6, source.data_type().clone(), &mut work, unexpected_read)
+        .await
+        .unwrap()
+        .unwrap();
+    let output = input.decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(output.to_data(), source.slice(2, 4).to_data());
+    drop((output, work));
+    assert_eq!(budget.reserved(), 0);
+}

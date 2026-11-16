@@ -138,3 +138,99 @@ async fn delta_overflow_and_short_read_do_not_escape_credit() {
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[rstest]
+#[case::range(false, vec![1, 3, 5])]
+#[case::delta_range(true, vec![7, 8, 11, 16])]
+#[tokio::test]
+async fn metadata_range_needs_no_input_or_scratch(#[case] delta: bool, #[case] expected: Vec<u64>) {
+    let range = EncodingUtils::range(64, 1, 2);
+    let encoding = if delta {
+        EncodingUtils::delta(64, 7, range)
+    } else {
+        range
+    };
+    let decoder = SequenceDecoder::try_new(&encoding, 64, expected.len() as u64).unwrap();
+    assert!(!decoder.requires_payload());
+    if delta {
+        assert!(decoder.metadata().is_none());
+    }
+    let plan = WindowSequence::try_new(&encoding, expected.len() as u64, 0..0).unwrap();
+    assert_eq!(plan.scratch_bytes(), 0);
+    let budget = AllocationBudget::new(0);
+    let mut work = budget.try_reserve(0).unwrap();
+    let mut output = Vec::new();
+    plan.visit(
+        &mut work,
+        &mut |_, _: ReservedBuffer| {
+            std::future::ready(Err(Error::internal("metadata Range must not read")))
+        },
+        &mut |value| {
+            output.push(value);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(budget.reserved(), 0);
+    let error = WindowSequence::try_new(&encoding, expected.len() as u64, 0..1).unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("unexpected payload"));
+}
+
+#[tokio::test]
+async fn metadata_delta_overflow_is_not_wrapped() {
+    let encoding = EncodingUtils::delta(64, u64::MAX - 1, EncodingUtils::range(64, 1, 1));
+    let plan = WindowSequence::try_new(&encoding, 3, 0..0).unwrap();
+    let budget = AllocationBudget::new(0);
+    let mut work = budget.try_reserve(0).unwrap();
+    let mut observed = Vec::new();
+    let error = plan
+        .visit(
+            &mut work,
+            &mut |_, _: ReservedBuffer| {
+                std::future::ready(Err(Error::internal("metadata Delta must not read")))
+            },
+            &mut |value| {
+                observed.push(value);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("prefix sum overflows"));
+    assert_eq!(observed, vec![u64::MAX - 1, u64::MAX]);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn metadata_traversal_allows_competing_preparation_to_progress() {
+    let plan = WindowSequence::try_new(&EncodingUtils::range(64, 0, 1), 4096, 0..0).unwrap();
+    let budget = AllocationBudget::new(0);
+    let mut work = budget.try_reserve(0).unwrap();
+    let progressed = std::cell::Cell::new(false);
+    let scan = async {
+        let mut count = 0;
+        plan.visit(
+            &mut work,
+            &mut |_, _: ReservedBuffer| std::future::ready(Err(Error::internal("unexpected read"))),
+            &mut |value| {
+                assert_eq!(value, count);
+                count += 1;
+                if count == 4096 {
+                    assert!(progressed.get());
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 4096);
+    };
+    tokio::join!(biased; scan, async { progressed.set(true) });
+    assert_eq!(budget.reserved(), 0);
+}

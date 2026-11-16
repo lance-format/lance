@@ -7,7 +7,7 @@ use crate::{encodings::physical::sequence::WindowSequence, format::metadata::Com
 #[derive(Clone, Debug)]
 pub(super) enum Positions {
     Metadata(SparsePositionPlan),
-    Payload {
+    Sequence {
         sequence: WindowSequence,
         domain: u64,
         len: u64,
@@ -28,15 +28,22 @@ impl Positions {
     ) -> Result<Self> {
         match position_decoder(encoding, len, domain, "admitted List nonempty")? {
             SparsePositionDecoder::Ready(plan) => Ok(Self::Metadata(plan)),
-            SparsePositionDecoder::Encoded { .. } => {
-                let &(start, size) = buffers
-                    .next()
-                    .ok_or_else(|| corrupt("missing nonempty positions buffer"))?;
-                let end = start
-                    .checked_add(size)
-                    .ok_or_else(|| corrupt("nonempty positions buffer range overflows"))?;
-                Ok(Self::Payload {
-                    sequence: WindowSequence::try_new(encoding, len, start..end)?,
+            SparsePositionDecoder::Encoded { sequence, .. } => {
+                // Encoded includes transforms of metadata, such as Delta(Range).
+                // Only the decoder's payload arity determines buffer consumption.
+                let payload = if sequence.requires_payload() {
+                    let &(start, size) = buffers
+                        .next()
+                        .ok_or_else(|| corrupt("missing nonempty positions buffer"))?;
+                    let end = start
+                        .checked_add(size)
+                        .ok_or_else(|| corrupt("nonempty positions buffer range overflows"))?;
+                    start..end
+                } else {
+                    0..0
+                };
+                Ok(Self::Sequence {
+                    sequence: WindowSequence::try_new(encoding, len, payload)?,
                     domain,
                     len,
                 })
@@ -72,7 +79,7 @@ impl Positions {
                 }
                 Ok(before + low as u64)
             }
-            Self::Payload { .. } => Err(Error::internal("payload positions were not prepared")),
+            Self::Sequence { .. } => Err(Error::internal("position sequence was not prepared")),
         }
     }
 
@@ -87,7 +94,7 @@ impl Positions {
         F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
         Fut: Future<Output = Result<ReservedBuffer>>,
     {
-        let Self::Payload {
+        let Self::Sequence {
             sequence,
             domain,
             len,

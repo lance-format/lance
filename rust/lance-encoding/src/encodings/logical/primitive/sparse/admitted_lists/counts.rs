@@ -10,7 +10,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(super) enum Counts {
     Metadata { first: u64, step: u64, len: u64 },
-    Payload(WindowSequence),
+    Sequence(WindowSequence),
     Selected { start: u64, prefixes: Buffer },
 }
 
@@ -27,21 +27,19 @@ impl Counts {
             Some(SequenceMetadata::Constant(value)) => (value, 0),
             Some(SequenceMetadata::Range { start, step }) => (start, step),
             None => {
-                if !sequence.requires_payload() {
-                    return Err(Error::not_supported(
-                        "admitted List counts require a supported metadata plan or windowed payload",
-                    ));
-                }
-                let &(start, size) = buffers
-                    .next()
-                    .ok_or_else(|| corrupt("missing counts buffer"))?;
-                let end = start
-                    .checked_add(size)
-                    .ok_or_else(|| corrupt("counts buffer range overflows"))?;
-                return Ok(Self::Payload(WindowSequence::try_new(
-                    encoding,
-                    len,
-                    start..end,
+                let payload = if sequence.requires_payload() {
+                    let &(start, size) = buffers
+                        .next()
+                        .ok_or_else(|| corrupt("missing counts buffer"))?;
+                    let end = start
+                        .checked_add(size)
+                        .ok_or_else(|| corrupt("counts buffer range overflows"))?;
+                    start..end
+                } else {
+                    0..0
+                };
+                return Ok(Self::Sequence(WindowSequence::try_new(
+                    encoding, len, payload,
                 )?));
             }
         };
@@ -90,7 +88,7 @@ impl Counts {
                     .ok_or_else(|| corrupt("count prefix outside prepared selection"))?;
                 Ok(u64::from_le_bytes(*bytes))
             }
-            Self::Payload(_) => Err(Error::internal("payload counts were not prepared")),
+            Self::Sequence(_) => Err(Error::internal("count sequence was not prepared")),
         }
     }
 
@@ -105,7 +103,7 @@ impl Counts {
         F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
         Fut: Future<Output = Result<ReservedBuffer>>,
     {
-        let Self::Payload(sequence) = self else {
+        let Self::Sequence(sequence) = self else {
             return Ok(Some(self.clone()));
         };
         let bytes = selected

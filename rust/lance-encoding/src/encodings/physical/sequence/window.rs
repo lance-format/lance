@@ -20,6 +20,10 @@ use crate::{
 
 #[derive(Clone, Debug)]
 enum Leaf {
+    Range {
+        start: u64,
+        step: u64,
+    },
     Flat,
     #[cfg(feature = "bitpacking")]
     Bitpacked {
@@ -28,8 +32,9 @@ enum Leaf {
     },
 }
 
-/// Reads at most one encoded chunk at a time. Visitors must discard their partial
-/// result on error/cancellation. This accounts input scratch, not visitor output
+/// Reads at most one encoded chunk at a time, or visits a metadata Range without
+/// I/O. Visitors must discard partial results on error/cancellation. This
+/// accounts input scratch, not visitor output
 /// or transport/cache allocations. There is no secondary admission or credit wait.
 #[derive(Clone, Debug)]
 pub struct WindowSequence {
@@ -70,6 +75,18 @@ impl WindowSequence {
         };
         let bytes = payload.end - payload.start;
         let leaf = match &encoding.compression {
+            Some(Compression::Range(range)) => {
+                if bytes != 0 {
+                    return Err(Error::corrupt_file_named(
+                        "unsigned sequence",
+                        "metadata Range has unexpected payload bytes",
+                    ));
+                }
+                Leaf::Range {
+                    start: range.start,
+                    step: range.step,
+                }
+            }
             Some(Compression::Flat(flat)) if flat.bits_per_value == 64 => {
                 if count.checked_mul(8) != Some(bytes) {
                     return Err(Error::corrupt_file_named(
@@ -110,7 +127,7 @@ impl WindowSequence {
             }
             _ => {
                 return Err(Error::not_supported(
-                    "windowed unsigned traversal supports Flat/Bitpacked and their Delta transform",
+                    "windowed unsigned traversal supports Range/Flat/Bitpacked and their Delta transform",
                 ));
             }
         };
@@ -127,6 +144,7 @@ impl WindowSequence {
             return (0, 0);
         }
         match self.leaf {
+            Leaf::Range { .. } => (remaining, 0),
             Leaf::Flat => {
                 let count = remaining.min(512);
                 (count, count as usize * 8)
@@ -184,6 +202,23 @@ impl WindowSequence {
             };
             visitor(next)
         };
+        if let Leaf::Range { start, step } = self.leaf {
+            for index in 0..self.count {
+                let next = step
+                    .checked_mul(index)
+                    .and_then(|offset| start.checked_add(offset))
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named("unsigned sequence", "Range value overflows")
+                    })?;
+                consume(next)?;
+                // Payload windows yield through I/O. Metadata has no reads, so
+                // yield between equally bounded 1024-value CPU chunks instead.
+                if (index + 1).is_multiple_of(1024) && index + 1 < self.count {
+                    tokio::task::yield_now().await;
+                }
+            }
+            return Ok(Some(()));
+        }
         let mut remaining = self.count;
         let mut position = self.payload.start;
         while remaining > 0 {
@@ -205,6 +240,11 @@ impl WindowSequence {
                 ));
             }
             match self.leaf {
+                Leaf::Range { .. } => {
+                    return Err(Error::internal(
+                        "metadata Range unexpectedly requested input",
+                    ));
+                }
                 Leaf::Flat => unsigned::flat(scratch.as_ref(), 64, count, &mut consume)?,
                 #[cfg(feature = "bitpacking")]
                 Leaf::Bitpacked { width, raw_tail } => {

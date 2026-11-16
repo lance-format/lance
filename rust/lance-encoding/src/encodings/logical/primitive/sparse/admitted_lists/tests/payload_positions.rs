@@ -431,3 +431,70 @@ async fn position_storage_overlaps_output_in_original_workspace() {
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[rstest]
+#[tokio::test]
+async fn metadata_delta_positions_do_not_consume_following_count_buffer(
+    #[values(false, true)] payload_counts: bool,
+) {
+    let (mut page, mut bytes, source) =
+        position_fixture(&[0, 1, 3], 4, false, false, false, payload_counts);
+    let codec = crate::encodings::physical::sequence::select_u64_sequence_codec(
+        [0, 1, 3].into_iter(),
+        &Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    assert!(!codec.has_payload());
+    let encoding = codec.expected_encoding().clone();
+    let sequence =
+        crate::encodings::physical::sequence::SequenceDecoder::try_new(&encoding, 64, 3).unwrap();
+    assert!(sequence.metadata().is_none());
+    let PageEncoding::Planar(layout) = &mut page.encoding else {
+        unreachable!()
+    };
+    let pb23::structural_plane::Codec::Sparse(structure) =
+        layout.structure.as_mut().unwrap().codec.as_mut().unwrap()
+    else {
+        unreachable!()
+    };
+    let Some(pb23::sparse_structural_layer::Layer::List(list)) = &mut structure.layers[0].layer
+    else {
+        unreachable!()
+    };
+    list.non_empty_positions = Some(encoding);
+    drop(bytes.drain(..24));
+    page.buffer_offsets_and_sizes = if payload_counts {
+        Arc::from([(17, bytes.len() as u64)])
+    } else {
+        Arc::from([])
+    };
+    let scheduler =
+        AdmittedBytePageScheduler::try_from_page(&page, &DefaultDecompressionStrategy::default())
+            .unwrap();
+    let budget = AllocationBudget::new(512);
+    let mut work = budget.try_reserve(512).unwrap();
+    let reads = RefCell::new(0);
+    let input = scheduler
+        .prepare_array_range_in(
+            1..4,
+            source.data_type().clone(),
+            &mut work,
+            |r, mut buffer| {
+                assert!(payload_counts, "metadata positions have no input buffer");
+                *reads.borrow_mut() += 1;
+                buffer
+                    .as_mut()
+                    .copy_from_slice(&bytes[(r.start - 17) as usize..(r.end - 17) as usize]);
+                std::future::ready(Ok(buffer))
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*reads.borrow(), usize::from(payload_counts));
+    let output = input.decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(output.to_data(), source.slice(1, 3).to_data());
+    drop((output, work));
+    assert_eq!(budget.reserved(), 0);
+}
