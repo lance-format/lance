@@ -1976,11 +1976,13 @@ async fn dictionary_limited_rewrite_outputs(dataset: &Dataset) -> Result<Roaring
 }
 
 /// Whether every two neighboring `fragments` hold more distinct values in some
-/// dictionary column than its key type addresses, so the writer would split them
-/// apart again whatever the compaction options.
+/// dictionary column than its key type addresses, so a rewrite that reads each of them
+/// whole would split them apart again.
 ///
 /// A rewrite can also keep its fragment count for other reasons, such as a row target
 /// smaller than the one the next run uses; those fragments must stay candidates.
+/// Smaller read batches (`batch_size`) can still pack values across the file
+/// boundaries; such a run merges them only once a later commit clears this check.
 /// Only the dictionary columns are read.
 async fn are_kept_apart_by_dictionaries(
     dataset: &Dataset,
