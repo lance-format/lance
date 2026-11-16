@@ -5699,6 +5699,60 @@ async fn test_fts_9058_phrase_corpus(
     }
 }
 
+/// The phrase matches rows 0 and 1 in the indexed fragment and rows 5 and 8 in
+/// the unindexed tail; one of each is deleted.
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 6, 7, 8, 9])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
+#[case::residual_filter(RestrictedMatchDomain::Filter("id >= 5"), &[6, 7, 8, 9])]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 2]), &[0, 2, 3, 7, 8, 9])]
+#[tokio::test]
+async fn test_fts_9058_phrase_deletions_corpus_scores(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, stable_row_ids).await;
+    dataset.delete("id = 1 OR id = 5").await.unwrap();
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    assert!(fragments[0].metadata().deletion_file.is_some());
+    assert!(fragments[1].metadata().deletion_file.is_some());
+    let mut observations = Vec::with_capacity(2);
+    for limit in [Some(1), None] {
+        observations.push(
+            restricted_fts_observation(
+                &dataset,
+                domain,
+                "with_deletions",
+                limit,
+                phrase_corpus_query(),
+            )
+            .await,
+        );
+    }
+    for observation in &observations {
+        let plan = observation.plan.as_ref().unwrap();
+        assert_contains!(plan, "MatchCorpus");
+        assert_contains!(plan, "PhraseQuery:");
+    }
+    // Indexed statistics are those stored at index time, so they still count
+    // deleted row 1; the unindexed scan is deletion-aware and omits row 5.
+    let corpus: Vec<_> = PHRASE_CORPUS
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != 5)
+        .collect();
+    assert_restricted_oracle(
+        &format!("9058-phrase-deletions-{domain:?}-stable-{stable_row_ids}.json"),
+        &corpus,
+        raw_phrase_oracle(&corpus, "alpha beta"),
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
 #[tokio::test]
 async fn test_fts_9058_phrase_corpus_requires_positions() {
     let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, false, false).await;
