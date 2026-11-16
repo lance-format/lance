@@ -7,11 +7,221 @@ use super::super::*;
 use super::support::*;
 use crate::Dataset;
 use crate::dataset::mem_wal::observer::WalObserver;
+use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
 use crate::dataset::mem_wal::test_util::failing_memory_store;
 use crate::dataset::mem_wal::write::test_support::*;
-use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
+use crate::index::DatasetIndexExt;
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int8Type;
+use arrow_array::{
+    DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array, RecordBatchIterator,
+    StringArray,
+};
+use arrow_schema::{DataType, Field};
 use lance_core::FenceReason;
 use rstest::rstest;
+
+/// Capacity survives WAL replay; rejection is atomic and leaves indices and
+/// deletions in the same row coordinates as the single-fragment flush.
+#[tokio::test]
+async fn test_dictionary_capacity_survives_replay_and_flush() {
+    let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+    let shard_id = Uuid::new_v4();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        create_pk_test_schema().field(0).clone(),
+        Field::new(
+            "name",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        ),
+    ]));
+    let config = ShardWriterConfig {
+        durable_write: true,
+        max_wal_buffer_size: 1,
+        max_wal_flush_interval: Some(Duration::from_secs(60)),
+        ..memtable_config_with_pk(shard_id)
+    };
+    let index_specs = vec![MemIndexSpec::btree("id_btree", 0, "id")];
+    let batch = |start, count| {
+        let names = DictionaryArray::<Int8Type>::try_new(
+            (0..count).map(|i| i as i8).collect::<Int8Array>(),
+            Arc::new(StringArray::from_iter_values(
+                (start..start + count).map(|i| format!("v{i}")),
+            )),
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..start + count)),
+                Arc::new(names),
+            ],
+        )
+        .unwrap()
+    };
+    let writer = ShardWriter::open(
+        store.clone(),
+        base_path.clone(),
+        base_uri.clone(),
+        config.clone(),
+        schema.clone(),
+        index_specs.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Even an empty generation must reject an atomic write that cannot fit.
+    let error = writer
+        .put(vec![batch(0, 100), batch(100, 100)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("capacity of 128"));
+    assert_eq!(writer.memtable_stats().await.unwrap().row_count, 0);
+    writer.put(vec![batch(0, 100)]).await.unwrap();
+    drop(writer);
+
+    // Reopening rebuilds the budget from the accepted WAL batches.
+    let writer = ShardWriter::open(
+        store,
+        base_path,
+        base_uri.clone(),
+        config,
+        schema.clone(),
+        index_specs,
+    )
+    .await
+    .unwrap();
+    // The first batch would fit exactly; the second makes the entire put fail.
+    let error = writer
+        .put_no_wait(vec![batch(100, 28), batch(128, 1)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("129 distinct encoded values"));
+    assert_eq!(writer.memtable_stats().await.unwrap().row_count, 100);
+    assert_eq!(writer.memtable_stats().await.unwrap().batch_count, 1);
+    let absent = writer
+        .scan()
+        .await
+        .unwrap()
+        .filter("id = 100")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        absent.num_rows(),
+        0,
+        "a rejected prefix must not reach the index"
+    );
+
+    // Overlap fills the budget to exactly 128 distinct values. Repeated values,
+    // null keys, null dictionary values and all-null tombstones still fit.
+    writer.put(vec![batch(28, 100)]).await.unwrap();
+    let names = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(0), None, Some(1)]),
+        Arc::new(StringArray::from(vec![Some("v127"), None])),
+    )
+    .unwrap();
+    let updates = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2])), Arc::new(names)],
+    )
+    .unwrap();
+    writer.put(vec![updates]).await.unwrap();
+    writer.delete(vec![id_only_keys(&[3])]).await.unwrap();
+    let error = writer.put(vec![batch(128, 1)]).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("129 distinct encoded values"));
+    writer
+        .force_freeze_active()
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+
+    let manifest = writer.manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.sstables.len(), 1);
+    let first = &manifest.sstables[0];
+    let uri = format!("{base_uri}/_mem_wal/{shard_id}/{}", first.path);
+    let generation = Dataset::open(&uri).await.unwrap();
+    assert_eq!(generation.get_fragments().len(), 1);
+    assert_eq!(generation.load_indices().await.unwrap()[0].name, "id_btree");
+    let mut scan = generation.scan();
+    scan.filter("id = 0").unwrap().with_row_address();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let updated = scan.try_into_batch().await.unwrap();
+    assert_eq!(updated.num_rows(), 1, "the old PK row must be deleted");
+    assert_eq!(
+        updated["_rowaddr"]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0),
+        200
+    );
+    let names = arrow_cast::cast(&updated["name"], &DataType::Utf8).unwrap();
+    assert_eq!(names.as_string::<i32>().value(0), "v127");
+    let nulls = generation
+        .scan()
+        .filter("id IN (1, 2)")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(nulls.num_rows(), 2);
+    assert_eq!(nulls["name"].logical_null_count(), 2);
+
+    // The documented retry goes into a fresh generation with independent capacity.
+    writer.put(vec![batch(100, 100)]).await.unwrap();
+    writer
+        .force_freeze_active()
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let manifest = writer.manifest().await.unwrap().unwrap();
+    assert_eq!(manifest.sstables.len(), 2);
+    let second = manifest
+        .sstables
+        .iter()
+        .find(|s| s.generation != first.generation)
+        .unwrap();
+    let uri = format!("{base_uri}/_mem_wal/{shard_id}/{}", second.path);
+    let generation = Dataset::open(&uri).await.unwrap();
+    assert_eq!(generation.get_fragments().len(), 1);
+    assert_eq!(generation.count_rows(None).await.unwrap(), 100);
+
+    // Read across both flushed fragments. Projecting the PK avoids asking
+    // Arrow to concatenate more than 128 values into one Int8 dictionary.
+    let base = Dataset::write(
+        RecordBatchIterator::new([Ok(batch(0, 1))], schema.clone()),
+        &base_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut snapshot =
+        ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
+    for sstable in &manifest.sstables {
+        snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
+    }
+    let scanned = LsmScanner::new(Arc::new(base), vec![snapshot], vec!["id".to_string()])
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut ids = scanned["id"]
+        .as_primitive::<arrow_array::types::Int32Type>()
+        .values()
+        .to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..200).filter(|id| *id != 3).collect::<Vec<_>>());
+    writer.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn test_writer_poisons_on_persistence_failure_and_recovers_on_reopen() {

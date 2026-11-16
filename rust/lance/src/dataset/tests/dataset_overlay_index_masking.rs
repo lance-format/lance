@@ -47,6 +47,7 @@ use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
 use crate::index::frag_reuse_reader::tests::persist_fixture;
+use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
@@ -397,6 +398,12 @@ fn string_lists(rows: &[&[&str]]) -> ArrayRef {
         }
         builder.append(true);
     }
+    Arc::new(builder.finish())
+}
+
+fn null_string_list() -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    builder.append_null();
     Arc::new(builder.finish())
 }
 
@@ -1873,13 +1880,16 @@ async fn test_nested_dependency_row_rewrite(
     let mut dataset = updated.as_ref().clone();
     let newest = dataset.fragments().last().unwrap().id as u32;
     let indices = dataset.load_indices_by_name("nested_idx").await.unwrap();
-    assert_eq!(
-        indices[0]
+    // NGram is address-domain under stable row ids, so a moved row's physical
+    // address changes even though its stable row id (and the indexed value)
+    // did not; `can_follow_stable_row_ids` therefore never lets this segment
+    // claim the new fragment without a remap, the same as BTree/Bitmap.
+    assert!(
+        !indices[0]
             .fragment_bitmap
             .as_ref()
             .unwrap()
-            .contains(newest),
-        !replaces_parent && !has_carried_field
+            .contains(newest)
     );
     assert_ids_match_oracle(
         &dataset,
@@ -2407,7 +2417,7 @@ async fn test_remapping_merge_rescans_overlay_stale_rows_off_fragment_zero(
     assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
 }
 
-/// `id` 0..6 with a `List<Utf8>` `tags` column, three rows per fragment (fragments 0 and 1).
+/// `id` 0..6 with a nullable `List<Utf8>` `tags` column, three rows per fragment (fragments 0 and 1).
 async fn create_tags_dataset() -> Dataset {
     let ids = Arc::new(Int32Array::from_iter_values(0..6)) as ArrayRef;
     let tags = string_lists(&[
@@ -2418,8 +2428,15 @@ async fn create_tags_dataset() -> Dataset {
         &["blue", "small"],
         &["red"],
     ]);
-    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
-    let schema = batch.schema();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new(
+            "tags",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, tags]).unwrap();
     Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
         "memory://",
@@ -2496,6 +2513,94 @@ async fn test_label_list_update_rescans_overlay_stale_fragment() {
     assert_ids_match_oracle(&dataset, "array_has_any(tags, ['tiny'])", &[1, 7]).await;
     assert_ids_match_oracle(&dataset, "array_has_any(tags, ['green'])", &[1, 3]).await;
     assert_ids_match_oracle(&dataset, "array_has_all(tags, ['red', 'big'])", &[0]).await;
+    assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
+}
+
+/// Bounded optimize keeps the old LabelList segment in the merge stage while a
+/// task builds the appended fragment. The pure merge must not hide the overlay
+/// mask: stale value and list-null postings stay excluded from index results and
+/// their rows are re-evaluated against the current values on the flat path.
+#[tokio::test]
+async fn test_label_list_bounded_merge_preserves_overlay_masking() {
+    let mut dataset = create_tags_dataset().await;
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::LabelList,
+            Some("tags_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Fragment 0 offset 1 (id 1): ["blue"] -> ["green", "tiny"].
+    let dataset = commit_overlay(
+        dataset,
+        "tags_overlay_replaced",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![string_lists(&[&["green", "tiny"]])],
+    )
+    .await;
+    // Fragment 1 offset 1 (id 4): ["blue", "small"] -> NULL.
+    let mut dataset = commit_overlay(
+        dataset,
+        "tags_overlay_null",
+        1,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![null_string_list()],
+    )
+    .await;
+
+    // Fragment 2: ids 6, 7, 8.
+    let ids = Arc::new(Int32Array::from_iter_values(6..9)) as ArrayRef;
+    let tags = string_lists(&[&["blue"], &["tiny"], &["red"]]);
+    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+
+    let options = OptimizeOptions::merge(1).max_rows_per_task(Some(3));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].fragments, vec![2]);
+    assert!(plan.tasks[0].old_segments.is_empty());
+    assert_eq!(plan.merges.len(), 1);
+    assert_eq!(plan.merges[0].old_segments.len(), 1);
+
+    let mut built = Vec::new();
+    for task in &plan.tasks {
+        built.extend(task.execute(&dataset).await.unwrap());
+    }
+    let mut merged = Vec::new();
+    for merge in &plan.merges {
+        merged.extend(merge.execute(&dataset, &built).await.unwrap());
+    }
+    commit_optimize_indices(&mut dataset, merged, &options)
+        .await
+        .unwrap();
+
+    let committed = dataset.load_indices_by_name("tags_idx").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(
+        committed[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter(0u32..3))
+    );
+    for (filter, expected) in [
+        ("array_has_any(tags, ['blue'])", vec![6]),
+        ("array_has_any(tags, ['tiny'])", vec![1, 7]),
+        ("array_has_any(tags, ['green'])", vec![1, 3]),
+        ("array_has_any(tags, ['small'])", vec![]),
+        ("array_has_all(tags, ['red', 'big'])", vec![0]),
+        ("tags IS NULL", vec![4]),
+    ] {
+        assert_ids_match_oracle(&dataset, filter, &expected).await;
+    }
     assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
 }
 

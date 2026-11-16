@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::MAX_FRAGMENT_UPDATE_BATCH_BYTES;
 use super::job::fragment_update_session_context;
+use super::{MAX_FRAGMENT_UPDATE_BATCH_BYTES, analysis};
 use super::{MergeInsertJob, PatchedFragments};
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::write::cleanup_data_fragments;
 use crate::dataset::write::seeds::SeedCollector;
-use crate::dataset::write::{TargetBaseInfo, WriteParams, write_fragments_internal};
+use crate::dataset::write::{
+    TargetBaseInfo, WriteParams, write_fragments_internal, write_fragments_internal_impl,
+};
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
@@ -42,7 +44,6 @@ use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
     exec::{HardCapBatchSizeExec, LanceExecutionOptions, provider_to_stream},
-    spill::spilling_table_provider_with_job_disk_manager,
     utils::reader_to_stream,
 };
 use lance_file::version::ConcreteFileVersion;
@@ -55,7 +56,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::task::JoinSet;
-use tracing::error;
+use tracing::{Instrument, error};
 
 struct UpdatedRowAddrReconciler<I>
 where
@@ -161,12 +162,7 @@ impl MergeInsertJob {
         // RecordBatches outside DataFusion's memory-pool accounting, so any
         // in-memory allowance would weaken the operation's bounded-memory
         // contract.
-        let staged_source = spilling_table_provider_with_job_disk_manager(
-            source,
-            0,
-            spill_session_context.runtime_env().disk_manager.clone(),
-        )
-        .await?;
+        let staged_source = analysis::replay(source, 0, spill_session_context).await?;
         provider_to_stream(staged_source.clone())
             .await?
             .try_for_each(|_| async { Ok::<(), DataFusionError>(()) })
@@ -225,11 +221,19 @@ impl MergeInsertJob {
                 }
             })?
             .data;
-        let capped_stream = capped_plan.execute(0, session_ctx.task_ctx())?;
+        let capped_stream = if analysis::scope(&session_ctx).is_some() {
+            // The fragment session has its own budget-derived batch size. Preserve it.
+            let mut options = spill_execution_options.clone();
+            options.batch_size = None;
+            analysis::execute("fragment_update_sort", capped_plan, options, &session_ctx)?
+        } else {
+            capped_plan.execute(0, session_ctx.task_ctx())?
+        };
         let mut group_stream = BatchStreamGrouper::new(capped_stream, "_fragment_id".into());
 
         // Can update the fragments in parallel.
         let patched = Arc::new(PatchSink::default());
+        let diagnostics = analysis::scope(spill_session_context);
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let task_limit = dataset.object_store.as_ref().io_parallelism();
@@ -271,12 +275,13 @@ impl MergeInsertJob {
             async fn handle_fragment(
                 dataset: Arc<Dataset>,
                 fragment: FileFragment,
-                mut metadata: Fragment,
                 mut batches: Vec<RecordBatch>,
                 patched: Arc<PatchSink>,
                 reservation_size: usize,
                 versions: (u64, ConcreteFileVersion),
+                diagnostics: Option<Arc<analysis::AnalysisScope>>,
             ) -> Result<usize> {
+                let mut metadata = fragment.metadata.clone();
                 let (current_version, write_version) = versions;
                 // batches still have _rowaddr
                 let write_schema = batches[0]
@@ -430,6 +435,13 @@ impl MergeInsertJob {
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
+                    if let Some(scope) = &diagnostics {
+                        scope
+                            .patches
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(metadata.clone());
+                    }
 
                     if dataset.manifest.uses_stable_row_ids() {
                         // in-place frag override: refresh row-level latest update version meta
@@ -492,6 +504,13 @@ impl MergeInsertJob {
                     updated_rows.finish()?;
 
                     let mut updated_fragment = updater.finish().await?;
+                    if let Some(scope) = &diagnostics {
+                        scope
+                            .patches
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(updated_fragment.clone());
+                    }
 
                     if dataset.manifest.uses_stable_row_ids() {
                         // in-place frag partial rows update, do the in-place refresh the frag's row_latest_update_version_meta
@@ -540,6 +559,7 @@ impl MergeInsertJob {
                 target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
                 write_version: ConcreteFileVersion,
                 write_params: Arc<WriteParams>,
+                diagnostics: Option<Arc<analysis::AnalysisScope>>,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -564,17 +584,37 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
-                let (fragments, _) = write_fragments_internal(
-                    write_version,
-                    Some(dataset.as_ref()),
-                    dataset.object_store.clone(),
-                    &dataset.base,
-                    write_schema,
-                    stream,
-                    write_params.as_ref().clone(),
-                    (*target_bases_info).clone(),
-                )
-                .await?;
+                let (fragments, _) = if let Some(scope) = diagnostics {
+                    write_fragments_internal_impl(
+                        write_version,
+                        Some(dataset.as_ref()),
+                        dataset.object_store.clone(),
+                        &dataset.base,
+                        write_schema,
+                        stream,
+                        write_params.as_ref().clone(),
+                        (*target_bases_info).clone(),
+                        None,
+                        None,
+                        false,
+                        false,
+                        Some(scope.blobs.clone()),
+                        None,
+                    )
+                    .await?
+                } else {
+                    write_fragments_internal(
+                        write_version,
+                        Some(dataset.as_ref()),
+                        dataset.object_store.clone(),
+                        &dataset.base,
+                        write_schema,
+                        stream,
+                        write_params.as_ref().clone(),
+                        (*target_bases_info).clone(),
+                    )
+                    .await?
+                };
 
                 new_fragments.lock().unwrap().extend(fragments);
                 Ok(reservation_size)
@@ -644,8 +684,6 @@ impl MergeInsertJob {
                             dataset.manifest().branch.as_deref().unwrap_or("main"),
                         )));
                     };
-                    let metadata = fragment.metadata.clone();
-
                     // Matched join columns are equal by definition. Retain
                     // them in the source only for the new-fragment branch.
                     let batches = batches
@@ -656,13 +694,13 @@ impl MergeInsertJob {
                     let fut = handle_fragment(
                         dataset.clone(),
                         fragment,
-                        metadata,
                         batches,
                         patched.clone(),
                         memory_size,
                         (current_version, write_version),
+                        diagnostics.clone(),
                     );
-                    tasks.spawn(fut);
+                    tasks.spawn(fut.in_current_span());
                 }
                 Some(ScalarValue::Null | ScalarValue::UInt64(None)) => {
                     let fut = handle_new_fragments(
@@ -673,6 +711,7 @@ impl MergeInsertJob {
                         target_bases_info.clone(),
                         write_version,
                         write_params.clone(),
+                        diagnostics.clone(),
                     );
                     tasks.spawn(fut);
                 }

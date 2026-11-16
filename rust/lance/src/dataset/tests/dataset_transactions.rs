@@ -15,7 +15,9 @@ use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
-use lance_table::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_ROW_ADDR_INDICES};
+use lance_table::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_ROW_ADDR_INDICES,
+};
 use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
 use lance_table::io::commit::{
     CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
@@ -2427,10 +2429,14 @@ async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
     assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
 }
 
-/// A covering declaration that is not a suffix of `fields` must be refused
-/// at commit, not silently accepted and later misread as a keyed column.
+#[rstest::rstest]
+#[case::independent(vec![0], None)]
+#[case::repeated_carried_field(vec![1, 1], Some("more than once"))]
 #[tokio::test]
-async fn test_create_index_rejects_non_suffix_covering_fields() {
+async fn test_create_index_commits_independent_covering_fields(
+    #[case] covering_fields: Vec<i32>,
+    #[case] refusal: Option<&str>,
+) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
 
@@ -2449,13 +2455,11 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
 
-    // fields = [0, 1] with covering = [0]: field 0 is the leading entry,
-    // not the trailing one, so this claims the keyed column is covered.
-    let bad_index = IndexMetadata {
+    let index = IndexMetadata {
         uuid: Uuid::new_v4(),
-        name: "bad_idx".to_string(),
+        name: "covered_idx".to_string(),
         fields: vec![0, 1],
-        covering_fields: vec![0],
+        covering_fields: covering_fields.clone(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
         index_details: None,
@@ -2470,24 +2474,35 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::CreateIndex {
-            new_indices: vec![bad_index],
+            new_indices: vec![index],
             removed_indices: vec![],
         },
         None,
     );
 
-    let err = dataset
+    let committed = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-        .expect_err("a non-suffix covering declaration must not commit");
-    assert!(
-        matches!(err, Error::InvalidInput { .. }),
-        "expected InvalidInput, got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("must come last"),
-        "unexpected message: {err}"
-    );
+        .await;
+    if let Some(refusal) = refusal {
+        let err = committed.expect_err("a repeated carried field must not commit");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(refusal),
+            "unexpected message: {err}"
+        );
+        return;
+    }
+    committed.unwrap();
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(dataset.manifest.reader_feature_flags & covering, covering);
+    assert_eq!(dataset.manifest.writer_feature_flags & covering, covering);
+    let reopened = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    let stored = reopened.load_indices().await.unwrap();
+    assert_eq!(stored[0].keyed_fields(), [0, 1]);
+    assert_eq!(stored[0].covering_fields, covering_fields);
 }
 
 /// A shallow clone copies the index metadata wholesale, `covering_fields`

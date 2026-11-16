@@ -11,6 +11,7 @@ EXECUTION_PROTO_PATHS = {
     "protos/cache_diagnostics.proto",
     "protos/filtered_read.proto",
     "protos/fts.proto",
+    "protos/merge_analysis.proto",
     "protos/table_identifier.proto",
 }
 
