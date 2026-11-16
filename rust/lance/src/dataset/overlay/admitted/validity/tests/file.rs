@@ -24,12 +24,17 @@ async fn validity_resolution_composes_with_real_file_owners(
     #[values(false, true)] lite: bool,
 ) {
     const WORKSPACE: usize = 65536;
-    let schema = Arc::new(ArrowSchema::new(["base", "left", "right"].map(|name| {
-        ArrowField::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
-            "lance-encoding:structural-encoding".into(),
-            "fullzip".into(),
-        )]))
-    })));
+    let schema = Arc::new(ArrowSchema::new(
+        ["base", "left", "right"]
+            .into_iter()
+            .map(|name| {
+                ArrowField::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
+                    "lance-encoding:structural-encoding".into(),
+                    "fullzip".into(),
+                )]))
+            })
+            .collect::<Vec<_>>(),
+    ));
     let columns: Vec<ArrayRef> = ["base", "left", "right"]
         .map(|name| {
             Arc::new(StringArray::from_iter((0..12).map(|row| {
