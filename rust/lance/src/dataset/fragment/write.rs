@@ -6,6 +6,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
 #[cfg(test)]
@@ -118,6 +119,8 @@ impl<'a> FragmentCreateBuilder<'a> {
         source: impl StreamingWriteSource,
         id: Option<u64>,
     ) -> Result<Fragment> {
+        let scope = OperationScope::start(ObservedOperation::Write, || None)?;
+        let stage = scope.stages().start("write_fragments");
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
         let version = self
             .write_params
@@ -126,14 +129,17 @@ impl<'a> FragmentCreateBuilder<'a> {
         if let Some(params) = self.write_params {
             crate::dataset::versions::validate_row_limits(version, params)?;
         }
-        crate::dataset::versions::write_fragment(
+        let fragment = crate::dataset::versions::write_fragment(
             version,
             self,
             stream,
             schema,
             id.unwrap_or_default(),
         )
-        .await
+        .await?;
+        stage.complete();
+        scope.finish();
+        Ok(fragment)
     }
 
     /// Write multi fragment which separated by max_rows_per_file.
@@ -141,8 +147,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<Vec<Fragment>> {
+        let scope = OperationScope::start(ObservedOperation::Write, || None)?;
+        let stage = scope.stages().start("write_fragments");
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
-        self.write_fragments_v2_impl(stream, schema).await
+        let fragments = self.write_fragments_v2_impl(stream, schema).await?;
+        stage.complete();
+        scope.finish();
+        Ok(fragments)
     }
 
     pub(crate) async fn write_current_impl(

@@ -37,6 +37,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{BlobHandling, Field as LanceField};
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
@@ -338,6 +339,7 @@ impl CompactionTask {
     /// the read version for this task (the same version from which the
     /// compaction was planned).
     pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
+        let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
         let dataset = if dataset.manifest.version == self.read_version {
             Cow::Borrowed(dataset)
         } else {
@@ -345,10 +347,19 @@ impl CompactionTask {
         };
         match &self.task.kind {
             CompactionTaskKind::RewriteFragments => {
-                rewrite_files(dataset, self.task.clone(), &self.options).await
+                let rewrite_stage = scope.stages().start("rewrite_files");
+                let result = rewrite_files(dataset, self.task.clone(), &self.options).await?;
+                rewrite_stage.complete();
+                scope.finish();
+                Ok(result)
             }
             CompactionTaskKind::RepackColumns { files } => {
-                repack::execute_repack(&dataset, &self.task, files, &self.options).await
+                let repack_stage = scope.stages().start("repack_files");
+                let result =
+                    repack::execute_repack(&dataset, &self.task, files, &self.options).await?;
+                repack_stage.complete();
+                scope.finish();
+                Ok(result)
             }
         }
     }

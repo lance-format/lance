@@ -88,6 +88,7 @@
 
 mod consolidate;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -95,6 +96,7 @@ use arrow_schema::DataType;
 use chrono::Utc;
 use futures::FutureExt;
 use itertools::Itertools;
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -120,6 +122,7 @@ use super::frag_reuse::{
     MissingCoverageReason, OpenPurpose, SegmentRemappingPlan, segment_coverage_reason,
 };
 use super::loading::{DatasetIndexInternalExt, load_all_indices};
+use super::memory_progress::observing_progress;
 use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
@@ -588,16 +591,41 @@ pub async fn plan_optimize_indices(
     dataset: &Dataset,
     options: &OptimizeOptions,
 ) -> Result<OptimizeIndicesPlan> {
+    let scope = OperationScope::start(ObservedOperation::OptimizeIndices, || None)?;
+    let stages = scope.stages();
+    // A split rebuild, and a `consolidate_selected` over segments with
+    // different models, train a model while planning.
+    let options = observing_options(&stages, options);
+    let plan_stage = stages.start("plan");
     let indices = load_all_indices(dataset).await?;
-    Ok(
-        plan_optimize_indices_or_skip(dataset, &indices, options, OptimizeExecution::Distributed)
+    let plan =
+        plan_optimize_indices_or_skip(dataset, &indices, &options, OptimizeExecution::Distributed)
             .await?
             .unwrap_or_else(|| OptimizeIndicesPlan {
                 plan_id: Uuid::new_v4(),
                 read_version: dataset.manifest.version,
                 tasks: Vec::new(),
                 merges: Vec::new(),
-            }),
+            });
+    plan_stage.complete();
+    scope.finish();
+    Ok(plan)
+}
+
+/// `options`, with a progress that also reports the stages of the builders an
+/// optimization runs into the operation of `stages`; `options` itself when
+/// that operation is not observed.
+pub(crate) fn observing_options<'a>(
+    stages: &StageReporter,
+    options: &'a OptimizeOptions,
+) -> Cow<'a, OptimizeOptions> {
+    if !stages.is_observed() {
+        return Cow::Borrowed(options);
+    }
+    Cow::Owned(
+        options
+            .clone()
+            .progress(observing_progress(stages, options.progress.clone())),
     )
 }
 
@@ -1370,7 +1398,15 @@ impl OptimizeIndexTask {
     /// reads the version it was planned from. `None` when there was nothing
     /// to do after all (a steady-state table, say).
     pub async fn execute(&self, dataset: &Dataset) -> Result<Option<IndexSegmentResult>> {
-        self.execute_with_progress(dataset, noop_progress()).await
+        let scope = OperationScope::start(ObservedOperation::OptimizeIndices, || None)?;
+        let stages = scope.stages();
+        let build_stage = stages.start("build_segments");
+        let result = self
+            .execute_with_progress(dataset, observing_progress(&stages, noop_progress()))
+            .await?;
+        build_stage.complete();
+        scope.finish();
+        Ok(result)
     }
 
     /// [`Self::execute`], reporting the build's stages to `progress`.
@@ -1450,8 +1486,19 @@ impl OptimizeIndexMerge {
         dataset: &Dataset,
         task_results: &[IndexSegmentResult],
     ) -> Result<Option<IndexSegmentResult>> {
-        self.execute_with_progress(dataset, task_results, noop_progress())
-            .await
+        let scope = OperationScope::start(ObservedOperation::OptimizeIndices, || None)?;
+        let stages = scope.stages();
+        let merge_stage = stages.start("merge_segments");
+        let result = self
+            .execute_with_progress(
+                dataset,
+                task_results,
+                observing_progress(&stages, noop_progress()),
+            )
+            .await?;
+        merge_stage.complete();
+        scope.finish();
+        Ok(result)
     }
 
     /// [`Self::execute`], reporting the merge's stages to `progress`.

@@ -15,12 +15,13 @@ pub const METRIC_RSS_PEAK: &str = "lance_memory_rss_peak_bytes";
 pub const METRIC_CGROUP: &str = "lance_memory_cgroup_bytes";
 /// Tightest memory limit over the process's cgroup and its ancestors, in bytes.
 pub const METRIC_CGROUP_LIMIT: &str = "lance_memory_cgroup_limit_bytes";
-/// Peak resident set size during each stage of an index build, in bytes,
-/// labelled by `operation`, `index_type` and `stage`.
+/// Peak resident set size during each stage of an observed operation, in
+/// bytes, labelled by `operation`, `stage` and, for operations that build one
+/// index, `index_type`.
 pub const METRIC_STAGE_PEAK: &str = "lance_memory_stage_peak_bytes";
-/// Peak resident set size during a whole index build, including its commit
-/// when the operation commits the index, in bytes, labelled by `operation` and
-/// `index_type`.
+/// Peak resident set size during a whole observed operation, including its
+/// commit when it commits, in bytes, labelled by `operation` and, for
+/// operations that build one index, `index_type`.
 pub const METRIC_OPERATION_PEAK: &str = "lance_memory_operation_peak_bytes";
 /// Bytes that Lance components hold right now, labelled by `component`.
 pub const METRIC_COMPONENT: &str = "lance_memory_component_bytes";
@@ -84,12 +85,12 @@ pub fn describe_metrics() {
         metrics::describe_histogram!(
             METRIC_STAGE_PEAK,
             Bytes,
-            "Peak resident set size during each index build stage, by operation, index type and stage."
+            "Peak resident set size during each stage of an observed operation, by operation, stage and, for index builds, index type."
         );
         metrics::describe_histogram!(
             METRIC_OPERATION_PEAK,
             Bytes,
-            "Peak resident set size during each index build operation, by operation and index type."
+            "Peak resident set size during each observed operation, by operation and, for index builds, index type."
         );
         metrics::describe_gauge!(
             METRIC_COMPONENT,
@@ -150,34 +151,50 @@ fn publish_gauges(
     }
 }
 
-/// Record the peak resident set size of one stage of an index build.
+/// Record the peak resident set size of one stage of an observed operation.
 pub(super) fn record_stage_peak(
     operation: &'static str,
-    index_type: &str,
+    index_type: Option<&str>,
     stage: &str,
     peak_bytes: u64,
 ) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!(
-        METRIC_STAGE_PEAK,
-        "operation" => operation,
-        "index_type" => labels::INDEX_TYPES.bound(index_type),
-        "stage" => labels::STAGES.bound(stage),
-    )
-    .record(peak_bytes as f64);
+    match index_type {
+        Some(index_type) => metrics::histogram!(
+            METRIC_STAGE_PEAK,
+            "operation" => operation,
+            "index_type" => labels::INDEX_TYPES.bound(index_type),
+            "stage" => labels::STAGES.bound(stage),
+        )
+        .record(peak_bytes as f64),
+        None => metrics::histogram!(
+            METRIC_STAGE_PEAK,
+            "operation" => operation,
+            "stage" => labels::STAGES.bound(stage),
+        )
+        .record(peak_bytes as f64),
+    }
     #[cfg(not(feature = "metrics"))]
     let _ = (operation, index_type, stage, peak_bytes);
 }
 
-/// Record the peak resident set size of a whole index build.
-pub(super) fn record_operation_peak(operation: &'static str, index_type: &str, peak_bytes: u64) {
+/// Record the peak resident set size of a whole observed operation.
+pub(super) fn record_operation_peak(
+    operation: &'static str,
+    index_type: Option<&str>,
+    peak_bytes: u64,
+) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!(
-        METRIC_OPERATION_PEAK,
-        "operation" => operation,
-        "index_type" => labels::INDEX_TYPES.bound(index_type),
-    )
-    .record(peak_bytes as f64);
+    match index_type {
+        Some(index_type) => metrics::histogram!(
+            METRIC_OPERATION_PEAK,
+            "operation" => operation,
+            "index_type" => labels::INDEX_TYPES.bound(index_type),
+        )
+        .record(peak_bytes as f64),
+        None => metrics::histogram!(METRIC_OPERATION_PEAK, "operation" => operation)
+            .record(peak_bytes as f64),
+    }
     #[cfg(not(feature = "metrics"))]
     let _ = (operation, index_type, peak_bytes);
 }
@@ -344,8 +361,8 @@ mod tests {
     #[test]
     fn test_peaks_are_recorded_with_their_labels() {
         let recorded = capture(|| {
-            record_stage_peak("create_index", "btree", "load_data", 1 << 20);
-            record_operation_peak("create_index", "btree", 2 << 20);
+            record_stage_peak("create_index", Some("btree"), "load_data", 1 << 20);
+            record_operation_peak("create_index", Some("btree"), 2 << 20);
         });
         assert_eq!(
             histogram(

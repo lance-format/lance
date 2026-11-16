@@ -81,6 +81,7 @@
 //! the successful tasks can be committed. You can also commit in batches if
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::index::DatasetIndexRemapperOptions;
@@ -88,6 +89,7 @@ use crate::Dataset;
 use crate::Result;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
@@ -101,7 +103,6 @@ mod repack;
 
 pub use commit::commit_compaction;
 use execution::refuse_stale_output_clustering;
-#[cfg(test)]
 use execution::rewrite_files;
 pub use execution::{CompactionMetrics, CompactionTask, RepackedFiles, RewriteResult};
 use planning::validate_fragment_groups_preserve_index_boundaries;
@@ -153,6 +154,18 @@ pub async fn compact_files_with_planner(
     dataset: &mut Dataset,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
+) -> Result<CompactionMetrics> {
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+    let metrics = compact_planned(dataset, remap_options, planner, &scope.stages()).await?;
+    scope.finish();
+    Ok(metrics)
+}
+
+async fn compact_planned(
+    dataset: &mut Dataset,
+    remap_options: Option<Arc<dyn IndexRemapperOptions>>,
+    planner: &dyn CompactionPlanner,
+    stages: &StageReporter,
 ) -> Result<CompactionMetrics> {
     let remap_options =
         remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
@@ -224,12 +237,29 @@ pub async fn compact_files_with_planner(
     // Execute against an immutable snapshot; the commit takes `&mut dataset`
     // once every task has finished.
     let snapshot = &dataset.clone();
+
+    // One stage for all tasks: they run side by side, so their peaks could not
+    // be told apart anyway. The tasks dispatch on their kind here instead of
+    // through `CompactionTask::execute`, which observes each task as an
+    // operation of its own for distributed execution.
+    let rewrite_stage = stages.start("rewrite_files");
     let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.compaction_tasks())
-        .map(|task| async move { task.execute(snapshot).await })
+        .map(|task| async move {
+            match &task.task.kind {
+                CompactionTaskKind::RewriteFragments => {
+                    rewrite_files(Cow::Borrowed(snapshot), task.task.clone(), &task.options).await
+                }
+                CompactionTaskKind::RepackColumns { files } => {
+                    repack::execute_repack(snapshot, &task.task, files, &task.options).await
+                }
+            }
+        })
         .buffer_unordered(concurrency)
         .try_collect()
         .await?;
-    commit_compaction(dataset, results, remap_options, options).await
+    rewrite_stage.complete();
+
+    commit::commit_compaction_inner(dataset, results, remap_options, options, stages).await
 }
 
 #[cfg(test)]

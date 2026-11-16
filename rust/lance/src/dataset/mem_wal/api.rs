@@ -656,6 +656,9 @@ pub trait DatasetMemWalExt {
     /// automatic sharding spec; an explicit id must match it. A manually
     /// sharded index accepts only id `0`.
     ///
+    /// A writer with a memtable is refused with an invalid-input error while
+    /// `LANCE_MEMORY_OBSERVE` holds a value other than a boolean.
+    ///
     /// # Arguments
     ///
     /// * `shard_id` - UUID identifying this shard

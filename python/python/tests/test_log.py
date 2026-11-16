@@ -215,7 +215,13 @@ def test_lance_log_records_memory_events(tmp_path):
     ]:
         assert any(f'event="{event}"' in line for line in memory_lines), log_content
     assert all("operation_id=" in line for line in memory_lines), log_content
-    assert all('index_type="btree"' in line for line in memory_lines), log_content
+    build_lines = [line for line in memory_lines if 'operation="create_index"' in line]
+    write_lines = [line for line in memory_lines if 'operation="write"' in line]
+    assert build_lines and write_lines, log_content
+    assert len(build_lines) + len(write_lines) == len(memory_lines), log_content
+    assert all('index_type="btree"' in line for line in build_lines), log_content
+    assert not any("index_type=" in line for line in write_lines), log_content
+    assert any('stage="write_fragments"' in line for line in write_lines), log_content
     assert "lance::events::dataset_events" not in log_content
 
 

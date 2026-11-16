@@ -30,6 +30,7 @@ use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_al
 use crate::index::loading::load_all_indices;
 use crate::io::commit::{commit_transaction, default_commit_retry_timeout};
 use crate::io::deletion::read_dataset_deletion_file;
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
@@ -37,10 +38,14 @@ use lance_table::format::Fragment;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 /// Returns the version the reservation committed at; `dataset` is not moved to it.
+/// The reservation is a commit of its own, which can run the automatic cleanup,
+/// so it is a stage of the compaction.
 pub(super) async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
+    stages: &StageReporter,
 ) -> Result<u64> {
+    let stage = stages.start("reserve_fragments");
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {
@@ -62,6 +67,7 @@ pub(super) async fn reserve_fragment_ids(
         None,
     )
     .await?;
+    stage.complete();
 
     // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
     let new_max_exclusive = manifest.max_fragment_id.unwrap_or(0) + 1;
@@ -140,6 +146,28 @@ pub async fn commit_compaction(
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+    let metrics = commit_compaction_inner(
+        dataset,
+        completed_tasks,
+        remap_options,
+        options,
+        &scope.stages(),
+    )
+    .await?;
+    scope.finish();
+    Ok(metrics)
+}
+
+/// [`commit_compaction`], reporting its stages into an operation that is
+/// already observed.
+pub(super) async fn commit_compaction_inner(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+    stages: &StageReporter,
+) -> Result<CompactionMetrics> {
     let (repacks, rewrites): (Vec<_>, Vec<_>) = completed_tasks
         .into_iter()
         .partition(|task| task.repacked_files.is_some());
@@ -164,16 +192,25 @@ pub async fn commit_compaction(
     // committing from it would load that version's manifest back, and it may
     // have been expired since.
     let repack_base = dataset.clone();
-    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, remap_options, options)).await?;
+    let mut metrics = Box::pin(commit_rewrites(
+        dataset,
+        rewrites,
+        remap_options,
+        options,
+        stages,
+    ))
+    .await?;
     metrics += super::repack::commit_repacked_files(dataset, repack_base, repacks, options).await?;
     Ok(metrics)
 }
 
+/// The rewrite half of [`commit_compaction_inner`], reporting its stages.
 async fn commit_rewrites(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
+    stages: &StageReporter,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
@@ -287,7 +324,7 @@ async fn commit_rewrites(
             .collect();
         // A replayed result shares file paths with its earlier commit, so a failed
         // reservation cannot prove the files are unreferenced. Leave them for GC.
-        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter()).await?);
+        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter(), stages).await?);
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -305,6 +342,10 @@ async fn commit_rewrites(
     // Trim reclaims such records once every index is disjoint from the chain
     // or postdates the rewrite.
 
+    // The row map built below is part of the memory an immediate remap takes.
+    let remap_stage = index_remapper
+        .as_ref()
+        .map(|_| stages.start("remap_indices"));
     for task in completed_tasks {
         metrics += task.metrics;
         // One source of truth: the deferred branch normalizes the source
@@ -468,12 +509,16 @@ async fn commit_rewrites(
             .flat_map(|group| group.new_fragments.iter_mut())
             .collect::<Vec<_>>();
         // As above, reservation failure does not make replayed files safe to delete.
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
+        reserve_fragment_ids(dataset, new_fragments.into_iter(), stages).await?;
         Vec::new()
     } else {
         Vec::new()
     };
+    if let Some(remap_stage) = remap_stage {
+        remap_stage.complete();
+    }
 
+    let commit_stage = stages.start("commit");
     // A stable-row-id table always keeps a v0 record: recording is refused
     // before any rewrite where the table requires a tagged history.
     //
@@ -626,6 +671,7 @@ async fn commit_rewrites(
         );
         return Err(e);
     }
+    commit_stage.complete();
 
     Ok(metrics)
 }

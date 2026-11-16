@@ -308,34 +308,49 @@ def test_native_snapshot_reports_components_while_observed(tmp_path, switch):
     assert result.returncode == 0, result.stderr
 
 
-_INVALID_SWITCH_BUILD = """
+_INVALID_SWITCH = """
 import sys
 
 import lance
 import pyarrow as pa
 from lance.otel import set_memory_observation
 
-dataset = lance.write_dataset(pa.table({"id": pa.array(range(16))}), sys.argv[1])
+invalid = 'LANCE_MEMORY_OBSERVE="maybe" is invalid'
+dataset = lance.dataset(sys.argv[1])
 try:
     dataset.create_scalar_index("id", "BTREE")
 except ValueError as error:
-    assert 'LANCE_MEMORY_OBSERVE="maybe" is invalid' in str(error), error
+    assert invalid in str(error), error
 else:
     raise AssertionError("the build ignored an invalid LANCE_MEMORY_OBSERVE")
+try:
+    lance.write_dataset(
+        pa.table({"id": pa.array(range(4))}), sys.argv[1], mode="append"
+    )
+except OSError as error:
+    assert invalid in str(error), error
+else:
+    raise AssertionError("the write ignored an invalid LANCE_MEMORY_OBSERVE")
 
 # A call takes over from the invalid variable, whichever way it switches.
 for enabled in (True, False):
     set_memory_observation(enabled)
     dataset.create_scalar_index("id", "BTREE")
+    lance.write_dataset(
+        pa.table({"id": pa.array(range(4))}), sys.argv[1], mode="append"
+    )
 """
 
 
-def test_invalid_memory_switch_fails_index_builds(tmp_path):
-    # LANCE_MEMORY_OBSERVE is read once per process, so the failure is
-    # exercised in a child. Invalid values are rejected before the
-    # Linux-only observation support is checked, until a call takes over.
+def test_invalid_memory_switch_fails_observed_operations(tmp_path):
+    # LANCE_MEMORY_OBSERVE is read once per process, so the failures are
+    # exercised in a child, which finds the dataset this process wrote.
+    # Invalid values are rejected before the Linux-only observation support
+    # is checked, until a call takes over.
+    uri = str(tmp_path / "ds.lance")
+    lance.write_dataset(pa.table({"id": pa.array(range(16))}), uri)
     result = subprocess.run(
-        [sys.executable, "-c", _INVALID_SWITCH_BUILD, str(tmp_path / "ds.lance")],
+        [sys.executable, "-c", _INVALID_SWITCH, uri],
         capture_output=True,
         text=True,
         env={**os.environ, "LANCE_MEMORY_OBSERVE": "maybe"},
