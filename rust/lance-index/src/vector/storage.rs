@@ -262,6 +262,12 @@ pub(crate) fn accumulate_distances_into_heap(
     let mut max_dist = res.peek().map(|node| node.dist);
 
     for (id, dist) in dists.iter().copied().enumerate() {
+        // Nearly every row of a full heap loses to its worst entry; one plain
+        // float compare settles those before the total-order compares below.
+        // A NaN fails this test and takes the ordered path unchanged.
+        if res.len() >= k && max_dist.is_some_and(|max_dist| dist >= max_dist.0) {
+            continue;
+        }
         let dist = OrderedFloat(dist);
         if dist < lower_bound || dist >= upper_bound {
             continue;

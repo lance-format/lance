@@ -605,6 +605,12 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "value = 6.5",
         "value BETWEEN 6.5 AND 7.5",
         "value IN (6.5, 7)",
+        // So are comparisons of the column cast to a float.
+        "CAST(value AS double) > 6.5",
+        "TRY_CAST(value AS double) = 7.0",
+        "NOT (CAST(value AS double) <= 7.0)",
+        "CAST(value AS double) BETWEEN 6.5 AND 7.5",
+        "CAST(value AS double) IN (6.5, 7.0)",
     ] {
         let mut indexed_scan = dataset.scan();
         indexed_scan
@@ -3272,6 +3278,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, replacement_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -8043,6 +8050,72 @@ async fn test_label_list_index_types(#[case] large_list: bool) {
     );
 }
 
+/// DataFusion types the literal list as Int64 and casts a narrower integer column to
+/// match, which must not stop the LabelList index from answering. Literals outside the
+/// item range must keep falling back to a scan instead of matching NULL items.
+#[tokio::test]
+async fn test_label_list_index_on_int32_items() {
+    let test_uri = TempStrDir::default();
+    let labels = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(3)]),
+        Some(vec![Some(2), Some(3)]),
+        None,
+        Some(vec![None, Some(1)]),
+    ]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(labels),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for (filter, expected_ids, uses_index) in [
+        ("array_has(labels, 2)", vec![0, 2], true),
+        ("array_has_any(labels, [1, 3])", vec![0, 1, 2, 4], true),
+        ("array_has_all(labels, [2, 3])", vec![2], true),
+        ("array_has(labels, 3000000000)", vec![], false),
+        ("array_has_any(labels, [3, 3000000000])", vec![1, 2], false),
+        ("array_has_all(labels, [1, 3000000000])", vec![], false),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "{filter}");
+
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert_eq!(
+            plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+            uses_index,
+            "{filter}: {plan}"
+        );
+    }
+}
+
 /// LabelList analogue: after prewarming, an `array_has_any` query against a
 /// `LabelList` index serves results without any further IO. Exercises the
 /// `LabelListIndexState` codec (which embeds the inner bitmap state and the
@@ -8489,6 +8562,66 @@ async fn test_json_btree_index_statistics() {
     assert_eq!(stats["num_unindexed_rows"], 0);
     assert_eq!(stats["indices"][0]["min"], "1000");
     assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
+/// A JSON-wrapped ngram target always needs a recheck. On legacy (V1) datasets
+/// the legacy scanner rechecks by re-materializing the index expression via
+/// `JsonQuery::to_expr`, so a filtered contains-scan must plan instead of
+/// panicking, and the recheck must drop the ngram false positive.
+#[rstest]
+#[case::legacy(LanceFileVersion::Legacy)]
+#[case::stable(LanceFileVersion::Stable)]
+#[tokio::test]
+async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVersion) {
+    let test_uri = TempStrDir::default();
+    let batch = json_batch(vec![
+        r#"{"tag": "unique-bravo"}"#,
+        r#"{"tag": "alpha-charlie"}"#,
+        // Holds every trigram of "bravo" but not the word, so only the
+        // recheck removes it.
+        r#"{"tag": "brazil ravioli avocado"}"#,
+    ]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "ngram",
+        "path": "tag",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_ngram_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .filter("contains(json_get_string(json, 'tag'), 'bravo')")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+    assert!(
+        result["json"]
+            .as_string::<i32>()
+            .value(0)
+            .contains("unique-bravo")
+    );
 }
 
 #[rstest]
@@ -9725,6 +9858,46 @@ async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
     .unwrap();
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "MaterializeIndex");
+}
+
+/// A negated filter answered by the index on a legacy-storage dataset with
+/// stable row ids, restricted to one fragment: the index's block list spans
+/// every fragment, so it is longer than the scanned fragment.
+#[tokio::test]
+async fn test_not_equal_filter_on_fragment_subset_legacy_stable_row_ids() {
+    let reader = gen_batch()
+        .col("c", array::cycle::<UInt64Type>(vec![0, 1]))
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["c"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.with_fragments(vec![dataset.get_fragment(0).unwrap().metadata().clone()])
+        .filter("c != 0")
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert_contains!(&plan, "MaterializeIndex");
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 5);
 }
 
 #[tokio::test]

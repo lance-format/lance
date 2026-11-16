@@ -77,6 +77,7 @@ use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
+use local_staging::{LocalStagingPaths, remove_local_staging_file};
 
 // Local disks tend to do fine with a few threads
 // Note: the number of threads here also impacts the number of files
@@ -189,6 +190,22 @@ pub(crate) fn canonicalize_local_io_result(
         Ok(path) => Ok(Some(path)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Preserve "already gone" across the stream's error type.
+///
+/// An absent staging file is the outcome the caller wanted, but the generic
+/// [`Error`]-to-[`object_store::Error`] conversion erases that, so report it as
+/// [`object_store::Error::NotFound`] with the location the caller asked to delete.
+fn staging_delete_error(location: &Path, error: Error) -> object_store::Error {
+    if error.is_not_found() {
+        object_store::Error::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        }
+    } else {
+        error.into()
     }
 }
 
@@ -1420,22 +1437,56 @@ impl ObjectStore {
     pub async fn delete(&self, path: &Path) -> Result<()> {
         if let Some(local_path) = self.local_staging_path(path)? {
             // LocalFileSystem rejects its reserved staging names, even for deletion.
-            let metrics = self.io_tracker.begin_io("delete");
-            let result = tokio::fs::remove_file(&local_path).await.map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    Error::not_found(path.to_string())
-                } else {
-                    Error::io(format!(
-                        "Failed to remove local staging file {}: {error}",
-                        local_path.display()
-                    ))
-                }
-            });
-            metrics.record(&result, 0);
-            return result;
+            return remove_local_staging_file(path, &local_path, &self.io_tracker).await;
         }
         self.inner.delete(path).await?;
         Ok(())
+    }
+
+    /// Delete every location in `locations`, using the backend's bulk delete when it
+    /// has one.
+    ///
+    /// The returned stream reports locations the backend removed; order is not
+    /// preserved. A backend may coalesce paths into one request (S3: up to 1000 paths
+    /// per `DeleteObjects`), and some report a failed request as one error that ends
+    /// the stream, so inputs after it and inputs omitted from a partial response are
+    /// never reported. Callers must therefore treat an input without a reported
+    /// outcome as failed, and not as removed. Paths that were already absent are
+    /// reported as not-found errors.
+    ///
+    /// Hidden local staging files (see [`Self::read_local_staging_files`]) are removed
+    /// through the same local filesystem path as [`Self::delete`], because the backend
+    /// rejects their names. Those stores have no bulk request to coalesce into, so
+    /// every location is dispatched individually.
+    pub fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let Some(staging_paths) = LocalStagingPaths::for_store(self) else {
+            return self.inner.delete_stream(locations);
+        };
+        let inner = Arc::clone(&self.inner);
+        let io_tracker = self.io_tracker.clone();
+        locations
+            .map(move |location| {
+                let staging_paths = staging_paths.clone();
+                let inner = Arc::clone(&inner);
+                let io_tracker = io_tracker.clone();
+                async move {
+                    let location = location?;
+                    match staging_paths.resolve(&location)? {
+                        Some(local_path) => {
+                            remove_local_staging_file(&location, &local_path, &io_tracker)
+                                .await
+                                .map_err(|error| staging_delete_error(&location, error))?;
+                        }
+                        None => inner.delete(&location).await?,
+                    }
+                    Ok(location)
+                }
+            })
+            .buffer_unordered(self.io_parallelism())
+            .boxed()
     }
 
     /// AWS S3 and GCS reject a single-shot server-side copy whose source is
@@ -4234,6 +4285,31 @@ mod tests {
             observations.delete_max_in_flight.load(Ordering::SeqCst) > 1,
             "deletions ran one at a time; remove_stream must overlap them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_removes_every_path() {
+        let store = ObjectStore::memory();
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut reported = store
+            .delete_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Bulk deletion does not preserve order.
+        reported.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        for path in &paths {
+            assert!(!store.exists(path).await.unwrap(), "{path} still present");
+        }
     }
 
     #[tokio::test]
