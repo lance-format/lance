@@ -5255,19 +5255,23 @@ async fn test_fts_9058_deletions_corpus_scores(
     #[case] candidate_ids: &[i32],
     #[values(false, true)] stable_row_ids: bool,
 ) {
-    let dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
-    let mut observations = Vec::with_capacity(2);
-    for limit in [Some(1), None] {
-        observations.push(
-            restricted_match_observation(&dataset, domain, "with_deletions", limit, "alpha beta")
-                .await,
-        );
-    }
-    for observation in &observations {
+    let mut dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.stage == "before_optimize")
+    {
         assert_contains!(observation.plan.as_ref().unwrap(), "MatchCorpus");
     }
     // Indexed statistics are those stored at index time, so they still count
-    // deleted row 1; the residual scan is deletion-aware and omits row 6.
+    // deleted row 1, and the append optimize leaves them in place; the residual
+    // scan and the new segment are deletion-aware and omit row 6.
     let corpus: Vec<_> = RESTRICTED_MATCH_CORPUS
         .iter()
         .copied()
@@ -5718,26 +5722,29 @@ async fn test_fts_9058_phrase_deletions_corpus_scores(
     assert_eq!(fragments.len(), 3);
     assert!(fragments[0].metadata().deletion_file.is_some());
     assert!(fragments[1].metadata().deletion_file.is_some());
-    let mut observations = Vec::with_capacity(2);
-    for limit in [Some(1), None] {
-        observations.push(
-            restricted_fts_observation(
-                &dataset,
-                domain,
-                "with_deletions",
-                limit,
-                phrase_corpus_query(),
-            )
-            .await,
-        );
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, phrase_corpus_query())
+                    .await,
+            );
+        }
     }
-    for observation in &observations {
+    for observation in &observations[..2] {
         let plan = observation.plan.as_ref().unwrap();
         assert_contains!(plan, "MatchCorpus");
         assert_contains!(plan, "PhraseQuery:");
     }
     // Indexed statistics are those stored at index time, so they still count
-    // deleted row 1; the unindexed scan is deletion-aware and omits row 5.
+    // deleted row 1, and the append optimize leaves them in place; the
+    // unindexed scan and the new segment are deletion-aware and omit row 5.
     let corpus: Vec<_> = PHRASE_CORPUS
         .iter()
         .copied()
