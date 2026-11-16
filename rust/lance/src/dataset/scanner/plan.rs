@@ -1229,15 +1229,15 @@ mod tests {
     use rstest::rstest;
 
     use crate::dataset::Dataset;
+    use crate::dataset::NewColumnTransform;
     use crate::dataset::WriteParams;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::scanner::test_dataset::{
         TestVectorDataset, assert_scan_slice_matches, batch_knn_two_queries, find_filtered_read,
     };
+    use crate::datatypes::Schema;
     use crate::index::DatasetIndexExt;
     use crate::io::exec::PreFilterSource;
-    use crate::dataset::NewColumnTransform;
-    use crate::datatypes::Schema;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[tokio::test]
