@@ -2277,35 +2277,22 @@ impl PartitionAdjuster<'_> {
         prefetch: usize,
     ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static> {
         let projection = Arc::new(dataset.schema().project(&[column])?);
-        // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let row_ids = dataset.filter_deleted_ids(row_ids).await?;
-        let chunks: Vec<Vec<u64>> = row_ids
-            .chunks(rows_per_chunk.max(1))
-            .map(|chunk| chunk.to_vec())
-            .collect();
         let dataset = dataset.clone();
-        Ok(stream::iter(chunks)
-            .map(move |chunk| {
+        Ok(fetch_in_chunks(
+            &row_ids,
+            rows_per_chunk,
+            prefetch,
+            move |chunk| {
                 let dataset = dataset.clone();
                 let projection = projection.clone();
                 async move {
-                    let batch = dataset
+                    dataset
                         .take_rows(&chunk, ProjectionRequest::Schema(projection))
-                        .await?;
-                    if batch.num_rows() != chunk.len() {
-                        return Err(Error::invalid_input(format!(
-                            "batch.num_rows() != chunk.len() ({} != {})",
-                            batch.num_rows(),
-                            chunk.len()
-                        )));
-                    }
-                    Ok(batch.try_with_column(
-                        ROW_ID_FIELD.clone(),
-                        Arc::new(UInt64Array::from(chunk)),
-                    )?)
+                        .await
                 }
-            })
-            .buffered(prefetch.max(1)))
+            },
+        ))
     }
 
     /// A chunk of raw vectors flattened to one row id per vector (a multivector
@@ -3324,6 +3311,43 @@ where
             }
         },
     )
+}
+
+/// The rows of `row_ids` read by `fetch` in chunks of `rows_per_chunk` rows
+/// with up to `prefetch` chunks in flight, each batch with a row id column
+/// appended.
+fn fetch_in_chunks<F, Fut>(
+    row_ids: &[u64],
+    rows_per_chunk: usize,
+    prefetch: usize,
+    fetch: F,
+) -> impl Stream<Item = Result<RecordBatch>> + Send + use<F, Fut>
+where
+    F: Fn(Vec<u64>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
+{
+    // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
+    let chunks: Vec<Vec<u64>> = row_ids
+        .chunks(rows_per_chunk.max(1))
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    stream::iter(chunks)
+        .map(move |chunk| {
+            let batch = fetch(chunk.clone());
+            async move {
+                let batch = batch.await?;
+                if batch.num_rows() != chunk.len() {
+                    return Err(Error::invalid_input(format!(
+                        "batch.num_rows() != chunk.len() ({} != {})",
+                        batch.num_rows(),
+                        chunk.len()
+                    )));
+                }
+                Ok(batch
+                    .try_with_column(ROW_ID_FIELD.clone(), Arc::new(UInt64Array::from(chunk)))?)
+            }
+        })
+        .buffered(prefetch.max(1))
 }
 
 /// Rows per fetch and fetches in flight for re-reading the raw vectors of a
@@ -4571,6 +4595,139 @@ mod tests {
             sizes.iter().all(|&rows| rows <= 400),
             "a join destination exceeds the split threshold: {sizes:?}"
         );
+    }
+
+    /// A batch with one `Float32` column `vec` holding `values`.
+    fn float_batch(values: Vec<f32>) -> RecordBatch {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "vec",
+            DataType::Float32,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Float32Array::from(values))]).unwrap()
+    }
+
+    #[rstest::rstest]
+    fn raw_vector_fetch_shape_bounds_each_fetch_to_the_budget(
+        #[values(64 * 1024, 4 * 1024)] block_size: usize,
+        #[values(8, 128, 1024, 4096)] dimension: usize,
+        #[values(
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::UInt8
+        )]
+        element_type: DataType,
+    ) {
+        let width = element_type.primitive_width().unwrap();
+        let vector_field = Field::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", element_type, true)),
+                dimension as i32,
+            ),
+            false,
+        );
+        let (rows_per_fetch, prefetch) =
+            raw_vector_fetch_shape(false, dimension, &vector_field, block_size);
+        assert!(rows_per_fetch >= 1);
+        assert!(rows_per_fetch <= block_size);
+        assert!(
+            rows_per_fetch * dimension * width <= RAW_VECTOR_FETCH_BYTES,
+            "{rows_per_fetch} rows of {dimension} x {width} bytes exceed the fetch budget"
+        );
+        assert_eq!(prefetch, RAW_VECTOR_FETCHES_IN_FLIGHT);
+    }
+
+    #[rstest::rstest]
+    fn raw_vector_fetch_shape_fetches_multivectors_one_row_at_a_time(
+        #[values(64 * 1024, 4 * 1024)] block_size: usize,
+        #[values(8, 1024)] dimension: usize,
+    ) {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let vector_field = Field::new(
+            "vec",
+            DataType::FixedSizeList(item, dimension as i32),
+            false,
+        );
+        assert_eq!(
+            raw_vector_fetch_shape(true, dimension, &vector_field, block_size),
+            (1, MULTIVECTOR_FETCHES_IN_FLIGHT)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_in_chunks_keeps_at_most_prefetch_fetches_in_flight() {
+        let prefetch = 3;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let row_ids: Vec<u64> = (0..100).collect();
+        let fetch = {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            move |chunk: Vec<u64>| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(float_batch(vec![0.0; chunk.len()]))
+                }
+            }
+        };
+        let batches: Vec<RecordBatch> = fetch_in_chunks(&row_ids, 7, prefetch, fetch)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), prefetch);
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            [vec![7; 14], vec![2]].concat()
+        );
+        let fetched_ids: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| b[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+            .collect();
+        assert_eq!(fetched_ids, row_ids);
+    }
+
+    #[tokio::test]
+    async fn fetch_in_chunks_rejects_a_short_fetch() {
+        let fetch = |_chunk: Vec<u64>| async { Ok(float_batch(vec![0.0])) };
+        let result: Result<Vec<RecordBatch>> =
+            fetch_in_chunks(&[0, 1], 2, 1, fetch).try_collect().await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("(1 != 2)"), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[case::fewer_rows_than_slices(3, 8, vec![1, 1, 1])]
+    #[case::even(16, 4, vec![4, 4, 4, 4])]
+    #[case::uneven(10, 4, vec![3, 3, 3, 1])]
+    #[case::one_slice(5, 1, vec![5])]
+    #[case::zero_slices(5, 0, vec![5])]
+    #[case::empty(0, 4, vec![])]
+    fn slice_evenly_cuts_near_equal_slices(
+        #[case] num_rows: usize,
+        #[case] num_slices: usize,
+        #[case] expected: Vec<usize>,
+    ) {
+        let values: Vec<f32> = (0..num_rows).map(|i| i as f32).collect();
+        let slices: Vec<RecordBatch> =
+            slice_evenly(float_batch(values.clone()), num_slices).collect();
+        assert!(slices.len() <= num_slices.max(1));
+        assert_eq!(
+            slices.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            expected
+        );
+        let sliced: Vec<f32> = slices
+            .iter()
+            .flat_map(|b| b["vec"].as_primitive::<Float32Type>().values().to_vec())
+            .collect();
+        assert_eq!(sliced, values);
     }
 
     #[tokio::test]
