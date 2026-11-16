@@ -26,6 +26,7 @@ impl FragmentReader {
     /// Flat all-null byte/string pages require metadata-only validity. V2_3 List
     /// chains with metadata-proven null leaves support metadata or
     /// Flat/Bitpacked/Delta parent validity, nonempty positions and counts.
+    /// RLE counts also support windowable unsigned value/run-length children.
     /// Payloads use bounded input windows and selected charged storage.
     /// Other sparse codecs return `NotSupported` when selected.
     /// Stored layout determines decoder dispatch.

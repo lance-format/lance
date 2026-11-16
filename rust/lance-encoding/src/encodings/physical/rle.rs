@@ -2774,6 +2774,23 @@ fn infer_generic_run_count(
     bits_per_value: u64,
     num_values: u64,
 ) -> Result<u64> {
+    infer_generic_run_count_from_sizes(
+        source,
+        values_payload.map(|p| p.len() as u64),
+        lengths_payload.map(|p| p.len() as u64),
+        bits_per_value,
+        num_values,
+    )
+}
+
+/// Recover cardinality from framing without retaining the child payloads.
+pub(crate) fn infer_generic_run_count_from_sizes(
+    source: BlockRleRunCount,
+    values_payload: Option<u64>,
+    lengths_payload: Option<u64>,
+    bits_per_value: u64,
+    num_values: u64,
+) -> Result<u64> {
     let run_count = match source {
         BlockRleRunCount::ConstantRunLength(length) => {
             if length == 0 || !num_values.is_multiple_of(length) {
@@ -2850,20 +2867,18 @@ fn infer_generic_run_count(
 }
 
 fn flat_generic_run_count(
-    payload: &LanceBuffer,
+    payload_bytes: u64,
     bits_per_value: u64,
     max_runs: u64,
     label: &str,
 ) -> Result<u64> {
-    let bytes_per_value = usize::try_from(bits_per_value / 8)
-        .map_err(|_| Error::invalid_input("RLE child width does not fit usize"))?;
-    if bytes_per_value == 0 || !payload.len().is_multiple_of(bytes_per_value) {
+    let bytes_per_value = bits_per_value / 8;
+    if bytes_per_value == 0 || !payload_bytes.is_multiple_of(bytes_per_value) {
         return Err(Error::invalid_input(format!(
-            "RLE {label} payload has {} bytes, not divisible by {bytes_per_value}",
-            payload.len()
+            "RLE {label} payload has {payload_bytes} bytes, not divisible by {bytes_per_value}"
         )));
     }
-    let run_count = (payload.len() / bytes_per_value) as u64;
+    let run_count = payload_bytes / bytes_per_value;
     if run_count > max_runs {
         return Err(Error::invalid_input(format!(
             "RLE {label} payload contains {run_count} runs, exceeding {max_runs}"

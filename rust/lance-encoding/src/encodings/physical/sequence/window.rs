@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Bounded input traversal for independently framed u64 structural sequences.
+//! Bounded input traversal for independently framed unsigned structural sequences.
 
 use std::{future::Future, ops::Range};
 
@@ -42,6 +42,7 @@ enum Leaf {
 #[derive(Clone, Debug)]
 pub struct WindowSequence {
     leaf: Leaf,
+    bits: u64,
     payload: Range<u64>,
     count: u64,
     base: Option<u64>,
@@ -53,8 +54,22 @@ impl WindowSequence {
         count: u64,
         payload: Range<u64>,
     ) -> Result<Self> {
+        Self::try_new_with_bits(encoding, 64, count, payload)
+    }
+
+    pub(crate) fn try_new_with_bits(
+        encoding: &CompressiveEncoding,
+        bits: u64,
+        count: u64,
+        payload: Range<u64>,
+    ) -> Result<Self> {
+        if !matches!(bits, 32 | 64) {
+            return Err(Error::not_supported(
+                "windowed sequences require 32 or 64 bits",
+            ));
+        }
         // Reuse the current codec grammar/cardinality validation before planning I/O.
-        SequenceDecoder::try_new(encoding, 64, count)?;
+        SequenceDecoder::try_new(encoding, bits, count)?;
         if payload.start > payload.end {
             return Err(Error::corrupt_file_named(
                 "unsigned sequence",
@@ -78,6 +93,18 @@ impl WindowSequence {
         };
         let bytes = payload.end - payload.start;
         let leaf = match &encoding.compression {
+            Some(Compression::Constant(constant)) if constant.value.is_some() && bytes == 0 => {
+                let scalar = constant
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("missing scalar"))?;
+                let mut value = [0; 8];
+                value[..scalar.len()].copy_from_slice(scalar);
+                Leaf::Range {
+                    start: u64::from_le_bytes(value),
+                    step: 0,
+                }
+            }
             Some(Compression::Range(range)) => {
                 if bytes != 0 {
                     return Err(Error::corrupt_file_named(
@@ -90,8 +117,8 @@ impl WindowSequence {
                     step: range.step,
                 }
             }
-            Some(Compression::Flat(flat)) if flat.bits_per_value == 64 => {
-                if count.checked_mul(8) != Some(bytes) {
+            Some(Compression::Flat(flat)) if flat.bits_per_value == bits => {
+                if count.checked_mul(bits / 8) != Some(bytes) {
                     return Err(Error::corrupt_file_named(
                         "unsigned sequence",
                         "Flat payload length disagrees with count",
@@ -111,12 +138,12 @@ impl WindowSequence {
                     ));
                 };
                 let width = flat.bits_per_value;
-                if width == 0 || width >= 64 {
+                if width == 0 || width >= bits {
                     return Err(Error::invalid_input(
                         "windowed bitpacking requires a narrower positive width",
                     ));
                 }
-                let [raw, padded] = out_of_line_payload_byte_lengths(count, 64, width)?;
+                let [raw, padded] = out_of_line_payload_byte_lengths(count, bits, width)?;
                 if bytes != raw && bytes != padded {
                     return Err(Error::corrupt_file_named(
                         "unsigned sequence",
@@ -136,6 +163,7 @@ impl WindowSequence {
         };
         Ok(Self {
             leaf,
+            bits,
             payload,
             count,
             base,
@@ -149,8 +177,8 @@ impl WindowSequence {
         match self.leaf {
             Leaf::Range { .. } => (remaining, 0),
             Leaf::Flat => {
-                let count = remaining.min(512);
-                (count, count as usize * 8)
+                let count = remaining.min(4096 / (self.bits / 8));
+                (count, count as usize * (self.bits as usize / 8))
             }
             #[cfg(feature = "bitpacking")]
             Leaf::Bitpacked { width, raw_tail } => {
@@ -159,7 +187,7 @@ impl WindowSequence {
                 (
                     count,
                     if raw {
-                        count as usize * 8
+                        count as usize * (self.bits as usize / 8)
                     } else {
                         width as usize * 128
                     },
@@ -196,9 +224,12 @@ impl WindowSequence {
         }
         let mut consume = |next| {
             let next = if self.base.is_some() {
-                value = value.checked_add(next).ok_or_else(|| {
-                    Error::corrupt_file_named("unsigned sequence", "Delta prefix sum overflows")
-                })?;
+                value = value
+                    .checked_add(next)
+                    .filter(|v| self.bits == 64 || *v <= u64::from(u32::MAX))
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named("unsigned sequence", "Delta prefix sum overflows")
+                    })?;
                 value
             } else {
                 next
@@ -248,13 +279,19 @@ impl WindowSequence {
                         "metadata Range unexpectedly requested input",
                     ));
                 }
-                Leaf::Flat => unsigned::flat(scratch.as_ref(), 64, count, &mut consume)?,
+                Leaf::Flat => unsigned::flat(scratch.as_ref(), self.bits, count, &mut consume)?,
                 #[cfg(feature = "bitpacking")]
                 Leaf::Bitpacked { width, raw_tail } => {
                     if count < 1024 && raw_tail {
-                        unsigned::flat(scratch.as_ref(), 64, count, &mut consume)?;
+                        unsigned::flat(scratch.as_ref(), self.bits, count, &mut consume)?;
                     } else {
-                        unsigned::bitpacked(scratch.as_ref(), 64, width, count, &mut consume)?;
+                        unsigned::bitpacked(
+                            scratch.as_ref(),
+                            self.bits,
+                            width,
+                            count,
+                            &mut consume,
+                        )?;
                     }
                 }
             }

@@ -98,17 +98,25 @@ impl<'a> WindowCursor<'a> {
                 .as_ref()
                 .ok_or_else(|| Error::internal("missing cursor input"))?;
             let next = match self.sequence.leaf {
-                Leaf::Flat => {
-                    unsigned::flat_at(scratch.as_ref(), 64, self.chunk_count, self.chunk_index)?
-                }
+                Leaf::Flat => unsigned::flat_at(
+                    scratch.as_ref(),
+                    self.sequence.bits,
+                    self.chunk_count,
+                    self.chunk_index,
+                )?,
                 #[cfg(feature = "bitpacking")]
                 Leaf::Bitpacked { width, raw_tail } => {
                     if self.chunk_count < 1024 && raw_tail {
-                        unsigned::flat_at(scratch.as_ref(), 64, self.chunk_count, self.chunk_index)?
+                        unsigned::flat_at(
+                            scratch.as_ref(),
+                            self.sequence.bits,
+                            self.chunk_count,
+                            self.chunk_index,
+                        )?
                     } else {
                         unsigned::bitpacked_at(
                             scratch.as_ref(),
-                            64,
+                            self.sequence.bits,
                             width,
                             self.chunk_count,
                             self.chunk_index,
@@ -124,9 +132,13 @@ impl<'a> WindowCursor<'a> {
         };
         self.index += 1;
         if self.sequence.base.is_some() {
-            self.value = self.value.checked_add(next).ok_or_else(|| {
-                Error::corrupt_file_named("unsigned cursor", "Delta prefix sum overflows")
-            })?;
+            self.value = self
+                .value
+                .checked_add(next)
+                .filter(|v| self.sequence.bits == 64 || *v <= u64::from(u32::MAX))
+                .ok_or_else(|| {
+                    Error::corrupt_file_named("unsigned cursor", "Delta prefix sum overflows")
+                })?;
             Ok(Some(self.value))
         } else {
             Ok(Some(next))

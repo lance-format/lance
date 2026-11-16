@@ -667,3 +667,5 @@ mod payload;
 mod payload_positions;
 
 mod payload_validity;
+
+mod rle_counts;

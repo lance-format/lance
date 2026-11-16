@@ -18,6 +18,7 @@ async fn packed_tail_windows_match_complete_sequence(
     #[case] padded: bool,
     #[values(false, true)] delta: bool,
     #[values(false, true)] incremental: bool,
+    #[values(32, 64)] bits: u64,
 ) {
     use crate::{
         buffer::LanceBuffer,
@@ -25,15 +26,26 @@ async fn packed_tail_windows_match_complete_sequence(
         data::{BlockInfo, DataBlock, FixedWidthDataBlock},
         encodings::physical::bitpacking::OutOfLineBitpacking,
     };
+    // A 5-bit packed chunk is 640 bytes for either decoded width.
+    let tail = if tail == 80 {
+        640 / (bits / 8) as usize
+    } else {
+        tail
+    };
     let values = (0..3072)
         .map(|i| 1 + i as u64 * 17 % 31)
         .collect::<Vec<_>>();
-    let codec = OutOfLineBitpacking::new(5, 64);
+    let codec = OutOfLineBitpacking::new(5, bits);
     let (bytes, encoding) = codec
         .compress(DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 64,
+            bits_per_value: bits,
             num_values: 3072,
-            data: LanceBuffer::reinterpret_vec(values.clone()),
+            data: LanceBuffer::from(
+                values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes().into_iter().take((bits / 8) as usize))
+                    .collect::<Vec<_>>(),
+            ),
             block_info: BlockInfo::default(),
         }))
         .unwrap();
@@ -41,7 +53,7 @@ async fn packed_tail_windows_match_complete_sequence(
     if !padded {
         bytes.truncate(1280);
         for value in &values[2048..2048 + tail] {
-            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes()[..(bits / 8) as usize]);
         }
     }
     let mut expected = values[..2048 + tail].to_vec();
@@ -53,12 +65,13 @@ async fn packed_tail_windows_match_complete_sequence(
                 sum
             }))
             .collect();
-        EncodingUtils::delta(64, 7, encoding)
+        EncodingUtils::delta(bits, 7, encoding)
     } else {
         encoding
     };
-    let plan = WindowSequence::try_new(
+    let plan = WindowSequence::try_new_with_bits(
         &encoding,
+        bits,
         expected.len() as u64,
         11..11 + bytes.len() as u64,
     )
@@ -107,18 +120,28 @@ fn flat_framing_rejected_before_input(#[case] size: u64) {
 #[tokio::test]
 async fn delta_overflow_and_short_read_do_not_escape_credit(
     #[values(false, true)] incremental: bool,
+    #[values(32, 64)] bits: u64,
 ) {
     for short in [false, true] {
-        let plan = WindowSequence::try_new(
-            &EncodingUtils::delta(64, u64::MAX, EncodingUtils::flat(64, None)),
+        let maximum = if bits == 32 {
+            u64::from(u32::MAX)
+        } else {
+            u64::MAX
+        };
+        let bytes = (bits / 8) as usize;
+        let plan = WindowSequence::try_new_with_bits(
+            &EncodingUtils::delta(bits, maximum, EncodingUtils::flat(bits, None)),
+            bits,
             2,
-            0..8,
+            0..bytes as u64,
         )
         .unwrap();
-        let budget = AllocationBudget::new(8);
-        let mut work = budget.try_reserve(8).unwrap();
+        let budget = AllocationBudget::new(bytes);
+        let mut work = budget.try_reserve(bytes).unwrap();
         let mut read = |_: Range<u64>, mut buffer: ReservedBuffer| {
-            buffer.as_mut().copy_from_slice(&1_u64.to_le_bytes());
+            buffer
+                .as_mut()
+                .copy_from_slice(&1_u64.to_le_bytes()[..bytes]);
             if short {
                 drop(buffer);
                 std::future::ready(Ok(AllocationBudget::new(0)
@@ -134,7 +157,7 @@ async fn delta_overflow_and_short_read_do_not_escape_credit(
             let mut cursor = WindowCursor::new(&plan);
             assert_eq!(
                 cursor.next(&mut work, &mut read).await.unwrap(),
-                Some(u64::MAX)
+                Some(maximum)
             );
             cursor.next(&mut work, &mut read).await.unwrap_err()
         } else {

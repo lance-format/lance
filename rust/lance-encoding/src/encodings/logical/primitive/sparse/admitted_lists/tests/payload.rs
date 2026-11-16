@@ -54,7 +54,7 @@ pub(super) fn encode(values: &[u64], packed: bool, delta: bool) -> (Vec<u8>, Com
     (bytes.unwrap().to_vec(), encoding)
 }
 
-fn payload_page(
+pub(super) fn payload_page(
     values: &[u64],
     encoding: CompressiveEncoding,
     bytes: usize,

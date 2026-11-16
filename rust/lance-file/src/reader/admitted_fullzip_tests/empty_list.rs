@@ -295,18 +295,20 @@ async fn current_writer_null_children_preserve_selected_structure_without_io(
 }
 
 #[rstest]
-#[case::counts(false, false)]
-#[case::positions(true, false)]
-#[case::positions_and_validity(true, true)]
+#[case::counts(false, false, false)]
+#[case::positions(true, false, false)]
+#[case::positions_and_validity(true, true, false)]
+#[case::rle_counts(false, false, true)]
 #[tokio::test]
 async fn current_writer_payload_counts_use_bounded_input_windows(
     #[values(false, true)] lite: bool,
     #[values(false, true)] large: bool,
     #[case] payload_positions: bool,
     #[case] payload_validity: bool,
+    #[case] rle_counts: bool,
 ) {
-    // Distinct non-monotonic counts prevent metadata, Delta, RLE and dictionary
-    // representations. The actual writer chooses a directly addressable codec.
+    // Distinct non-monotonic counts exercise direct payload codecs; repeated
+    // stretches exercise RLE. Inspect the stored descriptor below, not a hint.
     let mut offsets = vec![0_i32];
     let valid = (0..2051)
         .map(|i| !payload_validity || i % 13 != (i / 17) % 13)
@@ -314,6 +316,8 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
     for i in 0..2051 {
         let count = if !valid[i as usize] || (payload_positions && i % 7 == (i / 11) % 7) {
             0
+        } else if rle_counts {
+            1 + ((i / 64) * 17 % 31)
         } else {
             1 + (i * 1031 % 2053)
         };
@@ -332,6 +336,23 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
         1 + usize::from(payload_positions) + usize::from(payload_validity),
         "fixture must contain payload counts and the requested position/validity streams"
     );
+    if rle_counts {
+        let lance_encoding::decoder::PageEncoding::Planar(layout) = &page.encoding else {
+            unreachable!()
+        };
+        let Some(pb23::sparse_structural_layer::Layer::List(list)) =
+            &layout.sparse().unwrap().layers[0].layer
+        else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                list.counts.as_ref().unwrap().compression,
+                Some(lance_encoding::format::metadata::compressive_encoding::Compression::Rle(_))
+            ),
+            "fixture must use stored RLE counts"
+        );
+    }
     let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
     let reader = reader.with_scheduler(Arc::new(super::scan::RangeIo {
         inner: reader.core.scheduler.clone(),

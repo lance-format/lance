@@ -38,7 +38,8 @@ enum Scheduler {
 /// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
 /// pages require metadata-only validity. V2_3 List chains with null byte leaves
 /// support metadata or Flat/Bitpacked/Delta parent validity, nonempty positions,
-/// and counts. The leaf must still prove all-null from metadata. Payloads use
+/// and counts. RLE counts support windowable unsigned value/run-length children.
+/// The leaf must still prove all-null from metadata. Payloads use
 /// bounded I/O windows; selected positions, validity and prefixes remain charged
 /// alongside output construction. Position capacity is bounded by selected parent rows.
 /// Empty/null/nonempty parents stay distinct. Other layouts return an error without

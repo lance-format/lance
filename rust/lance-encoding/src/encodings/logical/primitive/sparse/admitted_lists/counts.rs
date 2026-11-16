@@ -7,10 +7,14 @@ use crate::{
     format::metadata::CompressiveEncoding,
 };
 
+mod rle;
+use rle::RleCounts;
+
 #[derive(Clone, Debug)]
 pub(super) enum Counts {
     Metadata { first: u64, step: u64, len: u64 },
     Sequence(WindowSequence),
+    Rle(Box<RleCounts>),
     Selected { start: u64, prefixes: Buffer },
 }
 
@@ -22,6 +26,14 @@ impl Counts {
     ) -> Result<Self> {
         let encoding = encoding.ok_or_else(|| corrupt("missing unsigned counts descriptor"))?;
         let sequence = SequenceDecoder::try_new(encoding, 64, len)?;
+        if matches!(
+            encoding.compression,
+            Some(crate::format::metadata::compressive_encoding::Compression::Rle(_))
+        ) {
+            return Ok(Self::Rle(Box::new(RleCounts::parse(
+                encoding, len, buffers,
+            )?)));
+        }
         let (first, step) = match sequence.metadata().filter(|_| !sequence.requires_payload()) {
             Some(SequenceMetadata::Empty) => (0, 0),
             Some(SequenceMetadata::Constant(value)) => (value, 0),
@@ -88,7 +100,9 @@ impl Counts {
                     .ok_or_else(|| corrupt("count prefix outside prepared selection"))?;
                 Ok(u64::from_le_bytes(*bytes))
             }
-            Self::Sequence(_) => Err(Error::internal("count sequence was not prepared")),
+            Self::Sequence(_) | Self::Rle(_) => {
+                Err(Error::internal("count sequence was not prepared"))
+            }
         }
     }
 
@@ -103,6 +117,9 @@ impl Counts {
         F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
         Fut: Future<Output = Result<ReservedBuffer>>,
     {
+        if let Self::Rle(rle) = self {
+            return rle.prepare(selected, total, work, read).await;
+        }
         let Self::Sequence(sequence) = self else {
             return Ok(Some(self.clone()));
         };
