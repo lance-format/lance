@@ -747,3 +747,96 @@ async fn test_batch_knn_adaptive_hybrid_scalar_prefilter(#[case] explicit_fragme
     let recall = hits as f32 / expected_total as f32;
     assert!(recall >= 0.5, "recall {recall} below 0.5");
 }
+
+/// On an index large enough for RQ's shared early scan to keep other rows than
+/// single-query search for some queries, adaptive batches still recall the
+/// exact top-k as well as one search per query does.
+#[rstest]
+#[case::no_filter(None)]
+#[case::late_search(Some("i % 7 = 0"))]
+#[tokio::test]
+async fn test_batch_knn_adaptive_rq_recall_matches_single(#[case] filter: Option<&str>) {
+    const DIM: usize = 32;
+    const QUERIES: usize = 64;
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "vec",
+            array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+        )
+        .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(5_000))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some("idx".into()),
+            &VectorIndexParams::ivf_rq(64, 5, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    let stored = dataset
+        .scan()
+        .project(&["vec"])
+        .unwrap()
+        .limit(Some(QUERIES as i64), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let values: Vec<f32> = stored["vec"]
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<Float32Type>()
+        .values()
+        .iter()
+        .map(|v| v + 0.01)
+        .collect();
+    let queries =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values.clone()), DIM as i32)
+            .unwrap();
+    let k = 10;
+
+    let mut scan = dataset.scan();
+    configure_adaptive_scan(&mut scan, &queries, k, filter, None, true);
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ANNIvfBatch"), "{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut exact_scan = dataset.scan();
+    configure_adaptive_scan(&mut exact_scan, &queries, k, filter, None, false);
+    let exact = exact_scan.try_into_batch().await.unwrap();
+
+    let (mut batch_hits, mut single_hits, mut total) = (0, 0, 0);
+    for query_index in 0..QUERIES {
+        let query = Float32Array::from(values[query_index * DIM..(query_index + 1) * DIM].to_vec());
+        let mut single_scan = dataset.scan();
+        configure_adaptive_scan(&mut single_scan, &query, k, filter, None, true);
+        let single = single_scan.try_into_batch().await.unwrap();
+        let truth: HashSet<i32> = rows_for_query(&exact, query_index)["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        total += truth.len();
+        let hits = |rows: &RecordBatch| {
+            rows["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|i| truth.contains(i))
+                .count()
+        };
+        batch_hits += hits(&rows_for_query(&batch, query_index));
+        single_hits += hits(&single);
+    }
+    let batch_recall = batch_hits as f32 / total as f32;
+    let single_recall = single_hits as f32 / total as f32;
+    assert!(single_recall >= 0.5, "single-query recall {single_recall}");
+    assert!(
+        (batch_recall - single_recall).abs() <= 0.02,
+        "batch recall {batch_recall} vs single-query recall {single_recall}"
+    );
+}
