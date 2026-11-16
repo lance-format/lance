@@ -202,6 +202,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
 
         fragment.files[0] = data_file;
+        fragment.set_schema_fingerprint(&schema)?;
 
         progress.complete(&fragment).await?;
 
@@ -248,7 +249,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         } else {
             None
         };
-        crate::dataset::versions::write_fragments_direct(
+        let mut fragments = crate::dataset::versions::write_fragments_direct(
             version,
             existing_dataset.as_ref(),
             object_store,
@@ -264,7 +265,17 @@ impl<'a> FragmentCreateBuilder<'a> {
             false,
             None,
         )
-        .await
+        .await?;
+
+        // This builder produces uncommitted fragments, which may be committed
+        // later against a dataset assembled in another process. Record the
+        // schema used by the writer so append validation can compare it
+        // without reading every data file footer.
+        for fragment in &mut fragments {
+            fragment.set_schema_fingerprint(&schema)?;
+        }
+
+        Ok(fragments)
     }
 
     pub(crate) async fn write_v1_impl(
@@ -290,7 +301,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut writer = V1FileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
-            schema,
+            schema.clone(),
             &Default::default(),
         )
         .await?;
@@ -308,6 +319,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
 
         fragment.physical_rows = Some(writer.finish().await?.num_rows as usize);
+        fragment.set_schema_fingerprint(&schema)?;
 
         progress.complete(&fragment).await?;
 
@@ -385,7 +397,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::{TempDir, TempStrDir};
-    use lance_table::format::BasePath;
+    use lance_table::format::{BasePath, SCHEMA_FINGERPRINT_METADATA_KEY};
     use rstest::rstest;
 
     use super::*;
@@ -569,6 +581,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_append_rejects_fragment_schema_fingerprint_mismatch() {
+        let dataset_dir = TempStrDir::default();
+        let fragment_dir = TempStrDir::default();
+
+        let base_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("count", DataType::Int32, false),
+        ]));
+        let base_batch = RecordBatch::try_new(
+            base_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow_array::Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            Box::new(RecordBatchIterator::new(
+                [Ok(base_batch)],
+                base_schema.clone(),
+            )),
+            &dataset_dir,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset.manifest.fragments.iter().all(|fragment| !fragment
+                .metadata
+                .contains_key(SCHEMA_FINGERPRINT_METADATA_KEY)),
+            "ordinary dataset writes should not pay for staged schema fingerprints"
+        );
+
+        // The distributed writer uses the same ids in a different order:
+        // (id=0, count=1, name=2) instead of (id=0, name=1, count=2).
+        let wrong_arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("count", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]));
+        let wrong_batch = RecordBatch::try_new(
+            wrong_arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(arrow_array::Int32Array::from(vec![30])),
+                Arc::new(StringArray::from(vec!["c"])),
+            ],
+        )
+        .unwrap();
+        let wrong_schema = Schema::try_from(wrong_arrow_schema.as_ref()).unwrap();
+        let fragment = FragmentCreateBuilder::new(&fragment_dir)
+            .schema(&wrong_schema)
+            .write(
+                Box::new(RecordBatchIterator::new(
+                    [Ok(wrong_batch)],
+                    wrong_arrow_schema,
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            fragment
+                .metadata
+                .contains_key(SCHEMA_FINGERPRINT_METADATA_KEY),
+            "staged fragment should carry a schema fingerprint"
+        );
+
+        let read_version = dataset.manifest.version;
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Append {
+                    fragments: vec![fragment.clone()],
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("schema fingerprint"), "{error}");
+
+        // A legacy fragment without the marker stays append-compatible.
+        let mut legacy = fragment;
+        legacy.metadata.remove(SCHEMA_FINGERPRINT_METADATA_KEY);
+        legacy
+            .validate_schema_fingerprint(dataset.schema())
+            .expect("legacy fragments should not be rejected");
+
+        // A staged fragment written with the target schema still matches.
+        let matching_dir = TempStrDir::default();
+        let matching_batch = RecordBatch::try_new(
+            base_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![4])),
+                Arc::new(StringArray::from(vec!["d"])),
+                Arc::new(arrow_array::Int32Array::from(vec![40])),
+            ],
+        )
+        .unwrap();
+        let matching_schema = dataset.schema().clone();
+        let matching = FragmentCreateBuilder::new(&matching_dir)
+            .schema(&matching_schema)
+            .write(
+                Box::new(RecordBatchIterator::new(
+                    [Ok(matching_batch)],
+                    base_schema.clone(),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        matching
+            .validate_schema_fingerprint(dataset.schema())
+            .expect("matching staged fragments should be accepted");
+
+        // The uncommitted InsertBuilder path used by the Python fragment API
+        // must also produce self-describing fragments.
+        let staged_dir = TempStrDir::default();
+        let staged_batch = RecordBatch::try_new(
+            base_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![5])),
+                Arc::new(StringArray::from(vec!["e"])),
+                Arc::new(arrow_array::Int32Array::from(vec![50])),
+            ],
+        )
+        .unwrap();
+        let transaction = InsertBuilder::new(&staged_dir)
+            .execute_uncommitted(vec![staged_batch])
+            .await
+            .unwrap();
+        let (Operation::Overwrite {
+            fragments: staged_fragments,
+            ..
+        }
+        | Operation::Append {
+            fragments: staged_fragments,
+        }) = transaction.operation
+        else {
+            panic!("unexpected staging operation");
+        };
+        assert!(
+            staged_fragments.iter().all(|fragment| fragment
+                .metadata
+                .contains_key(SCHEMA_FINGERPRINT_METADATA_KEY)),
+            "uncommitted InsertBuilder output should carry a schema fingerprint"
+        );
+    }
+
+    #[tokio::test]
     async fn test_fragment_write_with_schema() {
         // Uses provided schema. Field ids are correct in fragment metadata.
         let data = test_data();
@@ -727,6 +892,29 @@ mod tests {
         assert_eq!(fragments[0].deletion_file, None);
         assert_eq!(fragments[0].files.len(), 1);
         assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1]);
+        assert!(
+            fragments[0]
+                .metadata
+                .contains_key(SCHEMA_FINGERPRINT_METADATA_KEY),
+            "staged write_fragments output should carry a schema fingerprint"
+        );
+
+        let multi_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        let fragments = FragmentCreateBuilder::new(&multi_dir)
+            .write_params(&params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 3);
+        assert!(fragments.iter().all(|fragment| {
+            fragment
+                .metadata
+                .contains_key(SCHEMA_FINGERPRINT_METADATA_KEY)
+        }));
     }
 
     #[tokio::test]

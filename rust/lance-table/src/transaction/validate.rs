@@ -404,6 +404,9 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
 
     let result = match operation {
         Operation::Append { fragments } => {
+            for fragment in fragments {
+                fragment.validate_schema_fingerprint(&manifest.schema)?;
+            }
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }

@@ -763,9 +763,13 @@ public class TransactionTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         FragmentMetadata written = testDataset.createNewFragment(10);
-        // Old-style construction leaves both fields unset.
+        // Old-style construction leaves the user-facing fields unset. The
+        // writer may still attach reserved internal schema identity metadata.
         assertNull(written.getClusteringId());
-        assertTrue(written.getMetadata().isEmpty());
+        assertTrue(
+            written.getMetadata().keySet().stream()
+                .allMatch(key -> key.startsWith("lance.schema.")),
+            written.getMetadata().toString());
 
         Map<String, String> metadata = clusteringMetadata();
         // Java -> Rust: a populated map crosses the binding into the commit.
