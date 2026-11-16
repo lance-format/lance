@@ -732,6 +732,11 @@ impl AnyQuery for JsonQuery {
 pub struct JsonQueryParser {
     path: String,
     target_parser: Box<dyn ScalarQueryParser>,
+    /// The Arrow type the JSON index recorded for the value at `path`, when
+    /// known. A typed accessor only has the same meaning as the target index
+    /// when it produces this type, so a different accessor must fall back to a
+    /// scan instead of querying keys of another type.
+    recorded_target_type: Option<DataType>,
 }
 
 impl JsonQueryParser {
@@ -739,7 +744,17 @@ impl JsonQueryParser {
         Self {
             path,
             target_parser,
+            recorded_target_type: None,
         }
+    }
+
+    /// Compare typed accessors against the type recorded in the index details.
+    ///
+    /// Details written before the type was recorded carry `Unspecified`; they
+    /// keep their previous routing because there is no type to compare against.
+    pub(crate) fn with_recorded_target_type(mut self, target_type: Option<DataType>) -> Self {
+        self.recorded_target_type = target_type;
+        self
     }
 
     fn wrap_search(&self, target_expr: IndexedExpression) -> IndexedExpression {
@@ -871,6 +886,18 @@ impl ScalarQueryParser for JsonQueryParser {
                 // ensure that index 1 matches our path
                 match &udf.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(path)), _) if path == &self.path => {
+                        // The accessor and the target index must decode the path into the same
+                        // type. Typed accessors coerce values (for example, `json_get_int`
+                        // rounds floats and `json_get_string` renders numbers as text), while
+                        // the index stores only the recorded target type. A predicate on a
+                        // different type cannot be answered from those keys; in particular,
+                        // `IS NULL` would disagree on values the accessor cannot convert.
+                        // Leave it to the scan so the original predicate decides.
+                        if let Some(target_type) = self.recorded_target_type.as_ref()
+                            && target_type != &value_type
+                        {
+                            return None;
+                        }
                         Some(value_type)
                     }
                     _ => None,
@@ -1576,10 +1603,12 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         }
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
         let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
-        Some(Box::new(JsonQueryParser::new(
-            json_details.path.clone(),
-            target_parser,
-        )) as Box<dyn ScalarQueryParser>)
+        let recorded_target_type =
+            JsonIndexTargetType::from_pb(json_details.target_data_type).map(DataType::from);
+        Some(Box::new(
+            JsonQueryParser::new(json_details.path.clone(), target_parser)
+                .with_recorded_target_type(recorded_target_type),
+        ) as Box<dyn ScalarQueryParser>)
     }
 
     async fn load_index(

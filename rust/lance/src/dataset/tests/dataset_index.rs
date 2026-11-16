@@ -8623,19 +8623,35 @@ async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVer
     );
 }
 
-/// A typed `IS NULL` leaf in a composed filter must keep its original
-/// accessor when the recheck evaluates the filter. The index on `p` has a
-/// string target while the predicate asks `json_get_int`, and the two disagree
-/// about whether the nonnumeric string "many" is null. The inexact ngram leaf
-/// only yields a false positive for that row, so only the typed null leaf keeps
-/// it.
+/// The indexed scan must agree with a scan that ignores the index for the same
+/// predicate. The expected ids are literal because the full scan is only a
+/// second check, not the source of truth.
+async fn json_filter_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<u64> {
+    let mut scanner = dataset.scan();
+    scanner
+        .filter(filter)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .use_scalar_index(use_scalar_index);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+/// A typed accessor may only use a JSON index whose recorded target type it
+/// produces. The index stores keys of that one type, while accessors coerce
+/// values (`json_get_int` rounds nonintegral numbers, `json_get_string` renders
+/// numbers as text), so a mismatched accessor would answer a different
+/// question. This fixture also checks that an inexact index still accelerates
+/// when the types match, and that the legacy recheck evaluates the original
+/// predicate instead of an accessor reconstructed from the index expression.
 #[rstest]
 #[case::legacy(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
 #[tokio::test]
-async fn test_json_typed_is_null_recheck_composition(
-    #[case] data_storage_version: LanceFileVersion,
-) {
+async fn test_json_typed_index_routing_and_recheck(#[case] data_storage_version: LanceFileVersion) {
     let test_uri = TempStrDir::default();
     let mut metadata = HashMap::new();
     metadata.insert(
@@ -8649,17 +8665,19 @@ async fn test_json_typed_is_null_recheck_composition(
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(UInt64Array::from_iter_values(0..4)),
+            Arc::new(UInt64Array::from_iter_values(0..6)),
             Arc::new(StringArray::from(vec![
-                // `json_get_int` makes "many" null, but `json_get_string` does
-                // not. The ngram leaf is only a false positive for this row, so
-                // the row is reachable through the OR and the typed null leaf
-                // alone keeps it.
-                r#"{"p":"many","tag":"brazil ravioli avocado"}"#,
-                r#"{"p":null,"tag":"alpha-charlie"}"#,
-                r#"{"p":"7","tag":"unique-bravo"}"#,
+                // `json_get_int` makes "many" null, but `json_get_string` does not.
+                r#"{"p":"many","n":1.5,"m":10,"tag":"alpha-charlie"}"#,
+                // Both explicit null and a missing path are null for every accessor.
+                r#"{"p":null,"n":null,"m":null,"tag":"alpha-charlie"}"#,
+                r#"{"p":"7","n":2.5,"m":20,"tag":"unique-bravo"}"#,
                 // Ngram false positive that the recheck must drop.
-                r#"{"p":"7","tag":"brazil ravioli avocado"}"#,
+                r#"{"p":"7","n":2.0,"m":30,"tag":"brazil ravioli avocado"}"#,
+                r#"{"n":3.0,"tag":"alpha-charlie"}"#,
+                // Only the exact typed-null leaf keeps this row: its tag does
+                // contain "bravo", but the ngram index cannot supply `p`.
+                r#"{"p":"many","n":4.0,"m":40,"tag":"bravo-tango"}"#,
             ])),
         ],
     )
@@ -8675,88 +8693,160 @@ async fn test_json_typed_is_null_recheck_composition(
     )
     .await
     .unwrap();
-    let p_params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
-        "target_index_type": "btree",
-        "target_data_type": "Utf8",
-        "path": "p",
-    }));
-    dataset
-        .create_index(
-            &["json"],
-            IndexType::Scalar,
-            Some("json_p_idx".to_string()),
-            &p_params,
-            false,
-        )
-        .await
-        .unwrap();
-    let tag_params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
-        "target_index_type": "ngram",
-        "path": "tag",
-    }));
-    dataset
-        .create_index(
-            &["json"],
-            IndexType::Scalar,
-            Some("json_tag_ngram_idx".to_string()),
-            &tag_params,
-            false,
-        )
-        .await
-        .unwrap();
-
-    let filter =
-        "json_get_int(json, 'p') IS NULL OR contains(json_get_string(json, 'tag'), 'bravo')";
-    let plan = dataset
-        .scan()
-        .filter(filter)
-        .unwrap()
-        .explain_plan(false)
-        .await
-        .unwrap();
-    assert!(
-        plan.contains("MaterializeIndex") || plan.contains("ScalarIndexQuery"),
-        "plan must use an index: {plan}"
-    );
-    assert!(
-        plan.contains("json_p_idx") && plan.contains("json_tag_ngram_idx"),
-        "both composed leaves must be indexed: {plan}"
-    );
-    if data_storage_version == LanceFileVersion::Legacy {
-        assert!(
-            plan.contains("FilterExec"),
-            "legacy plan must recheck: {plan}"
-        );
+    for (name, params) in [
+        (
+            "json_p_idx",
+            ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+                "target_index_type": "btree",
+                "target_data_type": "Utf8",
+                "path": "p",
+            })),
+        ),
+        (
+            "json_n_idx",
+            ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+                "target_index_type": "btree",
+                "target_data_type": "Float64",
+                "path": "n",
+            })),
+        ),
+        (
+            "json_m_zonemap_idx",
+            ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+                "target_index_type": "zonemap",
+                "target_data_type": "Int64",
+                // Without a null bitmap the zone map is inexact for nulls and
+                // must recheck, which is what distinguishes the original
+                // `json_get_int` predicate from the string fallback.
+                "target_index_parameters": serde_json::to_string(&serde_json::json!({
+                    "rows_per_zone": 1,
+                    "store_null_bitmap": false,
+                })).unwrap(),
+                "path": "m",
+            })),
+        ),
+        (
+            "json_tag_ngram_idx",
+            ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+                "target_index_type": "ngram",
+                "path": "tag",
+            })),
+        ),
+    ] {
+        dataset
+            .create_index(
+                &["json"],
+                IndexType::Scalar,
+                Some(name.to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
     }
 
-    let expected = dataset
-        .scan()
-        .filter(filter)
-        .unwrap()
-        .use_scalar_index(false)
-        .project(&["id"])
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let result = dataset
-        .scan()
-        .filter(filter)
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let mut actual = result["id"].as_primitive::<UInt64Type>().values().to_vec();
-    actual.sort_unstable();
-    let mut expected_ids = expected["id"]
-        .as_primitive::<UInt64Type>()
-        .values()
-        .to_vec();
-    expected_ids.sort_unstable();
-    assert_eq!(expected_ids, vec![0, 1, 2], "full scan is the oracle");
-    assert_eq!(actual, expected_ids);
+    for (filter, expected_ids, used_index, unused_indexes, legacy_recheck_accessor) in [
+        (
+            "json_get_int(json, 'p') IS NULL",
+            vec![0, 1, 4, 5],
+            None,
+            &["json_p_idx"][..],
+            None,
+        ),
+        (
+            // The accessor type matches the recorded Utf8 target, so this one
+            // must still use the index.
+            "json_get_string(json, 'p') IS NULL",
+            vec![1, 4],
+            Some("json_p_idx"),
+            &[][..],
+            None,
+        ),
+        (
+            // With one OR side unindexable, the whole OR must fall back to a
+            // scan instead of intersecting candidate sets from different
+            // value domains.
+            "json_get_int(json, 'p') IS NULL OR contains(json_get_string(json, 'tag'), 'bravo')",
+            vec![0, 1, 2, 4, 5],
+            None,
+            &["json_p_idx"][..],
+            None,
+        ),
+        (
+            // The ngram branch is inexact, so the legacy scan rechecks. Row 5
+            // is only in the tag candidate set; the rejected `p` index must
+            // not remove it before the full predicate decides.
+            "json_get_int(json, 'p') IS NULL AND contains(json_get_string(json, 'tag'), 'bravo')",
+            vec![5],
+            Some("json_tag_ngram_idx"),
+            &["json_p_idx"][..],
+            None,
+        ),
+        (
+            // `json_get_int` rounds 1.5 to 2, while the Float64 index stores
+            // 1.5. Routing this to the index either misses row 0 or fails on
+            // the mismatched comparison type.
+            "json_get_int(json, 'n') = 2",
+            vec![0, 3],
+            None,
+            &["json_n_idx"][..],
+            None,
+        ),
+        (
+            // Matching Float64 accessor and target: the index must answer.
+            "json_get_float(json, 'n') = 2.0",
+            vec![3],
+            Some("json_n_idx"),
+            &[][..],
+            None,
+        ),
+        (
+            // Matching Int64 accessor and target, but an inexact zone map.
+            // The legacy recheck must use the original `json_get_int`, not
+            // the `json_get_string` fallback `JsonQuery::to_expr` produces
+            // for a null predicate.
+            "json_get_int(json, 'm') IS NULL",
+            vec![1, 4],
+            Some("json_m_zonemap_idx"),
+            &[][..],
+            Some("json_get_int"),
+        ),
+    ] {
+        let actual = json_filter_ids(&dataset, filter, true).await;
+        assert_eq!(actual, expected_ids, "indexed scan: {filter}");
+        let full = json_filter_ids(&dataset, filter, false).await;
+        assert_eq!(full, expected_ids, "full-scan oracle: {filter}");
+
+        let plan = dataset
+            .scan()
+            .filter(filter)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        if let Some(index) = used_index {
+            assert!(plan.contains(index), "expected {index} in plan: {plan}");
+        }
+        for index in unused_indexes {
+            assert!(
+                !plan.contains(index),
+                "expected {index} to be rejected in plan: {plan}"
+            );
+        }
+        if data_storage_version == LanceFileVersion::Legacy
+            && let Some(accessor) = legacy_recheck_accessor
+        {
+            let recheck = format!("FilterExec: {accessor}");
+            assert!(
+                plan.contains(&recheck),
+                "legacy recheck must use the original {accessor}: {plan}"
+            );
+            assert!(
+                !plan.contains("FilterExec: json_get_string"),
+                "legacy recheck must not use the string fallback: {plan}"
+            );
+        }
+    }
 }
 
 #[rstest]
