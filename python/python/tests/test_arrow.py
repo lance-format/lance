@@ -91,6 +91,14 @@ def test_bf16_repr():
 #     assert re.match(expected_re, repr(tab))
 
 
+def test_bf16_to_numpy_sliced():
+    np_arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=bfloat16)
+    arr = BFloat16Array.from_numpy(np_arr)
+    sliced = arr.slice(2, 2)
+    assert sliced.to_numpy().tolist() == [3.0, 4.0]
+    assert arr.to_numpy().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
 def test_bf16_array_str():
     from ml_dtypes import bfloat16
 

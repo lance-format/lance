@@ -133,7 +133,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// both to avoid using wrong row offsets during reconstruction.
     pub(crate) aux_ivf: IvfModel,
     pub(crate) distance_type: DistanceType,
-    pub(crate) sub_index_metadata: Vec<String>,
+    pub(crate) sub_index_metadata: Arc<[String]>,
     /// Parsed quantizer metadata — stored directly to avoid JSON re-parsing on
     /// every warm-path reconstruction.
     pub(crate) metadata: <Q::Storage as QuantizerStorage>::Metadata,
@@ -217,6 +217,89 @@ pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
 /// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
 /// expressible as a partition count: at most the prepare window plus two chunks.
 pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
+
+/// Fewest prepared-partition bytes one concurrent scoring task of a single
+/// query is given when a global-top-k chunk is split across CPU tasks.
+///
+/// A chunk is scored on one CPU thread unless it holds at least twice this
+/// many bytes, so small partitions keep the single-dispatch latency (#6475),
+/// while a query over large partitions, which otherwise ran on one core
+/// however idle the pool was, spreads its chunk over up to the compute CPUs.
+/// Each task costs a dispatch (~100µs); 1 MiB of PQ8 codes scores in several
+/// times that. Override with the `LANCE_IVF_SCORING_TASK_BYTES` environment
+/// variable.
+pub(crate) const DEFAULT_SCORING_TASK_BYTES: usize = 1024 * 1024;
+
+pub(crate) static SCORING_TASK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let task_bytes = std::env::var("LANCE_IVF_SCORING_TASK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_SCORING_TASK_BYTES")
+        })
+        .unwrap_or(DEFAULT_SCORING_TASK_BYTES);
+    assert!(
+        task_bytes > 0,
+        "LANCE_IVF_SCORING_TASK_BYTES must be greater than 0, got {task_bytes}"
+    );
+    task_bytes
+});
+
+/// Chunks scored by more than one task, for tests to observe the split.
+#[cfg(test)]
+pub(crate) static PARALLEL_SCORING_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Split `0..bytes.len()` into at most `max_tasks` contiguous ranges of
+/// roughly equal bytes, each holding at least `min_task_bytes` where the
+/// total allows; a total below `2 * min_task_bytes` is one range.
+fn balanced_byte_ranges(
+    bytes: &[usize],
+    min_task_bytes: usize,
+    max_tasks: usize,
+) -> Vec<Range<usize>> {
+    let total: usize = bytes.iter().sum();
+    let task_count = (total / min_task_bytes.max(1))
+        .clamp(1, max_tasks.max(1))
+        .min(bytes.len().max(1));
+    let target = total.div_ceil(task_count);
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    let mut sum = 0;
+    for (index, &size) in bytes.iter().enumerate() {
+        sum += size;
+        // Close the range before the next partition overshoots the target, so
+        // a partition below the target still gets a task of its own.
+        let next = bytes.get(index + 1).copied();
+        if ranges.len() + 1 < task_count && next.is_some_and(|next| sum + next > target) {
+            ranges.push(start..index + 1);
+            start = index + 1;
+            sum = 0;
+        }
+    }
+    if start < bytes.len() {
+        ranges.push(start..bytes.len());
+    }
+    ranges
+}
+
+/// Merges per-task top-k heaps into the `capacity` best entries, into the
+/// first heap.
+fn merge_topk_heaps(
+    heaps: Vec<BinaryHeap<OrderedNode<u64>>>,
+    capacity: usize,
+) -> BinaryHeap<OrderedNode<u64>> {
+    let mut heaps = heaps.into_iter();
+    let mut merged = heaps.next().unwrap_or_default();
+    for node in heaps.flatten() {
+        if merged.len() < capacity {
+            merged.push(node);
+        } else if merged.peek().is_some_and(|worst| worst.dist > node.dist) {
+            merged.pop();
+            merged.push(node);
+        }
+    }
+    merged
+}
 
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
@@ -1058,7 +1141,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 ivf,
                 aux_ivf,
                 distance_type,
-                sub_index_metadata: header.sub_index_metadata,
+                sub_index_metadata: header.sub_index_metadata.into(),
                 metadata,
                 sub_index_type,
                 quantization_type,
@@ -1129,7 +1212,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             index_file_path: self.index_file_path.clone(),
             uuid: self.uuid.to_string(),
             distance_type: self.distance_type.to_string(),
-            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_metadata: self.sub_index_metadata.to_vec(),
             sub_index_type: self.sub_index_type.to_string(),
             quantization_type: self.quantization_type.to_string(),
             quantizer_metadata_json,
@@ -1472,7 +1555,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// every column. Built once here because it is fallible and only depends on
     /// the file schema.
     read_projection: Option<ReaderProjection>,
-    sub_index_metadata: Vec<String>,
+    sub_index_metadata: Arc<[String]>,
     storage: IvfQuantizationStorage<Q>,
 
     distance_type: DistanceType,
@@ -2031,7 +2114,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             reader: index_reader,
             read_projection,
             storage,
-            sub_index_metadata,
+            sub_index_metadata: sub_index_metadata.into(),
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
             raw_cache,
@@ -2054,7 +2137,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: IvfModel,
         reader: FileReader,
         storage: IvfQuantizationStorage<Q>,
-        sub_index_metadata: Vec<String>,
+        sub_index_metadata: Arc<[String]>,
         distance_type: DistanceType,
         index_cache: LanceCache,
         raw_cache: WeakLanceCache,

@@ -32,6 +32,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{
@@ -603,6 +604,131 @@ impl RTreeIndex {
         }
     }
 
+    /// Merge caller-selected RTree segments into one self-contained segment.
+    ///
+    /// With `new_data = None`, only the stored entries are merged.
+    /// Source filters and remapping apply only to stored entries. New data must contain
+    /// geometry and row addresses, as for [`ScalarIndex::update`], in the sources' row
+    /// identifier domain: if the sources store row IDs, the new row addresses must equal
+    /// their row IDs.
+    ///
+    /// Sources may be laid out with different `page_size`s. Page size controls only the
+    /// output layout, so the merged segment is repacked with the first source's
+    /// `page_size`, which must be at least 2.
+    ///
+    /// Every source must store the same kind of row identifier (see
+    /// [`ScalarIndex::results_are_row_addresses`]); the merged index keeps it.
+    ///
+    /// `progress` reports when merging starts and when the output has been written.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use datafusion_execution::SendableRecordBatchStream;
+    /// use lance_core::Result;
+    /// use lance_geo::rtree::RTreeIndex;
+    /// use lance_index::progress::noop_progress;
+    /// use lance_index::scalar::{IndexStore, OldIndexDataFilter};
+    ///
+    /// async fn append(
+    ///     sources: &[Arc<RTreeIndex>],
+    ///     new_data: SendableRecordBatchStream,
+    ///     destination: &dyn IndexStore,
+    ///     filters: &[Option<OldIndexDataFilter>],
+    /// ) -> Result<()> {
+    ///     RTreeIndex::merge_segments(sources, Some(new_data), destination, filters, noop_progress()).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn merge_segments(
+        source_indices: &[Arc<Self>],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filters: &[Option<OldIndexDataFilter>],
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        if source_indices.is_empty() {
+            return Err(Error::invalid_input(
+                "RTree merge requires at least one source index",
+            ));
+        }
+        if source_indices.len() != old_data_filters.len() {
+            return Err(Error::invalid_input(format!(
+                "RTree merge received {} source indices but {} filters",
+                source_indices.len(),
+                old_data_filters.len()
+            )));
+        }
+
+        // Page size controls only the output layout, not the meaning of a leaf entry.
+        let page_size = source_indices[0].metadata.page_size;
+        validate_page_size(page_size)?;
+        // This function is public, so a direct caller -- not just the one
+        // in-repo wrapper, which already enforces this via `shared_segment_domain`
+        // before opening any segment -- could supply sources that disagree.
+        // Each source already carries its own `results_are_row_addresses`; check
+        // them here too, rather than silently combining row ids and row
+        // addresses in the same column.
+        let results_are_row_addresses = source_indices[0].results_are_row_addresses;
+        if source_indices
+            .iter()
+            .any(|source| source.results_are_row_addresses != results_are_row_addresses)
+        {
+            return Err(Error::invalid_input(
+                "cannot merge RTree segments that disagree on whether they store row ids or row \
+                 addresses -- rebuild them into one segment first",
+            ));
+        }
+        progress
+            .stage_start("merge_rtree_segments", None, "")
+            .await?;
+        let mut data_streams =
+            Vec::with_capacity(source_indices.len() + usize::from(new_data.is_some()));
+        let mut null_map = RowAddrTreeMap::new();
+
+        for (source, filter) in source_indices.iter().zip(old_data_filters) {
+            if filter_keeps_nothing(filter) {
+                continue;
+            }
+            let (data, source_nulls) = source.retained_data(filter.as_ref()).await?;
+            data_streams.push(data);
+            null_map |= &source_nulls;
+        }
+
+        if let Some(new_data) = new_data {
+            data_streams.push(RTreeIndexPlugin::convert_bbox_stream(new_data)?);
+        }
+
+        let combined = Box::pin(RecordBatchStreamAdapter::new(
+            BBOX_ROWADDR_SCHEMA.clone(),
+            stream::select_all(data_streams),
+        ));
+        let tmpdir = Arc::new(TempDir::default());
+        let spill_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let (bbox_data, mut stats) =
+            RTreeIndexPlugin::process_and_analyze_bbox_stream(combined, page_size, spill_store)
+                .await?;
+        stats.null_map |= &null_map;
+        let files =
+            RTreeIndexPlugin::train_rtree_index(bbox_data, stats, page_size, dest_store).await?;
+        progress.stage_complete("merge_rtree_segments").await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
+            // Preserve the sources' own domain rather than the latest version this
+            // build can write: merging row-id-domain segments (valid without
+            // stable row ids) must not silently flip the result to address domain.
+            index_version: rtree_index_version(results_are_row_addresses),
+            files,
+        })
+    }
+
     /// Prepare old entries in the current row-ID domain before filtering either
     /// representation. New input must bypass this helper, even when it reuses old IDs.
     async fn retained_data(
@@ -709,121 +835,21 @@ fn remap_rtree_data_async(
 
 /// Merge caller-selected RTree segments into one self-contained segment.
 ///
-/// Each source may supply a filter for rows that are still live. The merged index recomputes its
-/// bounding box from the retained, remapped rows and preserves retained null row IDs.
-///
-/// Every source must store the same kind of row identifier (see
-/// [`ScalarIndex::results_are_row_addresses`]); the merged index keeps it.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::sync::Arc;
-///
-/// use lance_core::Result;
-/// use lance_index::scalar::OldIndexDataFilter;
-/// use lance_index::scalar::lance_format::LanceIndexStore;
-/// use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
-///
-/// async fn merge(
-///     segments: &[Arc<RTreeIndex>],
-///     destination: &LanceIndexStore,
-///     filters: &[Option<OldIndexDataFilter>],
-/// ) -> Result<()> {
-///     merge_rtree_indices(segments, destination, filters).await?;
-///     Ok(())
-/// }
-/// ```
+/// Use [`RTreeIndex::merge_segments`] with `new_data = None` for the same operation.
+#[deprecated(note = "use RTreeIndex::merge_segments with new_data = None")]
 pub async fn merge_rtree_indices(
     source_indices: &[Arc<RTreeIndex>],
     dest_store: &dyn IndexStore,
     old_data_filters: &[Option<OldIndexDataFilter>],
 ) -> Result<CreatedIndex> {
-    if source_indices.is_empty() {
-        return Err(Error::invalid_input(
-            "merge_rtree_indices requires at least one source index",
-        ));
-    }
-    if source_indices.len() != old_data_filters.len() {
-        return Err(Error::invalid_input(format!(
-            "merge_rtree_indices received {} source indices but {} filters",
-            source_indices.len(),
-            old_data_filters.len()
-        )));
-    }
-
-    let first_contributing = source_indices
-        .iter()
-        .zip(old_data_filters)
-        .find(|(source, filter)| source.metadata.num_items > 0 && !filter_keeps_nothing(filter))
-        .or_else(|| {
-            source_indices
-                .iter()
-                .zip(old_data_filters)
-                .find(|(_, filter)| !filter_keeps_nothing(filter))
-        })
-        .map(|(source, _)| source)
-        .unwrap_or(&source_indices[0]);
-    let page_size = first_contributing.metadata.page_size;
-    validate_page_size(page_size)?;
-    // This function is public, so a direct caller -- not just the one
-    // in-repo wrapper, which already enforces this via `shared_segment_domain`
-    // before opening any segment -- could supply sources that disagree.
-    // Each source already carries its own `results_are_row_addresses`; check
-    // them here too, rather than silently combining row ids and row
-    // addresses in the same column.
-    let results_are_row_addresses = source_indices[0].results_are_row_addresses;
-    if source_indices
-        .iter()
-        .any(|source| source.results_are_row_addresses != results_are_row_addresses)
-    {
-        return Err(Error::invalid_input(
-            "cannot merge RTree segments that disagree on whether they store row ids or row \
-             addresses -- rebuild them into one segment first",
-        ));
-    }
-    let mut data_streams = Vec::with_capacity(source_indices.len());
-    let mut null_map = RowAddrTreeMap::new();
-
-    for (source, filter) in source_indices.iter().zip(old_data_filters) {
-        if filter_keeps_nothing(filter) {
-            continue;
-        }
-        if source.metadata.num_items > 0 && source.metadata.page_size != page_size {
-            return Err(Error::invalid_input(format!(
-                "cannot merge RTree segments with different page sizes: {} and {}",
-                page_size, source.metadata.page_size
-            )));
-        }
-        let (data, source_nulls) = source.retained_data(filter.as_ref()).await?;
-        data_streams.push(data);
-        null_map |= &source_nulls;
-    }
-
-    let combined = Box::pin(RecordBatchStreamAdapter::new(
-        BBOX_ROWADDR_SCHEMA.clone(),
-        stream::select_all(data_streams),
-    ));
-    let tmpdir = Arc::new(TempDir::default());
-    let spill_store = Arc::new(LanceIndexStore::new(
-        Arc::new(ObjectStore::local()),
-        tmpdir.obj_path(),
-        Arc::new(LanceCache::no_cache()),
-    ));
-    let (bbox_data, mut stats) =
-        RTreeIndexPlugin::process_and_analyze_bbox_stream(combined, page_size, spill_store).await?;
-    stats.null_map = null_map;
-    let files =
-        RTreeIndexPlugin::train_rtree_index(bbox_data, stats, page_size, dest_store).await?;
-
-    Ok(CreatedIndex {
-        index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
-        // Preserve the sources' own domain rather than the latest version this
-        // build can write: merging row-id-domain segments (valid without
-        // stable row ids) must not silently flip the result to address domain.
-        index_version: rtree_index_version(results_are_row_addresses),
-        files,
-    })
+    RTreeIndex::merge_segments(
+        source_indices,
+        None,
+        dest_store,
+        old_data_filters,
+        noop_progress(),
+    )
+    .await
 }
 
 impl DeepSizeOf for RTreeIndex {
@@ -974,44 +1000,14 @@ impl ScalarIndex for RTreeIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
-        let (old_data, null_map) = self.retained_data(old_data_filter.as_ref()).await?;
-        let combined_bbox_data = Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWADDR_SCHEMA.clone(),
-            stream::select(old_data, bbox_data),
-        ));
-        let tmpdir = Arc::new(TempDir::default());
-        let spill_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.obj_path(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let (bbox_data, mut stats) = RTreeIndexPlugin::process_and_analyze_bbox_stream(
-            combined_bbox_data,
-            self.metadata.page_size,
-            spill_store.clone(),
-        )
-        .await?;
-
-        stats.null_map |= &null_map;
-
-        let files = RTreeIndexPlugin::train_rtree_index(
-            bbox_data,
-            stats,
-            self.metadata.page_size,
+        Self::merge_segments(
+            &[Arc::new(self.clone())],
+            Some(new_data),
             dest_store,
+            &[old_data_filter],
+            noop_progress(),
         )
-        .await?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
-            // New data is always scanned as row addresses, which only matches a
-            // row-id-domain segment where the two coincide (no stable row
-            // ids); the caller rebuilds such a segment otherwise. Either way
-            // the result keeps this segment's own domain.
-            index_version: rtree_index_version(self.results_are_row_addresses),
-            files,
-        })
+        .await
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -1940,7 +1936,7 @@ mod tests {
     #[case::all_filtered("none", "all_filtered")]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_merge_rtree_indices_filters_rows_and_nulls(
+    async fn test_merge_segments_filters_rows_and_nulls(
         #[case] remapping: &str,
         #[case] filter_kind: &str,
     ) {
@@ -2026,7 +2022,7 @@ mod tests {
         let mut second_builder = PointBuilder::new(point_type);
         second_builder.push_point(Some(&geo_types::point!(x: 100.0, y: 100.0)));
         second_builder.push_null();
-        // A fully excluded source must not trigger a page-size mismatch.
+        // A fully excluded source contributes neither geometry nor nulls.
         let (second_index, _second_store, _second_tmpdir) =
             train_index(&second_builder.finish(), Some(8)).await;
         let merged_tmpdir = TempObjDir::default();
@@ -2035,14 +2031,16 @@ mod tests {
             merged_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        merge_rtree_indices(
+        RTreeIndex::merge_segments(
             &[empty_index, Arc::new(first_index), second_index],
+            None,
             merged_store.as_ref(),
             &[
                 None,
                 Some(filter),
                 Some(OldIndexDataFilter::RowIds(RowAddrTreeMap::new())),
             ],
+            noop_progress(),
         )
         .await
         .unwrap();
@@ -2665,7 +2663,14 @@ mod tests {
                 Arc::new(LanceCache::no_cache()),
             ));
             let filters = vec![None; sources.len()];
-            let result = merge_rtree_indices(&sources, dest_store.as_ref(), &filters).await;
+            let result = RTreeIndex::merge_segments(
+                &sources,
+                None,
+                dest_store.as_ref(),
+                &filters,
+                noop_progress(),
+            )
+            .await;
             (result, tmpdir)
         };
 

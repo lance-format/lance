@@ -46,6 +46,7 @@ use lance_file::reader::{
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
+use lance_file::writer::FileWriterOptions;
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
@@ -1301,14 +1302,25 @@ impl FileFragment {
         dataset_schema: &Schema,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<Vec<(u32, u64)>> {
+        let read_config = FragReadConfig::default().with_scan_scheduler(scan_scheduler);
         let mut stats = Vec::new();
         for reader in self
-            .open_readers_with_full_metadata(
-                dataset_schema,
-                &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
-            )
+            .open_readers_with_full_metadata(dataset_schema, &read_config)
             .await?
         {
+            stats.extend(reader.storage_stats()?);
+        }
+        // An overlay's values live outside the base data files, but they are
+        // bytes their fields occupy on disk all the same.
+        let overlay_readers = try_join_all(self.metadata.overlays.iter().map(|overlay| {
+            self.open_reader_with_full_metadata(
+                &overlay.data_file,
+                Some(dataset_schema),
+                &read_config,
+            )
+        }))
+        .await?;
+        for reader in overlay_readers.into_iter().flatten() {
             stats.extend(reader.storage_stats()?);
         }
         Ok(stats)
@@ -2330,9 +2342,10 @@ impl FileFragment {
         // Re-map the indices to row ids using the deletion vector
         let deletion_vector = self.get_deletion_vector().await?;
         let row_ids = if let Some(deletion_vector) = deletion_vector {
-            // Naive case is O(N*M), where N = indices.len() and M = deletion_vector.len()
-            // We can do better by sorting the deletion vector and using binary search
-            // This is O(N * log M + M log M).
+            // Sorting the deletion vector costs O(M log M), where M is the
+            // deletion vector length. Each index is then resolved with a
+            // binary search over the sorted deletions, for a total of
+            // O(N log M + M log M) where N = indices.len().
             let mut sorted_deleted_ids = deletion_vector
                 .as_ref()
                 .clone()
@@ -2558,7 +2571,7 @@ impl FileFragment {
         let mut last_id = row_ids[0];
 
         for id in row_ids.iter().skip(1) {
-            if *id != last_id + 1 {
+            if last_id.checked_add(1) != Some(*id) {
                 return false;
             }
             last_id = *id;
@@ -2916,12 +2929,27 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        self.write_columns_with_file_writer_options(data, schema, FileWriterOptions::default())
+            .await
+    }
+
+    /// Write replacement column data with runtime file-writer options.
+    ///
+    /// This has the same format and commit semantics as [`Self::write_columns`].
+    /// The options control buffering and execution only; the fragment's
+    /// manifest still selects the file grammar and physical layout.
+    pub async fn write_columns_with_file_writer_options(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        file_writer_options: FileWriterOptions,
+    ) -> Result<super::transaction::DataReplacementGroup> {
         let write_version = self
             .dataset
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.write_column_with_version(data, schema, write_version)
+        self.write_column_with_version_and_options(data, schema, write_version, file_writer_options)
             .await
     }
 
@@ -2950,6 +2978,22 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
         write_version: ConcreteFileVersion,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        self.write_column_with_version_and_options(
+            data,
+            schema,
+            write_version,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    async fn write_column_with_version_and_options(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        write_version: ConcreteFileVersion,
+        file_writer_options: FileWriterOptions,
     ) -> Result<super::transaction::DataReplacementGroup> {
         versions::validate_write_version(
             self.dataset
@@ -2998,11 +3042,12 @@ impl FileFragment {
             true,
         )
         .await?;
-        let mut writer = versions::open_update_writer(
+        let mut writer = versions::open_update_writer_with_options(
             write_version,
             self.dataset.as_ref(),
             &writer_schema,
             has_blob_v2,
+            file_writer_options,
         )
         .await?;
         let staged_path = {
@@ -3339,40 +3384,32 @@ impl FileFragment {
 }
 
 /// Using deleted ids to remap row ids into actual row ids.
+///
+/// The live row with logical index `i` sits at physical row `i + k`, where `k`
+/// is the number of deleted rows before it. The `j`-th deletion (0-based) has
+/// `deleted[j] - j` live rows before it, a count that never decreases with
+/// `j`, so it comes before the live row exactly when `deleted[j] - j <= i`.
+/// One binary search over the sorted deletions finds `k`. For example, if
+/// deleted rows are [2, 3, 5], the counts are [2, 2, 3], and row 4 has all
+/// three deletions before it, so it is at physical row 7.
 pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
-    let mut row_ids = row_ids.to_vec();
-    for row_id in row_ids.iter_mut() {
-        // We find the number of deleted rows that are less than each row
-        // index, and that becomes the initial offset. We increment the
-        // index by that amount, plus the number of deleted row ids we
-        // encounter along the way. So for example, if deleted rows are
-        // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
-        // 2 and 3 are less than 4). That puts us at row 6, but since
-        // we passed row 5, we need to advance by 1 more, giving a final
-        // row id of 7.
-        let mut new_row_id = *row_id;
-        let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
-
-        let mut deletion_i = offset;
-        let mut i = 0;
-        while i < offset {
-            // Advance the row id
-            new_row_id += 1;
-            while deletion_i < sorted_deleted_ids.len()
-                && sorted_deleted_ids[deletion_i] == new_row_id
-            {
-                // If we encounter a deleted row, we need to advance
-                // again.
-                deletion_i += 1;
-                new_row_id += 1;
-            }
-            i += 1;
-        }
-
-        *row_id = new_row_id;
-    }
-
     row_ids
+        .iter()
+        .map(|&row_id| {
+            let logical_index = row_id as usize;
+            // Deletion ids are unique and ascending, so `deleted[j] >= j`.
+            let (mut lo, mut hi) = (0, sorted_deleted_ids.len());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if sorted_deleted_ids[mid] as usize - mid <= logical_index {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            (logical_index + lo) as u32
+        })
+        .collect()
 }
 
 // Cache key for file metadata
@@ -7319,6 +7356,48 @@ mod tests {
         // Deleting from the end
         check("i >= 15", 10..15, vec![10, 11, 12, 13, 14]).await;
         check("i >= 15", 0..15, (0..15).collect()).await;
+    }
+
+    #[test]
+    fn test_resolve_actual_row_ids() {
+        // Doc example on resolve_actual_row_ids: with deletions [2, 3, 5],
+        // logical row 4 resolves to physical row 7.
+        assert_eq!(resolve_actual_row_ids(&[4], &[2, 3, 5]), vec![7]);
+
+        // Rows below every deletion map to themselves.
+        assert_eq!(resolve_actual_row_ids(&[0, 1], &[2, 3, 5]), vec![0, 1]);
+        // Indices that land on deleted positions skip past them.
+        assert_eq!(resolve_actual_row_ids(&[2], &[2, 3, 5]), vec![4]);
+        assert_eq!(resolve_actual_row_ids(&[5], &[2, 3, 5]), vec![8]);
+        // Repeated indices are resolved independently.
+        assert_eq!(
+            resolve_actual_row_ids(&[0, 0, 1, 1], &[1]),
+            vec![0, 0, 2, 2]
+        );
+        // No deletions is the identity mapping.
+        assert_eq!(resolve_actual_row_ids(&[3, 7], &[]), vec![3, 7]);
+    }
+
+    #[test]
+    fn test_resolve_actual_row_ids_matches_a_walk_over_live_rows() {
+        // Deletion sets that are empty, dense, sparse, a long prefix and a
+        // tail, checked against walking the live rows one by one.
+        let num_rows = 2_000u32;
+        let deletion_sets: Vec<Vec<u32>> = vec![
+            vec![],
+            (0..num_rows).filter(|row| row % 3 != 0).collect(),
+            (0..num_rows).filter(|row| row % 97 == 5).collect(),
+            (0..1_500).collect(),
+            (1_000..num_rows - 1).collect(),
+        ];
+        for deleted in deletion_sets {
+            let live: Vec<u32> = (0..num_rows)
+                .filter(|row| deleted.binary_search(row).is_err())
+                .collect();
+            let indices: Vec<u32> = (0..live.len() as u32).rev().collect();
+            let expected: Vec<u32> = indices.iter().map(|&i| live[i as usize]).collect();
+            assert_eq!(resolve_actual_row_ids(&indices, &deleted), expected);
+        }
     }
 
     #[rstest]
