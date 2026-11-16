@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Selected metadata-only List structure with null byte leaves, under one admission.
+
+use std::{ops::Range, sync::Arc};
+
+use arrow_array::{ArrayRef, make_array};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow_data::ArrayData;
+use arrow_schema::DataType;
+use lance_core::{Error, Result, utils::allocation::Reservation};
+
+use super::{
+    SparsePositionDecoder, SparsePositionPlan, SparseValidityMeaning, SparseValiditySet,
+    position_decoder, validity_set_decoder,
+};
+use crate::{
+    data::{AllNullDataBlock, DataBlock},
+    decoder::{PageEncoding, PageInfo},
+    encodings::physical::sequence::{SequenceDecoder, SequenceMetadata},
+    format::{metadata::CompressiveEncoding, pb23},
+};
+
+fn corrupt(message: &str) -> Error {
+    Error::corrupt_file_named("admitted sparse List", message)
+}
+
+fn ready_positions(decoder: SparsePositionDecoder) -> Result<SparsePositionPlan> {
+    match decoder {
+        SparsePositionDecoder::Ready(positions) => Ok(positions),
+        SparsePositionDecoder::Encoded { .. } => Err(Error::not_supported(
+            "admitted sparse List requires metadata-only positions",
+        )),
+    }
+}
+
+fn validity(
+    descriptor: Option<&pb23::SparseValiditySet>,
+    domain: u64,
+) -> Result<SparseValiditySet> {
+    let descriptor = descriptor.ok_or_else(|| corrupt("missing validity"))?;
+    let (decoder, _) = validity_set_decoder(descriptor, domain, "admitted List validity")?;
+    Ok(SparseValiditySet {
+        meaning: decoder.meaning,
+        positions: ready_positions(decoder.positions)?,
+    })
+}
+
+fn null_count(validity: &SparseValiditySet, rows: &Range<u64>) -> u64 {
+    let selected = validity.positions.rank(rows.end) - validity.positions.rank(rows.start);
+    match validity.meaning {
+        SparseValidityMeaning::NullPositions => selected,
+        SparseValidityMeaning::ValidPositions => rows.end - rows.start - selected,
+    }
+}
+
+#[derive(Debug)]
+struct Counts {
+    first: u64,
+    step: u64,
+    len: u64,
+}
+
+impl Counts {
+    fn parse(encoding: Option<&CompressiveEncoding>, len: u64) -> Result<Self> {
+        let encoding = encoding.ok_or_else(|| corrupt("missing unsigned counts descriptor"))?;
+        let sequence = SequenceDecoder::try_new(encoding, 64, len)?;
+        let (first, step) = match sequence.metadata().filter(|_| !sequence.requires_payload()) {
+            Some(SequenceMetadata::Empty) => (0, 0),
+            Some(SequenceMetadata::Constant(value)) => (value, 0),
+            Some(SequenceMetadata::Range { start, step }) => (start, step),
+            None => {
+                return Err(Error::not_supported(
+                    "admitted sparse List requires metadata-only counts",
+                ));
+            }
+        };
+        if len > 0 && first == 0 {
+            return Err(corrupt("nonempty List counts must be positive"));
+        }
+        let counts = Self { first, step, len };
+        counts.prefix(len)?;
+        Ok(counts)
+    }
+
+    fn prefix(&self, count: u64) -> Result<u64> {
+        if count > self.len {
+            return Err(corrupt("count prefix exceeds descriptor cardinality"));
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        // SequenceDecoder already checked the last element. Divide the even
+        // factor first so summing two u64 endpoints cannot overflow u128.
+        let endpoints = u128::from(self.first) * 2 + u128::from(self.step) * u128::from(count - 1);
+        let sum = if count.is_multiple_of(2) {
+            u128::from(count / 2) * endpoints
+        } else {
+            u128::from(count) * (endpoints / 2)
+        };
+        u64::try_from(sum).map_err(|_| corrupt("List count sum overflows u64"))
+    }
+}
+
+#[derive(Debug)]
+struct ListMetadata {
+    non_empty: SparsePositionPlan,
+    counts: Counts,
+    validity: SparseValiditySet,
+}
+
+impl ListMetadata {
+    fn child_before(&self, row: u64) -> Result<u64> {
+        self.counts.prefix(self.non_empty.rank(row))
+    }
+}
+
+#[derive(Debug)]
+pub(in crate::encodings::logical::primitive) struct MetadataListScheduler {
+    rows: u64,
+    lists: Arc<[ListMetadata]>,
+}
+
+impl MetadataListScheduler {
+    pub(in crate::encodings::logical::primitive) fn try_from_page(
+        page: &PageInfo,
+    ) -> Result<Option<Self>> {
+        let PageEncoding::Planar(layout) = &page.encoding else {
+            return Ok(None);
+        };
+        if !matches!(
+            layout.values.as_ref().and_then(|v| v.codec.as_ref()),
+            Some(pb23::value_plane::Codec::None(_))
+        ) {
+            return Ok(None);
+        }
+        let Some(structure) = layout.sparse() else {
+            return Ok(None);
+        };
+        if !matches!(
+            structure.layers.first().and_then(|l| l.layer.as_ref()),
+            Some(pb23::sparse_structural_layer::Layer::List(_))
+        ) {
+            return Ok(None);
+        }
+        let mut domain = page.num_rows;
+        let mut lists = Vec::with_capacity(structure.layers.len());
+        let mut has_leaf = false;
+        for layer in &structure.layers {
+            match &layer.layer {
+                Some(pb23::sparse_structural_layer::Layer::List(list)) if !has_leaf => {
+                    let positions = list
+                        .non_empty_positions
+                        .as_ref()
+                        .ok_or_else(|| corrupt("missing nonempty positions descriptor"))?;
+                    let non_empty = ready_positions(position_decoder(
+                        positions,
+                        list.num_non_empty_positions,
+                        domain,
+                        "admitted List nonempty",
+                    )?)?;
+                    let counts = Counts::parse(list.counts.as_ref(), list.num_non_empty_positions)?;
+                    if counts.prefix(list.num_non_empty_positions)? != list.num_child_slots {
+                        return Err(corrupt("List count sum differs from child domain"));
+                    }
+                    let validity = validity(list.validity.as_ref(), domain)?;
+                    // Reuse the sparse reader's checked set containment/intersection,
+                    // including its arithmetic-set path, without materializing rows.
+                    if !validity.contains_only_valid_positions(&non_empty, domain)? {
+                        return Err(corrupt("null List parent contains child slots"));
+                    }
+                    lists.push(ListMetadata {
+                        non_empty,
+                        counts,
+                        validity,
+                    });
+                    domain = list.num_child_slots;
+                }
+                Some(pb23::sparse_structural_layer::Layer::Validity(leaf)) if !has_leaf => {
+                    if null_count(&validity(Some(leaf), domain)?, &(0..domain)) != domain {
+                        return Err(corrupt(
+                            "no-values List leaf does not prove all children null",
+                        ));
+                    }
+                    has_leaf = true;
+                }
+                _ => {
+                    return Err(Error::not_supported(
+                        "admitted sparse List requires a List chain and one byte leaf",
+                    ));
+                }
+            }
+        }
+        if !has_leaf {
+            return Err(corrupt("missing leaf validity"));
+        }
+        if !page.buffer_offsets_and_sizes.is_empty() {
+            return Err(corrupt("metadata-only List has unexpected buffers"));
+        }
+        Ok(Some(Self {
+            rows: page.num_rows,
+            lists: lists.into(),
+        }))
+    }
+
+    pub(in crate::encodings::logical::primitive) fn validate_array_type(
+        &self,
+        data_type: &DataType,
+    ) -> Result<()> {
+        let mut current = data_type;
+        for _ in self.lists.iter() {
+            let (DataType::List(field) | DataType::LargeList(field)) = current else {
+                return Err(Error::not_supported(
+                    "sparse List Arrow depth differs from stored structure",
+                ));
+            };
+            current = field.data_type();
+        }
+        if !matches!(
+            current,
+            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8
+        ) {
+            return Err(Error::not_supported(
+                "admitted sparse List requires a byte/string leaf",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in crate::encodings::logical::primitive) fn prepare(
+        &self,
+        rows: Range<u64>,
+        data_type: DataType,
+    ) -> Result<MetadataListInput> {
+        self.validate_array_type(&data_type)?;
+        if rows.start >= rows.end || rows.end > self.rows {
+            return Err(Error::invalid_input(
+                "sparse List selection is outside the page or empty",
+            ));
+        }
+        Ok(MetadataListInput {
+            rows,
+            data_type,
+            lists: self.lists.clone(),
+        })
+    }
+}
+
+struct LayerOutput<'a> {
+    metadata: &'a ListMetadata,
+    data_type: &'a DataType,
+    rows: Range<u64>,
+    child_start: u64,
+    len: usize,
+    width: usize,
+    offsets: usize,
+    bitmap: usize,
+}
+
+fn offset_bytes(rows: u64, width: usize) -> Result<usize> {
+    usize::try_from(rows)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(width))
+        .ok_or_else(|| Error::invalid_input("List offsets size exceeds addressable allocation"))
+}
+
+#[derive(Debug)]
+pub(in crate::encodings::logical::primitive) struct MetadataListInput {
+    rows: Range<u64>,
+    data_type: DataType,
+    lists: Arc<[ListMetadata]>,
+}
+
+impl MetadataListInput {
+    pub(in crate::encodings::logical::primitive) fn decode_in(
+        self,
+        workspace: &mut Reservation,
+    ) -> Result<Option<ArrayRef>> {
+        let mut rows = self.rows;
+        let mut current_type = &self.data_type;
+        let mut plan = Vec::with_capacity(self.lists.len());
+        let mut total = 0_usize;
+        for metadata in self.lists.iter() {
+            let (width, field, max_offset) = match current_type {
+                DataType::List(field) => (4, field, i32::MAX as u64),
+                DataType::LargeList(field) => (8, field, i64::MAX as u64),
+                _ => return Err(Error::invalid_input("expected admitted List shape")),
+            };
+            let children = metadata.child_before(rows.start)?..metadata.child_before(rows.end)?;
+            if children.end - children.start > max_offset {
+                return Err(Error::invalid_input(
+                    "selected List children exceed Arrow offset width",
+                ));
+            }
+            let count = rows.end - rows.start;
+            let offsets = offset_bytes(count, width)?;
+            let len = usize::try_from(count)
+                .map_err(|_| Error::invalid_input("List length exceeds usize"))?;
+            let bitmap = if null_count(&metadata.validity, &rows) == 0 {
+                0
+            } else {
+                len.div_ceil(8)
+            };
+            total = total
+                .checked_add(offsets)
+                .and_then(|n| n.checked_add(bitmap))
+                .ok_or_else(|| Error::invalid_input("List output size overflows"))?;
+            plan.push(LayerOutput {
+                metadata,
+                data_type: current_type,
+                rows,
+                child_start: children.start,
+                len,
+                width,
+                offsets,
+                bitmap,
+            });
+            current_type = field.data_type();
+            rows = children;
+        }
+        let leaf_rows = rows.end - rows.start;
+        let leaf_width = if matches!(current_type, DataType::Binary | DataType::Utf8) {
+            4
+        } else {
+            8
+        };
+        let leaf_bitmap = usize::try_from(leaf_rows.div_ceil(8))
+            .map_err(|_| Error::invalid_input("List leaf bitmap exceeds usize"))?;
+        total = total
+            .checked_add(offset_bytes(leaf_rows, leaf_width)?)
+            .and_then(|n| n.checked_add(leaf_bitmap))
+            .ok_or_else(|| Error::invalid_input("List output size overflows"))?;
+        if total > workspace.len() {
+            return Ok(None);
+        }
+        let mut child = DataBlock::AllNull(AllNullDataBlock {
+            num_values: leaf_rows,
+        })
+        .try_to_arrow_in(current_type, workspace)?
+        .ok_or_else(|| Error::internal("List preflight underestimated null leaf"))?;
+        for layer in plan.into_iter().rev() {
+            let mut allocation = workspace
+                .try_allocate(layer.offsets + layer.bitmap)?
+                .ok_or_else(|| Error::internal("List preflight underestimated parent"))?;
+            allocation.as_mut().fill(0);
+            for (index, row) in (layer.rows.start..=layer.rows.end).enumerate() {
+                let offset = layer.metadata.child_before(row)? - layer.child_start;
+                let target =
+                    &mut allocation.as_mut()[index * layer.width..(index + 1) * layer.width];
+                // The complete selected child domain was checked against this width.
+                if layer.width == 4 {
+                    target.copy_from_slice(&(offset as i32).to_ne_bytes());
+                } else {
+                    target.copy_from_slice(&(offset as i64).to_ne_bytes());
+                }
+            }
+            if layer.bitmap > 0 {
+                let null_positions = matches!(
+                    layer.metadata.validity.meaning,
+                    SparseValidityMeaning::NullPositions
+                );
+                for (index, row) in layer.rows.clone().enumerate() {
+                    if layer.metadata.validity.positions.contains(row) != null_positions {
+                        allocation.as_mut()[layer.offsets + index / 8] |= 1 << (index % 8);
+                    }
+                }
+            }
+            let buffer = Buffer::from(allocation.freeze());
+            let nulls = (layer.bitmap > 0).then(|| {
+                NullBuffer::new(BooleanBuffer::new(
+                    buffer.slice_with_length(layer.offsets, layer.bitmap),
+                    0,
+                    layer.len,
+                ))
+            });
+            child = ArrayData::builder(layer.data_type.clone())
+                .len(layer.len)
+                .add_buffer(buffer.slice_with_length(0, layer.offsets))
+                .nulls(nulls)
+                .add_child_data(child)
+                .build()?;
+        }
+        Ok(Some(make_array(child)))
+    }
+}
+
+#[cfg(test)]
+mod tests;

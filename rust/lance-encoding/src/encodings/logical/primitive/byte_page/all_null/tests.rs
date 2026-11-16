@@ -217,8 +217,8 @@ fn rejects_unproven_sparse_nulls(#[case] kind: u8) {
     assert!(error.to_string().contains("null") || error.to_string().contains("empty unsigned"));
 }
 
-#[test]
-fn no_values_is_not_evidence_that_nested_parents_are_null() {
+#[tokio::test]
+async fn no_values_preserves_nonempty_parents_with_null_children() {
     let mut page = fixture(1);
     let PageEncoding::Planar(layout) = &mut page.encoding else {
         unreachable!()
@@ -261,11 +261,29 @@ fn no_values_is_not_evidence_that_nested_parents_are_null() {
         });
     }
     // No-values leaves must never shortcut the nonempty parent structure.
-    let error =
+    let scheduler =
         AdmittedBytePageScheduler::try_from_page(&page, &DefaultDecompressionStrategy::default())
-            .unwrap_err();
-    assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("dense FullZip page"));
+            .unwrap();
+    let field = Arc::new(Field::new("item", DataType::LargeBinary, true));
+    let data_type = DataType::List(field.clone());
+    let budget = AllocationBudget::new(1024);
+    let mut work = budget.try_reserve(1024).unwrap();
+    let input = scheduler
+        .prepare_array_range_in(2..7, data_type, &mut work, unexpected_read)
+        .await
+        .unwrap()
+        .unwrap();
+    let output = input.decode_in(&mut work).unwrap().unwrap();
+    let expected = arrow_array::ListArray::new(
+        field,
+        arrow_buffer::OffsetBuffer::new(vec![0_i32, 1, 2, 3, 4, 5].into()),
+        new_null_array(&DataType::LargeBinary, 5),
+        None,
+    );
+    assert_eq!(output.to_data(), arrow_array::Array::to_data(&expected));
+    assert_eq!(output.null_count(), 0);
+    drop((output, work));
+    assert_eq!(budget.reserved(), 0);
 }
 
 #[test]

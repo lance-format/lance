@@ -569,3 +569,89 @@ async fn admitted_fragment_empty_list_overlay_preserves_null_precedence(
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[rstest]
+#[tokio::test]
+async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_validity(
+    #[values(false, true)] lite: bool,
+) {
+    let version = LanceFileVersion::V2_3;
+    let mut dataset = write_payload_dataset(version, true).await;
+    let field_id = dataset.schema().field("payload").unwrap().id;
+    let original = payload("base", 1, true, usize::MAX);
+    let DataType::List(field) = original.data_type() else {
+        unreachable!()
+    };
+    let null_children: ArrayRef = Arc::new(ListArray::new(
+        field.clone(),
+        OffsetBuffer::new(vec![0_i32, 1, 1, 3].into()),
+        arrow_array::new_null_array(field.data_type(), 3),
+        Some(NullBuffer::from(vec![true, false, true])),
+    ));
+    for fragment in 0..2 {
+        dataset = commit_overlay(
+            dataset,
+            &format!("old-null-child-{fragment}"),
+            fragment,
+            &[field_id],
+            OverlayCoverage::dense(bitmap([1, 2, 3, 4])),
+            vec![payload("old", 4, true, usize::MAX)],
+            version,
+        )
+        .await;
+        dataset = commit_overlay(
+            dataset,
+            &format!("null-child-{fragment}"),
+            fragment,
+            &[field_id],
+            OverlayCoverage::dense(bitmap([2, 3, 4])),
+            vec![null_children.clone()],
+            version,
+        )
+        .await;
+    }
+    for fragment in 0..2 {
+        let reader = open(&dataset, fragment, dataset.schema(), lite).await;
+        let expected = reader
+            .take_as_batch(&[0, 1, 2, 3, 4, 5], None)
+            .await
+            .unwrap();
+        let values = expected["payload"]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(values.slice(2, 3).to_data(), null_children.to_data());
+        assert!(values.is_valid(2));
+        assert!(values.is_null(3));
+        assert_eq!(values.value_length(4), 2);
+        let indices = UInt32Array::from(vec![0, 1, 2, 3, 4, 5]);
+        let budget = AllocationBudget::new(2 * 65536);
+        assert!(
+            reader
+                .try_take_admitted_fullzip(&indices, budget.try_reserve(16).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(budget.reserved(), 0);
+        let left = reader.try_take_admitted_fullzip(&indices, budget.try_reserve(65536).unwrap());
+        let right = reader.try_take_admitted_fullzip(&indices, budget.try_reserve(65536).unwrap());
+        let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(left, right)
+        })
+        .await
+        .expect("null-child overlays must progress with one CPU worker");
+        let left = left.unwrap().unwrap();
+        let right = right.unwrap().unwrap();
+        assert_eq!(left, expected);
+        assert_eq!(right, expected);
+        let alias = left["payload"].to_data().child_data()[0]
+            .nulls()
+            .unwrap()
+            .clone();
+        drop((left, right));
+        assert!(budget.reserved() > 0);
+        drop(alias);
+        assert_eq!(budget.reserved(), 0);
+    }
+}
