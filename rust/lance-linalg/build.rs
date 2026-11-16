@@ -110,9 +110,9 @@ fn main() -> Result<(), String> {
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
-        // Keep the AVX2 L2 reductions lane-partitioned. A single reassociated
+        // Keep the AVX2 norm reduction lane-partitioned. A single reassociated
         // float accumulator can exceed the public 1e-6 relative-error contract
-        // for long f16 vectors.
+        // for long f16 vectors. x86 f16 L2 uses Rust intrinsics instead.
         if let Err(err) =
             build_f16_with_flags("avx2", &["-march=haswell", "-DPRECISE_F16_REDUCTION"])
         {

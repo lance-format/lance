@@ -808,7 +808,8 @@ mod x86 {
                     diff * diff
                 })
                 .sum();
-            unsafe { hsum256_ps(_mm256_add_ps(lo, hi)) + tail }
+            let lane_sum = unsafe { hsum256_ps(_mm256_add_ps(lo, hi)) };
+            lane_sum + tail
         }
     }
 
@@ -817,7 +818,8 @@ mod x86 {
         #[candidate(pub(super) L2_F16_BATCH_AVX2: BatchKernel<f16>)]
         /// At dimensions 8 and 16 the query stays widened in registers across
         /// the batch. Each fixed-width loop computes the same sums as
-        /// `l2_f16_avx2`.
+        /// `l2_f16_avx2`, whose FMAs at these widths add to zero and so round
+        /// like a plain multiply.
         pub(super) fn l2_batch_f16_avx2(
             x: &[f16],
             batch: &[f16],
@@ -827,6 +829,7 @@ mod x86 {
             if dimension == 8
                 && let Ok(key) = <&[f16; 8]>::try_from(x)
             {
+                // SAFETY: `key` and each `y` hold exactly eight values.
                 let key = unsafe { load_f16x8(key.as_ptr()) };
                 for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
                     let diff = _mm256_sub_ps(key, unsafe { load_f16x8(y.as_ptr()) });
@@ -835,6 +838,7 @@ mod x86 {
             } else if dimension == 16
                 && let Ok(key) = <&[f16; 16]>::try_from(x)
             {
+                // SAFETY: `key` and each `y` hold exactly sixteen values.
                 let (key_lo, key_hi) =
                     unsafe { (load_f16x8(key.as_ptr()), load_f16x8(key.as_ptr().add(8))) };
                 for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
@@ -1398,6 +1402,18 @@ mod tests {
         assert!(haswell.contains(L2_F32_BATCH.candidates()[0].features()));
     }
 
+    /// The F16C kernels don't depend on `fp16kernels`, so every x86_64 build
+    /// must offer a haswell host more than the scalar candidate.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_l2_f16_has_haswell_candidates() {
+        use lance_core::utils::cpu::CpuFeatures;
+        let haswell = CpuFeatures::from_target_features(&["avx2", "fma", "f16c"]);
+        let simd = |features: CpuFeatures| !features.is_empty() && haswell.contains(features);
+        assert!(L2_F16.candidates().iter().any(|c| simd(c.features())));
+        assert!(L2_F16_BATCH.candidates().iter().any(|c| simd(c.features())));
+    }
+
     #[test]
     fn test_euclidean_distance() {
         let mat = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
@@ -1727,8 +1743,8 @@ mod tests {
         Ok(())
     }
 
-    /// Also checks that each f16 batch kernel matches its tier's pair kernel
-    /// bit for bit.
+    /// Checks each f16 pair kernel against the reference, and each batch
+    /// kernel against its tier's pair kernel bit for bit.
     fn check_f16_l2_kernels(x: &[f16], y: &[f16]) -> std::result::Result<(), TestCaseError> {
         check_half_l2_kernels(&L2_F16, x, y)?;
         let batch = [y, x].concat();
@@ -1759,10 +1775,12 @@ mod tests {
         });
     }
 
-    /// Batch kernels take fixed-width loops at these PQ sub-vector widths,
-    /// which the random dimensions above rarely hit.
+    /// Dimensions the random ones above rarely hit: tail-only vectors, and the
+    /// PQ sub-vector widths where batch kernels take fixed-width loops.
     #[rstest::rstest]
-    fn test_l2_f16_kernels_match_reference_at_pq_widths(#[values(8, 16)] dimension: usize) {
+    fn test_l2_f16_kernels_match_reference_at_short_dims(
+        #[values(1, 7, 8, 9, 15, 16)] dimension: usize,
+    ) {
         run_vector_pair_proptest(arbitrary_f16, dimension..dimension + 1, |x, y| {
             check_f16_l2_kernels(&x, &y)
         });
