@@ -12,6 +12,8 @@ use std::collections::HashMap;
 
 use super::*;
 
+mod deletions;
+
 fn payload(prefix: &str, rows: usize, nested: bool, null_at: usize) -> ArrayRef {
     let values = (0..rows)
         .map(|row| format!("{prefix}{row:03}").repeat(24))

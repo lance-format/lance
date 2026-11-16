@@ -8,6 +8,8 @@ use lance_core::utils::{allocation::Reservation, tokio::spawn_cpu};
 
 use super::*;
 
+mod deletions;
+
 impl FragmentReader {
     /// Take sorted unique physical offsets within one already-admitted workspace.
     ///
@@ -31,7 +33,12 @@ impl FragmentReader {
     /// Payloads use bounded input windows and selected charged storage.
     /// Other sparse codecs return `NotSupported` when selected.
     /// Stored layout determines decoder dispatch.
-    /// Struct ancestors, deleted-row filtering/markers, generated system columns,
+    /// Deleted physical offsets are removed before base/overlay reads using the
+    /// reader's immutable deletion snapshot. A reduced selection's offsets share
+    /// this workspace; output contains only surviving rows in input order. Empty
+    /// results still charge their typed offset buffers. Deletion metadata itself
+    /// is borrowed, not admitted here. This is not logical-offset remapping.
+    /// Struct ancestors, deletion markers, generated system columns,
     /// missing-column synthesis and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed
     /// selection's physical storage; metadata/transport/cache/allocator overhead
@@ -53,19 +60,27 @@ impl FragmentReader {
         indices: &UInt32Array,
         mut workspace: Reservation,
     ) -> Result<Option<RecordBatch>> {
-        let read_selection =
+        let mut read_selection =
             OverlayReadSelection::from_sorted_indices(indices, self.num_physical_rows as u64)?;
-        if self.num_system_cols() != 0
-            || self.make_deletions_null
-            || self
-                .deletion_vec
-                .as_ref()
-                .is_some_and(|deleted| !deleted.is_empty())
-        {
+        if self.num_system_cols() != 0 || self.make_deletions_null {
             return Err(Error::not_supported(
-                "admitted fragment take does not yet compose deletions or generated columns",
+                "admitted fragment take does not yet compose deletion markers or generated columns",
             ));
         }
+        // Validate the original selection above: deletion pruning must not hide
+        // duplicates, null indices or physical offsets outside this fragment.
+        let Some(live_indices) =
+            deletions::try_filter_in(indices, self.deletion_vec.as_deref(), &mut workspace)?
+        else {
+            return Ok(None);
+        };
+        if live_indices.len() != indices.len() {
+            read_selection = OverlayReadSelection::from_sorted_indices(
+                &live_indices,
+                self.num_physical_rows as u64,
+            )?;
+        }
+        let indices = live_indices;
         let schema = Arc::new(self.output_schema.clone());
         // Resolve file-to-output placement before payload reads. Shared struct
         // spines need admitted ancestor reconstruction, never merge_streams here.
@@ -125,8 +140,10 @@ impl FragmentReader {
             };
             base_inputs.push((input, columns));
         }
-        let rows = indices.len();
         spawn_cpu(move || {
+            // Keep a copied selection's physical owner in the same admitted
+            // operation through output construction, alongside decoded inputs.
+            let rows = indices.len();
             let mut columns = vec![None; schema.fields().len()];
             for (input, placement) in base_inputs {
                 let Some(batch) = input.decode_in(&mut workspace)? else {
