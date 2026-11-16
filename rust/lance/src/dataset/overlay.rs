@@ -34,8 +34,10 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
+mod admitted;
 mod selection;
 pub mod writer;
+pub use admitted::AdmittedOverlayRouting;
 pub use selection::{OverlayBatchSelection, OverlayReadSelection};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

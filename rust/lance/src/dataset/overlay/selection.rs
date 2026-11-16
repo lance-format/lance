@@ -25,7 +25,10 @@ enum Selection {
 
 /// A batch keeps contiguous row identity without an offsets allocation.
 pub enum OverlayBatchSelection {
+    /// A half-open range of physical row offsets within one fragment.
     Range(Range<u32>),
+    /// Explicit physical row offsets, preserving caller order and duplicates.
+    /// Admitted routing rejects null entries.
     Indices(UInt32Array),
 }
 

@@ -129,6 +129,7 @@ pub mod write;
 
 pub use data_file::DataFileTarget;
 pub use data_file_part::DataFilePart;
+pub use overlay::{AdmittedOverlayRouting, OverlayBatchSelection};
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
