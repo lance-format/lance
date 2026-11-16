@@ -23,9 +23,10 @@ impl FragmentReader {
     /// Currently requires dense FullZip or byte-scalar Constant v2.2/v2.3 pages
     /// with byte/string leaves optionally nested in List/LargeList, with disjoint
     /// top-level fields across base files.
-    /// Flat all-null byte/string pages with metadata-only validity are supported
-    /// too. Other page layouts return `NotSupported` when selected, including
-    /// complex all-null List shapes. Stored layout determines decoder dispatch.
+    /// Flat all-null byte/string pages and V2_3 empty/null List chains with zero
+    /// child slots support metadata-only validity. Other layouts, including
+    /// nonempty lists of null children, return `NotSupported` when selected.
+    /// Stored layout determines decoder dispatch.
     /// Struct ancestors, deleted-row filtering/markers, generated system columns,
     /// missing-column synthesis and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed

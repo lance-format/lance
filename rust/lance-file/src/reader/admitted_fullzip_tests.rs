@@ -37,6 +37,7 @@ use crate::{
 use lance_encoding::format::metadata::{PageLayout, page_layout::Layout};
 
 mod all_null;
+mod empty_list;
 mod multi;
 mod scan;
 mod take;

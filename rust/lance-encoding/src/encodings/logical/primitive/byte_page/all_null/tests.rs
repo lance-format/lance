@@ -229,10 +229,14 @@ fn no_values_is_not_evidence_that_nested_parents_are_null() {
                 layers: vec![pb23::SparseStructuralLayer {
                     layer: Some(pb23::sparse_structural_layer::Layer::List(
                         pb23::SparseListLayer {
-                            num_child_slots: 0,
-                            num_non_empty_positions: 0,
-                            non_empty_positions: Some(EncodingUtils::constant(None)),
-                            counts: Some(EncodingUtils::constant(None)),
+                            num_child_slots: 9,
+                            num_non_empty_positions: 9,
+                            non_empty_positions: Some(
+                                RangeEncoder::new(64, 0, 1).encoding(9).unwrap(),
+                            ),
+                            counts: Some(EncodingUtils::constant(Some(
+                                1_u64.to_le_bytes().to_vec().into(),
+                            ))),
                             validity: Some(pb23::SparseValiditySet {
                                 meaning:
                                     pb23::sparse_validity_set::Meaning::SparseValidityNullPositions
@@ -246,7 +250,17 @@ fn no_values_is_not_evidence_that_nested_parents_are_null() {
             },
         )),
     });
-    // This describes valid empty lists, not null lists. No all-null shortcut.
+    // Every parent contains one null child, not an empty or null list.
+    if let Some(pb23::structural_plane::Codec::Sparse(structure)) =
+        layout.structure.as_mut().unwrap().codec.as_mut()
+    {
+        structure.layers.push(pb23::SparseStructuralLayer {
+            layer: Some(pb23::sparse_structural_layer::Layer::Validity(
+                sparse_validity(9, false),
+            )),
+        });
+    }
+    // No-values leaves must never shortcut the nonempty parent structure.
     let error =
         AdmittedBytePageScheduler::try_from_page(&page, &DefaultDecompressionStrategy::default())
             .unwrap_err();
