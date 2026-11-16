@@ -24,8 +24,8 @@ impl FragmentReader {
     /// with byte/string leaves optionally nested in List/LargeList, with disjoint
     /// top-level fields across base files.
     /// Flat all-null byte/string pages and V2_3 List chains with null leaves support
-    /// metadata-only validity/positions and metadata or Flat/Bitpacked/Delta counts.
-    /// Payload counts use bounded input windows and selected charged prefixes.
+    /// metadata-only validity and metadata or Flat/Bitpacked/Delta nonempty positions
+    /// and counts. Payloads use bounded input windows and selected charged storage.
     /// Other sparse positions/count codecs return `NotSupported` when selected.
     /// Stored layout determines decoder dispatch.
     /// Struct ancestors, deleted-row filtering/markers, generated system columns,

@@ -299,12 +299,18 @@ async fn current_writer_null_children_preserve_selected_structure_without_io(
 async fn current_writer_payload_counts_use_bounded_input_windows(
     #[values(false, true)] lite: bool,
     #[values(false, true)] large: bool,
+    #[values(false, true)] payload_positions: bool,
 ) {
     // Distinct non-monotonic counts prevent metadata, Delta, RLE and dictionary
     // representations. The actual writer chooses a directly addressable codec.
     let mut offsets = vec![0_i32];
     for i in 0..2051 {
-        offsets.push(offsets.last().unwrap() + 1 + (i * 1031 % 2053));
+        let count = if payload_positions && i % 7 == (i / 11) % 7 {
+            0
+        } else {
+            1 + (i * 1031 % 2053)
+        };
+        offsets.push(offsets.last().unwrap() + count);
     }
     let source = wrap_null_children(
         new_null_array(&DataType::Binary, *offsets.last().unwrap() as usize),
@@ -316,8 +322,8 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
     let page = &reader.metadata().column_infos[0].page_infos[0];
     assert_eq!(
         page.buffer_offsets_and_sizes.len(),
-        1,
-        "fixture must contain payload counts"
+        1 + usize::from(payload_positions),
+        "fixture must contain payload counts and optional nonempty positions"
     );
     let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
     let reader = reader.with_scheduler(Arc::new(super::scan::RangeIo {

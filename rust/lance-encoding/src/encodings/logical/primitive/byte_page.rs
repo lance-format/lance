@@ -37,8 +37,9 @@ enum Scheduler {
 /// Metadata-only dispatch for admitted byte/string pages.
 /// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
 /// pages and V2_3 List chains with null byte leaves support metadata-only validity,
-/// positions and metadata or Flat/Bitpacked/Delta counts. Counts use bounded I/O
-/// windows; only selected prefixes remain charged alongside output construction.
+/// and metadata or Flat/Bitpacked/Delta nonempty positions and counts. Payloads use
+/// bounded I/O windows; selected positions and prefixes remain charged alongside
+/// output construction. Position capacity is bounded by selected parent rows.
 /// Empty/null/nonempty parents stay distinct. Other layouts return an error without
 /// unadmitted decoding fallback. Metadata itself is not charged.
 #[derive(Debug)]

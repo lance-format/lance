@@ -571,10 +571,15 @@ async fn admitted_fragment_empty_list_overlay_preserves_null_precedence(
 }
 
 #[rstest]
+#[case::metadata(false, false)]
+#[case::counts(true, false)]
+#[case::positions(false, true)]
+#[case::both(true, true)]
 #[tokio::test]
 async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_validity(
     #[values(false, true)] lite: bool,
-    #[values(false, true)] payload_counts: bool,
+    #[case] payload_counts: bool,
+    #[case] payload_positions: bool,
 ) {
     let version = LanceFileVersion::V2_3;
     let mut dataset = write_payload_dataset(version, true).await;
@@ -583,7 +588,17 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
     let DataType::List(field) = original.data_type() else {
         unreachable!()
     };
-    let (offsets, valid, covered) = if payload_counts {
+    let (offsets, valid, covered) = if payload_positions {
+        (
+            if payload_counts {
+                vec![0_i32, 1, 4, 4, 6]
+            } else {
+                vec![0_i32, 2, 4, 4, 6]
+            },
+            vec![true; 4],
+            vec![2, 3, 4, 5],
+        )
+    } else if payload_counts {
         (vec![0_i32, 1, 4, 6, 10], vec![true; 4], vec![2, 3, 4, 5])
     } else {
         (vec![0_i32, 1, 1, 3], vec![true, false, true], vec![2, 3, 4])
@@ -631,8 +646,11 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
             null_children.to_data()
         );
         assert!(values.is_valid(2));
-        assert_eq!(values.is_null(3), !payload_counts);
-        assert_eq!(values.value_length(4), 2);
+        assert_eq!(values.is_null(3), !(payload_counts || payload_positions));
+        assert_eq!(
+            values.value_length(4),
+            if payload_positions { 0 } else { 2 }
+        );
         let indices = UInt32Array::from(vec![0, 1, 2, 3, 4, 5]);
         let budget = AllocationBudget::new(2 * 65536);
         assert!(

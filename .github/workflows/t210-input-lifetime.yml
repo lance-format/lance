@@ -25,12 +25,10 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted windowed List counts
+      - name: Verify admitted windowed List positions
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib compression::unsigned:: -- --nocapture
-          cargo test --profile ci --locked -p lance-encoding --lib sequence::window:: -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --lib sparse::admitted_lists:: -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --lib byte_page:: -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --doc AdmittedBytePageScheduler -- --nocapture

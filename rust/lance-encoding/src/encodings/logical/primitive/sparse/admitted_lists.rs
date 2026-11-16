@@ -59,10 +59,12 @@ fn null_count(validity: &SparseValiditySet, rows: &Range<u64>) -> u64 {
 
 mod counts;
 use counts::Counts;
+mod positions;
+use positions::Positions;
 
 #[derive(Clone, Debug)]
 struct ListMetadata {
-    non_empty: SparsePositionPlan,
+    non_empty: Positions,
     counts: Counts,
     child_slots: u64,
     validity: SparseValiditySet,
@@ -70,7 +72,7 @@ struct ListMetadata {
 
 impl ListMetadata {
     fn child_before(&self, row: u64) -> Result<u64> {
-        self.counts.prefix(self.non_empty.rank(row))
+        self.counts.prefix(self.non_empty.rank(row)?)
     }
 }
 
@@ -113,12 +115,12 @@ impl NullListScheduler {
                         .non_empty_positions
                         .as_ref()
                         .ok_or_else(|| corrupt("missing nonempty positions descriptor"))?;
-                    let non_empty = ready_positions(position_decoder(
+                    let non_empty = Positions::parse(
                         positions,
                         list.num_non_empty_positions,
                         domain,
-                        "admitted List nonempty",
-                    )?)?;
+                        &mut buffers,
+                    )?;
                     let counts = Counts::parse(
                         list.counts.as_ref(),
                         list.num_non_empty_positions,
@@ -133,7 +135,9 @@ impl NullListScheduler {
                     let validity = validity(list.validity.as_ref(), domain)?;
                     // Reuse the sparse reader's checked set containment/intersection,
                     // including its arithmetic-set path, without materializing rows.
-                    if !validity.contains_only_valid_positions(&non_empty, domain)? {
+                    if let Positions::Metadata(plan) = &non_empty
+                        && !validity.contains_only_valid_positions(plan, domain)?
+                    {
                         return Err(corrupt("null List parent contains child slots"));
                     }
                     lists.push(ListMetadata {
@@ -215,7 +219,14 @@ impl NullListScheduler {
         let mut selected = rows.clone();
         let mut lists = Vec::with_capacity(self.lists.len());
         for layer in self.lists.iter() {
-            let indices = layer.non_empty.rank(selected.start)..layer.non_empty.rank(selected.end);
+            let Some(non_empty) = layer
+                .non_empty
+                .prepare(selected.clone(), &layer.validity, work, &mut read)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let indices = non_empty.rank(selected.start)?..non_empty.rank(selected.end)?;
             let Some(counts) = layer
                 .counts
                 .prepare(indices, layer.child_slots, work, &mut read)
@@ -224,6 +235,7 @@ impl NullListScheduler {
                 return Ok(None);
             };
             let layer = ListMetadata {
+                non_empty,
                 counts,
                 ..layer.clone()
             };

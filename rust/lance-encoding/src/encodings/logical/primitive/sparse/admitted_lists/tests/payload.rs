@@ -13,11 +13,23 @@ use crate::{
 use futures::{FutureExt, poll};
 use std::{cell::RefCell, task::Poll};
 
-fn encode(values: &[u64], packed: bool, delta: bool) -> (Vec<u8>, CompressiveEncoding) {
+pub(super) fn encode(values: &[u64], packed: bool, delta: bool) -> (Vec<u8>, CompressiveEncoding) {
     let child: Box<dyn BlockCompressor> = if packed {
         #[cfg(feature = "bitpacking")]
         {
-            Box::new(OutOfLineBitpacking::new(5, 64))
+            let max = if delta {
+                values
+                    .windows(2)
+                    .map(|pair| pair[1] - pair[0])
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                values.iter().copied().max().unwrap_or(0)
+            };
+            Box::new(OutOfLineBitpacking::new(
+                u64::from((64 - max.leading_zeros()).max(1)),
+                64,
+            ))
         }
         #[cfg(not(feature = "bitpacking"))]
         {

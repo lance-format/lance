@@ -660,3 +660,5 @@ fn arithmetic_counts_validate_sum_and_prefixes_without_materialization() {
 }
 
 mod payload;
+
+mod payload_positions;
