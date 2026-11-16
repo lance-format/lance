@@ -2339,4 +2339,108 @@ mod tests {
         };
         assert!(!read_row_ids(data).unwrap().range_runs_span_a_gap());
     }
+
+    /// Fragment 0 of a stable row id table, backed by a file for a nullable
+    /// field 0, so its data can be tombstoned without a replacement.
+    fn stable_row_id_backed_manifest() -> Manifest {
+        let mut fragment = backed_manifest().fragments[0].clone();
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()));
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
+        manifest
+    }
+
+    fn tombstone_field_zero(data_change: bool) -> Action {
+        Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change,
+        })
+    }
+
+    fn reencode_field_zero(data_change: bool) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment: Ref::Committed(0),
+            file: one_column_file("data/reencoded.lance"),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change,
+            base: None,
+        })
+    }
+
+    /// `get_updated_rows()` reads `last_updated_at_version_meta`, which only a
+    /// restamp of the changed rows keeps current. Apply cannot tell which rows
+    /// a file for an existing fragment changed, so until an action can say so,
+    /// a value change to a committed fragment of a stable row id table is
+    /// refused. Moving values, writing new fragments, and deleting rows leave
+    /// no row's value changed in place.
+    #[rstest]
+    #[case::new_column_in_a_committed_fragment(
+        vec![
+            mint_field(0, "added", None),
+            write_data(Ref::Committed(0), FieldRef::Local(0)),
+        ],
+        Some("fragment 0")
+    )]
+    #[case::column_dropped_out_of_a_committed_fragment(
+        vec![tombstone_field_zero(true)],
+        Some("fragment 0")
+    )]
+    #[case::column_rewritten_in_a_committed_fragment(
+        vec![tombstone_field_zero(true), reencode_field_zero(true)],
+        Some("fragment 0")
+    )]
+    #[case::reencode_of_a_committed_fragment(
+        vec![tombstone_field_zero(false), reencode_field_zero(false)],
+        None
+    )]
+    #[case::new_fragment(
+        vec![mint_fragment(0), write_data(Ref::Local(0), FieldRef::Committed(0))],
+        None
+    )]
+    #[case::deletion_in_a_committed_fragment(
+        vec![Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: any_deletion_file(),
+            data_change: true,
+            base: None,
+        })],
+        None
+    )]
+    #[case::changed_fragment_removed_afterwards(
+        vec![
+            tombstone_field_zero(true),
+            Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(0),
+                data_change: true,
+            }),
+        ],
+        None
+    )]
+    fn test_a_value_change_to_a_committed_fragment_needs_a_row_version_restamp(
+        #[case] actions: Vec<Action>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let result = apply(&stable_row_id_backed_manifest(), actions.clone());
+
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(fragment) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                let message = error.to_string();
+                assert!(message.contains(fragment), "{message}");
+                assert!(
+                    message.contains("last_updated_at_version_meta"),
+                    "{message}"
+                );
+                // Without stable row ids there is no row version to keep.
+                let mut manifest = backed_manifest();
+                manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
+                apply(&manifest, actions).unwrap();
+            }
+        }
+    }
 }
