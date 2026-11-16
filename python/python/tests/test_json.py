@@ -394,8 +394,22 @@ def test_json_get_functions():
 def test_json_extract_typed_functions():
     """Test json_extract_* functions for typed JSONPath extraction."""
     json_data = [
-        {"user": {"profile": {"name": "Alice"}, "age": 30, "active": True, "score": 95.5}},
-        {"user": {"profile": {"name": "Bob"}, "age": 25, "active": False, "score": 87.3}},
+        {
+            "user": {
+                "profile": {"name": "Alice"},
+                "age": 30,
+                "active": True,
+                "score": 95.5,
+            }
+        },
+        {
+            "user": {
+                "profile": {"name": "Bob"},
+                "age": 25,
+                "active": False,
+                "score": 87.3,
+            }
+        },
         {"user": {"profile": {"name": "Charlie"}, "age": "35", "tags": ["a", "b"]}},
         {"user": None},
     ]
