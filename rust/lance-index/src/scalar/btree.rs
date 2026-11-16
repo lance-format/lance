@@ -98,8 +98,10 @@ use tracing::{info, instrument};
 mod flat;
 mod lookup;
 mod ordered;
+mod result_cache;
 
 use lookup::LookupPage;
+use result_cache::{CachedResult, MIN_MATCHED_PAGES, QueryResultKey};
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 /// The first column of [`BTREE_LOOKUP_NAME`]: each page's minimum key. Its type
@@ -1616,6 +1618,7 @@ impl CacheKey for BTreePageKey {
 #[derive(Debug, Clone)]
 struct BTreeIndexState {
     lookup_batch: RecordBatch,
+    result_identity: Arc<()>,
     batch_size: u64,
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     results_are_row_addresses: bool,
@@ -1626,6 +1629,7 @@ impl DeepSizeOf for BTreeIndexState {
         // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`;
         // the lookup batch dominates, matching how `BTreeIndex` accounts for itself.
         self.lookup_batch.deep_size_of_children(context)
+            + self.result_identity.deep_size_of_children(context)
     }
 }
 
@@ -1636,6 +1640,7 @@ impl BTreeIndexState {
         })?;
         Ok(Self {
             lookup_batch: btree.page_lookup.batch.clone(),
+            result_identity: btree.result_identity.clone(),
             batch_size: btree.batch_size,
             ranges_to_files: btree.ranges_to_files.clone(),
             results_are_row_addresses: btree.results_are_row_addresses,
@@ -1656,6 +1661,7 @@ impl BTreeIndexState {
             self.ranges_to_files.clone(),
             frag_reuse_index,
             self.results_are_row_addresses,
+            self.result_identity.clone(),
         )?;
         Ok(Arc::new(index) as Arc<dyn ScalarIndex>)
     }
@@ -1712,6 +1718,7 @@ impl CacheCodecImpl for BTreeIndexState {
         let lookup_batch = r.read_ipc()?;
         Ok(Self {
             lookup_batch,
+            result_identity: Arc::new(()),
             batch_size,
             ranges_to_files,
             results_are_row_addresses: header.results_are_row_addresses,
@@ -2005,6 +2012,8 @@ impl KeysByValue {
 #[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
+    /// Shared only by opens of one immutable index state in the same cache namespace.
+    result_identity: Arc<()>,
     regular_u64_pages: Option<lookup::RegularU64Pages>,
     /// Digests are populated on demand and never retain cached pages.
     page_keys: Arc<OnceLock<Box<[PageCacheKey]>>>,
@@ -2070,6 +2079,7 @@ impl DeepSizeOf for BTreeIndex {
             0
         };
         self.page_lookup.deep_size_of_children(context)
+            + self.result_identity.deep_size_of_children(context)
             + self.store.deep_size_of_children(context)
             + page_keys_size
     }
@@ -2095,6 +2105,7 @@ impl BTreeIndex {
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         results_are_row_addresses: bool,
+        result_identity: Arc<()>,
     ) -> Self {
         let regular_u64_pages = if results_are_row_addresses {
             lookup::RegularU64Pages::try_new(&page_lookup.batch, page_lookup.search_start)
@@ -2103,6 +2114,7 @@ impl BTreeIndex {
         };
         Self {
             page_lookup,
+            result_identity,
             regular_u64_pages,
             page_keys: Arc::new(OnceLock::new()),
             store,
@@ -2594,6 +2606,7 @@ impl BTreeIndex {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all)]
     fn try_from_serialized(
         data: RecordBatch,
@@ -2603,6 +2616,7 @@ impl BTreeIndex {
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         results_are_row_addresses: bool,
+        result_identity: Arc<()>,
     ) -> Result<Self> {
         checked_batch_size(batch_size)
             .map_err(|error| Error::corrupt_file_named("BTree index metadata", error))?;
@@ -2618,6 +2632,7 @@ impl BTreeIndex {
             ranges_to_files,
             frag_reuse_index,
             results_are_row_addresses,
+            result_identity,
         ))
     }
 
@@ -2705,6 +2720,7 @@ impl BTreeIndex {
             ranges_to_files,
             frag_reuse_index,
             results_are_row_addresses,
+            Arc::new(()),
         )?))
     }
 
@@ -3186,24 +3202,12 @@ impl BTreeIndex {
     }
 }
 
-#[async_trait]
-impl ScalarIndex for BTreeIndex {
-    async fn search(
+impl BTreeIndex {
+    fn matching_pages(
         &self,
-        query: &dyn AnyQuery,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<SearchResult> {
-        self.search_with_options(query, SearchOptions::default(), metrics)
-            .await
-    }
-
-    async fn search_with_options(
-        &self,
-        query: &dyn AnyQuery,
+        query: &SargableQuery,
         options: SearchOptions,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+    ) -> Result<Vec<Matches>> {
         let mut pages = match query {
             SargableQuery::Equals(val) => self
                 .page_lookup
@@ -3283,6 +3287,16 @@ impl ScalarIndex for BTreeIndex {
             }
         }
 
+        Ok(pages)
+    }
+
+    async fn search_pages(
+        &self,
+        query: &SargableQuery,
+        options: SearchOptions,
+        pages: Vec<Matches>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableRowAddrSet> {
         // Compile a large IsIn predicate once and reuse it across every page;
         // rebuilding the full IN-list per page is O(pages * values) and dominates
         // the lookup for sets with many values.
@@ -3322,9 +3336,69 @@ impl ScalarIndex for BTreeIndex {
             RowAddrTreeMap::new()
         };
 
-        Ok(SearchResult::Exact(NullableRowAddrSet::new(
-            selected, nulls,
-        )))
+        Ok(NullableRowAddrSet::new(selected, nulls))
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for BTreeIndex {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let query = query
+            .as_any()
+            .downcast_ref::<SargableQuery>()
+            .ok_or_else(|| Error::invalid_input("BTree index requires a SargableQuery"))?;
+        let pages = self.matching_pages(query, options)?;
+        if pages.len() < MIN_MATCHED_PAGES
+            || !self.results_are_row_addresses
+            || self.frag_reuse_index.is_some()
+            || self.batch_remapper.is_some()
+        {
+            return self
+                .search_pages(query, options, pages, metrics)
+                .await
+                .map(SearchResult::Exact);
+        }
+
+        let capacity = self.index_cache.capacity_bytes().unwrap_or(0);
+        let key = (capacity > 0)
+            .then(|| QueryResultKey::new(&self.result_identity, query, options))
+            .flatten()
+            .map(|key| self.index_cache.prepare_key(key));
+        if let Some(key) = &key {
+            if let Some(result) = self.index_cache.get_with_key(key).await
+                && Arc::ptr_eq(&result.identity, &self.result_identity)
+            {
+                metrics.record_index_cache_hit();
+                return Ok(SearchResult::Exact(result.rows.clone()));
+            }
+            metrics.record_index_cache_miss();
+        }
+
+        let rows = self.search_pages(query, options, pages, metrics).await?;
+        if let Some(key) = key
+            && CachedResult::fits(&rows, capacity)
+        {
+            let result = Arc::new(CachedResult {
+                rows: rows.clone(),
+                identity: self.result_identity.clone(),
+            });
+            self.index_cache.insert_with_key(&key, result).await;
+        }
+        Ok(SearchResult::Exact(rows))
     }
 
     fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
@@ -8628,9 +8702,115 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_btree_result_cache_reuses_warm_state_and_preserves_nulls() {
+        let values = (0..512_i32)
+            .map(|i| (i >= 32).then_some(i - 32))
+            .collect::<Vec<_>>();
+        let row_ids = (0..512_u32)
+            .map(|i| u64::from(RowAddress::new_from_parts(i % 16, i / 16)))
+            .collect::<Vec<_>>();
+        let data = record_batch!(
+            ("value", Int32, values),
+            ("_rowaddr", UInt64, row_ids.clone())
+        )
+        .unwrap();
+        let schema = data.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::once(async move { Ok(data) }),
+        )) as SendableRecordBatchStream;
+        let stream = break_stream(stream, 2).map_err(DataFusionError::from);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // A small page size creates a broad-search fixture with only 512 rows.
+        train_btree_index(stream, store.as_ref(), 2, None, None)
+            .await
+            .unwrap();
+        let cache = LanceCache::with_capacity(32 * 1024 * 1024);
+        let index = BTreeIndex::load(store.clone(), None, &cache, true)
+            .await
+            .unwrap();
+        let plugin = BTreeIndexPlugin;
+        plugin
+            .put_in_cache(store.clone(), &cache, index.clone())
+            .await
+            .unwrap();
+        let reopened = plugin
+            .get_from_cache(store.clone(), None, &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh = BTreeIndex::load(store, None, &cache, true).await.unwrap();
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(0))),
+            Bound::Unbounded,
+        );
+        let expected_true: RowAddrTreeMap = row_ids[32..].iter().copied().collect();
+
+        for track_nulls in [false, true] {
+            let options = SearchOptions::default().with_track_nulls(track_nulls);
+            let key = super::QueryResultKey::new(&index.result_identity, &query, options).unwrap();
+            assert!(index.index_cache.get_with_key(&key).await.is_none());
+            let expected_nulls: RowAddrTreeMap = if track_nulls {
+                row_ids[..32].iter().copied().collect()
+            } else {
+                RowAddrTreeMap::new()
+            };
+            let SearchResult::Exact(rows) = index
+                .search_with_options(&query, options, &NoOpMetricsCollector)
+                .await
+                .unwrap()
+            else {
+                panic!("a BTree search must be exact");
+            };
+            assert_eq!(rows.true_rows(), expected_true);
+            assert_eq!(rows.null_rows(), &expected_nulls);
+            assert!(index.index_cache.get_with_key(&key).await.is_some());
+
+            let warm = LocalMetricsCollector::default();
+            assert_eq!(
+                reopened
+                    .search_with_options(&query, options, &warm)
+                    .await
+                    .unwrap(),
+                SearchResult::Exact(rows),
+            );
+            // A result hit replaces hundreds of per-page cache accesses.
+            assert_eq!(warm.index_cache_hits(), 1);
+            assert_eq!(warm.index_cache_misses(), 0);
+            let fresh_key =
+                super::QueryResultKey::new(&fresh.result_identity, &query, options).unwrap();
+            assert!(fresh.index_cache.get_with_key(&fresh_key).await.is_none());
+        }
+
+        let point = SargableQuery::Equals(ScalarValue::Int32(Some(10)));
+        let options = SearchOptions::default().with_track_nulls(false);
+        assert_eq!(
+            index
+                .search_with_options(&point, options, &NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .row_addrs()
+                .len(),
+            Some(1)
+        );
+        let point_key =
+            super::QueryResultKey::new(&index.result_identity, &point, options).unwrap();
+        assert!(index.index_cache.get_with_key(&point_key).await.is_none());
+    }
+
     fn assert_state_roundtrips(state: &BTreeIndexState) {
         let restored = deserialize_state(serialize_state(state)).unwrap();
         assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert!(!Arc::ptr_eq(
+            &restored.result_identity,
+            &state.result_identity
+        ));
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
         // This flag decides whether search results are translated from row
@@ -8652,6 +8832,7 @@ mod tests {
         // Not range-partitioned.
         assert_state_roundtrips(&BTreeIndexState {
             lookup_batch: sample_lookup_batch(),
+            result_identity: Arc::new(()),
             batch_size: DEFAULT_BTREE_BATCH_SIZE,
             ranges_to_files: None,
             results_are_row_addresses: true,
@@ -8666,6 +8847,7 @@ mod tests {
         .collect();
         assert_state_roundtrips(&BTreeIndexState {
             lookup_batch: sample_lookup_batch(),
+            result_identity: Arc::new(()),
             batch_size: 8192,
             ranges_to_files: Some(Arc::new(ranges)),
             results_are_row_addresses: true,
@@ -8674,6 +8856,7 @@ mod tests {
         // Empty index.
         assert_state_roundtrips(&BTreeIndexState {
             lookup_batch: RecordBatch::new_empty(sample_lookup_batch().schema()),
+            result_identity: Arc::new(()),
             batch_size: DEFAULT_BTREE_BATCH_SIZE,
             ranges_to_files: None,
             results_are_row_addresses: true,
@@ -8682,6 +8865,7 @@ mod tests {
         // Legacy (row-id domain) segment.
         assert_state_roundtrips(&BTreeIndexState {
             lookup_batch: sample_lookup_batch(),
+            result_identity: Arc::new(()),
             batch_size: DEFAULT_BTREE_BATCH_SIZE,
             ranges_to_files: None,
             results_are_row_addresses: false,
@@ -8712,6 +8896,7 @@ mod tests {
         // Round-trip the state through the codec and reconstruct an index from it.
         let state = BTreeIndexState {
             lookup_batch: index.page_lookup.batch.clone(),
+            result_identity: Arc::new(()),
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
             results_are_row_addresses: index.results_are_row_addresses,
@@ -8824,6 +9009,7 @@ mod tests {
                 .collect();
         let state = BTreeIndexState {
             lookup_batch: sample_lookup_batch(),
+            result_identity: Arc::new(()),
             batch_size: 8192,
             ranges_to_files: Some(Arc::new(ranges)),
             results_are_row_addresses: true,
@@ -8892,6 +9078,7 @@ mod tests {
             .unwrap();
         let state = BTreeIndexState {
             lookup_batch: index.page_lookup.batch.clone(),
+            result_identity: Arc::new(()),
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
             results_are_row_addresses: index.results_are_row_addresses,
