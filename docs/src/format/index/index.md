@@ -258,7 +258,8 @@ There are both part of the `table.proto` file in the Lance source code.
 referenced by a segment's files so a commit retry can reuse prepared index
 files when fragment allocation changes. An empty map means no mapping. An
 entry `{17: 42}` maps fragment 17 to 42, and any unmapped fragment ID keeps
-its original ID. Each stored fragment ID is looked up once.
+its original ID. Translation is not transitive: with `{17: 42, 42: 43}`,
+stored 17 resolves to 42, not 43.
 
 The map applies to fragment IDs referenced by the segment's files.
 Apply it once, before any later transformation, including
@@ -268,14 +269,18 @@ values are unchanged. With entry `17 -> 42` and FRI translation
 `(42, 5) -> (60, 3)`, stored address `(17, 5)` resolves to `(60, 3)`.
 Retargeting the map directly to fragment 60 would lose the row offset change.
 
-`fragment_bitmap` stores committed source fragment IDs before FRI remapping,
-while `local_fragment_aliases` translates fragment IDs referenced by the index
-files. A commit or rebase updates the bitmap and aliases together without
-rewriting the index files. For example, local fragment 17 committing as
-dataset fragment 42 records `local_fragment_aliases: {17: 42}` and
-`fragment_bitmap: {42}`. If conflict resolution rebases that fragment to 43,
-the manifest updates to `local_fragment_aliases: {17: 43}` and
-`fragment_bitmap: {43}`.
+A segment whose files store stable row IDs must not carry local fragment
+aliases. A commit retry can reassign row IDs as well as fragment IDs, and the
+map cannot translate row IDs.
+
+`fragment_bitmap` must hold committed fragment IDs, before FRI remapping.
+When a commit or rebase changes the committed ID of a fragment referenced
+through `local_fragment_aliases`, it must update `fragment_bitmap` and the
+aliases together. The index files do not need to be rewritten. For example,
+local fragment 17 committing as dataset fragment 42 records
+`local_fragment_aliases: {17: 42}` and `fragment_bitmap: {42}`. If conflict
+resolution rebases that fragment to 43, the manifest updates to
+`local_fragment_aliases: {17: 43}` and `fragment_bitmap: {43}`.
 
 Operations that retain index files must retain their aliases. Index rewrites
 and merges must resolve aliases before writing replacement files.

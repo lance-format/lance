@@ -1270,9 +1270,10 @@ pub struct IndexMetadata {
     /// fragment IDs. An empty map means no mapping. Unmapped IDs keep their
     /// value. Each stored ID is translated once.
     ///
-    /// Applies to fragment references in the segment, including physical row
-    /// addresses, BTree, ZoneMap, and BloomFilter. A row address keeps its row
-    /// offset. Stable logical row IDs and user column values are not translated.
+    /// Applies to every fragment ID referenced by the segment's files, such as the
+    /// fragment half of a physical row address or a zone's fragment ID. A row
+    /// address keeps its row offset. Stable logical row IDs and user column values
+    /// are not translated.
     ///
     /// Keys and values must be less than 2^32 - 1. u32::MAX (2^32 - 1) is
     /// reserved for RowAddress::TOMBSTONE_FRAG. Two referenced IDs must not

@@ -47,6 +47,6 @@ they should return an "unsupported" error on any read or write operation.
 
 </div>
 
-Bits 12, 13, and 20 are reserved and remain unsupported. Bits 16 and 17 are supported. Bits at positions 21 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, zone write-seed, and local fragment alias reader and writer bits must each either both be set or both be clear. A half-set manifest is invalid.
+Bits 12 and 20 are reserved and remain unsupported. Bits 13, 16, and 17 are supported. Bits at positions 21 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, zone write-seed, and local fragment alias reader and writer bits must each either both be set or both be clear. A half-set manifest is invalid.
 
 Committing schema metadata `lance.blob.managed = "true"` activates the Managed Blob capability, even without new blob files. Ordinary Blob v2 writes without this opt-in do not activate it. Once activated, removing the opt-in, removing Blob fields, or restoring an older snapshot does not clear it. Before activation, all maintenance clients must support Managed Blobs: the flag cannot revoke old handles or prevent older clients from running cleanup through an unflagged historical snapshot. See [client compatibility](../../guide/blob.md#managed-objects-and-client-compatibility).
