@@ -357,3 +357,38 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
         ds.insert(data)
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
+
+
+@compat_test(min_version="4.0.0")
+class IvfHnswRqVectorIndex(UpgradeDowngradeTest):
+    """Releases without IVF_HNSW_RQ skip its newer index version and search flat."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        shutil.rmtree(self.path, ignore_errors=True)
+        vecs = pc.random(32 * 512).cast(pa.float32())
+        data = pa.table(
+            {
+                "id": pa.array(range(512)),
+                "vec": pa.FixedSizeListArray.from_arrays(vecs, 32),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
+        if not self._running_in_old_venv:
+            dataset.create_index("vec", "IVF_HNSW_RQ", num_partitions=1, num_bits=5)
+
+    def check_read(self):
+        ds = lance.dataset(self.path)
+        q = np.random.random(32).astype(np.float32)
+        nearest = {"q": q, "k": 4, "column": "vec"}
+        result = ds.to_table(nearest=nearest, columns=["id"])
+        assert result.num_rows == 4
+        if self._running_in_old_venv:
+            exact = ds.to_table(nearest={**nearest, "use_index": False}, columns=["id"])
+            assert result["id"].to_pylist() == exact["id"].to_pylist()

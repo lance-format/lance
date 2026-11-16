@@ -31,8 +31,8 @@ def test_kmeans_dot():
 
 
 def test_kmeans_cosine():
-    # Cosine trains and predicts over unit-length vectors, so a row and a
-    # scaled copy of it must land in the same cluster. This also used to panic
+    # Cosine trains and predicts over unit-length vectors: fit normalizes the
+    # training rows and predict normalizes the queries. This also used to panic
     # rather than train at this size.
     kmeans = lance.util.KMeans(8, metric_type="cosine")
     data = np.random.randn(1000, 128).astype(np.float32)
@@ -40,10 +40,45 @@ def test_kmeans_cosine():
 
     centroids = np.stack(kmeans.centroids.to_numpy(zero_copy_only=False))
     assert centroids.shape == (8, 128)
+    # A cosine centroid is the mean of unit-length training rows, so its norm
+    # cannot exceed 1.
+    assert np.all(np.linalg.norm(centroids, axis=1) <= 1.0)
 
     clusters = kmeans.predict(data).to_numpy(zero_copy_only=False)
-    scaled = kmeans.predict(data * 7.0).to_numpy(zero_copy_only=False)
-    np.testing.assert_array_equal(clusters, scaled)
+    assert clusters.shape == (1000,)
+    assert clusters.max() < 8
+
+
+def test_kmeans_cosine_predict_normalizes_queries():
+    # Centroids are model state, not input, so predict normalizes only the
+    # query. These two centroids have the norms a cosine fit can leave behind:
+    # a loose cluster averages to a short mean, a tight one stays near unit
+    # length. The query sits 0.41 away from the decision boundary in squared
+    # L2, so the expected labels do not depend on rounding.
+    centroids = np.zeros((2, 4), dtype=np.float32)
+    centroids[0, 0] = 0.3
+    centroids[1, 1] = 1.0
+    values = pa.FixedSizeListArray.from_arrays(
+        pa.array(centroids.reshape(-1), type=pa.float32()), list_size=4
+    )
+    kmeans = lance.util.KMeans(2, metric_type="cosine", centroids=values)
+    np.testing.assert_array_equal(
+        np.stack(kmeans.centroids.to_numpy(zero_copy_only=False)), centroids
+    )
+
+    # The direction 0.86/0.51 is nearest to the short centroid once the query
+    # is normalized; an unnormalized query is nearest to the long one. The raw
+    # query is deliberately not unit length, which is what the normalization
+    # under test has to fix.
+    query = np.array([[0.8613, 0.5084, 0.0, 0.0]], dtype=np.float32) * np.float32(3.7)
+    expected = np.array([0], dtype=np.uint32)
+    np.testing.assert_array_equal(
+        kmeans.predict(query).to_numpy(zero_copy_only=False), expected
+    )
+    np.testing.assert_array_equal(
+        kmeans.predict(query * np.float32(7.0)).to_numpy(zero_copy_only=False),
+        expected,
+    )
 
 
 @pytest.mark.parametrize("metric_type", ["l2", "cosine"])

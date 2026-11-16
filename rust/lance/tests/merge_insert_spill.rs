@@ -8,14 +8,19 @@
 //! This file must stay a single-test integration binary because the indexed
 //! merge path reads its pool size from the process-global `LANCE_MEM_POOL_SIZE`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, types::UInt64Type};
+use arrow_array::{
+    RecordBatch, RecordBatchIterator, RecordBatchReader,
+    cast::AsArray,
+    types::{Float32Type, UInt32Type, UInt64Type},
+};
 use lance::Dataset;
 use lance::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use lance::dataset::{MergeInsertBuilder, WriteParams};
 use lance::index::DatasetIndexExt;
-use lance_datagen::{BatchCount, ByteCount, RowCount, Seed, array, gen_batch};
+use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, Seed, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 
@@ -27,6 +32,112 @@ const PARTIAL_ROWS_PER_BATCH: u64 = 50_000;
 const PARTIAL_BATCHES: u32 = 4;
 const WIDE_KEY_BYTES: u64 = 2048;
 const NUM_ROWS: u64 = 8192;
+const SPILLED_SOURCE_MEM_POOL_SIZE: u64 = 8 * 1024 * 1024;
+const SPILLED_SOURCE_ROWS: u64 = 1024;
+// Vector dimensions of the rows below. A fixed width decodes to what the file holds, so the
+// batches have the sizes these comments rely on.
+//
+// 8192 rows of this width are about 2.7 MiB, above the 2 MiB byte cap of a sort input in a
+// 16 MiB pool, so the sort reserves 4 MiB for a capped slice.
+const TAIL_DIM: u32 = 80;
+const SPILLED_SOURCE_DIM: u32 = 1536;
+// A sort reserves twice a batch. Twice this 3 MiB row is more than a third of a 16 MiB pool
+// and less than two thirds.
+const WIDE_ROW_DIM: u32 = 768 * 1024;
+
+fn rows(first_id: u64, num_rows: u64, dim: u32, updated: u32) -> RecordBatch {
+    gen_batch()
+        .with_seed(Seed::from(first_id))
+        .col("id", array::step_custom::<UInt64Type>(first_id, 1))
+        .col(
+            "payload",
+            array::rand_vec::<Float32Type>(Dimension::from(dim)),
+        )
+        .col("updated", array::fill::<UInt32Type>(updated))
+        .into_batch_rows(RowCount::from(num_rows))
+        .unwrap()
+}
+
+fn reader(batches: Vec<RecordBatch>) -> Box<dyn RecordBatchReader + Send> {
+    let schema = batches[0].schema();
+    Box::new(RecordBatchIterator::new(
+        batches.into_iter().map(Ok),
+        schema,
+    ))
+}
+
+fn ids(batch: &RecordBatch) -> &[u64] {
+    batch["id"].as_primitive::<UInt64Type>().values()
+}
+
+/// Upserts `source` by `id` under `pool_bytes` and checks every row. The dataset has `indexed`
+/// under an index on `id`, and `unindexed` in a fragment appended after the index build.
+async fn upsert(
+    pool_bytes: u64,
+    indexed: RecordBatch,
+    unindexed: Option<RecordBatch>,
+    source: Vec<RecordBatch>,
+) {
+    let mut expected = ids(&indexed)
+        .iter()
+        .chain(unindexed.iter().flat_map(ids))
+        .map(|id| (*id, 0))
+        .collect::<BTreeMap<u64, u32>>();
+    let (mut expected_updates, mut expected_inserts) = (0, 0);
+    for id in source.iter().flat_map(ids) {
+        match expected.insert(*id, 1) {
+            Some(_) => expected_updates += 1,
+            None => expected_inserts += 1,
+        }
+    }
+
+    let mut dataset = Dataset::write(reader(vec![indexed]), "memory://", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    if let Some(unindexed) = unindexed {
+        dataset.append(reader(vec![unindexed]), None).await.unwrap();
+    }
+
+    unsafe { std::env::set_var("LANCE_MEM_POOL_SIZE", pool_bytes.to_string()) };
+    let (dataset, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(reader(source))
+        .await
+        .unwrap();
+
+    assert_eq!(stats.num_updated_rows, expected_updates);
+    assert_eq!(stats.num_inserted_rows, expected_inserts);
+    let mut scan = dataset.scan();
+    scan.project(&["id", "updated"]).unwrap();
+    let merged = scan.try_into_batch().await.unwrap();
+    let mut actual = ids(&merged)
+        .iter()
+        .copied()
+        .zip(
+            merged["updated"]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(actual, expected.into_iter().collect::<Vec<_>>());
+}
 
 #[tokio::test]
 async fn test_indexed_merge_insert_spills_wide_source() {
@@ -235,4 +346,48 @@ async fn test_indexed_merge_insert_spills_wide_source() {
             .unwrap(),
         partial_total_rows as usize
     );
+
+    // Rows appended after the index build reach the target sort through a scan, whose batches
+    // hit the byte cap of the sort input. A capped batch fits the sort's share of the pool next
+    // to one other spillable consumer, but not next to two.
+    upsert(
+        MEM_POOL_SIZE,
+        rows(0, 1024, TAIL_DIM, 0),
+        Some(rows(1024, NUM_ROWS, TAIL_DIM, 0)),
+        vec![
+            rows(512, 1024, TAIL_DIM, 1),
+            rows(1024 + NUM_ROWS, 512, TAIL_DIM, 1),
+        ],
+    )
+    .await;
+
+    // A source spilled to several runs keeps a merge reservation for each run of its last merge
+    // pass for as long as its stream is open. The target sort must not have to fit next to it.
+    // The keys arrive out of order, so the join is right only if the source reaches it sorted.
+    upsert(
+        SPILLED_SOURCE_MEM_POOL_SIZE,
+        rows(0, SPILLED_SOURCE_ROWS, SPILLED_SOURCE_DIM, 0),
+        None,
+        vec![
+            rows(
+                SPILLED_SOURCE_ROWS,
+                SPILLED_SOURCE_ROWS,
+                SPILLED_SOURCE_DIM,
+                1,
+            ),
+            rows(0, SPILLED_SOURCE_ROWS, SPILLED_SOURCE_DIM, 1),
+        ],
+    )
+    .await;
+
+    // The byte cap cannot split a row, so a row of up to a quarter of the pool must fit on either
+    // side of the join and in either arm of the target: a sort reserves twice the row, and
+    // merging two runs of it takes twice that.
+    upsert(
+        MEM_POOL_SIZE,
+        rows(0, 1, WIDE_ROW_DIM, 0),
+        Some(rows(1, 1, WIDE_ROW_DIM, 0)),
+        vec![rows(0, 2, WIDE_ROW_DIM, 1), rows(2, 1, WIDE_ROW_DIM, 1)],
+    )
+    .await;
 }

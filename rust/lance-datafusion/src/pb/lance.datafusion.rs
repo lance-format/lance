@@ -150,7 +150,7 @@ impl ::prost::Name for FilteredReadThreadingModeProto {
     }
 }
 /// Serializable form of FilteredReadOptions.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FilteredReadOptionsProto {
     #[prost(message, optional, tag = "1")]
     pub scan_range_before_filter: ::core::option::Option<U64Range>,
@@ -199,6 +199,58 @@ pub struct FilteredReadOptionsProto {
     /// refer to the exact dataset snapshot used to plan the scan.
     #[prost(bytes = "vec", optional, tag = "15")]
     pub physical_row_addr_allowlist: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// List field IDs whose consumers need only the specified structural property.
+    /// Element values are placeholders and must not be consumed or returned.
+    /// An empty map requests ordinary reads. Unspecified or unknown modes are invalid.
+    /// Older executors may ignore this field and read full values, preserving results
+    /// but losing the optimization. These modes apply only to this read, not the dataset.
+    #[prost(
+        map = "int32, enumeration(filtered_read_options_proto::ListReadMode)",
+        tag = "16"
+    )]
+    pub list_structure: ::std::collections::HashMap<i32, i32>,
+    /// If true, fragment_ids is an explicit fragment selection and may be empty
+    /// ("read no fragments"). If false or absent (older planners), an empty
+    /// fragment_ids list means no fragment selection; a repeated field alone
+    /// cannot distinguish the two. A non-empty list is a selection regardless of
+    /// this field. Older executors ignore this field and treat an empty list as
+    /// no selection.
+    #[prost(bool, optional, tag = "17")]
+    pub has_fragment_ids: ::core::option::Option<bool>,
+}
+/// Nested message and enum types in `FilteredReadOptionsProto`.
+pub mod filtered_read_options_proto {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum ListReadMode {
+        Unspecified = 0,
+        /// Preserve exact outer list lengths and validity without element payloads.
+        Length = 1,
+        /// Preserve outer validity and emptiness; nonempty lengths may become one.
+        NonEmpty = 2,
+    }
+    impl ListReadMode {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "LIST_READ_MODE_UNSPECIFIED",
+                Self::Length => "LIST_READ_MODE_LENGTH",
+                Self::NonEmpty => "LIST_READ_MODE_NON_EMPTY",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "LIST_READ_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+                "LIST_READ_MODE_LENGTH" => Some(Self::Length),
+                "LIST_READ_MODE_NON_EMPTY" => Some(Self::NonEmpty),
+                _ => None,
+            }
+        }
+    }
 }
 impl ::prost::Name for FilteredReadOptionsProto {
     const NAME: &'static str = "FilteredReadOptionsProto";
@@ -271,5 +323,39 @@ impl ::prost::Name for FilteredReadExecProto {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lance.datafusion.FilteredReadExecProto".into()
+    }
+}
+/// Visibility-aware execution envelope. The V1 messages remain unchanged so
+/// existing Rust callers can keep constructing them with exhaustive literals.
+/// Codecs must select this message using a distinct identifier or negotiated
+/// capability, for example its prost::Name type URL. Fields 1-3 are reserved to
+/// avoid overlap with FilteredReadExecProto: decoding with the wrong version
+/// leaves the required read/options absent and the conversion rejects it.
+/// The caller also transports index children and current-value replay branches.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FilteredReadExecV2Proto {
+    /// Required by conversion; absence is an invalid execution envelope.
+    #[prost(message, optional, tag = "4")]
+    pub read: ::core::option::Option<FilteredReadExecProto>,
+    /// If true, omit fragments outside the scalar index result's coverage.
+    /// False preserves the normal fallback scan of unindexed fragments.
+    #[prost(bool, tag = "5")]
+    pub only_indexed_fragments: bool,
+    /// If present, a serialized RowAddrTreeMap of stale index entries to exclude.
+    /// Entries use the index result's identifier domain: stable row IDs on stable-ID
+    /// datasets, physical addresses otherwise. This is not a physical allowlist.
+    /// If absent, no overlay exclusion is applied.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub overlay_block: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+impl ::prost::Name for FilteredReadExecV2Proto {
+    const NAME: &'static str = "FilteredReadExecV2Proto";
+    const PACKAGE: &'static str = "lance.datafusion";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.datafusion.FilteredReadExecV2Proto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.datafusion.FilteredReadExecV2Proto".into()
     }
 }

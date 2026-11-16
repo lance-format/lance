@@ -59,7 +59,7 @@ pub use priority::PriorityEntries;
 mod registry;
 pub mod telemetry;
 
-pub use backend::{CacheBackend, CacheEntry, CacheLoader, CacheTier};
+pub use backend::{CacheBackend, CacheEntry, CacheLoader, CacheTier, ImmediateCacheRead};
 pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, CacheRangeReader, MAGIC,
@@ -151,6 +151,15 @@ pub trait CacheKey {
         builder.write_str(self.key().as_ref());
     }
 
+    /// Reuse a canonical key already computed for this namespace.
+    ///
+    /// Most keys should keep the default and use [`LanceCache::prepare_key`]
+    /// when repeated reads justify retaining the digest. A returned key must
+    /// match this key's schema, fields, value type, and the supplied namespace.
+    fn precomputed_key(&self, _namespace: CacheNamespace) -> Option<InternalCacheKey> {
+        None
+    }
+
     /// Per-key cache policy, defaulting to the value type's codec.
     fn codec_for_key(&self) -> Option<CacheCodec> {
         Self::codec()
@@ -166,6 +175,68 @@ pub trait CacheKey {
     /// by value is cheap — no allocation needed.
     fn codec() -> Option<CacheCodec> {
         None
+    }
+}
+
+/// A typed key with its canonical digest prepared for one cache namespace.
+///
+/// Use [`LanceCache::prepare_key`] or [`WeakLanceCache::prepare_key`] to create
+/// one. It retains neither the cache nor its value, so eviction and weak-cache
+/// lifetimes are unchanged. Using it in another namespace safely recomputes
+/// the digest from the original logical key.
+/// The logical key's identity must remain immutable after preparation.
+#[derive(Clone, Debug)]
+pub struct PreparedCacheKey<K> {
+    logical: K,
+    namespace: CacheNamespace,
+    physical: InternalCacheKey,
+}
+
+impl<K: CacheKey> PreparedCacheKey<K> {
+    fn new(namespace: CacheNamespace, logical: K) -> Self {
+        let mut builder = KeyBuilder::new(namespace, K::stable_type_id(), K::schema());
+        logical.write_key(&mut builder);
+        Self {
+            logical,
+            namespace,
+            physical: builder.finish(),
+        }
+    }
+}
+
+impl<K: CacheKey> CacheKey for PreparedCacheKey<K> {
+    type ValueType = K::ValueType;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.logical.key()
+    }
+
+    fn type_name() -> &'static str {
+        K::type_name()
+    }
+
+    fn stable_type_id() -> &'static str {
+        K::stable_type_id()
+    }
+
+    fn schema() -> CacheKeySchema {
+        K::schema()
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.logical.write_key(builder);
+    }
+
+    fn precomputed_key(&self, namespace: CacheNamespace) -> Option<InternalCacheKey> {
+        (namespace == self.namespace).then_some(self.physical)
+    }
+
+    fn codec_for_key(&self) -> Option<CacheCodec> {
+        self.logical.codec_for_key()
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        K::codec()
     }
 }
 
@@ -468,6 +539,31 @@ impl DeepSizeOf for LanceCache {
 }
 
 impl LanceCache {
+    /// Prepare a typed key for repeated operations in this cache namespace.
+    ///
+    /// This avoids recomputing its digest on each read without retaining the
+    /// cached value. Prepared and original keys address the same entry.
+    ///
+    /// ```
+    /// # use std::{borrow::Cow, sync::Arc};
+    /// # use lance_core::cache::{CacheKey, LanceCache};
+    /// # struct Page(u32);
+    /// # impl CacheKey for Page {
+    /// #     type ValueType = Vec<u32>;
+    /// #     fn key(&self) -> Cow<'_, str> { self.0.to_string().into() }
+    /// #     fn type_name() -> &'static str { "example.Page" }
+    /// # }
+    /// # async fn example() {
+    /// let cache = LanceCache::with_capacity(1024);
+    /// let page = cache.prepare_key(Page(7));
+    /// cache.insert_with_key(&Page(7), Arc::new(vec![1, 2])).await;
+    /// assert_eq!(cache.get_with_key(&page).await.as_deref(), Some(&vec![1, 2]));
+    /// # }
+    /// ```
+    pub fn prepare_key<K: CacheKey>(&self, key: K) -> PreparedCacheKey<K> {
+        PreparedCacheKey::new(self.namespace, key)
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         Self::with_backend(Arc::new(MokaCacheBackend::with_capacity(capacity)))
     }
@@ -545,6 +641,13 @@ impl LanceCache {
     /// Weighted capacity in bytes, if the backend reports one.
     pub fn capacity_bytes(&self) -> Option<usize> {
         self.state.backend.capacity_bytes()
+    }
+
+    /// Change the backend's weighted capacity, evicting entries as needed.
+    ///
+    /// Backends that cannot resize after construction return an error.
+    pub fn set_capacity(&self, capacity: usize) -> Result<()> {
+        self.state.backend.set_capacity(capacity)
     }
 
     /// Largest admissible RAM entry, if reported by the backend. An admitted
@@ -759,15 +862,17 @@ impl LanceCache {
         let by_type = self.state.type_activity.get(K::stable_type_id());
         self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        let entry = self
-            .state
-            .backend
-            .get_with_context(
-                &key,
-                cache_key.codec_for_key(),
-                CacheOperationContext::new(K::stable_type_id(), self.origin),
-            )
-            .await;
+        let codec = cache_key.codec_for_key();
+        let context = CacheOperationContext::new(K::stable_type_id(), self.origin);
+        let entry = match self.state.backend.get_immediate(&key, codec) {
+            ImmediateCacheRead::Ready(entry) => entry,
+            ImmediateCacheRead::Deferred => {
+                self.state
+                    .backend
+                    .get_with_context(&key, codec, context)
+                    .await
+            }
+        };
         self.lookup_result(entry, by_type, K::stable_type_id(), true)
     }
 
@@ -1098,6 +1203,9 @@ impl LanceCache {
     }
 
     fn sized_key<K: CacheKey>(&self, cache_key: &K) -> InternalCacheKey {
+        if let Some(key) = cache_key.precomputed_key(self.namespace) {
+            return key;
+        }
         let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
         cache_key.write_key(&mut builder);
         builder.finish()
@@ -1124,6 +1232,14 @@ pub struct WeakLanceCache {
 }
 
 impl WeakLanceCache {
+    /// Prepare a key without retaining the cache or any cached value.
+    ///
+    /// See [`LanceCache::prepare_key`] for an example. The key remains safe to
+    /// reuse with another namespace, and a dropped weak cache still misses.
+    pub fn prepare_key<K: CacheKey>(&self, key: K) -> PreparedCacheKey<K> {
+        PreparedCacheKey::new(self.namespace, key)
+    }
+
     pub fn from(cache: &LanceCache) -> Self {
         Self {
             state: Arc::downgrade(&cache.state),
@@ -1785,9 +1901,16 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::asynchronous(false)]
+    #[case::immediate(true)]
     #[tokio::test]
-    async fn typed_roundtrip_stats_clear_and_namespace_isolation() {
-        let cache = LanceCache::with_capacity(4096);
+    async fn typed_roundtrip_stats_clear_and_namespace_isolation(#[case] immediate: bool) {
+        let cache = if immediate {
+            LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(4096)))
+        } else {
+            LanceCache::with_capacity(4096)
+        };
         let left = cache.with_key_prefix("left");
         let right = cache.with_key_prefix("right");
         left.insert_with_key(&TestKey::new(7), Arc::new(vec![1, 2, 3]))
@@ -1804,6 +1927,29 @@ mod tests {
         cache.clear().await;
         let stats = left.stats().await;
         assert_eq!((stats.hits, stats.misses, stats.num_entries), (0, 0, 0));
+
+        let prepared = left.prepare_key(TestKey::new(7));
+        left.insert_with_key(&prepared, Arc::new(vec![11])).await;
+        right
+            .insert_with_key(&TestKey::new(7), Arc::new(vec![22]))
+            .await;
+        assert_eq!(
+            left.get_with_key(&TestKey::new(7)).await.as_deref(),
+            Some(&vec![11])
+        );
+        assert_eq!(
+            left.get_with_key(&prepared).await.as_deref(),
+            Some(&vec![11])
+        );
+        // A prepared digest must never bypass the destination's namespace.
+        assert_eq!(
+            right.get_with_key(&prepared).await.as_deref(),
+            Some(&vec![22])
+        );
+        let other_schema = left.prepare_key(TestKeyV2::new(7));
+        assert!(left.get_with_key(&other_schema).await.is_none());
+        left.clear().await;
+        assert!(left.get_with_key(&prepared).await.is_none());
     }
 
     #[tokio::test]
@@ -1811,11 +1957,9 @@ mod tests {
         let cache = LanceCache::with_capacity(4096);
         let child = cache.with_key_prefix("child");
         let weak = WeakLanceCache::from(&child);
+        let prepared = weak.prepare_key(TestKey::new(1));
 
-        assert!(
-            weak.insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
-                .await
-        );
+        assert!(weak.insert_with_key(&prepared, Arc::new(vec![1])).await);
         assert_eq!(
             child.get_with_key(&TestKey::new(1)).await.as_deref(),
             Some(&vec![1])
@@ -1828,6 +1972,9 @@ mod tests {
             Some(&vec![2])
         );
         assert_eq!((cache.stats().await.hits, cache.size().await), (2, 2));
+        drop(child);
+        drop(cache);
+        assert!(weak.get_with_key(&prepared).await.is_none());
     }
 
     #[test]

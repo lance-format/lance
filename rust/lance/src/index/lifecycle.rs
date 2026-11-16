@@ -8,7 +8,7 @@
 //! optimize entry. Low-level source freshness lives in `provenance`; opening
 //! and cache behavior lives in `loading`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -54,7 +54,10 @@ use crate::index::statistics::{
     index_statistics_mem_wal, index_statistics_scalar, serialize_regular_index_statistics,
 };
 use crate::index::vector;
-use crate::session::index_caches::DerivedIndexListingKey;
+use crate::index::vector::details::needs_vector_details_inference;
+use crate::session::index_caches::{
+    DerivedIndexListingKey, QueryIndexListing, QueryIndexListingKey,
+};
 use crate::{Dataset, Error, Result};
 
 pub(super) async fn build_index_metadata_from_segments(
@@ -75,8 +78,7 @@ pub(super) async fn build_index_metadata_from_segments(
     // the logical index: both carried columns and plugin dependencies can
     // differ. Keep the same invariant as `IndexDescriptionImpl::try_new` and
     // `merge_existing_index_segments`.
-    let expected_fields = segments[0].fields().to_vec();
-    let expected_covering_fields = segments[0].covering_fields().to_vec();
+    let expected = &segments[0];
     for segment in &segments {
         if segment.dataset_version() > dataset.manifest.version {
             return Err(Error::invalid_input(format!(
@@ -127,9 +129,8 @@ pub(super) async fn build_index_metadata_from_segments(
                 }
             }
         }
-        // Cardinality alone does not prove `covering_fields` is really the
-        // trailing slice of `fields`; delegate that to the same rule a
-        // committed `IndexMetadata` is held to, rather than re-deriving it.
+        // Hold the covering declaration to the same rule a committed
+        // `IndexMetadata` is held to, rather than re-deriving it.
         IndexMetadata {
             uuid: segment.uuid(),
             fields: segment.fields().to_vec(),
@@ -146,9 +147,7 @@ pub(super) async fn build_index_metadata_from_segments(
             metadata: Default::default(),
         }
         .validate_covering_fields()?;
-        if segment.fields() != expected_fields.as_slice()
-            || segment.covering_fields() != expected_covering_fields.as_slice()
-        {
+        if !segment.declares_same_fields(expected) {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} declares fields {:?} (carried {:?}) but index \
                  '{}' declares fields {:?} (carried {:?}); every segment of one index \
@@ -157,8 +156,8 @@ pub(super) async fn build_index_metadata_from_segments(
                 segment.fields(),
                 segment.covering_fields(),
                 index_name,
-                expected_fields,
-                expected_covering_fields,
+                expected.fields(),
+                expected.covering_fields(),
             )));
         }
         if !seen_segment_ids.insert(segment.uuid()) {
@@ -278,6 +277,95 @@ impl Dataset {
         )?;
         Ok(catchup_of(&speculative)? != catchup_of(indices)?)
     }
+
+    /// The tagged reader's derived index listing for this snapshot, with the
+    /// flag telling whether a segment is absent from it only because its
+    /// format marker could not be read.
+    ///
+    /// [`DatasetIndexExt::load_indices`] drops the flag once it has decided
+    /// whether to cache; a caller that caches a SECOND derivation of its own
+    /// (the FRI query plan) needs the same flag for the same reason, so the
+    /// decision is made from one source here instead of re-derived from the
+    /// plan's contents.
+    pub(crate) async fn derived_index_listing(&self) -> Result<DerivedIndexListing> {
+        let indices = load_all_indices(self).await?;
+        self.derive_index_listing(indices).await
+    }
+
+    /// [`Self::derived_index_listing`] for a raw listing the caller already
+    /// loaded, so a caller that must inspect the raw listing first does not
+    /// load it twice.
+    async fn derive_index_listing(
+        &self,
+        indices: Arc<Vec<IndexMetadata>>,
+    ) -> Result<DerivedIndexListing> {
+        // Readers apply the fragment reuse index to every index they open.
+        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+            && indices.iter().any(is_hidden_by_frag_reuse)
+        {
+            Arc::new(
+                indices
+                    .iter()
+                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            indices
+        };
+        let tagged = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .map(|fri| fri.index_version);
+        match tagged {
+            // Legacy FRI index version 0 already had its fragment coverage
+            // remapped in load_all_indices().
+            None | Some(0) => Ok(DerivedIndexListing {
+                indices: filter_unusable(indices),
+                unverifiable: BTreeSet::new(),
+            }),
+            Some(1) => {
+                let fri = indices
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                    .expect("the v1 FRI entry was just located");
+                let (derived, unverifiable) =
+                    frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                Ok(DerivedIndexListing {
+                    indices: derived,
+                    unverifiable,
+                })
+            }
+            Some(version) => Err(Error::not_supported(format!(
+                "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+            ))),
+        }
+    }
+}
+
+/// The index listing a snapshot's readers see, with what the caller needs to
+/// decide whether to cache it.
+pub struct DerivedIndexListing {
+    pub indices: Arc<Vec<IndexMetadata>>,
+    /// Logical indices with at least one segment whose format marker could not
+    /// be read; empty when every segment was verified. Those indices' listings
+    /// hold for this call alone.
+    pub unverifiable: BTreeSet<String>,
+}
+
+/// Drop the segments no reader can open, keeping the input allocation when
+/// every segment is usable.
+fn filter_unusable(indices: Arc<Vec<IndexMetadata>>) -> Arc<Vec<IndexMetadata>> {
+    if indices.iter().all(index_is_usable) {
+        return indices;
+    }
+    Arc::new(
+        indices
+            .iter()
+            .filter(|idx| index_is_usable(idx))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[async_trait]
@@ -525,64 +613,45 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = load_all_indices(self).await?;
-        // Readers apply the fragment reuse index to every index they open.
-        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
-            && indices.iter().any(is_hidden_by_frag_reuse)
-        {
-            Arc::new(
-                indices
-                    .iter()
-                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            indices
-        };
-        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            match fri.index_version {
-                // Legacy FRI index version 0 already had its fragment coverage
-                // remapped in load_all_indices().
-                0 => {}
-                1 => {
-                    // Cache the coverage-rewritten listing per snapshot identity:
-                    // load_indices sits on the query-planning and merge_insert
-                    // per-batch paths, and the derivation (segment_coverage plus
-                    // the per-index bitmap rewrites) is otherwise redone on every
-                    // call. The raw ledger and mapping readers are already cached
-                    // by frag_reuse_reader; this caches its derived output.
-                    let derived_key = DerivedIndexListingKey {
-                        version: self.manifest.version,
-                        store_identity: &self.object_store.store_prefix,
-                        e_tag: self.manifest_location.e_tag.as_deref(),
-                    };
-                    return self
-                        .index_cache
-                        .get_or_insert_with_key(derived_key, || async {
-                            let derived =
-                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                            Ok(derived.as_ref().clone())
-                        })
-                        .await;
-                }
-                version => {
-                    return Err(Error::not_supported(format!(
-                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
-                    )));
-                }
-            }
-        }
-        if indices.iter().all(index_is_usable) {
-            return Ok(indices);
-        }
-        Ok(Arc::new(
-            indices
+        let derive = || async {
+            let indices = load_all_indices(self).await?;
+            // Best-effort inference and unreadable format markers must be
+            // retried on later calls instead of freezing an incomplete listing.
+            let retry_inference = indices
                 .iter()
-                .filter(|idx| index_is_usable(idx))
-                .cloned()
-                .collect(),
-        ))
+                .any(|idx| needs_vector_details_inference(idx, self.schema()));
+            let listing = self.derive_index_listing(indices).await?;
+            Ok(QueryIndexListing {
+                indices: listing.indices,
+                retry_derivation: retry_inference || !listing.unverifiable.is_empty(),
+            })
+        };
+        // The key's e-tag is its generation token. Without one, a dataset
+        // dropped and recreated at this URI restarts its version history, so a
+        // version-only key could serve the previous incarnation's listing from
+        // this cache, which is shared by every dataset opened at the URI.
+        // `None` is not proof that two observations share an incarnation (see
+        // `ManifestLocation::e_tag`), so derive privately and never publish.
+        let Some(e_tag) = self.manifest_location.e_tag.as_deref() else {
+            return Ok(derive().await?.indices);
+        };
+        let derived_key = QueryIndexListingKey(DerivedIndexListingKey {
+            version: self.manifest.version,
+            store_identity: &self.object_store.store_prefix,
+            e_tag: Some(e_tag),
+        });
+        let (listing, was_cached) = self
+            .index_cache
+            .get_or_insert_with_key_hit(derived_key, derive)
+            .await?;
+        if was_cached && listing.retry_derivation {
+            let refreshed = Arc::new(derive().await?);
+            self.index_cache
+                .insert_with_key(&derived_key, refreshed.clone())
+                .await;
+            return Ok(refreshed.indices.clone());
+        }
+        Ok(listing.indices.clone())
     }
 
     async fn merge_existing_index_segments(
@@ -898,10 +967,9 @@ impl DatasetIndexExt for Dataset {
         let is_index_type_change = existing_different_type_url.is_some();
         let existing_snapshot = existing_named_indices.clone();
         // What a retained sibling has to agree with. Every incoming segment
-        // already carries the same pair: `build_index_metadata_from_segments`
+        // already declares the same fields: `build_index_metadata_from_segments`
         // compares them against each other before this point.
-        let expected_fields = new_indices[0].fields.clone();
-        let expected_covering_fields = new_indices[0].covering_fields.clone();
+        let expected = &new_indices[0];
         let removed_indices = existing_named_indices
             .into_iter()
             .map(|idx| -> Result<Option<IndexMetadata>> {
@@ -932,21 +1000,19 @@ impl DatasetIndexExt for Dataset {
                 if existing_fragments.is_disjoint(&incoming_fragments) {
                     // Retained, so its declaration outlives this commit and has
                     // to match what is being written: `IndexDescriptionImpl::try_new`
-                    // requires `fields` to be identical across the segments of one
-                    // logical index. Nothing above catches a disagreement, because
+                    // requires the same keyed and carried fields across the segments
+                    // of one logical index. Nothing above catches a disagreement, because
                     // `keyed_fields` is the prefix left after the carried ones -- a
                     // segment carrying columns keys on exactly what a plain one
                     // keys on, and both pass the keyed-field guard.
-                    if idx.fields != expected_fields
-                        || idx.covering_fields != expected_covering_fields
-                    {
+                    if !idx.declares_same_fields(expected) {
                         return Err(Error::invalid_input(format!(
                             "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
                              but retained segment {} declares fields {:?} and covering_fields {:?}; \
                              a logical index cannot mix declarations - rebuild every segment in one commit",
                             index_name,
-                            expected_fields,
-                            expected_covering_fields,
+                            expected.fields,
+                            expected.covering_fields,
                             idx.uuid,
                             idx.fields,
                             idx.covering_fields
@@ -1222,7 +1288,13 @@ impl DatasetIndexExt for Dataset {
         // The stages a distributed optimize runs across workers, run here in
         // turn: without row bounds every index is one task that does the
         // whole single-process optimize, and every merge passes it through.
-        let Some(plan) = optimize::plan_optimize_indices_or_skip(self, &indices, options).await?
+        let Some(plan) = optimize::plan_optimize_indices_or_skip(
+            self,
+            &indices,
+            options,
+            optimize::OptimizeExecution::Local,
+        )
+        .await?
         else {
             return Ok(());
         };

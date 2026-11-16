@@ -87,7 +87,7 @@ impl PageScheduler for DictionaryPageScheduler {
         let copy_size = self.num_dictionary_items as u64;
 
         if self.should_decode_dict {
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
 
@@ -114,7 +114,7 @@ impl PageScheduler for DictionaryPageScheduler {
             .boxed()
         } else {
             let num_dictionary_items = self.num_dictionary_items;
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
 

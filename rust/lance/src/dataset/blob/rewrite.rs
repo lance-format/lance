@@ -695,6 +695,9 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
+/// Reusable Blob v2 rewrite plan for new fragments of the same dataset.
+///
+/// Used by compaction to preserve payload references or materialize payload bytes.
 pub struct BlobV2BatchRewritePlan {
     row_addr_idx: usize,
     columns: Vec<(usize, BlobV2FieldRewritePlan)>,
@@ -702,7 +705,16 @@ pub struct BlobV2BatchRewritePlan {
 }
 
 impl BlobV2BatchRewritePlan {
-    pub(crate) fn try_new(
+    /// Build a plan from the dataset schema and scanned batch schema.
+    ///
+    /// Input must include `_rowaddr`; Struct children must be complete and in
+    /// dataset order. Scan legacy blobs as binary and Blob v2 as descriptors.
+    /// `keep_row_addr` retains `_rowaddr` in the output.
+    ///
+    /// `preserve_managed` keeps payload references instead of materializing bytes.
+    /// It requires Managed blobs and a V2_2+ writer. Write output to the same
+    /// dataset's primary storage.
+    pub fn try_new(
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
@@ -772,11 +784,19 @@ impl BlobV2BatchRewritePlan {
         self
     }
 
-    pub(crate) fn output_schema(&self) -> &SchemaRef {
+    /// Schema of rewritten batches, for opening the destination writer.
+    pub fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
     }
 
-    pub(crate) async fn transform_batch(
+    /// Rewrite a batch using Blob payloads from `dataset`.
+    ///
+    /// `batch` must match the planned schema and contain valid, non-null `UInt64`
+    /// row addresses from this dataset snapshot. These preconditions are not
+    /// validated. Keep the snapshot alive until the output is committed.
+    ///
+    /// May read from storage. Batches can be transformed concurrently.
+    pub async fn transform_batch(
         &self,
         dataset: &Arc<Dataset>,
         batch: RecordBatch,

@@ -123,7 +123,7 @@ Common analyzer options include:
 - `base_tokenizer`: controls tokenization, such as `simple`, `whitespace`, `raw`, `icu`, or language-specific tokenizers.
 - `lower_case`, `stem`, `remove_stop_words`, `ascii_folding`: control case normalization, stemming, stop-word removal, and accent folding.
 - `language`: selects the language for stemming and default stop words.
-- `max_token_length`: drops tokens longer than the configured limit.
+- `max_token_length`: an exclusive UTF-8 byte limit; tokens whose encoded length is at least the limit are removed.
 - `analyzer="code"`: enables the code-analysis profile and its identifier/operator options.
 
 See [Tokenizers](tokenizer.md) for language models, code analysis, and token inspection with `lance.tokenize`.

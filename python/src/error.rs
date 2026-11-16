@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lance_namespace::error::NamespaceError;
+use lance_namespace::error::{ErrorCode, NamespaceError};
 use pyo3::{
     BoundObject, PyErr, PyResult, Python,
     exceptions::{PyIOError, PyNotImplementedError, PyRuntimeError, PyTimeoutError, PyValueError},
@@ -65,8 +65,17 @@ fn namespace_error_to_pyerr(py: Python<'_>, ns_err: &NamespaceError) -> PyErr {
                 Ok(from_error_code) => {
                     match from_error_code.call1((code, message.clone())) {
                         Ok(exc) => {
+                            let exc = exc.into_bound();
+                            // Throttling callers always get typed retry
+                            // guidance: a timedelta when the server sent
+                            // Retry-After and None otherwise, so one
+                            // missing-value check covers both cases. PyO3
+                            // converts Option<Duration> to timedelta or None.
+                            if matches!(ns_err.code(), ErrorCode::Throttling) {
+                                let _ = exc.setattr("retry_after", ns_err.retry_after());
+                            }
                             // Create a PyErr from the exception object
-                            PyErr::from_value(exc.into_bound())
+                            PyErr::from_value(exc)
                         }
                         Err(_) => PyRuntimeError::new_err(format!(
                             "[NamespaceError code={}] {}",

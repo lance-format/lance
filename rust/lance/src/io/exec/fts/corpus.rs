@@ -19,6 +19,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::{Distribution, PhysicalExpr};
 use datafusion_physical_plan::ExecutionPlanProperties;
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_index::scalar::inverted::query::Operator;
 use lance_index::scalar::inverted::{CombinedFieldsBM25Scorer, MemBM25Scorer};
 
 use super::{
@@ -155,6 +156,11 @@ impl SharedFtsCorpus {
                 {
                     return Some(ScorerRole::Consumer);
                 }
+                if let Some(node) = plan.downcast_ref::<PhraseQueryExec>()
+                    && node.uses_shared_scorer(template)
+                {
+                    return Some(ScorerRole::Consumer);
+                }
                 if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
                     && node.uses_shared_scorer(template)
                 {
@@ -189,10 +195,15 @@ impl SharedFtsCorpus {
             ))
         };
         let rebound: Arc<dyn ExecutionPlan> = match (self, role) {
-            (Self::Match(scorer), ScorerRole::Consumer) => plan
-                .downcast_ref::<MatchQueryExec>()
-                .ok_or_else(wrong_role)?
-                .rebuilt_with_shared_scorer(scorer.clone()),
+            (Self::Match(scorer), ScorerRole::Consumer) => {
+                if let Some(node) = plan.downcast_ref::<MatchQueryExec>() {
+                    node.rebuilt_with_shared_scorer(scorer.clone())
+                } else {
+                    plan.downcast_ref::<PhraseQueryExec>()
+                        .ok_or_else(wrong_role)?
+                        .rebuilt_with_shared_scorer(scorer.clone())
+                }
+            }
             (Self::Match(scorer), ScorerRole::Producer) => plan
                 .downcast_ref::<FlatMatchQueryExec>()
                 .ok_or_else(wrong_role)?
@@ -228,6 +239,25 @@ impl SharedFtsCorpus {
                 return Err(DataFusionError::Plan(
                     "FTS corpus branches must use the same Match query and document granularity"
                         .to_string(),
+                ));
+            }
+            return Ok(Self::Match(Arc::new(SharedFtsScorer::new())));
+        }
+        if let (Some(producer), Some(consumer)) = (
+            producer.downcast_ref::<FlatMatchQueryExec>(),
+            consumer.downcast_ref::<PhraseQueryExec>(),
+        ) {
+            require_same_snapshot(producer.dataset(), consumer.dataset())?;
+            if producer.query().terms != consumer.query().terms
+                || producer.query().column != consumer.query().column
+                || producer.query().operator != Operator::And
+                || producer.query().fuzziness != Some(0)
+                || producer.query().boost != 1.0
+                || producer.document_granularity() != consumer.document_granularity()
+                || producer.params().phrase_slop != consumer.params().phrase_slop
+            {
+                return Err(DataFusionError::Plan(
+                    "FTS corpus phrase branches must use an exact AND match of the same terms and column with the same slop and document granularity".to_string(),
                 ));
             }
             return Ok(Self::Match(Arc::new(SharedFtsScorer::new())));
@@ -392,10 +422,11 @@ impl SharedFtsScorerExec {
     /// Reconnect the producer and consumer in a decoded native corpus plan.
     ///
     /// The binding refers to child paths in `input`. The selected leaves must be
-    /// a FlatMatch/Match or FlatCombinedFields/CombinedFields pair with the same
-    /// query and opened dataset snapshot. Resolve the dataset once and reuse it
-    /// (or a shallow clone) for both leaves. Candidate filters and limits may
-    /// differ; their separation from the statistics corpus is preserved.
+    /// a FlatMatch/Match, FlatMatch/Phrase, or FlatCombinedFields/CombinedFields
+    /// pair with the same query and opened dataset snapshot. Resolve the dataset
+    /// once and reuse it (or a shallow clone) for both leaves. Candidate filters
+    /// and limits may differ; their separation from the statistics corpus is
+    /// preserved.
     /// Native segment/fragment scopes and scorer overrides remain authoritative.
     ///
     /// The two branches must be separate and cannot cross another corpus owner.

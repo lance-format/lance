@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Union
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import pyarrow as pa
 
 
@@ -56,6 +58,40 @@ class SqlQueryBuilder:
 
     def __init__(self, builder):
         self._builder = builder
+
+    def parameters(
+        self, parameters: Union[Sequence[Any], Dict[str, Any], pa.RecordBatch]
+    ) -> "SqlQueryBuilder":
+        """
+        Bind values to SQL placeholders without interpolating SQL text.
+
+        Parameters
+        ----------
+        parameters: sequence, dict, or pyarrow.RecordBatch
+            A sequence binds ``$1``, ``$2``, etc. A dict binds ``$name`` using
+            keys without the ``$`` prefix. Values may be Python scalars,
+            including ``None``, or PyArrow scalars for explicit Arrow types.
+            A RecordBatch must have exactly one row; its column names bind
+            named placeholders, also without the ``$`` prefix.
+
+            Calling this method again replaces the previous bindings. Missing
+            bindings and incompatible types raise an error during execution.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            query = dataset.sql(
+                "SELECT * FROM dataset WHERE id = $1", parameters=[42]
+            ).build()
+            query.to_batch_records()
+
+            query = dataset.sql(
+                "SELECT * FROM dataset WHERE name = $name"
+            ).parameters({"name": "O'Reilly"}).build()
+        """
+        self._builder = self._builder.parameters(parameters)
+        return self
 
     def table_name(self, table_name: str) -> "SqlQueryBuilder":
         """

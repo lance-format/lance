@@ -62,6 +62,14 @@ pub enum CacheTier {
     Absent,
 }
 
+/// A cache read that can finish without allocating or polling a future.
+pub enum ImmediateCacheRead {
+    /// The complete result of a read, including a definitive cache miss.
+    Ready(Option<CacheEntry>),
+    /// The caller must use [`CacheBackend::get`] to finish the read.
+    Deferred,
+}
+
 /// Boxed loader accepted by cache backends.
 pub type CacheLoader<'a> = Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>;
 
@@ -73,6 +81,30 @@ pub type CacheLoader<'a> = Pin<Box<dyn Future<Output = Result<(CacheEntry, usize
 /// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
+    /// Complete a read synchronously when the backend supports it.
+    ///
+    /// A ready result must have the same access/priority accounting as
+    /// [`get`](Self::get). Return `Deferred` if reading a lower tier or any
+    /// asynchronous work may be necessary; `Ready(None)` is a final miss.
+    /// The default preserves the asynchronous path for existing backends.
+    ///
+    /// ```
+    /// # use lance_core::cache::{CacheBackend, CacheEntry, ImmediateCacheRead, InternalCacheKey};
+    /// # async fn read(backend: &dyn CacheBackend, key: &InternalCacheKey) -> Option<CacheEntry> {
+    /// match backend.get_immediate(key, None) {
+    ///     ImmediateCacheRead::Ready(value) => value,
+    ///     ImmediateCacheRead::Deferred => backend.get(key, None).await,
+    /// }
+    /// # }
+    /// ```
+    fn get_immediate(
+        &self,
+        _key: &InternalCacheKey,
+        _codec: Option<CacheCodec>,
+    ) -> ImmediateCacheRead {
+        ImmediateCacheRead::Deferred
+    }
+
     /// Whether this backend consumes the entry sizes passed to
     /// [`insert`](Self::insert) and [`get_or_insert`](Self::get_or_insert)
     /// for eviction accounting. Backends that drop entries without
@@ -81,7 +113,10 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Returning `false` also gives up per-entry size reporting, since the
     /// traversal that registers a type's deep-size accessor is what gets
-    /// skipped. Only return `false` from a backend that retains nothing.
+    /// skipped. Only return `false` from a backend that retains nothing. A
+    /// backend whose capacity can grow at runtime must additionally refuse
+    /// insertions that carry no measured size: that size was taken while the
+    /// cache was disabled, so it says nothing about the entry's footprint.
     fn uses_entry_sizes(&self) -> bool {
         true
     }
@@ -253,6 +288,18 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
                 };
                 (entry, outcome)
             })
+    }
+
+    /// Resize the backend's weighted capacity, evicting entries as needed so
+    /// that the resident weight fits the new budget.
+    ///
+    /// Growing the capacity only raises the budget; evicted entries are
+    /// reloaded on demand. Backends that cannot change capacity after
+    /// construction keep the default implementation, which reports an error.
+    fn set_capacity(&self, _capacity: usize) -> Result<()> {
+        Err(crate::Error::not_supported(
+            "this cache backend does not support resizing its capacity",
+        ))
     }
 
     /// Remove all entries.

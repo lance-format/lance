@@ -29,6 +29,7 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::blocking_dataset::clone_dataset;
 use crate::blocking_dataset::conversions::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -78,7 +79,7 @@ fn inner_count_rows_native(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> Result<usize> {
-    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+    let dataset = clone_dataset(env, &jdataset)?;
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
         return Err(Error::input_error(format!(
             "Fragment not found: {fragment_id}"

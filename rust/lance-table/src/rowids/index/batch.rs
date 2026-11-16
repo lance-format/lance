@@ -54,7 +54,7 @@ impl RowIdIndex {
             Ok(())
         };
         if let SegmentLookup::Positions(positions) = &entry.lookup {
-            search_positions(positions, queries, &mut |id, ordinal, position| {
+            positions.search_many(queries, &mut |id, ordinal, position| {
                 let offset = entry.start_offset + position;
                 if !fragment.deletion_vector.contains(offset) {
                     store(
@@ -76,24 +76,26 @@ impl RowIdIndex {
     }
 }
 
-fn search_positions(
-    positions: &[(u64, u32)],
+pub(super) fn search_sorted(
+    len: usize,
+    key: impl Fn(usize) -> u64,
+    offset: impl Fn(usize) -> u32,
     queries: &[(u64, usize)],
     emit: &mut impl FnMut(u64, usize, u32) -> Result<()>,
 ) -> Result<()> {
-    if positions.is_empty() {
+    if len == 0 {
         return Ok(());
     }
     let (chunks, remainder) = queries.as_chunks::<LANES>();
     for chunk in chunks {
         let mut bases = [0usize; LANES];
-        let mut size = positions.len();
+        let mut size = len;
         while size > 1 {
             let half = size / 2;
             let mids: [usize; LANES] = std::array::from_fn(|lane| bases[lane] + half);
             // Load independent midpoints before consuming their results. Each
             // lane still depends on its own previous comparison, not its peers.
-            let keys: [u64; LANES] = std::array::from_fn(|lane| positions[mids[lane]].0);
+            let keys: [u64; LANES] = std::array::from_fn(|lane| key(mids[lane]));
             for lane in 0..LANES {
                 bases[lane] = std::hint::select_unpredictable(
                     keys[lane] <= chunk[lane].0,
@@ -105,15 +107,22 @@ fn search_positions(
         }
         for lane in 0..LANES {
             let (id, ordinal) = chunk[lane];
-            let (key, physical_offset) = positions[bases[lane]];
-            if key == id {
-                emit(id, ordinal, physical_offset)?;
+            if key(bases[lane]) == id {
+                emit(id, ordinal, offset(bases[lane]))?;
             }
         }
     }
     for &(id, ordinal) in remainder {
-        if let Ok(found) = positions.binary_search_by_key(&id, |&(key, _)| key) {
-            emit(id, ordinal, positions[found].1)?;
+        let mut base = 0;
+        let mut size = len;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            base = std::hint::select_unpredictable(key(mid) <= id, mid, base);
+            size -= half;
+        }
+        if key(base) == id {
+            emit(id, ordinal, offset(base))?;
         }
     }
     Ok(())
@@ -143,11 +152,17 @@ mod tests {
         let mut sorted: Vec<_> = queries.into_iter().zip(0..expected.len()).collect();
         sorted.sort_unstable_by_key(|q| q.0);
         let mut actual = vec![None; expected.len()];
-        search_positions(&positions, &sorted, &mut |_, ordinal, offset| {
-            assert!(actual[ordinal].is_none());
-            actual[ordinal] = Some(offset);
-            Ok(())
-        })
+        search_sorted(
+            positions.len(),
+            |i| positions[i].0,
+            |i| positions[i].1,
+            &sorted,
+            &mut |_, ordinal, offset| {
+                assert!(actual[ordinal].is_none());
+                actual[ordinal] = Some(offset);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(actual, expected);
     }

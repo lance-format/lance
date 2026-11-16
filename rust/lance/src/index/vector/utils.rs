@@ -1590,13 +1590,12 @@ mod tests {
     fn test_random_ranges(
         #[values(99, 100, 102)] num_rows: usize,
         #[values(10, 100)] sample_size: usize,
+        // A vector wider than the block still gets a one-row range (#3426).
+        #[values((10, 10), (101, 1))] byte_width_and_bin_size: (usize, usize),
     ) {
         // We can just assert that the output when sorted is the same as the input
         let block_size = 100;
-        let byte_width = 10;
-
-        let bin_size = block_size / byte_width;
-        assert_eq!(bin_size, 10);
+        let (byte_width, bin_size) = byte_width_and_bin_size;
 
         let mut ranges =
             random_ranges(num_rows, sample_size, block_size, byte_width).collect::<Vec<_>>();
@@ -1804,6 +1803,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1030);
+    }
+
+    /// Training on chosen fragments samples each in proportion to its rows,
+    /// in whatever order the fragments are listed.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_fragment_limited_sample_spans_every_fragment(
+        #[values(false, true)] nullable: bool,
+    ) {
+        const DIM: i32 = 4;
+        const ROWS: usize = 1000;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "vec",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            nullable,
+        )]));
+        // Every value of a row names the fragment it was written to.
+        let batch = |fragment: usize| {
+            let values = Float32Array::from(vec![fragment as f32; ROWS * DIM as usize]);
+            let vectors = FixedSizeListArray::try_new_from_values(values, DIM).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors) as ArrayRef]).unwrap()
+        };
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![batch(0)])
+            .await
+            .unwrap();
+        for fragment in 1..6 {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch(fragment))], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+
+        let sample =
+            maybe_sample_training_data(&dataset, "vec", 600, Some(&[ids[5], ids[1], ids[3]]))
+                .await
+                .unwrap();
+        let values = sample.values().as_primitive::<Float32Type>();
+        let mut counts = [0; 6];
+        for row in 0..sample.len() {
+            counts[values.value(row * DIM as usize) as usize] += 1;
+        }
+        assert_eq!(counts[0] + counts[2] + counts[4], 0, "{counts:?}");
+        for fragment in [1, 3, 5] {
+            assert!((120..=280).contains(&counts[fragment]), "{counts:?}");
+        }
     }
 
     // Creates a dataset with three fragments holding 100, 200, and 150 rows.

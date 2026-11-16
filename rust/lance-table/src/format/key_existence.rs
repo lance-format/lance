@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::format::pb;
+use crate::format::pb_actions;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
@@ -131,12 +131,12 @@ impl KeyExistenceFilterBuilder {
     }
 }
 
-impl From<&KeyExistenceFilterBuilder> for pb::transaction::KeyExistenceFilter {
+impl From<&KeyExistenceFilterBuilder> for pb_actions::KeyExistenceFilter {
     fn from(builder: &KeyExistenceFilterBuilder) -> Self {
         Self {
             field_ids: builder.field_ids.clone(),
-            data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-                pb::transaction::BloomFilter {
+            data: Some(pb_actions::key_existence_filter::Data::Bloom(
+                pb_actions::BloomFilter {
                     bitmap: builder.sbbf.to_bytes(),
                     num_bits: (builder.sbbf.size_bytes() as u32) * 8,
                     number_of_items: BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS,
@@ -314,13 +314,13 @@ impl KeyExistenceFilter {
     }
 }
 
-impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
+impl From<&KeyExistenceFilter> for pb_actions::KeyExistenceFilter {
     fn from(filter: &KeyExistenceFilter) -> Self {
         match &filter.filter {
             FilterType::ExactSet(hashes) => Self {
                 field_ids: filter.field_ids.clone(),
-                data: Some(pb::transaction::key_existence_filter::Data::Exact(
-                    pb::transaction::ExactKeySetFilter {
+                data: Some(pb_actions::key_existence_filter::Data::Exact(
+                    pb_actions::ExactKeySetFilter {
                         key_hashes: hashes.iter().copied().collect(),
                     },
                 )),
@@ -332,8 +332,8 @@ impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
                 probability,
             } => Self {
                 field_ids: filter.field_ids.clone(),
-                data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-                    pb::transaction::BloomFilter {
+                data: Some(pb_actions::key_existence_filter::Data::Bloom(
+                    pb_actions::BloomFilter {
                         bitmap: bitmap.clone(),
                         num_bits: *num_bits,
                         number_of_items: *number_of_items,
@@ -345,15 +345,15 @@ impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
     }
 }
 
-impl TryFrom<&pb::transaction::KeyExistenceFilter> for KeyExistenceFilter {
+impl TryFrom<&pb_actions::KeyExistenceFilter> for KeyExistenceFilter {
     type Error = lance_core::Error;
 
-    fn try_from(message: &pb::transaction::KeyExistenceFilter) -> Result<Self> {
+    fn try_from(message: &pb_actions::KeyExistenceFilter) -> Result<Self> {
         let filter = match message.data.as_ref() {
-            Some(pb::transaction::key_existence_filter::Data::Exact(exact)) => {
+            Some(pb_actions::key_existence_filter::Data::Exact(exact)) => {
                 FilterType::ExactSet(exact.key_hashes.iter().copied().collect())
             }
-            Some(pb::transaction::key_existence_filter::Data::Bloom(b)) => {
+            Some(pb_actions::key_existence_filter::Data::Bloom(b)) => {
                 // Use defaults for backwards compatibility
                 let number_of_items = if b.number_of_items == 0 {
                     BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS
@@ -444,6 +444,10 @@ fn extract_key_value(array: &dyn Array, row_idx: usize) -> Option<KeyValue> {
             let arr = array.as_any().downcast_ref::<LargeBinaryArray>()?;
             KeyValue::Binary(arr.value(row_idx).to_vec())
         }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array.as_fixed_size_binary();
+            KeyValue::Binary(arr.value(row_idx).to_vec())
+        }
         DataType::List(_) => {
             let list_array = array.as_any().downcast_ref::<ListArray>().unwrap();
             let values = list_array.value(row_idx);
@@ -496,8 +500,47 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::builder::{Int32Builder, ListBuilder, StringBuilder};
-    use arrow_array::{Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{Field, Schema};
+
+    #[rstest::rstest]
+    #[case::one_byte(1)]
+    #[case::uuid(16)]
+    #[case::content_hash(32)]
+    fn test_extract_fixed_size_binary_key(#[case] size: i32) {
+        let values = [
+            Some(vec![0; size as usize]),
+            Some(vec![1; size as usize]),
+            None,
+            Some(vec![2; size as usize]),
+        ];
+        let array =
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), size).unwrap();
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(array) as ArrayRef)])
+            .unwrap()
+            .slice(1, 3);
+        let on_columns = vec!["id".to_string()];
+        let key = KeyValue::Binary(vec![1; size as usize]);
+        assert_eq!(
+            extract_key_value_from_batch(&batch, 0, &on_columns),
+            Some(key.clone())
+        );
+        assert_eq!(extract_key_value_from_batch(&batch, 1, &on_columns), None);
+        assert_eq!(
+            extract_key_value_from_batch(&batch, 2, &on_columns),
+            Some(KeyValue::Binary(vec![2; size as usize]))
+        );
+
+        let mut builder = KeyExistenceFilterBuilder::new(vec![0]);
+        builder.insert(key).unwrap();
+        assert_eq!(
+            builder
+                .build()
+                .might_contain_columns(batch.columns())
+                .unwrap(),
+            vec![true, false, false]
+        );
+    }
 
     #[test]
     fn test_extract_key_value_from_batch_list_int() {

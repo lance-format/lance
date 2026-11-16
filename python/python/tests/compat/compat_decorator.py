@@ -141,6 +141,15 @@ class UpgradeDowngradeTest:
         """Return True to skip the current-write -> old-read downgrade test."""
         return False
 
+    def skip_upgrade_downgrade(self, version: str) -> bool:
+        """Return True to skip the old-write -> current -> old-read round trip.
+
+        Use this when the fixture itself cannot be produced by the old
+        build -- e.g. a capability this test exercises was outright rejected
+        by that release, not merely written in an older format.
+        """
+        return False
+
     def current_env(self, method_name: str) -> Dict[str, str]:
         """Return environment overrides for methods executed in the current runtime."""
         return {}
@@ -341,6 +350,10 @@ def test_func({sig_params}):
     from pathlib import Path
     obj = cls(tmp_path / "data.lance", {init_params})
     obj.compat_version = version
+    if obj.skip_upgrade_downgrade(version):
+        pytest.skip(
+            "upgrade/downgrade compatibility is intentionally unsupported for this test"
+        )
     venv = venv_factory.get_venv(version)
     # Old version: create data
     venv.execute_method(obj, "create", obj.compat_env(version, "create"))

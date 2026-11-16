@@ -825,6 +825,8 @@ pub enum AmbiguousFailure {
     LandAndConflict,
     /// Apply the commit, then report an I/O error.
     LandAndError,
+    /// Apply the commit, then report an I/O error and make verification unavailable.
+    LandAndErrorWithoutVerification,
     /// Do not apply the commit; report an I/O error.
     FailOutright,
 }
@@ -848,6 +850,8 @@ pub struct AmbiguousCommitHandler {
     /// When set, version resolution fails, making commit-outcome verification
     /// impossible.
     pub fail_resolve: AtomicBool,
+    /// Preserve a handler error even when readback proves that the commit landed.
+    pub propagate_error_after_success: AtomicBool,
     /// Number of upcoming resolution calls that should return NotFound.
     resolve_not_found_remaining: AtomicUsize,
     /// Whether a persistent NotFound proves that the requested version is
@@ -863,6 +867,7 @@ impl Default for AmbiguousCommitHandler {
         Self {
             fail_next_commit: Mutex::new(None),
             fail_resolve: AtomicBool::new(false),
+            propagate_error_after_success: AtomicBool::new(false),
             resolve_not_found_remaining: AtomicUsize::new(0),
             not_found_is_definitive: AtomicBool::new(true),
             resolve_calls: AtomicUsize::new(0),
@@ -904,7 +909,7 @@ impl CommitHandler for AmbiguousCommitHandler {
     }
 
     fn propagate_commit_error_after_success(&self) -> bool {
-        false
+        self.propagate_error_after_success.load(Ordering::SeqCst)
     }
 
     async fn commit(
@@ -960,7 +965,10 @@ impl CommitHandler for AmbiguousCommitHandler {
                     .await?;
                 Err(CommitError::CommitConflict)
             }
-            Some(AmbiguousFailure::LandAndError) => {
+            Some(
+                failure @ (AmbiguousFailure::LandAndError
+                | AmbiguousFailure::LandAndErrorWithoutVerification),
+            ) => {
                 ConditionalPutCommitHandler
                     .commit(
                         manifest,
@@ -972,6 +980,9 @@ impl CommitHandler for AmbiguousCommitHandler {
                         transaction,
                     )
                     .await?;
+                if failure == AmbiguousFailure::LandAndErrorWithoutVerification {
+                    self.fail_resolve.store(true, Ordering::SeqCst);
+                }
                 Err(CommitError::OtherError(lance_core::Error::io(
                     "simulated ambiguous commit failure",
                 )))

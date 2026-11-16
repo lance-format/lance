@@ -560,6 +560,37 @@ def test_versions(tmp_path: Path):
     assert current["manifest_size"] == _manifest_file_size(base_dir, 2)
 
 
+@pytest.mark.parametrize("uri", ["memory://versions_pagination", "local"])
+def test_versions_pagination(tmp_path: Path, uri: str):
+    if uri == "local":
+        uri = str(tmp_path / "test")
+    table = pa.table({"a": [1, 2]})
+    dataset = lance.write_dataset(table, uri)
+    for _ in range(4):
+        dataset = lance.write_dataset(table, dataset, mode="append")
+
+    def ids(versions):
+        return [v["version"] for v in versions]
+
+    all_versions = dataset.versions()
+    assert ids(all_versions) == [1, 2, 3, 4, 5]
+    assert dataset.count_versions() == 5
+
+    assert ids(dataset.versions(limit=2, descending=True)) == [5, 4]
+    assert ids(dataset.versions(offset=2, limit=2, descending=True)) == [3, 2]
+    assert ids(dataset.versions(offset=4, limit=2, descending=True)) == [1]
+    assert ids(dataset.versions(offset=1, limit=3)) == [2, 3, 4]
+    assert ids(dataset.versions(offset=3)) == [4, 5]
+    assert dataset.versions(offset=5, limit=2) == []
+    assert dataset.versions(limit=0) == []
+    assert dataset.versions(limit=1, descending=True) == [all_versions[-1]]
+
+    with pytest.raises(ValueError, match="offset"):
+        dataset.versions(offset=-1)
+    with pytest.raises(ValueError, match="limit"):
+        dataset.versions(limit=-1)
+
+
 def test_version_id(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -646,6 +677,46 @@ def test_asof_checkout(tmp_path: Path):
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
 
 
+@pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])
+def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
+    ds = lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+    ds = lance.write_dataset(pa.table({"x": [2]}), tmp_path, mode="append")
+    time.sleep(0.1)
+    ds = lance.write_dataset(pa.table({"x": [3]}), tmp_path, mode="append")
+
+    versions = ds.versions()
+    ts_2, ts_3 = (v["timestamp"] for v in versions[1:])
+    cutoff = ts_2 + (ts_3 - ts_2) / 2
+    before_cleanup = lance.dataset(tmp_path, asof=cutoff)
+    assert before_cleanup.version == 2
+    assert before_cleanup.to_table()["x"].to_pylist() == [1, 2]
+    assert len(before_cleanup.get_fragments()) == 2
+
+    if cleanup == "explicit":
+        ds.cleanup_old_versions(versions=[2])
+    else:
+        if cleanup == "branch":
+            ds.create_branch("keep-v1", 1)
+        elif cleanup == "tag":
+            ds.tags.create("keep-v1", 1)
+        ds.cleanup_old_versions(
+            older_than=timedelta(0), error_if_tagged_old_versions=cleanup != "tag"
+        )
+
+    with pytest.raises(ValueError, match="[Vv]ersion.*not found"):
+        lance.dataset(tmp_path, version=2)
+
+    if cleanup == "all_older":
+        assert [v["version"] for v in ds.versions()] == [3]
+        with pytest.raises(ValueError, match="earlier than the first version"):
+            lance.dataset(tmp_path, asof=cutoff)
+    else:
+        assert [v["version"] for v in ds.versions()] == [1, 3]
+        after_cleanup = lance.dataset(tmp_path, asof=cutoff)
+        assert after_cleanup.version == 1
+        assert after_cleanup.to_table()["x"].to_pylist() == [1]
+
+
 @pytest.mark.parametrize(
     "ts", ["2026-01-01", pd.Timestamp("2026-01-01"), datetime(2026, 1, 1)]
 )
@@ -722,6 +793,42 @@ def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool
     assert ds.count_rows() == len(rows)
     assert len(ds.get_fragments()) == (0 if len(rows) == 0 else 1)
     assert ds.has_stable_row_ids is enable_stable_row_ids
+
+
+def _live_row_addrs(ds):
+    rows = ds.to_table(columns=[], with_row_id=True, with_row_address=True)
+    return dict(zip(rows["_rowid"].to_pylist(), rows["_rowaddr"].to_pylist()))
+
+
+def test_get_row_addresses(tmp_path: Path):
+    table = pa.table({"a": range(6)})
+    ds = lance.write_dataset(
+        table, tmp_path / "stable", enable_stable_row_ids=True, max_rows_per_file=3
+    )
+    ds.update({"a": "a + 10"}, where="a = 1")
+    ds.delete("a = 4")
+    ds.optimize.compact_files(target_rows_per_fragment=100)
+    live = _live_row_addrs(ds)
+    assert sorted(live) == [0, 1, 2, 3, 5]
+    # an update rewrote row 1 and compaction moved every row, so addresses no
+    # longer equal ids
+    assert any(row_id != addr for row_id, addr in live.items())
+
+    ids = [5, 4, None, 1, 1, 100]
+    expected = [live[5], None, None, live[1], live[1], None]
+    assert ds.get_row_addresses(ids).to_pylist() == expected
+    chunked = pa.chunked_array([[5, 4], [None, 1, 1, 100]], type=pa.int64())
+    assert ds.get_row_addresses(chunked).to_pylist() == expected
+    assert ds.get_row_addresses([]).to_pylist() == []
+    with pytest.raises(pa.ArrowInvalid):
+        ds.get_row_addresses(pa.array([-1], type=pa.int64()))
+
+    plain = lance.write_dataset(table, tmp_path / "plain")
+    assert plain.get_row_addresses([0, None, 1 << 32]).to_pylist() == [
+        0,
+        None,
+        1 << 32,
+    ]
 
 
 def _list_manifests(versions_dir):
@@ -983,6 +1090,16 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+@pytest.mark.parametrize("columns", [["a", "nope"], ["s.nope"], ["a.b"]])
+def test_take_unknown_column(tmp_path: Path, columns):
+    table = pa.table({"a": [1, 10], "s": pa.array([{"x": 2}, {"x": 20}])})
+    dataset = lance.write_dataset(table, tmp_path)
+    with pytest.raises(ValueError, match="not found"):
+        dataset.take([0], columns=columns)
+    with pytest.raises(ValueError, match="not found"):
+        dataset._take_rows([0], columns=columns)
 
 
 @pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
@@ -4583,6 +4700,203 @@ def test_merge_insert_empty_index():
     empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_merge_insert_structured_analysis(streaming):
+    data = pa.table({"id": list(range(64)), "value": list(range(64))})
+    ds = lance.write_dataset(
+        data, "memory://", max_rows_per_file=32, max_rows_per_group=32
+    )
+    source = pa.table({"id": [1, 100], "value": [999, 999]})
+    if streaming:
+        source = source.to_reader()
+    report = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .analyze_plan_report(source)
+    )
+    assert report["outcome"] == "complete"
+    assert report["error"] is None
+    assert report["write_mode"] == "rewrite_rows"
+    assert report["elapsed_ns"] >= 0
+    assert report["stats"]["num_updated_rows"] == 1
+    assert report["stats"]["num_inserted_rows"] == 1
+    assert report["stats"]["bytes_written"] > 0
+    assert report["fragments_touched"] == 1
+    assert report["target_rows_read"] == 64
+    assert report["fragments_read"] == 2
+    assert report["index_used"] is False
+    assert report["join_index_segments"] == 0
+    assert report["replay_spills"]["bytes_written"] == 0
+    assert len(report["joins"]) == 1
+    join = report["joins"][0]
+    assert join["strategy"] == "hash"
+    assert join["join_type"] == ("Right" if streaming else "Left")
+    expected_source = "StreamingTableExec" if streaming else "DataSourceExec"
+    assert expected_source in report["plan"]
+    assert any(operator["path"] == join["path"] for operator in report["operators"])
+    assert report["counts"]["bytes_read"] >= 0
+    assert ds.version == 1
+    assert ds.to_table() == data
+
+
+@pytest.mark.parametrize("ids", [[], [None]])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_merge_insert_structured_analysis_empty_and_null(ids, indexed):
+    data = pa.table({"id": [1, 2, 3, 4]})
+    ds = lance.write_dataset(
+        data, "memory://", max_rows_per_file=2, max_rows_per_group=2
+    )
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+    source = pa.table({"id": pa.array(ids, type=pa.int64())})
+    report = (
+        ds.merge_insert("id").when_not_matched_insert_all().analyze_plan_report(source)
+    )
+    assert report["outcome"] == "complete"
+    if not indexed:
+        assert report["stats"]["num_inserted_rows"] == len(ids)
+    assert report["stats"]["num_updated_rows"] == 0
+    assert report["fragments_touched"] == 0
+    assert report["index_used"] == indexed
+    assert ds.version == version
+    assert ds.to_table() == data
+    # The current indexed writer discards null source keys. Report that same behavior.
+    result = ds.merge_insert("id").when_not_matched_insert_all().execute(source)
+    assert report["stats"]["num_inserted_rows"] == result["num_inserted_rows"]
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_merge_insert_structured_analysis_source_failure(indexed):
+    data = pa.table({"id": [1, 2, 3, 4]})
+    ds = lance.write_dataset(data, "memory://")
+
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+
+    def batches():
+        yield pa.record_batch({"id": [10]})
+        raise ValueError("analysis source failed")
+
+    reader = pa.RecordBatchReader.from_batches(data.schema, batches())
+    report = (
+        ds.merge_insert("id").when_not_matched_insert_all().analyze_plan_report(reader)
+    )
+    assert report["outcome"] == "failed"
+    assert "analysis source failed" in report["error"]
+    assert report["stats"] is None
+    assert report["fragments_touched"] is None
+    assert ds.version == version
+    assert ds.to_table() == data
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_merge_analysis_spills_and_subplans(indexed, streaming, tmp_path):
+    data = pa.table(
+        {"id": [0, 1, 2, 3, 4, 5], "value": [0, 1, 2, 3, 4, 5], "other": [0] * 6}
+    )
+    ds = lance.write_dataset(
+        data, tmp_path / "analysis", max_rows_per_file=3, max_rows_per_group=3
+    )
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+    files = sorted(
+        path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()
+    )
+    source = pa.table({"id": [1, 4], "value": [99, 44]})
+    if streaming:
+        source = source.to_reader()
+    report = ds.merge_insert("id").when_matched_update_all().analyze_plan_report(source)
+    assert report["outcome"] == "complete", report["error"]
+    assert report["index_used"] == indexed
+    assert report["join_index_segments"] == int(indexed)
+    assert report["write_mode"] == ("rewrite_columns" if indexed else "rewrite_rows")
+    assert report["stats"]["num_updated_rows"] == 2
+    assert report["stats"]["bytes_written"] > 0
+    assert report["join_duration_ns"] is not None
+    assert report["merge_write_duration_ns"] is not None
+    assert report["joined_rows"] is not None
+    assert report["scratch_spills"] is None
+    assert report["operator_spills"]["bytes_read"] is None
+    if indexed:
+        assert report["mapped_target_rows"] == 2
+        assert report["replay_spills"]["bytes_written"] > 0
+        assert report["replay_spills"]["bytes_read"] > 0
+        assert any(
+            plan["purpose"] == "fragment_update_sort" for plan in report["subplans"]
+        )
+        ids = {plan["id"] for plan in report["subplans"]}
+        assert len(ids) == len(report["subplans"])
+        assert all(join["subplan_id"] in ids for join in report["joins"])
+    assert ds.version == version
+    assert ds.to_table() == data
+    assert (
+        sorted(
+            path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()
+        )
+        == files
+    )
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_merge_analysis_partial_index_coverage(filtered, tmp_path):
+    data = pa.table({"id": [0, 1], "value": [0, 1]})
+    ds = lance.write_dataset(data, tmp_path / "partial")
+    ds.create_scalar_index("id", "BTREE")
+    ds = lance.write_dataset(
+        pa.table({"id": [2, 3], "value": [2, 3]}), ds.uri, mode="append"
+    )
+    before = ds.to_table()
+    version = ds.version
+    builder = ds.merge_insert("id").when_matched_update_all(
+        "source.value < 0" if filtered else None
+    )
+    source = pa.table({"id": [1, 3], "value": [11, 33]})
+    report = builder.analyze_plan_report(source)
+    assert report["outcome"] == "complete", report["error"]
+    assert report["index_used"] is True
+    assert report["join_index_segments"] == 1
+    assert report["stats"]["num_updated_rows"] == (0 if filtered else 2)
+    assert report["stats"]["num_inserted_rows"] == 0
+    assert ds.version == version
+    assert ds.to_table() == before
+    result = builder.execute(source)
+    assert result["num_updated_rows"] == (0 if filtered else 2)
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_merge_insert_structured_analysis_partial_indexed_insert(indexed, tmp_path):
+    data = pa.table({"id": [0, 1], "value": [10, 20], "note": ["a", "b"]})
+    ds = lance.write_dataset(
+        data, tmp_path / "partial-insert", max_rows_per_file=1, max_rows_per_group=1
+    )
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+    before = ds.to_table()
+    source = pa.table({"id": [2], "value": [30]})
+    builder = ds.merge_insert("id").when_not_matched_insert_all()
+    report = builder.analyze_plan_report(source)
+    assert report["outcome"] == "complete", report["error"]
+    assert report["index_used"] is indexed
+    assert report["join_index_segments"] == int(indexed)
+    assert report["write_mode"] == "rewrite_rows"
+    assert report["stats"]["num_updated_rows"] == 0
+    assert report["stats"]["num_inserted_rows"] == 1
+    assert report["fragments_touched"] == 0
+    assert ds.version == version
+    assert ds.to_table() == before
+
+    result = builder.execute(source)
+    assert result["num_updated_rows"] == 0
+    assert result["num_inserted_rows"] == 1
+    assert lance.dataset(ds.uri).count_rows() == 3
+
+
 def test_merge_insert_explain_analyze_plan():
     """Test that explain_plan and analyze_plan work on merge insert operations."""
     # Create a simple test dataset
@@ -4744,6 +5058,46 @@ def test_native_dataset_falls_back_for_blob_v2(tmp_path, monkeypatch):
             "id"
         ).when_matched_update_all().when_not_matched_insert_all().execute(source)
     assert calls == [True]
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("same_dataset", [False, True])
+def test_merge_report_preserves_dataset_source_routing(
+    tmp_path, monkeypatch, native, same_dataset
+):
+    data = pa.table({"id": [0, 1, 2, 3], "value": [0, 1, 2, 3]})
+    target = lance.write_dataset(data, tmp_path / "target", max_rows_per_file=2)
+    source = (
+        target
+        if same_dataset
+        else lance.write_dataset(
+            pa.table({"id": [1, 9], "value": [11, 99]}), tmp_path / "source"
+        )
+    )
+    input_source = source if native else source.scanner()
+    if native:
+
+        def reject_scanner(*args, **kwargs):
+            raise AssertionError("native analysis must not create a Python scanner")
+
+        monkeypatch.setattr(source, "scanner", reject_scanner)
+    report = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .analyze_plan_report(input_source)
+    )
+    assert report["outcome"] == "complete", report["error"]
+    assert report["stats"]["num_updated_rows"] == (4 if same_dataset else 1)
+    assert report["stats"]["num_inserted_rows"] == (0 if same_dataset else 1)
+    assert report["target_rows_read"] == 4
+    assert report["fragments_read"] == 2
+    if native:
+        assert "StreamingTableExec" not in report["plan"]
+        # Restore target scanning before checking a native self-merge's contents.
+        monkeypatch.undo()
+    assert target.version == 1
+    assert target.to_table() == data
 
 
 def test_merge_insert_native_dataset_build_side(tmp_path):
@@ -7880,11 +8234,6 @@ def _write_overlay_file(
     )
 
 
-@pytest.fixture
-def enable_unstable_data_overlay_files(monkeypatch):
-    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
-
-
 @pytest.mark.parametrize("overlay_version", ["2.2", "2.3"])
 @pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
 def test_mixed_version_overlays_preserve_data(
@@ -8928,6 +9277,125 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+@pytest.mark.parametrize("result_method", ["to_batch_records", "to_stream_reader"])
+@pytest.mark.parametrize("parameter_form", ["positional", "named", "record_batch"])
+@pytest.mark.parametrize("register_ids", [False, True])
+def test_dataset_sql_parameters(
+    tmp_path: Path, result_method, parameter_form, register_ids
+):
+    key = "O'Reilly' OR 1=1 -- $1"
+    table = pa.table({"id": [1, 2, 3, 4], "value": ["other", key, None, key]})
+    ds = lance.write_dataset(
+        table, tmp_path / "test", max_rows_per_file=2, max_rows_per_group=2
+    )
+    if parameter_form == "positional":
+        parameters = [2, key]
+        lower, value = "$1", "$2"
+    else:
+        parameters = {"lower": 2, "value": key}
+        if parameter_form == "record_batch":
+            parameters = pa.record_batch({name: [v] for name, v in parameters.items()})
+        lower, value = "$lower", "$value"
+    sql = (
+        f"SELECT id, {value} AS bound_value, '$1' AS literal FROM test "
+        f"WHERE id >= {lower} AND (value = {value} OR value = {value})"
+    )
+    if register_ids:
+        sql += f" AND id IN (SELECT id FROM ids WHERE id >= {lower})"
+    builder = ds.sql(sql + " ORDER BY id", parameters=parameters).table_name("test")
+    if register_ids:
+        builder.register_arrow("ids", pa.table({"id": [1, 4, 99]}))
+    query = builder.with_row_id().with_row_addr().batch_size(1).build()
+    result = pa.Table.from_batches(list(getattr(query, result_method)()))
+    expected_ids = [4] if register_ids else [2, 4]
+    assert result["id"].to_pylist() == expected_ids
+    assert result["bound_value"].to_pylist() == [key] * len(expected_ids)
+    assert result["literal"].to_pylist() == ["$1"] * len(expected_ids)
+    assert result["_rowid"].null_count == 0
+    assert result["_rowaddr"].null_count == 0
+
+
+def test_dataset_sql_parameters_count_and_replace(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": [1, 2, 3]}), tmp_path / "test")
+    builder = ds.sql("SELECT count(*) AS n FROM dataset WHERE id = $1", parameters=[1])
+    first = builder.build()
+    second = builder.parameters((99,)).build()
+    assert pa.Table.from_batches(first.to_batch_records()).to_pydict() == {"n": [1]}
+    assert pa.Table.from_batches(second.to_batch_records()).to_pydict() == {"n": [0]}
+    assert pa.Table.from_batches(first.to_batch_records()).to_pydict() == {"n": [1]}
+
+
+@pytest.mark.parametrize(
+    "value,arrow_type",
+    [
+        (None, pa.null()),
+        (True, pa.bool_()),
+        (3.5, pa.float64()),
+        (b"bytes", pa.binary()),
+        (date(2026, 1, 2), pa.date32()),
+        (pa.scalar(42, pa.int32()), pa.int32()),
+        (pa.scalar(None, pa.int64()), pa.int64()),
+        (pa.scalar("text", pa.large_string()), pa.large_string()),
+        (pa.scalar(b"bytes", pa.large_binary()), pa.large_binary()),
+    ],
+)
+def test_dataset_sql_parameter_types(tmp_path: Path, value, arrow_type):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    result = pa.Table.from_batches(
+        ds.sql("SELECT $1 AS value", parameters=[value]).build().to_batch_records()
+    )
+    assert result.column_names == ["value"]
+    assert result["value"].combine_chunks() == pa.array([value], type=arrow_type)
+
+
+def test_dataset_sql_null_parameter(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": [1, None]}), tmp_path / "test")
+    result = pa.Table.from_batches(
+        ds.sql("SELECT id FROM dataset WHERE id IS NOT DISTINCT FROM $1")
+        .parameters([None])
+        .build()
+        .to_batch_records()
+    )
+    assert result.to_pydict() == {"id": [None]}
+
+
+@pytest.mark.parametrize(
+    "sql,parameters,message",
+    [
+        ("SELECT id FROM dataset WHERE id = $1", None, "Placeholder.*not provided"),
+        ("SELECT $1", [], "No value found for placeholder with id \\$1"),
+        ("SELECT $missing", {}, "No value found for placeholder with name \\$missing"),
+        ("SELECT id + $1 FROM dataset", [True], "type"),
+    ],
+)
+def test_dataset_sql_invalid_bindings(tmp_path: Path, sql, parameters, message):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    with pytest.raises(ValueError, match=message):
+        ds.sql(sql, parameters=parameters).build().to_batch_records()
+
+
+@pytest.mark.parametrize("parameters", ["text", b"bytes", bytearray(b"bytes"), 1])
+def test_dataset_sql_invalid_parameter_container(tmp_path: Path, parameters):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    with pytest.raises(TypeError, match="SQL parameters must be"):
+        ds.sql("SELECT $1", parameters=parameters)
+
+
+@pytest.mark.parametrize("values", [[], [1, 2]])
+def test_dataset_sql_invalid_parameter_batch(tmp_path: Path, values):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    parameters = pa.record_batch({"value": values})
+    with pytest.raises(ValueError, match="must have exactly one row"):
+        ds.sql("SELECT $value", parameters=parameters)
+
+
+def test_dataset_sql_duplicate_parameter_names(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    parameters = pa.record_batch([[1], [2]], names=["value", "value"])
+    with pytest.raises(ValueError, match='duplicate column name "value"'):
+        ds.sql("SELECT $value", parameters=parameters)
+
+
 @pytest.mark.parametrize("as_reader", [False, True], ids=["table", "reader"])
 def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
     table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
@@ -9774,6 +10242,233 @@ def test_shallow_clone(tmp_path: Path):
     cloned_by_branch = branch.shallow_clone(clone_branch_v3, 3)
     assert cloned_by_branch.to_table() == table_v3
     assert lance.dataset(clone_branch_v3).to_table() == table_v3
+
+
+def test_shallow_clone_cross_store_returns_readable_dataset():
+    """A cross-store shallow clone is returned already bound to the source store.
+
+    Arrange:
+      - Register one in-memory provider per scheme and open a session on that
+        registry, so source, target, and chained target live in different stores
+        that are built from different storage options.
+      - Write a two-fragment source dataset into the source store.
+    Act:
+      - Shallow clone it into the target store with target-only options, then
+        shallow clone the returned dataset into a third store.
+    Assert:
+      - The returned handles read the shared data files without any caller-side
+        ``base_store_params`` and the target store holds metadata but no data
+        files, so nothing was copied into it.
+
+    Local paths cannot express this: a target opened with target-only options
+    would still reach the source files, while a distinct provider only serves the
+    source data to a handle that kept the source bindings.
+    """
+    from lance.lance import (
+        _ObjectStoreProvider,
+        _ObjectStoreRegistry,
+        _Session,
+    )
+
+    registry = _ObjectStoreRegistry()
+    for scheme in ["test-clone-src", "test-clone-dst", "test-clone-chain"]:
+        registry.register_provider(scheme, _ObjectStoreProvider.memory())
+    session = _Session(store_registry=registry)
+
+    source_uri = "test-clone-src://bucket/source.lance"
+    target_uri = "test-clone-dst://bucket/target.lance"
+    chained_uri = "test-clone-chain://bucket/chained.lance"
+    source_options = {"test_store_options": "source"}
+    target_options = {"test_store_options": "target"}
+
+    expected = pa.table(
+        {
+            "id": pa.array(range(8), type=pa.int32()),
+            "value": pa.array([f"row-{i}" for i in range(8)], type=pa.string()),
+        }
+    )
+    source = lance.write_dataset(
+        expected,
+        source_uri,
+        mode="create",
+        storage_options=source_options,
+        session=session,
+        max_rows_per_file=4,
+    )
+    assert len(source.get_fragments()) == 2
+    assert source.to_table() == expected
+
+    cloned = source.shallow_clone(
+        target_uri, source.version, storage_options=target_options
+    )
+    assert cloned.uri == target_uri
+    assert cloned.version == 1
+    assert {base.path for base in cloned.base_paths().values()} == {source_uri}
+    assert cloned.to_table() == expected
+
+    # The chained clone resolves the source binding inherited through `cloned`.
+    chained = cloned.shallow_clone(
+        chained_uri,
+        cloned.version,
+        storage_options={"test_store_options": "chain"},
+    )
+    assert {base.path for base in chained.base_paths().values()} == {
+        source_uri,
+        target_uri,
+    }
+    assert chained.to_table() == expected
+
+    # The clone publishes its own metadata and references the shared files instead
+    # of copying them into the target store.
+    target_paths = cloned.all_files().read_all().column("path").to_pylist()
+    assert target_paths
+    assert not [path for path in target_paths if path.startswith("data/")]
+
+    # Constructor-only options reconfigure the returned handle, but must keep the
+    # inherited source binding and session so a cross-store clone still reads.
+    configured_uri = "test-clone-dst://bucket/configured.lance"
+    configured = source.shallow_clone(
+        configured_uri,
+        source.version,
+        storage_options=target_options,
+        block_size=1024,
+    )
+    assert configured.uri == configured_uri
+    assert {base.path for base in configured.base_paths().values()} == {source_uri}
+    assert configured.to_table() == expected
+
+    explicit = source.shallow_clone(
+        "test-clone-dst://bucket/explicit.lance",
+        source.version,
+        storage_options=target_options,
+        session=session,
+        base_store_params={source_uri: source_options},
+    )
+    assert explicit.to_table() == expected
+
+
+def test_shallow_clone_applies_session_and_cache_sizes(tmp_path: Path):
+    """Constructor cache/session options still configure the returned handle."""
+    expected = pa.table({"id": range(8)})
+    source = lance.write_dataset(expected, tmp_path / "source")
+
+    cache_configured = source.shallow_clone(
+        tmp_path / "cache_configured",
+        source.version,
+        index_cache_size_bytes=8 * 1024 * 1024,
+        metadata_cache_size_bytes=2 * 1024 * 1024,
+    )
+    diagnostics = cache_configured.session().cache_diagnostics()
+    assert diagnostics["index"]["backend"]["capacity_bytes"] == 8 * 1024 * 1024
+    assert diagnostics["metadata"]["backend"]["capacity_bytes"] == 2 * 1024 * 1024
+    assert cache_configured.to_table() == expected
+
+    session = lance.Session(
+        index_cache_size_bytes=4 * 1024 * 1024,
+        metadata_cache_size_bytes=1024 * 1024,
+    )
+    session_configured = source.shallow_clone(
+        tmp_path / "session_configured", source.version, session=session
+    )
+    diagnostics = session_configured.session().cache_diagnostics()
+    assert diagnostics["index"]["backend"]["capacity_bytes"] == 4 * 1024 * 1024
+    assert diagnostics["metadata"]["backend"]["capacity_bytes"] == 1024 * 1024
+    assert session_configured.to_table() == expected
+
+    class RecordingLock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, version):
+            self.calls += 1
+            return contextlib.nullcontext()
+
+    lock = RecordingLock()
+    writable = source.shallow_clone(
+        tmp_path / "writable", source.version, commit_lock=lock
+    )
+    writable.delete("id < 2")
+    assert lock.calls == 1
+    assert writable.count_rows() == 6
+
+
+def test_shallow_clone_applies_read_params_to_native_handle(tmp_path: Path):
+    """read_params must configure the returned native handle, not only its state.
+
+    Nested data uses the full-zip repetition index, so disabling the repetition
+    index cache removes the extra initialization read from a scanner over the
+    returned handle. The native parsing of both read_params keys is covered by
+    the pylance crate Rust test for ``file_reader_options_from_read_params``.
+    """
+    n = 10_000
+    values = [[f"value-{i}", "x" * 1000] for i in range(n)]
+    table = pa.table({"vals": pa.array(values, type=pa.list_(pa.string()))})
+    source = lance.write_dataset(table, tmp_path / "source")
+    expected = table
+
+    def read_iops(name: str, cache_repetition_index: bool) -> int:
+        read_params = {
+            "cache_repetition_index": cache_repetition_index,
+            "validate_on_decode": True,
+        }
+        cloned = source.shallow_clone(
+            tmp_path / name, source.version, read_params=read_params
+        )
+        assert cloned._read_params == read_params
+
+        before = lance.iops_counter()
+        result = cloned.scanner(columns=["vals"]).to_table()
+        iops = lance.iops_counter() - before
+        assert result == expected
+        return iops
+
+    without_cache = read_iops("without_cache", False)
+    with_cache = read_iops("with_cache", True)
+    assert with_cache > without_cache
+
+
+def test_shallow_clone_installs_namespace_credentials_on_target(tmp_path: Path):
+    """Constructor namespace credentials must back the returned handle.
+
+    The native clone builds its target store from the static ``storage_options``
+    before the refreshable namespace accessor is installed. The installed
+    accessor must still reach the live target handle and vendor refreshed
+    credentials for it, and the handle must stay readable and writable.
+    """
+    from lance_namespace import DescribeTableResponse, LanceNamespace
+
+    class RotatingNamespace(LanceNamespace):
+        def namespace_id(self) -> str:
+            return "shallow-clone-rotating-namespace"
+
+        def describe_table(self, request):
+            return DescribeTableResponse(
+                location=str(tmp_path / "cloned"),
+                storage_options={"test_credential": "refreshed-temporary"},
+            )
+
+    expected = pa.table({"id": pa.array(range(8), type=pa.int32())})
+    source = lance.write_dataset(expected, tmp_path / "source")
+    initial_options = {
+        "test_credential": "expired-temporary",
+        "expires_at_millis": "0",
+        "refresh_offset_millis": "1000",
+    }
+
+    cloned = source.shallow_clone(
+        tmp_path / "cloned",
+        source.version,
+        storage_options=initial_options,
+        namespace_client=RotatingNamespace(),
+        table_id=["test_ns", "cloned"],
+    )
+
+    accessor = cloned.storage_options_accessor
+    assert accessor.has_provider()
+    assert accessor.get_storage_options()["test_credential"] == "refreshed-temporary"
+    assert cloned.to_table() == expected
+    cloned.delete("id < 2")
+    assert cloned.count_rows() == 6
 
 
 def test_deep_clone(tmp_path: Path):

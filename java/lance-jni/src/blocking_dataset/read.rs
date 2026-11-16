@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -11,8 +11,9 @@ use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ipc::writer::StreamWriter;
 use jni::JNIEnv;
-use jni::objects::{JObject, JString, JValue};
+use jni::objects::{JLongArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong};
+use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ProjectionRequest, Version};
 use lance::table::format::Fragment;
@@ -27,6 +28,16 @@ impl BlockingDataset {
 
     pub fn list_versions(&self) -> Result<Vec<Version>> {
         let versions = block_on(self.inner.versions())?;
+        Ok(versions)
+    }
+
+    pub fn list_versions_with_options(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> Result<Vec<Version>> {
+        let versions = block_on(self.inner.versions_with_options(offset, limit, descending))?;
         Ok(versions)
     }
 
@@ -362,9 +373,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionCount(
 }
 
 fn inner_get_version_count(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.count_versions()
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.count_versions()
 }
 
 fn inner_list_versions<'local>(
@@ -372,10 +382,47 @@ fn inner_list_versions<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let versions = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_versions()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_versions()?
     };
+    versions_to_java_list(env, versions)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeListVersionsWithOptions<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    offset: jlong,
+    limit: jlong,
+    descending: jboolean,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_list_versions_with_options(&mut env, java_dataset, offset, limit, descending)
+    )
+}
+
+fn inner_list_versions_with_options<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    offset: jlong,
+    limit: jlong,
+    descending: jboolean,
+) -> Result<JObject<'local>> {
+    let offset = usize::try_from(offset)
+        .map_err(|_| Error::input_error(format!("offset must be non-negative, got {offset}")))?;
+    let limit = usize::try_from(limit).ok();
+    let versions = {
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_versions_with_options(offset, limit, descending != 0)?
+    };
+    versions_to_java_list(env, versions)
+}
+
+fn versions_to_java_list<'local>(
+    env: &mut JNIEnv<'local>,
+    versions: Vec<Version>,
+) -> Result<JObject<'local>> {
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
 
     versions
@@ -424,9 +471,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeGetLatestVersionId(
 }
 
 fn inner_latest_version_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.latest_version()
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.latest_version()
 }
 
 #[unsafe(no_mangle)]
@@ -471,9 +517,8 @@ fn inner_get_latest_storage_options<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let storage_options = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.latest_storage_options()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.latest_storage_options()?
     };
     match storage_options {
         Some(opts) => opts.into_java(env),
@@ -500,9 +545,8 @@ fn inner_count_rows(
     filter_jobj: JObject,
 ) -> Result<usize> {
     let filter = env.get_string_opt(&filter_jobj)?;
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.count_rows(filter)
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.count_rows(filter)
 }
 
 #[unsafe(no_mangle)]
@@ -518,9 +562,8 @@ fn inner_get_data_statistics<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let stats = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.calculate_data_stats()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.calculate_data_stats()?
     };
     let data_stats = env.new_object("org/lance/ipc/DataStatistics", "()V", &[])?;
 
@@ -590,6 +633,41 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
     java_dataset: JObject,
 ) -> jboolean {
     ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetRowAddresses<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    row_ids_obj: JObject, // List<Long>
+) -> JLongArray<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_row_addresses(&mut env, java_dataset, row_ids_obj),
+        unsafe { JLongArray::from_raw(std::ptr::null_mut()) }
+    )
+}
+
+/// Unresolved ids are returned as -1, which the Java side maps to null.
+fn inner_get_row_addresses<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    row_ids_obj: JObject,
+) -> Result<JLongArray<'local>> {
+    let row_ids: Vec<u64> = env
+        .get_longs(&row_ids_obj)?
+        .into_iter()
+        .map(|id| id as u64)
+        .collect();
+    let dataset = clone_dataset(env, &java_dataset)?;
+    let addrs = block_on(row_ids_to_row_addrs(&dataset.inner, &row_ids))?;
+    let addrs: Vec<i64> = addrs
+        .into_iter()
+        .map(|addr| addr.map_or(-1, |addr| addr as i64))
+        .collect();
+    let arr = env.new_long_array(addrs.len() as i32)?;
+    env.set_long_array_region(&arr, 0, &addrs)?;
+    Ok(arr)
 }
 
 #[unsafe(no_mangle)]
@@ -682,11 +760,9 @@ fn inner_take(
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
 
     let result = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
+        let dataset = clone_dataset(env, &java_dataset)?.inner;
 
-        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let projection = ProjectionRequest::try_from_columns(columns, dataset.schema())?;
 
         match block_on(dataset.take(indices_slice, projection)) {
             Ok(res) => res,
@@ -734,11 +810,9 @@ fn inner_take_rows(
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
 
     let result = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
+        let dataset = clone_dataset(env, &java_dataset)?.inner;
 
-        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let projection = ProjectionRequest::try_from_columns(columns, dataset.schema())?;
 
         match block_on(dataset.take_rows(&row_ids_u64, projection)) {
             Ok(res) => res,
@@ -789,9 +863,7 @@ fn inner_sample(
         fragment_ids.map(|ids| ids.iter().map(|&id| id as u32).collect());
 
     let result = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let dataset = &dataset_guard.inner;
+        let dataset = clone_dataset(env, &java_dataset)?.inner;
 
         let projection = dataset
             .schema()
@@ -830,9 +902,8 @@ fn inner_get_table_metadata<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let table_metadata = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.get_table_metadata()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.get_table_metadata()?
     };
 
     let java_hashmap = env

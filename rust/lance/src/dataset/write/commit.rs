@@ -472,6 +472,12 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
+        // A clone creates a new dataset. The destination may have appeared
+        // after the caller's preflight; never rebase a clone onto its winner.
+        if dest.dataset().is_some() && matches!(transaction.operation, Operation::Clone { .. }) {
+            return Err(Error::dataset_already_exists(dest.uri()));
+        }
+
         if dest.dataset().is_none()
             && !matches!(
                 transaction.operation,
@@ -611,6 +617,16 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+                let branch_identifier = if let Some(dataset) = dest.dataset() {
+                    dataset.ensure_branch_exists().await?;
+                    dataset.branch_identifier.clone()
+                } else {
+                    Arc::new(
+                        refs.branches()
+                            .get_identifier(manifest.branch.as_deref())
+                            .await?,
+                    )
+                };
 
                 Ok(Dataset {
                     object_store,
@@ -621,6 +637,7 @@ impl<'a> CommitBuilder<'a> {
                     session,
                     commit_handler,
                     refs,
+                    branch_identifier,
                     index_cache,
                     fragment_bitmap,
                     metadata_cache,

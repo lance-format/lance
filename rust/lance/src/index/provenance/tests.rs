@@ -12,7 +12,10 @@ use arrow_schema::{DataType, Field, Schema};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{array, gen_batch};
 use lance_index::IndexType;
+use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseIndexDetails};
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+use lance_table::format::{DataStorageFormat, DeletionFileType};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -554,4 +557,535 @@ async fn test_tracing_a_zone_map_follows_each_shared_ancestor_once() {
         current
     );
     assert_answers_through(&dataset, "i_idx", "i < 50").await;
+}
+
+/// A table's history held in memory: a manifest per retained version, the
+/// fragments each rewrite commit wrote, and each deletion file's rows.
+#[derive(Default)]
+struct MemoryHistory {
+    manifests: BTreeMap<u64, Manifest>,
+    rewrites: HashMap<u64, HashSet<u32>>,
+    deletions: HashMap<(u64, u64), RoaringBitmap>,
+}
+
+#[derive(Clone)]
+struct MemoryTable {
+    history: Arc<MemoryHistory>,
+    version: u64,
+}
+
+impl TableVersion for MemoryTable {
+    fn manifest(&self) -> &Manifest {
+        &self.history.manifests[&self.version]
+    }
+
+    async fn retained_versions(&self) -> Result<Vec<u64>> {
+        Ok(self.history.manifests.keys().copied().collect())
+    }
+
+    async fn checkout(&self, version: u64) -> Result<Self> {
+        Ok(Self {
+            history: self.history.clone(),
+            version,
+        })
+    }
+
+    async fn rewrite_outputs(&self, version: u64) -> Result<Option<HashSet<u32>>> {
+        Ok(self.history.rewrites.get(&version).cloned())
+    }
+
+    async fn deleted_rows(
+        &self,
+        fragment: &Fragment,
+        deletion_file: &DeletionFile,
+    ) -> Result<Arc<DeletionVector>> {
+        let rows = self.history.deletions[&(fragment.id, deletion_file.id)].clone();
+        Ok(Arc::new(DeletionVector::Bitmap(rows)))
+    }
+}
+
+/// A row as the model tracks it: `token` follows the row wherever compaction
+/// moves it.
+#[derive(Clone, Copy, Debug)]
+struct ModelRow {
+    token: u32,
+    val: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ModelOverlay {
+    committed_version: u64,
+    path: String,
+    offset: u32,
+    val: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ModelFragment {
+    id: u64,
+    rows: Vec<ModelRow>,
+    val_file: String,
+    spare_file: String,
+    deleted: RoaringBitmap,
+    /// The deletion file's (id, read version).
+    deletion_file: Option<(u64, u64)>,
+    overlays: Vec<ModelOverlay>,
+}
+
+impl ModelFragment {
+    /// Live rows with their values as a reader sees them, through overlays.
+    fn live_rows(&self) -> impl Iterator<Item = ModelRow> + '_ {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| !self.deleted.contains(*offset as u32))
+            .map(|(offset, row)| {
+                let val = self
+                    .overlays
+                    .iter()
+                    .rfind(|overlay| overlay.offset == offset as u32)
+                    .map_or(row.val, |overlay| overlay.val);
+                ModelRow { val, ..*row }
+            })
+    }
+
+    fn digest(&self) -> FragDigest {
+        FragDigest {
+            id: self.id,
+            physical_rows: self.rows.len(),
+            num_deleted_rows: self.deleted.len() as usize,
+        }
+    }
+
+    fn to_fragment(&self, schema: &LanceSchema) -> Fragment {
+        let val = schema.field("val").unwrap().id;
+        let spare = schema.field("spare").unwrap().id;
+        let mut fragment = Fragment::new(self.id).with_physical_rows(self.rows.len());
+        fragment.files = vec![
+            DataFile::new_legacy_from_fields(&self.val_file, vec![val], None),
+            DataFile::new_legacy_from_fields(&self.spare_file, vec![spare], None),
+        ];
+        fragment.deletion_file = self.deletion_file.map(|(id, read_version)| DeletionFile {
+            read_version,
+            id,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(self.deleted.len() as usize),
+            base_id: None,
+            inline: None,
+        });
+        fragment.overlays = self
+            .overlays
+            .iter()
+            .map(|overlay| DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields(&overlay.path, vec![val], None),
+                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([overlay.offset])),
+                committed_version: overlay.committed_version,
+            })
+            .collect();
+        fragment
+    }
+}
+
+#[derive(Clone, Default)]
+struct ModelVersion {
+    fragments: Vec<ModelFragment>,
+    reuse: Vec<FragReuseVersion>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ModelOp {
+    Append,
+    Delete,
+    UpdateVal,
+    UpdateSpare,
+    Overlay,
+    /// A deferred compaction, recorded in the fragment reuse index.
+    Compact,
+    /// The remap job dropping the oldest reuse record.
+    Trim,
+    Restore,
+    CleanUp,
+    Config,
+}
+
+/// A table with `val` and `spare` columns, its history kept as both the
+/// manifests the coverage check reads and the rows each version holds.
+struct ModelTable {
+    rng: u64,
+    schema: LanceSchema,
+    versions: BTreeMap<u64, ModelVersion>,
+    history: MemoryHistory,
+    version: u64,
+    next_fragment: u64,
+    next_token: u32,
+    next_val: u32,
+    next_file: u64,
+    ops: Vec<ModelOp>,
+}
+
+impl ModelTable {
+    fn new(seed: u64, fragments: usize) -> Self {
+        let schema = LanceSchema::try_from(&Schema::new(vec![
+            Field::new("val", DataType::Int32, true),
+            Field::new("spare", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let mut table = Self {
+            rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            schema,
+            versions: BTreeMap::new(),
+            history: MemoryHistory::default(),
+            version: 0,
+            next_fragment: 0,
+            next_token: 0,
+            next_val: 0,
+            next_file: 0,
+            ops: Vec::new(),
+        };
+        let fragments = (0..fragments).map(|_| table.new_fragment(3)).collect();
+        table.commit(
+            ModelVersion {
+                fragments,
+                reuse: Vec::new(),
+            },
+            None,
+        );
+        table
+    }
+
+    fn next(&mut self, bound: usize) -> usize {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng % bound as u64) as usize
+    }
+
+    fn file(&mut self) -> String {
+        self.next_file += 1;
+        format!("{}.lance", self.next_file)
+    }
+
+    fn new_val(&mut self) -> u32 {
+        self.next_val += 1;
+        self.next_val
+    }
+
+    fn new_fragment(&mut self, rows: usize) -> ModelFragment {
+        let rows = (0..rows)
+            .map(|_| {
+                self.next_token += 1;
+                ModelRow {
+                    token: self.next_token,
+                    val: self.new_val(),
+                }
+            })
+            .collect();
+        self.fragment_of(rows)
+    }
+
+    fn fragment_of(&mut self, rows: Vec<ModelRow>) -> ModelFragment {
+        self.next_fragment += 1;
+        ModelFragment {
+            id: self.next_fragment - 1,
+            rows,
+            val_file: self.file(),
+            spare_file: self.file(),
+            deleted: RoaringBitmap::new(),
+            deletion_file: None,
+            overlays: Vec::new(),
+        }
+    }
+
+    fn current(&self) -> &ModelVersion {
+        &self.versions[&self.version]
+    }
+
+    fn commit(&mut self, state: ModelVersion, rewrite: Option<HashSet<u32>>) {
+        self.version += 1;
+        let fragments = state
+            .fragments
+            .iter()
+            .map(|fragment| fragment.to_fragment(&self.schema))
+            .collect();
+        let mut manifest = Manifest::new(
+            self.schema.clone(),
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.version = self.version;
+        self.history.manifests.insert(self.version, manifest);
+        if let Some(rewrite) = rewrite {
+            self.history.rewrites.insert(self.version, rewrite);
+        }
+        self.versions.insert(self.version, state);
+    }
+
+    fn run(&mut self, len: usize) {
+        use ModelOp::*;
+        const KINDS: [ModelOp; 12] = [
+            Append,
+            Delete,
+            UpdateVal,
+            UpdateSpare,
+            Overlay,
+            Compact,
+            Compact,
+            Compact,
+            Trim,
+            Restore,
+            CleanUp,
+            Config,
+        ];
+        for _ in 0..len {
+            let op = KINDS[self.next(KINDS.len())];
+            self.ops.push(op);
+            self.apply(op);
+        }
+    }
+
+    fn apply(&mut self, op: ModelOp) {
+        let mut state = self.current().clone();
+        let picked = self.next(state.fragments.len().max(1));
+        let mut rewrite = None;
+        match op {
+            ModelOp::Append => {
+                let fragment = self.new_fragment(3);
+                state.fragments.push(fragment);
+            }
+            ModelOp::Delete => {
+                let Some(fragment) = state.fragments.get_mut(picked) else {
+                    return;
+                };
+                let offset = self.next(fragment.rows.len()) as u32;
+                fragment.deleted.insert(offset);
+                self.next_file += 1;
+                fragment.deletion_file = Some((self.next_file, self.version));
+                self.history
+                    .deletions
+                    .insert((fragment.id, self.next_file), fragment.deleted.clone());
+            }
+            ModelOp::UpdateVal => {
+                let Some(fragment) = state.fragments.get(picked) else {
+                    return;
+                };
+                // Rewriting the column in place folds the overlays on it.
+                let mut rows = fragment.rows.clone();
+                let mut live = fragment.live_rows().collect::<Vec<_>>().into_iter();
+                for (offset, row) in rows.iter_mut().enumerate() {
+                    if !fragment.deleted.contains(offset as u32) {
+                        *row = live.next().unwrap();
+                    }
+                }
+                let offset = self.next(rows.len());
+                rows[offset].val = self.new_val();
+                let val_file = self.file();
+                let fragment = &mut state.fragments[picked];
+                fragment.rows = rows;
+                fragment.val_file = val_file;
+                fragment.overlays.clear();
+            }
+            ModelOp::UpdateSpare => {
+                let spare_file = self.file();
+                let Some(fragment) = state.fragments.get_mut(picked) else {
+                    return;
+                };
+                fragment.spare_file = spare_file;
+            }
+            ModelOp::Overlay => {
+                let path = self.file();
+                let val = self.new_val();
+                let committed_version = self.version + 1;
+                let Some(fragment) = state.fragments.get_mut(picked) else {
+                    return;
+                };
+                let offset = self.next(fragment.rows.len()) as u32;
+                fragment.overlays.push(ModelOverlay {
+                    committed_version,
+                    path,
+                    offset,
+                    val,
+                });
+            }
+            ModelOp::Compact => {
+                let len = 2 + self.next(2);
+                if state.fragments.len() < len {
+                    return;
+                }
+                let start = self.next(state.fragments.len() - len + 1);
+                let old = state
+                    .fragments
+                    .drain(start..start + len)
+                    .collect::<Vec<_>>();
+                let rows = old
+                    .iter()
+                    .flat_map(ModelFragment::live_rows)
+                    .collect::<Vec<_>>();
+                let outputs = 1 + self.next(2);
+                let new = rows
+                    .chunks(rows.len().div_ceil(outputs).max(1))
+                    .map(|rows| self.fragment_of(rows.to_vec()))
+                    .collect::<Vec<_>>();
+                state.reuse.push(FragReuseVersion {
+                    dataset_version: self.version,
+                    groups: vec![FragReuseGroup {
+                        changed_row_addrs: Vec::new(),
+                        old_frags: old.iter().map(ModelFragment::digest).collect(),
+                        new_frags: new.iter().map(ModelFragment::digest).collect(),
+                    }],
+                });
+                rewrite = Some(new.iter().map(|fragment| fragment.id as u32).collect());
+                state.fragments.splice(start..start, new);
+            }
+            ModelOp::Trim => {
+                if state.reuse.is_empty() {
+                    return;
+                }
+                state.reuse.remove(0);
+            }
+            ModelOp::Restore => {
+                let retained = self.versions.keys().copied().collect::<Vec<_>>();
+                let version = retained[self.next(retained.len())];
+                state = self.versions[&version].clone();
+            }
+            ModelOp::CleanUp => {
+                let retained = self.versions.keys().copied().collect::<Vec<_>>();
+                let version = retained[self.next(retained.len())];
+                if version != self.version {
+                    self.versions.remove(&version);
+                    self.history.manifests.remove(&version);
+                    self.history.rewrites.remove(&version);
+                }
+                return;
+            }
+            ModelOp::Config => {}
+        }
+        self.commit(state, rewrite);
+    }
+
+    /// A `val` segment over `fragments` built at the current version, and the
+    /// values it indexed for each row.
+    fn stage(&self, fragments: &RoaringBitmap) -> (IndexMetadata, HashMap<u32, u32>) {
+        let indexed = self
+            .current()
+            .fragments
+            .iter()
+            .filter(|fragment| fragments.contains(fragment.id as u32))
+            .flat_map(ModelFragment::live_rows)
+            .map(|row| (row.token, row.val))
+            .collect();
+        let segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "val_idx".to_string(),
+            fields: vec![self.schema.field("val").unwrap().id],
+            covering_fields: vec![],
+            dataset_version: self.version,
+            fragment_bitmap: Some(fragments.clone()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        (segment, indexed)
+    }
+}
+
+/// Stages `val` segments at two versions while a seeded workload runs, then
+/// carries their coverage to the latest version. Every row of a fragment that
+/// stays covered must be indexed, with the value it holds now. Returns how many
+/// fragments stayed covered.
+async fn carry_under_workload(seed: u64) -> u64 {
+    let mut table = ModelTable::new(seed, 6);
+    let len = table.next(3);
+    table.run(len);
+    let live = table
+        .current()
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<Vec<_>>();
+    let first = live
+        .into_iter()
+        .filter(|_| table.next(3) != 0)
+        .collect::<RoaringBitmap>();
+    let (first, mut indexed) = table.stage(&first);
+    let len = table.next(4);
+    table.run(len);
+    // Include outputs reached from the first segment through compaction. Keep
+    // the indexed row sets disjoint so the oracle preserves each build's values.
+    let second = table
+        .current()
+        .fragments
+        .iter()
+        .filter(|fragment| {
+            fragment
+                .live_rows()
+                .all(|row| !indexed.contains_key(&row.token))
+        })
+        .map(|fragment| fragment.id as u32)
+        .collect::<RoaringBitmap>();
+    let (second, more) = table.stage(&second);
+    indexed.extend(more);
+    let len = table.next(6);
+    table.run(len);
+
+    let segments = [first, second];
+    let staged_coverage = segments
+        .iter()
+        .filter_map(|segment| segment.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap);
+    let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
+        Uuid::nil(),
+        vec![],
+        FragReuseIndexDetails {
+            versions: table.current().reuse.clone(),
+        },
+    );
+    let version = table.version;
+    let fragments = table.current().fragments.clone();
+    let ops = std::mem::take(&mut table.ops);
+    let latest = MemoryTable {
+        history: Arc::new(table.history),
+        version,
+    };
+    let carried = carry_coverage(
+        &latest,
+        "val_idx",
+        &frag_reuse_index,
+        &segments,
+        &staged_coverage,
+    )
+    .await
+    .unwrap();
+
+    for fragment in fragments
+        .iter()
+        .filter(|fragment| carried.contains(fragment.id as u32))
+    {
+        for row in fragment.live_rows() {
+            assert_eq!(
+                indexed.get(&row.token),
+                Some(&row.val),
+                "seed {seed} {ops:?}: fragment {} stayed covered, but its row {} changed",
+                fragment.id,
+                row.token,
+            );
+        }
+    }
+    carried.len()
+}
+
+/// Many short workloads of writes, overlays, restores, cleanups and recorded
+/// compactions: coverage carried to the latest version only stays on
+/// fragments whose rows the segments indexed with the values they hold now.
+#[tokio::test]
+async fn test_carried_coverage_holds_only_unchanged_rows() {
+    let mut covered = 0;
+    for seed in 0..1000 {
+        covered += carry_under_workload(seed).await;
+    }
+    assert!(covered >= 1000, "only {covered} fragments stayed covered");
 }

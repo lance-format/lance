@@ -241,6 +241,40 @@ The default index name is `<column>_idx`. Vector index creation uses `replace=Fa
 
 ## Tune Search Parameters
 
+Use `search_effort` to choose a calibrated partition-routing target without
+selecting a fixed number of partitions:
+
+| Search effort | Routing recall target | Use |
+| --- | --- | --- |
+| `0.1` | 80% mean | Favor lower query cost |
+| `0.25` | 90% mean | Balance quality and query cost |
+| `0.5` (default) | 95% mean | Preserve the default Auto policy |
+| `1.0` | Search all available partitions | Check routing losses; caller maximum still applies |
+
+```python
+result = dataset.to_table(
+    nearest={
+        "column": "vector", "q": query_vector, "k": 10,
+        "search_effort": 0.25,
+    }
+)
+```
+
+The calibrated profiles apply to L2, cosine and dot with `k <= 100000`.
+For a fixed effort, the probe budget adapts to both the metric and `k` while the
+target stays the same.
+Targets describe average coverage of the true neighbors' partitions on unfiltered
+calibration data. They are not guarantees for each query, dataset, or final Recall@k.
+Quantization, refinement, filtering and HNSW search can change final recall.
+Measure these settings on representative queries before choosing one.
+
+Effort is continuous in `[0, 1]`; budgets interpolate between the listed anchors.
+Zero starts at the caller minimum, with at least one available partition.
+Hamming and larger `k` keep their existing effort interpolation without calibrated
+recall targets. An explicit effort overrides `nprobes`; explicit
+`minimum_nprobes` and `maximum_nprobes` still apply. Filters can trigger more
+probing to obtain `k` rows, so the initial budget is not a total-work limit.
+
 Use `nprobes` and `refine_factor` to trade recall for query work:
 
 === "Python"
