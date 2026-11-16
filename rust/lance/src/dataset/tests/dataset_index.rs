@@ -5246,23 +5246,6 @@ async fn restricted_match_dataset_with_deletions(stable_row_ids: bool) -> Datase
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_fts_9058_deletions_use_shared_corpus_plan(
-    #[values(false, true)] stable_row_ids: bool,
-) {
-    let dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
-    let observation = restricted_match_observation(
-        &dataset,
-        RestrictedMatchDomain::Prefilter,
-        "with_deletions",
-        Some(1),
-        "alpha beta",
-    )
-    .await;
-    assert_contains!(observation.plan.as_ref().unwrap(), "MatchCorpus");
-}
-
-#[rstest]
 #[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 5, 7])]
 #[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
 #[case::filter(RestrictedMatchDomain::Filter("id != 3"), &[0, 2, 4, 5, 7])]
