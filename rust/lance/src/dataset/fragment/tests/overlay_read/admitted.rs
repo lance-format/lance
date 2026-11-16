@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use super::*;
 
 mod deletions;
+mod row_ids;
 
 fn payload(prefix: &str, rows: usize, nested: bool, null_at: usize) -> ArrayRef {
     let values = (0..rows)
@@ -67,7 +68,7 @@ async fn open(
         .unwrap()
 }
 
-async fn write_payload_dataset(version: LanceFileVersion, nested: bool) -> Dataset {
+async fn write_payload_dataset(version: LanceFileVersion, nested: bool, stable: bool) -> Dataset {
     let values = payload("base", 12, nested, 1);
     let schema = Arc::new(ArrowSchema::new(vec![
         fullzip_field("payload", values.data_type().clone()),
@@ -88,6 +89,7 @@ async fn write_payload_dataset(version: LanceFileVersion, nested: bool) -> Datas
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 6,
+            enable_stable_row_ids: stable,
             data_storage_version: Some(version),
             ..Default::default()
         }),
@@ -138,7 +140,7 @@ async fn admitted_fragment_take_matches_actual_overlay_resolution(
     #[values(false, true)] nested: bool,
 ) {
     const WORKSPACE: usize = 65536;
-    let mut dataset = write_payload_dataset(version, nested).await;
+    let mut dataset = write_payload_dataset(version, nested, false).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     for fragment in 0..2 {
         dataset = commit_overlay(
@@ -322,7 +324,10 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
         .unwrap()
         .open(
             dataset.schema(),
-            FragReadConfig::default().with_row_id(true),
+            FragReadConfig {
+                with_row_created_at_version: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -334,7 +339,7 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("generated columns"));
+    assert!(error.to_string().contains("row-version columns"));
     assert_eq!(budget.reserved(), 0);
 }
 
@@ -345,7 +350,7 @@ async fn admitted_fragment_reads_constant_overlay_in_shared_workspace(
     #[values(false, true)] nested: bool,
 ) {
     let version = LanceFileVersion::V2_2;
-    let mut dataset = write_payload_dataset(version, nested).await;
+    let mut dataset = write_payload_dataset(version, nested, false).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     for fragment in 0..2 {
         let name = format!("constant-{fragment}");
@@ -432,7 +437,7 @@ async fn admitted_fragment_null_overlay_wins_over_older_values(
     #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     #[values(false, true)] lite: bool,
 ) {
-    let mut dataset = write_payload_dataset(version, false).await;
+    let mut dataset = write_payload_dataset(version, false, false).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     for fragment in 0..2 {
         dataset = commit_overlay(
@@ -497,7 +502,7 @@ async fn admitted_fragment_empty_list_overlay_preserves_null_precedence(
     #[values(false, true)] lite: bool,
 ) {
     let version = LanceFileVersion::V2_3;
-    let mut dataset = write_payload_dataset(version, true).await;
+    let mut dataset = write_payload_dataset(version, true, false).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     let original = payload("base", 1, true, usize::MAX);
     let DataType::List(field) = original.data_type() else {
@@ -588,7 +593,7 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
     #[case] rle_counts: bool,
 ) {
     let version = LanceFileVersion::V2_3;
-    let mut dataset = write_payload_dataset(version, true).await;
+    let mut dataset = write_payload_dataset(version, true, false).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     let original = payload("base", 1, true, usize::MAX);
     let DataType::List(field) = original.data_type() else {

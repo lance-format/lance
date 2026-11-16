@@ -9,6 +9,7 @@ use lance_core::utils::{allocation::Reservation, tokio::spawn_cpu};
 use super::*;
 
 mod deletions;
+mod row_ids;
 
 impl FragmentReader {
     /// Take sorted unique physical offsets within one already-admitted workspace.
@@ -38,7 +39,12 @@ impl FragmentReader {
     /// this workspace; output contains only surviving rows in input order. Empty
     /// results still charge their typed offset buffers. Deletion metadata itself
     /// is borrowed, not admitted here. This is not logical-offset remapping.
-    /// Struct ancestors, deletion markers, generated system columns,
+    /// `_rowid` and `_rowaddr` use surviving physical offsets. Stable IDs use
+    /// the reader's inline row-ID sequence snapshot; spilled ID columns are not
+    /// supported. Shared sequence metadata is outside this payload budget, but
+    /// generated values reserve credit alongside inputs and retain it through
+    /// their final Arrow alias. Non-stable IDs and addresses share one buffer.
+    /// Struct ancestors, deletion markers, generated row-version columns,
     /// missing-column synthesis and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed
     /// selection's physical storage; metadata/transport/cache/allocator overhead
@@ -62,9 +68,12 @@ impl FragmentReader {
     ) -> Result<Option<RecordBatch>> {
         let mut read_selection =
             OverlayReadSelection::from_sorted_indices(indices, self.num_physical_rows as u64)?;
-        if self.num_system_cols() != 0 || self.make_deletions_null {
+        if self.with_row_created_at_version
+            || self.with_row_last_updated_at_version
+            || self.make_deletions_null
+        {
             return Err(Error::not_supported(
-                "admitted fragment take does not yet compose deletion markers or generated columns",
+                "admitted fragment take does not yet compose deletion markers or row-version columns",
             ));
         }
         // Validate the original selection above: deletion pruning must not hide
@@ -82,10 +91,16 @@ impl FragmentReader {
         }
         let indices = live_indices;
         let schema = Arc::new(self.output_schema.clone());
+        let Some(row_ids) =
+            row_ids::PreparedRowIds::try_prepare(self, indices.len(), &mut workspace).await?
+        else {
+            return Ok(None);
+        };
         // Resolve file-to-output placement before payload reads. Shared struct
         // spines need admitted ancestor reconstruction, never merge_streams here.
         let mut file_columns = Vec::new();
         let mut covered = vec![false; schema.fields().len()];
+        row_ids.mark_columns(&mut covered);
         for reader in &self.readers {
             if reader.projection().fields.is_empty() {
                 continue;
@@ -105,7 +120,7 @@ impl FragmentReader {
         }
         if covered.is_empty() || covered.iter().any(|covered| !covered) {
             return Err(Error::not_supported(
-                "admitted fragment take requires stored payload for every output field",
+                "admitted fragment take requires stored payload or generated IDs for every output field",
             ));
         }
         let selection = OverlayBatchSelection::Indices(indices.clone());
@@ -158,6 +173,7 @@ impl FragmentReader {
                     columns[column] = Some(array.clone());
                 }
             }
+            row_ids.fill_columns(&indices, &mut columns)?;
             let columns = columns
                 .into_iter()
                 .map(|column| {

@@ -11,7 +11,7 @@ async fn deletion_filter_matches_real_fragment_and_overlay_take(
     #[values(false, true)] lite: bool,
     #[values(false, true)] nested: bool,
 ) {
-    let mut dataset = write_payload_dataset(version, nested).await;
+    let mut dataset = write_payload_dataset(version, nested, false).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     for fragment in 0..2 {
         dataset = commit_overlay(
@@ -136,7 +136,7 @@ async fn deletion_filter_matches_real_fragment_and_overlay_take(
 
 #[tokio::test]
 async fn deletion_snapshot_and_ignore_deletions_keep_physical_row_identity() {
-    let mut dataset = write_payload_dataset(LanceFileVersion::V2_3, false).await;
+    let mut dataset = write_payload_dataset(LanceFileVersion::V2_3, false, false).await;
     dataset.delete("untouched = 'other1'").await.unwrap();
     let first = open(&dataset, 0, dataset.schema(), false).await;
     let selected = UInt32Array::from(vec![0, 1, 2, 3]);
@@ -184,7 +184,7 @@ async fn deletion_snapshot_and_ignore_deletions_keep_physical_row_identity() {
 
 #[tokio::test]
 async fn deletion_pruning_does_not_hide_invalid_selection_or_marker_mode() {
-    let dataset = write_payload_dataset(LanceFileVersion::V2_3, false).await;
+    let dataset = write_payload_dataset(LanceFileVersion::V2_3, false, false).await;
     let mut reader = open(&dataset, 0, dataset.schema(), false).await;
     // Include the invalid offset in the set so pruning before validation would
     // accidentally hide it. No stored metadata or ordinary reader is altered.
