@@ -736,6 +736,11 @@ pub struct JsonQueryParser {
     /// known. A typed accessor only has the same meaning as the target index
     /// when it produces this type, so a different accessor must fall back to a
     /// scan instead of querying keys of another type.
+    ///
+    /// `None` means the caller of [`JsonQueryParser::new`] asserts that the
+    /// target's value domain already matches the accessors. The plugin factory
+    /// never leaves it unset, because it is the only place that can read the
+    /// type the index details recorded.
     recorded_target_type: Option<DataType>,
 }
 
@@ -750,10 +755,11 @@ impl JsonQueryParser {
 
     /// Compare typed accessors against the type recorded in the index details.
     ///
-    /// Details written before the type was recorded carry `Unspecified`; they
-    /// keep their previous routing because there is no type to compare against.
-    pub(crate) fn with_recorded_target_type(mut self, target_type: Option<DataType>) -> Self {
-        self.recorded_target_type = target_type;
+    /// Takes a definite type: deciding whether the details recorded one belongs
+    /// to [`JsonIndexPlugin::new_query_parser`], which declines the index when
+    /// they did not.
+    pub(crate) fn with_recorded_target_type(mut self, target_type: DataType) -> Self {
+        self.recorded_target_type = Some(target_type);
         self
     }
 
@@ -1601,13 +1607,17 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         if target_plugin.name().eq_ignore_ascii_case("inverted") {
             return None;
         }
+        // A typed accessor may only answer from this index when it produces the type the
+        // index decoded its keys as. `Unspecified` (written before the field existed) and
+        // unrecognized values (written by a newer build) name no type, so nothing licenses
+        // the routing; the scan evaluates the predicate itself. Only routing is affected:
+        // loading, maintenance, and rebuilds read the details without this parser.
+        let recorded_target_type = JsonIndexTargetType::from_pb(json_details.target_data_type)?;
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
         let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
-        let recorded_target_type =
-            JsonIndexTargetType::from_pb(json_details.target_data_type).map(DataType::from);
         Some(Box::new(
             JsonQueryParser::new(json_details.path.clone(), target_parser)
-                .with_recorded_target_type(recorded_target_type),
+                .with_recorded_target_type(DataType::from(recorded_target_type)),
         ) as Box<dyn ScalarQueryParser>)
     }
 
@@ -2504,6 +2514,41 @@ mod tests {
         assert!(!plugin.can_remap(&details).unwrap());
     }
 
+    #[rstest]
+    #[case::unspecified(crate::pb::JsonTargetDataType::Unspecified as i32, false)]
+    #[case::unknown_variant(999, false)]
+    #[case::utf8(crate::pb::JsonTargetDataType::Utf8 as i32, true)]
+    fn test_json_query_parser_requires_recorded_target_type(
+        #[case] target_data_type: i32,
+        #[case] expected_routable: bool,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let target_details = prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails {
+            rows_per_zone: Some(128),
+            use_seeds: Some(false),
+            has_null_bitmap: Some(true),
+        })
+        .unwrap();
+        let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+            target_data_type,
+            target_index_version: None,
+        })
+        .unwrap();
+
+        // Without a recorded type this index cannot show that a typed accessor reads
+        // the same value domain as its keys, so it must not be offered for routing.
+        assert_eq!(
+            plugin
+                .new_query_parser("json_value".to_string(), &index_details)
+                .is_some(),
+            expected_routable,
+            "target_data_type {target_data_type}"
+        );
+    }
+
     #[test]
     fn test_json_query_parser_forwards_target_details() {
         let registry = IndexPluginRegistry::with_default_plugins();
@@ -2517,7 +2562,7 @@ mod tests {
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
             path: "$.value".to_string(),
             target_details: Some(target_details),
-            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_data_type: crate::pb::JsonTargetDataType::Utf8 as i32,
             target_index_version: None,
         })
         .unwrap();
@@ -2559,10 +2604,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        // Record a type so the inverted guard is the only reason this index is declined.
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
             path: "$.value".to_string(),
             target_details: Some(target_details),
-            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_data_type: crate::pb::JsonTargetDataType::Utf8 as i32,
             target_index_version: None,
         })
         .unwrap();
