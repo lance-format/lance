@@ -225,6 +225,8 @@ pub mod u8_inputs {
 /// vectors together and the rest one at a time; the two must agree.
 ///
 /// The batch is nine rotations of `y`: one block of eight plus one left over.
+/// Only the f32 batch kernels reduce blocks of vectors, so it takes their
+/// dispatch.
 pub fn check_batch_position_independent(
     batch: &Dispatch<BatchKernel>,
     x: &[f32],

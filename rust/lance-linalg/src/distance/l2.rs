@@ -36,7 +36,7 @@ pub trait L2: Num {
     ///
     /// The default calls [`L2::l2`] per vector. `f32`, `f64`, `f16` and
     /// `bf16` override it with one batch kernel call, so none chooses a
-    /// kernel per vector. Off x86_64, `f64` also specializes the loop for the
+    /// kernel per vector. `f64` also specializes the loop for the
     /// common PQ sub-vector lengths.
     ///
     /// # Panics
@@ -717,7 +717,7 @@ mod x86 {
         #[candidate(pub(super) L2_F32_BATCH_AVX_FMA: BatchKernel)]
         /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
         /// to its remainder loop, so the explicit AVX kernel wins; above that
-        /// the auto-vectorized scalar kernel is as good or better. That arm
+        /// the auto-vectorized scalar kernel is as good or better. The above-16 arm
         /// calls `l2_scalar` directly because LLVM declines to inline the
         /// `#[inline]` `l2_f32_scalar` wrapper into this many loops.
         pub(super) fn l2_batch_f32_avx_fma(
@@ -730,7 +730,8 @@ mod x86 {
                 && let Ok(key) = <&[f32; 8]>::try_from(x)
             {
                 let key_lanes = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-                // Adding -0.0 leaves every value, signed zeros included, as is.
+                // Dimension 8 has no tail. Adding -0.0, unlike +0.0, leaves every
+                // sum as is, signed zeros included.
                 fixed_width_batch(batch, output, |y: &[f32; 8]| {
                     let diff = _mm256_sub_ps(key_lanes, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     (_mm256_mul_ps(diff, diff), -0.0)
@@ -764,7 +765,8 @@ mod x86 {
                 && let Ok(key) = <&[f32; 8]>::try_from(x)
             {
                 let key_lanes = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-                // Adding -0.0 leaves every value, signed zeros included, as is.
+                // Dimension 8 has no tail. Adding -0.0, unlike +0.0, leaves every
+                // sum as is, signed zeros included.
                 fixed_width_batch(batch, output, |y: &[f32; 8]| {
                     let diff = _mm256_sub_ps(key_lanes, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     (_mm256_mul_ps(diff, diff), -0.0)
@@ -919,14 +921,14 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            // With the key the same length as each vector, the pair kernel's
-            // `min` folds away, which frees registers in the per-vector loop.
             if let Ok(key) = <&[f64; 8]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx512(x, y));
             }
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx512(x, y));
             }
+            // With the key the same length as each vector, the pair kernel's
+            // `min` folds away, which frees registers in the per-vector loop.
             let x = &x[..dimension];
             for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *distance = l2_f64_avx512(x, y);
@@ -943,13 +945,13 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            // See `l2_batch_f64_avx512` for slicing the key.
             if let Ok(key) = <&[f64; 8]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx_fma(x, y));
             }
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx_fma(x, y));
             }
+            // See `l2_batch_f64_avx512` for slicing the key.
             let x = &x[..dimension];
             for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *distance = l2_f64_avx_fma(x, y);
@@ -966,13 +968,13 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            // See `l2_batch_f64_avx512` for slicing the key.
             if let Ok(key) = <&[f64; 8]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx(x, y));
             }
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| l2_f64_avx(x, y));
             }
+            // See `l2_batch_f64_avx512` for slicing the key.
             let x = &x[..dimension];
             for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *distance = l2_f64_avx(x, y);
@@ -1509,7 +1511,7 @@ mod tests {
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            for dimension in [8, 16, x.len()].into_iter().filter(|&d| d <= x.len()) {
+            for dimension in [8, 16, 32, x.len()].into_iter().filter(|&d| d <= x.len()) {
                 let (x, y) = (&x[..dimension], &y[..dimension]);
                 let x_f64 = x.iter().map(|&v| v as f64).collect::<Vec<_>>();
                 let y_f64 = y.iter().map(|&v| v as f64).collect::<Vec<_>>();
@@ -1961,6 +1963,7 @@ mod tests {
             );
         }
         rejects::<f16>(output_len);
+        rejects::<bf16>(output_len);
         rejects::<f32>(output_len);
         rejects::<f64>(output_len);
     }
@@ -1977,6 +1980,7 @@ mod tests {
             l2_distance_batch_into::<T>(&x, &[], dimension, &mut []);
         }
         accepts::<f16>(dimension);
+        accepts::<bf16>(dimension);
         accepts::<f32>(dimension);
         accepts::<f64>(dimension);
     }

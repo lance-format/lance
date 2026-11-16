@@ -154,7 +154,10 @@ pub fn fixed_width_batch<const D: usize>(
 /// constant, `pair` inlines fully unrolled with no tail, so each vector is
 /// straight-line code instead of the generic kernel's loop and tail stages,
 /// whose speed swung by up to 25% with code alignment. `pair` is the
-/// generic-width kernel, so the result is unchanged.
+/// generic-width kernel, so the result is unchanged. Unlike
+/// [`fixed_width_batch`] it has no target features of its own:
+/// `inline(always)` puts the loop, and `pair` with it, under the calling
+/// kernel's features.
 #[inline(always)]
 pub fn fixed_width_rows<T, const D: usize>(
     key: &[T; D],

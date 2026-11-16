@@ -708,7 +708,7 @@ mod x86 {
         #[candidate(pub(super) DOT_F32_BATCH_AVX_FMA: BatchKernel)]
         /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
         /// to its remainder loop, so the explicit AVX kernel wins; above that
-        /// the auto-vectorized scalar kernel is as good or better. That arm
+        /// the auto-vectorized scalar kernel is as good or better. The above-16 arm
         /// calls `dot_scalar` directly because LLVM declines to inline the
         /// `#[inline]` `dot_f32_scalar` wrapper into this many loops.
         pub(super) fn dot_batch_f32_avx_fma(
@@ -721,7 +721,8 @@ mod x86 {
                 && let Ok(key) = <&[f32; 8]>::try_from(x)
             {
                 let key_lanes = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-                // Adding -0.0 leaves every value, signed zeros included, as is.
+                // Dimension 8 has no tail. Adding -0.0, unlike +0.0, leaves every
+                // sum as is, signed zeros included.
                 fixed_width_batch(batch, output, |y: &[f32; 8]| {
                     let product = _mm256_mul_ps(key_lanes, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     (product, -0.0)
@@ -755,7 +756,8 @@ mod x86 {
                 && let Ok(key) = <&[f32; 8]>::try_from(x)
             {
                 let key_lanes = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-                // Adding -0.0 leaves every value, signed zeros included, as is.
+                // Dimension 8 has no tail. Adding -0.0, unlike +0.0, leaves every
+                // sum as is, signed zeros included.
                 fixed_width_batch(batch, output, |y: &[f32; 8]| {
                     let product = _mm256_mul_ps(key_lanes, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     (product, -0.0)
@@ -897,13 +899,13 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
             if let Ok(key) = <&[f64; 8]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx512(x, y));
             }
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx512(x, y));
             }
+            // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
             let x = &x[..dimension];
             for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *product = dot_f64_avx512(x, y);
@@ -920,13 +922,13 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
             if let Ok(key) = <&[f64; 8]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx_fma(x, y));
             }
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx_fma(x, y));
             }
+            // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
             let x = &x[..dimension];
             for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *product = dot_f64_avx_fma(x, y);
@@ -943,13 +945,13 @@ mod x86 {
             dimension: usize,
             output: &mut [f32],
         ) {
-            // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
             if let Ok(key) = <&[f64; 8]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx(x, y));
             }
             if let Ok(key) = <&[f64; 16]>::try_from(x) {
                 return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx(x, y));
             }
+            // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
             let x = &x[..dimension];
             for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *product = dot_f64_avx(x, y);
@@ -1346,7 +1348,7 @@ mod tests {
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            for dimension in [8, 16, x.len()].into_iter().filter(|&d| d <= x.len()) {
+            for dimension in [8, 16, 32, x.len()].into_iter().filter(|&d| d <= x.len()) {
                 let (x, y) = (&x[..dimension], &y[..dimension]);
                 let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
                 let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
@@ -1590,6 +1592,7 @@ mod tests {
             dot_distance_batch_into::<T>(&x, &[], dimension, &mut []);
         }
         accepts::<f16>(dimension);
+        accepts::<bf16>(dimension);
         accepts::<f32>(dimension);
         accepts::<f64>(dimension);
     }
