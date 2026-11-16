@@ -25,12 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted windowed RLE List counts
+      - name: Verify admitted windowed Dictionary List counts
         env:
           LANCE_CPU_THREADS: 1
         run: |
           # Window and generic RLE code is unchanged from de8e675c9, where all
-          # 44 window and 230 generic RLE cases passed. Resume repaired coverage.
+          # 44 window and 230 generic RLE cases passed. Validate the new dispatch
+          # through sparse pages, real files and the existing fragment composition.
           cargo test --profile ci --locked -p lance-encoding --lib sparse::admitted_lists:: -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --lib byte_page:: -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --doc AdmittedBytePageScheduler -- --nocapture

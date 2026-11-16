@@ -27,6 +27,7 @@ impl FragmentReader {
     /// chains with metadata-proven null leaves support metadata or
     /// Flat/Bitpacked/Delta parent validity, nonempty positions and counts.
     /// RLE counts also support windowable unsigned value/run-length children.
+    /// Dictionary counts charge the bounded lookup table and windowed children.
     /// Payloads use bounded input windows and selected charged storage.
     /// Other sparse codecs return `NotSupported` when selected.
     /// Stored layout determines decoder dispatch.

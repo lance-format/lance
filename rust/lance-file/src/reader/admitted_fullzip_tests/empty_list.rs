@@ -4,7 +4,7 @@
 use super::*;
 use crate::reader::FullZipScanOutcome;
 use arrow_array::{UInt32Array, new_empty_array, new_null_array};
-use lance_encoding::format::pb23;
+use lance_encoding::format::{metadata::compressive_encoding::Compression, pb23};
 
 fn empty_lists(large: bool, depth: usize, leaf: DataType, valid: Vec<bool>) -> ArrayRef {
     let child_type = (1..depth).fold(leaf, |child, _| {
@@ -294,21 +294,30 @@ async fn current_writer_null_children_preserve_selected_structure_without_io(
     assert!(reads.lock().unwrap().is_empty());
 }
 
+#[derive(Clone, Copy)]
+enum CountPattern {
+    Distinct,
+    Runs,
+    Dictionary,
+}
+
 #[rstest]
-#[case::counts(false, false, false)]
-#[case::positions(true, false, false)]
-#[case::positions_and_validity(true, true, false)]
-#[case::rle_counts(false, false, true)]
+#[case::counts(false, false, CountPattern::Distinct)]
+#[case::positions(true, false, CountPattern::Distinct)]
+#[case::positions_and_validity(true, true, CountPattern::Distinct)]
+#[case::rle_counts(false, false, CountPattern::Runs)]
+#[case::dictionary_counts(false, false, CountPattern::Dictionary)]
 #[tokio::test]
 async fn current_writer_payload_counts_use_bounded_input_windows(
     #[values(false, true)] lite: bool,
     #[values(false, true)] large: bool,
     #[case] payload_positions: bool,
     #[case] payload_validity: bool,
-    #[case] rle_counts: bool,
+    #[case] pattern: CountPattern,
 ) {
     // Distinct non-monotonic counts exercise direct payload codecs; repeated
-    // stretches exercise RLE. Inspect the stored descriptor below, not a hint.
+    // stretches exercise RLE; recurring nonconsecutive values exercise Dictionary.
+    // Inspect the stored descriptor below, not an encoding hint.
     let mut offsets = vec![0_i32];
     let valid = (0..2051)
         .map(|i| !payload_validity || i % 13 != (i / 17) % 13)
@@ -316,10 +325,12 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
     for i in 0..2051 {
         let count = if !valid[i as usize] || (payload_positions && i % 7 == (i / 11) % 7) {
             0
-        } else if rle_counts {
-            1 + ((i / 64) * 17 % 31)
         } else {
-            1 + (i * 1031 % 2053)
+            match pattern {
+                CountPattern::Distinct => 1 + (i * 1031 % 2053),
+                CountPattern::Runs => 1 + ((i / 64) * 17 % 31),
+                CountPattern::Dictionary => [1, 1031, 2051][((i * 17 + i / 7) % 3) as usize],
+            }
         };
         offsets.push(offsets.last().unwrap() + count);
     }
@@ -336,7 +347,7 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
         1 + usize::from(payload_positions) + usize::from(payload_validity),
         "fixture must contain payload counts and the requested position/validity streams"
     );
-    if rle_counts {
+    if !matches!(pattern, CountPattern::Distinct) {
         let lance_encoding::decoder::PageEncoding::Planar(layout) = &page.encoding else {
             unreachable!()
         };
@@ -347,10 +358,11 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
         };
         assert!(
             matches!(
-                list.counts.as_ref().unwrap().compression,
-                Some(lance_encoding::format::metadata::compressive_encoding::Compression::Rle(_))
+                (pattern, &list.counts.as_ref().unwrap().compression),
+                (CountPattern::Runs, Some(Compression::Rle(_)))
+                    | (CountPattern::Dictionary, Some(Compression::Dictionary(_)))
             ),
-            "fixture must use stored RLE counts"
+            "fixture must use the requested stored counts codec"
         );
     }
     let reads = Arc::new(std::sync::Mutex::new(Vec::new()));

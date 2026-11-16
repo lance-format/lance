@@ -668,4 +668,5 @@ mod payload_positions;
 
 mod payload_validity;
 
+mod dictionary_counts;
 mod rle_counts;

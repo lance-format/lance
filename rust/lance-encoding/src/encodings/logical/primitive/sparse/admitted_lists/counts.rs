@@ -7,7 +7,9 @@ use crate::{
     format::metadata::CompressiveEncoding,
 };
 
+mod dictionary;
 mod rle;
+use dictionary::DictionaryCounts;
 use rle::RleCounts;
 
 #[derive(Clone, Debug)]
@@ -15,6 +17,7 @@ pub(super) enum Counts {
     Metadata { first: u64, step: u64, len: u64 },
     Sequence(WindowSequence),
     Rle(Box<RleCounts>),
+    Dictionary(Box<DictionaryCounts>),
     Selected { start: u64, prefixes: Buffer },
 }
 
@@ -26,6 +29,17 @@ impl Counts {
     ) -> Result<Self> {
         let encoding = encoding.ok_or_else(|| corrupt("missing unsigned counts descriptor"))?;
         let sequence = SequenceDecoder::try_new(encoding, 64, len)?;
+        if matches!(
+            encoding.compression,
+            Some(crate::format::metadata::compressive_encoding::Compression::Dictionary(_))
+        ) {
+            return Ok(Self::Dictionary(Box::new(DictionaryCounts::parse(
+                encoding,
+                len,
+                sequence.requires_payload(),
+                buffers,
+            )?)));
+        }
         if matches!(
             encoding.compression,
             Some(crate::format::metadata::compressive_encoding::Compression::Rle(_))
@@ -100,7 +114,7 @@ impl Counts {
                     .ok_or_else(|| corrupt("count prefix outside prepared selection"))?;
                 Ok(u64::from_le_bytes(*bytes))
             }
-            Self::Sequence(_) | Self::Rle(_) => {
+            Self::Sequence(_) | Self::Rle(_) | Self::Dictionary(_) => {
                 Err(Error::internal("count sequence was not prepared"))
             }
         }
@@ -119,6 +133,9 @@ impl Counts {
     {
         if let Self::Rle(rle) = self {
             return rle.prepare(selected, total, work, read).await;
+        }
+        if let Self::Dictionary(dictionary) = self {
+            return dictionary.prepare(selected, total, work, read).await;
         }
         let Self::Sequence(sequence) = self else {
             return Ok(Some(self.clone()));
