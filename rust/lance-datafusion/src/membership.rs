@@ -3,7 +3,7 @@
 
 //! Expose separated membership predicates to DataFusion's set simplification rules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -33,7 +33,10 @@ enum Replacement {
 
 enum Term<'a> {
     Membership(Membership<'a>),
-    /// Negating a compound predicate can expose memberships after this pass.
+    /// Columns inside a nested AND/OR boundary that could collapse into a
+    /// membership once constant or absorbed branches simplify away.
+    Boundary(Vec<&'a Column>),
+    /// Negating or unwrapping a compound predicate can expose memberships after this pass.
     Barrier,
     Other,
 }
@@ -110,6 +113,22 @@ fn rewrite(expr: &mut Expr, simplify: &impl Fn(Expr) -> Result<Expr>) -> Result<
     Ok(())
 }
 
+fn is_eligible_literal(value: &ScalarValue) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    let data_type = match value {
+        ScalarValue::Dictionary(_, inner) => {
+            if inner.is_null() {
+                return false;
+            }
+            inner.data_type()
+        }
+        _ => value.data_type(),
+    };
+    !data_type.is_floating() && !data_type.is_nested()
+}
+
 fn plan_replacements(
     terms: &[&mut Expr],
     operator: Operator,
@@ -118,24 +137,51 @@ fn plan_replacements(
     // Column lookup is constant-time. Keep only a bounded list of computed
     // expressions to detect unsafe repeats without hashing Exprs containing UDFs.
     let mut columns: HashMap<&Column, usize> = HashMap::new();
+    let mut boundary_columns: HashSet<&Column> = HashSet::new();
     let mut groups: Vec<Vec<(usize, Membership<'_>)>> = Vec::new();
-    let mut computed: Vec<&Expr> = Vec::new();
+    let mut computed: Vec<(Membership<'_>, Vec<&Column>)> = Vec::new();
     for (index, term) in terms.iter().enumerate() {
         let membership = match classify_term(term)? {
             Term::Membership(membership) => membership,
+            Term::Boundary(cols) => {
+                // Reject boundaries whose columns overlap another membership or
+                // boundary in this region (e.g. `(s NOT IN (...) OR FALSE)` or
+                // `(s IN (...) AND TRUE)` collapsing beside an opposing `s` term).
+                for col in cols {
+                    if columns.contains_key(col)
+                        || !boundary_columns.insert(col)
+                        || computed.iter().any(|(_, c_cols)| c_cols.contains(&col))
+                    {
+                        return Ok(Vec::new());
+                    }
+                }
+                continue;
+            }
             Term::Barrier => return Ok(Vec::new()),
             Term::Other => continue,
         };
         let group_index = if let Expr::Column(column) = membership.expr {
+            if boundary_columns.contains(column) {
+                return Ok(Vec::new());
+            }
             *columns.entry(column).or_insert_with(|| {
                 groups.push(Vec::new());
                 groups.len() - 1
             })
         } else {
-            if computed.len() == MAX_COMPUTED_MEMBERSHIPS || computed.contains(&membership.expr) {
+            if computed.len() == MAX_COMPUTED_MEMBERSHIPS
+                || computed
+                    .iter()
+                    .any(|(prev, _)| prev.expr == membership.expr)
+            {
                 return Ok(Vec::new());
             }
-            computed.push(membership.expr);
+            let mut cols = Vec::new();
+            collect_columns(membership.expr, &mut cols)?;
+            if cols.iter().any(|col| boundary_columns.contains(col)) {
+                return Ok(Vec::new());
+            }
+            computed.push((membership, cols));
             continue;
         };
         groups[group_index].push((index, membership));
@@ -155,10 +201,9 @@ fn plan_replacements(
         // cloning even its first list or folding non-literal operands.
         if group.iter().any(|(_, membership)| {
             membership.values.is_empty()
-                || membership.values.iter().any(|value| {
-                    matches!(value, Expr::Literal(value, _)
-                        if value.is_null() || value.data_type().is_floating())
-                })
+                || membership.values.iter().any(
+                    |value| matches!(value, Expr::Literal(value, _) if !is_eligible_literal(value)),
+                )
         }) {
             return Ok(Vec::new());
         }
@@ -176,13 +221,12 @@ fn plan_replacements(
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Float normalization may introduce NaN and signed-zero alternatives.
-            // Do not reduce them using structural literal equality. NULL list
-            // elements also do not obey the ordinary set-algebra rules.
-            if !values.iter().all(|value| {
-                matches!(value,
-                    Expr::Literal(value, _) if !value.is_null() && !value.data_type().is_floating()
-                )
-            }) {
+            // Do not reduce them using structural literal equality. NULL and nested
+            // list elements also do not obey the ordinary set-algebra rules.
+            if !values
+                .iter()
+                .all(|value| matches!(value, Expr::Literal(value, _) if is_eligible_literal(value)))
+            {
                 return Ok(Vec::new());
             }
             indices.push(index);
@@ -216,11 +260,63 @@ fn plan_replacements(
         }
         replacements.push((indices, simplified));
     }
+
+    if !replacements.is_empty() {
+        for (i, (membership, cols)) in computed.iter().enumerate() {
+            let overlaps = cols.iter().any(|col| {
+                columns.contains_key(col)
+                    || computed[..i].iter().any(|(_, prev)| prev.contains(col))
+                    || computed[i + 1..].iter().any(|(_, next)| next.contains(col))
+            });
+            if overlaps {
+                // Reject computed memberships whose LHS simplifies (e.g. `coalesce(s)`
+                // or `i * 1`) into a predicate that can collide with a sibling term.
+                let probe = simplify(Expr::InList(InList::new(
+                    Box::new(membership.expr.clone()),
+                    membership.values.to_vec(),
+                    membership.negated,
+                )))?;
+                if !matches!(
+                    classify_term(&probe)?,
+                    Term::Membership(simplified) if simplified.expr == membership.expr
+                ) {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
+
     Ok(replacements)
 }
 
+fn has_column(expr: &Expr) -> Result<bool> {
+    let mut found = false;
+    expr.apply(|node| {
+        if matches!(node, Expr::Column(_)) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })?;
+    Ok(found)
+}
+
+fn collect_columns<'a>(expr: &'a Expr, columns: &mut Vec<&'a Column>) -> Result<()> {
+    expr.apply(|node| {
+        if let Expr::Column(column) = node
+            && !columns.contains(&column)
+        {
+            columns.push(column);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(())
+}
+
 /// Look through scalar wrappers without evaluating them or cloning their data.
-/// A boolean-valued operation below a wrapper may become a region term later.
+/// A boolean-valued operation or column cast below a wrapper may become a
+/// region term later.
 fn contains_predicate(expr: &Expr) -> Result<bool> {
     let mut found = false;
     expr.apply(|node| {
@@ -229,13 +325,26 @@ fn contains_predicate(expr: &Expr) -> Result<bool> {
             Expr::InList(_)
                 | Expr::Between(_)
                 | Expr::Like(_)
+                | Expr::SimilarTo(_)
+                | Expr::Not(_)
                 | Expr::IsTrue(_)
                 | Expr::IsFalse(_)
+                | Expr::IsNotTrue(_)
+                | Expr::IsNotFalse(_)
+                | Expr::IsUnknown(_)
+                | Expr::IsNotUnknown(_)
                 | Expr::IsNull(_)
                 | Expr::IsNotNull(_)
+                | Expr::Case(_)
         ) || matches!(node, Expr::BinaryExpr(binary) if matches!(binary.op,
                 Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq
-                | Operator::Gt | Operator::GtEq | Operator::And | Operator::Or))
+                | Operator::Gt | Operator::GtEq | Operator::And | Operator::Or
+                | Operator::IsDistinctFrom | Operator::IsNotDistinctFrom
+                | Operator::RegexMatch | Operator::RegexIMatch
+                | Operator::RegexNotMatch | Operator::RegexNotIMatch
+                | Operator::LikeMatch | Operator::ILikeMatch
+                | Operator::NotLikeMatch | Operator::NotILikeMatch))
+            || matches!(node, Expr::Cast(_) | Expr::TryCast(_) if has_column(node)?)
         {
             found = true;
             Ok(TreeNodeRecursion::Stop)
@@ -246,6 +355,27 @@ fn contains_predicate(expr: &Expr) -> Result<bool> {
     Ok(found)
 }
 
+fn is_safe_membership(membership: &Membership<'_>) -> Result<bool> {
+    if matches!(membership.expr, Expr::Column(_)) {
+        for value in membership.values {
+            if !matches!(value, Expr::Literal(_, _) | Expr::Column(_))
+                && (has_column(value)? || contains_predicate(value)?)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    } else {
+        Ok(!contains_predicate(membership.expr)?
+            && membership.values.iter().all(|value| {
+                matches!(
+                    value,
+                    Expr::Literal(scalar, _) if !matches!(scalar, ScalarValue::Boolean(_))
+                )
+            }))
+    }
+}
+
 fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
     let mut negated = false;
     while let Expr::Not(inner) = term {
@@ -253,6 +383,17 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
         term = inner;
     }
     let classified = match term {
+        Expr::InList(list) if matches!(list.expr.as_ref(), Expr::Literal(_, _)) => {
+            if list
+                .list
+                .iter()
+                .all(|value| matches!(value, Expr::Literal(_, _)))
+            {
+                Term::Other
+            } else {
+                return Ok(Term::Barrier);
+            }
+        }
         Expr::InList(list) => Term::Membership(Membership {
             expr: &list.expr,
             values: &list.list,
@@ -260,11 +401,13 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
         }),
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq | Operator::NotEq) => {
             let (expr, value) = match (binary.left.as_ref(), binary.right.as_ref()) {
-                (Expr::Column(_), Expr::Column(_)) => return Ok(Term::Other),
-                (expr, value @ Expr::Literal(_, _))
-                | (value @ Expr::Literal(_, _), expr)
-                | (expr @ Expr::Column(_), value)
-                | (value, expr @ Expr::Column(_)) => (expr, value),
+                (Expr::Column(_), Expr::Column(_)) | (Expr::Literal(_, _), Expr::Literal(_, _)) => {
+                    return Ok(Term::Other);
+                }
+                (expr @ Expr::Column(_), value)
+                | (value, expr @ Expr::Column(_))
+                | (expr, value @ Expr::Literal(_, _))
+                | (value @ Expr::Literal(_, _), expr) => (expr, value),
                 _ => return Ok(Term::Barrier),
             };
             Term::Membership(Membership {
@@ -287,10 +430,14 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
             Term::Other
         }
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
-            // A boundary is safe only if every term is understood. LIKE and
-            // scalar functions can become memberships in a subsequent pass.
+            if negated {
+                return Ok(Term::Barrier);
+            }
+            // A boundary is safe only if every term is understood and its columns
+            // do not overlap another membership or boundary in the enclosing region.
             let mut pending = vec![term];
             let mut visited = 0;
+            let mut boundary_columns = Vec::new();
             while let Some(child) = pending.pop() {
                 visited += 1;
                 if visited > MAX_BOUNDARY_TERMS {
@@ -301,13 +448,22 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
                         pending.push(&inner.left);
                         pending.push(&inner.right);
                     }
-                    child if matches!(classify_term(child)?, Term::Barrier) => {
-                        return Ok(Term::Barrier);
-                    }
-                    _ => {}
+                    child => match classify_term(child)? {
+                        Term::Membership(membership)
+                            if matches!(membership.expr, Expr::Column(_)) =>
+                        {
+                            collect_columns(child, &mut boundary_columns)?;
+                        }
+                        Term::Other => {
+                            collect_columns(child, &mut boundary_columns)?;
+                        }
+                        Term::Membership(_) | Term::Boundary(_) | Term::Barrier => {
+                            return Ok(Term::Barrier);
+                        }
+                    },
                 }
             }
-            if negated { Term::Barrier } else { Term::Other }
+            return Ok(Term::Boundary(boundary_columns));
         }
         // Only explicit safe separators are allowed. Unknown predicates may
         // simplify into memberships, even if they contain no predicate today.
@@ -315,16 +471,10 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
         _ => Term::Barrier,
     };
     // Boolean wrappers may disappear in a later simplifier pass. Keep their
-    // separators unless this is an independently rewritten AND/OR boundary.
-    let has_predicate = match &classified {
-        Term::Membership(membership) => contains_predicate(membership.expr)?,
-        Term::Barrier => return Ok(Term::Barrier),
-        Term::Other
-            if matches!(term, Expr::BinaryExpr(binary)
-            if matches!(binary.op, Operator::And | Operator::Or)) =>
-        {
-            false
-        }
+    // separators unless this is an independently validated AND/OR boundary.
+    let is_safe = match &classified {
+        Term::Membership(membership) => is_safe_membership(membership)?,
+        Term::Boundary(_) | Term::Barrier => return Ok(classified),
         Term::Other => {
             let mut found = false;
             term.apply_children(|child| {
@@ -335,14 +485,10 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
                     TreeNodeRecursion::Continue
                 })
             })?;
-            found
+            !found
         }
     };
-    Ok(if has_predicate {
-        Term::Barrier
-    } else {
-        classified
-    })
+    Ok(if is_safe { classified } else { Term::Barrier })
 }
 
 /// Prune replaced terms without changing the parenthesization of those kept.
@@ -593,6 +739,7 @@ mod tests {
     #[rstest::rstest]
     #[case::column_comparison(col("t").eq(col("u")))]
     #[case::literal_comparison(col("i").eq(lit(1)))]
+    #[case::disjoint_boundary(col("u").in_list(vec![lit("x"), lit("y")], true).or(lit(false)))]
     fn groups_separated_memberships_once(#[case] separator: Expr) {
         let original = col("s")
             .in_list(vec![lit("a"), lit("b")], false)
@@ -607,5 +754,44 @@ mod tests {
         .unwrap();
         assert_eq!(calls.get(), 1);
         assert_ne!(rewritten, original);
+    }
+
+    #[rstest::rstest]
+    #[case::and_with_or_false(
+        Operator::And,
+        col("s").in_list(vec![lit("a"), lit("b"), lit("c"), lit("d")], false),
+        col("s")
+            .in_list(vec![lit("a"), lit("b"), lit("c"), lit("d")], true)
+            .or(lit(false))
+    )]
+    #[case::or_with_and_true(
+        Operator::Or,
+        col("s").in_list(vec![lit("a"), lit("b")], true),
+        col("s").in_list(vec![lit("c"), lit("d")], true).and(lit(true))
+    )]
+    #[case::two_boundaries_same_column(
+        Operator::And,
+        col("s")
+            .in_list(vec![lit("a"), lit("b"), lit("c"), lit("d")], false)
+            .or(lit(false)),
+        col("s")
+            .in_list(vec![lit("a"), lit("b"), lit("c"), lit("d")], true)
+            .or(lit(false))
+    )]
+    fn preserves_overlapping_boundary_columns(
+        #[case] operator: Operator,
+        #[case] first: Expr,
+        #[case] boundary: Expr,
+    ) {
+        let join = |left: Expr, right: Expr| {
+            Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+        };
+        let sep = col("t").eq(lit("a"));
+        let original = join(join(join(first, sep.clone()), boundary), sep);
+        let rewritten = simplify_membership_regions(original.clone(), &|_| {
+            panic!("Overlapping boundary columns must reject the region before simplifying")
+        })
+        .unwrap();
+        assert_eq!(rewritten, original);
     }
 }

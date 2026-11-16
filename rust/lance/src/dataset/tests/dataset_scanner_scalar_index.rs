@@ -746,6 +746,14 @@ async fn test_redundant_in_conjunction_index_plan(
         "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
             AND (month LIKE 'x' OR month LIKE 'y')) AND clip = 'target')",
         "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+            AND (month NOT IN ('202601','202607','202608','202609') OR FALSE)) AND clip = 'target')",
+        "((month NOT IN ('202601','202607') OR clip = 'missing') \
+            OR (month NOT IN ('202608','202609') AND TRUE)) OR clip = 'missing'",
+        "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+            AND coalesce(month) NOT IN ('202601','202607','202608','202609')) AND clip = 'target')",
+        "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+            AND arrow_cast(month, 'LargeUtf8') NOT IN ('202601','202607','202608','202609')) AND clip = 'target')",
+        "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
             AND ((month NOT IN ('202601','202607','202608','202609')) = TRUE)) AND clip = 'target')",
         "((((month IN ('202601','202607','202608','202609') AND clip = 'target') \
             AND ((month IN ('202601','202607','202608','202609')) = FALSE)) AND clip = 'target')) IS FALSE",

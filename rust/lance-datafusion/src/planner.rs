@@ -1474,9 +1474,14 @@ mod tests {
     #[case::is_distinct_false("({}) IS DISTINCT FROM FALSE")]
     #[case::is_not_distinct_true("({}) IS NOT DISTINCT FROM TRUE")]
     #[case::in_true("({}) IN (TRUE)")]
+    #[case::reverse_in_true("TRUE IN ({})")]
     #[case::not_in_false("({}) NOT IN (FALSE)")]
+    #[case::or_false("({}) OR FALSE")]
+    #[case::and_true("({}) AND TRUE")]
     #[case::cast("CAST(({}) AS BOOLEAN)")]
+    #[case::try_cast("TRY_CAST(({}) AS BOOLEAN)")]
     #[case::is_true("({}) IS TRUE")]
+    #[case::is_not_true("({}) IS NOT TRUE")]
     #[case::is_not_false("({}) IS NOT FALSE")]
     fn test_wrapped_memberships_preserve_separators(#[case] wrapper: &str) {
         let values = [Some("a"), Some("outside"), None];
@@ -1520,7 +1525,18 @@ mod tests {
 
     #[rstest]
     #[case::array_has("array_has(['x','y','z','w'], s)")]
+    #[case::array_has_eq_true("(array_has(['x','y','z','w'], s)) = TRUE")]
     #[case::like_union("s LIKE 'x' OR s LIKE 'y'")]
+    #[case::or_false_boundary("s NOT IN ('a','b','c','d') OR FALSE")]
+    #[case::or_false_nullable_list("s NOT IN ('a', NULL) OR FALSE")]
+    #[case::absorbed_boundary(
+        "s NOT IN ('a','b','c','d') OR (s NOT IN ('a','b','c','d') AND t = 'x')"
+    )]
+    #[case::range_equality_boundary(
+        "(s >= 'x' AND s <= 'x') OR (s >= 'y' AND s <= 'y') OR (s >= 'z' AND s <= 'z') OR (s >= 'w' AND s <= 'w')"
+    )]
+    #[case::cast_column("CAST(s AS STRING) NOT IN ('a','b','c','d')")]
+    #[case::concat_identity("concat(s, '') NOT IN ('a','b','c','d')")]
     fn test_hidden_memberships_preserve_separators(#[case] hidden: &str) {
         let values = [Some("a"), Some("x"), Some("outside"), None];
         let batch = arrow_array::record_batch!(
@@ -1543,10 +1559,15 @@ mod tests {
         )
         .unwrap();
         let planner = Planner::new(batch.schema());
-        let sql = format!("((s IN ('a','b','c','d') AND t='a') AND ({hidden})) AND t='a'");
-        let expr = planner.parse_filter(&sql).unwrap();
-        for original in [expr.clone(), !expr.clone(), expr.is_false()] {
-            assert_optimization_preserves_values(&planner, &batch, original);
+        for sql in [
+            format!("((s IN ('a','b','c','d') AND t='a') AND ({hidden})) AND t='a'"),
+            format!("(((s IN ('a','b','c','d') OR FALSE) AND t='a') AND ({hidden})) AND t='a'"),
+            format!("((s NOT IN ('a','b') OR t='a') OR (({hidden}) AND TRUE)) OR t='a'"),
+        ] {
+            let expr = planner.parse_filter(&sql).unwrap();
+            for original in [expr.clone(), !expr.clone(), expr.is_false()] {
+                assert_optimization_preserves_values(&planner, &batch, original);
+            }
         }
     }
 
