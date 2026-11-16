@@ -160,26 +160,67 @@ mod tests {
         assert!(next.fragments[0].files.is_empty());
     }
 
-    #[test]
-    fn test_tombstone_field_data_keeps_a_file_with_a_live_field() {
+    /// A legacy V1 file's reader finds a field's pages by its position among
+    /// the file's fields, so tombstoning one slot would decode its siblings
+    /// from the wrong pages. As with `DataReplacement`, a V1 file is replaced
+    /// whole: its live fields are tombstoned together or not at all.
+    #[rstest]
+    #[case::v2(
+        DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], ConcreteFileVersion::V2_0, None, None),
+        &[0],
+        Ok(Some(&[TOMBSTONED_FIELD, 1][..]))
+    )]
+    #[case::v1_one_of_its_fields(
+        DataFile::new_legacy_from_fields("data/0.lance", vec![0, 1], None),
+        &[0],
+        Err("legacy V1 file data/0.lance")
+    )]
+    #[case::v1_every_field(
+        DataFile::new_legacy_from_fields("data/0.lance", vec![0, 1], None),
+        &[0, 1],
+        Ok(None)
+    )]
+    fn test_tombstone_field_data_keeps_a_file_with_a_live_field(
+        #[case] file: DataFile,
+        #[case] tombstoned: &[i32],
+        #[case] expected: std::result::Result<Option<&[i32]>, &str>,
+    ) {
         let mut manifest = backed_manifest();
+        let mut schema_field = added_field("keep");
+        schema_field.id = 1;
+        manifest.schema.fields.push(schema_field);
         let mut fragment = manifest.fragments[0].clone();
-        fragment.files[0] = DataFile::new(
-            "data/0.lance",
-            vec![0, 1],
-            vec![0, 1],
-            ConcreteFileVersion::V2_0,
-            None,
-            None,
-        );
+        fragment.files[0] = file;
         manifest.fragments = Arc::new(vec![fragment]);
 
-        let next = apply(&manifest, vec![tombstone_field_zero(true)]).unwrap();
-
-        assert_eq!(
-            next.fragments[0].files[0].fields.as_ref(),
-            &[TOMBSTONED_FIELD, 1]
+        let result = apply(
+            &manifest,
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: tombstoned
+                    .iter()
+                    .copied()
+                    .map(FieldRef::Committed)
+                    .collect(),
+                data_change: true,
+            })],
         );
+
+        match expected {
+            Ok(expected_fields) => {
+                let next = result.unwrap();
+                let fields: Option<Vec<i32>> = next.fragments[0]
+                    .files
+                    .first()
+                    .map(|file| file.fields.to_vec());
+                assert_eq!(fields.as_deref(), expected_fields);
+            }
+            Err(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
     }
 
     #[test]

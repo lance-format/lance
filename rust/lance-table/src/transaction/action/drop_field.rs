@@ -171,38 +171,47 @@ mod tests {
         assert!(indices.is_empty());
     }
 
-    #[test]
-    fn test_drop_field_keeps_a_file_with_a_surviving_field() {
+    /// The surviving field stays at the position it was written at. A legacy
+    /// V1 file's reader finds a field's pages by its position among the
+    /// file's fields, so its list is kept whole, the way `Project` keeps it.
+    /// Once nothing in it is live the file is pruned either way.
+    #[rstest]
+    #[case::v2(
+        DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], ConcreteFileVersion::V2_0, None, None),
+        &[0],
+        Some(&[TOMBSTONED_FIELD, 1][..])
+    )]
+    #[case::v1(
+        DataFile::new_legacy_from_fields("data/0.lance", vec![0, 1], None),
+        &[0],
+        Some(&[0, 1][..])
+    )]
+    #[case::v1_with_every_field_dropped(
+        DataFile::new_legacy_from_fields("data/0.lance", vec![0, 1], None),
+        &[0, 1],
+        None
+    )]
+    fn test_drop_field_keeps_a_file_with_a_surviving_field(
+        #[case] file: DataFile,
+        #[case] dropped: &[i32],
+        #[case] expected_fields: Option<&[i32]>,
+    ) {
         let mut manifest = backed_manifest();
         let mut schema_field = added_field("keep");
         schema_field.id = 1;
         manifest.schema.fields.push(schema_field);
         let mut fragment = manifest.fragments[0].clone();
-        fragment.files[0] = DataFile::new(
-            "data/0.lance",
-            vec![0, 1],
-            vec![0, 1],
-            ConcreteFileVersion::V2_0,
-            None,
-            None,
-        );
+        fragment.files[0] = file;
         manifest.fragments = Arc::new(vec![fragment]);
 
-        let next = apply(
-            &manifest,
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(0),
-            })],
-        )
-        .unwrap();
+        let next = apply(&manifest, dropped.iter().copied().map(drop_field).collect()).unwrap();
 
         assert!(next.schema.field_by_id(0).is_none());
-        assert!(next.schema.field_by_id(1).is_some());
-        // The surviving field stays at the position it was written at.
-        assert_eq!(
-            next.fragments[0].files[0].fields.as_ref(),
-            &[TOMBSTONED_FIELD, 1]
-        );
+        let fields: Option<Vec<i32>> = next.fragments[0]
+            .files
+            .first()
+            .map(|file| file.fields.to_vec());
+        assert_eq!(fields.as_deref(), expected_fields);
     }
 
     /// `id` at 0, then `s: {a, t: {b}}` at 1-4, with fragment 0's second file
