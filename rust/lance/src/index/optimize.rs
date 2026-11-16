@@ -123,9 +123,9 @@ use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
-    segment_has_bloomfilter_details, segment_has_inverted_details,
-    segment_has_label_list_details, segment_has_merge_primitive,
-    segment_has_vector_details, unsupported_index_version, validate_segment_metadata,
+    segment_has_bloomfilter_details, segment_has_inverted_details, segment_has_label_list_details,
+    segment_has_merge_primitive, segment_has_vector_details, unsupported_index_version,
+    validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -2712,8 +2712,10 @@ mod tests {
             .as_ref()
             .clone();
 
-        // Alone in its bin, the older segment is left as it is: a rewrite
-        // could not drop the deleted copy from its zones.
+        // Each old segment fills its own bin, so the older one is left as it
+        // is: a rewrite could not drop the deleted copy from its zones.
+        // Executing the bounded plan commits only the new fragment, and the
+        // index still answers for every row with the deletion filtered out.
         let bounded = OptimizeOptions::merge(2).max_rows_per_segment(Some(100));
         let plan = plan_optimize_indices(&dataset, &bounded).await.unwrap();
         assert_eq!(plan.tasks.len(), 1);
@@ -2723,12 +2725,28 @@ mod tests {
                 .all(|merge| merge.old_segments.iter().all(|old| old.uuid != older)),
             "{plan:?}"
         );
+        let merged = execute_plan(&dataset, &plan).await;
+        commit_optimize_indices(&mut dataset, merged, &bounded)
+            .await
+            .unwrap();
+        let merged_segments = segments(&dataset, BLOOM_INDEX).await;
+        assert_eq!(merged_segments.len(), 3);
+        assert!(merged_segments.iter().any(|segment| segment.uuid == older));
+        assert_eq!(
+            coverage(&merged_segments),
+            *dataset.fragment_bitmap.as_ref()
+        );
+        assert_eq!(ids_where(&dataset, "value = 1000").await, vec![5]);
+        assert!(ids_where(&dataset, "value = 5").await.is_empty());
+        let unchanged = (0..200).filter(|id| *id != 5).collect::<Vec<_>>();
+        assert_bloom_answers(&dataset, &unchanged).await;
 
-        // The default optimize also rewrites the older segment, which covers
-        // the deletion, so both segments merge with the new fragment.
+        // With no unindexed fragment left, an unset merge count is append only,
+        // so name all three segments: the merge absorbs the older segment too,
+        // which covers the deletion, without reading its data.
         read_paths(&dataset);
         dataset
-            .optimize_indices(&OptimizeOptions::default())
+            .optimize_indices(&OptimizeOptions::merge(3))
             .await
             .unwrap();
         let paths = read_paths(&dataset);
@@ -2737,7 +2755,6 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
         assert_eq!(ids_where(&dataset, "value = 1000").await, vec![5]);
-        let unchanged = (0..200).filter(|id| *id != 5).collect::<Vec<_>>();
         assert_bloom_answers(&dataset, &unchanged).await;
     }
 }
