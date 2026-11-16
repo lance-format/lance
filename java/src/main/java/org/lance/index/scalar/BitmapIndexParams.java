@@ -33,12 +33,15 @@ public final class BitmapIndexParams {
     private Integer shardId;
 
     /**
-     * Configure an explicit shard ID for distributed bitmap builds spanning multiple fragments.
+     * Retain a legacy shard ID so index creation reports that shard builds are unsupported.
      *
      * @param shardId non-negative shard identifier
      * @return this builder
      * @throws IllegalArgumentException
+     * @deprecated Bitmap builds create independent segments. Omit this option and use the
+     *     uncommitted segment build API; index creation rejects any supplied shard ID.
      */
+    @Deprecated
     public Builder shardId(int shardId) {
       if (shardId < 0) {
         throw new IllegalArgumentException("shardId must be non-negative");
