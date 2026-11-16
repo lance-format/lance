@@ -343,17 +343,16 @@ impl DirectoryNamespace {
         }
         let is_v2_naming = first_manifest_filename_len == Some(29);
 
-        // V2 filenames invert the version, so a lexically-ordered stream
-        // arrives newest-first; when that matches the requested order, stop
-        // after `limit` manifests instead of paginating the whole directory
-        // (the `get_latest_version` hot path: descending, limit 1).
+        // Only V2 names may be trusted to match stream order: V2 filenames
+        // invert and zero-pad the version, so a lexically-ordered stream
+        // arrives newest-first and a descending request can stop after
+        // `limit` manifests instead of paginating the whole directory (the
+        // `get_latest_version` hot path: descending, limit 1). V1 names are
+        // unpadded, so lexical order diverges from version order across
+        // digit widths (`10.manifest` sorts before `2.manifest`); V1
+        // listings are always collected and sorted numerically.
         let list_is_ordered = self.object_store.list_is_lexically_ordered;
-        let stream_matches_request = list_is_ordered
-            && if is_v2_naming {
-                descending
-            } else {
-                !descending
-            };
+        let stream_matches_request = list_is_ordered && is_v2_naming && descending;
         let early_stop_at = limit.filter(|_| stream_matches_request);
 
         while early_stop_at.is_none_or(|n| table_versions.len() < n) {
