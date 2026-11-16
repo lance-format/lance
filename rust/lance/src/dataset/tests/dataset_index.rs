@@ -8623,6 +8623,142 @@ async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVer
     );
 }
 
+/// A typed `IS NULL` leaf in a composed filter must keep its original
+/// accessor when the recheck evaluates the filter. The index on `p` has a
+/// string target while the predicate asks `json_get_int`, and the two disagree
+/// about whether the nonnumeric string "many" is null. The inexact ngram leaf
+/// only yields a false positive for that row, so only the typed null leaf keeps
+/// it.
+#[rstest]
+#[case::legacy(LanceFileVersion::Legacy)]
+#[case::stable(LanceFileVersion::Stable)]
+#[tokio::test]
+async fn test_json_typed_is_null_recheck_composition(
+    #[case] data_storage_version: LanceFileVersion,
+) {
+    let test_uri = TempStrDir::default();
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt64, false),
+        ArrowField::new("json", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from_iter_values(0..4)),
+            Arc::new(StringArray::from(vec![
+                // `json_get_int` makes "many" null, but `json_get_string` does
+                // not. The ngram leaf is only a false positive for this row, so
+                // the row is reachable through the OR and the typed null leaf
+                // alone keeps it.
+                r#"{"p":"many","tag":"brazil ravioli avocado"}"#,
+                r#"{"p":null,"tag":"alpha-charlie"}"#,
+                r#"{"p":"7","tag":"unique-bravo"}"#,
+                // Ngram false positive that the recheck must drop.
+                r#"{"p":"7","tag":"brazil ravioli avocado"}"#,
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let p_params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "target_data_type": "Utf8",
+        "path": "p",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_p_idx".to_string()),
+            &p_params,
+            false,
+        )
+        .await
+        .unwrap();
+    let tag_params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "ngram",
+        "path": "tag",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_tag_ngram_idx".to_string()),
+            &tag_params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let filter =
+        "json_get_int(json, 'p') IS NULL OR contains(json_get_string(json, 'tag'), 'bravo')";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("MaterializeIndex") || plan.contains("ScalarIndexQuery"),
+        "plan must use an index: {plan}"
+    );
+    assert!(
+        plan.contains("json_p_idx") && plan.contains("json_tag_ngram_idx"),
+        "both composed leaves must be indexed: {plan}"
+    );
+    if data_storage_version == LanceFileVersion::Legacy {
+        assert!(
+            plan.contains("FilterExec"),
+            "legacy plan must recheck: {plan}"
+        );
+    }
+
+    let expected = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(false)
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let result = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut actual = result["id"].as_primitive::<UInt64Type>().values().to_vec();
+    actual.sort_unstable();
+    let mut expected_ids = expected["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    expected_ids.sort_unstable();
+    assert_eq!(expected_ids, vec![0, 1, 2], "full scan is the oracle");
+    assert_eq!(actual, expected_ids);
+}
+
 #[rstest]
 #[case::merge(false)]
 #[case::append_rebuild(true)]
