@@ -147,7 +147,7 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
-    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    ReclaimOnLoss, commit_detached_transaction, commit_new_dataset, commit_transaction,
     default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
@@ -2030,12 +2030,50 @@ impl Dataset {
         .await
     }
 
+    /// Commit a transaction and reclaim the `_indices/{uuid}` directories it
+    /// minted if the commit is verified not to have landed. Only for callers
+    /// that rebuild those directories on a retry; a caller replaying the same
+    /// transaction must use [`Self::apply_commit`] instead.
+    pub(crate) async fn apply_commit_reclaiming_minted_index_dirs(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+    ) -> Result<()> {
+        self.apply_commit_inner(
+            transaction,
+            write_config,
+            commit_config,
+            None,
+            ReclaimOnLoss::MintedIndexDirs,
+        )
+        .await
+    }
+
     async fn apply_commit_with_expected_latest_version(
         &mut self,
         transaction: Transaction,
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
         expected_latest_version: Option<u64>,
+    ) -> Result<()> {
+        self.apply_commit_inner(
+            transaction,
+            write_config,
+            commit_config,
+            expected_latest_version,
+            ReclaimOnLoss::None,
+        )
+        .await
+    }
+
+    async fn apply_commit_inner(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+        expected_latest_version: Option<u64>,
+        reclaim: ReclaimOnLoss,
     ) -> Result<()> {
         // Keep the retry and rebase state machine out of every caller's future.
         let (manifest, manifest_location) = Box::pin(commit_transaction(
@@ -2049,6 +2087,7 @@ impl Dataset {
             self.manifest_location.naming_scheme,
             None,
             expected_latest_version,
+            reclaim,
         ))
         .await?;
 

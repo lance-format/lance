@@ -28,7 +28,7 @@ use crate::dataset::transaction::{
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::loading::load_all_indices;
-use crate::io::commit::{commit_transaction, default_commit_retry_timeout};
+use crate::io::commit::{ReclaimOnLoss, commit_transaction, default_commit_retry_timeout};
 use crate::io::deletion::read_dataset_deletion_file;
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
@@ -60,6 +60,7 @@ pub(super) async fn reserve_fragment_ids(
         dataset.manifest_location.naming_scheme,
         None,
         None,
+        ReclaimOnLoss::None,
     )
     .await?;
 
@@ -613,12 +614,18 @@ async fn commit_rewrites(
     .build();
 
     if let Err(e) = dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
+        .apply_commit_reclaiming_minted_index_dirs(
+            transaction,
+            &Default::default(),
+            &Default::default(),
+        )
         .await
     {
         // RewriteResult is serializable and may be retried after an earlier
         // ambiguous success. A conflict on this call therefore does not prove
         // that the rewritten files are unreferenced. Leave them for dataset GC.
+        // The index directories this call minted are reclaimed by the commit
+        // path itself, but only once it verifies the commit did not land.
         log::warn!(
             "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
             new_fragment_count,

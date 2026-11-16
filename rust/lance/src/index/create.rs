@@ -784,8 +784,14 @@ impl<'a> CreateIndexBuilder<'a> {
         .transaction_properties(self.transaction_properties.clone())
         .build();
 
+        // This call built the index directory above and a retry rebuilds it,
+        // so the commit path may reclaim it after a verified loss.
         self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
+            .apply_commit_reclaiming_minted_index_dirs(
+                transaction,
+                &Default::default(),
+                &Default::default(),
+            )
             .await?;
 
         // Rebasing may withdraw all query coverage while keeping the committed
@@ -1233,11 +1239,27 @@ mod tests {
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
     use rstest::rstest;
-    use std::{collections::BTreeSet, ops::Bound, sync::Arc};
+    use std::{
+        collections::{BTreeSet, HashSet},
+        ops::Bound,
+        sync::Arc,
+    };
     use tracing_subscriber::{Layer, layer::SubscriberExt};
     use uuid::Uuid;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    /// Names of the immediate children of `_indices`, i.e. one entry per
+    /// stored index directory.
+    async fn index_dir_names(dataset: &Dataset) -> HashSet<String> {
+        dataset
+            .object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
 
     #[test]
     fn test_inverted_training_params_include_build_only_fields() {
@@ -1623,6 +1645,8 @@ mod tests {
             first.is_ok(),
             "first create_index should succeed: {first:?}"
         );
+        let dirs_before = index_dir_names(&reader1).await;
+        assert_eq!(dirs_before.len(), 1);
 
         let second = CreateIndexBuilder::new(&mut reader2, &["a"], IndexType::BTree, &params)
             .name("a_idx".to_string())
@@ -1631,6 +1655,11 @@ mod tests {
         assert!(
             matches!(second, Err(Error::RetryableCommitConflict { .. })),
             "second concurrent create_index should be retryable, got {second:?}"
+        );
+        assert_eq!(
+            index_dir_names(&reader1).await,
+            dirs_before,
+            "the index directory of the rejected CreateIndex must be reclaimed"
         );
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
@@ -1690,6 +1719,7 @@ mod tests {
             .unwrap();
 
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let dirs_before = index_dir_names(&writer).await;
         let result = CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
             .name("value_idx".to_string())
             .execute()
@@ -1706,6 +1736,11 @@ mod tests {
                     "CreateIndex transaction was preempted by concurrent transaction {operation}"
                 )),
                 "{error}"
+            );
+            assert_eq!(
+                index_dir_names(&writer).await,
+                dirs_before,
+                "the index directory of the preempted CreateIndex must be reclaimed"
             );
         } else {
             result.unwrap();

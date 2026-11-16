@@ -43,7 +43,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use lance_table::io::manifest::read_manifest;
+use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use lance_table::transaction::{
     FragReuseUpdate, PreparedIndices, canonicalize_non_reusable_field_ids,
     has_writer_placed_lineage, validate_detached_non_reusable_field_ids,
@@ -80,6 +80,7 @@ use log;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
+use uuid::Uuid;
 
 #[cfg(test)]
 mod conflict_matrix;
@@ -220,6 +221,84 @@ async fn cleanup_transaction_file(
                 "Failed to clean up orphaned transaction file '{}': {}",
                 transaction_file,
                 e
+            );
+        }
+    }
+}
+
+/// Best-effort removal of `_indices/{uuid}` directories a commit call minted
+/// before its manifest write was confirmed not to have landed.
+///
+/// Only call this when every manifest write the call made was verified as
+/// [`CommitOutcome::Foreign`] or [`CommitOutcome::Absent`], and only for
+/// callers that own the directories: they were minted during this call, so a
+/// retry mints new UUIDs instead of reusing these (see [`ReclaimOnLoss`]).
+///
+/// The latest manifest is re-read first, because a concurrent writer may have
+/// committed since the failed attempt and could reference one of these UUIDs.
+/// If that read fails, nothing is removed: leaving an orphaned directory for
+/// GC is always safer than deleting a referenced one.
+async fn cleanup_minted_index_dirs(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    candidates: &HashSet<Uuid>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let location = match dataset
+        .commit_handler
+        .resolve_latest_location(&dataset.base, &dataset.object_store)
+        .await
+    {
+        Ok(location) => location,
+        Err(error) => {
+            log::warn!(
+                "Failed to resolve the latest version while reclaiming index directories from a \
+                 failed commit; leaving them for GC: {error}"
+            );
+            return;
+        }
+    };
+    // Read without touching the dataset caches: loading a manifest through
+    // `Dataset` also decodes its inline transaction into the session cache,
+    // which would replace the caller's in-memory transaction for that version.
+    let manifest = match read_manifest(&dataset.object_store, &location.path, location.size).await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            log::warn!(
+                "Failed to read the latest manifest while reclaiming index directories from a \
+                 failed commit; leaving them for GC: {error}"
+            );
+            return;
+        }
+    };
+    let referenced = match read_manifest_indexes(&dataset.object_store, &location, &manifest).await
+    {
+        Ok(indices) => indices
+            .into_iter()
+            .map(|index| index.uuid)
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            log::warn!(
+                "Failed to read the index list of the latest manifest while reclaiming index \
+                 directories from a failed commit; leaving them for GC: {error}"
+            );
+            return;
+        }
+    };
+    for uuid in candidates.difference(&referenced) {
+        let path = dataset.indices_dir().join(uuid.to_string());
+        // A missing directory is the normal case: a fragment reuse entry, for
+        // instance, is inline and never writes a directory.
+        if let Err(error) = object_store.remove_dir_all(path.clone()).await
+            && !error.is_not_found()
+        {
+            log::warn!(
+                "Failed to reclaim index directory '{}' from a failed commit; leaving it for \
+                 GC: {}",
+                path,
+                error
             );
         }
     }
@@ -1772,6 +1851,60 @@ async fn record_successful_commit(
     dataset.ensure_branch_exists().await
 }
 
+/// Whether a failed commit may reclaim the index directories its transaction
+/// minted before the commit was attempted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimOnLoss {
+    /// Leave every minted directory for dataset GC.
+    ///
+    /// This is the only safe choice for a caller that may retry the same
+    /// transaction, because its index UUIDs keep pointing at those
+    /// directories across attempts.
+    #[default]
+    None,
+    /// Remove the minted `_indices/{uuid}` directories once the commit is
+    /// verified not to have landed. Only for callers that minted them inside
+    /// the call and rebuild them (with fresh UUIDs) on a retry.
+    MintedIndexDirs,
+}
+
+/// State a single [`commit_transaction`] call keeps to decide, on failure,
+/// whether the index directories it minted can be reclaimed.
+#[derive(Debug, Default)]
+struct MintedIndexDirs {
+    /// Directories minted by this call, from the input transaction and every
+    /// rebased transaction.
+    uuids: HashSet<Uuid>,
+    /// At least one manifest write this call made has not been verified as
+    /// landed elsewhere or absent. Starts false so a call that fails before
+    /// reaching the write is clean.
+    has_unverified_write: bool,
+}
+
+/// The index UUIDs whose directories `operation` minted for its caller. Only
+/// ids that differ from an existing index are included: a remap can decide to
+/// keep the original instead of writing a new directory.
+fn minted_index_uuids(operation: &Operation) -> Vec<Uuid> {
+    match operation {
+        Operation::Rewrite {
+            rewritten_indices,
+            frag_reuse_index,
+            ..
+        } => rewritten_indices
+            .iter()
+            .filter(|index| index.new_id != index.old_id)
+            .map(|index| index.new_id)
+            .chain(frag_reuse_index.iter().map(|index| index.uuid))
+            .collect(),
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .filter(|index| index.base_id.is_none())
+            .map(|index| index.uuid)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1785,6 +1918,48 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
     expected_latest_version: Option<u64>,
+    reclaim: ReclaimOnLoss,
+) -> Result<(Manifest, ManifestLocation)> {
+    let mut minted = MintedIndexDirs {
+        uuids: minted_index_uuids(&transaction.operation)
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let result = Box::pin(commit_transaction_inner(
+        dataset,
+        object_store,
+        commit_handler,
+        transaction,
+        write_config,
+        commit_config,
+        retry_timeout,
+        manifest_naming_scheme,
+        affected_rows,
+        expected_latest_version,
+        &mut minted,
+    ))
+    .await;
+    if result.is_err() && reclaim == ReclaimOnLoss::MintedIndexDirs && !minted.has_unverified_write
+    {
+        cleanup_minted_index_dirs(dataset, object_store, &minted.uuids).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_transaction_inner(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+    retry_timeout: Duration,
+    manifest_naming_scheme: ManifestNamingScheme,
+    affected_rows: Option<&RowAddrTreeMap>,
+    expected_latest_version: Option<u64>,
+    minted: &mut MintedIndexDirs,
 ) -> Result<(Manifest, ManifestLocation)> {
     dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
@@ -1943,6 +2118,11 @@ pub(crate) async fn commit_transaction(
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
+            // A rebase can mint a new fragment reuse UUID; collect it so a
+            // call that later fails can reclaim its directory too.
+            minted
+                .uuids
+                .extend(minted_index_uuids(&transaction.operation));
             tagged_rewrite = assembly;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
@@ -2098,6 +2278,9 @@ pub(crate) async fn commit_transaction(
 
         // Try to commit the manifest
         original_dataset.ensure_branch_exists().await?;
+        // From here until `verify_commit_outcome` clears it, a manifest write
+        // of unclear fate exists and cleanup must stay off.
+        minted.has_unverified_write = true;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -2167,7 +2350,9 @@ pub(crate) async fn commit_transaction(
                     // for handlers that detect conflicts before writing,
                     // the attempt never landed). Proceed with the normal
                     // rebase-and-retry path.
-                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                    CommitOutcome::Foreign | CommitOutcome::Absent => {
+                        minted.has_unverified_write = false;
+                    }
                     CommitOutcome::Unknown => {
                         return Err(Error::commit_status_unknown_source(
                             target_version,
@@ -2242,6 +2427,7 @@ pub(crate) async fn commit_transaction(
                     CommitOutcome::Foreign | CommitOutcome::Absent => {
                         // The attempt certainly did not land; its
                         // transaction file is orphaned.
+                        minted.has_unverified_write = false;
                         cleanup_transaction_file(
                             object_store,
                             &dataset.base,
@@ -2315,6 +2501,7 @@ mod tests {
     use crate::Dataset;
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::transaction::RewrittenIndex;
     use crate::dataset::{
         CommitBuilder, DeleteBuilder, MergeInsertBuilder, UpdateBuilder, WhenMatched,
         WhenNotMatched, WriteMode, WriteParams,
@@ -2322,6 +2509,7 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use lance_index::scalar::ScalarIndexParams;
 
     #[rstest::rstest]
     #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]
@@ -4066,6 +4254,218 @@ mod tests {
         )]))
     }
 
+    fn test_index_metadata(uuid: Uuid, base_id: Option<u32>) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            fields: vec![0],
+            covering_fields: vec![],
+            name: "test_index".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// T1: only directories this transaction minted are candidates. A remap
+    /// that keeps the original index and an index that replaces another one
+    /// must not put either existing UUID in the set.
+    #[test]
+    fn test_minted_index_uuids_collects_only_new_ids() {
+        let kept = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let remapped = Uuid::new_v4();
+        let frag_reuse = Uuid::new_v4();
+        let created = Uuid::new_v4();
+        let replaced = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+
+        let operation = Operation::Rewrite {
+            groups: vec![],
+            rewritten_indices: vec![
+                RewrittenIndex {
+                    old_id: kept,
+                    new_id: kept,
+                    new_index_details: prost_types::Any::default(),
+                    new_index_version: 0,
+                    new_index_files: None,
+                },
+                RewrittenIndex {
+                    old_id: old,
+                    new_id: remapped,
+                    new_index_details: prost_types::Any::default(),
+                    new_index_version: 0,
+                    new_index_files: None,
+                },
+            ],
+            frag_reuse_index: Some(test_index_metadata(frag_reuse, None)),
+        };
+        assert_eq!(
+            minted_index_uuids(&operation)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([remapped, frag_reuse])
+        );
+
+        let operation = Operation::CreateIndex {
+            new_indices: vec![
+                test_index_metadata(created, None),
+                // Files of an imported index live in another base directory,
+                // so this call did not mint one under `_indices`.
+                test_index_metadata(foreign, Some(7)),
+            ],
+            removed_indices: vec![test_index_metadata(replaced, None)],
+        };
+        assert_eq!(minted_index_uuids(&operation), vec![created]);
+
+        assert!(minted_index_uuids(&Operation::Append { fragments: vec![] }).is_empty());
+    }
+
+    /// T9: cleanup must re-read the latest manifest and keep a directory it
+    /// references, even when the caller claims the directory was minted by
+    /// the failed call.
+    #[tokio::test]
+    async fn test_cleanup_keeps_index_dir_referenced_by_latest_manifest() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(simple_batch(&schema, vec![1, 2, 3]))], schema),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["x"],
+                IndexType::Scalar,
+                Some("x_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let index = dataset.load_index_by_name("x_idx").await.unwrap().unwrap();
+        let index_dir = dataset.indices_dir().join(index.uuid.to_string());
+        assert!(
+            !dataset
+                .object_store
+                .read_dir(index_dir.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        cleanup_minted_index_dirs(
+            &dataset,
+            dataset.object_store.as_ref(),
+            &HashSet::from([index.uuid]),
+        )
+        .await;
+
+        assert!(
+            !dataset
+                .object_store
+                .read_dir(index_dir)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an index directory referenced by the latest manifest must survive cleanup"
+        );
+    }
+
+    /// C1's `Foreign` branch: when another writer wins the target version,
+    /// the attempt is verified as not landed and the directory it minted is
+    /// reclaimed.
+    #[tokio::test]
+    async fn test_foreign_commit_outcome_reclaims_minted_index_dir() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(simple_batch(&schema, vec![1, 2, 3]))], schema),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+        let segment = dataset
+            .create_index_builder(&["x"], IndexType::Scalar, &ScalarIndexParams::default())
+            .name("x_idx".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
+        assert!(
+            !dataset
+                .object_store
+                .read_dir(index_dir.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A foreign transaction lands at the version this attempt targets, so
+        // the conditional put conflicts and verification reports `Foreign`.
+        let mut foreign_manifest = dataset.manifest.as_ref().clone();
+        foreign_manifest.version = dataset.manifest.version + 1;
+        let foreign_transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        let handler = inject_foreign_commit_handler(foreign_manifest, &foreign_transaction);
+
+        let transaction = Transaction::new(
+            segment.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        // One attempt only: the foreign commit is a one-shot injection.
+        let commit_config = CommitConfig {
+            num_retries: 1,
+            ..Default::default()
+        };
+        let error = commit_transaction(
+            &dataset,
+            dataset.object_store.as_ref(),
+            handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &commit_config,
+            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            dataset.manifest_location.naming_scheme,
+            None,
+            None,
+            ReclaimOnLoss::MintedIndexDirs,
+        )
+        .await
+        .expect_err("a commit that lost the version must fail");
+        assert!(
+            !error.is_commit_status_unknown(),
+            "a verified foreign owner is a definite loss, got: {error:?}"
+        );
+
+        assert!(
+            dataset
+                .object_store
+                .read_dir(index_dir)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the index directory of a verified-foreign attempt must be reclaimed"
+        );
+    }
+
     /// A commit whose manifest lands but is reported as a conflict (the
     /// incident shape: successful conditional PUT, response lost, internal
     /// retry sees "already exists") must be recognized as our own commit and
@@ -4240,6 +4640,7 @@ mod tests {
             dataset.manifest_location.naming_scheme,
             None,
             None,
+            ReclaimOnLoss::None,
         )
         .await
         .expect("the inline transaction must identify the landed commit");

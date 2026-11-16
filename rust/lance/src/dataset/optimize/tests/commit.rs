@@ -1219,3 +1219,354 @@ async fn test_commit_compaction_leaves_blob_v2_sidecars_for_gc_on_commit_failure
         "Blob v2 sidecars should be retained for GC after the Rewrite commit fails"
     );
 }
+
+/// A small dataset with one BTree index and four fragments, so that an eager
+/// compaction rewrites the index and therefore mints an `_indices/{uuid}`
+/// directory before committing.
+async fn reclaim_fixture(uri: &str, handler: Arc<dyn CommitHandler>) -> Dataset {
+    let mut data_gen =
+        BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+    let mut dataset = Dataset::write(
+        data_gen.batch(200),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 50,
+            commit_handler: Some(handler),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_scalar_index(&mut dataset, "i", false).await;
+    dataset
+}
+
+fn reclaim_options() -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment: 1000,
+        ..Default::default()
+    }
+}
+
+/// Asserts the reopened dataset answers `filter` the same way with and
+/// without the index, and that the answer is non-empty.
+async fn assert_indexed_query_matches(uri: &str, filter: &str) {
+    let dataset = Dataset::open(uri).await.unwrap();
+    let indexed = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(true)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let plain = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(indexed, plain, "indexed and plain scans must agree");
+    assert!(indexed.num_rows() > 0, "the filter must match some rows");
+}
+
+/// T2 (#7207's original shape): a concurrent DELETE lands before the rewrite
+/// publishes, the retry's conflict check rejects the rewrite, and the index
+/// directory the remap minted is reclaimed while the original index survives.
+#[tokio::test]
+async fn test_delete_conflict_reclaims_remapped_index_dir() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+    assert_eq!(before.len(), 1);
+
+    handler.arm(&dataset, vec![Race::Delete]);
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the DELETE must preempt the rewrite commit");
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "expected a retryable conflict, got: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        index_dir_names(&dataset).await,
+        before,
+        "the remapped directory of the rejected rewrite must be reclaimed, \
+         and the original index directory must survive"
+    );
+    assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+}
+
+/// The failure injected into the Rewrite commit for
+/// `test_rewrite_commit_failure_preserves_or_reclaims_index_dirs`.
+#[derive(Debug, Clone, Copy)]
+enum RewriteFailure {
+    /// The manifest write fails and verification finds no manifest at the
+    /// target version.
+    VerifiedAbsent,
+    /// The manifest lands, but the handler reports an error and asks for it
+    /// to be propagated even though verification proves the commit landed.
+    LandedThenPropagatedError,
+    /// The manifest lands, but verification cannot run.
+    LandedWithoutVerification,
+    /// The manifest lands and a later version drops the index it published
+    /// before the handler reports the error. The latest manifest therefore
+    /// does not reference the minted directory: only the write tracking of
+    /// C1 protects it.
+    LandedThenIndexDropped,
+    /// As [`Self::LandedThenIndexDropped`], with verification unavailable.
+    UnknownThenIndexDropped,
+}
+
+/// Lands the Rewrite commit, then commits a later version that drops the index
+/// name it published, and only then reports the failure. Used to show that
+/// cleanup cannot rely on the latest manifest alone: an earlier version still
+/// references the directory, so deleting it would corrupt that version.
+#[derive(Debug)]
+struct LandDropThenFail {
+    uri: String,
+    fail_resolve: std::sync::atomic::AtomicBool,
+}
+
+impl LandDropThenFail {
+    fn new(uri: &str) -> Self {
+        Self {
+            uri: uri.to_string(),
+            fail_resolve: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl CommitHandler for LandDropThenFail {
+    fn is_version_not_found_definitive(&self) -> bool {
+        true
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        true
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &object_store::path::Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let is_rewrite = transaction
+            .as_ref()
+            .and_then(|transaction| transaction.as_pb().operation.as_ref())
+            .is_some_and(|operation| matches!(operation, PbOperation::Rewrite(_)));
+        let location = ConditionalPutCommitHandler
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await?;
+        if is_rewrite {
+            // A later writer drops the very index this rewrite published.
+            let mut latest = Dataset::open(&self.uri).await.unwrap();
+            latest.drop_index("scalar").await.unwrap();
+            return Err(CommitError::OtherError(Error::io(
+                "simulated ambiguous commit failure",
+            )));
+        }
+        Ok(location)
+    }
+
+    async fn resolve_version_location(
+        &self,
+        base_path: &object_store::path::Path,
+        version: u64,
+        object_store: &dyn object_store::ObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        if self.fail_resolve.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::io("simulated verification outage"));
+        }
+        ConditionalPutCommitHandler
+            .resolve_version_location(base_path, version, object_store)
+            .await
+    }
+}
+
+/// T3, T4, T5: whether the remapped index directory survives depends only on
+/// whether verification proved the commit did not land.
+#[rstest]
+#[case::verified_absent(RewriteFailure::VerifiedAbsent)]
+#[case::landed_then_propagated_error(RewriteFailure::LandedThenPropagatedError)]
+#[case::landed_without_verification(RewriteFailure::LandedWithoutVerification)]
+#[case::landed_then_index_dropped(RewriteFailure::LandedThenIndexDropped)]
+#[case::unknown_then_index_dropped(RewriteFailure::UnknownThenIndexDropped)]
+#[tokio::test]
+async fn test_rewrite_commit_failure_preserves_or_reclaims_index_dirs(
+    #[case] failure: RewriteFailure,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let ambiguous = Arc::new(AmbiguousCommitHandler::default());
+    let dropping = Arc::new(LandDropThenFail::new(uri));
+    let mut dataset = match failure {
+        RewriteFailure::LandedThenIndexDropped | RewriteFailure::UnknownThenIndexDropped => {
+            reclaim_fixture(uri, dropping.clone()).await
+        }
+        _ => reclaim_fixture(uri, ambiguous.clone()).await,
+    };
+    let before = index_dir_names(&dataset).await;
+    assert_eq!(before.len(), 1);
+
+    match failure {
+        RewriteFailure::VerifiedAbsent => {
+            ambiguous.fail_next_rewrite(AmbiguousFailure::FailOutright);
+        }
+        RewriteFailure::LandedThenPropagatedError => {
+            ambiguous.fail_next_rewrite(AmbiguousFailure::LandAndError);
+            ambiguous
+                .propagate_error_after_success
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        RewriteFailure::LandedWithoutVerification => {
+            ambiguous.fail_next_rewrite(AmbiguousFailure::LandAndErrorWithoutVerification);
+        }
+        RewriteFailure::LandedThenIndexDropped => {}
+        RewriteFailure::UnknownThenIndexDropped => dropping
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst),
+    }
+
+    let error = compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect_err("the injected commit failure must surface");
+    let after = index_dir_names(&dataset).await;
+
+    match failure {
+        RewriteFailure::VerifiedAbsent => {
+            // The original commit error is preserved, not replaced by a
+            // cleanup error.
+            assert!(
+                error
+                    .to_string()
+                    .contains("simulated outright commit failure"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                after, before,
+                "a verified-absent commit must reclaim the directory it minted"
+            );
+            assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+        }
+        RewriteFailure::LandedThenPropagatedError => {
+            assert!(
+                error
+                    .to_string()
+                    .contains("simulated ambiguous commit failure"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "a commit that landed must keep the directory its manifest references"
+            );
+            assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+        }
+        RewriteFailure::LandedWithoutVerification => {
+            assert!(
+                error.is_commit_status_unknown(),
+                "unverifiable outcome must be CommitStatusUnknown, got: {error:?}"
+            );
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "an unknown commit outcome must keep every index directory"
+            );
+            assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+        }
+        RewriteFailure::LandedThenIndexDropped | RewriteFailure::UnknownThenIndexDropped => {
+            if matches!(failure, RewriteFailure::UnknownThenIndexDropped) {
+                assert!(
+                    error.is_commit_status_unknown(),
+                    "unverifiable outcome must be CommitStatusUnknown, got: {error:?}"
+                );
+            } else {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("simulated ambiguous commit failure"),
+                    "unexpected error: {error}"
+                );
+            }
+            assert!(
+                after.is_superset(&before) && after.len() == before.len() + 1,
+                "a minted directory referenced by any version must survive, even when the                  latest manifest dropped the index"
+            );
+            // The dropped index is gone from the latest version, but the
+            // version the commit published still references the directory and
+            // must remain queryable.
+            let latest = Dataset::open(uri).await.unwrap();
+            let committed_version = latest.version().version - 1;
+            let committed = latest.checkout_version(committed_version).await.unwrap();
+            let indexed = committed
+                .scan()
+                .filter("i >= 20 AND i < 40")
+                .unwrap()
+                .use_scalar_index(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let plain = committed
+                .scan()
+                .filter("i >= 20 AND i < 40")
+                .unwrap()
+                .use_scalar_index(false)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(indexed, plain);
+            assert!(indexed.num_rows() > 0);
+        }
+    }
+}
+
+/// T6: between retries the directories must survive, because the retry reuses
+/// the same UUIDs. The second attempt succeeds after a non-conflicting append
+/// preempted the first.
+#[tokio::test]
+async fn test_retry_after_concurrent_append_keeps_index_dirs() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let before = index_dir_names(&dataset).await;
+    assert_eq!(before.len(), 1);
+    let version_before = dataset.manifest.version;
+
+    handler.arm(&dataset, vec![Race::Append]);
+    compact_files(&mut dataset, reclaim_options(), None)
+        .await
+        .expect("the second attempt must commit");
+
+    assert!(dataset.manifest.version >= version_before + 2);
+    let after = index_dir_names(&dataset).await;
+    assert!(
+        after.is_superset(&before) && after.len() == before.len() + 1,
+        "the committed recipe's index directory must exist"
+    );
+    assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+}
