@@ -9,6 +9,8 @@
 //! FTS_BENCH_ROWS (default 50000) and FTS_BENCH_REPEATS (default 3) control size.
 //! FTS_BENCH_RARE_TERMS (default 8) controls unique terms per generated document.
 //! FTS_BENCH_POSITIONS=true enables positional postings (default false).
+//! FTS_BENCH_DELETE_PREFIX=true deletes whole leading fragments instead of
+//! interleaved rows, exercising removal filtering during index consolidation.
 //! FTS_BENCH_CORPUS optionally names a Lance dataset with a Utf8 `text` column;
 //! it is read only. Otherwise deterministic documents mix common and rare terms.
 //! Every iteration restores the same seed snapshot in a temporary dataset.
@@ -88,17 +90,23 @@ async fn input(rows: usize) -> Result<Vec<String>> {
         .collect())
 }
 
-fn batch(text: &[String], start_id: usize, fresh: bool) -> RecordBatch {
+fn batch(text: &[String], start_id: usize, fresh: bool, delete_prefix: bool) -> RecordBatch {
     let ids: Vec<_> = (start_id..start_id + text.len())
         .map(|id| id as i32)
         .collect();
+    let deleted_end = text.len() / 4;
     let text: Vec<_> = ids
         .iter()
         .zip(text)
         .map(|(&id, text)| {
+            let deleted = if delete_prefix {
+                (id as usize) < deleted_end
+            } else {
+                id % 4 == 0
+            };
             let marker = if fresh {
                 "freshmarker"
-            } else if id % 4 == 0 {
+            } else if deleted {
                 "deletedmarker"
             } else {
                 "keptmarker"
@@ -135,6 +143,7 @@ async fn main() -> Result<()> {
     if rows < 100 {
         return Err("need at least 100 rows".into());
     }
+    let delete_prefix = env::var("FTS_BENCH_DELETE_PREFIX").as_deref() == Ok("true");
     let repeats = setting("FTS_BENCH_REPEATS", 3)?;
     let dir = tempfile::tempdir()?;
     let params = WriteParams {
@@ -142,7 +151,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let mut dataset = Dataset::write(
-        reader(batch(&text, 0, false)),
+        reader(batch(&text, 0, false, delete_prefix)),
         dir.path().to_str().unwrap(),
         Some(params.clone()),
     )
@@ -168,11 +177,15 @@ async fn main() -> Result<()> {
         )
         .await?;
     let seed = dataset.version().version;
-    let deleted = rows.div_ceil(4);
+    let deleted = if delete_prefix {
+        rows / 4
+    } else {
+        rows.div_ceil(4)
+    };
     let added = rows / 4;
-    let replacement = batch(&text[..added], rows, true);
+    let replacement = batch(&text[..added], rows, true, delete_prefix);
     println!(
-        "positions={with_positions} rows={rows} deleted={deleted} added={added} text_bytes={} repeats={repeats}",
+        "delete_prefix={delete_prefix} positions={with_positions} rows={rows} deleted={deleted} added={added} text_bytes={} repeats={repeats}",
         text.iter().map(String::len).sum::<usize>()
     );
     for compact in [false, true] {
@@ -180,7 +193,12 @@ async fn main() -> Result<()> {
             dataset = dataset.checkout_version(seed).await?;
             dataset.restore().await?;
             let total = Instant::now();
-            dataset.delete("id % 4 = 0").await?;
+            let predicate = if delete_prefix {
+                format!("id < {deleted}")
+            } else {
+                "id % 4 = 0".to_owned()
+            };
+            dataset.delete(&predicate).await?;
             dataset
                 .append(reader(replacement.clone()), Some(params.clone()))
                 .await?;
