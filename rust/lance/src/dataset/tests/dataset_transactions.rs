@@ -2848,7 +2848,9 @@ mod composite {
     use lance_core::datatypes::Field as LanceField;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+    use lance_table::feature_flags::{
+        FLAG_COVERED_INDEX_METADATA, FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY,
+    };
     use lance_table::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
     };
@@ -3973,5 +3975,122 @@ mod composite {
             1,
             "the indexed predicate missed the new value"
         );
+    }
+
+    /// Every `ConfigUpdate` step is checked against the version the operation
+    /// read, so no single step sees the settings the set finally leaves. Each
+    /// step here is valid on its own; together they name both the retention
+    /// policy and the legacy interval it replaces.
+    #[tokio::test]
+    async fn test_a_contradictory_auto_cleanup_config_publishes_nothing() {
+        let dataset = test_dataset(false).await;
+        let version = dataset.version().version;
+        let set = |key: &str, value: &str| {
+            Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: key.into(),
+                        value: Some(value.into()),
+                    }],
+                    replace: false,
+                }),
+                ..Default::default()
+            })
+        };
+
+        let error = try_commit(
+            dataset.clone(),
+            vec![
+                set("lance.auto_cleanup.interval", "10"),
+                set("lance.auto_cleanup.policy", "keep_last"),
+                set("lance.auto_cleanup.policy_interval", "10"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("remove lance.auto_cleanup.interval"),
+            "unexpected error: {error}"
+        );
+
+        // Rejected before publication: the next commit lands on the version
+        // after the one the rejected set read, and none of its settings are
+        // visible. A version published by the rejected set would have moved it
+        // two versions on.
+        let dataset = commit(dataset, vec![set("owner", "analytics")]).await;
+        assert_eq!(dataset.version().version, version + 1);
+        assert_eq!(
+            dataset.manifest().config.get("owner").map(String::as_str),
+            Some("analytics")
+        );
+        for key in [
+            "lance.auto_cleanup.interval",
+            "lance.auto_cleanup.policy",
+            "lance.auto_cleanup.policy_interval",
+        ] {
+            assert!(
+                !dataset.manifest().config.contains_key(key),
+                "{key} outlived the rejected commit"
+            );
+        }
+    }
+
+    /// Schema metadata is edited by an action too, and the managed-blob fence
+    /// has to follow the schema the commit publishes rather than the version it
+    /// read. A set that only adds the metadata key must land both flag words,
+    /// and a value that is neither `true` nor `false` must publish nothing.
+    #[tokio::test]
+    async fn test_a_schema_metadata_opt_in_sets_the_managed_blob_flags() {
+        let dataset = test_dataset(false).await;
+        let version = dataset.version().version;
+        assert_eq!(
+            dataset.manifest().reader_feature_flags & FLAG_MANAGED_BLOBS,
+            0
+        );
+        let opt_in = |value: &str| {
+            Action::ConfigUpdate(ConfigUpdate {
+                schema_metadata: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: MANAGED_BLOBS_META_KEY.into(),
+                        value: Some(value.into()),
+                    }],
+                    replace: false,
+                }),
+                ..Default::default()
+            })
+        };
+
+        let error = try_commit(dataset.clone(), vec![opt_in("maybe")])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("must be true or false"),
+            "unexpected error: {error}"
+        );
+
+        let dataset = commit(dataset, vec![opt_in("true")]).await;
+
+        assert_eq!(dataset.version().version, version + 1);
+        assert_eq!(
+            dataset
+                .schema()
+                .metadata
+                .get(MANAGED_BLOBS_META_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        for (word, flags) in [
+            ("reader", dataset.manifest().reader_feature_flags),
+            ("writer", dataset.manifest().writer_feature_flags),
+        ] {
+            assert_ne!(
+                flags & FLAG_MANAGED_BLOBS,
+                0,
+                "the {word} flags do not fence the schema they publish"
+            );
+        }
+        assert!(dataset.manifest().has_managed_blobs());
     }
 }
