@@ -2310,6 +2310,56 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
         assert_eq!(out_offsets, compressed_offsets);
     }
 
+    // Research characterization, not a new format requirement. A matcher must
+    // handle existing dictionaries instead of assuming the paper's renumbering.
+    #[test]
+    fn research_like_writer_does_not_require_index_suffix_divergence() {
+        let input = vec![0_u8; 64 * 1024];
+        let offsets: Vec<i32> = (0..=128).map(|i| i * 512).collect();
+        let mut table = vec![0_u8; FSST_SYMBOL_TABLE_SIZE];
+        let (encoded, encoded_offsets) = compress_into(&mut table, &input, &offsets).unwrap();
+        let decoder = FsstDecompressor::try_new(&table).unwrap();
+        assert!(decoder.decoder_switch_on);
+        let collisions: Vec<_> = decoder
+            .lens
+            .iter()
+            .enumerate()
+            .filter(|(code, len)| {
+                **len != 0
+                    && decoder.symbols[*code].to_ne_bytes()[**len as usize - 1] == *code as u8
+            })
+            .map(|(code, _)| code)
+            .collect();
+        assert!(
+            !collisions.is_empty(),
+            "fixture must disprove index-suffix divergence"
+        );
+        let (decoded, decoded_offsets) =
+            decoder.decompress_into(&encoded, &encoded_offsets).unwrap();
+        assert_eq!(decoded, input);
+        assert_eq!(decoded_offsets, offsets);
+    }
+
+    #[test]
+    fn research_like_decoder_accepts_non_greedy_symbol_sequences() {
+        // Two valid symbols overlap in prefix. Both streams decode to the same
+        // UTF-8 value, even though a greedy encoder would choose the long one.
+        let mut table = vec![0_u8; FSST_SYMBOL_TABLE_SIZE];
+        let header = FSST_MAGIC | (1 << 24) | 2;
+        table[..8].copy_from_slice(&header.to_ne_bytes());
+        table[8] = b'a';
+        table[16..18].copy_from_slice(b"aa");
+        table[24..26].copy_from_slice(&[1, 2]);
+        let decoder = FsstDecompressor::try_new(&table).unwrap();
+        for encoded in [&[0_u8, 0][..], &[1_u8][..], &[255_u8, b'a', 0][..]] {
+            let (decoded, offsets) = decoder
+                .decompress_into(encoded, &[0_i32, encoded.len() as i32])
+                .unwrap();
+            assert_eq!(decoded, b"aa");
+            assert_eq!(offsets, [0, 2]);
+        }
+    }
+
     fn assert_missing_escape_payload(table: &[u8], bytes: &[u8], offsets: &[i32]) {
         let mut out = vec![0_u8; bytes.len() * 8];
         let mut out_offsets = vec![0_i32; offsets.len()];
