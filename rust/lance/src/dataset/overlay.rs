@@ -37,7 +37,9 @@
 mod admitted;
 mod selection;
 pub mod writer;
-pub use admitted::AdmittedOverlayRouting;
+pub use admitted::{
+    AdmittedOverlayRouting, AdmittedStructValidityRouting, OverlayStructValidityInput,
+};
 pub use selection::{OverlayBatchSelection, OverlayReadSelection};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

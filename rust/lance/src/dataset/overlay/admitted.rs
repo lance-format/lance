@@ -12,6 +12,9 @@ use lance_encoding::data::try_interleave_nested_binary_in;
 
 use super::*;
 
+mod validity;
+pub use validity::{AdmittedStructValidityRouting, OverlayStructValidityInput};
+
 /// Newest-first overlay routing with one admitted physical owner.
 ///
 /// The final interleave indices and sorted unique fetch offsets share one exact
@@ -54,15 +57,6 @@ impl AdmittedOverlayRouting {
         coverages: &[&RoaringBitmap],
         workspace: &mut Reservation,
     ) -> Result<Option<Self>> {
-        // The storage is also exposed as initialized bytes. Reject a platform
-        // layout with tuple padding rather than publishing uninitialized padding.
-        if size_of::<(usize, usize)>() != 2 * size_of::<usize>()
-            || !align_of::<(usize, usize)>().is_multiple_of(align_of::<u32>())
-        {
-            return Err(Error::not_supported(
-                "overlay routing requires unpadded aligned usize pairs",
-            ));
-        }
         let rows = match selection {
             OverlayBatchSelection::Range(range) => range
                 .end
@@ -78,9 +72,7 @@ impl AdmittedOverlayRouting {
                 indices.len()
             }
         };
-        let index_bytes = rows
-            .checked_mul(size_of::<(usize, usize)>())
-            .ok_or_else(|| Error::invalid_input("overlay routing index size overflows"))?;
+        let index_bytes = checked_index_bytes(rows)?;
         let mut counts = vec![0_usize; coverages.len()];
         for row in selected_rows(selection) {
             if let Some((overlay, _)) = winner(row, coverages) {
@@ -230,6 +222,20 @@ impl AdmittedOverlayRouting {
         sources.extend(fetched.iter().map(|array| array.as_ref()));
         try_interleave_nested_binary_in(&sources, self.indices(), workspace)
     }
+}
+
+// The output is also exposed as initialized bytes. Reject tuple layouts with
+// padding before publishing them; the owner supplies Arrow-aligned storage.
+fn checked_index_bytes(rows: usize) -> Result<usize> {
+    if size_of::<(usize, usize)>() != 2 * size_of::<usize>()
+        || !align_of::<(usize, usize)>().is_multiple_of(align_of::<u32>())
+    {
+        return Err(Error::not_supported(
+            "overlay routing requires unpadded aligned usize pairs",
+        ));
+    }
+    rows.checked_mul(size_of::<(usize, usize)>())
+        .ok_or_else(|| Error::invalid_input("overlay routing index size overflows"))
 }
 
 fn selected_rows(selection: &OverlayBatchSelection) -> Box<dyn Iterator<Item = u32> + '_> {
