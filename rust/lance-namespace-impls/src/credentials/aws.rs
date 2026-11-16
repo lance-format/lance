@@ -344,9 +344,15 @@ impl AwsCredentialVendor {
 
         let session_name = format!("lance-{}", sanitized);
 
-        // Cap to 64 chars (AWS limit)
+        // Cap to 64 chars (AWS limit). Back the cut index down to the
+        // nearest char boundary: subjects may carry multi-byte UTF-8 (e.g.
+        // CJK 'sub' claims) and slicing at byte 64 panics mid-character.
         if session_name.len() > 64 {
-            session_name[..64].to_string()
+            let mut end = 64;
+            while !session_name.is_char_boundary(end) {
+                end -= 1;
+            }
+            session_name[..end].to_string()
         } else {
             session_name
         }
@@ -354,8 +360,13 @@ impl AwsCredentialVendor {
 
     /// Cap a session name to 64 characters (AWS limit).
     fn cap_session_name(name: &str) -> String {
+        // Same char-boundary walk-back as `derive_session_name_from_token`.
         if name.len() > 64 {
-            name[..64].to_string()
+            let mut end = 64;
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            name[..end].to_string()
         } else {
             name.to_string()
         }
@@ -849,6 +860,33 @@ mod tests {
                 .contains("failed to read pod web identity token"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_session_name_truncates_on_char_boundaries() {
+        // A JWT whose decoded 'sub' claim is 20 CJK chars (60 bytes) makes
+        // "lance-<sub>" 66 bytes with byte 64 landing mid-character, so a
+        // truncating byte slice at 64 panics. The header/signature segments
+        // are never parsed, so any non-empty fillers work.
+        let payload =
+            URL_SAFE_NO_PAD.encode(r#"{"sub":"用戶名稱測試資料用戶名稱測試資料再加四字"}"#);
+        let jwt = format!("header.{}.signature", payload);
+
+        let session_name = AwsCredentialVendor::derive_session_name_from_token(&jwt);
+        assert!(
+            session_name.starts_with("lance-"),
+            "unexpected session name: {session_name}"
+        );
+        assert!(
+            session_name.len() <= 64,
+            "session name exceeds 64 bytes: {session_name}"
+        );
+
+        // Operator-supplied role session names go through the same kind of
+        // 64-limit truncation and must not slice mid-character either.
+        let long_cjk_name = format!("{}a", "中".repeat(23)); // 70 bytes
+        let capped = AwsCredentialVendor::cap_session_name(&long_cjk_name);
+        assert!(capped.len() <= 64, "capped name exceeds 64 bytes: {capped}");
     }
 
     // ============================================================================
