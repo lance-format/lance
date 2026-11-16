@@ -122,7 +122,7 @@ fn test_path_exists_expr() {
 
 #[test]
 fn test_select_by_path() {
-    let source = r#"{"name":"Fred","phones":[{"type":"home","number":3720453},{"type":"work","number":5062051}],"car_no":123,"测试\"\uD83D\uDC8E":"ab","numbers":[2,3,4],"key":null}"#;
+    let source = r#"{"name":"Fred","phones":[{"type":"home","number":3720453},{"type":"work","number":5062051}],"car_no":123,"测试\"\uD83D\uDC8E":"ab","numbers":[2,3,4],"key":null,"big":18446744073709551615,"two63":9223372036854775808,"neg":-1,"neg5":-5,"neg_min":-9223372036854775808}"#;
 
     let paths = vec![
         (r#"$.name"#, vec![r#""Fred""#]),
@@ -215,6 +215,14 @@ fn test_select_by_path() {
         (r#"+$.numbers"#, vec![r#"2"#, r#"3"#, r#"4"#]),
         (r#"-$.numbers"#, vec![r#"-2"#, r#"-3"#, r#"-4"#]),
         (r#"$.numbers[1] / 2"#, vec![r#"1.5"#]),
+        // u64 values above i64::MAX must stay exact through arithmetic:
+        // narrowing them through i64 casts wraps and returns wrong values.
+        (r#"$.big + $.neg"#, vec![r#"18446744073709551614"#]),
+        (r#"$.big - 1"#, vec![r#"18446744073709551614"#]),
+        (r#"$.two63 - 0"#, vec![r#"9223372036854775808"#]),
+        (r#"$.big % -2"#, vec![r#"1"#]),
+        (r#"$.neg5 % $.big"#, vec![r#"-5"#]),
+        (r#"$.neg_min % $.big"#, vec![r#"-9223372036854775808"#]),
     ];
 
     let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
@@ -225,6 +233,87 @@ fn test_select_by_path() {
         assert!(res.is_ok());
         let owned_jsonbs = res.unwrap();
         assert_eq!(owned_jsonbs.len(), expects.len());
+        for (owned_jsonb, expect) in owned_jsonbs.into_iter().zip(expects.iter()) {
+            let expected_buf = parse_value(expect.as_bytes()).unwrap().to_vec();
+            assert_eq!(owned_jsonb.as_raw(), RawJsonb::new(&expected_buf));
+        }
+    }
+}
+
+#[test]
+fn test_select_by_filter_wildcard_compare() {
+    // A wildcard comparison (`@.x[*] == 1`) is existential: any pair
+    // comparing true selects the item. An incomparable pair (e.g. null vs
+    // number) must not abort the search, otherwise the filter result would
+    // depend on the order of elements inside the array.
+    let sources = vec![
+        // Both elements match: in the second one the incomparable null
+        // precedes the matching 1.
+        (
+            r#"{"items":[{"x":[1,null]},{"x":[null,1]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![r#"{"x":[1,null]}"#, r#"{"x":[null,1]}"#],
+        ),
+        // Single-element arrays differing only in element order must agree.
+        (
+            r#"{"items":[{"x":[1,null]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![r#"{"x":[1,null]}"#],
+        ),
+        (
+            r#"{"items":[{"x":[null,1]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![r#"{"x":[null,1]}"#],
+        ),
+        // No pair compares true: SQL-style unknown still filters the item
+        // out, with or without an incomparable pair present.
+        (
+            r#"{"items":[{"x":[2,null]},{"x":[null]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![],
+        ),
+    ];
+
+    for (source, path, expects) in sources {
+        let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
+        let raw_jsonb = owned_jsonb.as_raw();
+        let json_path = parse_json_path(path.as_bytes()).unwrap();
+        let res = Selector::new(raw_jsonb).select_values(&json_path);
+        assert!(res.is_ok());
+        let owned_jsonbs = res.unwrap();
+        assert_eq!(owned_jsonbs.len(), expects.len(), "path: {path}");
+        for (owned_jsonb, expect) in owned_jsonbs.into_iter().zip(expects.iter()) {
+            let expected_buf = parse_value(expect.as_bytes()).unwrap().to_vec();
+            assert_eq!(owned_jsonb.as_raw(), RawJsonb::new(&expected_buf));
+        }
+    }
+}
+
+#[test]
+fn test_select_by_array_indices_list() {
+    // A bracket index list selects elements once per selector, concatenated
+    // in selector-list order, keeping duplicates across selectors.
+    let source = r#"[10,20,30,40,50,60]"#;
+
+    let paths = vec![
+        (r#"$[5, 0]"#, vec![r#"60"#, r#"10"#]),
+        (r#"$[0, 0 to 2]"#, vec![r#"10"#, r#"10"#, r#"20"#, r#"30"#]),
+        (
+            r#"$[1 to last-1, last]"#,
+            vec![r#"20"#, r#"30"#, r#"40"#, r#"50"#, r#"60"#],
+        ),
+        (r#"$[last]"#, vec![r#"60"#]),
+        (r#"$[6]"#, vec![]),
+    ];
+
+    let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
+    let raw_jsonb = owned_jsonb.as_raw();
+    for (path, expects) in paths {
+        let json_path = parse_json_path(path.as_bytes()).unwrap();
+        let res = Selector::new(raw_jsonb).select_values(&json_path);
+        assert!(res.is_ok());
+        let owned_jsonbs = res.unwrap();
+        assert_eq!(owned_jsonbs.len(), expects.len(), "path: {path}");
         for (owned_jsonb, expect) in owned_jsonbs.into_iter().zip(expects.iter()) {
             let expected_buf = parse_value(expect.as_bytes()).unwrap().to_vec();
             assert_eq!(owned_jsonb.as_raw(), RawJsonb::new(&expected_buf));
