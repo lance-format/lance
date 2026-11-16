@@ -124,7 +124,19 @@ impl<'a> TransactionRebase<'a> {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         };
 
-        if Footprint::from(ours).conflicts_with(&Footprint::from(theirs)) {
+        // Field ids only nest one way for good, so resolving them in both the
+        // read and the latest schema finds every relation either side named:
+        // a child added since the read, or a field dropped since.
+        let schemas = [self.read_schema.as_ref(), self.current_schema.as_ref()];
+        let footprint = |operation| {
+            schemas
+                .iter()
+                .flatten()
+                .fold(Footprint::from(operation), |footprint, schema| {
+                    footprint.with_field_ancestry(schema)
+                })
+        };
+        if footprint(ours).conflicts_with(&footprint(theirs)) {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
         Ok(())

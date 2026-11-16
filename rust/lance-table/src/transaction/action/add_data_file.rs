@@ -153,7 +153,7 @@ impl AddDataFile {
         // listed only to place a new child holds no values, so it is left out:
         // invalidating it would also prune indices on its other children.
         if self.data_change {
-            state.rebind_fields(fragment_id, exclusive_fields);
+            state.rebind_fields(fragment_id, exclusive_fields)?;
             state.note_value_change(fragment_id);
         }
         Ok(())
