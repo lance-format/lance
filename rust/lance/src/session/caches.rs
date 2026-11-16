@@ -12,6 +12,8 @@
 
 use std::{borrow::Cow, ops::Deref};
 
+use arrow_schema::Field as ArrowField;
+
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
@@ -26,6 +28,7 @@ use lance_table::{
 };
 use object_store::path::Path;
 
+use crate::dataset::scanner::FilterSchema;
 use crate::dataset::transaction::Transaction;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for dataset metadata.
@@ -94,6 +97,54 @@ impl CacheKey for ManifestKey<'_> {
             builder.write_str(e_tag);
         } else {
             builder.write_none();
+        }
+    }
+}
+
+/// The filter schema of one manifest version, for one set of search columns.
+#[derive(Debug)]
+pub struct FilterSchemaKey<'a> {
+    pub version: u64,
+    pub e_tag: Option<&'a str>,
+    pub extra_columns: &'a [ArrowField],
+}
+
+impl CacheKey for FilterSchemaKey<'_> {
+    type ValueType = FilterSchema;
+    fn key(&self) -> Cow<'_, str> {
+        let extra = self
+            .extra_columns
+            .iter()
+            .map(|f| format!("{}:{}:{}", f.name(), f.data_type(), f.is_nullable()))
+            .collect::<Vec<_>>()
+            .join(",");
+        Cow::Owned(format!(
+            "filter_schema/{}/{}/{extra}",
+            self.version,
+            self.e_tag.unwrap_or_default()
+        ))
+    }
+    fn type_name() -> &'static str {
+        "FilterSchema"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.filter-schema-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
+        builder.write_sequence_len(self.extra_columns.len() as u64);
+        for field in self.extra_columns {
+            builder.write_str(field.name());
+            builder.write_str(&field.data_type().to_string());
+            builder.write_bool(field.is_nullable());
         }
     }
 }

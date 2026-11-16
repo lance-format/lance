@@ -19,7 +19,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
-use super::filter_schemas::{FilterSchema, FilterSchemas};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{COVERING_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
@@ -126,10 +125,6 @@ pub struct Manifest {
     /// Encoded bytes of `fragments`, reused when this manifest, or one derived
     /// from it, is written. Ignored by equality.
     encoded_fragments: EncodedFragmentCache,
-
-    /// Schemas scan filters resolve against, built from `schema` on first use.
-    /// Not carried by `Clone`, ignored by equality.
-    filter_schemas: FilterSchemas,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -234,7 +229,6 @@ impl Manifest {
             clustering: Vec::new(),
             max_clustering_id: 0,
             encoded_fragments: EncodedFragmentCache::default(),
-            filter_schemas: FilterSchemas::default(),
         }
     }
 
@@ -270,7 +264,6 @@ impl Manifest {
             clustering: previous.clustering.clone(),
             max_clustering_id: previous.max_clustering_id,
             encoded_fragments: EncodedFragmentCache::default(),
-            filter_schemas: FilterSchemas::default(),
         }
     }
 
@@ -355,20 +348,7 @@ impl Manifest {
             clustering: self.clustering.clone(),
             max_clustering_id: self.max_clustering_id,
             encoded_fragments: EncodedFragmentCache::default(),
-            filter_schemas: FilterSchemas::default(),
         }
-    }
-
-    /// The schema available to scan filters with `extra_columns` appended,
-    /// building it with `build` the first time this manifest is asked for it.
-    ///
-    /// `build` must derive the schema from this manifest's `schema`.
-    pub fn filter_schema(
-        &self,
-        extra_columns: &[arrow_schema::Field],
-        build: impl FnOnce() -> Result<Schema>,
-    ) -> Result<FilterSchema> {
-        self.filter_schemas.get_or_try_insert(extra_columns, build)
     }
 
     /// Encoded `pb::DataFragment` bytes of `fragments`, by position, if the
@@ -1214,7 +1194,6 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .or(p.transaction_section_deprecated)
                 .map(|i| i as usize),
             encoded_fragments: EncodedFragmentCache::default(),
-            filter_schemas: FilterSchemas::default(),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,

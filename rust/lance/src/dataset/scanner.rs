@@ -12,6 +12,7 @@
 
 mod aggregate;
 mod builder;
+mod filter_schema;
 pub(crate) mod fts;
 mod list_structure;
 mod minhash;
@@ -20,6 +21,9 @@ mod source;
 #[cfg(test)]
 pub mod test_dataset;
 mod vector;
+
+pub(crate) use filter_schema::FilterSchema;
+use filter_schema::ScannerFilterSchemas;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
 pub use source::TakeOperation;
@@ -687,6 +691,9 @@ pub struct Scanner {
     explicit_projection: bool,
     /// Whether the user wants to use the legacy projection behavior.
     autoproject_scoring_columns: bool,
+
+    /// Filter schemas this scanner has looked up.
+    filter_schemas: ScannerFilterSchemas,
 }
 
 impl Dataset {
