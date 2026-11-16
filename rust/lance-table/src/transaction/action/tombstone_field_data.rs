@@ -70,6 +70,7 @@ impl TombstoneFieldData {
                 .collect();
             crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
             state.rebind_fields(fragment_id, field_ids.iter().copied());
+            state.note_value_change(fragment_id);
         }
         // A re-encode leaves both alone: the overlays are newer than the base
         // values it moves, and an index over the fields still describes them.

@@ -42,7 +42,7 @@ use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -214,6 +214,10 @@ pub(super) struct ApplyState<'a> {
     /// tombstoned.
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
 
+    /// Committed fragments whose values a data-changing action changed in
+    /// place, which on a stable row id table leaves their row versions stale.
+    value_changed_fragments: BTreeSet<u64>,
+
     /// Whether the table was reset, which discards every index outright rather
     /// than pruning fragments out of them.
     reset: bool,
@@ -250,6 +254,7 @@ impl<'a> ApplyState<'a> {
             reserved_row_ids: 0,
             rebound_fields: HashMap::new(),
             tombstoned_fields: HashMap::new(),
+            value_changed_fragments: BTreeSet::new(),
             reset: false,
         }
     }
@@ -268,6 +273,7 @@ impl<'a> ApplyState<'a> {
 
         self.check_spilled_lineage_is_bound()?;
         self.check_reencodes_are_rebound()?;
+        self.check_value_changes_are_restamped()?;
 
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
@@ -487,6 +493,7 @@ impl<'a> ApplyState<'a> {
         self.rebound_fields.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
+        self.value_changed_fragments.remove(&fragment_id);
         true
     }
 
@@ -500,6 +507,7 @@ impl<'a> ApplyState<'a> {
         self.new_fragments.clear();
         self.rebound_fields.clear();
         self.tombstoned_fields.clear();
+        self.value_changed_fragments.clear();
         self.reset = true;
     }
 
@@ -737,6 +745,14 @@ impl<'a> ApplyState<'a> {
             .extend(fields);
     }
 
+    /// Record that a data-changing action changed values stored in this
+    /// fragment. A fragment this operation adds is stamped whole at assembly.
+    pub(super) fn note_value_change(&mut self, fragment_id: u64) {
+        if !self.is_new_fragment(fragment_id) {
+            self.value_changed_fragments.insert(fragment_id);
+        }
+    }
+
     /// Record that a [`TombstoneFieldData`](super::TombstoneFieldData) freed
     /// `field_id` in `fragment_id`.
     pub(super) fn note_tombstone(&mut self, fragment_id: u64, field_id: i32, data_change: bool) {
@@ -799,6 +815,30 @@ impl<'a> ApplyState<'a> {
             "TombstoneFieldData with data_change false leaves {unbound} without a data file; \
              a re-encode must re-bind every field it tombstones with an AddDataFile that is \
              also data_change false, or tombstone it with data_change true"
+        )))
+    }
+
+    /// On a stable row id table, `get_updated_rows()` reads which rows changed
+    /// from `last_updated_at_version_meta`. Apply cannot infer which rows of a
+    /// committed fragment a data file or tombstone changed (a column rewrite
+    /// writes the whole fragment but may change only some rows), and no
+    /// action yet lets the writer say, so such a change is refused rather
+    /// than published with stale row versions.
+    fn check_value_changes_are_restamped(&self) -> Result<()> {
+        if !self.uses_stable_row_ids() || self.value_changed_fragments.is_empty() {
+            return Ok(());
+        }
+        let changed = self
+            .value_changed_fragments
+            .iter()
+            .map(|fragment| format!("fragment {fragment}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Error::invalid_input(format!(
+            "the table has stable row ids, and the operation changes values in place in \
+             committed {changed}, which would leave last_updated_at_version_meta stale; an \
+             action-based transaction cannot yet restamp row versions, so write such a change \
+             with a named operation"
         )))
     }
 

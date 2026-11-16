@@ -154,6 +154,7 @@ impl AddDataFile {
         // invalidating it would also prune indices on its other children.
         if self.data_change {
             state.rebind_fields(fragment_id, exclusive_fields);
+            state.note_value_change(fragment_id);
         }
         Ok(())
     }
