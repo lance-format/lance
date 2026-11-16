@@ -11,7 +11,6 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta};
 use lance_table::io::deletion::read_deletion_file;
-use lance_table::rowids::{FragmentRowIdIndex, RowIdSequence};
 
 use crate::session::caches::{DeletionFileKey, RowIdSequenceKey};
 use crate::session::index_caches::RowIdFragmentDeletionKey;
@@ -143,33 +142,6 @@ pub(super) fn deletion_identity(
         .transpose()
 }
 
-pub(super) async fn load_source(
-    dataset: &Dataset,
-    fragment: &Fragment,
-    sequence: Arc<RowIdSequence>,
-    needs_deletions: bool,
-) -> Result<FragmentRowIdIndex> {
-    // The index owns and charges these vectors, rather than retaining them in
-    // the metadata cache as well.
-    let deletion_vector = match &fragment.deletion_file {
-        Some(file) if needs_deletions => Arc::new(
-            read_deletion_file(
-                fragment.id,
-                file,
-                &dataset.dataset_dir_for_deletion(file)?,
-                dataset.object_store_for_deletion(file).await?.as_ref(),
-            )
-            .await?,
-        ),
-        _ => Arc::new(DeletionVector::default()),
-    };
-    Ok(FragmentRowIdIndex {
-        fragment_id: fragment.id as u32,
-        row_id_sequence: sequence,
-        deletion_vector,
-    })
-}
-
 pub(super) async fn load_deletions(
     dataset: &Dataset,
     fragment: &Fragment,
@@ -257,6 +229,7 @@ pub(super) mod tests {
     use lance_core::utils::address::RowAddress;
     use lance_datagen::array;
     use lance_table::format::{BasePath, DeletionFile, DeletionFileType};
+    use lance_table::rowids::RowIdSequence;
     use lance_table::rowids::version::RowDatasetVersionSequence;
     use lance_table::transaction::{Operation, Transaction};
     use roaring::RoaringBitmap;

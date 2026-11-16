@@ -1,0 +1,20 @@
+{
+  "engine": "rowid",
+  "mode": "profile",
+  "memory_limit_bytes": 4294967296,
+  "concurrency": 4,
+  "throughput_waves": 4,
+  "locality": "random",
+  "batch": 64,
+  "metadata_bytes": 1073741824,
+  "index_bytes": 134217728,
+  "expected_row_index_bytes": 0,
+  "prewarm_batches": 4,
+  "distinct_prefix_calls": 4,
+  "warm_calls": 8,
+  "nonresident_calls": 1,
+  "round": 0,
+  "name": "small-cache",
+  "query_file": "small-cache-oracle.json",
+  "path": "take"
+}

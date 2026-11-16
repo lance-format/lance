@@ -1,0 +1,20 @@
+{
+  "engine": "rowid",
+  "mode": "churn",
+  "memory_limit_bytes": 8589934592,
+  "concurrency": 4,
+  "throughput_waves": 4,
+  "locality": "random",
+  "batch": 1000,
+  "metadata_bytes": 1073741824,
+  "index_bytes": 4294967296,
+  "expected_row_index_bytes": 0,
+  "prewarm_batches": 4,
+  "distinct_prefix_calls": 4,
+  "warm_calls": 8,
+  "nonresident_calls": 1,
+  "round": 0,
+  "name": "small-updates",
+  "query_file": "small-updates-oracle.json",
+  "path": "take"
+}

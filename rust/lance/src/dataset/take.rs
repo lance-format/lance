@@ -640,6 +640,7 @@ mod test {
 
     use crate::dataset::{
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
+        optimize::{CompactionOptions, compact_files},
         scanner::test_dataset::TestVectorDataset,
     };
 
@@ -1952,8 +1953,11 @@ mod test {
     /// An update keeps the old copy of a row under a deletion vector and writes
     /// its id again in a new fragment. Ignoring deletions must still resolve
     /// the id to the live copy, which takes that fragment's deletion vector.
+    #[rstest]
+    #[case::before_compaction(false)]
+    #[case::after_compaction(true)]
     #[tokio::test]
-    async fn test_take_rows_ignore_deletions_after_update() {
+    async fn test_take_rows_ignore_deletions_after_update(#[case] compacted: bool) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             enable_stable_row_ids: true,
@@ -1963,7 +1967,7 @@ mod test {
         let dataset = Dataset::write(batches, "memory://", Some(write_params))
             .await
             .unwrap();
-        let dataset = UpdateBuilder::new(Arc::new(dataset))
+        let mut dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("i = 1")
             .unwrap()
             .set("s", "'updated'")
@@ -1973,7 +1977,14 @@ mod test {
             .execute()
             .await
             .unwrap()
-            .new_dataset;
+            .new_dataset
+            .as_ref()
+            .clone();
+        if compacted {
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+        }
 
         let checked = dataset
             .take_rows(&[1, 2], dataset.schema().clone())

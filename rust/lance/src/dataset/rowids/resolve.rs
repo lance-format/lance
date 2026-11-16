@@ -17,11 +17,11 @@ use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex, segment::U64Segment};
 use roaring::RoaringBitmap;
 
 use crate::session::index_caches::{
-    PreparedRowIdFragmentKey, RowIdFragmentAliasKey, RowIdFragmentDeletionKey, RowIdFragmentSpanKey,
+    PreparedRowIdFragmentKey, RowIdFragmentAliasKey, RowIdFragmentSpanKey,
 };
 use crate::{Dataset, Error, Result};
 
-use super::cache::{deletion_identity, load_deletions, load_source, sequence_identity};
+use super::cache::{deletion_identity, load_deletions, sequence_identity};
 use super::{get_row_id_index_with, read_row_id_sequence};
 
 /// Small encoded inline sources need no CPU-pool dispatch to prepare a lookup.
@@ -518,52 +518,26 @@ async fn prepare_fragment(
             }
         }
     };
-    if !is_range_only && deleted.is_none() && key.deletion.is_some() {
-        deleted = Some(
-            load_source(dataset, fragment, sequence.clone(), true)
-                .await?
-                .deletion_vector,
-        );
+    if !is_range_only
+        && deleted.is_none()
+        && let Some(identity) = key.deletion
+    {
+        deleted = Some(load_deletions(dataset, fragment, identity).await?);
     }
-    let mut deletion = key.deletion.filter(|_| {
+    let deletion = key.deletion.filter(|_| {
         !is_range_only
             && deleted
                 .as_ref()
                 .is_some_and(|deleted| deleted.len() as u64 >= source_rows.div_ceil(2))
     });
-    let mut pruned = match (deletion, &deleted) {
+    let pruned = match (deletion, &deleted) {
         (Some(_), Some(deleted)) => deleted.clone(),
         _ => Arc::new(DeletionVector::default()),
     };
-    let index = match build(pruned.clone()).await {
-        Ok(index) => index,
-        // A merged map cannot represent repeated raw IDs. Preserve the previous
-        // snapshot-aware construction for such sources, using the loaded sequence.
-        Err(_) if deletion.is_none() && key.deletion.is_some() => {
-            pruned = match &deleted {
-                Some(deleted) => deleted.clone(),
-                None => {
-                    load_source(dataset, fragment, sequence.clone(), true)
-                        .await?
-                        .deletion_vector
-                }
-            };
-            deletion = key.deletion;
-            build(pruned.clone()).await?
-        }
-        Err(error) => return Err(error),
-    };
-    // A folded deletion vector is no longer needed by a merged lookup. Cache
-    // visibility only when queries still need it, avoiding a second large mask
-    // alongside a small, already-pruned map under cache pressure.
-    if deletion.is_none()
-        && let (Some(identity), Some(deleted)) = (key.deletion, deleted)
-    {
-        dataset
-            .index_cache
-            .insert_with_key(&RowIdFragmentDeletionKey { deletion: identity }, deleted)
-            .await;
-    }
+    // Writers move updated rows into a new fragment; they do not append a
+    // second copy to an existing fragment's sequence. Do not hide corrupt
+    // source mappings or CPU-pool errors by retrying with snapshot deletions.
+    let index = build(pruned.clone()).await?;
     let retained = if deletion.is_some() {
         let mut retained = RoaringBitmap::new();
         if let Some(last) = source_rows.checked_sub(1) {
@@ -1442,9 +1416,11 @@ mod tests {
         let fragment = &dataset.manifest.fragments[3];
         let sequence = Arc::new(read_row_id_sequence(&dataset, fragment).await.unwrap());
         let span = sequence.row_id_range();
-        let source = load_source(&dataset, fragment, sequence, true)
-            .await
-            .unwrap();
+        let source = FragmentRowIdIndex {
+            fragment_id: fragment.id as u32,
+            row_id_sequence: sequence,
+            deletion_vector: Arc::new(DeletionVector::default()),
+        };
         let index = RowIdIndex::new(&[source]).unwrap();
         let index = Arc::new(index);
         let key = PreparedRowIdFragmentKey {
@@ -1838,34 +1814,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::segments(false)]
-    #[case::single_array(true)]
+    #[case::visible_rows(true)]
+    #[case::ignore_deletions(false)]
     #[tokio::test]
-    async fn deleted_segment_copy_is_filtered_before_duplicate_validation(
-        #[case] single_array: bool,
+    async fn duplicate_ids_in_one_array_do_not_trigger_a_deletion_retry(
+        #[case] with_deletions: bool,
     ) {
         let mut dataset = super::super::cache::tests::dataset(false).await;
-        let expected = scan_address(&dataset, 7).await;
-        dataset.delete("i < 5").await.unwrap();
-        get_row_id_index(&dataset).await.unwrap().unwrap();
-        // Avoid compaction: its fragment order need not match payload order.
-        // Keep two explicit inline segments in the original ten-row fragment.
+        dataset.delete("i = 0").await.unwrap();
+        // An update writes its replacement into another fragment. This invalid
+        // array repeats an ID inside one fragment; hiding the first copy with
+        // a deletion must not turn a source-build error into a successful retry.
         let mut fragments = dataset.manifest.fragments.as_ref().clone();
-        assert_eq!(fragments[0].physical_rows, Some(10));
-        assert_eq!(
-            expected,
-            RowAddress::new_from_parts(fragments[0].id as u32, 7)
-        );
-        assert!(fragments[0].deletion_file.is_some());
-        let mut sequence = RowIdSequence::from(0..5);
-        sequence.extend(RowIdSequence::from(0..5));
-        if single_array {
-            sequence = RowIdSequence::from(&[0, 1, 2, 3, 4, 0, 1, 2, 3, 4][..]);
-            assert!(matches!(
-                sequence.segments(),
-                [lance_table::rowids::segment::U64Segment::Array(_)]
-            ));
-        }
+        let sequence = RowIdSequence::from(&[0, 0, 2, 3, 4, 5, 6, 7, 8, 9][..]);
+        assert!(matches!(sequence.segments(), [U64Segment::Array(_)]));
         let lineage = RowLineage {
             row_ids: sequence,
             created_at: RowDatasetVersionSequence::from_uniform_row_count(10, 1),
@@ -1883,20 +1845,46 @@ mod tests {
                 preserves_nullability: true,
             },
         );
-        dataset = CommitBuilder::new(Arc::new(dataset))
+        let dataset = CommitBuilder::new(Arc::new(dataset))
             .execute(transaction)
             .await
             .unwrap();
-        let batch = dataset
-            .take_rows(
-                &[2, 2],
-                ProjectionRequest::from_columns(["i"], dataset.schema()),
-            )
+        let error = resolve_row_ids(&dataset, &[0], with_deletions)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("stable row id 0 has multiple physical positions")
+        );
+    }
+
+    #[rstest]
+    #[case::shared("i % 10 = 1")]
+    #[case::pruned("i % 10 != 0")]
+    #[tokio::test]
+    async fn preparation_reuses_cached_deletions(#[case] predicate: &str) {
+        let mut dataset = shuffled_dataset(false, true).await;
+        dataset.delete(predicate).await.unwrap();
+        let dataset = cold_dataset(dataset, 1 << 20, 0);
+        for fragment in dataset.manifest.fragments.iter() {
+            if let Some(identity) = deletion_identity(&dataset, fragment, true).unwrap() {
+                load_deletions(&dataset, fragment, identity).await.unwrap();
+            }
+        }
+        let before = dataset.object_store.io_stats_snapshot();
         assert_eq!(
-            batch["i"].as_primitive::<Int32Type>().values().as_ref(),
-            &[7, 7]
+            resolve_row_ids(&dataset, &[0], true)
+                .await
+                .unwrap()
+                .unwrap(),
+            [Some(RowAddress::new_from_parts(0, 0))]
+        );
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_bytes,
+            before.read_bytes,
+            "preparing inline mappings must reuse the already cached deletion vectors"
         );
     }
 
@@ -1960,11 +1948,19 @@ mod tests {
             .find(|f| f.deletion_file.is_some())
             .unwrap();
         let before = current.object_store.io_stats_snapshot();
-        drop(
-            load_source(&current, changed, Arc::new(RowIdSequence::default()), true)
+        let file = changed.deletion_file.as_ref().unwrap();
+        lance_table::io::deletion::read_deletion_file(
+            changed.id,
+            file,
+            &current.dataset_dir_for_deletion(file).unwrap(),
+            current
+                .object_store_for_deletion(file)
                 .await
-                .unwrap(),
-        );
+                .unwrap()
+                .as_ref(),
+        )
+        .await
+        .unwrap();
         let deletion_bytes =
             current.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
         let before = current.object_store.io_stats_snapshot();
