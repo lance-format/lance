@@ -157,6 +157,8 @@ public final class InvertedIndexParams {
     /**
      * Configure whether to store token positions in the index.
      *
+     * <p>This option is not supported with the {@code "ngram"} tokenizer when creating a new index.
+     *
      * @param withPosition whether to store term positions
      * @return this builder
      */

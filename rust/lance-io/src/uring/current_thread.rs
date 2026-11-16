@@ -7,11 +7,10 @@
 //! and directly processes completions during future polling, eliminating
 //! the need for background threads and MPSC channels.
 
-use super::requests::{IoRequest, RequestState};
+use super::requests::{IoRequest, PendingRequests, RequestState};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
-use crate::uring::DEFAULT_URING_QUEUE_DEPTH;
 use crate::utils::tracking_store::IOTracker;
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
@@ -22,11 +21,11 @@ use lance_core::{Error, Result};
 use object_store::path::Path;
 
 use std::cell::{LazyCell, RefCell};
-use std::collections::HashMap;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, ErrorKind};
 use std::ops::Range;
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,10 +37,35 @@ use super::reader::{CacheKey, CachedReaderData, HANDLE_CACHE, UringFileHandle};
 /// Global counter for generating unique user_data values
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Keep unit-test rings small enough for low-memlock CI hosts. Queue capacity does not participate
+/// in the request-lifetime behavior these tests exercise.
+#[cfg(test)]
+pub(super) const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = 2;
+
+#[cfg(not(test))]
+const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = super::DEFAULT_URING_QUEUE_DEPTH;
+
 /// Thread-local io_uring instance with pending requests
 struct ThreadLocalUring {
     ring: IoUring,
-    pending: HashMap<u64, Arc<IoRequest>>,
+    pending: PendingRequests,
+}
+
+impl Drop for ThreadLocalUring {
+    fn drop(&mut self) {
+        // The owning thread is exiting. Wait for the reads still in `pending` so that their
+        // requests can be freed; if waiting fails, dropping `pending` leaks whatever is left.
+        while !self.pending.is_empty() {
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            }
+            for cqe in self.ring.completion() {
+                self.pending.remove(&cqe.user_data());
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -49,7 +73,7 @@ thread_local! {
         let queue_depth = std::env::var("LANCE_URING_QUEUE_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_URING_QUEUE_DEPTH);
+            .unwrap_or(DEFAULT_THREAD_LOCAL_QUEUE_DEPTH);
 
         let ring = IoUring::builder()
             // Ensures work is only done in submit_and_wait
@@ -66,7 +90,7 @@ thread_local! {
 
         RefCell::new(ThreadLocalUring {
             ring,
-            pending: HashMap::new(),
+            pending: PendingRequests::default(),
         })
     });
 }
@@ -81,10 +105,10 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
 
         // Get buffer pointer, adjusting for any bytes already read (short read retry)
         let (buffer_ptr, read_offset, read_length) = {
-            let state = request.state.lock().unwrap();
+            let mut state = request.state.lock().unwrap();
             let br = state.bytes_read;
             (
-                unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                state.buffer[br..].as_mut_ptr(),
                 request.offset + br as u64,
                 (request.length - br) as u32,
             )
@@ -92,7 +116,8 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
 
         // Prepare read operation
         let read_op =
-            opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length).offset(read_offset);
+            opcode::Read::new(types::Fd(request.file.as_raw_fd()), buffer_ptr, read_length)
+                .offset(read_offset);
 
         // Get submission queue
         let mut sq = uring.ring.submission();
@@ -107,6 +132,11 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
         }
 
         // Push to SQ
+        // SAFETY: the read writes into `request`'s buffer from the file that `request` keeps open.
+        // `pending` keeps `request` alive until this read's completion is reaped, and leaks it if
+        // the ring goes away first. Nothing resizes or takes the buffer before that reap: a future
+        // takes it only on success, and after a failure it returns the error once (`get_range` and
+        // `get_all` wrap it in `map`, which panics if polled again).
         unsafe {
             sq.push(&read_op.build().user_data(user_data))
                 .map_err(|_| io::Error::other("Failed to push to SQ"))?;
@@ -190,17 +220,18 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
             let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
 
             let (buffer_ptr, read_offset, read_length) = {
-                let state = request.state.lock().unwrap();
+                let mut state = request.state.lock().unwrap();
                 let br = state.bytes_read;
                 (
-                    unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                    state.buffer[br..].as_mut_ptr(),
                     request.offset + br as u64,
                     (request.length - br) as u32,
                 )
             };
 
-            let read_op = opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length)
-                .offset(read_offset);
+            let read_op =
+                opcode::Read::new(types::Fd(request.file.as_raw_fd()), buffer_ptr, read_length)
+                    .offset(read_offset);
 
             let mut sq = uring.ring.submission();
             if sq.is_full() {
@@ -212,6 +243,9 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                 continue;
             }
 
+            // SAFETY: as in `push_request`: `request` keeps its file open, `pending` keeps
+            // `request` alive until this read's completion is reaped (leaking it if the ring
+            // goes away first), and nothing takes the buffer before then.
             unsafe {
                 if sq.push(&read_op.build().user_data(user_data)).is_err() {
                     request.fail(io::Error::other("Failed to push short-read retry to SQ"));
@@ -335,12 +369,15 @@ impl UringCurrentThreadReader {
         length: usize,
     ) -> Pin<Box<dyn Future<Output = object_store::Result<Bytes>> + Send>> {
         let mut buffer = BytesMut::with_capacity(length);
+        // SAFETY: the capacity covers `length`. `set_len` also asks for initialized bytes, and
+        // these stay uninitialized until the kernel writes them, but nothing reads them before
+        // that: callers only ever get the first `bytes_read`, all written by the kernel.
         unsafe {
             buffer.set_len(length);
         }
 
         let request = Arc::new(IoRequest {
-            fd: self.handle.fd,
+            file: Arc::clone(&self.handle.file),
             offset,
             length,
             thread_id: std::thread::current().id(),

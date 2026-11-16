@@ -23,7 +23,9 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::frag_reuse;
 use crate::index::loading::DatasetIndexInternalExt;
-use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
+use crate::index::scalar::{
+    IndexDetails, TrainingScanOptions, fetch_index_details, load_training_data,
+};
 use crate::index::vector::details::vector_index_details_default;
 use crate::index::vector::remap_vector_index;
 use crate::{Dataset, Error, Result};
@@ -86,8 +88,8 @@ pub(crate) async fn remap_index(
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
     let matched = &matched;
 
-    // Corrupt metadata fails closed before anything else: a declaration that is
-    // not a valid suffix of `fields` cannot be reasoned about at all, and the
+    // Corrupt metadata fails closed before anything else: a declaration that
+    // breaks the covering rules cannot be reasoned about at all, and the
     // withdrawal below would otherwise swallow it as an ordinary covered index.
     matched.validate_covering_fields()?;
 
@@ -102,8 +104,8 @@ pub(crate) async fn remap_index(
     if !matched.covering_fields.is_empty() {
         log::warn!(
             "Index '{}' declares covering fields {:?}, which no index builder \
-             writes or preserves yet. Index will be dropped during compaction \
-             and must be rebuilt.",
+             writes or preserves yet, so it is not remapped. Rebuild it to \
+             cover the rewritten fragments.",
             matched.name,
             matched.covering_fields,
         );
@@ -147,8 +149,7 @@ pub(crate) async fn remap_index(
         Ok(g) => g,
         Err(e) => {
             log::warn!(
-                "Cannot open index '{}' on '{}': {}. \
-                 Index will be dropped during compaction.",
+                "Cannot open index '{}' on '{}': {}, so it is not remapped. Rebuild the index.",
                 index_id,
                 field_path,
                 e
@@ -199,7 +200,7 @@ pub(crate) async fn remap_index(
                             None,
                             true, // Legacy reindexing should always train
                             None,
-                            None,
+                            TrainingScanOptions::default(),
                         )
                         .await?;
                         InvertedIndexPlugin::train_inverted_index(

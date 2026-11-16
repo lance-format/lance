@@ -404,9 +404,11 @@ impl CacheBackend for CacheWithoutResidentProbe {
     async fn clear(&self) {
         self.0.clear().await;
     }
+
     async fn num_entries(&self) -> usize {
         self.0.num_entries().await
     }
+
     async fn size_bytes(&self) -> usize {
         self.0.size_bytes().await
     }
@@ -504,6 +506,11 @@ async fn test_posting_cache_conflict_across_partitions() {
 
     // Prewarm the inverted index (this loads posting lists into cache)
     index.prewarm().await.unwrap();
+    let diagnostics = cache.diagnostics();
+    let warm = &diagnostics.activity.warm;
+    assert!(warm.attempts > 0);
+    assert!(warm.loads_succeeded > 0);
+    assert!(warm.load_bytes > 0);
 
     let tokens = Arc::new(Tokens::new(vec!["test".to_string()], DocType::Text));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
@@ -1095,9 +1102,71 @@ async fn test_prewarm_streams_in_chunks_with_positions(
             "token {token_id} posting list / positions mismatch after chunked prewarm"
         );
     }
+    let before_readiness = cache.diagnostics().activity;
+    assert_eq!(
+        inverted_list.prewarm_readiness_status(true).await,
+        (true, Some(true)),
+        "active post-prewarm verification must not treat an unavailable probe as absence"
+    );
+    let after_readiness = cache.diagnostics().activity;
+    assert_eq!(
+        (
+            after_readiness.hits - after_readiness.warm.hits,
+            after_readiness.misses,
+            after_readiness.loads_started
+        ),
+        (
+            before_readiness.hits - before_readiness.warm.hits,
+            before_readiness.misses,
+            before_readiness.loads_started
+        ),
+        "active verification is prewarm work and must not count demand activity"
+    );
+    assert!(
+        after_readiness.warm.attempts > before_readiness.warm.attempts
+            && after_readiness.warm.hits > before_readiness.warm.hits,
+        "active verification must read through a temporary warm handle"
+    );
     assert_eq!(
         inverted_list.prewarm_residency_status(true).await,
+        (false, Some(false)),
+        "a backend without a resident probe cannot prove diagnostic residency"
+    );
+
+    let probe_cache = Arc::new(LanceCache::with_backend(Arc::new(
+        QuickCacheBackend::with_capacity(1 << 20),
+    )));
+    let probe_index = InvertedIndex::load(store, None, probe_cache.as_ref())
+        .await
+        .unwrap();
+    let probe_inverted_list = &probe_index.partitions[0].inverted_list;
+    probe_inverted_list
+        .prewarm_posting_lists_chunked(true, Some(CHUNK_TOKENS), 2)
+        .await
+        .unwrap();
+    let before = probe_cache.diagnostics().activity;
+    assert_eq!(
+        probe_inverted_list.prewarm_residency_status(true).await,
         (true, Some(true))
+    );
+    let after = probe_cache.diagnostics().activity;
+    assert_eq!(
+        (after.hits, after.misses),
+        (before.hits, before.misses),
+        "residency diagnostics must not record lookups"
+    );
+    assert_eq!(
+        (
+            after.loads_started,
+            after.warm.attempts,
+            after.warm.loads_succeeded
+        ),
+        (
+            before.loads_started,
+            before.warm.attempts,
+            before.warm.loads_succeeded
+        ),
+        "residency diagnostics must not record load or warm activity"
     );
 }
 

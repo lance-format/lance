@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_execution::SendableRecordBatchStream;
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -266,10 +266,94 @@ impl DeepSizeOf for ZoneMapIndex {
     }
 }
 
+fn zone_scalar_column(
+    data_type: &DataType,
+    values: impl IntoIterator<Item = ScalarValue>,
+) -> lance_core::Result<ArrayRef> {
+    let values: Vec<ScalarValue> = values.into_iter().collect();
+    if values.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+    ScalarValue::iter_to_array(values).map_err(|err| {
+        lance_core::Error::invalid_input(format!("failed to build zone statistic column: {err}"))
+    })
+}
+
+/// The record batch behind [`ZoneMapIndex::zones_as_batch`], built from the
+/// parsed zones alone so a caller can have it without loading the index.
+fn zone_statistics_batch(
+    zones: &[ZoneMapStatistics],
+    data_type: &DataType,
+    rows_per_zone: u64,
+) -> lance_core::Result<RecordBatch> {
+    let min_array = zone_scalar_column(data_type, zones.iter().map(|zone| zone.min.clone()))?;
+    let max_array = zone_scalar_column(data_type, zones.iter().map(|zone| zone.max.clone()))?;
+    let null_count = UInt32Array::from_iter_values(zones.iter().map(|zone| zone.null_count));
+    let nan_count = UInt32Array::from_iter_values(zones.iter().map(|zone| zone.nan_count));
+    let negative_nan_count =
+        UInt32Array::from_iter(zones.iter().map(|zone| zone.negative_nan_count));
+    let fragment_id =
+        UInt64Array::from_iter_values(zones.iter().map(|zone| zone.bound.fragment_id));
+    let zone_start = UInt64Array::from_iter_values(zones.iter().map(|zone| zone.bound.start));
+    let zone_length =
+        UInt64Array::from_iter_values(zones.iter().map(|zone| zone.bound.length as u64));
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("rows_per_zone".to_string(), rows_per_zone.to_string());
+    let schema = Arc::new(
+        Schema::new(vec![
+            Field::new("min", min_array.data_type().clone(), true),
+            Field::new("max", max_array.data_type().clone(), true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, true),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ])
+        .with_metadata(metadata),
+    );
+    RecordBatch::try_new(
+        schema,
+        vec![
+            min_array,
+            max_array,
+            Arc::new(null_count),
+            Arc::new(nan_count),
+            Arc::new(negative_nan_count),
+            Arc::new(fragment_id),
+            Arc::new(zone_start),
+            Arc::new(zone_length),
+        ],
+    )
+    .map_err(|err| {
+        lance_core::Error::invalid_input(format!("failed to build zone statistics batch: {err}"))
+    })
+}
+
 impl ZoneMapIndex {
     /// Returns the rows-per-zone parameter for this index.
     pub fn rows_per_zone(&self) -> u64 {
         self.rows_per_zone
+    }
+
+    /// Returns this segment's persisted ZoneMap entries as a stable record batch.
+    ///
+    /// This is a raw view of the persisted index, not a snapshot of the current
+    /// dataset rows. `fragment_id` and `zone_start` are in the index's original
+    /// address domain: fragment-reuse remapping is not applied, and appended
+    /// fragments or data overlays are not represented. `zone_length` is the
+    /// offset span recorded for the zone, not its physical row count after
+    /// deletions. The counts are the statistics recorded when the zone was
+    /// built.
+    ///
+    /// The columns are `min`, `max`, `null_count`, `nan_count`,
+    /// `negative_nan_count`, `fragment_id`, `zone_start`, and `zone_length`.
+    /// `negative_nan_count` is null when a legacy zone contains NaNs but did
+    /// not persist their sign split; callers must not interpret that null as
+    /// zero. Schema metadata carries this segment's `rows_per_zone`.
+    pub fn zones_as_batch(&self) -> lance_core::Result<RecordBatch> {
+        zone_statistics_batch(&self.zones, &self.data_type, self.rows_per_zone)
     }
 
     /// The file version this segment was loaded from.
@@ -765,6 +849,40 @@ impl ZoneMapIndex {
         Ok(Arc::new(index))
     }
 
+    /// Read a segment's zones without loading it as an index: the null bitmap
+    /// is not read and nothing is cached. The file is decoded and validated
+    /// under `version` exactly as loading the index does, and the batch has
+    /// the [`Self::zones_as_batch`] schema.
+    ///
+    /// `version` is the segment's own
+    /// [`IndexMetadata::index_version`](lance_table::format::IndexMetadata::index_version):
+    /// a file is only decoded under the version it was written with, and one
+    /// written at a version this build does not know is a `NotSupported`
+    /// error.
+    ///
+    /// ```
+    /// # use lance_index::scalar::IndexStore;
+    /// # use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
+    /// # use lance_core::Result;
+    /// # async fn zone_count(store: &dyn IndexStore, index_version: i32) -> Result<usize> {
+    /// let version = ZoneMapIndexVersion::from_metadata(index_version as u32)?;
+    /// let zones = ZoneMapIndex::load_zone_statistics(store, version).await?;
+    /// Ok(zones.num_rows())
+    /// # }
+    /// ```
+    pub async fn load_zone_statistics(
+        store: &dyn IndexStore,
+        version: ZoneMapIndexVersion,
+    ) -> Result<RecordBatch> {
+        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
+        let zone_maps = index_file
+            .read_range(0..index_file.num_rows(), None)
+            .await?;
+        let rows_per_zone = rows_per_zone_from_schema(index_file.schema());
+        let (data_type, zones) = parse_zones(&zone_maps, version)?;
+        zone_statistics_batch(&zones, &data_type, rows_per_zone)
+    }
+
     /// Load the scalar index from storage, decoding the file under the
     /// contract of `version` (the segment's `IndexMetadata.index_version`).
     async fn load(
@@ -782,12 +900,7 @@ impl ZoneMapIndex {
             .read_range(0..index_file.num_rows(), None)
             .await?;
         let file_schema = index_file.schema();
-
-        let rows_per_zone: u64 = file_schema
-            .metadata
-            .get(ZONEMAP_SIZE_META_KEY)
-            .and_then(|bs| bs.parse().ok())
-            .unwrap_or(ROWS_PER_ZONE_DEFAULT);
+        let rows_per_zone = rows_per_zone_from_schema(file_schema);
 
         let null_rows = if let Some(idx_str) = file_schema.metadata.get(NULL_BITMAP_META_KEY) {
             let idx = idx_str.parse::<u32>().map_err(|e| {
@@ -828,152 +941,7 @@ impl ZoneMapIndex {
         store_null_bitmap: bool,
         version: ZoneMapIndexVersion,
     ) -> Result<Self> {
-        // The RecordBatch should have columns: min, max, null_count
-        let min_col = data
-            .column_by_name("min")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
-        let max_col = data
-            .column_by_name("max")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'max' column"))?;
-        let null_count_col = data
-            .column_by_name("null_count")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'null_count' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'null_count' column is not UInt32")
-            })?;
-        let nan_count_col = data
-            .column_by_name("nan_count")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'nan_count' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'nan_count' column is not UInt32")
-            })?;
-        let zone_length = data
-            .column_by_name("zone_length")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_length' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64")
-            })?;
-
-        let fragment_id_col = data
-            .column_by_name("fragment_id")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64")
-            })?;
-
-        let zone_start_col = data
-            .column_by_name("zone_start")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
-            })?;
-
-        // Only version 1 stores the NaN sign split.
-        let negative_nan_count_col = match version {
-            ZoneMapIndexVersion::V1 => Some(
-                data.column_by_name("negative_nan_count")
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            "ZoneMapIndex: version 1 file has no 'negative_nan_count' column",
-                        )
-                    })?
-                    .as_any()
-                    .downcast_ref::<arrow_array::UInt32Array>()
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            "ZoneMapIndex: 'negative_nan_count' column is not UInt32",
-                        )
-                    })?,
-            ),
-            ZoneMapIndexVersion::V0 => None,
-        };
-
-        let data_type = min_col.data_type().clone();
-
-        if data.num_rows() == 0 {
-            return Ok(Self {
-                zones: Vec::new(),
-                data_type,
-                rows_per_zone,
-                use_seeds,
-                version,
-                store_null_bitmap,
-                store,
-                fri,
-                batch_remapper: None,
-                index_cache: WeakLanceCache::from(index_cache),
-                null_rows,
-            });
-        }
-
-        let num_zones = data.num_rows();
-        let mut zones = Vec::with_capacity(num_zones);
-
-        for i in 0..num_zones {
-            let (min, max) = if data_type.is_nested() {
-                (
-                    ScalarValue::try_new_null(&data_type)?,
-                    ScalarValue::try_new_null(&data_type)?,
-                )
-            } else {
-                (
-                    ScalarValue::try_from_array(min_col, i)?,
-                    ScalarValue::try_from_array(max_col, i)?,
-                )
-            };
-            let null_count = null_count_col.value(i);
-            let nan_count = nan_count_col.value(i);
-            let length = zone_length.value(i);
-            let negative_nan_count = match negative_nan_count_col {
-                Some(col) => {
-                    let negative = col.value(i);
-                    if let Some(violation) = v1_zone_violation(
-                        &min,
-                        &max,
-                        null_count,
-                        nan_count,
-                        negative,
-                        length,
-                        data_type.is_nested(),
-                    ) {
-                        return Err(Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            format!("ZoneMapIndex: version 1 zone {i} has {violation}"),
-                        ));
-                    }
-                    Some(negative)
-                }
-                // Version 0 stores no split: unknown, unless the zone has no
-                // NaNs at all.
-                None if nan_count == 0 => Some(0),
-                None => None,
-            };
-            zones.push(ZoneMapStatistics {
-                min,
-                max,
-                null_count,
-                nan_count,
-                negative_nan_count,
-                bound: ZoneBound {
-                    fragment_id: fragment_id_col.value(i),
-                    start: zone_start_col.value(i),
-                    length: length as usize,
-                },
-            });
-        }
-
+        let (data_type, zones) = parse_zones(&data, version)?;
         Ok(Self {
             zones,
             data_type,
@@ -988,6 +956,146 @@ impl ZoneMapIndex {
             null_rows,
         })
     }
+}
+
+/// The `rows_per_zone` a ZoneMap file was written with, from its schema
+/// metadata; files that predate the key used the default.
+fn rows_per_zone_from_schema(schema: &lance_core::datatypes::Schema) -> u64 {
+    schema
+        .metadata
+        .get(ZONEMAP_SIZE_META_KEY)
+        .and_then(|bs| bs.parse().ok())
+        .unwrap_or(ROWS_PER_ZONE_DEFAULT)
+}
+
+/// Decode the zones of a ZoneMap file under the contract of `version`,
+/// checking the version 1 invariants and restoring the typed-null bounds of
+/// nested types. Returns the value type with the zones.
+fn parse_zones(
+    data: &RecordBatch,
+    version: ZoneMapIndexVersion,
+) -> Result<(DataType, Vec<ZoneMapStatistics>)> {
+    // The RecordBatch should have columns: min, max, null_count
+    let min_col = data
+        .column_by_name("min")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
+    let max_col = data
+        .column_by_name("max")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'max' column"))?;
+    let null_count_col = data
+        .column_by_name("null_count")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'null_count' column"))?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: 'null_count' column is not UInt32"))?;
+    let nan_count_col = data
+        .column_by_name("nan_count")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'nan_count' column"))?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: 'nan_count' column is not UInt32"))?;
+    let zone_length = data
+        .column_by_name("zone_length")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_length' column"))?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64"))?;
+
+    let fragment_id_col = data
+        .column_by_name("fragment_id")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64"))?;
+
+    let zone_start_col = data
+        .column_by_name("zone_start")
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64"))?;
+
+    // Only version 1 stores the NaN sign split.
+    let negative_nan_count_col = match version {
+        ZoneMapIndexVersion::V1 => Some(
+            data.column_by_name("negative_nan_count")
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        ZONEMAP_FILENAME,
+                        "ZoneMapIndex: version 1 file has no 'negative_nan_count' column",
+                    )
+                })?
+                .as_any()
+                .downcast_ref::<arrow_array::UInt32Array>()
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        ZONEMAP_FILENAME,
+                        "ZoneMapIndex: 'negative_nan_count' column is not UInt32",
+                    )
+                })?,
+        ),
+        ZoneMapIndexVersion::V0 => None,
+    };
+
+    let data_type = min_col.data_type().clone();
+
+    let num_zones = data.num_rows();
+    let mut zones = Vec::with_capacity(num_zones);
+
+    for i in 0..num_zones {
+        let (min, max) = if data_type.is_nested() {
+            (
+                ScalarValue::try_new_null(&data_type)?,
+                ScalarValue::try_new_null(&data_type)?,
+            )
+        } else {
+            (
+                ScalarValue::try_from_array(min_col, i)?,
+                ScalarValue::try_from_array(max_col, i)?,
+            )
+        };
+        let null_count = null_count_col.value(i);
+        let nan_count = nan_count_col.value(i);
+        let length = zone_length.value(i);
+        let negative_nan_count = match negative_nan_count_col {
+            Some(col) => {
+                let negative = col.value(i);
+                if let Some(violation) = v1_zone_violation(
+                    &min,
+                    &max,
+                    null_count,
+                    nan_count,
+                    negative,
+                    length,
+                    data_type.is_nested(),
+                ) {
+                    return Err(Error::corrupt_file_named(
+                        ZONEMAP_FILENAME,
+                        format!("ZoneMapIndex: version 1 zone {i} has {violation}"),
+                    ));
+                }
+                Some(negative)
+            }
+            // Version 0 stores no split: unknown, unless the zone has no
+            // NaNs at all.
+            None if nan_count == 0 => Some(0),
+            None => None,
+        };
+        zones.push(ZoneMapStatistics {
+            min,
+            max,
+            null_count,
+            nan_count,
+            negative_nan_count,
+            bound: ZoneBound {
+                fragment_id: fragment_id_col.value(i),
+                start: zone_start_col.value(i),
+                length: length as usize,
+            },
+        });
+    }
+
+    Ok((data_type, zones))
 }
 
 #[async_trait]

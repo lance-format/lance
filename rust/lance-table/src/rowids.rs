@@ -2678,4 +2678,17 @@ mod test {
             runs_sequence
         );
     }
+
+    #[test]
+    fn encoded_u64_array_roundtrips_full_width_values() {
+        use crate::rowids::encoded_array::EncodedU64Array;
+
+        let values = vec![0, u32::MAX as u64, u32::MAX as u64 + 1];
+        let array = EncodedU64Array::from(values.clone());
+        assert!(matches!(array, EncodedU64Array::U64(_)));
+
+        let sequence = RowIdSequence(vec![U64Segment::SortedArray(array)]);
+        let decoded = read_row_ids(write_row_ids(&sequence).as_slice()).unwrap();
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), values);
+    }
 }

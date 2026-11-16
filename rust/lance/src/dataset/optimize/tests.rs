@@ -9,10 +9,12 @@ mod commit;
 mod concurrent_reindex;
 mod execution;
 mod frag_reuse;
+mod frag_reuse_contract;
 mod index_remap;
 mod lineage;
 mod overlays;
 mod planning;
+mod undeferrable_withdrawal;
 mod vector;
 use self::remapping::RemappedIndex;
 use super::*;
@@ -33,7 +35,8 @@ use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
 use crate::index::vector::{StageParams, VectorIndexParams};
-use crate::session::caches::{ManifestKey, RowIdIndexKey, TransactionKey};
+use crate::session::caches::{ManifestKey, TransactionKey};
+use crate::session::index_caches::RowIdIndexKey;
 use crate::utils::test::{
     AmbiguousCommitHandler, AmbiguousFailure, DatagenExt, FragmentCount, FragmentRowCount,
 };
@@ -1143,13 +1146,11 @@ enum RaceOutcome {
 enum FirstCommitSeenAs {
     /// The shared session caches the manifest under the key the rebase lists.
     InMemory,
-    /// The shared session caches the manifest only under the e_tag-less key
-    /// a `RenameCommitHandler` commit leaves.
-    InlineTransaction,
+    /// The rebase opens its own session and decodes the manifest from storage.
     SeparateSession,
 }
 
-async fn uncached_listed_manifest(rebasing: &Dataset, version: u64) -> ManifestLocation {
+async fn listed_manifest(rebasing: &Dataset, version: u64) -> ManifestLocation {
     let listed = rebasing
         .commit_handler
         .list_manifest_locations_since(
@@ -1167,7 +1168,6 @@ async fn uncached_listed_manifest(rebasing: &Dataset, version: u64) -> ManifestL
         e_tag: listed.e_tag.as_deref(),
     };
     assert!(key.e_tag.is_some());
-    assert!(rebasing.metadata_cache.get_with_key(&key).await.is_none());
     listed
 }
 

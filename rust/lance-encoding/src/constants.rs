@@ -9,6 +9,8 @@
 // Compression-related metadata keys
 /// Metadata key for specifying compression scheme (e.g., "lz4", "zstd", "none")
 pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
+/// The [`COMPRESSION_META_KEY`] value that selects pcodec for float values (Lance 2.3+)
+pub const PCODEC_COMPRESSION: &str = "pcodec";
 /// Metadata key for specifying compression level (applies to schemes that support levels)
 pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
 /// Metadata key for specifying RLE (Run-Length Encoding) threshold

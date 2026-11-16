@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions};
+use lance::dataset::optimize::{CompactionMode, CompactionOptions, SourceBudgetMode};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -205,6 +205,7 @@ pub fn build_compaction_options(
     target_rows_per_fragment: &JObject,        // Optional<Long>
     max_rows_per_group: &JObject,              // Optional<Long>
     max_bytes_per_file: &JObject,              // Optional<Long>
+    min_bytes_per_file: &JObject,              // Optional<Long>
     materialize_deletions: &JObject,           // Optional<Boolean>
     materialize_deletions_threshold: &JObject, // Optional<Float>
     num_threads: &JObject,                     // Optional<Long>
@@ -217,6 +218,7 @@ pub fn build_compaction_options(
     max_source_bytes: &JObject,                // Optional<Long>
     excluded_fragment_ids: &JObject,           // List<Long>
     data_storage_version: &JObject,            // Optional<String>
+    source_budget_mode: Option<&JObject>,      // Optional<String>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -229,6 +231,13 @@ pub fn build_compaction_options(
     }
     if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
         compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    }
+    if let Some(bytes) = env.get_long_opt(min_bytes_per_file)? {
+        compaction_options.min_bytes_per_file = Some(usize::try_from(bytes).map_err(|_| {
+            lance::Error::invalid_input(format!(
+                "min_bytes_per_file must be a positive integer, got {bytes}"
+            ))
+        })?);
     }
     if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
         compaction_options.materialize_deletions = materialize_deletions_val;
@@ -281,6 +290,12 @@ pub fn build_compaction_options(
         .collect::<Result<Vec<_>>>()?;
     if let Some(version) = env.get_string_opt(data_storage_version)? {
         compaction_options.data_storage_version = Some(LanceFileVersion::from_str(&version)?);
+    }
+    if let Some(source_budget_mode) = source_budget_mode
+        && let Some(source_budget_mode) = env.get_string_opt(source_budget_mode)?
+    {
+        compaction_options.source_budget_mode =
+            SourceBudgetMode::try_from(source_budget_mode.as_str())?;
     }
 
     Ok(compaction_options)
@@ -728,6 +743,8 @@ pub fn to_java_string_obj<'local>(
 ///
 /// Maps numeric types to their boxed Java equivalents (Long, Double)
 /// and string types to Java String. Null ScalarValues produce JObject::null().
+/// A type without a conversion, or a UInt64 above `i64::MAX`, is an error:
+/// null is reserved for a genuinely null value.
 ///
 /// This is useful for exposing index statistics (e.g., zonemap min/max)
 /// to Java clients in a type-safe, Comparable-compatible way.
@@ -750,8 +767,13 @@ pub fn scalar_value_to_java<'a>(
         ScalarValue::UInt8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
         ScalarValue::UInt16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
         ScalarValue::UInt32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
-        // UInt64 may overflow i64, but for min/max stats this is acceptable
-        ScalarValue::UInt64(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt64(v) => {
+            let v = v
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| Error::runtime_error("UInt64 value exceeds Java long".to_string()))?;
+            to_java_long_obj(env, v)
+        }
 
         // Float types → Java Double
         ScalarValue::Float16(v) => to_java_double_obj(env, v.map(|x| f64::from(x.to_f32()))),
@@ -772,13 +794,11 @@ pub fn scalar_value_to_java<'a>(
         ScalarValue::TimestampMicrosecond(v, _) => to_java_long_obj(env, *v),
         ScalarValue::TimestampNanosecond(v, _) => to_java_long_obj(env, *v),
 
-        // For any unsupported type, return null (conservative: caller will skip)
-        _ => {
-            log::warn!(
-                "Unsupported ScalarValue type for Java conversion: {:?}",
-                value.data_type()
-            );
-            Ok(JObject::null())
-        }
+        // Null would be indistinguishable from an all-null zone; the caller
+        // must not hand this function a type it cannot represent.
+        other => Err(Error::runtime_error(format!(
+            "Unsupported ScalarValue type for Java conversion: {:?}",
+            other.data_type()
+        ))),
     }
 }

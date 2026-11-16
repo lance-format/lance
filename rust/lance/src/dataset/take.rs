@@ -166,18 +166,7 @@ async fn do_take_rows(
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
-        let empty_batch = RecordBatch::new_empty(Arc::new(builder.projection.output_schema()?));
-        // If row addresses were requested, add an empty row address column.
-        // This ensures callers that expect the _rowaddr column don't panic.
-        if builder.with_row_address {
-            let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
-            let row_addr_field =
-                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            return to_logical_json_batch(
-                empty_batch.try_with_column(row_addr_field, row_addr_col)?,
-            );
-        }
-        return to_logical_json_batch(empty_batch);
+        return builder.empty_batch();
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
@@ -385,9 +374,7 @@ async fn do_take_rows(
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
-        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
-            builder.projection.output_schema()?,
-        )));
+        return builder.empty_batch();
     }
 
     let projection = builder.projection.clone();
@@ -422,7 +409,7 @@ pub fn take_scan(
                     .await
                     .map_err(|err| DataFusionError::External(Box::new(err)))
             };
-            async move { tokio::task::spawn(fut).await.unwrap() }
+            async move { lance_core::utils::tokio::spawn(fut).await.unwrap() }
         })
         .buffered(batch_readahead);
 
@@ -450,7 +437,7 @@ fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
 
     for addr in row_addrs.iter().skip(1) {
         sorted &= *addr >= last_offset;
-        contiguous &= *addr == last_offset + 1;
+        contiguous &= last_offset.checked_add(1) == Some(*addr);
         // Contiguous also requires the fragment ids are all the same
         contiguous &= (*addr >> 32) == first_fragment_id;
         last_offset = *addr;
@@ -552,6 +539,17 @@ impl TakeBuilder {
         }
     }
 
+    fn empty_batch(&self) -> Result<RecordBatch> {
+        let mut batch = RecordBatch::new_empty(Arc::new(self.projection.output_schema()?));
+        if self.with_row_address && batch.column_by_name(ROW_ADDR).is_none() {
+            batch = batch.try_with_column(
+                ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false),
+                Arc::new(UInt64Array::from(Vec::<u64>::new())),
+            )?;
+        }
+        to_logical_json_batch(batch)
+    }
+
     async fn get_row_addrs(&mut self) -> Result<&Vec<u64>> {
         if self.row_addrs.is_none() {
             let row_ids = self
@@ -648,6 +646,89 @@ mod test {
 
     use super::*;
 
+    #[rstest]
+    #[case::single(&[6])]
+    #[case::repeated(&[6, 6])]
+    #[case::sorted(&[0, 6])]
+    #[case::unsorted(&[6, 0])]
+    #[tokio::test]
+    async fn test_take_out_of_bound(
+        #[case] indices: &[u64],
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let data = test_batch(0..6);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let error = dataset
+            .take(indices, dataset.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("fragment"), "{error}");
+        assert!(error.to_string().contains("4294967295"), "{error}");
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::missing(vec![100])]
+    #[tokio::test]
+    async fn test_take_empty_row_address_schema(
+        #[case] ids: Vec<u64>,
+        #[values(false, true)] explicit_address: bool,
+        #[values(false, true)] with_row_address: bool,
+    ) {
+        let data = test_batch(0..4);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let columns = if explicit_address {
+            vec!["i", ROW_ADDR]
+        } else {
+            vec!["i"]
+        };
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+        let expected = dataset
+            .take_builder(&[0], projection.clone())
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap();
+        let actual = dataset
+            .take_builder(&ids, projection)
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(actual.num_rows(), 0);
+        assert_eq!(actual.schema(), expected.schema());
+    }
+
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
         t
@@ -668,6 +749,58 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    #[rstest]
+    #[case::top_level(&["i", "nope"], Some("nope"))]
+    #[case::nested(&["st.a", "st.nope"], Some("st.nope"))]
+    #[case::under_a_leaf(&["i.a"], Some("i.a"))]
+    #[case::nested_and_system(&["st.a", "_rowid"], None)]
+    #[tokio::test]
+    async fn test_take_projection_from_column_names(
+        #[case] columns: &[&str],
+        #[case] missing: Option<&str>,
+    ) {
+        let child = Arc::new(ArrowField::new("a", DataType::Int32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("st", DataType::Struct(vec![child.clone()].into()), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                Arc::new(StructArray::new(
+                    vec![child].into(),
+                    vec![Arc::new(Int32Array::from(vec![10, 11]))],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let projection = ProjectionRequest::try_from_columns(columns, dataset.schema());
+        match missing {
+            Some(missing) => {
+                let err = projection.unwrap_err();
+                assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+                assert!(err.to_string().contains(missing), "{err}");
+            }
+            None => {
+                let values = dataset.take(&[1], projection.unwrap()).await.unwrap();
+                let st = values["st"].as_struct();
+                assert_eq!(st.column_names(), vec!["a"]);
+                assert_eq!(
+                    st.column(0)
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .value(0),
+                    11
+                );
+                assert!(values.column_by_name("_rowid").is_some());
+            }
+        }
     }
 
     /// How a nested field carries one Arrow JSON document per row.
@@ -1595,6 +1728,15 @@ mod test {
             "{}",
             err.to_string()
         );
+
+        // Repeated maximum offsets must reach bounds validation without overflowing.
+        let err = ds
+            .take_rows(&[u32::MAX as u64; 2], ds.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("Invalid read params"), "{err}");
+        assert!(err.to_string().contains("4294967295"), "{err}");
     }
 
     #[rstest]

@@ -33,4 +33,11 @@ codegen-units = 16
 rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]
 
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon,+fp16,+fhm,+dotprod"]
+rustflags = [
+    "-C", "target-cpu=apple-m1",
+    "-C", "target-feature=+neon,+fp16,+fhm,+dotprod",
+    # Keep ctor's startup trampoline in __text so the linker can insert branch
+    # islands when the Python extension exceeds ARM64's 128 MiB branch range.
+    # https://github.com/lance-format/lance/issues/10588
+    "-C", "link-arg=-Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text",
+]

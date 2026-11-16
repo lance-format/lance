@@ -28,6 +28,7 @@ import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
@@ -40,6 +41,7 @@ import org.lance.memwal.InitializeMemWalParams;
 import org.lance.memwal.MemWalIndexDetails;
 import org.lance.memwal.ShardWriter;
 import org.lance.memwal.ShardWriterConfig;
+import org.lance.merge.MergeInsertAnalysis;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 import org.lance.namespace.LanceNamespace;
@@ -920,6 +922,39 @@ public class Dataset implements Closeable {
   private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
 
   /**
+   * Resolve row IDs (from the {@code _rowid} column) to their current row addresses.
+   *
+   * <p>A row address is {@code (fragmentId << 32) | rowOffset}, so callers can tell which fragment
+   * holds each row without scanning. With stable row IDs, a row keeps its ID when compaction or an
+   * update moves it, so its address can differ between versions. Without stable row IDs, a row ID
+   * is its row address, and each input is returned unchanged without checking that the row exists.
+   *
+   * <p>Reading stable row IDs may access row-id metadata and deletion files; I/O failures surface
+   * as {@link IOException}.
+   *
+   * @param rowIds the row IDs to resolve
+   * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
+   *     is unknown or its row was deleted
+   * @throws RuntimeException if a row ID is live in more than one fragment, which means the stable
+   *     row IDs are corrupt
+   */
+  public List<Long> getRowAddresses(List<Long> rowIds) {
+    Preconditions.checkArgument(rowIds != null, "rowIds cannot be null");
+    long[] addresses;
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      addresses = nativeGetRowAddresses(rowIds);
+    }
+    List<Long> result = new ArrayList<>(addresses.length);
+    for (long address : addresses) {
+      result.add(address == -1L ? null : address);
+    }
+    return result;
+  }
+
+  private native long[] nativeGetRowAddresses(List<Long> rowIds);
+
+  /**
    * Randomly sample n rows from the dataset.
    *
    * <p>The returned rows are in row-id order (not random order), which allows the underlying take
@@ -1047,6 +1082,40 @@ public class Dataset implements Closeable {
   }
 
   private native List<Version> nativeListVersions();
+
+  /**
+   * Get one page of the version history of the dataset.
+   *
+   * <p>Versions are ordered ascending by version, or descending when {@code descending} is true.
+   * Detached versions are never part of the history, and only the manifests in the returned page
+   * are read.
+   *
+   * <p>On a lexically ordered store with V2 manifest paths, a descending page stops listing once
+   * {@code offset + limit} manifest entries have been observed. Ascending pages, V1 manifest paths,
+   * and stores without lexically ordered listings enumerate every manifest location before
+   * selecting the page.
+   *
+   * @param offset the number of versions to skip; an offset past the end of the history returns an
+   *     empty list
+   * @param limit the maximum number of versions to return, or empty for every remaining version;
+   *     zero returns an empty list without listing or reading any manifest
+   * @param descending whether to return the newest version first
+   * @return the requested page of versions
+   */
+  public List<Version> listVersions(long offset, Optional<Long> limit, boolean descending) {
+    Preconditions.checkArgument(offset >= 0, "offset must be non-negative, got %s", offset);
+    Preconditions.checkNotNull(limit, "limit must not be null");
+    limit.ifPresent(
+        value ->
+            Preconditions.checkArgument(value >= 0, "limit must be non-negative, got %s", value));
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListVersionsWithOptions(offset, limit.orElse(-1L), descending);
+    }
+  }
+
+  private native List<Version> nativeListVersionsWithOptions(
+      long offset, long limit, boolean descending);
 
   /**
    * Get the number of versions in the current version history.
@@ -1648,6 +1717,24 @@ public class Dataset implements Closeable {
   private native FragmentStatistics nativeGetFragmentStatistics();
 
   /**
+   * Get per-fragment column-layout statistics for this dataset version: how many data files hold a
+   * column of the schema, each file's size and schema field count, the share of dead field slots,
+   * and how many overlay files each fragment carries. Only manifest metadata is read.
+   *
+   * <p>This is an experimental API. It may change at any time.
+   *
+   * @return column-layout statistics as parallel arrays, in manifest order
+   */
+  public ColumnLayoutStatistics getColumnLayoutStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetColumnLayoutStatistics();
+    }
+  }
+
+  private native ColumnLayoutStatistics nativeGetColumnLayoutStatistics();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
@@ -1754,6 +1841,64 @@ public class Dataset implements Closeable {
   private native String nativeGetIndexStatistics(String indexName);
 
   /**
+   * Returns results in UUID request order at this dataset's read version.
+   *
+   * <p>UUIDs must be nonempty, unique, non-null, and belong to {@code indexName}. System indices
+   * are unsupported.
+   *
+   * <pre>{@code
+   * List<IndexSegmentStatistics> segments =
+   *     dataset.getIndexSegmentStatistics("vector_idx", segmentUuids);
+   * Map<String, Object> statistics =
+   *     dataset.getIndexStatisticsFromSegments("vector_idx", segments);
+   * }</pre>
+   */
+  public List<IndexSegmentStatistics> getIndexSegmentStatistics(
+      String indexName, List<UUID> indexUuids) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        indexUuids != null && !indexUuids.isEmpty(), "indexUuids cannot be null or empty");
+    Preconditions.checkArgument(
+        indexUuids.stream().allMatch(indexUuid -> indexUuid != null),
+        "indexUuids cannot contain null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetIndexSegmentStatistics(indexName, indexUuids);
+    }
+  }
+
+  private native List<IndexSegmentStatistics> nativeGetIndexSegmentStatistics(
+      String indexName, List<UUID> indexUuids);
+
+  /**
+   * Requires exactly one result per segment from this dataset and read version.
+   *
+   * <p>Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+   * Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+   *
+   * <p>See {@link #getIndexSegmentStatistics} for a collection example.
+   */
+  public Map<String, Object> getIndexStatisticsFromSegments(
+      String indexName, List<IndexSegmentStatistics> segmentStatistics) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        segmentStatistics != null && !segmentStatistics.isEmpty(),
+        "segmentStatistics cannot be null or empty");
+    Preconditions.checkArgument(
+        segmentStatistics.stream().allMatch(statistics -> statistics != null),
+        "segmentStatistics cannot contain null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return JsonUtils.fromJson(nativeGetIndexStatisticsFromSegments(indexName, segmentStatistics));
+    }
+  }
+
+  private native String nativeGetIndexStatisticsFromSegments(
+      String indexName, List<IndexSegmentStatistics> segmentStatistics);
+
+  /**
    * Build global BM25 statistics for a full-text query across every committed segment of its
    * logical FTS index.
    *
@@ -1851,8 +1996,17 @@ public class Dataset implements Closeable {
   /**
    * Read zonemap statistics for a column.
    *
-   * <p>Returns per-zone min/max/null_count statistics for the given column, if a zonemap index
-   * exists. Returns an empty list if no zonemap index exists for the column.
+   * <p>Returns per-zone min/max/null_count/nan_count statistics for the given column, if a zonemap
+   * index exists. Returns an empty list if no zonemap index exists for the column, or if the
+   * column's type has no faithful {@link Comparable} representation: decimal, binary and nested
+   * types, or an unsigned 64-bit column holding a value above {@link Long#MAX_VALUE}. A null min or
+   * max means the zone has no comparable value: every value is null or, for a floating-point
+   * column, every non-null value is NaN. A zone is known to be all null only when its null count
+   * equals its zone length.
+   *
+   * <p>String bounds follow Arrow's UTF-8 byte ordering, which is not the same as {@link
+   * String#compareTo(String)}: that method compares UTF-16 code units and orders some supplementary
+   * characters differently.
    *
    * <p>The zonemap index file is typically small (one row per zone), so this is a lightweight
    * metadata-only operation suitable for calling on the driver during scan planning.
@@ -2447,7 +2601,7 @@ public class Dataset implements Closeable {
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
-      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
+      update(tag, Ref.ofMain(versionNumber));
     }
 
     /**
@@ -2614,6 +2768,32 @@ public class Dataset implements Closeable {
   }
 
   private native MergeInsertResult nativeMergeInsert(
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Analyze one streaming merge without committing a dataset version.
+   *
+   * <p>The stream has no materialized statistics and is consumed once. Analysis can write temporary
+   * data, deletion and replay files, then cleans up uncommitted data. Execution errors return
+   * partial reports; planning/validation errors throw. Cleanup failures are logged for orphan
+   * cleanup. Cancelling execution can interrupt cleanup. Join and write times overlap; pool peaks
+   * measure DataFusion reservations rather than process memory.
+   *
+   * <p>For example, inspect {@code report.getReplaySpills().getBytesWritten()} to diagnose staging,
+   * and {@code report.getExecution().getError()} for an execution failure.
+   *
+   * @param mergeInsert the same options accepted by {@link #mergeInsert}
+   * @param source streaming source, consumed by this call
+   * @return an operation-owned protobuf-backed diagnostic snapshot
+   */
+  public MergeInsertAnalysis analyzeMergeInsert(
+      MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock ignored = lockManager.acquireReadLock()) {
+      return nativeAnalyzeMergeInsert(mergeInsert, source.memoryAddress());
+    }
+  }
+
+  private native MergeInsertAnalysis nativeAnalyzeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**
