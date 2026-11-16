@@ -15,7 +15,7 @@ use lance_core::{
 use super::{
     FullZipArrayInput, FullZipScheduler,
     constant::{ConstantArrayInput, ConstantArrayScheduler},
-    sparse::admitted_lists::{MetadataListInput, MetadataListScheduler},
+    sparse::admitted_lists::{NullListInput, NullListScheduler},
 };
 use crate::{
     compression::DecompressionStrategy,
@@ -28,7 +28,7 @@ use all_null::{AllNullInput, AllNullScheduler};
 
 #[derive(Debug)]
 enum Scheduler {
-    MetadataList(MetadataListScheduler),
+    NullList(NullListScheduler),
     AllNull(AllNullScheduler),
     FullZip(Arc<FullZipScheduler>),
     Constant(Arc<ConstantArrayScheduler>),
@@ -37,7 +37,9 @@ enum Scheduler {
 /// Metadata-only dispatch for admitted byte/string pages.
 /// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
 /// pages and V2_3 List chains with null byte leaves support metadata-only validity,
-/// positions and counts, preserving empty/null/nonempty parents. Other layouts return an error, without
+/// positions and metadata or Flat/Bitpacked/Delta counts. Counts use bounded I/O
+/// windows; only selected prefixes remain charged alongside output construction.
+/// Empty/null/nonempty parents stay distinct. Other layouts return an error without
 /// unadmitted decoding fallback. Metadata itself is not charged.
 #[derive(Debug)]
 pub struct AdmittedBytePageScheduler(Scheduler);
@@ -46,8 +48,8 @@ impl AdmittedBytePageScheduler {
     /// Validate the stored layout before payload reads. Use with
     /// [`Self::prepare_array_range_in`] inside an existing operation reservation.
     pub fn try_from_page(page: &PageInfo, codecs: &dyn DecompressionStrategy) -> Result<Self> {
-        if let Some(scheduler) = MetadataListScheduler::try_from_page(page)? {
-            return Ok(Self(Scheduler::MetadataList(scheduler)));
+        if let Some(scheduler) = NullListScheduler::try_from_page(page)? {
+            return Ok(Self(Scheduler::NullList(scheduler)));
         }
         if let Some(scheduler) = AllNullScheduler::try_from_page(page)? {
             return Ok(Self(Scheduler::AllNull(scheduler)));
@@ -77,7 +79,7 @@ impl AdmittedBytePageScheduler {
     /// Check the projected Arrow shape without payload I/O or allocation.
     pub fn validate_array_type(&self, data_type: &DataType) -> Result<()> {
         match &self.0 {
-            Scheduler::MetadataList(scheduler) => scheduler.validate_array_type(data_type),
+            Scheduler::NullList(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::AllNull(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::FullZip(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::Constant(scheduler) => scheduler.validate_array_type(data_type),
@@ -115,9 +117,10 @@ impl AdmittedBytePageScheduler {
         Fut: Future<Output = Result<ReservedBuffer>>,
     {
         Ok(match &self.0 {
-            Scheduler::MetadataList(scheduler) => Some(AdmittedBytePageInput(Input::MetadataList(
-                scheduler.prepare(rows, data_type)?,
-            ))),
+            Scheduler::NullList(scheduler) => scheduler
+                .prepare(rows, data_type, workspace, read)
+                .await?
+                .map(|input| AdmittedBytePageInput(Input::NullList(input))),
             Scheduler::AllNull(scheduler) => Some(AdmittedBytePageInput(Input::AllNull(
                 scheduler.prepare(rows, data_type)?,
             ))),
@@ -136,7 +139,7 @@ impl AdmittedBytePageScheduler {
 
 #[derive(Debug)]
 enum Input {
-    MetadataList(MetadataListInput),
+    NullList(NullListInput),
     AllNull(AllNullInput),
     FullZip(FullZipArrayInput),
     Constant(ConstantArrayInput),
@@ -153,7 +156,7 @@ impl AdmittedBytePageInput {
     /// `None` means discard/replan the whole operation, never partial success.
     pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {
         match self.0 {
-            Input::MetadataList(input) => input.decode_in(workspace),
+            Input::NullList(input) => input.decode_in(workspace),
             Input::AllNull(input) => input.decode_in(workspace),
             Input::FullZip(input) => input.decode_in(workspace),
             Input::Constant(input) => input.decode_in(workspace),

@@ -293,3 +293,86 @@ async fn current_writer_null_children_preserve_selected_structure_without_io(
     assert_eq!(take_budget.reserved(), 0);
     assert!(reads.lock().unwrap().is_empty());
 }
+
+#[rstest]
+#[tokio::test]
+async fn current_writer_payload_counts_use_bounded_input_windows(
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] large: bool,
+) {
+    // Distinct non-monotonic counts prevent metadata, Delta, RLE and dictionary
+    // representations. The actual writer chooses a directly addressable codec.
+    let mut offsets = vec![0_i32];
+    for i in 0..2051 {
+        offsets.push(offsets.last().unwrap() + 1 + (i * 1031 % 2053));
+    }
+    let source = wrap_null_children(
+        new_null_array(&DataType::Binary, *offsets.last().unwrap() as usize),
+        large,
+        &offsets,
+        vec![true; 2051],
+    );
+    let (_fs, reader) = fixture_arrays(ConcreteFileVersion::V2_3, lite, vec![source.clone()]).await;
+    let page = &reader.metadata().column_infos[0].page_infos[0];
+    assert_eq!(
+        page.buffer_offsets_and_sizes.len(),
+        1,
+        "fixture must contain payload counts"
+    );
+    let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = reader.with_scheduler(Arc::new(super::scan::RangeIo {
+        inner: reader.core.scheduler.clone(),
+        reads: reads.clone(),
+    }));
+    let budget = AllocationBudget::new(65536);
+    let mut scan = reader
+        .open_admitted_fullzip_scan(2047..2051, budget.clone(), 65536, 2)
+        .await
+        .unwrap();
+    for (start, end) in [(2047, 2049), (2049, 2051)] {
+        let FullZipScanOutcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
+            panic!("expected selected List batch")
+        };
+        assert_eq!(rows, start..end);
+        assert_eq!(
+            batch.column(0).to_data(),
+            source
+                .slice(start as usize, (end - start) as usize)
+                .to_data()
+        );
+        let alias = batch.column(0).to_data().buffers()[0].slice_with_length(0, 1);
+        drop(batch);
+        if end < 2051 {
+            assert!(matches!(
+                scan.try_next().await.unwrap(),
+                FullZipScanOutcome::NeedsCapacity
+            ));
+            assert_eq!(scan.position(), end);
+        }
+        drop(alias);
+        assert_eq!(budget.reserved(), 0);
+    }
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        FullZipScanOutcome::Finished
+    ));
+    let selected = [0, 1024, 2050];
+    let mut work = budget.try_reserve(65536).unwrap();
+    let prepared = reader
+        .prepare_admitted_fullzip_take_in(&selected, &mut work)
+        .await
+        .unwrap()
+        .unwrap();
+    let batch = prepared.decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(
+        batch.column(0).to_data(),
+        arrow_select::take::take(source.as_ref(), &UInt32Array::from(selected.to_vec()), None)
+            .unwrap()
+            .to_data()
+    );
+    drop((batch, work));
+    assert_eq!(budget.reserved(), 0);
+    let reads = reads.lock().unwrap();
+    assert!(reads.len() > 2);
+    assert!(reads.iter().all(|range| range.end - range.start <= 8192));
+}

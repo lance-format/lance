@@ -574,6 +574,7 @@ async fn admitted_fragment_empty_list_overlay_preserves_null_precedence(
 #[tokio::test]
 async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_validity(
     #[values(false, true)] lite: bool,
+    #[values(false, true)] payload_counts: bool,
 ) {
     let version = LanceFileVersion::V2_3;
     let mut dataset = write_payload_dataset(version, true).await;
@@ -582,11 +583,16 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
     let DataType::List(field) = original.data_type() else {
         unreachable!()
     };
+    let (offsets, valid, covered) = if payload_counts {
+        (vec![0_i32, 1, 4, 6, 10], vec![true; 4], vec![2, 3, 4, 5])
+    } else {
+        (vec![0_i32, 1, 1, 3], vec![true, false, true], vec![2, 3, 4])
+    };
     let null_children: ArrayRef = Arc::new(ListArray::new(
         field.clone(),
-        OffsetBuffer::new(vec![0_i32, 1, 1, 3].into()),
-        arrow_array::new_null_array(field.data_type(), 3),
-        Some(NullBuffer::from(vec![true, false, true])),
+        OffsetBuffer::new(offsets.clone().into()),
+        arrow_array::new_null_array(field.data_type(), *offsets.last().unwrap() as usize),
+        Some(NullBuffer::from(valid)),
     ));
     for fragment in 0..2 {
         dataset = commit_overlay(
@@ -604,7 +610,7 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
             &format!("null-child-{fragment}"),
             fragment,
             &[field_id],
-            OverlayCoverage::dense(bitmap([2, 3, 4])),
+            OverlayCoverage::dense(bitmap(covered.clone())),
             vec![null_children.clone()],
             version,
         )
@@ -620,9 +626,12 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
-        assert_eq!(values.slice(2, 3).to_data(), null_children.to_data());
+        assert_eq!(
+            values.slice(2, covered.len()).to_data(),
+            null_children.to_data()
+        );
         assert!(values.is_valid(2));
-        assert!(values.is_null(3));
+        assert_eq!(values.is_null(3), !payload_counts);
         assert_eq!(values.value_length(4), 2);
         let indices = UInt32Array::from(vec![0, 1, 2, 3, 4, 5]);
         let budget = AllocationBudget::new(2 * 65536);

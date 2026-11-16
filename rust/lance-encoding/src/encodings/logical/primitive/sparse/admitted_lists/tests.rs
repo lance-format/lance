@@ -13,7 +13,7 @@ use super::*;
 use crate::{
     compression::DefaultDecompressionStrategy,
     encodings::{logical::primitive::AdmittedBytePageScheduler, physical::range::RangeEncoder},
-    format::EncodingUtils,
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 
 fn positions(is_null: bool, start: u64, step: u64, count: u64) -> pb23::SparseValiditySet {
@@ -244,7 +244,7 @@ fn malformed_structure_does_not_become_an_empty_list(#[case] kind: u8, #[case] m
         6 => page.buffer_offsets_and_sizes = Arc::from([(0, 1)]),
         _ => (),
     }
-    let error = MetadataListScheduler::try_from_page(&page).unwrap_err();
+    let error = NullListScheduler::try_from_page(&page).unwrap_err();
     if matches!(kind, 3 | 4 | 5 | 7) {
         assert!(matches!(error, Error::InvalidInput { .. }));
     } else {
@@ -309,7 +309,7 @@ fn payload_positions_are_not_assumed_empty() {
     };
     list.validity.as_mut().unwrap().positions = Some(EncodingUtils::flat(64, None));
     page.buffer_offsets_and_sizes = Arc::from([(0, 24)]);
-    let error = MetadataListScheduler::try_from_page(&page).unwrap_err();
+    let error = NullListScheduler::try_from_page(&page).unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(error.to_string().contains("metadata-only positions"));
 }
@@ -318,7 +318,7 @@ fn payload_positions_are_not_assumed_empty() {
 fn overflowing_validity_descriptor_is_rejected_before_range_arithmetic() {
     let mut validity = positions(true, 2, 2, 3);
     validity.positions = Some(EncodingUtils::range(64, u64::MAX - 1, 2));
-    let error = MetadataListScheduler::try_from_page(&fixture(1, validity)).unwrap_err();
+    let error = NullListScheduler::try_from_page(&fixture(1, validity)).unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("overflows"));
 }
@@ -486,7 +486,7 @@ async fn selected_nonempty_null_lists_fit_one_workspace(
 ) {
     for is_null in [false, true] {
         let source = populated_source(&leaf, large, depth, is_null);
-        let scheduler = MetadataListScheduler::try_from_page(&populated_fixture(depth, is_null))
+        let scheduler = NullListScheduler::try_from_page(&populated_fixture(depth, is_null))
             .unwrap()
             .unwrap();
         for range in [0..2, 1..2, 3..4, 2..7, 7..9] {
@@ -498,7 +498,14 @@ async fn selected_nonempty_null_lists_fit_one_workspace(
             let budget = AllocationBudget::new(bytes);
             let mut short = budget.try_reserve(bytes - 1).unwrap();
             let input = scheduler
-                .prepare(range.clone(), source.data_type().clone())
+                .prepare(
+                    range.clone(),
+                    source.data_type().clone(),
+                    &mut short,
+                    unexpected_read,
+                )
+                .await
+                .unwrap()
                 .unwrap();
             assert!(input.decode_in(&mut short).unwrap().is_none());
             assert_eq!(short.len(), bytes - 1);
@@ -506,7 +513,14 @@ async fn selected_nonempty_null_lists_fit_one_workspace(
             assert_eq!(budget.reserved(), 0);
             let mut work = budget.try_reserve(bytes).unwrap();
             let output = scheduler
-                .prepare(range.clone(), source.data_type().clone())
+                .prepare(
+                    range.clone(),
+                    source.data_type().clone(),
+                    &mut work,
+                    unexpected_read,
+                )
+                .await
+                .unwrap()
                 .unwrap()
                 .decode_in(&mut work)
                 .unwrap()
@@ -557,7 +571,7 @@ fn invalid_nonempty_structure_is_rejected(#[case] kind: u8, #[case] message: &st
         2 => list.validity = Some(positions(true, 0, 2, 5)),
         _ => (),
     }
-    let error = MetadataListScheduler::try_from_page(&page).unwrap_err();
+    let error = NullListScheduler::try_from_page(&page).unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert!(error.to_string().contains(message), "{error}");
 }
@@ -583,14 +597,19 @@ async fn tiny_selection_does_not_materialize_the_page_domain() {
         EncodingUtils::constant(Some(1_u64.to_le_bytes().to_vec().into())),
         positions(true, 0, 1, 0),
     );
-    let scheduler = MetadataListScheduler::try_from_page(&page)
-        .unwrap()
-        .unwrap();
+    let scheduler = NullListScheduler::try_from_page(&page).unwrap().unwrap();
     let field = Arc::new(Field::new("item", DataType::Binary, true));
     let budget = AllocationBudget::new(17); // two List offsets, two leaf offsets, one leaf bitmap
     let mut work = budget.try_reserve(17).unwrap();
     let output = scheduler
-        .prepare(u64::MAX - 1..u64::MAX, DataType::List(field.clone()))
+        .prepare(
+            u64::MAX - 1..u64::MAX,
+            DataType::List(field.clone()),
+            &mut work,
+            unexpected_read,
+        )
+        .await
+        .unwrap()
         .unwrap()
         .decode_in(&mut work)
         .unwrap()
@@ -619,7 +638,7 @@ fn arithmetic_counts_validate_sum_and_prefixes_without_materialization() {
                 } else {
                     RangeEncoder::new(64, first, step).encoding(count).unwrap()
                 };
-                let counts = Counts::parse(Some(&encoding), count).unwrap();
+                let counts = Counts::parse(Some(&encoding), count, &mut [].iter()).unwrap();
                 let values = (0..count).map(|i| first + i * step).collect::<Vec<_>>();
                 for prefix in 0..=count {
                     assert_eq!(
@@ -631,11 +650,13 @@ fn arithmetic_counts_validate_sum_and_prefixes_without_materialization() {
         }
     }
     let overflow = EncodingUtils::constant(Some(u64::MAX.to_le_bytes().to_vec().into()));
-    let error = Counts::parse(Some(&overflow), 2).unwrap_err();
+    let error = Counts::parse(Some(&overflow), 2, &mut [].iter()).unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }));
     assert!(error.to_string().contains("sum overflows"));
     let payload = EncodingUtils::flat(64, None);
-    let error = Counts::parse(Some(&payload), 3).unwrap_err();
-    assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("metadata-only counts"));
+    let error = Counts::parse(Some(&payload), 3, &mut [].iter()).unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("missing counts buffer"));
 }
+
+mod payload;

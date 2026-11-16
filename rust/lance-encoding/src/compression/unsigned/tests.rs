@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::buffer::LanceBuffer;
 use crate::{compression::create_fixed_width_block_decompressor, format::EncodingUtils};
 use rstest::rstest;
 

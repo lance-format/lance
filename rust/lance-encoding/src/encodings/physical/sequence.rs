@@ -36,6 +36,9 @@ use crate::encodings::physical::bitpacking::{
 
 mod decoder;
 mod statistics;
+mod window;
+
+pub(crate) use window::WindowSequence;
 
 pub use decoder::{SequenceDecoder, SequenceMetadata};
 

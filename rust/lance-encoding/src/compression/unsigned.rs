@@ -3,7 +3,6 @@
 
 //! Borrowed unsigned traversal for container preflight. No payload allocations.
 
-use crate::buffer::LanceBuffer;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::out_of_line_payload_byte_lengths;
 use lance_core::{Error, Result};
@@ -15,7 +14,7 @@ fn word(data: &[u8], index: usize, bytes: usize) -> u64 {
 }
 
 pub fn flat(
-    data: &LanceBuffer,
+    data: &[u8],
     bits: u64,
     count: u64,
     visitor: &mut dyn FnMut(u64) -> Result<()>,
@@ -27,7 +26,7 @@ pub fn flat(
     Ok(())
 }
 
-pub fn flat_at(data: &LanceBuffer, bits: u64, count: u64, index: u64) -> Result<u64> {
+pub fn flat_at(data: &[u8], bits: u64, count: u64, index: u64) -> Result<u64> {
     let width = flat_width(data, bits, count)?;
     if index >= count {
         return Err(Error::invalid_input(
@@ -38,7 +37,7 @@ pub fn flat_at(data: &LanceBuffer, bits: u64, count: u64, index: u64) -> Result<
     Ok(word(data, index as usize, width))
 }
 
-fn flat_width(data: &LanceBuffer, bits: u64, count: u64) -> Result<usize> {
+fn flat_width(data: &[u8], bits: u64, count: u64) -> Result<usize> {
     if !matches!(bits, 32 | 64) {
         return Err(Error::invalid_input(
             "unsigned Flat visitor requires 32 or 64 bits",
@@ -59,7 +58,7 @@ fn flat_width(data: &LanceBuffer, bits: u64, count: u64) -> Result<usize> {
 
 #[cfg(feature = "bitpacking")]
 pub fn bitpacked(
-    data: &LanceBuffer,
+    data: &[u8],
     bits: u64,
     packed: u64,
     count: u64,
@@ -93,13 +92,7 @@ pub fn bitpacked(
 }
 
 #[cfg(feature = "bitpacking")]
-pub fn bitpacked_at(
-    data: &LanceBuffer,
-    bits: u64,
-    packed: u64,
-    count: u64,
-    index: u64,
-) -> Result<u64> {
+pub fn bitpacked_at(data: &[u8], bits: u64, packed: u64, count: u64, index: u64) -> Result<u64> {
     let raw = validate_bitpacked(data, bits, packed, count)?;
     if index >= count {
         return Err(Error::invalid_input(
@@ -126,7 +119,7 @@ pub fn bitpacked_at(
 }
 
 #[cfg(feature = "bitpacking")]
-fn validate_bitpacked(data: &LanceBuffer, bits: u64, packed: u64, count: u64) -> Result<u64> {
+fn validate_bitpacked(data: &[u8], bits: u64, packed: u64, count: u64) -> Result<u64> {
     if !matches!(bits, 8 | 16 | 32 | 64) || packed == 0 || packed >= bits {
         return Err(Error::invalid_input(
             "unsigned bitpacking visitor requires a narrower positive width",

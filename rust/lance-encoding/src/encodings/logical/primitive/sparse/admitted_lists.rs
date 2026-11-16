@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Selected metadata-only List structure with null byte leaves, under one admission.
+//! Selected sparse List structure with null byte leaves, under one admission.
 
-use std::{ops::Range, sync::Arc};
+use std::{future::Future, ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use lance_core::{Error, Result, utils::allocation::Reservation};
+use lance_core::{
+    Error, Result,
+    utils::allocation::{Reservation, ReservedBuffer},
+};
 
 use super::{
     SparsePositionDecoder, SparsePositionPlan, SparseValidityMeaning, SparseValiditySet,
@@ -18,8 +21,7 @@ use super::{
 use crate::{
     data::{AllNullDataBlock, DataBlock},
     decoder::{PageEncoding, PageInfo},
-    encodings::physical::sequence::{SequenceDecoder, SequenceMetadata},
-    format::{metadata::CompressiveEncoding, pb23},
+    format::pb23,
 };
 
 fn corrupt(message: &str) -> Error {
@@ -55,58 +57,14 @@ fn null_count(validity: &SparseValiditySet, rows: &Range<u64>) -> u64 {
     }
 }
 
-#[derive(Debug)]
-struct Counts {
-    first: u64,
-    step: u64,
-    len: u64,
-}
+mod counts;
+use counts::Counts;
 
-impl Counts {
-    fn parse(encoding: Option<&CompressiveEncoding>, len: u64) -> Result<Self> {
-        let encoding = encoding.ok_or_else(|| corrupt("missing unsigned counts descriptor"))?;
-        let sequence = SequenceDecoder::try_new(encoding, 64, len)?;
-        let (first, step) = match sequence.metadata().filter(|_| !sequence.requires_payload()) {
-            Some(SequenceMetadata::Empty) => (0, 0),
-            Some(SequenceMetadata::Constant(value)) => (value, 0),
-            Some(SequenceMetadata::Range { start, step }) => (start, step),
-            None => {
-                return Err(Error::not_supported(
-                    "admitted sparse List requires metadata-only counts",
-                ));
-            }
-        };
-        if len > 0 && first == 0 {
-            return Err(corrupt("nonempty List counts must be positive"));
-        }
-        let counts = Self { first, step, len };
-        counts.prefix(len)?;
-        Ok(counts)
-    }
-
-    fn prefix(&self, count: u64) -> Result<u64> {
-        if count > self.len {
-            return Err(corrupt("count prefix exceeds descriptor cardinality"));
-        }
-        if count == 0 {
-            return Ok(0);
-        }
-        // SequenceDecoder already checked the last element. Divide the even
-        // factor first so summing two u64 endpoints cannot overflow u128.
-        let endpoints = u128::from(self.first) * 2 + u128::from(self.step) * u128::from(count - 1);
-        let sum = if count.is_multiple_of(2) {
-            u128::from(count / 2) * endpoints
-        } else {
-            u128::from(count) * (endpoints / 2)
-        };
-        u64::try_from(sum).map_err(|_| corrupt("List count sum overflows u64"))
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ListMetadata {
     non_empty: SparsePositionPlan,
     counts: Counts,
+    child_slots: u64,
     validity: SparseValiditySet,
 }
 
@@ -117,12 +75,12 @@ impl ListMetadata {
 }
 
 #[derive(Debug)]
-pub(in crate::encodings::logical::primitive) struct MetadataListScheduler {
+pub(in crate::encodings::logical::primitive) struct NullListScheduler {
     rows: u64,
     lists: Arc<[ListMetadata]>,
 }
 
-impl MetadataListScheduler {
+impl NullListScheduler {
     pub(in crate::encodings::logical::primitive) fn try_from_page(
         page: &PageInfo,
     ) -> Result<Option<Self>> {
@@ -145,6 +103,7 @@ impl MetadataListScheduler {
             return Ok(None);
         }
         let mut domain = page.num_rows;
+        let mut buffers = page.buffer_offsets_and_sizes.iter();
         let mut lists = Vec::with_capacity(structure.layers.len());
         let mut has_leaf = false;
         for layer in &structure.layers {
@@ -160,8 +119,15 @@ impl MetadataListScheduler {
                         domain,
                         "admitted List nonempty",
                     )?)?;
-                    let counts = Counts::parse(list.counts.as_ref(), list.num_non_empty_positions)?;
-                    if counts.prefix(list.num_non_empty_positions)? != list.num_child_slots {
+                    let counts = Counts::parse(
+                        list.counts.as_ref(),
+                        list.num_non_empty_positions,
+                        &mut buffers,
+                    )?;
+                    if counts
+                        .metadata_total()?
+                        .is_some_and(|total| total != list.num_child_slots)
+                    {
                         return Err(corrupt("List count sum differs from child domain"));
                     }
                     let validity = validity(list.validity.as_ref(), domain)?;
@@ -173,6 +139,7 @@ impl MetadataListScheduler {
                     lists.push(ListMetadata {
                         non_empty,
                         counts,
+                        child_slots: list.num_child_slots,
                         validity,
                     });
                     domain = list.num_child_slots;
@@ -195,8 +162,8 @@ impl MetadataListScheduler {
         if !has_leaf {
             return Err(corrupt("missing leaf validity"));
         }
-        if !page.buffer_offsets_and_sizes.is_empty() {
-            return Err(corrupt("metadata-only List has unexpected buffers"));
+        if buffers.next().is_some() {
+            return Err(corrupt("sparse List has unexpected buffers"));
         }
         Ok(Some(Self {
             rows: page.num_rows,
@@ -228,22 +195,46 @@ impl MetadataListScheduler {
         Ok(())
     }
 
-    pub(in crate::encodings::logical::primitive) fn prepare(
+    pub(in crate::encodings::logical::primitive) async fn prepare<F, Fut>(
         &self,
         rows: Range<u64>,
         data_type: DataType,
-    ) -> Result<MetadataListInput> {
+        work: &mut Reservation,
+        mut read: F,
+    ) -> Result<Option<NullListInput>>
+    where
+        F: FnMut(Range<u64>, ReservedBuffer) -> Fut,
+        Fut: Future<Output = Result<ReservedBuffer>>,
+    {
         self.validate_array_type(&data_type)?;
         if rows.start >= rows.end || rows.end > self.rows {
             return Err(Error::invalid_input(
                 "sparse List selection is outside the page or empty",
             ));
         }
-        Ok(MetadataListInput {
+        let mut selected = rows.clone();
+        let mut lists = Vec::with_capacity(self.lists.len());
+        for layer in self.lists.iter() {
+            let indices = layer.non_empty.rank(selected.start)..layer.non_empty.rank(selected.end);
+            let Some(counts) = layer
+                .counts
+                .prepare(indices, layer.child_slots, work, &mut read)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let layer = ListMetadata {
+                counts,
+                ..layer.clone()
+            };
+            selected = layer.child_before(selected.start)?..layer.child_before(selected.end)?;
+            lists.push(layer);
+        }
+        Ok(Some(NullListInput {
             rows,
             data_type,
-            lists: self.lists.clone(),
-        })
+            lists: lists.into(),
+        }))
     }
 }
 
@@ -267,13 +258,13 @@ fn offset_bytes(rows: u64, width: usize) -> Result<usize> {
 }
 
 #[derive(Debug)]
-pub(in crate::encodings::logical::primitive) struct MetadataListInput {
+pub(in crate::encodings::logical::primitive) struct NullListInput {
     rows: Range<u64>,
     data_type: DataType,
     lists: Arc<[ListMetadata]>,
 }
 
-impl MetadataListInput {
+impl NullListInput {
     pub(in crate::encodings::logical::primitive) fn decode_in(
         self,
         workspace: &mut Reservation,
