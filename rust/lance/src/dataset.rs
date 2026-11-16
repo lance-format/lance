@@ -146,7 +146,7 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
-    CommitTransactionOptions, commit_detached_transaction, commit_new_dataset, commit_transaction,
+    CommitTransactionOptions, ReclaimOnLoss, commit_detached_transaction, commit_new_dataset, commit_transaction,
     detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
@@ -1526,6 +1526,28 @@ impl Dataset {
                 self.table_state.manifest_location.naming_scheme,
             )
             .with_tagged_frag_reuse_trim(),
+        )
+        .await
+    }
+
+    /// Commit a transaction and reclaim the `_indices/{uuid}` directories it
+    /// minted if the commit is verified not to have landed. Only for callers
+    /// that rebuild those directories on a retry; a caller replaying the same
+    /// transaction must use [`Self::apply_commit`] instead.
+    pub(crate) async fn apply_commit_reclaiming_minted_index_dirs(
+        &mut self,
+        transaction: Transaction,
+        build_config: &ManifestBuildConfig,
+        commit_config: &CommitConfig,
+    ) -> Result<()> {
+        self.apply_commit_with_options(
+            transaction,
+            CommitTransactionOptions::new(
+                build_config,
+                commit_config,
+                self.table_state.manifest_location.naming_scheme,
+            )
+            .with_reclaim_on_loss(ReclaimOnLoss::MintedIndexDirs),
         )
         .await
     }

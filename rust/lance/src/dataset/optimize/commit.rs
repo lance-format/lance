@@ -614,12 +614,18 @@ async fn commit_rewrites(
     .build();
 
     if let Err(e) = dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
+        .apply_commit_reclaiming_minted_index_dirs(
+            transaction,
+            &Default::default(),
+            &Default::default(),
+        )
         .await
     {
         // RewriteResult is serializable and may be retried after an earlier
         // ambiguous success. A conflict on this call therefore does not prove
         // that the rewritten files are unreferenced. Leave them for dataset GC.
+        // The index directories this call minted are reclaimed by the commit
+        // path itself, but only once it verifies the commit did not land.
         log::warn!(
             "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
             new_fragment_count,
