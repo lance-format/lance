@@ -566,6 +566,9 @@ impl TakeBuilder {
                             Error::internal("Stable row ID take did not produce a row ID index")
                         })?
                         .get_many(row_ids)?
+                        .into_iter()
+                        .map(|address| address.map(u64::from))
+                        .collect()
                 } else {
                     row_ids_to_row_addrs(&self.dataset, row_ids).await?
                 };

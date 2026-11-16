@@ -360,8 +360,13 @@ pub async fn row_ids_to_row_addrs(dataset: &Dataset, row_ids: &[u64]) -> Result<
         return Ok(row_ids.iter().copied().map(Some).collect());
     }
     let ids = UInt64Array::from(row_ids.to_vec());
-    let addresses = dataset.lookup_row_addresses(lance_core::ROW_ID, &ids).await?;
-    Ok(addresses.into_iter().map(|addr| addr.map(u64::from)).collect())
+    let addresses = dataset
+        .lookup_row_addresses(lance_core::ROW_ID, &ids)
+        .await?;
+    Ok(addresses
+        .into_iter()
+        .map(|addr| addr.map(u64::from))
+        .collect())
 }
 
 /// Resolve physical row addresses to stable row ids only for live physical slots.
@@ -675,7 +680,10 @@ mod test {
             lance_table::rowids::write_row_ids(&sequence).into(),
         ));
         assert_eq!(
-            dataset.lookup_row_addresses(lance_core::ROW_ID, &keys).await.unwrap(),
+            dataset
+                .lookup_row_addresses(lance_core::ROW_ID, &keys)
+                .await
+                .unwrap(),
             vec![
                 Some(RowAddress::new_from_parts(0, 2)),
                 Some(RowAddress::new_from_parts(0, 0)),
