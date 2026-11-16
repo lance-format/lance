@@ -165,8 +165,10 @@ async fn invalid_unselected_suffix_is_not_hidden(
     let (start, len) = page.buffer_offsets_and_sizes[1];
     let offset = (start - 17) as usize;
     let mut values = bytes[offset..offset + len as usize]
-        .chunks_exact(8)
-        .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|v| u64::from_le_bytes(*v))
         .collect::<Vec<_>>();
     match kind {
         0 => {
