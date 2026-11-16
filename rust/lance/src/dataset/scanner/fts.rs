@@ -1867,11 +1867,6 @@ impl Scanner {
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || match_query.document_granularity != Some(DocumentGranularity::Row)
-            || self
-                .dataset
-                .fragments()
-                .iter()
-                .any(|f| f.deletion_file.is_some())
         {
             return Ok(None);
         }

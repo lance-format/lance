@@ -5224,10 +5224,103 @@ async fn test_fts_9058_deleted_candidates_stay_excluded(
         &[None],
     )
     .await;
-    // Deletions retain their established corpus-statistics semantics. The new
-    // restriction path must preserve live candidates and never revive postings.
+    // The shared-corpus plan also runs on tables with deletions; it must keep
+    // deleted rows out of the results.
     assert_restricted_match_membership(
         &format!("9058-deleted-{name}-stable-{stable_row_ids}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+/// Deletes one row from the indexed fragment and one from the residual tail.
+async fn restricted_match_dataset_with_deletions(stable_row_ids: bool) -> Dataset {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete("id = 1 OR id = 6").await.unwrap();
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    assert!(fragments[0].metadata().deletion_file.is_some());
+    assert!(fragments[2].metadata().deletion_file.is_some());
+    dataset
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_deletions_use_shared_corpus_plan(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
+    let observation = restricted_match_observation(
+        &dataset,
+        RestrictedMatchDomain::Prefilter,
+        "with_deletions",
+        Some(1),
+        "alpha beta",
+    )
+    .await;
+    assert_contains!(observation.plan.as_ref().unwrap(), "MatchCorpus");
+}
+
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 5, 7])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
+#[case::filter(RestrictedMatchDomain::Filter("id != 3"), &[0, 2, 4, 5, 7])]
+#[tokio::test]
+async fn test_fts_9058_deletions_corpus_scores(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
+    let mut observations = Vec::with_capacity(2);
+    for limit in [Some(1), None] {
+        observations.push(
+            restricted_match_observation(&dataset, domain, "with_deletions", limit, "alpha beta")
+                .await,
+        );
+    }
+    for observation in &observations {
+        assert_contains!(observation.plan.as_ref().unwrap(), "MatchCorpus");
+    }
+    // Indexed statistics are those stored at index time, so they still count
+    // deleted row 1; the residual scan is deletion-aware and omits row 6.
+    let corpus: Vec<_> = RESTRICTED_MATCH_CORPUS
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != 6)
+        .collect();
+    assert_restricted_match_oracle(
+        &format!("9058-deletions-scores-{domain:?}-stable-{stable_row_ids}.json"),
+        &corpus,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::indexed_fragment("indexed-fragment", "id <= 2 OR id = 6", &[3, 4, 7])]
+#[case::residual_fragment("residual-fragment", "id >= 5 OR id = 1", &[0, 2, 3, 4])]
+#[tokio::test]
+async fn test_fts_9058_fully_deleted_fragment(
+    #[case] name: &str,
+    #[case] deletion: &str,
+    #[case] expected_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete(deletion).await.unwrap();
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Filter("id >= 0"),
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    assert_restricted_match_membership(
+        &format!("9058-fully-deleted-{name}-stable-{stable_row_ids}.json"),
         expected_ids,
         &observations,
     );
