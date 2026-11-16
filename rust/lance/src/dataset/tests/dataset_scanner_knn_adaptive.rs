@@ -147,8 +147,10 @@ fn rows_for_query(batch: &RecordBatch, query_index: usize) -> RecordBatch {
 
 /// Batch search with adaptive nprobes must return exactly what each query
 /// returns on its own: same initial budget, same late-search stop point, and
-/// the same "fewer than k rows match" shortcut. RQ preserves this through
-/// the per-query fallback until its batch scorer has matching semantics.
+/// the same "fewer than k rows match" shortcut. RQ, whose scores depend on the
+/// query's top-k, runs each query's late search as the single-query path does;
+/// its shared early scan can still keep other rows than single-query search on
+/// larger indexes, as with fixed probes.
 #[rstest]
 #[case::no_filter(None, None)]
 #[case::late_search(Some("i % 97 = 0"), None)]
@@ -174,10 +176,9 @@ async fn test_batch_knn_adaptive_nprobes_matches_single(
     let mut scan = dataset.scan();
     configure_adaptive_scan(&mut scan, &queries, k, filter, maximum_nprobes, true);
     let plan = scan.explain_plan(false).await.unwrap();
-    assert_eq!(
+    assert!(
         plan.contains("ANNIvfBatch"),
-        index_type != "IVF_RQ",
-        "adaptive RQ must preserve the per-query path; other types share scans:\n{plan}"
+        "adaptive batch search must share scans:\n{plan}"
     );
     let batch = scan.try_into_batch().await.unwrap();
 

@@ -3479,11 +3479,9 @@ def test_vector_search_effort(
         scan_stats_callback=batch_stats.append,
     ).to_table()
     assert batch["id"].to_pylist() == actual["id"].to_pylist() * 2
-    # IVF_FLAT shares one scan across the batch, so the two identical queries
-    # load each partition once. Adaptive IVF_RQ searches each query separately.
-    shared_scan = index_type == "IVF_FLAT"
-    batch_probes = probes if shared_scan else probes * 2
-    assert batch_stats[0].all_counts["partitions_searched"] == batch_probes
+    # The batch shares one scan, so the two identical queries load each
+    # partition once.
+    assert batch_stats[0].all_counts["partitions_searched"] == probes
     if metric == "l2" and index_type == "IVF_FLAT":
         captured.clear()
         ds.create_scalar_index("text", "INVERTED")

@@ -26,25 +26,35 @@
 //! to a strict total probe cap across all queries and deltas. Rounds admit whole
 //! queries, so a query's rows do not depend on the rest of the batch unless its
 //! own waves exceed the cap.
+//!
+//! A scorer whose results depend on the rows already in a query's top-k, as
+//! multi-bit RQ's does, gets a different late search: each query searches its
+//! late range the way the single-query path does, sharing one top-k heap across
+//! its partitions (see [`late_scores_depend_on_heap`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt32Array, cast::AsArray};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::ROW_ID;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::minhash_lsh::{MinHashHit, TopHits};
 use lance_index::vector::graph::OrderedFloat;
-use lance_index::vector::{DIST_COL, Query, VectorIndex};
+use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::{DIST_COL, PartitionSearchControl, Query, VectorIndex};
 use lance_select::RowAddrMask;
 use roaring::RoaringBitmap;
 
 use super::adaptive_probe::AutoProbePolicy;
-use super::{AnnIndexMetrics, LateSearchBudget, restrict_to_segment, segment_owns_rows};
+use super::{
+    AnnIndexMetrics, LateSearchBudget, num_rows_in_segment, restrict_to_segment, segment_owns_rows,
+};
 use crate::index::prefilter::DatasetPreFilter;
 
 /// One query's probe plan against one index delta.
@@ -256,6 +266,116 @@ pub(super) async fn search_batch(
         .collect()
 }
 
+/// Whether `index` scores a partition depending on the rows already in the
+/// query's top-k. Multi-bit RQ does: it computes a row's full distance only when
+/// a probabilistic bound on it beats the current k-th distance. Searching each
+/// late partition with a heap of its own, as the shared late search does, then
+/// returns other distances than the single-query path, which keeps one heap
+/// across a query's late partitions.
+fn late_scores_depend_on_heap(index: &dyn VectorIndex) -> bool {
+    index.sub_index_type().1 == QuantizationType::Rabit
+}
+
+/// Late search for a scorer whose results depend on the query's top-k
+/// ([`late_scores_depend_on_heap`]). Each active query searches its late range
+/// in every delta it joins with `search_partitions`, as the single-query path
+/// does, so its partitions share one top-k heap and it stops at the same
+/// partition. Deltas are searched in order; queries run in parallel.
+async fn sequential_late_search(
+    deltas: &[BatchDelta],
+    dim: usize,
+    budget: usize,
+    found: &mut [usize],
+    is_active: &[bool],
+    candidates: &mut [TopHits],
+    metrics: &AnnIndexMetrics,
+) -> DataFusionResult<()> {
+    let searches = (0..candidates.len())
+        .filter(|&query_index| is_active[query_index])
+        .map(|query_index| {
+            let query_found = Arc::new(AtomicUsize::new(found[query_index]));
+            async move {
+                let mut batches = Vec::new();
+                for delta in deltas
+                    .iter()
+                    .filter(|delta| delta.joins_late_search(query_index))
+                {
+                    if query_found.load(Ordering::Relaxed) >= budget {
+                        break;
+                    }
+                    let plan = &delta.plans[query_index];
+                    let mut query = delta.query.clone();
+                    query.key = delta.query.key.slice(query_index * dim, dim);
+                    let control: Arc<dyn PartitionSearchControl> =
+                        Arc::new(BatchLateSearchControl {
+                            found: query_found.clone(),
+                            max_results: budget,
+                            seg_mask: delta.seg_mask.clone(),
+                        });
+                    let index_metrics: Arc<dyn MetricsCollector> =
+                        Arc::new(metrics.index_metrics.clone());
+                    let mut stream = delta
+                        .index
+                        .clone()
+                        .search_partitions(
+                            query,
+                            plan.partitions.clone(),
+                            plan.q_c_dists.clone(),
+                            plan.early_end,
+                            plan.late_end,
+                            delta.pre_filter.clone(),
+                            Some(control),
+                            index_metrics,
+                        )
+                        .await?;
+                    while let Some(batch) = stream.next().await {
+                        metrics.partitions_searched.add(1);
+                        batches.push(restrict_to_segment(batch?, delta.seg_mask.as_deref())?);
+                    }
+                }
+                Ok::<_, DataFusionError>((
+                    query_index,
+                    batches,
+                    query_found.load(Ordering::Relaxed),
+                ))
+            }
+        });
+    let results: Vec<_> = futures::stream::iter(searches)
+        .buffer_unordered(get_num_compute_intensive_cpus().max(1))
+        .try_collect()
+        .await?;
+    for (query_index, batches, query_found) in results {
+        for batch in &batches {
+            append_candidates(batch, &mut candidates[query_index])?;
+        }
+        found[query_index] = query_found;
+    }
+    Ok(())
+}
+
+/// Stops a query's sequential late search at its budget, counting the rows of
+/// each partition that the delta's segment owns, like the single-query path's
+/// late search control.
+struct BatchLateSearchControl {
+    found: Arc<AtomicUsize>,
+    max_results: usize,
+    seg_mask: Option<Arc<RowAddrMask>>,
+}
+
+impl PartitionSearchControl for BatchLateSearchControl {
+    fn should_stop(&self) -> bool {
+        self.found.load(Ordering::Relaxed) >= self.max_results
+    }
+
+    fn record_batch(&self, batch: &RecordBatch) {
+        let num_rows = match self.seg_mask.as_ref() {
+            Some(seg_mask) => num_rows_in_segment(batch, seg_mask),
+            None => batch.num_rows(),
+        };
+        self.found.fetch_add(num_rows, Ordering::Relaxed);
+    }
+}
+
 /// Upper bound on (query, partition) probes issued in one late-search round.
 ///
 /// Each probe copies its query vector into the round's key array and returns up
@@ -443,6 +563,16 @@ pub(super) async fn late_search(
             continue;
         }
         is_active.push(found[query_index] < budget);
+    }
+
+    if deltas
+        .iter()
+        .any(|delta| late_scores_depend_on_heap(delta.index.as_ref()))
+    {
+        return sequential_late_search(
+            deltas, dim, budget, &mut found, &is_active, candidates, metrics,
+        )
+        .await;
     }
 
     let max_wave = get_num_compute_intensive_cpus().max(1);
