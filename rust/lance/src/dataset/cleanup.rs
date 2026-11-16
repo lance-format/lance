@@ -37,6 +37,13 @@
 //! Otherwise we will leave the file unless delete_unverified is set to true.
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
+//!
+//! The age rule is the same for every kind of managed file. Without
+//! delete_unverified, a data file, blob file, deletion file, index file or
+//! transaction file that no manifest has ever referenced is kept while it is
+//! younger than 7 days. It becomes a cleanup candidate once it is older, however
+//! old the retained manifests are. Writers of uncommitted files rely on that
+//! window.
 
 pub mod retention;
 
@@ -1733,11 +1740,11 @@ impl<'a> CleanupTask<'a> {
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
         let unmodified_since = inspection.listing_unmodified_since();
-        // Data files owned by no manifest can be newer than the retained
-        // manifest floor. List through the moving verification threshold so
-        // they become candidates once old enough, or list all data files when
-        // the caller explicitly permits deleting unverified files.
-        let data_unmodified_since = if self.policy.delete_unverified {
+        // Files owned by no manifest can be newer than the retained manifest
+        // floor. List through the moving verification threshold so they
+        // become candidates once old enough, or list all of them when the
+        // caller explicitly permits deleting unverified files.
+        let orphan_unmodified_since = if self.policy.delete_unverified {
             None
         } else {
             unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
@@ -1747,18 +1754,18 @@ impl<'a> CleanupTask<'a> {
             // so a retained-manifest cutoff could hide them indefinitely. Live
             // paths are revalidated against the commit handler instead.
             build_listing_stream(self.dataset.versions_dir(), None),
-            build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
+            build_listing_stream(self.dataset.transactions_dir(), orphan_unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), orphan_unmodified_since),
             build_listing_stream(
                 self.dataset.base.clone().join("_blobs"),
-                data_unmodified_since,
+                orphan_unmodified_since,
             ),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
             // the proof when the old manifests are removed by this cleanup pass.
             build_listing_stream(self.dataset.indices_dir(), None),
-            build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.deletions_dir(), orphan_unmodified_since),
         ];
         if collect_frag_reuse_maps {
             // Stable-partition row maps, referenced by map id from tagged FRI

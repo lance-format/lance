@@ -68,6 +68,59 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     // Appends leave every fragment referenced by the latest version.
     assert_eq!(after_count.num_data_files, 3);
 }
+
+#[rstest]
+#[case::data("data/00000000-0000-0000-0000-00000000000a.lance")]
+#[case::deletion("_deletions/0-1-42.arrow")]
+#[case::index_directory("_indices/00000000-0000-0000-0000-00000000000b/index.idx")]
+#[case::blobs_payload("_blobs/orphan.blob")]
+#[case::blob_sidecar("data/00000000-0000-0000-0000-00000000000c/0.blob")]
+#[case::transaction("_transactions/2-00000000-0000-0000-0000-00000000000d.txn")]
+#[tokio::test]
+async fn cleanup_removes_a_never_referenced_file_only_after_the_grace_period(
+    #[case] orphan_relative_path: &str,
+) {
+    // The retained first version keeps the retained-manifest floor older
+    // than the orphan, so only the age rule can make it a candidate.
+    MockClock::set_system_time(std::time::Duration::from_secs(0));
+    let fixture = MockDatasetFixture::try_new().unwrap();
+    fixture.create_some_data().await.unwrap();
+    fixture.append_some_data().await.unwrap();
+    let row_count = fixture.count_rows().await.unwrap();
+
+    let written_at = TimeDelta::try_days(1).unwrap();
+    MockClock::set_system_time(written_at.to_std().unwrap());
+    let dataset = fixture.open().await.unwrap();
+    let orphan = Path::parse(format!("{}/{orphan_relative_path}", dataset.base)).unwrap();
+    dataset.object_store.put(&orphan, b"orphan").await.unwrap();
+    drop(dataset);
+    // Checked on disk because every store request restamps the mock mtime.
+    let orphan_on_disk = std::path::Path::new(fixture.tmpdir.as_str())
+        .join("my_db")
+        .join(orphan_relative_path);
+
+    let grace = TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).unwrap();
+    let one_second = TimeDelta::try_seconds(1).unwrap();
+    MockClock::set_system_time((written_at + grace - one_second).to_std().unwrap());
+    let removed = fixture
+        .run_cleanup(utc_now() - TimeDelta::try_days(30).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(removed.old_versions, 0);
+    assert_eq!(removed.bytes_removed, 0);
+    assert!(orphan_on_disk.exists());
+
+    MockClock::set_system_time((written_at + grace + one_second).to_std().unwrap());
+    let removed = fixture
+        .run_cleanup(utc_now() - TimeDelta::try_days(30).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(removed.old_versions, 0);
+    assert!(!orphan_on_disk.exists());
+    assert_eq!(fixture.count_files().await.unwrap().num_manifest_files, 2);
+    assert_eq!(fixture.count_rows().await.unwrap(), row_count);
+}
+
 #[tokio::test]
 async fn auto_cleanup_old_versions() {
     // Every n commits, all versions older than T should be deleted.
