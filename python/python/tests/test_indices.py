@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 from lance.indices import IndicesBuilder, IvfModel, PqModel
+from lance.torch import preferred_device
 
 DIMENSION = 128
 NUM_SUBVECTORS = 8
@@ -495,6 +496,20 @@ def test_assign_partitions(small_rand_dataset, small_rand_ivf):
         for part_id in part_ids:
             assert part_id.as_py() < 100
     assert len(found_row_ids) == small_rand_dataset.count_rows()
+
+
+@pytest.mark.gpu
+def test_assign_partitions_float64_on_accelerator(tmp_path):
+    data = np.random.default_rng(0).standard_normal(1024 * 16)
+    vectors = pa.FixedSizeListArray.from_arrays(pa.array(data), 16)
+    ds = lance.write_dataset(pa.table({"vectors": vectors}), tmp_path)
+    builder = IndicesBuilder(ds, "vectors")
+    accelerator = preferred_device().type
+
+    ivf = builder.train_ivf(4, accelerator=accelerator)
+    partitions_uri = builder.assign_ivf_partitions(ivf, accelerator=accelerator)
+
+    assert lance.dataset(partitions_uri).count_rows() == ds.count_rows()
 
 
 @pytest.mark.cuda

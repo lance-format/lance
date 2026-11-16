@@ -462,6 +462,7 @@ def compute_partitions(
     str
         The absolute path of the partition dataset.
     """
+    from .torch import _to_device
     from .torch.data import LanceDataset as TorchDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
@@ -527,7 +528,9 @@ def compute_partitions(
                     ids = torch.arange(id_offset, id_offset + vecs.size(0))
                     id_offset += vecs.size(0)
 
-                vecs = vecs.to(kmeans.device).reshape(-1, kmeans.centroids.shape[1])
+                vecs = _to_device(vecs, kmeans.device).reshape(
+                    -1, kmeans.centroids.shape[1]
+                )
 
                 partitions = kmeans.transform(vecs)
 
@@ -659,6 +662,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
     str
         The absolute path of the ivfpq codes dataset, as precomputed partition buffers.
     """
+    from .torch import _to_device
     from .torch.data import LanceDataset as TorchDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
@@ -704,10 +708,8 @@ def one_pass_assign_ivf_pq_on_accelerator(
         with torch.no_grad():
             first_iter = True
             for batch in loader:
-                vecs = (
-                    batch[column]
-                    .to(ivf_kmeans.device)
-                    .reshape(-1, ivf_kmeans.centroids.shape[1])
+                vecs = _to_device(batch[column], ivf_kmeans.device).reshape(
+                    -1, ivf_kmeans.centroids.shape[1]
                 )
 
                 partitions = ivf_kmeans.transform(vecs)

@@ -9,6 +9,7 @@ import pyarrow as pa
 import pytest
 
 torch = pytest.importorskip("torch")
+from lance.torch import preferred_device  # noqa: E402
 from lance.torch.bench_utils import ground_truth, sort_tensors  # noqa: E402
 
 
@@ -63,3 +64,16 @@ def test_ground_truth(tmp_path: Path):
 
     assert min(boundary_gaps) > 8e-3, "fixture is too close to the top-k boundary"
     np.testing.assert_array_equal(np.stack(expected), gt.cpu().numpy())
+
+
+@pytest.mark.gpu
+def test_ground_truth_float64_on_accelerator(tmp_path: Path):
+    data = np.random.default_rng(0).standard_normal((256, 8))
+    fsl = pa.FixedSizeListArray.from_arrays(data.reshape(-1), 8)
+    ds = lance.write_dataset(pa.Table.from_arrays([fsl], ["vec"]), tmp_path)
+
+    gt = ground_truth(
+        ds, "vec", data[:4], k=1, batch_size=64, device=preferred_device().type
+    )
+
+    assert gt.reshape(-1).tolist() == [0, 1, 2, 3]
