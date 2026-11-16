@@ -266,9 +266,22 @@ impl RowAddrMask {
     /// at every branch that produces rows, which is how branches get missed.
     pub fn intersect(self, other: Self) -> Self {
         match (self, other) {
+            // Owning both block lists lets the union move fragments over.
+            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
+            // Narrow the allow list, whichever side it is on.
+            (block @ Self::BlockList(_), allow) => allow.intersect_with(&block),
+            (lhs, rhs) => lhs.intersect_with(&rhs),
+        }
+    }
+
+    /// [`Self::intersect`] with `other` borrowed: `self` is narrowed in place
+    /// where it can be, so folding shared masks into an owned one allocates
+    /// nothing per step.
+    pub fn intersect_with(self, other: &Self) -> Self {
+        match (self, other) {
             (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
-            (Self::AllowList(a), Self::BlockList(b)) => Self::AllowList(a).also_block(b),
-            (Self::BlockList(a), Self::AllowList(b)) => Self::AllowList(b).also_block(a),
+            (Self::AllowList(a), Self::BlockList(b)) => Self::AllowList(a - b),
+            (Self::BlockList(a), Self::AllowList(b)) => Self::AllowList(b.difference(&a)),
             (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
         }
     }
@@ -1625,6 +1638,7 @@ mod tests {
             (&block, &other_block),
         ] {
             assert_eq!(a.intersect_ref(b), a.clone().intersect(b.clone()));
+            assert_eq!(a.intersect_ref(b), a.clone().intersect_with(b));
         }
 
         // The expected masks spelled out, so that the two implementations

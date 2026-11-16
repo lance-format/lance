@@ -543,7 +543,7 @@ impl PreFilter for DatasetPreFilter {
                 return first;
             };
             let combined = masks.fold(first.intersect_ref(&second), |combined, mask| {
-                combined.intersect_ref(&mask)
+                combined.intersect_with(&mask)
             });
             Arc::new(combined)
         });
