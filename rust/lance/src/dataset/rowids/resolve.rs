@@ -1826,7 +1826,10 @@ mod tests {
         // array repeats an ID inside one fragment; hiding the first copy with
         // a deletion must not turn a source-build error into a successful retry.
         let mut fragments = dataset.manifest.fragments.as_ref().clone();
-        let sequence = RowIdSequence::from(&[0, 0, 2, 3, 4, 5, 6, 7, 8, 9][..]);
+        // Keep a descending pair so the infallible constructor preserves the
+        // invalid duplicates in an Array instead of choosing a range encoding.
+        let row_ids = [0, 0, 3, 2, 4, 5, 6, 7, 8, 9];
+        let sequence = RowIdSequence::from(row_ids.as_slice());
         assert!(matches!(sequence.segments(), [U64Segment::Array(_)]));
         let lineage = RowLineage {
             row_ids: sequence,
@@ -1849,6 +1852,10 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
+        let stored = read_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(stored.iter().collect::<Vec<_>>(), row_ids);
         let error = resolve_row_ids(&dataset, &[0], with_deletions)
             .await
             .unwrap_err();
