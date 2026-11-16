@@ -133,6 +133,17 @@ impl AddDataFile {
         }
         let bound_fields = file.fields.clone();
         fragment.files.push(file);
+        // New values supersede an overlay still shadowing the field, which no
+        // tombstone precedes them to drop when the fragment had no file for it.
+        // A struct parent listed only to place a new child is left out, the
+        // same as for index coverage below.
+        if self.data_change {
+            let overlaid: Vec<u32> = exclusive_fields
+                .iter()
+                .filter_map(|id| u32::try_from(*id).ok())
+                .collect();
+            crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+        }
         for field_id in bound_fields.iter() {
             state.note_rebind(fragment_id, *field_id, self.data_change)?;
         }
