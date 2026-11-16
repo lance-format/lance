@@ -700,7 +700,7 @@ mod x86 {
 
     use crate::distance::{BatchKernel, PairKernel};
     use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::x86::{fixed_width_batch, hsum256_ps};
+    use crate::simd::x86::{fixed_width_batch, fixed_width_rows, hsum256_ps};
     use crate::simd::{FloatSimd, SIMD};
 
     lance_core::target_kernel! {
@@ -898,6 +898,12 @@ mod x86 {
             output: &mut [f32],
         ) {
             // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
+            if let Ok(key) = <&[f64; 8]>::try_from(x) {
+                return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx512(x, y));
+            }
+            if let Ok(key) = <&[f64; 16]>::try_from(x) {
+                return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx512(x, y));
+            }
             let x = &x[..dimension];
             for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *product = dot_f64_avx512(x, y);
@@ -915,6 +921,12 @@ mod x86 {
             output: &mut [f32],
         ) {
             // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
+            if let Ok(key) = <&[f64; 8]>::try_from(x) {
+                return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx_fma(x, y));
+            }
+            if let Ok(key) = <&[f64; 16]>::try_from(x) {
+                return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx_fma(x, y));
+            }
             let x = &x[..dimension];
             for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *product = dot_f64_avx_fma(x, y);
@@ -932,6 +944,12 @@ mod x86 {
             output: &mut [f32],
         ) {
             // See `l2_batch_f64_avx512` in `l2.rs` for slicing the key.
+            if let Ok(key) = <&[f64; 8]>::try_from(x) {
+                return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx(x, y));
+            }
+            if let Ok(key) = <&[f64; 16]>::try_from(x) {
+                return fixed_width_rows(key, batch, output, |x, y| dot_f64_avx(x, y));
+            }
             let x = &x[..dimension];
             for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *product = dot_f64_avx(x, y);
@@ -1402,8 +1420,8 @@ mod tests {
 
     /// Every host-supported f64 kernel must agree with an f64 reference, and
     /// each batch kernel must match its tier's pair kernel bit for bit.
-    /// Prefixes of length 0 to 3 are all tail, and 8 and 16 pin the portable
-    /// batch kernel's PQ-width fast paths regardless of the generated dimension.
+    /// Prefixes of length 0 to 3 are all tail, and 8 and 16 pin the batch
+    /// kernels' PQ-width fast paths regardless of the generated dimension.
     /// A longer second input checks that each pair kernel reads only the
     /// shorter length.
     #[rstest::rstest]

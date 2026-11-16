@@ -147,6 +147,26 @@ pub fn fixed_width_batch<const D: usize>(
     }
 }
 
+/// Writes `pair(key, y)` for each `D`-wide vector `y` of `batch` into the
+/// matching element of `output`.
+///
+/// f64 batch kernels call this for the common PQ sub-vector widths. With `D`
+/// constant, `pair` inlines fully unrolled with no tail, so each vector is
+/// straight-line code instead of the generic kernel's loop and tail stages,
+/// whose speed swung by up to 25% with code alignment. `pair` is the
+/// generic-width kernel, so the result is unchanged.
+#[inline(always)]
+pub fn fixed_width_rows<T, const D: usize>(
+    key: &[T; D],
+    batch: &[T],
+    output: &mut [f32],
+    pair: impl Fn(&[T], &[T]) -> f32,
+) {
+    for (distance, y) in output.iter_mut().zip(batch.as_chunks::<D>().0) {
+        *distance = pair(key, y);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
