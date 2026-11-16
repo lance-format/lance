@@ -43,6 +43,9 @@ use crate::{
 
 mod admitted;
 mod concat;
+mod interleave;
+
+pub use interleave::try_interleave_binary_in;
 
 /// A data block with no buffers where everything is null
 ///
