@@ -8,7 +8,7 @@ use std::{
 
 use arrow_array::{StructArray, cast::AsArray};
 use lance_core::{Result, utils::allocation::Reservation, utils::tokio::spawn_cpu};
-use lance_encoding::data::try_interleave_nested_binary_in;
+use lance_encoding::data::{try_interleave_nested_binary_in, try_splice_struct_in};
 
 use super::*;
 use crate::reader::{FullZipScan, FullZipScanOutcome};
@@ -388,6 +388,119 @@ async fn admitted_transform_assembles_structs(
     };
     assert_eq!(rows, 3..6);
     assert_eq!(batch.column(0).to_data(), expected.slice(3, 3).to_data());
+    drop(batch);
+    assert_eq!(budget.reserved(), 0);
+}
+
+fn splice_decoded_child(
+    _rows: Range<u64>,
+    batch: RecordBatch,
+    workspace: &mut Reservation,
+) -> Result<Option<RecordBatch>> {
+    let indices = (0..batch.num_rows())
+        .map(|row| (0, (row + 1) % batch.num_rows()))
+        .collect::<Vec<_>>();
+    let Some(replacement) =
+        try_interleave_nested_binary_in(&[batch.column(1).as_ref()], &indices, workspace)?
+    else {
+        return Ok(None);
+    };
+    let base = struct_spine(struct_spine(batch.column(0).clone()));
+    let Some(output) = try_splice_struct_in(base.as_struct(), &[0, 0], replacement, workspace)?
+    else {
+        return Ok(None);
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        output.data_type().clone(),
+        true,
+    )]));
+    Ok(Some(RecordBatch::try_new(schema, vec![output])?))
+}
+
+fn expected_splice(rows: Range<usize>) -> ArrayRef {
+    let base = array(0, 1).slice(rows.start, rows.len());
+    let overlay = array(17, 1).slice(rows.start, rows.len());
+    let indices = (0..rows.len())
+        .map(|row| (0, (row + 1) % rows.len()))
+        .collect::<Vec<_>>();
+    let replacement = arrow_select::interleave::interleave(&[overlay.as_ref()], &indices).unwrap();
+    // Independent ordinary Arrow validity union; the source bitmap may not mask
+    // a replacement null after selection changes its position.
+    let mask = NullBuffer::union(base.nulls(), replacement.nulls());
+    let inner: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(Field::new(
+            "frames",
+            replacement.data_type().clone(),
+            false,
+        ))]
+        .into(),
+        vec![replacement],
+        mask.clone(),
+    ));
+    Arc::new(StructArray::new(
+        vec![Arc::new(Field::new(
+            "frames",
+            inner.data_type().clone(),
+            false,
+        ))]
+        .into(),
+        vec![inner],
+        mask,
+    ))
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_transform_splices_structs(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+) {
+    let budget = AllocationBudget::new(WORKSPACE);
+    let (_left_fs, _right_fs, mut scan, _) = merged_fixture(version, lite, 1, budget.clone()).await;
+    let FullZipScanOutcome::Batch { rows, batch } = scan
+        .try_next_with_transform(splice_decoded_child)
+        .await
+        .unwrap()
+    else {
+        panic!("read, child assembly and validity splice must fit one workspace")
+    };
+    assert_eq!(rows, 0..3);
+    assert_eq!(batch.column(0).to_data(), expected_splice(0..3).to_data());
+    let outer = batch.column(0).as_struct();
+    let inner = outer.column(0).as_struct();
+    let parent_alias = outer.nulls().unwrap().buffer().clone();
+    let child_alias = inner.nulls().unwrap().buffer().clone();
+    let payload_alias = inner
+        .column(0)
+        .as_list::<i32>()
+        .values()
+        .as_binary::<i64>()
+        .values()
+        .slice_with_length(0, 1);
+    drop(batch);
+    let retained = budget.reserved();
+    assert!(retained > 2);
+    assert!(matches!(
+        scan.try_next().await.unwrap(),
+        FullZipScanOutcome::NeedsCapacity
+    ));
+    assert_eq!(scan.position(), 3);
+    drop(parent_alias);
+    assert_eq!(budget.reserved(), retained - 1);
+    drop(child_alias);
+    assert_eq!(budget.reserved(), retained - 2);
+    drop(payload_alias);
+    assert_eq!(budget.reserved(), 0);
+    let FullZipScanOutcome::Batch { rows, batch } = scan
+        .try_next_with_transform(splice_decoded_child)
+        .await
+        .unwrap()
+    else {
+        panic!("draining aliases must permit the next operation")
+    };
+    assert_eq!(rows, 3..6);
+    assert_eq!(batch.column(0).to_data(), expected_splice(3..6).to_data());
     drop(batch);
     assert_eq!(budget.reserved(), 0);
 }

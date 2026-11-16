@@ -25,12 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify struct assembly and admitted file composition
+      - name: Verify charged struct splicing and admitted file composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib data::interleave:: -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib admitted_transform_assembles_structs -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib data::struct_splice:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib admitted_transform_splices_structs -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --doc try_splice_struct_in -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |

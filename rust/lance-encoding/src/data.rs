@@ -44,8 +44,10 @@ use crate::{
 mod admitted;
 mod concat;
 mod interleave;
+mod struct_splice;
 
 pub use interleave::{try_interleave_binary_in, try_interleave_nested_binary_in};
+pub use struct_splice::try_splice_struct_in;
 
 /// A data block with no buffers where everything is null
 ///
