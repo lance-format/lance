@@ -32,7 +32,7 @@ enum Leaf {
 /// result on error/cancellation. This accounts input scratch, not visitor output
 /// or transport/cache allocations. There is no secondary admission or credit wait.
 #[derive(Clone, Debug)]
-pub(crate) struct WindowSequence {
+pub struct WindowSequence {
     leaf: Leaf,
     payload: Range<u64>,
     count: u64,
