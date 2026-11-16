@@ -179,25 +179,23 @@ async fn open_cold(uri: &str) -> Dataset {
 /// Write the base dataset and its index, or reuse them from an earlier run.
 /// Returns the base version every scenario restores.
 async fn prepare_base(config: &Config, uri: &str) -> u64 {
-    if let Ok(dataset) = Dataset::open(uri).await
-        && dataset.count_rows(None).await.unwrap() == config.rows
-        && dataset
-            .load_index_by_name(INDEX_NAME)
-            .await
-            .unwrap()
-            .is_some()
-    {
-        let version = dataset.version().version;
-        println!("reusing base dataset {uri} at version {version}");
+    if let Ok(dataset) = Dataset::open(uri).await {
         // The first version with the index is the base; later versions are
-        // scenario leftovers.
+        // scenario leftovers with rows deleted.
         for v in dataset.versions().await.unwrap() {
             let at = dataset.checkout_version(v.version).await.unwrap();
             if at.load_index_by_name(INDEX_NAME).await.unwrap().is_some() {
+                let rows = at.count_rows(None).await.unwrap();
+                assert_eq!(
+                    rows, config.rows,
+                    "base dataset {uri} has {rows} rows, not --rows {}; pass another --uri",
+                    config.rows
+                );
+                println!("reusing base dataset {uri} at version {}", v.version);
                 return v.version;
             }
         }
-        unreachable!("an indexed version exists");
+        panic!("dataset {uri} has no version with index {INDEX_NAME}; pass another --uri");
     }
 
     let mut rng = SmallRng::seed_from_u64(7);

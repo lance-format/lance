@@ -223,17 +223,31 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     let storage = old_storage.remap(mapping)?;
     let graph = index.read_sub_index_batch(partition_id, None, None).await?;
 
-    let mut new_ids = Vec::with_capacity(old_storage.len());
+    let mut remapped_ids = Vec::with_capacity(old_storage.len());
     let mut num_kept = 0u32;
     for row_id in old_storage.row_ids() {
         if matches!(mapping.get(*row_id), Some(None)) {
-            new_ids.push(None);
+            remapped_ids.push(None);
         } else {
-            new_ids.push(Some(num_kept));
+            remapped_ids.push(Some(num_kept));
             num_kept += 1;
         }
     }
-    let num_deleted = old_storage.len() - num_kept as usize;
+    // The index opens through the fragment-reuse index, whose deletions
+    // `old_storage` already dropped while the graph on disk still holds every
+    // node. Compose both removals so the graph is repaired once instead of
+    // rebuilt.
+    let new_ids: Vec<Option<u32>> = match index
+        .dropped_row_positions(partition_id, old_storage.len(), None)
+        .await?
+    {
+        Some(loaded) => loaded
+            .into_iter()
+            .map(|position| position.and_then(|position| remapped_ids[position as usize]))
+            .collect(),
+        None => remapped_ids,
+    };
+    let num_deleted = new_ids.len() - num_kept as usize;
     // Repairing or rebuilding the graph scores rows pairwise, staged from the centroid.
     let staged = || match index.ivf_model().centroid(partition_id) {
         Some(centroid) => storage.clone().with_centroid(centroid.as_ref()),

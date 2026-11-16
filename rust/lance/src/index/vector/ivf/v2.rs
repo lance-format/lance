@@ -2481,7 +2481,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     ///
     /// Only a row-ID remapping drops rows, so this reads the partition's row
     /// IDs again only while deferred compaction has deleted some of them.
-    async fn dropped_row_positions(
+    pub(crate) async fn dropped_row_positions(
         &self,
         partition_id: usize,
         storage_rows: usize,
