@@ -718,6 +718,7 @@ async fn test_create_data_file_checks_column_types(
                 replacements: vec![crate::dataset::transaction::DataReplacementGroup(
                     0, data_file,
                 )],
+                data_change: true,
             },
             Some(read_version),
             None,
