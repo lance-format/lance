@@ -11,7 +11,8 @@ between a base and head commit and reports files the change makes larger:
 
 Changes that shrink a module are never flagged, so a PR that splits an
 oversized module always passes. Entries in the exceptions list that are no
-longer over the fail threshold are errors, so the list only shrinks.
+longer over the fail threshold are errors, and so are entries the change adds
+to it, so the list only shrinks.
 
 Results are emitted as GitHub workflow annotations, plus an optional markdown
 summary. Only git objects are read.
@@ -163,7 +164,7 @@ def annotation(finding, warn_lines=WARN_LINES, fail_bytes=FAIL_BYTES):
     )
 
 
-def render_summary(findings, stale):
+def render_summary(findings, stale, added=()):
     lines = ["### Rust module size check", ""]
     if findings:
         lines += [
@@ -179,9 +180,11 @@ def render_summary(findings, stale):
                 f"{change.after.bytes / 1000:,.0f} |"
             )
         lines.append("")
+    for path in added:
+        lines.append(f":x: `{path}` is new in `{EXCEPTIONS_FILE}`; split it instead.")
     for path in stale:
         lines.append(f":x: Remove `{path}` from `{EXCEPTIONS_FILE}`.")
-    if not findings and not stale:
+    if not findings and not stale and not added:
         lines.append(":white_check_mark: No modules grew past the size limits.")
     return "\n".join(lines) + "\n"
 
@@ -203,9 +206,23 @@ def main(argv=None):
     # Read the list from the same tree as the module sizes, not the working
     # tree, so the two cannot disagree when the checkout differs from `head`.
     exceptions = parse_exceptions(git("show", f"{args.head}:{EXCEPTIONS_FILE}"))
+    # The list is part of the change under review, so an entry it adds must not
+    # excuse the change's own growth. Compare with the merge base, as for the
+    # module sizes, so entries the base branch removed since are not blamed on
+    # a head that has not merged them yet.
+    merge_base = git("merge-base", args.base, args.head).strip()
+    previous = parse_exceptions(git("show", f"{merge_base}:{EXCEPTIONS_FILE}"))
+    added = [path for path in exceptions if path not in previous]
+    excepted = {path for path in exceptions if path in previous}
+    for path in added:
+        print(
+            f"::error file={EXCEPTIONS_FILE},line={exceptions[path]},"
+            f"title=New module size exception::{path} is not in the list on the "
+            "base branch. Do not add new entries: split the module instead."
+        )
 
     changes = changed_rust_files(args.base, args.head)
-    findings = evaluate(changes, exceptions, args.warn_lines, args.fail_bytes)
+    findings = evaluate(changes, excepted, args.warn_lines, args.fail_bytes)
     for finding in findings:
         level, title, message = annotation(finding, args.warn_lines, args.fail_bytes)
         print(f"::{level} file={finding.change.path},title={title}::{escape(message)}")
@@ -221,9 +238,9 @@ def main(argv=None):
 
     if args.summary:
         with open(args.summary, "a") as f:
-            f.write(render_summary(findings, stale))
+            f.write(render_summary(findings, stale, added))
 
-    return 1 if stale or any(f.failed for f in findings) else 0
+    return 1 if added or stale or any(f.failed for f in findings) else 0
 
 
 if __name__ == "__main__":

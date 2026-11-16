@@ -16,7 +16,7 @@ use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
         CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        RewriteResult, SourceBudgetMode, commit_compaction, compact_files, plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -42,6 +42,11 @@ fn parse_compaction_options(
             }
             "max_bytes_per_file" => {
                 opts.max_bytes_per_file = value.extract()?;
+            }
+            "min_bytes_per_file" => {
+                if let Some(bytes) = value.extract::<Option<usize>>()? {
+                    opts.min_bytes_per_file = Some(bytes);
+                }
             }
             "materialize_deletions" => {
                 opts.materialize_deletions = value.extract()?;
@@ -82,6 +87,13 @@ fn parse_compaction_options(
             "max_source_bytes" => {
                 opts.max_source_bytes = value.extract()?;
             }
+            "source_budget_mode" => {
+                let mode_str: Option<String> = value.extract()?;
+                if let Some(mode_str) = mode_str {
+                    opts.source_budget_mode = SourceBudgetMode::try_from(mode_str.as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                }
+            }
             "excluded_fragment_ids" => {
                 opts.excluded_fragment_ids =
                     value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
@@ -104,18 +116,16 @@ fn parse_compaction_options(
     Ok(opts)
 }
 
-fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
+pub(crate) fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
     let ds = dataset.getattr("_ds")?;
     Ok(ds.cast::<Dataset>()?.clone())
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
-    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
-    let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
-        PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
-    })?;
-
-    fragment_metadata.call_method1("from_json", (fragment_json,))
+    // Build the dataclass directly. The JSON form of a fragment describes
+    // overlay coverage differently from the Python dataclass, so a round-trip
+    // fails on any fragment that carries overlays.
+    PyLance(fragment).into_pyobject(py)
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]

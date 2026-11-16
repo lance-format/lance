@@ -11,9 +11,36 @@ use lance_index::{
 };
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Error, Result};
+
+/// Statistics for one physical index segment, collected at a dataset read version.
+///
+/// The payload is opaque to the aggregation API: callers may serialize it, move it
+/// to another process, and aggregate it with
+/// [`DatasetIndexExt::index_statistics_from_segments`] without the payload being
+/// recomputed. Values produced by different index types are not portable between
+/// those types.
+///
+/// ```
+/// # use lance::index::IndexSegmentStatistics;
+/// # fn round_trip(statistics: &IndexSegmentStatistics) -> serde_json::Result<IndexSegmentStatistics> {
+/// let json = serde_json::to_string(statistics)?;
+/// serde_json::from_str(&json)
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexSegmentStatistics {
+    /// Manifest read version, not the segment's build version.
+    pub read_version: u64,
+    pub index_uuid: Uuid,
+    /// Empty for natively maintained segments with no fragment coverage.
+    pub index_type_uri: String,
+    /// Index-specific payload; `{}` for natively maintained segments with no fragment coverage.
+    pub statistics: serde_json::Value,
+}
 
 /// A single physical segment of a logical index.
 ///
@@ -26,11 +53,10 @@ pub struct IndexSegment {
     uuid: Uuid,
     /// The fragments covered by this segment.
     fragment_bitmap: RoaringBitmap,
-    /// Field IDs whose physical values are encoded in this segment.
+    /// Field IDs whose physical values are encoded in this segment, besides any
+    /// that only `covering_fields` lists.
     fields: Vec<i32>,
-    /// Field IDs whose values this segment carries but is not keyed on.
-    ///
-    /// Always the trailing entries of `fields`.
+    /// Field IDs whose values this segment carries.
     covering_fields: Vec<i32>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
@@ -112,14 +138,16 @@ impl IndexSegment {
         &mut self.fragment_bitmap
     }
 
-    /// Return the field IDs whose values are encoded in this segment.
+    /// Return the field IDs whose values are encoded in this segment, besides any
+    /// that only [`Self::covering_fields`] lists.
     pub fn fields(&self) -> &[i32] {
         &self.fields
     }
 
-    /// Return the fields whose values this segment carries but is not keyed on.
+    /// Return the fields whose values this segment carries.
     ///
-    /// Always the trailing entries of [`Self::fields`].
+    /// Read against [`Self::fields`] as [`IndexMetadata::covering_fields`]
+    /// describes.
     pub fn covering_fields(&self) -> &[i32] {
         &self.covering_fields
     }
@@ -127,16 +155,19 @@ impl IndexSegment {
     /// Return the single column this segment is keyed on, or `None` when it is
     /// keyed on several -- a genuinely composite index -- or on none at all.
     ///
-    /// Mirrors [`IndexMetadata::keyed_field`], including its fail-closed
-    /// behavior on a declaration longer than [`Self::fields`]: a segment comes
-    /// from a caller (a distributed build's output, say) that this build never
-    /// validated.
+    /// Reads the keys as [`IndexMetadata::keyed_field`] does, so a segment
+    /// commits under the column its manifest entry is read back keyed on.
     pub fn keyed_field(&self) -> Option<i32> {
-        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
-        match &self.fields[..keyed] {
+        match IndexMetadata::keyed_fields_of(&self.fields, &self.covering_fields) {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    pub(crate) fn declares_same_fields(&self, other: &Self) -> bool {
+        IndexMetadata::keyed_fields_of(&self.fields, &self.covering_fields)
+            == IndexMetadata::keyed_fields_of(&other.fields, &other.covering_fields)
+            && self.covering_fields == other.covering_fields
     }
 
     /// Return the serialized index details for this segment.
@@ -336,10 +367,11 @@ pub trait DatasetIndexExt {
 
     /// Read the indices of this Dataset version that this build can use.
     ///
-    /// An index whose declared type has no reader in this build, or whose format
-    /// version is newer than this build supports, is omitted: it is still in the
-    /// manifest and still belongs to the dataset, but nothing here can decode
-    /// it. Code deciding what the *next* manifest should say must not use this
+    /// An index whose declared type has no reader in this build, whose format
+    /// version is newer than this build supports, or whose fields are reserved
+    /// and unsupported is omitted: it is still in the manifest and still belongs
+    /// to the dataset, but this build cannot use it. Code deciding what the *next*
+    /// manifest should say must not use this
     /// list - it would drop what it omits.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
@@ -405,6 +437,62 @@ pub trait DatasetIndexExt {
 
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    /// Collect statistics for physical segments of an index.
+    ///
+    /// Returns results in UUID request order at the current manifest version.
+    /// UUIDs must be nonempty, unique, and belong to `index_name`; system indices
+    /// are unsupported. The returned payloads can be aggregated by
+    /// [`Self::index_statistics_from_segments`] on another dataset instance that
+    /// reads the same version and index segments.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::DatasetIndexExt};
+    /// # async fn collect(dataset: &Dataset) -> Result<()> {
+    /// let segments = dataset.load_indices_by_name("vector_idx").await?;
+    /// let uuids: Vec<_> = segments.iter().map(|segment| segment.uuid).collect();
+    /// let statistics = dataset.index_segment_statistics("vector_idx", &uuids).await?;
+    /// let json = dataset
+    ///     .index_statistics_from_segments("vector_idx", statistics)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn index_segment_statistics(
+        &self,
+        _index_name: &str,
+        _index_uuids: &[Uuid],
+    ) -> Result<Vec<IndexSegmentStatistics>> {
+        Err(Error::not_supported(
+            "segment statistics are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Aggregate statistics collected from every physical segment of an index.
+    ///
+    /// Requires exactly one result per segment from this dataset and read version.
+    /// Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+    /// Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::{DatasetIndexExt, IndexSegmentStatistics}};
+    /// # async fn aggregate(dataset: &Dataset, stats: Vec<IndexSegmentStatistics>) -> Result<()> {
+    /// let json = dataset
+    ///     .index_statistics_from_segments("vector_idx", stats)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn index_statistics_from_segments(
+        &self,
+        _index_name: &str,
+        _segment_statistics: Vec<IndexSegmentStatistics>,
+    ) -> Result<String> {
+        Err(Error::not_supported(
+            "segment statistics aggregation is not supported by this dataset implementation"
+                .to_owned(),
+        ))
+    }
 
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(
@@ -485,14 +573,14 @@ mod tests {
         assert_eq!(segment.dataset_version(), 42);
     }
 
-    /// Segments arrive from callers this build never validated, so the keyed
-    /// prefix must fail closed on a declaration longer than `fields` rather than
-    /// underflow, exactly as [`IndexMetadata::keyed_field`] does.
     #[rstest]
     #[case::not_covered(vec![7], vec![], Some(7))]
     #[case::covered(vec![7, 11], vec![11], Some(7))]
     #[case::composite(vec![7, 11], vec![], None)]
-    #[case::malformed_longer_than_fields(vec![7], vec![11, 13], None)]
+    #[case::keys_only(vec![7], vec![11, 13], Some(7))]
+    #[case::carries_its_key(vec![7], vec![7, 11], Some(7))]
+    #[case::carries_its_leading_key(vec![7, 11], vec![7], None)]
+    #[case::no_fields(vec![], vec![11], None)]
     fn test_index_segment_keyed_field(
         #[case] fields: Vec<i32>,
         #[case] covering_fields: Vec<i32>,
@@ -512,6 +600,7 @@ mod tests {
         );
 
         assert_eq!(segment.keyed_field(), expected);
+        assert_eq!(segment.into_metadata("idx").keyed_field(), expected);
     }
 
     /// A covering declaration must survive the metadata -> segment -> metadata

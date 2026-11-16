@@ -26,7 +26,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::index::append::SeedHarvester;
-use crate::index::scalar::{TrainingRows, scan_training_data};
+use crate::index::scalar::{TrainingRows, TrainingScanOptions, scan_training_data};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
@@ -366,8 +366,11 @@ fn scan_batch<'a>(
             column,
             criteria,
             Some(TrainingRows::Fragments(fragments)),
-            masked.then_some(mask),
-            Some(batch_rows),
+            TrainingScanOptions {
+                physical_rows: masked.then_some(mask),
+                expected_rows: Some(batch_rows),
+                ..Default::default()
+            },
         )
         .await?;
         let scanned = train_zonemap_scan(

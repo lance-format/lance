@@ -1,0 +1,13 @@
+[package]
+name = "lance-proto-codegen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+prost-build = "0.14.1"
+protoc-bin-vendored = "3"
+
+# Keep code generation out of the main workspace dependency graph. Normal
+# Lance builds consume the checked-in output and do not compile these tools.
+[workspace]

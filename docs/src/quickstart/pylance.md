@@ -13,10 +13,10 @@ By the end of this tutorial, you'll be able to create Lance datasets from pandas
 
 ## Install the Python SDK
 
-The easiest way to get started with Lance is via our Python SDK `pylance`:
+Install `pylance` along with the data libraries used in these quickstarts:
 
 ```bash
-pip install pylance
+--8<-- "snippets/quickstart/pylance-install.sh"
 ```
 
 For the latest features and bug fixes, you can install the preview version:
@@ -45,11 +45,7 @@ For the latest features and bug fixes, you can install the preview version:
 First, let's import the necessary libraries:
 
 ```python
-import shutil
-import lance
-import numpy as np
-import pandas as pd
-import pyarrow as pa
+--8<-- "snippets/quickstart/pylance_quickstart.py:imports"
 ```
 
 ## Create Your First Dataset
@@ -63,17 +59,21 @@ You'll create a simple dataframe and then write it to Lance format. This demonst
 Create a simple dataframe:
 
 ```python
-df = pd.DataFrame({"a": [5]})
-df
+--8<-- "snippets/quickstart/pylance_quickstart.py:create-df"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/pylance_quickstart.py.create-df.txt"
 ```
 
 Now you'll write this dataframe to Lance format and verify the data was saved correctly:
 
 ```python
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
+--8<-- "snippets/quickstart/pylance_quickstart.py:write-lance"
+```
 
-dataset = lance.write_dataset(df, "/tmp/test.lance")
-dataset.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/pylance_quickstart.py.write-lance.txt"
 ```
 
 ### Convert Your Existing Parquet Files
@@ -83,23 +83,21 @@ You'll convert an existing Parquet file to Lance format. This shows how to migra
 First, you'll create a Parquet file and then convert it to Lance:
 
 ```python
-shutil.rmtree("/tmp/test.parquet", ignore_errors=True)
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
+--8<-- "snippets/quickstart/pylance_quickstart.py:write-parquet"
+```
 
-tbl = pa.Table.from_pandas(df)
-pa.dataset.write_dataset(tbl, "/tmp/test.parquet", format='parquet')
-
-parquet = pa.dataset.dataset("/tmp/test.parquet")
-parquet.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/pylance_quickstart.py.write-parquet.txt"
 ```
 
 Now you'll convert the Parquet dataset to Lance format in a single line:
 
 ```python
-dataset = lance.write_dataset(parquet, "/tmp/test.lance")
+--8<-- "snippets/quickstart/pylance_quickstart.py:convert-parquet"
+```
 
-# Make sure it's the same
-dataset.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/pylance_quickstart.py.convert-parquet.txt"
 ```
 
 ## Next Steps

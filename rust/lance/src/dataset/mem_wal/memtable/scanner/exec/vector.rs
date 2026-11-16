@@ -26,9 +26,10 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::VectorQuery;
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{MemMatches, SearchContext};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance column name in output.
 pub const DISTANCE_COLUMN: &str = "_distance";

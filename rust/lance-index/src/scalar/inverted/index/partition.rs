@@ -204,7 +204,10 @@ impl FuzzyAutomaton {
         if token.is_ascii() {
             let levenshtein = fst::automaton::Levenshtein::new(token, fuzzy.edit_distance)
                 .map_err(|error| {
-                    Error::index(format!("failed to construct the fuzzy query: {error}"))
+                    Error::invalid_input(format!(
+                        "failed to construct fuzzy query with fuzziness {}: {error}; reduce fuzziness or shorten the query",
+                        fuzzy.edit_distance
+                    ))
                 })?;
             Ok(Self::Ascii(AsciiFuzzyAutomaton {
                 levenshtein,
@@ -217,7 +220,10 @@ impl FuzzyAutomaton {
                 fuzzy.edit_distance,
             )
             .map_err(|error| {
-                Error::index(format!("failed to construct the fuzzy query: {error}"))
+                Error::invalid_input(format!(
+                    "failed to construct fuzzy query with fuzziness {}: {error}; reduce fuzziness or shorten the query",
+                    fuzzy.edit_distance
+                ))
             })?;
             Ok(Self::Unicode(levenshtein))
         }
@@ -474,21 +480,18 @@ struct PositionMatchSummary {
 
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
-    force_global_scorer: bool,
     read_policy: PostingReadPolicy,
 }
 
 impl PostingLoadOptions {
-    pub(super) const fn read_ahead(force_global_scorer: bool) -> Self {
+    pub(super) const fn read_ahead() -> Self {
         Self {
-            force_global_scorer,
             read_policy: PostingReadPolicy::ReadAhead,
         }
     }
 
-    pub(in super::super) const fn cache_aware_exact(force_global_scorer: bool) -> Self {
+    pub(in super::super) const fn cache_aware_exact() -> Self {
         Self {
-            force_global_scorer,
             read_policy: PostingReadPolicy::CacheAwareExact,
         }
     }
@@ -582,7 +585,10 @@ fn tokens_may_match(
     // without allocating two hash tables for every leaf in every partition.
     let mut positions = SmallVec::<[(u32, bool); 8]>::new();
     for index in 0..tokens.len() {
-        positions.push((tokens.position(index), in_dictionary(index)));
+        positions.push((
+            tokens.position_for_query(index, is_phrase_query),
+            in_dictionary(index),
+        ));
     }
     summarize_position_matches(positions).every_position_matched
 }
@@ -621,10 +627,11 @@ fn effective_posting_read_policy(
         return PostingReadPolicy::CacheAwareExact;
     };
     let demand_count = group_demand_counts.get(&group).copied();
-    debug_assert!(
-        demand_count.is_some(),
-        "posting group {group:?} must have a demand count for token {token_id}"
-    );
+    // Prewarm may publish byte boundaries after this query counted demand
+    // using the unplanned ranges. Exact loading remains safe across that transition.
+    if demand_count.is_none() {
+        return PostingReadPolicy::CacheAwareExact;
+    }
     // Keep alternatives coalesced, even when a fuzzy expansion covers only a
     // small part of a group. Ordinary sparse terms need no such read ahead.
     if demand_count.is_some_and(|count| {
@@ -977,6 +984,7 @@ impl InvertedPartition {
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
+        let mut new_groups = Vec::with_capacity(new_tokens.capacity());
         let mut seen = HashSet::new();
         let mut seen_source_terms = HashSet::new();
         for token_idx in 0..tokens.len() {
@@ -986,7 +994,8 @@ impl InvertedPartition {
             }
             let token = tokens.get_token(token_idx);
             let position = tokens.position(token_idx);
-            if !seen_source_terms.insert((position, token)) {
+            let group = tokens.position_for_query(token_idx, params.phrase_slop.is_some());
+            if !seen_source_terms.insert((group, token)) {
                 continue;
             }
             let mut candidates = BTreeSet::new();
@@ -996,17 +1005,17 @@ impl InvertedPartition {
                 if new_tokens.len() >= params.max_expansions {
                     break;
                 }
-                if seen.insert((candidate.clone(), position)) {
+                if seen.insert((candidate.clone(), group)) {
                     new_tokens.push(candidate);
                     new_positions.push(position);
+                    new_groups.push(group);
                 }
             }
         }
-        Ok(Tokens::with_positions(
-            new_tokens,
-            new_positions,
-            tokens.token_type().clone(),
-        ))
+        Ok(
+            Tokens::with_positions(new_tokens, new_positions, tokens.token_type().clone())
+                .with_term_groups(new_groups),
+        )
     }
 
     /// Collect up to `limit` fuzzy candidates for one query token from this
@@ -1338,10 +1347,10 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     //
-    // `force_global_scorer` is used by compound search, where leaf scores and
-    // bounds must share corpus-level statistics before the global collector
-    // can safely propagate its threshold. Standard leaf search also routes
-    // no-impact postings through scorer-derived corpus-global upper bounds.
+    // Query weights always come from the corpus-global `impact_scorer`, so every
+    // partition scores in one space and standard and compound search can share
+    // one top-k threshold across partitions. Postings without stored impacts
+    // also take their upper bounds from that scorer.
     pub(in super::super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
@@ -1349,7 +1358,6 @@ impl InvertedPartition {
         operator: Operator,
         impact_scorer: &MemBM25Scorer,
         metrics: &dyn MetricsCollector,
-        force_global_scorer: bool,
     ) -> Result<LoadedPostings> {
         self.load_posting_lists_with_policy(
             tokens,
@@ -1357,7 +1365,7 @@ impl InvertedPartition {
             operator,
             impact_scorer,
             metrics,
-            PostingLoadOptions::read_ahead(force_global_scorer),
+            PostingLoadOptions::read_ahead(),
         )
         .await
     }
@@ -1396,18 +1404,17 @@ impl InvertedPartition {
         term_ids: Option<PartitionTermIds<'_>>,
     ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
-            force_global_scorer,
             read_policy: requested_read_policy,
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
-        // The caller passes final tokens after any fuzzy expansion. Positions
+        // The caller passes final tokens after any fuzzy expansion. Query groups
         // identify alternatives that must share one posting iterator,
         // including code identifier subwords and fuzzy expansions.
         let mut token_ids = Vec::with_capacity(tokens.len());
         let mut position_matches = SmallVec::<[(u32, bool); 8]>::new();
         for index in 0..tokens.len() {
-            let position = tokens.position(index);
+            let position = tokens.position_for_query(index, is_phrase_query);
             let token_id = match &term_ids {
                 Some(term_ids) => term_ids.token_id(index),
                 None => self.map(tokens.get_token(index)),
@@ -1512,7 +1519,6 @@ impl InvertedPartition {
             is_and_query,
             is_phrase_query,
             exact_scoring_required,
-            force_global_scorer,
             docs_for_union,
         }))
     }
@@ -1690,7 +1696,6 @@ pub(super) struct FetchedPostings {
     is_and_query: bool,
     is_phrase_query: bool,
     exact_scoring_required: bool,
-    force_global_scorer: bool,
     /// Scoring lengths for unioning same-position postings, when any exist.
     docs_for_union: Option<LoadedDocLengths>,
 }
@@ -1709,7 +1714,6 @@ impl FetchedPostings {
             is_and_query,
             is_phrase_query,
             exact_scoring_required,
-            force_global_scorer,
             docs_for_union,
         } = self;
         if docs_for_union.is_none() {
@@ -1734,12 +1738,7 @@ impl FetchedPostings {
                     .map(|(token_id, token_index, position, posting)| {
                         let token = tokens.get_token(token_index);
                         let needs_scorer_upper_bound = !posting.has_impacts();
-                        let query_weight =
-                            if impact_safe || exact_scoring_required || force_global_scorer {
-                                impact_scorer.query_weight(token)
-                            } else {
-                                idf(posting.len(), num_docs)
-                            };
+                        let query_weight = impact_scorer.query_weight(token);
                         let posting = PostingIterator::with_query_weight(
                             token.to_owned(),
                             token_id,
@@ -2000,6 +1999,22 @@ mod tests {
 
         assert!(automaton_accepts(&automaton, "café".as_bytes()));
         assert!(!automaton_accepts(&automaton, "dafé".as_bytes()));
+    }
+
+    #[rstest]
+    #[case::ascii("quick")]
+    #[case::unicode("éabcdefghijklmnopqrstuvwxyz")]
+    fn excessive_fuzziness_is_an_input_error(#[case] token: &str) {
+        let params = FtsSearchParams::new().with_fuzziness(Some(10));
+        let Err(error) = FuzzyAutomaton::new(token, &DocType::Text, &params) else {
+            panic!("fuzziness=10 must exceed the automaton construction budget");
+        };
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("fuzziness 10"), "{message}");
+        assert!(message.contains("10000"), "{message}");
+        assert!(message.contains("reduce fuzziness"), "{message}");
     }
 
     #[test]

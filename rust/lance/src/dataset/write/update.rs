@@ -339,7 +339,7 @@ impl UpdatePlan {
             .keys()
             .filter_map(|column| {
                 let field = dataset.schema().field(column)?;
-                crate::dataset::optimize::field_contains_blob_v2(field)
+                crate::dataset::blob::field_contains_blob_v2(field)
                     .then(|| (column.clone(), Arc::new(Field::from(field))))
             })
             .collect::<HashMap<_, _>>();
@@ -471,7 +471,7 @@ impl UpdateJob {
         }
 
         let stream = if has_blob_v2_columns {
-            let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+            let rewrite_plan = Arc::new(crate::dataset::blob::BlobV2BatchRewritePlan::try_new(
                 self.dataset.schema(),
                 scan_schema.as_ref(),
                 false,
@@ -699,11 +699,23 @@ impl UpdateJob {
         Ok(())
     }
 
+    /// Commit `update_data` against `dataset` as an `Update` transaction.
     async fn commit_impl(
         &self,
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // Noop when no rows match so we don't bump the version or block other writers.
+        if update_data.removed_fragment_ids.is_empty()
+            && update_data.old_fragments.is_empty()
+            && update_data.new_fragments.is_empty()
+        {
+            return Ok(UpdateResult {
+                new_dataset: dataset,
+                rows_updated: 0,
+            });
+        }
+
         // Updated columns are top-level (nested references are rejected by `set`), but a
         // struct-column update rewrites all of its descendants. Collect the full field
         // subtree so an index on a nested child field is recognized as modified and not
@@ -724,6 +736,7 @@ impl UpdateJob {
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
@@ -1865,11 +1878,11 @@ mod tests {
             .unwrap();
 
         // Need to use a row-id-domain index (while we still have one)
-        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
         dataset
             .create_index(
                 &["str"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("str_idx".to_string()),
                 &scalar_params,
                 true,

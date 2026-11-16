@@ -281,12 +281,16 @@ async fn append_commit_validates_fragment_references() {
     assert_eq!(appended.metadata, object_metadata("5"));
 }
 
+/// A restore brings back the target snapshot's definitions, specs, fragments
+/// and index segments as they were; the current definitions are not merged
+/// into them. Only the allocation mark is kept, so an id this lineage handed
+/// out is never handed out again: the next definition continues above the
+/// mark, which after a restore lies above every definition present.
 #[tokio::test]
-async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
+async fn restore_keeps_the_high_water_mark_and_the_targets_definitions() {
     let dir = TempStrDir::default();
     let dataset = write_dataset(&dir).await; // version 1: nothing allocated
     let before_allocation = dataset.version().version;
-
     let dataset = commit_edited_manifest(&dataset, |manifest, _| {
         manifest.clustering = vec![definition(1)];
         manifest.max_clustering_id = 1;
@@ -297,7 +301,6 @@ async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
     })
     .await;
     let first_definition = dataset.version().version;
-
     let dataset = commit_edited_manifest(&dataset, |manifest, _| {
         manifest.clustering.push(definition(2));
         manifest.max_clustering_id = 2;
@@ -306,10 +309,28 @@ async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
             .insert("org.example.cluster.active_id".into(), "2".into());
     })
     .await;
-
-    // Restore to before any allocation: the historical selection comes back
-    // (none), the mark does not rewind, and every definition this lineage
-    // handed out stays defined.
+    // A new definition through the commit path, as a provider allocates one.
+    async fn allocate(dataset: &Dataset, id: u32) -> crate::Result<Dataset> {
+        let transaction = Transaction::new(
+            dataset.manifest().version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut desired = dataset.manifest().clustering.clone();
+        desired.push(definition(id));
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_clustering_definitions(desired)
+            .execute(transaction)
+            .await
+    }
+    // Restore to before any allocation: the target's metadata and definitions
+    // (none) come back, the fragment is unlabelled again, and the mark does
+    // not rewind.
     let mut restored = dataset.checkout_version(before_allocation).await.unwrap();
     restored.restore().await.unwrap();
     assert!(
@@ -319,62 +340,42 @@ async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
             .contains_key("org.example.cluster.active_id")
     );
     assert_eq!(restored.manifest().max_clustering_id, 2);
-    assert_eq!(
-        restored.manifest().clustering,
-        vec![definition(1), definition(2)]
+    assert!(
+        restored.manifest().clustering.is_empty(),
+        "the current definitions are not merged into the restored snapshot"
     );
     assert_eq!(restored.fragments()[0].clustering_id, None);
     assert_ne!(
         restored.manifest().writer_feature_flags & FLAG_OBJECT_METADATA,
         0
     );
-
-    // Allocating again continues above the mark; id 1 and 2 are never reused.
-    let restored = commit_edited_manifest(&restored, |manifest, _| {
-        manifest.clustering.push(definition(3));
-        manifest.max_clustering_id = 3;
-    })
-    .await;
-    assert_eq!(restored.manifest().max_clustering_id, 3);
-
-    // Restore to the first definition's version: its selection and its
-    // fragment references come back, with the later definitions retained.
+    // Restore to the first definition's version: its definition, selection
+    // and fragment references come back as they were, the later definition
+    // does not, and the mark stays above them all.
     let mut restored = restored.checkout_version(first_definition).await.unwrap();
     restored.restore().await.unwrap();
     assert_eq!(
         restored.manifest().table_metadata["org.example.cluster.active_id"],
         "1"
     );
+    assert_eq!(restored.manifest().max_clustering_id, 2);
+    assert_eq!(restored.manifest().clustering, vec![definition(1)]);
+    assert_eq!(restored.fragments()[0].clustering_id, Some(1));
+    assert_eq!(restored.fragments()[0].metadata, object_metadata("3"));
+    // Allocation continues above the mark, not above the definitions present:
+    // the id handed out before the restore is refused, the next one lands.
+    let error = allocate(&restored, 2).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not continue max_clustering_id 2"),
+        "{error}"
+    );
+    let restored = allocate(&restored, 3).await.unwrap();
     assert_eq!(restored.manifest().max_clustering_id, 3);
     assert_eq!(
         restored.manifest().clustering,
-        vec![definition(1), definition(2), definition(3)]
-    );
-    assert_eq!(restored.fragments()[0].clustering_id, Some(1));
-    assert_eq!(restored.fragments()[0].metadata, object_metadata("3"));
-}
-
-#[tokio::test]
-async fn restore_rejects_a_definition_that_changed_meaning() {
-    let dir = TempStrDir::default();
-    let dataset = write_dataset(&dir).await;
-    let dataset = commit_edited_manifest(&dataset, |manifest, _| {
-        manifest.clustering = vec![definition(1)];
-        manifest.max_clustering_id = 1;
-    })
-    .await;
-    let original = dataset.version().version;
-    // Simulate a writer that redefined id 1 in place, which the contract forbids.
-    let dataset = commit_edited_manifest(&dataset, |manifest, _| {
-        manifest.clustering[0].provider = "org.example.other".into();
-    })
-    .await;
-
-    let mut restored = dataset.checkout_version(original).await.unwrap();
-    let error = restored.restore().await.unwrap_err();
-    assert!(
-        error.to_string().contains("differs between manifests"),
-        "{error}"
+        vec![definition(1), definition(3)]
     );
 }
 
@@ -1101,6 +1102,257 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
     }
 }
 
+/// A key that was already absent when the writer read the table is history,
+/// not a changed dependency: a list that retains such a definition, allocates
+/// another and removes an unreferenced one still lands.
+#[tokio::test]
+async fn a_historical_absence_is_not_a_changed_dependency() {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let a_id = read.schema().field("a").unwrap().id;
+    let on_region = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let stale = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(2)
+    };
+    let read = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![on_region.clone(), stale.clone()],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    let mut read = read;
+    read.drop_columns(&["region"]).await.unwrap();
+    assert!(read.schema().field_by_id(key_id).is_none());
+
+    let on_a = ClusteringDefinition {
+        columns: vec![a_id],
+        ..definition(3)
+    };
+    let landed = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![on_region.clone(), on_a.clone()],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![on_region, on_a]);
+    assert_eq!(landed.manifest().max_clustering_id, 3);
+}
+
+/// The first-allocation fence judges the concurrent transaction, not the final
+/// shape: a Merge that only adds fields (a new column, a new struct column
+/// with its children) is compatible and the allocation rebases over it, while a Merge
+/// that renames a field the writer read is refused, since on a table with
+/// reusable field ids it may have moved a key's id.
+#[tokio::test]
+async fn a_first_allocation_rebases_over_an_additive_merge_but_not_a_rename() {
+    // Additive: a new top-level column and a new struct column with children.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let mut b = read.clone();
+    b.add_columns(
+        NewColumnTransform::SqlExpressions(vec![
+            ("price".to_string(), "a * 2".to_string()),
+            (
+                "info".to_string(),
+                "named_struct('zip', a, 'note', a)".to_string(),
+            ),
+        ]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let key_id = read.schema().field("region").unwrap().id;
+    let landed = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![ClusteringDefinition {
+                columns: vec![key_id],
+                ..definition(1)
+            }],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&landed), vec![1]);
+    assert!(landed.schema().field("price").is_some());
+    assert!(landed.schema().field("info").is_some());
+
+    // A rename through a Merge in the window is refused: the renamed field is
+    // one the writer read, and on this table its id could have moved.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let mut b = Dataset::open(&dir).await.unwrap();
+    b.alter_columns(&[crate::dataset::ColumnAlteration::new("a".into()).rename("b".into())])
+        .await
+        .unwrap();
+    let key_id = read.schema().field("region").unwrap().id;
+    let error = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![ClusteringDefinition {
+                columns: vec![key_id],
+                ..definition(1)
+            }],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("may have given one of those ids to another column"),
+        "{error}"
+    );
+}
+
+/// A submission depends on the key fields of the definitions it allocates,
+/// not on every retained definition's. An unchanged list with unrelated
+/// metadata lands over another writer's rename, retype or drop of a retained
+/// key. A submission allocating two more definitions, the lower one keyed on
+/// that field, lands over the rename and is refused as a whole over the
+/// retype or drop; planned again from the landing snapshot, it lands.
+#[rstest]
+#[case::rename("rename")]
+#[case::cast("cast")]
+#[case::drop("drop")]
+#[tokio::test]
+async fn a_retained_keys_change_blocks_only_a_new_allocation_on_it(#[case] change: &'static str) {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let a_id = read.schema().field("a").unwrap().id;
+    let configured = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let read = commit(
+        &read,
+        submission(read.manifest().version, vec![configured.clone()], vec![]),
+    )
+    .await
+    .unwrap();
+    let planned_at = read.manifest().version;
+    let mut b = Dataset::open(&dir).await.unwrap();
+    match change {
+        "drop" => b.drop_columns(&["region"]).await.unwrap(),
+        "rename" => b
+            .alter_columns(&[
+                crate::dataset::ColumnAlteration::new("region".into()).rename("zone".into())
+            ])
+            .await
+            .unwrap(),
+        _ => b
+            .alter_columns(&[crate::dataset::ColumnAlteration::new("region".into())
+                .cast_to(arrow_schema::DataType::Int64)])
+            .await
+            .unwrap(),
+    }
+    // Unrelated to the retained definition: lands over any of the changes.
+    let note = ("org.example.note".to_string(), Some("x".to_string()));
+    let landed = commit(
+        &read,
+        submission(planned_at, vec![configured.clone()], vec![note.clone()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![configured.clone()]);
+    assert_eq!(
+        landed.manifest().table_metadata["org.example.note"],
+        "x",
+        "{change}: the unrelated submission landed"
+    );
+
+    // Allocating on the changed key (definition 2) and on an untouched one
+    // (definition 3) at once: a rename keeps the key, a retype or a drop
+    // refuses the submission for definition 2 and nothing of it lands.
+    let on_region = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(2)
+    };
+    let on_a = ClusteringDefinition {
+        columns: vec![a_id],
+        ..definition(3)
+    };
+    let spec = ("org.example.spec.2".to_string(), Some("{}".to_string()));
+    let result = commit(
+        &read,
+        submission(
+            planned_at,
+            vec![configured.clone(), on_region.clone(), on_a.clone()],
+            vec![spec.clone()],
+        ),
+    )
+    .await;
+    let reopened = Dataset::open(&dir).await.unwrap();
+    if change == "rename" {
+        let landed = result.unwrap();
+        assert_eq!(ids(&landed), vec![1, 2, 3]);
+        assert_eq!(
+            reopened.manifest().table_metadata["org.example.spec.2"],
+            "{}"
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, crate::Error::CommitConflict { .. }),
+            "{change}: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("definition 2 is keyed on field id {key_id}")),
+            "{change}: {error}"
+        );
+        assert_eq!(ids(&reopened), vec![1], "{change}: no allocation landed");
+        assert!(
+            !reopened
+                .manifest()
+                .table_metadata
+                .contains_key("org.example.spec.2"),
+            "{change}: the refused submission landed nothing"
+        );
+        // Planned again from the landing snapshot, with the key as it is
+        // now (or without it, once dropped), it lands; ids continue the mark.
+        let mut replanned = vec![configured.clone()];
+        if let Some(region) = reopened.schema().field("region") {
+            replanned.push(ClusteringDefinition {
+                columns: vec![region.id],
+                ..definition(2)
+            });
+        }
+        replanned.push(ClusteringDefinition {
+            columns: vec![a_id],
+            ..definition(replanned.len() as u32 + 1)
+        });
+        let landed = commit(
+            &reopened,
+            submission(reopened.manifest().version, replanned.clone(), vec![spec]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed.manifest().clustering, replanned);
+        assert_eq!(landed.manifest().table_metadata["org.example.spec.2"], "{}");
+    }
+}
+
 /// Writer A resolves its key field in a reusable-id snapshot; before A lands,
 /// writer B replaces the schema in a way that can hand A's key id to another
 /// column: an overwrite, a drop followed by an add, the same with the original
@@ -1196,7 +1448,8 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
     );
 
     // Under the contract from the start, the same race leaves A's key without
-    // a field; nothing in the window can give its id to another column.
+    // a field; nothing in the window can give its id to another column, and
+    // the vanished key is still a changed dependency, not bad input.
     if matches!(race, "overwrite" | "drop_add") {
         let dir = TempStrDir::default();
         let mut read =
@@ -1213,8 +1466,9 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("not in the schema"),
-            "{race}: {error}"
+            matches!(error, crate::Error::CommitConflict { .. })
+                && error.to_string().contains("no longer exists"),
+            "{race}: {error:?}"
         );
     }
 }
@@ -1391,9 +1645,10 @@ async fn the_first_allocation_makes_earlier_versions_unrestorable_but_readable()
     restored.restore().await.unwrap();
     assert_eq!(
         ids(&restored),
-        vec![1, 2],
-        "restore keeps every allocated definition"
+        vec![1],
+        "restore brings back the target's definitions, not the later ones"
     );
+    assert_eq!(restored.manifest().max_clustering_id, 2, "the mark stays");
 }
 
 /// A build that does not know segment labels caches the index list with every
@@ -2398,6 +2653,126 @@ async fn ambiguous_success_is_recognized_by_transaction_identity() {
 }
 
 #[tokio::test]
+async fn detached_restore_through_an_old_handle_keeps_the_target_allocation_mark() {
+    let dir = TempStrDir::default();
+    let before_allocation = write_dataset(&dir).await;
+    let allocated = commit(
+        &before_allocation,
+        submission(
+            before_allocation.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    let target = commit(
+        &allocated,
+        submission(allocated.manifest().version, vec![], vec![]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before_allocation.manifest().max_clustering_id, 0);
+    assert_eq!(target.manifest().max_clustering_id, 2);
+    assert!(target.manifest().clustering.is_empty());
+
+    let detached = CommitBuilder::new(Arc::new(before_allocation.clone()))
+        .with_detached(true)
+        .execute(Transaction::new(
+            before_allocation.manifest().version,
+            Operation::Restore {
+                version: target.manifest().version,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let reopened = target
+        .checkout_version(detached.manifest().version)
+        .await
+        .unwrap();
+    assert_eq!(reopened.manifest().max_clustering_id, 2);
+    assert_eq!(reopened.manifest().clustering, target.manifest().clustering);
+    assert_eq!(
+        reopened.manifest().table_metadata,
+        target.manifest().table_metadata
+    );
+}
+
+#[rstest]
+#[case::upsert(false)]
+#[case::replace(true)]
+#[tokio::test]
+async fn provider_metadata_cannot_rebase_over_restore(#[case] replace: bool) {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let target = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(1)],
+            vec![(ACTIVE_KEY.to_string(), Some("1".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    let before_restore = commit(
+        &target,
+        submission(
+            target.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![(ACTIVE_KEY.to_string(), Some("2".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    // No definitions list accompanies this provider-only update, so checking
+    // clustering allocation alone cannot detect its stale selector.
+    let metadata_update = |read_version, active: &str| {
+        Transaction::new(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: Some(UpdateMap {
+                    update_entries: vec![(ACTIVE_KEY, Some(active)).into()],
+                    replace,
+                }),
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        )
+    };
+    let stale = metadata_update(before_restore.manifest().version, "2");
+    let mut restored = target.clone();
+    restored.restore().await.unwrap();
+    let restored_version = restored.manifest().version;
+    let error = CommitBuilder::new(Arc::new(before_restore))
+        .execute(stale)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("Restore"), "{error}");
+
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(reopened.manifest().version, restored_version);
+    assert_eq!(ids(&reopened), vec![1]);
+    assert_eq!(reopened.manifest().max_clustering_id, 2);
+    assert_eq!(reopened.manifest().table_metadata[ACTIVE_KEY], "1");
+    // A provider can re-read the restored snapshot and compute a valid update.
+    let refreshed = CommitBuilder::new(Arc::new(reopened))
+        .execute(metadata_update(restored_version, "1"))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.manifest().table_metadata[ACTIVE_KEY], "1");
+    assert_eq!(ids(&refreshed), vec![1]);
+    assert_eq!(refreshed.count_rows(None).await.unwrap(), 100);
+}
+
+#[tokio::test]
 async fn restored_manifest_keeps_the_mark_for_later_submissions() {
     let dir = TempStrDir::default();
     let dataset = write_dataset(&dir).await;
@@ -2421,15 +2796,16 @@ async fn restored_manifest_keeps_the_mark_for_later_submissions() {
 
     let mut restored = dataset.checkout_version(with_one).await.unwrap();
     restored.restore().await.unwrap();
-    // definitions merge and the mark never goes down; the provider keys are
-    // the restored version's
-    assert_eq!(ids(&restored), vec![1, 2]);
+    // the restored version's definitions and provider keys come back; the
+    // mark never goes down
+    assert_eq!(ids(&restored), vec![1]);
     assert_eq!(restored.manifest().max_clustering_id, 2);
     assert!(!restored.manifest().table_metadata.contains_key(ACTIVE_KEY));
 
-    // a list built from the pre-restore snapshot still describes the current
-    // definitions exactly, so the next allocation continues at 3
-    let dataset = commit(
+    // a list built from the pre-restore snapshot names a definition the
+    // table no longer has; it is refused rather than re-added under an id
+    // the lineage handed out before
+    let error = commit(
         &restored,
         submission(
             restored.manifest().version,
@@ -2438,7 +2814,24 @@ async fn restored_manifest_keeps_the_mark_for_later_submissions() {
         ),
     )
     .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not continue max_clustering_id 2"),
+        "{error}"
+    );
+    // a list built from the restored snapshot allocates above the mark
+    let dataset = commit(
+        &restored,
+        submission(
+            restored.manifest().version,
+            vec![definition(1), definition(3)],
+            vec![(ACTIVE_KEY.to_string(), Some("3".to_string()))],
+        ),
+    )
+    .await
     .unwrap();
-    assert_eq!(ids(&dataset), vec![1, 2, 3]);
+    assert_eq!(ids(&dataset), vec![1, 3]);
     assert_eq!(dataset.manifest().max_clustering_id, 3);
 }
