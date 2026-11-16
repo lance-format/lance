@@ -724,7 +724,7 @@ async fn test_action_txns_writing_the_same_field_data_conflict() {
     config_upsert_values: None,
     initial_bases: None,
 })]
-#[case::data_replacement(Operation::DataReplacement { replacements: vec![] })]
+#[case::data_replacement(Operation::DataReplacement { replacements: vec![], data_change: true })]
 #[case::data_overlay(Operation::DataOverlay { groups: vec![] })]
 #[case::merge(Operation::Merge {
     fragments: vec![],

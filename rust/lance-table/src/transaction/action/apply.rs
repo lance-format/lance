@@ -1304,6 +1304,7 @@ mod tests {
         } else {
             Operation::DataReplacement {
                 replacements: vec![DataReplacementGroup(0, replacement)],
+                data_change: true,
             }
         };
 
