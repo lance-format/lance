@@ -62,6 +62,13 @@ impl CpuFeatures {
     pub const AVX512VPOPCNTDQ: Self = Self(1 << 23);
     pub const AVX512VBMI: Self = Self(1 << 24);
     pub const AVX512BF16: Self = Self(1 << 25);
+    /// Set only on Linux, once detection has obtained the XTILEDATA permission
+    /// that tile instructions need. Never in the [baseline](Self::baseline),
+    /// since a build flag cannot grant that permission.
+    pub const AMX_TILE: Self = Self(1 << 26);
+    /// AMX FP16 tile multiply. Usable under the same conditions as
+    /// [`Self::AMX_TILE`].
+    pub const AMX_FP16: Self = Self(1 << 27);
 
     /// The set with no features, which every host supports.
     pub const fn empty() -> Self {
@@ -235,6 +242,8 @@ const FEATURE_TABLE: &[FeatureInfo] = {
         x86(F::AVX512VPOPCNTDQ, "avx512vpopcntdq", F::AVX512F),
         x86(F::AVX512VBMI, "avx512vbmi", F::AVX512BW),
         x86(F::AVX512BF16, "avx512bf16", F::AVX512BW),
+        x86(F::AMX_TILE, "amx-tile", F::empty()),
+        x86(F::AMX_FP16, "amx-fp16", F::AMX_TILE),
         other(F::NEON, "neon", F::empty()),
         other(F::FP16, "fp16", F::NEON),
         other(F::LSX, "lsx", F::empty()),
@@ -259,6 +268,8 @@ const fn str_eq(a: &str, b: &str) -> bool {
 
 const BASELINE: CpuFeatures = {
     // `cfg!` needs a literal feature name, so this cannot loop over the table.
+    // AMX is left out: `-C target-feature=+amx-tile` cannot request the
+    // XTILEDATA permission, so it does not make tile instructions usable.
     let enabled = [
         (cfg!(target_feature = "sse2"), CpuFeatures::SSE2),
         (cfg!(target_feature = "sse3"), CpuFeatures::SSE3),
@@ -356,7 +367,100 @@ fn detect_host_features() -> CpuFeatures {
         is_x86_feature_detected!("avx512bf16"),
         CpuFeatures::AVX512BF16,
     );
+    // Other OSes enable tile state in their own ways; they are left out until
+    // something there needs AMX.
+    #[cfg(target_os = "linux")]
+    let features = features.union(amx::detect());
     features
+}
+
+/// AMX detection. `is_x86_feature_detected!` cannot name AMX on stable Rust,
+/// so this reads CPUID itself.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod amx {
+    use super::CpuFeatures;
+
+    /// The AMX features the host can run, or none.
+    ///
+    /// On Linux the CPUID bits are not enough: the first tile instruction
+    /// raises SIGILL until the process is granted the XTILEDATA state, so
+    /// this requests it. The grant is process-wide and idempotent, and is
+    /// only requested on hosts that report AMX.
+    pub(super) fn detect() -> CpuFeatures {
+        let features = from_cpuid(cpuid_amx_registers());
+        if features.is_empty() || !request_xtiledata_permission() {
+            return CpuFeatures::empty();
+        }
+        features
+    }
+
+    /// The CPUID registers that hold the AMX bits.
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct AmxRegisters {
+        /// Leaf 7, sub-leaf 0, EDX.
+        pub leaf7_edx: u32,
+        /// Leaf 7, sub-leaf 1, EAX.
+        pub leaf7_1_eax: u32,
+    }
+
+    const AMX_TILE_BIT: u32 = 1 << 24;
+    const AMX_FP16_BIT: u32 = 1 << 21;
+
+    /// AMX-TILE is leaf 7.0 EDX bit 24 and AMX-FP16 is leaf 7.1 EAX bit 21.
+    /// AMX-FP16 counts only with AMX-TILE, which every tile instruction needs.
+    pub(super) fn from_cpuid(registers: AmxRegisters) -> CpuFeatures {
+        if registers.leaf7_edx & AMX_TILE_BIT == 0 {
+            return CpuFeatures::empty();
+        }
+        if registers.leaf7_1_eax & AMX_FP16_BIT == 0 {
+            CpuFeatures::AMX_TILE
+        } else {
+            CpuFeatures::AMX_TILE.union(CpuFeatures::AMX_FP16)
+        }
+    }
+
+    fn cpuid_amx_registers() -> AmxRegisters {
+        use std::arch::x86_64::{__cpuid, __cpuid_count};
+
+        // A leaf above the CPU's maximum returns another leaf's data rather
+        // than zeros, so check the maxima before reading.
+        // `__cpuid*` are safe on newer toolchains and `unsafe` on older ones.
+        #[allow(unused_unsafe)]
+        let max_leaf = unsafe { __cpuid(0) }.eax;
+        if max_leaf < 7 {
+            return AmxRegisters::default();
+        }
+        #[allow(unused_unsafe)]
+        let leaf7 = unsafe { __cpuid_count(7, 0) };
+        let leaf7_1_eax = if leaf7.eax >= 1 {
+            #[allow(unused_unsafe)]
+            unsafe { __cpuid_count(7, 1) }.eax
+        } else {
+            0
+        };
+        AmxRegisters {
+            leaf7_edx: leaf7.edx,
+            leaf7_1_eax,
+        }
+    }
+
+    /// `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)`, per Linux
+    /// `Documentation/arch/x86/xstate.rst`. XTILEDATA backs every AMX
+    /// instruction, so one grant covers them all. Fails on kernels without
+    /// AMX support.
+    fn request_xtiledata_permission() -> bool {
+        const ARCH_REQ_XCOMP_PERM: libc::c_long = 0x1023;
+        const XFEATURE_XTILEDATA: libc::c_long = 18;
+        // SAFETY: this arch_prctl only changes which XSAVE state the process
+        // may use; it touches no memory.
+        unsafe {
+            libc::syscall(
+                libc::SYS_arch_prctl,
+                ARCH_REQ_XCOMP_PERM,
+                XFEATURE_XTILEDATA,
+            ) == 0
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -636,6 +740,7 @@ mod tests {
     #[case::avx512vpopcntdq("avx512vpopcntdq", CpuFeatures::AVX512F.union(CpuFeatures::F16C))]
     #[case::avx512vbmi("avx512vbmi", CpuFeatures::AVX512BW.union(CpuFeatures::AVX2))]
     #[case::avx512bf16("avx512bf16", CpuFeatures::AVX512BW.union(CpuFeatures::FMA))]
+    #[case::amx_fp16("amx-fp16", CpuFeatures::AMX_TILE)]
     #[case::fp16("fp16", CpuFeatures::NEON)]
     #[case::lasx("lasx", CpuFeatures::LSX)]
     fn target_feature_mask_includes_implied_features(
@@ -657,6 +762,34 @@ mod tests {
             assert!(!seen.contains(feature), "{feature:?} reuses a bit");
             seen = seen.union(feature);
         }
+    }
+
+    #[test]
+    fn amx_is_never_in_the_baseline() {
+        assert!(!CpuFeatures::baseline().contains(CpuFeatures::AMX_TILE));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[rstest]
+    #[case::none(0, 0, CpuFeatures::empty())]
+    #[case::tile(1 << 24, 0, CpuFeatures::AMX_TILE)]
+    #[case::tile_and_fp16(
+        1 << 24,
+        1 << 21,
+        CpuFeatures::AMX_TILE.union(CpuFeatures::AMX_FP16)
+    )]
+    #[case::fp16_without_tile(0, 1 << 21, CpuFeatures::empty())]
+    #[case::other_bits_ignored(!(1 << 24), !(1 << 21), CpuFeatures::empty())]
+    fn amx_features_from_cpuid(
+        #[case] leaf7_edx: u32,
+        #[case] leaf7_1_eax: u32,
+        #[case] expected: CpuFeatures,
+    ) {
+        let registers = amx::AmxRegisters {
+            leaf7_edx,
+            leaf7_1_eax,
+        };
+        assert_eq!(amx::from_cpuid(registers), expected);
     }
 
     #[test]

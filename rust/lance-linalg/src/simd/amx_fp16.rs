@@ -22,35 +22,19 @@
 //! padding `n` up to a multiple of 32, holding the packed B operand across
 //! calls, and turning the absence of AMX into an `Option` its caller — k-means
 //! assignment, in another crate that cannot see `kernel_support` — can branch
-//! on. Every kernel here is guarded by
-//! [`crate::distance::dot_f16::amx_fp16_supported`], which is also what callers
-//! consult before routing work here: one gate, decided by run-time capability
-//! alone.
+//! on.
 //!
 //! ## Safety gate
 //!
-//! A set CPUID bit is not sufficient to run AMX tile instructions on Linux:
-//! the OS must first grant the extended (XTILEDATA)
-//! state via `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)`; skipping
-//! that SIGILLs the first tile instruction. `amx_supported` requires, and
-//! caches process-wide, all of:
-//!   1. `target_arch = "x86_64"` and `target_os = "linux"` (compile-time cfg),
-//!   2. the amx-tile CPUID bit (leaf 7, sub-leaf 0, EDX bit 24) **and** the
-//!      amx-fp16 CPUID bit (leaf 7, sub-leaf 1, EAX bit 21),
-//!   3. a successful one-time `arch_prctl` permission request.
+//! Every kernel here needs the host to have `FEATURES`. `CpuFeatures::host`
+//! reports AMX only once Linux has granted the XTILEDATA state, without which
+//! the first tile instruction raises SIGILL, so a host check is the whole
+//! precondition. [`crate::distance::dot_f16::amx_fp16_supported`] is that
+//! check, and is also what callers consult before routing work here.
 //!
-//! On any failure the caller falls back to the existing AVX-512-FP16 / scalar
+//! Without AMX, callers fall back to the existing AVX-512-FP16 / scalar
 //! `f16::dot` path, so results are unchanged (both accumulate in f32; only the
 //! summation order — hence fp16-level rounding — differs).
-//!
-//! ## XTILEDATA is a shared AMX state permission
-//!
-//! XTILEDATA (component 18) is the single dynamically-enabled XSAVE state
-//! backing the physical TMM tile registers; it is requested per-*state*, not
-//! per-*instruction*, so one grant covers every AMX compute instruction — see
-//! Linux `Documentation/arch/x86/xstate.rst` ("Dynamically Enabled XSAVE
-//! Features", AMX example) and Intel SDM Vol.1 §13.3. The syscall is
-//! idempotent, so requesting an already-granted permission again is harmless.
 
 #[cfg(all(
     kernel_support = "amx_fp16",
@@ -64,6 +48,23 @@ use crate::distance::dot_f16::strided_len;
     target_os = "linux"
 ))]
 use half::f16;
+#[cfg(all(
+    kernel_support = "amx_fp16",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+use lance_core::utils::cpu::{Candidate, CpuFeatures};
+
+/// What the host needs to run these kernels. build.rs compiles them with
+/// `-march=sapphirerapids -mamx-fp16`; as in `half_c_objects`, `avx512fp16`
+/// stands in for Sapphire Rapids' vector features.
+#[cfg(all(
+    kernel_support = "amx_fp16",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+pub(crate) const FEATURES: CpuFeatures =
+    CpuFeatures::from_target_features(&["amx-fp16", "avx512fp16"]);
 
 #[cfg(all(
     kernel_support = "amx_fp16",
@@ -71,9 +72,6 @@ use half::f16;
     target_os = "linux"
 ))]
 unsafe extern "C" {
-    /// arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA); 0 on success.
-    fn lance_amx_fp16_request_perm() -> i32;
-
     /// out[i] = sum_d f32(query[d]) * f32(candidates[i][d]), i in 0..count;
     /// out[count..16] = 0. `query` is `dim` IEEE binary16 bit patterns;
     /// `candidates` is 16 pointers to `dim` of them each, of which only the
@@ -126,7 +124,7 @@ unsafe extern "C" {
 /// is about to run.
 ///
 /// # Safety
-/// Executes TILERELEASE, so [`amx_supported`] must have returned `true` first.
+/// Executes TILERELEASE, so the host must have [`FEATURES`].
 #[cfg(all(
     test,
     kernel_support = "amx_fp16",
@@ -199,47 +197,43 @@ pub(crate) fn tilecfg_image(cfg_kind: i32) -> Option<[u8; 64]> {
     (rc == 0).then_some(image)
 }
 
-/// True iff AMX-FP16 tile instructions can be executed safely in this process.
-/// Evaluated once and cached; the `arch_prctl` permission request (a syscall)
-/// happens at most once, process-wide.
-///
-/// This is a hardware question only — a pure "would a tile instruction fault
-/// here?" — so that kernel-level tests can exercise the kernels on any host
-/// that can run them.
+/// [`dot_f16_batch_16_amx`] as a `dot_f16_batch_16` dispatch candidate.
 #[cfg(all(
     kernel_support = "amx_fp16",
     target_arch = "x86_64",
     target_os = "linux"
 ))]
-pub(crate) fn amx_supported() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        if !detect_amx_fp16() {
-            return false;
-        }
-        // Request XTILEDATA permission; without a 0 return, any tile instruction
-        // would SIGILL, so treat anything else as unavailable.
-        unsafe { lance_amx_fp16_request_perm() == 0 }
-    })
-}
+pub(crate) const DOT_F16_BATCH_16_AMX: Candidate<crate::distance::dot_f16::Batch16Kernel> =
+    // SAFETY: `dot_f16_batch_16_amx_checked` checks every precondition of the
+    // kernel except the host features, which are `FEATURES`.
+    unsafe {
+        Candidate::new(
+            "dot_f16_batch_16_amx",
+            FEATURES,
+            dot_f16_batch_16_amx_checked,
+        )
+    };
 
-/// AMX-TILE = CPUID leaf 7, sub-leaf 0, EDX bit 24. AMX-FP16 = CPUID leaf 7,
-/// sub-leaf 1, EAX bit 21. Both required.
+/// [`dot_f16_batch_16_amx`] with its argument preconditions checked, so the
+/// host features are its only precondition, as a [`Candidate`] requires.
 #[cfg(all(
     kernel_support = "amx_fp16",
     target_arch = "x86_64",
     target_os = "linux"
 ))]
-fn detect_amx_fp16() -> bool {
-    use std::arch::x86_64::__cpuid_count;
-    // `__cpuid_count` is safe on nightly but `unsafe` on stable; allow both.
-    #[allow(unused_unsafe)]
-    let leaf7_0 = unsafe { __cpuid_count(7, 0) };
-    let amx_tile = (leaf7_0.edx & (1 << 24)) != 0;
-    #[allow(unused_unsafe)]
-    let leaf7_1 = unsafe { __cpuid_count(7, 1) };
-    let amx_fp16 = (leaf7_1.eax & (1 << 21)) != 0;
-    amx_tile && amx_fp16
+unsafe fn dot_f16_batch_16_amx_checked(
+    query: &[f16],
+    candidates: &[&[f16]; 16],
+    len: usize,
+) -> [f32; 16] {
+    assert!((1..=16).contains(&len), "len ({len}) must be in 1..=16");
+    assert!(
+        candidates.iter().all(|c| c.len() == query.len()),
+        "every candidate must have the query's length"
+    );
+    // SAFETY: the host has `FEATURES` per this function's contract, and the
+    // asserts above cover the rest.
+    unsafe { dot_f16_batch_16_amx(query, candidates, len) }
 }
 
 /// Batched AMX-FP16 dot product: one query against the first `len` of 16
@@ -257,7 +251,7 @@ fn detect_amx_fp16() -> bool {
 /// 16 lanes either way, but only `len` rows are gathered.
 ///
 /// # Safety
-/// `amx_supported` must have returned `true`. `len` must be in `1..=16` — the
+/// The host must have [`FEATURES`]. `len` must be in `1..=16` — the
 /// kernel does not clamp it, and a larger value walks its staging buffer off the
 /// end; [`crate::distance::dot_f16::dot_f16_batch_16`] is where that is
 /// rejected. Every candidate slice must have length `query.len()`, and must
