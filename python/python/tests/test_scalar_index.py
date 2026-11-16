@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance._dataset.scanner import ScannerBuilder
+from lance._dataset.scanner import ColumnOrdering, ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -7273,3 +7273,44 @@ def test_row_address_index_maintenance(tmp_path, index_type):
     # both rows remain available through physical-address coverage as well.
     dataset.optimize.optimize_indices()
     _assert_row_address_case(index_type, dataset, 16)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"ordered_index": "off"}, {"use_scalar_index": False}],
+    ids=["default", "ordered_index_off", "use_scalar_index_false"],
+)
+def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
+    ts = [None if i % 10 == 3 else i * 7 % 60 for i in range(60)]
+    table = pa.table(
+        {
+            "ts": pa.array(ts, pa.int32()),
+            "v": pa.array([None if t is None else t * 10 for t in ts], pa.int64()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=20)
+    dataset.create_scalar_index("ts", "BTREE", name="ts_idx")
+    dataset.delete("ts > 55")
+    order_by = [ColumnOrdering("ts", ascending=False, nulls_first=False)]
+
+    scanner = dataset.scanner(columns=["v"], order_by=order_by, limit=10, **options)
+    plan = scanner.explain_plan()
+    if options:
+        assert "SortExec" in plan and "OrderedIndexScan" not in plan, plan
+    else:
+        node = "OrderedIndexScan: index=ts_idx, order=[ts DESC NULLS LAST], fetch=10"
+        assert node in plan and "SortExec" not in plan, plan
+
+    live = dataset.to_table(columns=["ts", "v"])
+    newest = live.sort_by([("ts", "descending")]).slice(0, 10).select(["v"])
+    assert newest["v"].to_pylist() == [550, 540, 530, 520, 500, 490, 480, 470, 460, 450]
+    assert scanner.to_table() == newest
+    to_table = dataset.to_table(columns=["v"], order_by=order_by, limit=10, **options)
+    assert to_table == newest
+
+
+def test_ordered_index_rejects_unknown_mode(tmp_path):
+    dataset = lance.write_dataset(pa.table({"ts": pa.array([2, 1])}), tmp_path)
+    expected = "unknown ordered_index mode 'sorted', expected one of: off, auto"
+    with pytest.raises(ValueError, match=expected):
+        dataset.scanner(order_by=["ts"], limit=1, ordered_index="sorted")

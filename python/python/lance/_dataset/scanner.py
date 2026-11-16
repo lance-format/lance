@@ -734,6 +734,7 @@ class ScannerBuilder:
         self._full_text_query = None
         self._use_scalar_index = None
         self._ignored_scalar_indices = None
+        self._ordered_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -980,12 +981,16 @@ class ScannerBuilder:
         return self
 
     def ignored_scalar_indices(self, index_names: Iterable[str]) -> ScannerBuilder:
-        """Ignore named scalar indices from expression-filter planning.
+        """Ignore named scalar indices from expression-filter planning and ordered
+        reads.
 
         Other scalar indices remain eligible, and the original filter is still
         evaluated. Names that do not identify an available scalar index have no
         effect. This option is ignored when scalar indices are disabled with
         :meth:`use_scalar_index`.
+
+        An ignored index never serves an ordered read for :meth:`order_by`. See
+        :meth:`ordered_index`.
 
         Inverted index names are also honored for expression filters such as
         ``contains_tokens``, which fall back to evaluating the function without
@@ -1002,6 +1007,22 @@ class ScannerBuilder:
         if any(not isinstance(name, str) or not name for name in index_names):
             raise ValueError("ignored_scalar_indices must contain non-empty strings")
         self._ignored_scalar_indices = index_names
+        return self
+
+    def ordered_index(self, mode: str) -> ScannerBuilder:
+        """
+        Set whether a B-tree index may be read in key order to serve ``order_by``
+
+        With ``"auto"``, the default, a scan with a limit that orders by one column
+        with a B-tree index reads that index in key order and stops after
+        ``offset + limit`` live rows, instead of sorting every row.  This applies
+        when the scan has no filter or a filter that the same index answers
+        exactly.  An index named in :meth:`ignored_scalar_indices` never serves
+        the read.  ``"off"`` always sorts.  Names are case-insensitive, and the
+        scanner rejects any other name with a ``ValueError``.  Other uses of
+        scalar indices are not affected.
+        """
+        self._ordered_index = mode
         return self
 
     def with_fragments(
@@ -1390,6 +1411,7 @@ class ScannerBuilder:
             self._row_addr_allowlist,
             self._row_addr_blocklist,
             self._minhash_query,
+            self._ordered_index,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 

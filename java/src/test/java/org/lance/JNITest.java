@@ -25,6 +25,7 @@ import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
 import org.lance.ipc.Query;
+import org.lance.ipc.ScanOptions;
 import org.lance.test.JniTestHelper;
 
 import org.junit.jupiter.api.Test;
@@ -38,6 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class JNITest {
   @Test
@@ -163,6 +165,18 @@ public class JNITest {
         IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfFlat(10, DistanceType.L2))
             .build());
+  }
+
+  @Test
+  public void testParseOrderedIndexMode() {
+    for (ScanOptions.OrderedIndexMode mode : ScanOptions.OrderedIndexMode.values()) {
+      JniTestHelper.parseOrderedIndexMode(mode.toRustString());
+    }
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class, () -> JniTestHelper.parseOrderedIndexMode("sorted"));
+    String expected = "unknown ordered_index mode 'sorted', expected one of: off, auto";
+    assertTrue(error.getMessage().contains(expected), error.getMessage());
   }
 
   @Test

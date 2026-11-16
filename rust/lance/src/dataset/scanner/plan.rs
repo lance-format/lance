@@ -857,6 +857,7 @@ impl Scanner {
             .await?;
 
         let mut use_limit_node = true;
+        let mut is_index_ordered = false;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
         let mut plan: Arc<dyn ExecutionPlan> = match (
             &self.nearest,
@@ -898,6 +899,9 @@ impl Scanner {
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
                     self.take_source(take_op).await?
+                } else if let Some(ordered_read) = self.try_ordered_read(&mut filter_plan).await {
+                    is_index_ordered = true;
+                    ordered_read
                 } else {
                     let planned_read = self
                         .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
@@ -980,7 +984,9 @@ impl Scanner {
         }
 
         // Sort
-        if let Some(ordering) = &self.ordering {
+        if let Some(ordering) = &self.ordering
+            && !is_index_ordered
+        {
             let ordering_columns = ordering.iter().map(|col| &col.column_name);
             let projection_with_ordering = self
                 .dataset

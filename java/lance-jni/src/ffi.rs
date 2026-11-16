@@ -4,6 +4,7 @@
 use core::slice;
 
 use crate::Error;
+use crate::blocking_scanner::get_ordered_index_mode;
 use crate::error::Result;
 use crate::utils::{get_query, get_vector_index_params};
 use jni::objects::{JByteArray, JByteBuffer, JFloatArray, JObjectArray, JString};
@@ -520,6 +521,15 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     query_opt: JObject, // Optional<TmpQuery>
 ) {
     ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseOrderedIndexMode(
+    mut env: JNIEnv,
+    _obj: JObject,
+    name: JString, // String
+) {
+    ok_or_throw_without_return!(env, get_ordered_index_mode(&mut env, &name));
 }
 
 #[unsafe(no_mangle)]

@@ -40,7 +40,7 @@ use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
-    MaterializationStyle, RowAddrMask,
+    MaterializationStyle, OrderedIndexMode, RowAddrMask,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
@@ -939,7 +939,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, ignored_scalar_indices=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, ignored_scalar_indices=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None, ordered_index=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -977,6 +977,7 @@ impl Dataset {
         row_addr_allowlist: Option<Vec<u8>>,
         row_addr_blocklist: Option<Vec<u8>>,
         minhash_query: Option<&Bound<PyDict>>,
+        ordered_index: Option<String>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1236,6 +1237,10 @@ impl Dataset {
 
         if let Some(ignored_scalar_indices) = ignored_scalar_indices {
             scanner.with_ignored_scalar_indices(ignored_scalar_indices);
+        }
+
+        if let Some(ordered_index) = ordered_index {
+            scanner.ordered_index(ordered_index.parse::<OrderedIndexMode>().infer_error()?);
         }
 
         if let Some(strict_batch_size) = strict_batch_size {
