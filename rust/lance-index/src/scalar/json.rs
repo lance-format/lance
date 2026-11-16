@@ -666,8 +666,9 @@ impl JsonQuery {
             Some(value_type) if value_type.is_floating() => json_get_float_udf(),
             Some(DataType::Boolean) => json_get_bool_udf(),
             // String-typed targets, and queries with no recoverable value type
-            // (`IS NULL`), recheck through the string accessor, which is null
-            // exactly where the indexed value is (path missing or JSON null).
+            // (`IS NULL`), recheck through the string accessor. On the strings,
+            // numbers and booleans a scalar target indexes, it is null exactly
+            // where the value is missing or JSON null.
             _ => json_get_string_udf(),
         };
         Expr::ScalarFunction(ScalarFunction {
