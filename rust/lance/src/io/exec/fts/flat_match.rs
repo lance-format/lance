@@ -28,7 +28,7 @@ use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
 use crate::index::scalar::inverted::{
-    ResolvedFtsField, load_segment_details, load_segments, resolve_fts_field,
+    ResolvedFtsField, load_segment_details, load_segment_params, load_segments, resolve_fts_field,
 };
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
@@ -626,8 +626,9 @@ impl ExecutionPlan for FlatMatchFilterExec {
         self.input.properties()
     }
 
+    // Drops rows that do not match the query, so a limit cannot move below it.
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -772,7 +773,9 @@ impl FlatMatchQueryExec {
         }
     }
 
-    /// See [`super::MatchQueryExec::new_with_segments`].
+    /// See [`super::MatchQueryExec::new_with_segments`]. An empty selection adds
+    /// no indexed corpus statistics. It retains the snapshot's index tokenizer
+    /// configuration, or the default tokenizer when the column has no index.
     pub fn new_with_segments(
         dataset: Arc<Dataset>,
         query: MatchQuery,
@@ -1046,6 +1049,28 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     None => load_segments(&ds, &column, document_granularity).await?,
                 };
                 let (tokenizer, base_scorer) = match segments {
+                    Some(segments) if segments.is_empty() => {
+                        // A residual-only distributed scope must not implicitly
+                        // open every committed segment. Read tokenizer metadata
+                        // from the pinned snapshot without constructing an index
+                        // or borrowing any of its document/term statistics.
+                        let mut tokenizer =
+                            match load_segments(&ds, &column, document_granularity).await? {
+                                Some(metadata) => {
+                                    let segment = metadata.first().ok_or_else(|| {
+                                        Error::internal("FTS tokenizer metadata has no segment")
+                                    })?;
+                                    load_segment_params(&ds, segment).await?.build()?
+                                }
+                                None => default_text_tokenizer(),
+                            };
+                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+                        record_tokenized_query(&tokenized_query, &query_tokens);
+                        (
+                            tokenizer,
+                            preset_base_scorer.map(|scorer| (*scorer).clone()),
+                        )
+                    }
                     Some(segments) => {
                         let _details = load_segment_details(&ds, &column, &segments).await?;
                         let indices =
@@ -1179,6 +1204,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
 #[cfg(test)]
 mod tests {
+    mod empty_segments;
     mod filter_binding;
     use super::*;
     use crate::dataset::transaction::{Operation, TransactionBuilder};

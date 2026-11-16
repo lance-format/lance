@@ -428,7 +428,7 @@ impl ExprFilter {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema.clone());
-                let filter = planner.parse_filter(sql)?;
+                let filter = planner.parse_filter_with_schema(sql, full_schema)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
@@ -566,9 +566,13 @@ pub struct Scanner {
     ordering: Option<Vec<ColumnOrdering>>,
 
     nearest: Option<Query>,
+    /// When set, score coarse candidates in this separate vector space.
+    nearest_refine: Option<vector::VectorRefinement>,
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
+    /// WARP's `t'`; `None` scales it with the indexed corpus.
+    warp_imputation_rank: Option<usize>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -747,7 +751,7 @@ impl Dataset {
                         segment.name
                     )));
                 }
-                let Some(field_id) = segment.keyed_field() else {
+                let Some(&field_id) = segment.keyed_fields().first() else {
                     return Err(Error::invalid_input(format!(
                         "Scalar index '{index_name}' segment {segment_uuid} has no keyed field"
                     )));
@@ -1095,5 +1099,319 @@ mod tests {
             std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
         }
         assert_eq!(get_default_io_buffer_size_override(), None);
+    }
+
+    mod multi_column_planner {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+        use async_trait::async_trait;
+        use datafusion::logical_expr::Expr;
+        use datafusion::scalar::ScalarValue;
+        use futures::TryStreamExt;
+        use lance_core::ROW_ID;
+        use lance_core::cache::LanceCache;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
+        use lance_file::version::LanceFileVersion;
+        use lance_index::IndexType;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::expression::{
+            ScalarIndexLoader, ScalarIndexPlan, ScalarIndexPlanner, ScalarIndexSearch,
+            ScalarQueryParser, create_filter_plan,
+        };
+        use lance_index::scalar::registry::ScalarIndexPlugin;
+        use lance_index::scalar::{
+            IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
+        };
+        use rstest::rstest;
+
+        use super::*;
+        use crate::dataset::WriteParams;
+        use crate::dataset::transaction::{Operation, Transaction};
+        use crate::index::scalar::IndexDetails;
+
+        #[derive(Debug)]
+        struct ContainsPlugin;
+
+        #[async_trait]
+        impl ScalarIndexPlugin for ContainsPlugin {
+            fn name(&self) -> &str {
+                "Contains"
+            }
+
+            fn provides_exact_answer(&self) -> bool {
+                false
+            }
+
+            fn version(&self) -> u32 {
+                0
+            }
+
+            fn new_query_parser(
+                &self,
+                _index_name: String,
+                _index_details: &prost_types::Any,
+            ) -> Option<Box<dyn ScalarQueryParser>> {
+                None
+            }
+
+            fn new_planner(
+                &self,
+                index_name: String,
+                _index_details: &prost_types::Any,
+                keys: &Fields,
+            ) -> Option<Box<dyn ScalarIndexPlanner>> {
+                Some(Box::new(ContainsPlanner {
+                    index_name,
+                    column: keys[0].name().clone(),
+                }))
+            }
+
+            async fn load_index(
+                &self,
+                _index_store: Arc<dyn IndexStore>,
+                _index_details: &prost_types::Any,
+                _index_version: u32,
+                _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+                _cache: &LanceCache,
+            ) -> Result<Arc<dyn ScalarIndex>> {
+                unimplemented!("scans open sb_idx through the NGram plugin")
+            }
+        }
+
+        #[derive(Debug)]
+        struct ContainsPlanner {
+            index_name: String,
+            column: String,
+        }
+
+        impl ScalarIndexPlanner for ContainsPlanner {
+            fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+                conjuncts.iter().find_map(|conjunct| {
+                    let Expr::ScalarFunction(call) = conjunct else {
+                        return None;
+                    };
+                    let [
+                        Expr::Column(column),
+                        Expr::Literal(ScalarValue::Utf8(Some(needle)), _),
+                    ] = call.args.as_slice()
+                    else {
+                        return None;
+                    };
+                    (call.func.name() == "contains" && column.name == self.column).then(|| {
+                        ScalarIndexPlan {
+                            search: ScalarIndexSearch {
+                                column: self.column.clone(),
+                                index_name: self.index_name.clone(),
+                                index_type: "NGram".to_string(),
+                                query: Arc::new(TextQuery::StringContains(needle.clone())),
+                                needs_recheck: true,
+                                fragment_bitmap: None,
+                            },
+                            consumed: vec![conjunct],
+                        }
+                    })
+                })
+            }
+        }
+
+        async fn sb_dataset(version: LanceFileVersion) -> (TempStrDir, Arc<Dataset>) {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("s", DataType::Utf8, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("d", DataType::Int32, false),
+            ]));
+            let abcd_trigrams_without_abcd = "abc-bcd";
+            let words = ["abcd", abcd_trigrams_without_abcd, "xyz", "ab"];
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        (0..600).map(|row| words[row % 4]),
+                    )),
+                    Arc::new(Int32Array::from_iter_values((0..600).map(|row| row % 11))),
+                    Arc::new(Int32Array::from_iter_values((0..600).map(|row| row % 13))),
+                ],
+            )
+            .unwrap();
+            let test_dir = TempStrDir::default();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                test_dir.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 200,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 3);
+            dataset
+                .create_index(
+                    &["s"],
+                    IndexType::NGram,
+                    Some("sb_idx".to_string()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut sb_idx = dataset.load_indices().await.unwrap()[0].clone();
+            sb_idx.fields = ["s", "b"]
+                .map(|name| dataset.schema().field(name).unwrap().id)
+                .to_vec();
+            let transaction = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![sb_idx],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+            (test_dir, Arc::new(dataset))
+        }
+
+        fn row_ids(batches: &[RecordBatch]) -> Vec<u64> {
+            let mut ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name(ROW_ID)
+                        .unwrap()
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        }
+
+        #[rstest]
+        #[case::at_least("ab", true, "")]
+        #[case::at_least_with_row_residual("ab", true, " AND d < 7")]
+        #[case::at_most("abcd", false, "")]
+        #[case::at_most_with_row_residual("abcd", false, " AND d < 7")]
+        #[tokio::test]
+        async fn planner_results_scan_like_unindexed_reads(
+            #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
+            #[case] needle: &str,
+            #[case] at_least: bool,
+            #[case] row_residual: &str,
+        ) {
+            let (_test_dir, dataset) = sb_dataset(version).await;
+            let index = ScalarIndexLoader::load_index(
+                dataset.as_ref(),
+                "s",
+                "sb_idx",
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let result = index
+                .search(
+                    &TextQuery::StringContains(needle.to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    (at_least, &result),
+                    (true, SearchResult::AtLeast(_)) | (false, SearchResult::AtMost(_))
+                ),
+                "{result:?}"
+            );
+
+            // The scanner finds plugins only in the process-wide registry, so the
+            // test plans the filter itself.
+            let indices = dataset.load_indices().await.unwrap();
+            let info = dataset
+                .scalar_index_info_with_plugins(
+                    &indices,
+                    &HashSet::new(),
+                    |details: &IndexDetails| {
+                        if details.0.type_url.ends_with("NGramIndexDetails") {
+                            Ok(&ContainsPlugin as &dyn ScalarIndexPlugin)
+                        } else {
+                            details.get_plugin()
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            let filter = format!("contains(s, '{needle}'){row_residual}");
+            let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+            let mut filter_plan = create_filter_plan(
+                planner
+                    .optimize_expr(planner.parse_filter(&filter).unwrap())
+                    .unwrap(),
+                &info,
+                true,
+            )
+            .unwrap();
+
+            let mut scanner = dataset.scan();
+            scanner.with_row_id();
+            let read = scanner
+                .filtered_read_source(&mut filter_plan, None)
+                .await
+                .unwrap();
+            let scan_plan = datafusion::physical_plan::displayable(read.plan.as_ref())
+                .indent(true)
+                .to_string();
+            let batches = execute_plan(read.plan, LanceExecutionOptions::default())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            let expected = dataset
+                .scan()
+                .filter(&filter)
+                .unwrap()
+                .use_scalar_index(false)
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert!(expected.num_rows() > 0);
+            assert_eq!(row_ids(&batches), row_ids(&[expected]));
+            let sb_idx_search = format!("[contains(s, Utf8(\"{needle}\"))]@sb_idx(NGram)");
+            assert_eq!(
+                scan_plan.contains(&sb_idx_search),
+                version != LanceFileVersion::Legacy,
+                "{scan_plan}"
+            );
+        }
+
+        #[tokio::test]
+        async fn selected_multi_key_segment_reaches_planning() {
+            let (_test_dir, dataset) = sb_dataset(LanceFileVersion::Stable).await;
+            let segment = dataset.load_indices().await.unwrap()[0].uuid;
+            let filter = "contains(s, 'abcd')";
+            let whole = dataset
+                .count_indexed_rows("sb_idx", filter, None, None)
+                .await
+                .map_err(|error| error.to_string());
+            let selected = dataset
+                .count_indexed_rows("sb_idx", filter, Some(&[segment]), None)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(selected, whole);
+            // No built-in plugin returns a planner, so both calls stop at planning.
+            let error = selected.unwrap_err();
+            assert!(
+                error.contains("Filter cannot be planned using scalar index 'sb_idx'"),
+                "{error}"
+            );
+        }
     }
 }

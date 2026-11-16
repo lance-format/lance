@@ -90,7 +90,7 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
     { id = "RUSTSEC-2026-0195", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
     { id = "RUSTSEC-2024-0449", reason = "no fix: `unsafe-libyaml` is unmaintained; serde_yaml pulls it in for substrait 0.63, which datafusion-substrait (latest 55.2) still requires, and serde_yaml_ng for lindera 3" },
-    { id = "RUSTSEC-2026-0441", reason = "no fix: `pin-utils` is unmaintained and archived; `aws-smithy-http` depends on 0.1.0 and no patched release is available" },
+    { id = "RUSTSEC-2026-0441", reason = "no fix: `pin-utils` is unmaintained and archived; `aws-smithy-http` depends on 0.1.1 and no patched release is available" },
 ]
 # Fail when an ignored advisory no longer matches any crate, so an ignore is
 # removed along with the upgrade that fixed it.

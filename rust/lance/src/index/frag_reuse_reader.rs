@@ -9,7 +9,7 @@ use lance_core::{Error, Result};
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use roaring::RoaringBitmap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 mod cache;
@@ -33,11 +33,16 @@ fn check_reader_path() -> Result<()> {
 /// The returned coverage bitmaps are snapshot-derived query inputs and must
 /// never be persisted back to a manifest: stored segment metadata keeps its
 /// original provenance.
+///
+/// The second element names the logical indices with a segment excluded only
+/// because its format marker could not be read. Those exclusions hold for THIS
+/// call alone: the caller records the listing as needing re-derivation, so the
+/// next call re-probes instead of treating the exclusion as final.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
     indices: &[IndexMetadata],
-) -> Result<Arc<Vec<IndexMetadata>>> {
+) -> Result<(Arc<Vec<IndexMetadata>>, BTreeSet<String>)> {
     let mapping = FragmentReuseIndex::open(dataset, fri).await?;
     let mut groups: HashMap<&str, Vec<(usize, &IndexMetadata)>> = HashMap::new();
     let mut result = vec![None; indices.len()];
@@ -72,6 +77,7 @@ pub(super) async fn load_indices(
     // reports true in this state as well, so this is the same decision made
     // explicitly here without consulting the plugin registry per segment.
     let unsupported_history = mapping.ledger.has_unsupported_transitions();
+    let mut unverifiable = BTreeSet::new();
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
@@ -79,9 +85,26 @@ pub(super) async fn load_indices(
                 continue;
             }
             if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                let can_remap = segment_supports_batch_remapping(dataset, index)
-                    .await?
-                    .unwrap_or(false);
+                // A probe that cannot reach the segment's format marker says
+                // nothing about its format, and planning every query on the
+                // table must not fail for it. Treat it as unknown for THIS
+                // call only (no coverage, scan fallback) and mark the listing
+                // for re-derivation, so the next call reclassifies once the
+                // store answers again.
+                let can_remap = match segment_supports_batch_remapping(dataset, index).await {
+                    Ok(can_remap) => can_remap.unwrap_or(false),
+                    Err(error) => {
+                        log::warn!(
+                            "index {} (segment {}): could not read its format marker ({error}); \
+                             excluding it from coverage for this query, its fragments are \
+                             scanned until the read succeeds",
+                            index.name,
+                            index.uuid,
+                        );
+                        unverifiable.insert(index.name.clone());
+                        false
+                    }
+                };
                 if index.fragment_bitmap.is_none() || !can_remap {
                     continue;
                 }
@@ -113,7 +136,10 @@ pub(super) async fn load_indices(
             result[position] = Some(index);
         }
     }
-    Ok(Arc::new(result.into_iter().flatten().collect()))
+    Ok((
+        Arc::new(result.into_iter().flatten().collect()),
+        unverifiable,
+    ))
 }
 
 impl FragmentReuseIndex {
@@ -139,9 +165,8 @@ pub(super) async fn segment_supports_batch_remapping(
         ));
     }
     if details.type_url.ends_with("InvertedIndexDetails") {
-        return Ok(Some(
-            super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index).await?,
-        ));
+        return super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
+            .await;
     }
     Ok(super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
         .get_plugin_by_details(details)
@@ -780,6 +805,7 @@ pub mod tests {
                 .map(|f| f.id as u32)
                 .collect(),
         );
+        dataset.index_cache.clear().await;
         let key = IndexMetadataKey {
             version: dataset.manifest.version,
             store_identity: &dataset.object_store.store_prefix,
@@ -1503,7 +1529,11 @@ pub mod tests {
         orphan_user_index.fragment_bitmap = None;
 
         let indices = vec![fri.clone(), mem_wal.clone(), orphan_user_index.clone()];
-        let listing = load_indices(&dataset, &fri, &indices).await.unwrap();
+        let (listing, unverifiable) = load_indices(&dataset, &fri, &indices).await.unwrap();
+        assert!(
+            unverifiable.is_empty(),
+            "every marker is readable in this fixture"
+        );
 
         assert!(
             listing.iter().any(|i| i.name == MEM_WAL_INDEX_NAME),

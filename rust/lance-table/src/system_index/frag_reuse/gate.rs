@@ -466,6 +466,7 @@ mod tests {
                     entry: appended_entry(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 },
             ))
         } else {

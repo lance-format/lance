@@ -3,6 +3,15 @@
 
 use super::support::*;
 use super::*;
+use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::transaction::RewriteGroup;
+use crate::index::frag_reuse::{
+    MissingCoverageReason, frag_reuse_entry_appending, segment_coverage_reason,
+};
+use crate::index::frag_reuse_reader::tests::{persist_fixture, prepare_partition};
+use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{IndexStore, index_files_to_table};
 
 #[tokio::test]
 async fn test_segmented_optimize_rebalances_only_one_segment() {
@@ -957,6 +966,666 @@ async fn test_optimize_empty_code_fts_index_preserves_params(#[case] block_size:
         .await
         .unwrap();
     assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
+}
+
+#[rstest]
+#[case::btree(IndexType::BTree, "id", "page_lookup.lance", false)]
+#[case::fts(IndexType::Inverted, "text", "tokens.lance", false)]
+#[case::fts_036(IndexType::Inverted, "text", "tokens.lance", true)]
+#[tokio::test]
+async fn test_optimize_reports_segment_open_errors(
+    #[case] index_type: IndexType,
+    #[case] column: &str,
+    #[case] file_suffix: &str,
+    #[case] has_036_type_url: bool,
+    #[values(false, true)] is_missing_file: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_dataset(&test_dir, FragmentCount(1), FragmentRowCount(4))
+        .await
+        .unwrap();
+    let params: Box<dyn IndexParams> = match index_type {
+        IndexType::BTree => Box::new(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree)),
+        IndexType::Inverted => Box::new(InvertedIndexParams::default()),
+        _ => unreachable!(),
+    };
+    dataset
+        .create_index(
+            &[column],
+            index_type,
+            Some("test_idx".into()),
+            params.as_ref(),
+            false,
+        )
+        .await
+        .unwrap();
+    if has_036_type_url {
+        let original = dataset.load_indices_by_name("test_idx").await.unwrap();
+        let mut segment = original[0].clone();
+        Arc::make_mut(segment.index_details.as_mut().unwrap()).type_url =
+            "type.googleapis.com/lance.index.pb.InvertedIndexDetails".into();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![segment],
+                        removed_indices: original,
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let appended = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    dataset.append(appended, None).await.unwrap();
+
+    // Reopen with a fresh session so a cached index cannot hide the missing file.
+    let mut dataset = Dataset::open(&test_dir).await.unwrap();
+    let original = dataset.load_indices_by_name("test_idx").await.unwrap();
+    let version = dataset.version().version;
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].reference.name, "test_idx");
+
+    if is_missing_file {
+        let segment = &original[0];
+        let file = segment
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|file| file.path.ends_with(file_suffix))
+            .unwrap();
+        let path = dataset
+            .indices_dir()
+            .join(segment.uuid.to_string())
+            .join(file.path.as_str());
+        dataset.object_store.delete(&path).await.unwrap();
+    }
+
+    let result = dataset.optimize_indices(&OptimizeOptions::default()).await;
+    let dataset = Dataset::open(&test_dir).await.unwrap();
+    let indices = dataset.load_indices_by_name("test_idx").await.unwrap();
+    if is_missing_file {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::Index { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("index 'test_idx'"), "{message}");
+        assert!(message.contains(&format!("column '{column}'")), "{message}");
+        assert!(message.contains(file_suffix), "{message}");
+        assert!(
+            message.to_ascii_lowercase().contains("not found"),
+            "{message}"
+        );
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(indices, original);
+    } else {
+        result.unwrap();
+        let covered: RoaringBitmap = indices
+            .iter()
+            .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+            .collect();
+        assert_eq!(covered, RoaringBitmap::from_iter([0, 1]));
+    }
+}
+
+#[rstest]
+#[case::unsupported(false, MissingCoverageReason::Unsupported)]
+#[case::withdrawn(false, MissingCoverageReason::Withdrawn)]
+#[case::empty(true, MissingCoverageReason::Withdrawn)]
+#[tokio::test]
+async fn test_optimize_skips_an_index_without_fragment_reuse_translation(
+    #[case] is_empty: bool,
+    #[case] expected_reason: MissingCoverageReason,
+) {
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_ram_dataset(
+            FragmentCount(if is_empty { 0 } else { 2 }),
+            FragmentRowCount(2),
+        )
+        .await
+        .unwrap();
+    let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Fm,
+            Some("text_idx".into()),
+            &fm_params,
+            false,
+        )
+        .await
+        .unwrap();
+    let original = load_all_indices_by_name(&dataset, "text_idx")
+        .await
+        .unwrap()[0]
+        .clone();
+    if is_empty {
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col(
+                "text",
+                array::cycle_utf8_literals(&["hello world", "lance"]),
+            )
+            .into_reader_rows(RowCount::from(2), BatchCount::from(2));
+        dataset
+            .append(
+                reader,
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::ReserveFragments { num_fragments: 2 },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let old_fragments = dataset.fragments().to_vec();
+    let (transition, new_fragments) = prepare_partition(&dataset, &[0, 1], 2).await;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index,
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let appended = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    dataset.append(appended, None).await.unwrap();
+
+    // A sibling on a fragment outside the rewrite history is directly readable.
+    // It must also be preserved when the old segment cannot be translated.
+    let sibling = dataset
+        .create_index_builder(&["text"], IndexType::Fm, &fm_params)
+        .name("text_idx".into())
+        .fragments(vec![4])
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![sibling],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    if expected_reason == MissingCoverageReason::Unsupported {
+        // Current compaction withdraws this coverage. Preserve a fixture with
+        // retained coverage to exercise readers of existing tagged histories.
+        let mut indices = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let segment = indices
+            .iter_mut()
+            .find(|segment| segment.uuid == original.uuid)
+            .unwrap();
+        *segment = original;
+        persist_fixture(&mut dataset, indices).await;
+    }
+    let before = load_all_indices_by_name(&dataset, "text_idx")
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(
+        segment_coverage_reason(&dataset, &before[0]).await.unwrap(),
+        Some(expected_reason)
+    );
+    assert_eq!(
+        segment_coverage_reason(&dataset, &before[1]).await.unwrap(),
+        None
+    );
+
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].reference.name, "i_idx");
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        load_all_indices_by_name(&dataset, "text_idx")
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        dataset
+            .unindexed_fragments("i_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.validate().await.unwrap();
+
+    let error = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec!["text_idx".into()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error.to_string().contains("cannot be translated"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_optimize_trains_vector_definition_under_tagged_history() {
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .into_ram_dataset(FragmentCount(2), FragmentRowCount(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(
+            &["vec"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .name("vec_idx".into())
+        .train(false)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::ReserveFragments { num_fragments: 2 },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let old_fragments = dataset.fragments().to_vec();
+    let (transition, new_fragments) = prepare_partition(&dataset, &[0, 1], 2).await;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index,
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let before = load_all_indices_by_name(&dataset, "vec_idx").await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(crate::index::append::is_definition_only_segment(&before[0]));
+    assert_eq!(
+        segment_coverage_reason(&dataset, &before[0]).await.unwrap(),
+        Some(MissingCoverageReason::Withdrawn)
+    );
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].reference.name, "vec_idx");
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let after = dataset.load_indices_by_name("vec_idx").await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_ne!(after[0].uuid, before[0].uuid);
+    assert_eq!(
+        after[0].fragment_bitmap.as_ref().unwrap(),
+        dataset.fragment_bitmap.as_ref()
+    );
+    dataset.validate().await.unwrap();
+
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    let query = rows["vec"].as_fixed_size_list().value(0);
+    let expected = dataset
+        .scan()
+        .nearest("vec", query.as_ref(), 4)
+        .unwrap()
+        .use_index(false)
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let actual = dataset
+        .scan()
+        .nearest("vec", query.as_ref(), 4)
+        .unwrap()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = expected["i"].as_primitive::<Int32Type>();
+    let actual = actual["i"].as_primitive::<Int32Type>();
+    let hits = actual
+        .values()
+        .iter()
+        .filter(|id| expected.values().contains(id))
+        .count();
+    let recall = hits as f64 / expected.len() as f64;
+    assert_eq!(recall, 1.0);
+}
+
+#[rstest]
+#[case::jieba("jieba")]
+#[case::lindera("lindera")]
+#[case::unknown("unknown-tokenizer")]
+#[tokio::test]
+async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
+    #[case] tokenizer: &str,
+    #[values(false, true)] is_bounded: bool,
+    #[values(false, true)] has_manifest_tokenizer: bool,
+    #[values(false, true)] has_stable_row_ids: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_dataset_with_params(
+            &test_dir,
+            FragmentCount(3),
+            FragmentRowCount(2),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: has_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let mut segments = Vec::with_capacity(2);
+    for fragment in [0, 1] {
+        let mut segment = dataset
+            .create_index_builder(
+                &["text"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .name("text_idx".into())
+            .fragments(vec![fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        if let Some(files) =
+            crate::index::scalar::inverted::finalize_segment_files_if_needed(&dataset, &segment)
+                .await
+                .unwrap()
+        {
+            segment.files = Some(index_files_to_table(files));
+        }
+        segments.push(segment);
+    }
+    // Model an index written by a process with a tokenizer model installed.
+    // Rewrite both persisted copies of its configuration, leaving its data
+    // files intact. This process cannot load the uniquely named model.
+    let tokenizer = format!("{tokenizer}/missing-{}", Uuid::new_v4());
+    let params = InvertedIndexParams::default().base_tokenizer(tokenizer.clone());
+    assert!(params.build().is_err());
+    let segment = &mut segments[1];
+    let store = LanceIndexStore::from_dataset_for_new(&dataset, &segment.uuid).unwrap();
+    let reader = store.open_index_file(METADATA_FILE).await.unwrap();
+    let schema = reader.schema();
+    let batch = reader.read_range(0..1, None).await.unwrap();
+    let mut metadata = schema.metadata.clone();
+    metadata.insert("params".into(), serde_json::to_string(&params).unwrap());
+    let mut writer = store
+        .new_index_file(
+            METADATA_FILE,
+            Arc::new(Schema::new(batch.schema().fields().clone())),
+        )
+        .await
+        .unwrap();
+    writer.write_record_batch(batch).await.unwrap();
+    let file = writer.finish_with_metadata(metadata).await.unwrap();
+    let recorded_file = segment
+        .files
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|existing| existing.path == file.path)
+        .unwrap();
+    recorded_file.size_bytes = file.size_bytes;
+    recorded_file.file_metadata_size_bytes = None;
+    let details = if has_manifest_tokenizer {
+        InvertedIndexDetails::try_from(&params).unwrap()
+    } else {
+        InvertedIndexDetails::default()
+    };
+    segment.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: segments.clone(),
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(&["i"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("i_idx".into())
+        .fragments(vec![0])
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(&test_dir).await.unwrap();
+    let before = load_all_indices_by_name(&dataset, "text_idx")
+        .await
+        .unwrap();
+    let error = dataset
+        .open_scalar_index_for_maintenance("text", &segments[1].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidInput { .. } | Error::IO { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&tokenizer), "{error}");
+
+    let options = OptimizeOptions::default().max_rows_per_task(is_bounded.then_some(2));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tasks
+            .iter()
+            .filter(|task| task.reference.name == "i_idx")
+            .count(),
+        if is_bounded { 2 } else { 1 }
+    );
+    let named = options.clone().index_names(vec!["text_idx".into()]);
+    if !is_bounded || has_stable_row_ids {
+        // Unsplit tasks can use tokenizer resources installed only on workers.
+        // FTS remains unsplit with stable row IDs, even in bounded plans.
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .filter(|task| task.reference.name == "text_idx")
+                .count(),
+            1
+        );
+        let plan = crate::index::optimize::plan_optimize_indices(&dataset, &named)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].reference.name, "text_idx");
+    } else {
+        assert!(plan.tasks.iter().all(|task| task.reference.name == "i_idx"));
+        let error = crate::index::optimize::plan_optimize_indices(&dataset, &named)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("text_idx"), "{error}");
+        assert!(error.to_string().contains(&tokenizer), "{error}");
+    }
+    dataset.optimize_indices(&options).await.unwrap();
+    assert_eq!(
+        load_all_indices_by_name(&dataset, "text_idx")
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        dataset
+            .unindexed_fragments("i_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.validate().await.unwrap();
+
+    let error = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec!["text_idx".into()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("which this process cannot build"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_optimize_fts_with_legacy_tokenizer_details() {
+    let test_dir = copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let original = dataset.load_indices().await.unwrap();
+    assert_eq!(original.len(), 1);
+    assert!(
+        original[0]
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<InvertedIndexDetails>()
+            .unwrap()
+            .base_tokenizer
+            .is_none()
+    );
+    let reader = gen_batch()
+        .col("text", array::cycle_utf8_literals(&["happy puppy"]))
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    dataset.append(reader, None).await.unwrap();
+    let options = OptimizeOptions::default();
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert!(!plan.tasks.is_empty());
+    dataset.optimize_indices(&options).await.unwrap();
+    assert!(
+        dataset
+            .unindexed_fragments(&original[0].name)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// Optimizing a name whose segments this build cannot all read would commit

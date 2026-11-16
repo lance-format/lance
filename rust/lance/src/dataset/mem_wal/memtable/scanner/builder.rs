@@ -1488,7 +1488,8 @@ mod tests {
 
     /// A deduplicated filtered read from the filter indexes returns what
     /// reading every row returns, across overwrites, deletes, rows not yet
-    /// visible, and every key type, single and composite.
+    /// visible, every key type, single and composite, and filters over one
+    /// index, two, or an index beside a predicate it cannot answer.
     #[tokio::test]
     async fn memtable_filter_indexes_answer_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -1500,7 +1501,7 @@ mod tests {
             "red", "blue", "green", "amber", "black", "white", "grey", "pink", "cyan", "teal",
             "navy", "lime", "plum", "rose", "sand", "gold",
         ];
-        const FILTERS: [&str; 9] = [
+        const FILTERS: [&str; 17] = [
             "colour = 'red'",
             "colour IN ('red', 'blue')",
             "colour IS NULL",
@@ -1511,6 +1512,16 @@ mod tests {
             "colour BETWEEN 'red' AND 'blue'",
             "colour > 'red' AND colour < 'blue'",
             "colour > 'red' AND colour <= 'red'",
+            "n = 3",
+            "n IN (1, 2)",
+            "n < 3",
+            "n BETWEEN 30 AND 10",
+            "n > 20 AND n <= 20",
+            // Both indexes in one filter, and an index beside a predicate it
+            // cannot answer.
+            "n > 30 AND colour = 'red'",
+            "n = 3 OR colour = 'blue'",
+            "n = 3 AND colour LIKE 'r%'",
         ];
         // Every key type a memtable key index accepts.
         const KEY_TYPES: [DataType; 13] = [
@@ -1537,7 +1548,8 @@ mod tests {
             (seed >> 33) % bound
         };
         let (mut checked_reads, mut full_reads) = (0, 0);
-        for round in 0..150 {
+        // Twice through every pairing of key type with single or composite key.
+        for round in 0..2 * 3 * KEY_TYPES.len() {
             let composite = round % 3 == 1;
             let key_type = KEY_TYPES[round % KEY_TYPES.len()].clone();
             let string_key = matches!(
@@ -1548,11 +1560,15 @@ mod tests {
                 Field::new("a", key_type.clone(), false),
                 Field::new("b", DataType::Int32, false),
                 Field::new("colour", DataType::Utf8, true),
+                Field::new("n", DataType::Int32, true),
                 Field::new(TOMBSTONE, DataType::Boolean, false),
             ]));
             let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
             let mut indexes = IndexStore::from_specs(
-                &[MemIndexSpec::btree("colour_idx", 2, "colour")],
+                &[
+                    MemIndexSpec::btree("colour_idx", 2, "colour"),
+                    MemIndexSpec::btree("n_idx", 3, "n"),
+                ],
                 &lance_schema,
                 1024,
                 64,
@@ -1570,7 +1586,8 @@ mod tests {
             let batches = 1 + next(40) as usize;
             for position in 0..batches {
                 let rows = 1 + next(16) as usize;
-                let (mut a, mut b, mut colour, mut tombstone) = (vec![], vec![], vec![], vec![]);
+                let (mut a, mut b, mut colour, mut n, mut tombstone) =
+                    (vec![], vec![], vec![], vec![], vec![]);
                 for _ in 0..rows {
                     a.push(next(60) as i32);
                     b.push(if composite { next(3) as i32 } else { 1 });
@@ -1580,6 +1597,7 @@ mod tests {
                         16 => None,
                         c => Some(COLOURS[c as usize]),
                     });
+                    n.push((!deleted && next(12) != 0).then(|| next(40) as i32));
                     tombstone.push(deleted);
                 }
                 let batch = RecordBatch::try_new(
@@ -1598,6 +1616,7 @@ mod tests {
                         .unwrap(),
                         Arc::new(Int32Array::from(b)),
                         Arc::new(StringArray::from(colour)),
+                        Arc::new(Int32Array::from(n)),
                         Arc::new(BooleanArray::from(tombstone)),
                     ],
                 )

@@ -134,3 +134,69 @@ def test_pr_diverged_from_main(
 
     monkeypatch.chdir(tmp_path)
     assert main(["HEAD^1", head, "--fail-bytes", "100"]) == 0
+
+
+@pytest.mark.parametrize(
+    "base_files, pr_files, expected, errors",
+    [
+        # The PR grows big.rs past the limit and lists it to silence the failure.
+        pytest.param(
+            {"big.rs": numbered(0, 10), EXCEPTIONS_FILE: ""},
+            {"big.rs": numbered(0, 14), EXCEPTIONS_FILE: "big.rs\n"},
+            1,
+            ["New module size exception", "Module too large"],
+            id="adds_exception_for_grown_module",
+        ),
+        # The PR lists an oversized module it does not touch.
+        pytest.param(
+            {"big.rs": numbered(0, 14), "other.rs": "", EXCEPTIONS_FILE: ""},
+            {"other.rs": numbered(0, 1), EXCEPTIONS_FILE: "big.rs\n"},
+            1,
+            ["New module size exception"],
+            id="adds_exception_for_untouched_module",
+        ),
+        # big.rs was already listed on the base branch: growth stays a warning.
+        pytest.param(
+            {"big.rs": numbered(0, 14), EXCEPTIONS_FILE: "big.rs\n"},
+            {"big.rs": numbered(0, 15)},
+            0,
+            [],
+            id="existing_exception",
+        ),
+        # The PR splits big.rs and removes its entry.
+        pytest.param(
+            {"big.rs": numbered(0, 15), EXCEPTIONS_FILE: "big.rs\n"},
+            {"big.rs": numbered(10, 15), EXCEPTIONS_FILE: ""},
+            0,
+            [],
+            id="removes_exception_after_split",
+        ),
+    ],
+)
+def test_pr_changes_exceptions(
+    tmp_path, monkeypatch, capsys, base_files, pr_files, expected, errors
+):
+    def git(*args):
+        subprocess.run(["git", "-C", tmp_path, *args], check=True, capture_output=True)
+
+    def commit(files):
+        for name, content in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        git("add", "-A")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+
+    git("init", "-q", "-b", "main")
+    commit(base_files)
+    git("switch", "-q", "-c", "pr")
+    commit(pr_files)
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["main", "HEAD", "--fail-bytes", "100"]) == expected
+    titles = [
+        line.split("title=", 1)[1].split("::", 1)[0]
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("::error")
+    ]
+    assert titles == errors

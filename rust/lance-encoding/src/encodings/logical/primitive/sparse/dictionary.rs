@@ -479,7 +479,7 @@ impl EncodingsIo for DictionaryItemsIo {
         let io = self.inner.clone();
         // Cache lookup is asynchronous, but reads must start during scheduling.
         // Waiting for a decoder to poll this future serializes sibling pages.
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             let mut output = vec![None; ranges.len()];
             let mut misses = Vec::new();
             for (position, range) in ranges.into_iter().enumerate() {

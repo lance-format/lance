@@ -384,6 +384,8 @@ public class WriteDatasetBuilder {
    *
    * @return Dataset
    * @throws IllegalArgumentException if required parameters are missing or invalid
+   * @throws DatasetAlreadyExistsException if the mode is {@link WriteParams.WriteMode#CREATE} and a
+   *     dataset already exists at the target location
    */
   public Dataset execute() {
     // Auto-create allocator if not provided

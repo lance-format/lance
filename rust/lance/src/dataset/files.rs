@@ -327,7 +327,7 @@ impl Dataset {
         let tx_emitter = tx.clone();
         let uri_emitter = uri.clone();
         let progress_cb = options.progress;
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             let mut stream = stream;
             let mut processed = 0usize;
             while let Some(scanned) = stream.next().await {
@@ -378,7 +378,7 @@ impl Dataset {
         let uri_idx = uri;
         let os_idx = object_store;
         let base_idx = base;
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
             while let Some((version, indexes)) = rx_indexes.recv().await {
                 let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();

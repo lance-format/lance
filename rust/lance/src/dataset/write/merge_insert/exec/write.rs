@@ -13,7 +13,9 @@ use arrow_select;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
@@ -61,7 +63,7 @@ use super::apply_deletions;
 
 /// Consumers own the producer task so cancelling a merge also stops polling
 /// its source, including when the producer is waiting on a full output queue.
-struct SplitterTask(tokio::task::JoinHandle<()>);
+struct SplitterTask(lance_core::utils::tokio::JoinHandle<()>);
 
 impl Drop for SplitterTask {
     fn drop(&mut self) {
@@ -906,7 +908,7 @@ impl FullSchemaMergeInsertExec {
         // `AssertUnwindSafe` bound is fine.
         let panic_update_tx = update_tx.clone();
         let panic_insert_tx = insert_tx.clone();
-        let splitter = Arc::new(SplitterTask(tokio::spawn(async move {
+        let splitter = Arc::new(SplitterTask(lance_core::utils::tokio::spawn(async move {
             let result =
                 futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
                     let mut input_stream = input_stream;
@@ -1214,6 +1216,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let write_time =
+            MetricBuilder::new(&self.metrics).subset_time("merge_write_time", partition);
 
         // Input schema structure based on our logical plan:
         // - target._rowaddr: Address of existing rows to update/delete
@@ -1309,6 +1313,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         };
 
         let result_stream = stream::once(async move {
+            // Time lazy execution, including upstream waits, rather than stream construction.
+            let _write_timer = write_time.timer();
             // Step 2: Write new fragments using the filtered data (inserts + updates)
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
