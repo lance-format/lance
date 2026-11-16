@@ -280,7 +280,9 @@ fn late_scores_depend_on_heap(index: &dyn VectorIndex) -> bool {
 /// ([`late_scores_depend_on_heap`]). Each active query searches its late range
 /// in every delta it joins with `search_partitions`, as the single-query path
 /// does, so its partitions share one top-k heap and it stops at the same
-/// partition. Deltas are searched in order; queries run in parallel.
+/// partition. Each partition's rows go straight into the query's bounded
+/// candidates as they arrive, so the search holds at most `k` rows per query.
+/// Deltas are searched in order; queries run in parallel.
 async fn sequential_late_search(
     deltas: &[BatchDelta],
     dim: usize,
@@ -290,66 +292,77 @@ async fn sequential_late_search(
     candidates: &mut [TopHits],
     metrics: &AnnIndexMetrics,
 ) -> DataFusionResult<()> {
-    let searches = (0..candidates.len())
-        .filter(|&query_index| is_active[query_index])
-        .map(|query_index| {
-            let query_found = Arc::new(AtomicUsize::new(found[query_index]));
-            async move {
-                let mut batches = Vec::new();
-                for delta in deltas
-                    .iter()
-                    .filter(|delta| delta.joins_late_search(query_index))
-                {
-                    if query_found.load(Ordering::Relaxed) >= budget {
-                        break;
-                    }
-                    let plan = &delta.plans[query_index];
-                    let mut query = delta.query.clone();
-                    query.key = delta.query.key.slice(query_index * dim, dim);
-                    let control: Arc<dyn PartitionSearchControl> =
-                        Arc::new(BatchLateSearchControl {
-                            found: query_found.clone(),
-                            max_results: budget,
-                            seg_mask: delta.seg_mask.clone(),
-                        });
-                    let index_metrics: Arc<dyn MetricsCollector> =
-                        Arc::new(metrics.index_metrics.clone());
-                    let mut stream = delta
-                        .index
-                        .clone()
-                        .search_partitions(
-                            query,
-                            plan.partitions.clone(),
-                            plan.q_c_dists.clone(),
-                            plan.early_end,
-                            plan.late_end,
-                            delta.pre_filter.clone(),
-                            Some(control),
-                            index_metrics,
-                        )
-                        .await?;
-                    while let Some(batch) = stream.next().await {
-                        metrics.partitions_searched.add(1);
-                        batches.push(restrict_to_segment(batch?, delta.seg_mask.as_deref())?);
-                    }
-                }
-                Ok::<_, DataFusionError>((
-                    query_index,
-                    batches,
-                    query_found.load(Ordering::Relaxed),
-                ))
-            }
-        });
-    let results: Vec<_> = futures::stream::iter(searches)
-        .buffer_unordered(get_num_compute_intensive_cpus().max(1))
-        .try_collect()
-        .await?;
-    for (query_index, batches, query_found) in results {
-        for batch in &batches {
-            append_candidates(batch, &mut candidates[query_index])?;
+    let mut searches = Vec::new();
+    for (query_index, (hits, found)) in candidates.iter_mut().zip(found.iter_mut()).enumerate() {
+        if is_active[query_index] {
+            searches.push(sequential_late_search_of_query(
+                deltas,
+                dim,
+                budget,
+                query_index,
+                hits,
+                found,
+                metrics,
+            ));
         }
-        found[query_index] = query_found;
     }
+    futures::stream::iter(searches)
+        .buffer_unordered(get_num_compute_intensive_cpus().max(1))
+        .try_for_each(|()| async { Ok(()) })
+        .await
+}
+
+/// One query's part of [`sequential_late_search`]: its late range in every delta
+/// it joins, with its rows going into `hits` and its row count into `found`.
+async fn sequential_late_search_of_query(
+    deltas: &[BatchDelta],
+    dim: usize,
+    budget: usize,
+    query_index: usize,
+    hits: &mut TopHits,
+    found: &mut usize,
+    metrics: &AnnIndexMetrics,
+) -> DataFusionResult<()> {
+    let query_found = Arc::new(AtomicUsize::new(*found));
+    for delta in deltas
+        .iter()
+        .filter(|delta| delta.joins_late_search(query_index))
+    {
+        if query_found.load(Ordering::Relaxed) >= budget {
+            break;
+        }
+        let plan = &delta.plans[query_index];
+        let mut query = delta.query.clone();
+        query.key = delta.query.key.slice(query_index * dim, dim);
+        let control: Arc<dyn PartitionSearchControl> = Arc::new(BatchLateSearchControl {
+            found: query_found.clone(),
+            max_results: budget,
+            seg_mask: delta.seg_mask.clone(),
+        });
+        let index_metrics: Arc<dyn MetricsCollector> = Arc::new(metrics.index_metrics.clone());
+        let mut stream = delta
+            .index
+            .clone()
+            .search_partitions(
+                query,
+                plan.partitions.clone(),
+                plan.q_c_dists.clone(),
+                plan.early_end,
+                plan.late_end,
+                delta.pre_filter.clone(),
+                Some(control),
+                index_metrics,
+            )
+            .await?;
+        while let Some(batch) = stream.next().await {
+            metrics.partitions_searched.add(1);
+            let batch = restrict_to_segment(batch?, delta.seg_mask.as_deref())?;
+            if batch.num_rows() > 0 {
+                append_candidates(&batch, hits)?;
+            }
+        }
+    }
+    *found = query_found.load(Ordering::Relaxed);
     Ok(())
 }
 
@@ -1064,6 +1077,69 @@ mod tests {
             .map(|(_, row_id)| row_id)
             .collect();
         assert_eq!(rows, vec![10, 12, 13, 15]);
+    }
+
+    /// The per-query late search of a heap-dependent scorer stops at the same
+    /// cut as the shared one: partition 2 meets k, so partition 3 is not read.
+    #[tokio::test]
+    async fn test_sequential_late_search_stops_at_the_cut() {
+        let pre_filter = empty_prefilter().await;
+        let (delta, searched) = delta(
+            vec![vec![], vec![10], vec![12, 13, 15, 16], vec![14]],
+            1,
+            pre_filter,
+        );
+        let mut candidates = vec![TopHits::new(4)];
+        let mut found = vec![0];
+        sequential_late_search(
+            &[delta],
+            1,
+            4,
+            &mut found,
+            &[true],
+            &mut candidates,
+            prepared_metrics().as_ref(),
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = sorted_hits(&candidates[0])
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect();
+        assert_eq!(rows, vec![10, 12, 13, 15]);
+        assert_eq!(*searched.lock().unwrap(), vec![1, 2]);
+        assert_eq!(found, vec![5]);
+    }
+
+    /// Empty partitions leave nothing behind: every query probes every late
+    /// partition and keeps only its bounded candidates.
+    #[tokio::test]
+    async fn test_sequential_late_search_over_empty_partitions() {
+        let (query_count, partition_count) = (32, 256);
+        let pre_filter = empty_prefilter().await;
+        let (delta, searched) = delta(vec![vec![]; partition_count], query_count, pre_filter);
+        let mut candidates: Vec<_> = (0..query_count).map(|_| TopHits::new(1)).collect();
+        let metrics = prepared_metrics();
+        sequential_late_search(
+            &[delta],
+            1,
+            1,
+            &mut vec![0; query_count],
+            &vec![true; query_count],
+            &mut candidates,
+            metrics.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(candidates.iter().all(|hits| hits.missing() == 1));
+        assert_eq!(
+            searched.lock().unwrap().len(),
+            query_count * (partition_count - 1)
+        );
+        assert_eq!(
+            metrics.partitions_searched.value(),
+            query_count * (partition_count - 1)
+        );
     }
 
     #[tokio::test]
