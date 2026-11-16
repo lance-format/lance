@@ -1703,7 +1703,8 @@ impl ObjectStore {
             && destination_store.has_direct_local_paths()
             && !destination_store.local_fsync
         {
-            let source_size = std::fs::metadata(super::local::to_local_path(source_path))
+            let source_size = tokio::fs::metadata(super::local::to_local_path(source_path))
+                .await
                 .map_err(|source| {
                     let source = if source.kind() == std::io::ErrorKind::NotFound {
                         Error::not_found(source_path.to_string())
@@ -1724,7 +1725,12 @@ impl ObjectStore {
             Span::current().record("source_size", source_size as u64);
 
             let metrics = destination_store.io_tracker.begin_io("copy");
-            let result = super::local::copy_file(source_path, destination_path);
+            let from = source_path.clone();
+            let to = destination_path.clone();
+            let result = tokio::task::spawn_blocking(move || super::local::copy_file(&from, &to))
+                .await
+                .map_err(Error::from)
+                .and_then(|result| result);
             metrics.record(&result, source_size as u64);
             result.map_err(|source| {
                 stream_copy_error(
@@ -1913,7 +1919,12 @@ impl ObjectStore {
             }
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
-            let result = super::local::copy_file(from, to);
+            let from = from.clone();
+            let to = to.clone();
+            let result = tokio::task::spawn_blocking(move || super::local::copy_file(&from, &to))
+                .await
+                .map_err(Error::from)
+                .and_then(|result| result);
             metrics.record(&result, 0);
             return result;
         }
@@ -3799,6 +3810,39 @@ mod tests {
         assert!(dest_file.exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_local_bulk_copies() {
+        let directory = TempStdDir::default();
+        let store = ObjectStore::local();
+        let paths = (0_u8..8)
+            .map(|value| {
+                let source = directory.join(format!("source-{value}"));
+                let destination = directory.join("nested").join(format!("copy-{value}"));
+                std::fs::write(&source, [value; 64]).unwrap();
+                (
+                    Path::from_absolute_path(source).unwrap(),
+                    Path::from_absolute_path(destination).unwrap(),
+                    value,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let copies = futures::future::try_join_all(
+            paths
+                .iter()
+                .map(|(source, destination, _)| store.copy_bulk(source, &store, destination)),
+        )
+        .await
+        .unwrap();
+        for ((_, destination, value), result) in paths.iter().zip(copies) {
+            assert_eq!(result.size, 64);
+            assert_eq!(
+                store.read_one_all(destination).await.unwrap().as_ref(),
+                &[*value; 64]
+            );
+        }
     }
 
     #[rstest]
