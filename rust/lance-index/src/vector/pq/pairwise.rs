@@ -711,9 +711,9 @@ enum TableLayout {
     BytePlanes,
 }
 
-/// A lookup kernel and the table layout it reads. The layout is fixed when
-/// the scorer builds its table, so it travels with the candidate rather than
-/// being a `Dispatch` of its own.
+/// A lookup kernel and the table layout it reads. The scorer builds its table
+/// for the chosen kernel, but `Dispatch` yields only the kernel, so PQ selects
+/// from these pairs itself (`best_lookup`) instead of using a `Dispatch`.
 struct LookupCandidate {
     candidate: Candidate<LookupFn>,
     layout: TableLayout,
@@ -781,7 +781,7 @@ const LOOKUP8: &[LookupCandidate] = {
     }
 };
 
-// Every host must have a lookup.
+// Every host must have a lookup: the check `Dispatch::new` would otherwise make.
 const _: () = {
     assert!(LOOKUP4[LOOKUP4.len() - 1].candidate.features().is_empty());
     assert!(LOOKUP8[LOOKUP8.len() - 1].candidate.features().is_empty());
@@ -805,8 +805,8 @@ impl PairKernel for PQKernel<'_> {
         assert_eq!(out.len(), candidates.len());
         let range = candidates.clone();
         // SAFETY: the host supports the kernel's target features, since the
-        // pointer came from a `Kernel`. The lookup kernels are safe functions
-        // with no other preconditions: they bounds-check `range` against the
+        // pointer came from a `Kernel`. Beyond their target features, the lookup
+        // kernels have no preconditions: they bounds-check `range` against the
         // staged codes and write only `out`. (`call` cannot name the
         // `PQKernel` lifetime, hence the raw pointer.)
         unsafe { scorer.lookup.kernel.as_fn()(self, anchor_row, range, out) };

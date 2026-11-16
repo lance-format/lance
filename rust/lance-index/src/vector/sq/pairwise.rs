@@ -612,6 +612,7 @@ mod tests {
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
+    use lance_core::utils::cpu::{Candidate, CpuFeatures};
     use rstest::rstest;
 
     fn stage(scorer: &SQPairScorer, codes: &[u8], rows: Range<usize>) -> RecordBatch {
@@ -665,21 +666,18 @@ mod tests {
             ..*kernel
         });
         // Unbatched scorers stage no statistics for the batched kernels.
-        let l2_candidates = if kernel.scorer.batched {
-            SQ_L2.candidates()
-        } else {
-            &[]
-        };
-        for (l2, dot) in l2_candidates.iter().zip(SQ_DOT.candidates()) {
-            let (Some(l2_kernel), Some(dot_kernel)) = (l2.kernel(), dot.kernel()) else {
-                continue;
-            };
-            let actual = run(&SQKernel {
-                l2: l2_kernel,
-                dot: dot_kernel,
-                ..*kernel
-            });
-            assert_eq!(actual, expected, "{} / {}", l2.name(), dot.name());
+        if kernel.scorer.batched {
+            for (l2, dot) in SQ_L2.candidates().iter().zip(SQ_DOT.candidates()) {
+                let (Some(l2_kernel), Some(dot_kernel)) = (l2.kernel(), dot.kernel()) else {
+                    continue;
+                };
+                let actual = run(&SQKernel {
+                    l2: l2_kernel,
+                    dot: dot_kernel,
+                    ..*kernel
+                });
+                assert_eq!(actual, expected, "{} / {}", l2.name(), dot.name());
+            }
         }
         let out = run(kernel);
         assert_eq!(out, expected, "dispatched");
@@ -758,6 +756,14 @@ mod tests {
         let rows = 11;
         let sq = ScalarQuantizer::with_bounds(8, dim, 0.0..1.0);
         let scorer = SQPairScorer::new(&sq, metric).unwrap();
+        // Hosts with the batched kernels' features must use them.
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+        {
+            assert!(scorer.batched);
+        }
         let codes: Vec<u8> = (0..rows)
             .flat_map(|r| {
                 (0..dim).map(move |i| match r % 4 {
@@ -825,8 +831,6 @@ mod tests {
     /// must pair candidates with the same features.
     #[test]
     fn test_sq_dispatches_list_the_same_features() {
-        use lance_core::utils::cpu::{Candidate, CpuFeatures};
-
         fn features<F: Copy>(candidates: &[Candidate<F>]) -> Vec<CpuFeatures> {
             candidates.iter().map(|c| c.features()).collect()
         }
