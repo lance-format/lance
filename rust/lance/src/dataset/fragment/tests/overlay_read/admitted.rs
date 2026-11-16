@@ -319,11 +319,13 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(error.to_string().contains("binary/string leaves"));
     assert_eq!(budget.reserved(), 0);
-    let marker_reader = dataset
+    // Row-version readers require stable IDs before reaching the admitted API.
+    let version_dataset = write_payload_dataset(LanceFileVersion::V2_3, false, true).await;
+    let version_reader = version_dataset
         .get_fragment(0)
         .unwrap()
         .open(
-            dataset.schema(),
+            version_dataset.schema(),
             FragReadConfig {
                 with_row_created_at_version: true,
                 ..Default::default()
@@ -331,7 +333,7 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
         )
         .await
         .unwrap();
-    let error = marker_reader
+    let error = version_reader
         .try_take_admitted_fullzip(
             &UInt32Array::from(vec![0]),
             budget.try_reserve(8192).unwrap(),
