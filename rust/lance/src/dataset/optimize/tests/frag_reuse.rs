@@ -3070,8 +3070,10 @@ async fn test_row_id_index_creation_racing_defer_index_remap_disjoint_coverage()
              row-id-domain index(es) {row_id_indices:?} (create returned {result:?})"
     );
 }
-/// The commits use `RenameCommitHandler` so that how the rebase sees the first
-/// one does not depend on the platform.
+/// The commits use `RenameCommitHandler`, which reports the published
+/// manifest's e_tag, so a shared session caches the first commit under the key
+/// the rebase lists. A separate session still exercises the decoded inline
+/// transaction.
 #[rstest]
 #[tokio::test]
 async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
@@ -3081,11 +3083,7 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
     #[values(IndexType::Inverted, IndexType::ZoneMap)] index_type: IndexType,
     #[values(false, true)] index_commits_first: bool,
     #[values(false, true)] is_disjoint: bool,
-    #[values(
-        FirstCommitSeenAs::InMemory,
-        FirstCommitSeenAs::InlineTransaction,
-        FirstCommitSeenAs::SeparateSession
-    )]
+    #[values(FirstCommitSeenAs::InMemory, FirstCommitSeenAs::SeparateSession)]
     first_commit_seen_as: FirstCommitSeenAs,
 ) {
     let is_in_memory = first_commit_seen_as == FirstCommitSeenAs::InMemory;
@@ -3154,17 +3152,19 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             assert!(committed_index.is_none());
         } else {
             assert!(committed_index.is_some());
-            let listed = uncached_listed_manifest(&dataset, index_key.version).await;
-            if is_in_memory {
-                let listed_key = ManifestKey {
-                    version: listed.version,
-                    e_tag: listed.e_tag.as_deref(),
-                };
+            let listed = listed_manifest(&dataset, index_key.version).await;
+            let listed_key = ManifestKey {
+                version: listed.version,
+                e_tag: listed.e_tag.as_deref(),
+            };
+            assert!(
                 dataset
                     .metadata_cache
-                    .insert_with_key(&listed_key, other.manifest.clone())
-                    .await;
-            }
+                    .get_with_key(&listed_key)
+                    .await
+                    .is_some(),
+                "the published manifest is cached under the listed e_tag"
+            );
         }
         let result = commit_compaction(
             &mut dataset,
@@ -3229,17 +3229,19 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
                     ..
                 }
             ));
-            let listed = uncached_listed_manifest(&other, rewrite_key.version).await;
-            if is_in_memory {
-                let listed_key = ManifestKey {
-                    version: listed.version,
-                    e_tag: listed.e_tag.as_deref(),
-                };
+            let listed = listed_manifest(&other, rewrite_key.version).await;
+            let listed_key = ManifestKey {
+                version: listed.version,
+                e_tag: listed.e_tag.as_deref(),
+            };
+            assert!(
                 other
                     .metadata_cache
-                    .insert_with_key(&listed_key, dataset.manifest.clone())
-                    .await;
-            }
+                    .get_with_key(&listed_key)
+                    .await
+                    .is_some(),
+                "the published manifest is cached under the listed e_tag"
+            );
         }
         let result = create_index(&mut other).await;
         let seen = other

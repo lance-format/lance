@@ -48,6 +48,21 @@ pub fn physical_column_count(field: &Field) -> usize {
     }
 }
 
+/// Count v2.0 field encoders that own an accumulation cache.
+///
+/// Struct headers are physical columns but only route their children, so a
+/// struct itself does not consume one cache allocation. Lists own their offsets
+/// cache in addition to their child encoders.
+fn cache_owner_count(field: &Field) -> usize {
+    if field.is_blob() || field.is_packed_struct() || field.children.is_empty() {
+        1
+    } else if field.logical_type.is_struct() {
+        field.children.iter().map(cache_owner_count).sum()
+    } else {
+        1 + field.children.iter().map(cache_owner_count).sum::<usize>()
+    }
+}
+
 /// Build persisted field-to-column entries for a v2.0 data file.
 pub fn data_file_columns(schema: &Schema) -> (Vec<i32>, Vec<i32>) {
     let mut field_ids = Vec::new();
@@ -161,4 +176,32 @@ pub fn encode_self_described_batch(batch: &EncodedBatch) -> Result<Bytes> {
 /// Encode a mini-lance v2.0 batch.
 pub fn encode_mini_batch(batch: &EncodedBatch) -> Result<Bytes> {
     writer::concat_lance_footer(batch, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
+
+    use super::cache_owner_count;
+
+    #[test]
+    fn struct_headers_do_not_consume_cache_owners() {
+        let nested = DataType::Struct(Fields::from(vec![
+            ArrowField::new("left", DataType::Boolean, true),
+            ArrowField::new("right", DataType::Int32, true),
+        ]));
+        let items = DataType::List(Arc::new(ArrowField::new("item", DataType::Int64, true)));
+        let schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("nested", nested, true),
+            ArrowField::new("items", items, true),
+        ]))
+        .unwrap();
+
+        let owners = schema.fields.iter().map(cache_owner_count).sum::<usize>();
+
+        assert_eq!(owners, 4);
+    }
 }

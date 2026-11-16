@@ -2325,12 +2325,14 @@ impl WriterOptions {
         source_store_registry: Arc<ObjectStoreRegistry>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
+        file_writer_options: FileWriterOptions,
     ) -> Self {
         Self {
             add_data_dir: true,
             external_base_resolver,
             allow_external_blob_outside_bases,
             source_store_registry,
+            file_writer_options,
             ..Default::default()
         }
     }

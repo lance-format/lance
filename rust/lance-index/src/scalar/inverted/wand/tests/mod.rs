@@ -38,7 +38,7 @@ use super::bounds::{
 use super::collector::TopKCollector;
 use super::maxscore::{MAXSCORE_INNER_WINDOW, MaxScoreClause, MaxScoreSoaScratch};
 use super::phrase::counted_anchor_steps;
-use super::posting::{find_next_geq, find_next_geq_in_block, take_position_cursor_calls};
+use super::posting::{FIND_NEXT_GEQ, FIND_NEXT_GEQ_IN_BLOCK, take_position_cursor_calls};
 use super::*;
 use super::{AllModernDocuments, ModernVisibility};
 
