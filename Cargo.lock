@@ -5298,6 +5298,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-protos"
+version = "15.0.0-beta.23"
+
+[[package]]
 name = "lance-select"
 version = "15.0.0-beta.23"
 dependencies = [
