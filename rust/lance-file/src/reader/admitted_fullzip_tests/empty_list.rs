@@ -295,17 +295,24 @@ async fn current_writer_null_children_preserve_selected_structure_without_io(
 }
 
 #[rstest]
+#[case::counts(false, false)]
+#[case::positions(true, false)]
+#[case::positions_and_validity(true, true)]
 #[tokio::test]
 async fn current_writer_payload_counts_use_bounded_input_windows(
     #[values(false, true)] lite: bool,
     #[values(false, true)] large: bool,
-    #[values(false, true)] payload_positions: bool,
+    #[case] payload_positions: bool,
+    #[case] payload_validity: bool,
 ) {
     // Distinct non-monotonic counts prevent metadata, Delta, RLE and dictionary
     // representations. The actual writer chooses a directly addressable codec.
     let mut offsets = vec![0_i32];
+    let valid = (0..2051)
+        .map(|i| !payload_validity || i % 13 != (i / 17) % 13)
+        .collect::<Vec<_>>();
     for i in 0..2051 {
-        let count = if payload_positions && i % 7 == (i / 11) % 7 {
+        let count = if !valid[i as usize] || (payload_positions && i % 7 == (i / 11) % 7) {
             0
         } else {
             1 + (i * 1031 % 2053)
@@ -316,14 +323,14 @@ async fn current_writer_payload_counts_use_bounded_input_windows(
         new_null_array(&DataType::Binary, *offsets.last().unwrap() as usize),
         large,
         &offsets,
-        vec![true; 2051],
+        valid,
     );
     let (_fs, reader) = fixture_arrays(ConcreteFileVersion::V2_3, lite, vec![source.clone()]).await;
     let page = &reader.metadata().column_infos[0].page_infos[0];
     assert_eq!(
         page.buffer_offsets_and_sizes.len(),
-        1 + usize::from(payload_positions),
-        "fixture must contain payload counts and optional nonempty positions"
+        1 + usize::from(payload_positions) + usize::from(payload_validity),
+        "fixture must contain payload counts and the requested position/validity streams"
     );
     let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
     let reader = reader.with_scheduler(Arc::new(super::scan::RangeIo {

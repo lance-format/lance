@@ -38,7 +38,7 @@ mod decoder;
 mod statistics;
 mod window;
 
-pub use window::WindowSequence;
+pub use window::{WindowCursor, WindowSequence};
 
 pub use decoder::{SequenceDecoder, SequenceMetadata};
 

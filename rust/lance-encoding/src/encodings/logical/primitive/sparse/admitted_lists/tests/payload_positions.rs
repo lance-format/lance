@@ -273,11 +273,11 @@ async fn selected_position_alias_keeps_unused_backing_capacity() {
     let scheduler = NullListScheduler::try_from_page(&page).unwrap().unwrap();
     let budget = AllocationBudget::new(128);
     let mut work = budget.try_reserve(128).unwrap();
-    let selected = scheduler.lists[0]
-        .non_empty
+    let (selected, _) = scheduler.lists[0]
+        .validity
         .prepare(
+            &scheduler.lists[0].non_empty,
             0..4,
-            &scheduler.lists[0].validity,
             &mut work,
             &mut |r, mut buffer: ReservedBuffer| {
                 buffer

@@ -18,6 +18,9 @@ use crate::{
     format::metadata::{CompressiveEncoding, compressive_encoding::Compression},
 };
 
+mod cursor;
+pub use cursor::WindowCursor;
+
 #[derive(Clone, Debug)]
 enum Leaf {
     Range {

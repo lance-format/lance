@@ -25,7 +25,7 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted windowed List positions
+      - name: Verify admitted merged List position and validity windows
         env:
           LANCE_CPU_THREADS: 1
         run: |

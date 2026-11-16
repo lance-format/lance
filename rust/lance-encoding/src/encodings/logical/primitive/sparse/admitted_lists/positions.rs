@@ -51,6 +51,27 @@ impl Positions {
         }
     }
 
+    pub(super) fn scratch_bytes(&self) -> usize {
+        match self {
+            Self::Sequence { sequence, .. } => sequence.scratch_bytes(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn selected_capacity(&self, rows: &Range<u64>) -> Result<usize> {
+        match self {
+            Self::Metadata(_) => Ok(0),
+            Self::Sequence { len, .. } => rows
+                .end
+                .checked_sub(rows.start)
+                .map(|n| n.min(*len))
+                .and_then(|n| n.checked_mul(8))
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| corrupt("selected positions exceed address space")),
+            Self::Selected { .. } => Err(Error::internal("positions already prepared")),
+        }
+    }
+
     pub(super) fn rank(&self, row: u64) -> Result<u64> {
         match self {
             Self::Metadata(plan) => Ok(plan.rank(row)),

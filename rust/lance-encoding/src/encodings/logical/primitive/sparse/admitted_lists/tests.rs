@@ -293,7 +293,7 @@ async fn validates_selection_before_capacity_and_cancels_without_owners() {
 }
 
 #[test]
-fn payload_positions_are_not_assumed_empty() {
+fn payload_validity_requires_its_declared_buffer() {
     let mut page = fixture(1, positions(true, 2, 2, 3));
     let PageEncoding::Planar(layout) = &mut page.encoding else {
         unreachable!()
@@ -308,10 +308,13 @@ fn payload_positions_are_not_assumed_empty() {
         unreachable!()
     };
     list.validity.as_mut().unwrap().positions = Some(EncodingUtils::flat(64, None));
-    page.buffer_offsets_and_sizes = Arc::from([(0, 24)]);
     let error = NullListScheduler::try_from_page(&page).unwrap_err();
-    assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("metadata-only positions"));
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("missing nonempty positions buffer")
+    );
 }
 
 #[test]
@@ -662,3 +665,5 @@ fn arithmetic_counts_validate_sum_and_prefixes_without_materialization() {
 mod payload;
 
 mod payload_positions;
+
+mod payload_validity;

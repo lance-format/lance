@@ -61,13 +61,15 @@ mod counts;
 use counts::Counts;
 mod positions;
 use positions::Positions;
+mod validity;
+use validity::Validity;
 
 #[derive(Clone, Debug)]
 struct ListMetadata {
     non_empty: Positions,
     counts: Counts,
     child_slots: u64,
-    validity: SparseValiditySet,
+    validity: Validity,
 }
 
 impl ListMetadata {
@@ -132,11 +134,12 @@ impl NullListScheduler {
                     {
                         return Err(corrupt("List count sum differs from child domain"));
                     }
-                    let validity = validity(list.validity.as_ref(), domain)?;
+                    let validity = Validity::parse(list.validity.as_ref(), domain, &mut buffers)?;
                     // Reuse the sparse reader's checked set containment/intersection,
                     // including its arithmetic-set path, without materializing rows.
-                    if let Positions::Metadata(plan) = &non_empty
-                        && !validity.contains_only_valid_positions(plan, domain)?
+                    if let (Positions::Metadata(plan), Validity::Metadata(set)) =
+                        (&non_empty, &validity)
+                        && !set.contains_only_valid_positions(plan, domain)?
                     {
                         return Err(corrupt("null List parent contains child slots"));
                     }
@@ -219,9 +222,9 @@ impl NullListScheduler {
         let mut selected = rows.clone();
         let mut lists = Vec::with_capacity(self.lists.len());
         for layer in self.lists.iter() {
-            let Some(non_empty) = layer
-                .non_empty
-                .prepare(selected.clone(), &layer.validity, work, &mut read)
+            let Some((non_empty, validity)) = layer
+                .validity
+                .prepare(&layer.non_empty, selected.clone(), work, &mut read)
                 .await?
             else {
                 return Ok(None);
@@ -237,6 +240,7 @@ impl NullListScheduler {
             let layer = ListMetadata {
                 non_empty,
                 counts,
+                validity,
                 ..layer.clone()
             };
             selected = layer.child_before(selected.start)?..layer.child_before(selected.end)?;
@@ -301,7 +305,7 @@ impl NullListInput {
             let offsets = offset_bytes(count, width)?;
             let len = usize::try_from(count)
                 .map_err(|_| Error::invalid_input("List length exceeds usize"))?;
-            let bitmap = if null_count(&metadata.validity, &rows) == 0 {
+            let bitmap = if metadata.validity.null_count(&rows)? == 0 {
                 0
             } else {
                 len.div_ceil(8)
@@ -360,12 +364,8 @@ impl NullListInput {
                 }
             }
             if layer.bitmap > 0 {
-                let null_positions = matches!(
-                    layer.metadata.validity.meaning,
-                    SparseValidityMeaning::NullPositions
-                );
                 for (index, row) in layer.rows.clone().enumerate() {
-                    if layer.metadata.validity.positions.contains(row) != null_positions {
+                    if layer.metadata.validity.is_valid(row)? {
                         allocation.as_mut()[layer.offsets + index / 8] |= 1 << (index % 8);
                     }
                 }

@@ -571,15 +571,17 @@ async fn admitted_fragment_empty_list_overlay_preserves_null_precedence(
 }
 
 #[rstest]
-#[case::metadata(false, false)]
-#[case::counts(true, false)]
-#[case::positions(false, true)]
-#[case::both(true, true)]
+#[case::metadata(false, false, false)]
+#[case::counts(true, false, false)]
+#[case::positions(false, true, false)]
+#[case::both(true, true, false)]
+#[case::parent_validity(false, true, true)]
 #[tokio::test]
 async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_validity(
     #[values(false, true)] lite: bool,
     #[case] payload_counts: bool,
     #[case] payload_positions: bool,
+    #[case] payload_validity: bool,
 ) {
     let version = LanceFileVersion::V2_3;
     let mut dataset = write_payload_dataset(version, true).await;
@@ -588,7 +590,13 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
     let DataType::List(field) = original.data_type() else {
         unreachable!()
     };
-    let (offsets, valid, covered) = if payload_positions {
+    let (offsets, valid, covered) = if payload_validity {
+        (
+            vec![0_i32, 0, 2, 2, 2, 5, 9],
+            vec![false, true, false, false, true, true],
+            (0..6).collect(),
+        )
+    } else if payload_positions {
         (
             if payload_counts {
                 vec![0_i32, 1, 4, 4, 6]
@@ -630,6 +638,36 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
             version,
         )
         .await;
+        if payload_validity {
+            let scheduler =
+                ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::new(1024));
+            let file = scheduler
+                .open_file(
+                    &dataset
+                        .data_dir()
+                        .join(format!("null-child-{fragment}.lance")),
+                    &CachedFileSize::unknown(),
+                )
+                .await
+                .unwrap();
+            let file = FileReader::try_open(
+                file,
+                None,
+                Default::default(),
+                &Arc::new(LanceCache::no_cache()),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            let page = &file.metadata().column_infos[0].page_infos[0];
+            assert!(
+                matches!(&page.encoding, PageEncoding::Planar(layout) if layout.sparse().is_some())
+            );
+            assert!(
+                page.buffer_offsets_and_sizes.len() >= 2,
+                "irregular parent and validity positions must exercise payload input"
+            );
+        }
     }
     for fragment in 0..2 {
         let reader = open(&dataset, fragment, dataset.schema(), lite).await;
@@ -642,15 +680,21 @@ async fn admitted_fragment_nonempty_null_children_overlay_preserves_parent_valid
             .downcast_ref::<ListArray>()
             .unwrap();
         assert_eq!(
-            values.slice(2, covered.len()).to_data(),
+            values.slice(covered[0] as usize, covered.len()).to_data(),
             null_children.to_data()
         );
-        assert!(values.is_valid(2));
-        assert_eq!(values.is_null(3), !(payload_counts || payload_positions));
-        assert_eq!(
-            values.value_length(4),
-            if payload_positions { 0 } else { 2 }
-        );
+        if payload_validity {
+            assert!(values.is_null(0));
+            assert!(values.is_null(3));
+            assert_eq!(values.value_length(4), 3);
+        } else {
+            assert!(values.is_valid(2));
+            assert_eq!(values.is_null(3), !(payload_counts || payload_positions));
+            assert_eq!(
+                values.value_length(4),
+                if payload_positions { 0 } else { 2 }
+            );
+        }
         let indices = UInt32Array::from(vec![0, 1, 2, 3, 4, 5]);
         let budget = AllocationBudget::new(2 * 65536);
         assert!(
