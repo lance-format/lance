@@ -105,8 +105,9 @@ async fn windowed_rle_preserves_selected_prefixes(
     for rows in [
         0..5,
         page.num_rows - 5..page.num_rows,
-        0..0,
-        page.num_rows..page.num_rows,
+        1..2,                             // a null parent selects no counts
+        3..4,                             // a valid empty parent selects no counts
+        page.num_rows - 1..page.num_rows, // empty parent at the terminal prefix
     ] {
         let reads = Cell::new(0);
         let mut work = budget.try_reserve(16384).unwrap();
