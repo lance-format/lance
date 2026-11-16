@@ -34,6 +34,8 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::index::{
     load_indices_for_remapping, vector_segment_merge_groups_for_compaction,
 };
+use crate::dataset::transaction::Operation;
+use crate::dataset::write::dictionary_budget::DictionaryValueBudget;
 use crate::dataset::{WriteParams, versions};
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::vector::details::needs_vector_details_inference;
@@ -1664,6 +1666,8 @@ impl DefaultCompactionPlanner {
             CompactionMode::ForceBinaryCopy
         );
 
+        let unconsolidated = unconsolidated_dictionary_rewrite_outputs(dataset).await;
+
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
         let mut i = 0;
@@ -1680,8 +1684,12 @@ impl DefaultCompactionPlanner {
                 continue;
             };
 
-            let candidacy =
-                self.candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only);
+            let candidacy = self
+                .candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only)
+                .filter(|candidacy| {
+                    !matches!(candidacy, CompactionCandidacy::CompactWithNeighbors)
+                        || !u32::try_from(fragment.id).is_ok_and(|id| unconsolidated.contains(id))
+                });
 
             let indices = Vec::new();
 
@@ -1872,6 +1880,68 @@ impl DefaultCompactionPlanner {
             .collect();
         Ok(tasks)
     }
+}
+
+/// Fragments that the dataset's latest commit, a compaction, rewrote without reducing
+/// the number of fragments in their group.
+///
+/// With narrow dictionary keys the writer finishes a file before its dictionaries
+/// outgrow the key type, so fragments whose values cannot share one dictionary come
+/// back as many as they went in. Merging them again would rewrite the same rows into
+/// the same fragments, so they are no longer candidates for merging with their
+/// neighbors. Any later commit (an append, a delete, a config change, an index) makes
+/// another commit the latest one and lets them be planned again; deletions, overlays
+/// and dropped columns still compact a fragment by itself.
+///
+/// Only datasets with a dictionary column narrower than 32-bit keys are checked, since
+/// no other constraint makes a compaction keep its small fragments apart. This is best
+/// effort: if the latest transaction cannot be read, nothing is held back.
+async fn unconsolidated_dictionary_rewrite_outputs(dataset: &Dataset) -> RoaringBitmap {
+    let arrow_schema = arrow_schema::Schema::from(dataset.schema());
+    if !matches!(DictionaryValueBudget::try_new(&arrow_schema), Ok(Some(_))) {
+        return RoaringBitmap::new();
+    }
+    let transaction = match dataset.read_transaction().await {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            warn!(
+                "could not read the transaction of version {} to look for an ineffective \
+                 compaction, planning every candidate: {err}",
+                dataset.manifest.version
+            );
+            return RoaringBitmap::new();
+        }
+    };
+    let Some(Operation::Rewrite { groups, .. }) = transaction.map(|t| t.operation) else {
+        return RoaringBitmap::new();
+    };
+    // A group of one fragment is rewritten for its deletions, overlays or columns,
+    // not to merge it.
+    let unconsolidated_files = groups
+        .iter()
+        .filter(|group| {
+            group.old_fragments.len() > 1 && group.new_fragments.len() >= group.old_fragments.len()
+        })
+        .flat_map(|group| &group.new_fragments)
+        .filter_map(|fragment| fragment.files.first())
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    // The transaction can record the outputs before the commit gave them ids, so they
+    // are found by their data files.
+    // One that took on deletions or overlays at commit has changed since.
+    dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.deletion_file.is_none() && fragment.overlays.is_empty())
+        .filter(|fragment| {
+            fragment
+                .files
+                .first()
+                .is_some_and(|file| unconsolidated_files.contains(file.path.as_str()))
+        })
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect()
 }
 
 /// Information about a fragment used to decide its fate in compaction
