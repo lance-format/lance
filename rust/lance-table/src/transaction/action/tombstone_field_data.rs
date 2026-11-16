@@ -9,6 +9,8 @@ use super::{FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
+use lance_file::version::ConcreteFileVersion;
+use std::collections::HashSet;
 
 /// Tombstone the data-file binding of committed fields within one fragment.
 ///
@@ -17,6 +19,9 @@ use lance_core::{Error, Result};
 /// of their own and a live field is backed by exactly one file, so this is how a
 /// column's data is dropped or superseded: re-encoding a column is a tombstone
 /// followed by an [`AddDataFile`](super::AddDataFile) for the same field.
+///
+/// A legacy V1 data file is tombstoned whole: one action must name every one
+/// of its fields still in the schema.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct TombstoneFieldData {
     pub fragment: Ref,
@@ -40,25 +45,57 @@ impl TombstoneFieldData {
             .iter()
             .map(|field| state.resolve_schema_field(*field, "TombstoneFieldData"))
             .collect::<Result<Vec<_>>>()?;
+        let schema_field_ids: HashSet<i32> = state
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect();
         let fragment = state.fragment_mut(fragment_id, "TombstoneFieldData")?;
 
-        for &field_id in &field_ids {
-            let mut found = false;
-            for file in fragment.files.iter_mut() {
-                let Some(position) = file.fields.iter().position(|id| *id == field_id) else {
-                    continue;
-                };
-                let mut fields = file.fields.to_vec();
-                fields[position] = TOMBSTONED_FIELD;
-                file.fields = fields.into();
-                found = true;
+        let mut found: HashSet<i32> = HashSet::with_capacity(field_ids.len());
+        for file in fragment.files.iter_mut() {
+            if !file.fields.iter().any(|id| field_ids.contains(id)) {
+                continue;
             }
-            if !found {
-                return Err(Error::invalid_input(format!(
-                    "TombstoneFieldData names field {field_id}, which no data file in fragment \
-                     {fragment_id} backs"
-                )));
+            found.extend(file.fields.iter().filter(|id| field_ids.contains(id)));
+            // A V1 reader finds a field's pages by its position among the
+            // file's fields, so tombstoning one slot would decode its siblings
+            // from the wrong pages. Like `DataReplacement`, a V1 file is only
+            // replaced whole.
+            if file.file_version()? == ConcreteFileVersion::V1 {
+                if let Some(live) = file
+                    .fields
+                    .iter()
+                    .find(|id| !field_ids.contains(id) && schema_field_ids.contains(id))
+                {
+                    return Err(Error::invalid_input(format!(
+                        "TombstoneFieldData for fragment {fragment_id} names fields \
+                         {field_ids:?} of legacy V1 file {}, which also backs live field {live}; \
+                         a V1 file's fields can only be tombstoned all together",
+                        file.path
+                    )));
+                }
+                file.fields = vec![TOMBSTONED_FIELD; file.fields.len()].into();
+            } else {
+                file.fields = file
+                    .fields
+                    .iter()
+                    .map(|id| {
+                        if field_ids.contains(id) {
+                            TOMBSTONED_FIELD
+                        } else {
+                            *id
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
             }
+        }
+        if let Some(field_id) = field_ids.iter().find(|id| !found.contains(*id)) {
+            return Err(Error::invalid_input(format!(
+                "TombstoneFieldData names field {field_id}, which no data file in fragment \
+                 {fragment_id} backs"
+            )));
         }
 
         if self.data_change {

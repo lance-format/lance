@@ -10,6 +10,8 @@ use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
+use lance_file::version::ConcreteFileVersion;
+use std::collections::HashSet;
 
 /// Remove a field from the schema.
 ///
@@ -45,6 +47,11 @@ impl DropField {
             )));
         }
         remove_field(&mut state.schema_mut().fields, field_id);
+        let schema_field_ids: HashSet<i32> = state
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect();
 
         // The fields are gone from the schema, so the slots that backed them in
         // each data file are dead. Tombstoning rather than rewriting the field
@@ -54,6 +61,16 @@ impl DropField {
         for fragment in state.fragments_mut() {
             for file in fragment.files.iter_mut() {
                 if !file.fields.contains(&field_id) {
+                    continue;
+                }
+                // A V1 reader finds a field's pages by its position among the
+                // file's fields, so even a tombstone would shift its siblings.
+                // The list stays whole, as `Project` leaves it, until no field
+                // in it is live.
+                if file.file_version()? == ConcreteFileVersion::V1 {
+                    if !file.fields.iter().any(|id| schema_field_ids.contains(id)) {
+                        file.fields = vec![TOMBSTONED_FIELD; file.fields.len()].into();
+                    }
                     continue;
                 }
                 let fields = file
