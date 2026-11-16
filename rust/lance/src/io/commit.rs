@@ -1911,6 +1911,11 @@ pub(crate) async fn commit_transaction(
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
             rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            // A retry's window starts after its previous attempt, so it would
+            // miss the moves recorded there; not tracking only costs coverage.
+            if checked_since == read_version && missing.is_empty() {
+                rebase.track_moved_files();
+            }
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.
             if identity_fence.is_some() && !missing.is_empty() {
