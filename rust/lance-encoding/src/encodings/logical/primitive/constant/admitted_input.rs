@@ -144,8 +144,8 @@ impl ConstantArrayScheduler {
             if scratch.as_ref().len() != len {
                 return Err(corrupt("short repetition read"));
             }
-            for (offset, bytes) in scratch.as_ref().chunks_exact(2).enumerate() {
-                let level = u16::from_le_bytes([bytes[0], bytes[1]]);
+            for (offset, bytes) in scratch.as_ref().as_chunks::<2>().0.iter().enumerate() {
+                let level = u16::from_le_bytes(*bytes);
                 let index = (position - rep.start) / 2 + offset as u64;
                 if level > max_rep || (index == 0 && level != max_rep) {
                     return Err(corrupt("invalid repetition row boundary"));
@@ -268,8 +268,10 @@ fn scalar_array(
         .get(..12)
         .ok_or_else(|| corrupt("truncated scalar header"))?;
     let words: Vec<_> = header
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word) as usize)
         .collect();
     let width = match data_type {
         DataType::Binary | DataType::Utf8 => 4,

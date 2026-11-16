@@ -10,7 +10,7 @@ use rstest::rstest;
 use super::*;
 use crate::{
     compression::DefaultDecompressionStrategy, decoder::PageEncoding,
-    encodings::logical::primitive::AdmittedBytePageScheduler,
+    encodings::logical::primitive::AdmittedBytePageScheduler, repdef::RepDefBuilder,
 };
 use lance_core::utils::allocation::AllocationBudget;
 
@@ -127,17 +127,6 @@ async fn reads_byte_scalar_and_selected_nullable_rows(#[case] kind: u8) {
 #[tokio::test]
 async fn selects_list_null_empty_and_nullable_children() {
     let scalar: ArrayRef = Arc::new(LargeBinaryArray::from(vec![b"value".as_slice()]));
-    let meanings = [
-        DefinitionInterpretation::NullableItem,
-        DefinitionInterpretation::NullableAndEmptyableList,
-    ];
-    let (page, bytes) = fixture(
-        &scalar,
-        4,
-        &[1, 0, 1, 1, 1, 0],
-        &[0, 1, 2, 3, 0, 0],
-        &meanings,
-    );
     let expected = ListArray::new(
         Arc::new(Field::new("item", DataType::LargeBinary, true)),
         OffsetBuffer::new(vec![0, 2, 2, 2, 4].into()),
@@ -148,6 +137,19 @@ async fn selects_list_null_empty_and_nullable_children() {
             Some(b"value".as_slice()),
         ])),
         Some(NullBuffer::from(vec![true, true, false, true])),
+    );
+    // Use the actual writer's level numbering while keeping Arrow values and
+    // null/empty semantics as the independent decode oracle.
+    let mut builder = RepDefBuilder::default();
+    builder.add_offsets(expected.offsets().clone(), expected.nulls().cloned());
+    builder.add_validity_bitmap(expected.values().nulls().unwrap().clone());
+    let encoded = RepDefBuilder::serialize(vec![builder]);
+    let (page, bytes) = fixture(
+        &scalar,
+        expected.len() as u64,
+        encoded.repetition_levels.as_deref().unwrap(),
+        encoded.definition_levels.as_deref().unwrap(),
+        &encoded.def_meaning,
     );
     let scheduler =
         AdmittedBytePageScheduler::try_from_page(&page, &DefaultDecompressionStrategy {}).unwrap();
