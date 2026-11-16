@@ -375,7 +375,8 @@ pub struct DeletionFile {
     /// Normalized relative path under `_deletions/` from the dataset root selected
     /// by `base_id`, ending in `.arrow` or `.bin` to match `file_type`. Cannot be
     /// set together with `inline`. Requires `FLAG_DELETION_FILE_PATHS` (1 << 21)
-    /// in both reader and writer feature flags.
+    /// in both reader and writer feature flags while present, and the writer flag
+    /// remains set on subsequent versions.
     #[prost(string, optional, tag = "5")]
     pub path: ::core::option::Option<::prost::alloc::string::String>,
     /// The deletion vector itself, stored in the manifest instead of in a file.

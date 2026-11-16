@@ -36,14 +36,10 @@ static DELETION_ARROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// Get the file path for a deletion file relative to `base`.
 pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &DeletionFile) -> Path {
     if let Some(stored) = &deletion_file.path {
-        return match Path::parse(stored) {
-            Ok(parsed) => {
-                let mut path = base.clone();
-                path.extend(parsed.parts());
-                path
-            }
-            Err(_) => base.clone().join(stored.as_str()),
-        };
+        let parsed = Path::parse(stored).expect("validated deletion file path");
+        let mut path = base.clone();
+        path.extend(parsed.parts());
+        return path;
     }
     let DeletionFile {
         read_version,

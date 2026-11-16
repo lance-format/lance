@@ -8,7 +8,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
-
 use lance_file::version::ConcreteFileVersion;
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
@@ -568,7 +567,13 @@ impl DeletionFile {
         self.inline.is_some()
     }
 
-    pub(crate) fn validate_location(&self) -> Result<()> {
+    /// Whether the file's path is derived from the id of the fragment that
+    /// owns it rather than stored explicitly or inline.
+    pub fn uses_derived_path(&self) -> bool {
+        self.path.is_none() && !self.is_inline()
+    }
+
+    pub fn validate_location(&self) -> Result<()> {
         self.check_location().map_err(Error::invalid_input)
     }
 

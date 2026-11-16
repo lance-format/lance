@@ -219,11 +219,12 @@ Because `fragment_id` is part of the filename, a fragment with a derived deletio
 assigned a different `fragment_id` at commit time.
 
 When `DeletionFile.path` is set, the file is at `{root}/{path}`. The path must be a normalized relative
-object path under `_deletions/` (no leading or trailing `/`, and no empty, `.`, or `..` segments) and includes the file extension
-while `file_type` selects the decoder. Because the path does not depend on `fragment_id`, it stays valid if
-the fragment is renumbered. Writers must not overwrite an existing deletion file path while any manifest
-version references it. Setting `path` requires `FLAG_DELETION_FILE_PATHS` (`2^21`) in both reader and
-writer feature flags, which remain set on subsequent versions.
+object path under `_deletions/` (no leading or trailing `/`, and no empty, `.`, or `..` segments). Its
+extension must match `file_type`, using `.arrow` for the Arrow IPC format and `.bin` for the Roaring bitmap
+format. Because the path does not depend on `fragment_id`, it stays valid if the fragment is renumbered.
+Each new deletion file is written to a new, unique path (for example, derived from a UUID), so existing
+files are never overwritten. Setting `path` requires `FLAG_DELETION_FILE_PATHS` (`2^21`) in both reader and
+writer feature flags, and the writer flag remains set on subsequent versions.
 
 When `DeletionFile.inline` is set, the deletion vector is stored directly in the manifest as a
 Roaring bitmap with no external file (requires `FLAG_INLINE_DELETIONS`).
