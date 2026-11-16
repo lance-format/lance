@@ -4494,6 +4494,55 @@ async fn compaction_skips_fragments_dictionary_keeps_apart(
     dataset.validate().await.unwrap();
 }
 
+/// Two fragments over the same 100 Int8 dictionary values, with 20 of them deleted,
+/// rewritten into two fragments only because of a small row target. A later run with a
+/// larger target must still merge them: their dictionaries fit one file.
+#[rstest]
+#[tokio::test]
+async fn compaction_merges_rewritten_fragments_whose_dictionaries_fit(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let reader = |rows: usize| {
+        let values = StringArray::from_iter_values((0..100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(rows));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        RecordBatchIterator::new([Ok(batch)], schema.clone())
+    };
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader(3000), "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset.append(reader(500), None).await.unwrap();
+    let deleted = (0..20).map(|i| format!("'v{i}'")).collect::<Vec<_>>();
+    dataset
+        .delete(&format!("d IN ({})", deleted.join(", ")))
+        .await
+        .unwrap();
+    let mut compact = async |options: CompactionOptions| {
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+
+    let small_target = CompactionOptions {
+        target_rows_per_fragment: 1000,
+        ..Default::default()
+    };
+    assert_eq!(compact(small_target).await, (2, 2));
+    assert_eq!(compact(CompactionOptions::default()).await, (2, 1));
+    assert_eq!(compact(CompactionOptions::default()).await, (0, 0));
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2800);
+    dataset.validate().await.unwrap();
+}
+
 /// A file finished early for its dictionary leaves the input's row-limit cuts out of line
 /// with the files. The next file must still stop at `max_rows_per_file` rows.
 #[rstest]

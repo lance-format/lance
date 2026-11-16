@@ -8,7 +8,7 @@
 //! Tests live in `optimize/tests/planning.rs`.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -1883,7 +1883,8 @@ impl DefaultCompactionPlanner {
 }
 
 /// Fragments that the dataset's latest commit, a compaction, rewrote without reducing
-/// the number of fragments in their group.
+/// the number of fragments in their group because their dictionaries could not share a
+/// data file.
 ///
 /// With narrow dictionary keys the writer finishes a file before its dictionaries
 /// outgrow the key type, so fragments whose values cannot share one dictionary come
@@ -1893,55 +1894,125 @@ impl DefaultCompactionPlanner {
 /// another commit the latest one and lets them be planned again; deletions, overlays
 /// and dropped columns still compact a fragment by itself.
 ///
-/// Only datasets with a dictionary column narrower than 32-bit keys are checked, since
-/// no other constraint makes a compaction keep its small fragments apart. This is best
-/// effort: if the latest transaction cannot be read, nothing is held back.
+/// This is best effort: if the check fails, nothing is held back.
 async fn unconsolidated_dictionary_rewrite_outputs(dataset: &Dataset) -> RoaringBitmap {
-    let arrow_schema = arrow_schema::Schema::from(dataset.schema());
-    if !matches!(DictionaryValueBudget::try_new(&arrow_schema), Ok(Some(_))) {
-        return RoaringBitmap::new();
-    }
-    let transaction = match dataset.read_transaction().await {
-        Ok(transaction) => transaction,
+    match dictionary_limited_rewrite_outputs(dataset).await {
+        Ok(fragment_ids) => fragment_ids,
         Err(err) => {
             warn!(
-                "could not read the transaction of version {} to look for an ineffective \
-                 compaction, planning every candidate: {err}",
+                "could not check version {} for an ineffective compaction, planning every \
+                 candidate: {err}",
                 dataset.manifest.version
             );
-            return RoaringBitmap::new();
+            RoaringBitmap::new()
         }
-    };
-    let Some(Operation::Rewrite { groups, .. }) = transaction.map(|t| t.operation) else {
-        return RoaringBitmap::new();
-    };
-    // A group of one fragment is rewritten for its deletions, overlays or columns,
-    // not to merge it.
-    let unconsolidated_files = groups
+    }
+}
+
+async fn dictionary_limited_rewrite_outputs(dataset: &Dataset) -> Result<RoaringBitmap> {
+    // Only dictionaries narrower than 32-bit keys make the writer keep small files
+    // apart, so other datasets skip reading the transaction.
+    let dictionary_fields = arrow_schema::Schema::from(dataset.schema())
+        .fields()
         .iter()
-        .filter(|group| {
-            group.old_fragments.len() > 1 && group.new_fragments.len() >= group.old_fragments.len()
+        .filter(|field| {
+            matches!(
+                DictionaryValueBudget::try_new(&arrow_schema::Schema::new(vec![Arc::clone(field)])),
+                Ok(Some(_))
+            )
         })
-        .flat_map(|group| &group.new_fragments)
-        .filter_map(|fragment| fragment.files.first())
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
+        .cloned()
+        .collect::<Vec<_>>();
+    if dictionary_fields.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    let Some(Operation::Rewrite { groups, .. }) = dataset
+        .read_transaction()
+        .await?
+        .map(|transaction| transaction.operation)
+    else {
+        return Ok(RoaringBitmap::new());
+    };
     // The transaction can record the outputs before the commit gave them ids, so they
-    // are found by their data files.
-    // One that took on deletions or overlays at commit has changed since.
-    dataset
+    // are found by their data files. One that took on deletions or overlays at commit
+    // has changed since.
+    let unchanged = dataset
         .manifest
         .fragments
         .iter()
         .filter(|fragment| fragment.deletion_file.is_none() && fragment.overlays.is_empty())
-        .filter(|fragment| {
-            fragment
-                .files
-                .first()
-                .is_some_and(|file| unconsolidated_files.contains(file.path.as_str()))
+        .filter_map(|fragment| {
+            let file = fragment.files.first()?;
+            Some((file.path.as_str(), fragment))
         })
-        .filter_map(|fragment| u32::try_from(fragment.id).ok())
-        .collect()
+        .collect::<HashMap<_, _>>();
+    let dictionary_schema = arrow_schema::Schema::new(dictionary_fields);
+    let mut unconsolidated = RoaringBitmap::new();
+    // A group of one fragment is rewritten for its deletions, overlays or columns,
+    // not to merge it.
+    for group in groups.iter().filter(|group| {
+        group.old_fragments.len() > 1 && group.new_fragments.len() >= group.old_fragments.len()
+    }) {
+        let Some(outputs) = group
+            .new_fragments
+            .iter()
+            .map(|fragment| {
+                let file = fragment.files.first()?;
+                unchanged.get(file.path.as_str()).copied()
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if are_kept_apart_by_dictionaries(dataset, &dictionary_schema, &outputs).await? {
+            unconsolidated.extend(
+                outputs
+                    .iter()
+                    .filter_map(|fragment| u32::try_from(fragment.id).ok()),
+            );
+        }
+    }
+    Ok(unconsolidated)
+}
+
+/// Whether every two neighboring `fragments` hold more distinct values in some
+/// dictionary column than its key type addresses, so the writer would split them
+/// apart again whatever the compaction options.
+///
+/// A rewrite can also keep its fragment count for other reasons, such as a row target
+/// smaller than the one the next run uses; those fragments must stay candidates.
+/// Only the dictionary columns are read.
+async fn are_kept_apart_by_dictionaries(
+    dataset: &Dataset,
+    dictionary_schema: &arrow_schema::Schema,
+    fragments: &[&Fragment],
+) -> Result<bool> {
+    let Some(mut budget) = DictionaryValueBudget::try_new(dictionary_schema)? else {
+        return Ok(false);
+    };
+    let columns = dictionary_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    for pair in fragments.windows(2) {
+        budget.reset();
+        let mut is_full = false;
+        for fragment in pair {
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(vec![(*fragment).clone()])
+                .project(&columns)?;
+            let mut batches = scanner.try_into_stream().await?;
+            while !is_full && let Some(batch) = batches.try_next().await? {
+                is_full = budget.admit(&VecDeque::from([batch]), usize::MAX)?.is_full;
+            }
+        }
+        if !is_full {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Information about a fragment used to decide its fate in compaction
