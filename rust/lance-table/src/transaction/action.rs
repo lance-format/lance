@@ -119,10 +119,10 @@ mod test_support;
 pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
-pub use add_fragment::AddFragment;
-pub use add_index_segment::AddIndexSegment;
+pub use add_fragment::{AddFragment, AddFragmentParts};
+pub use add_index_segment::{AddIndexSegment, AddIndexSegmentParts};
 pub use add_overlays::AddOverlays;
-pub use adjust_index_coverage::AdjustIndexCoverage;
+pub use adjust_index_coverage::{AdjustIndexCoverage, AdjustIndexCoverageParts};
 pub use alter_field::AlterField;
 pub use append_frag_reuse_transition::{AppendFragReuseTransition, FragReuseMapping};
 pub use assert_cells_unchanged::AssertCellsUnchanged;
@@ -298,36 +298,40 @@ impl std::fmt::Display for FieldId {
 /// # use lance_file::version::ConcreteFileVersion;
 /// # use lance_table::format::DataFile;
 /// use lance_table::transaction::action::{
-///     Action, AddDataFile, AddFragment, CompositeOperation, FieldRef, Ref, UserStep,
+///     Action, AddDataFile, AddFragment, AddFragmentParts, CompositeOperation, FieldRef, Ref,
+///     UserStep,
 /// };
 ///
 /// let operation = CompositeOperation::new(vec![
 ///     UserStep::new(
 ///         "add a fragment",
-///         vec![Action::AddFragment(AddFragment {
+///         vec![Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
 ///             id: Ref::Local(0),
 ///             physical_rows: 10,
 ///             row_id_meta: None,
 ///             last_updated_at_version_meta: None,
 ///             created_at_version_meta: None,
 ///             data_change: true,
-///         })],
+///         }))],
 ///     ),
 ///     UserStep::new(
 ///         "back its one column",
-///         vec![Action::AddDataFile(AddDataFile {
-///             fragment: Ref::Local(0),
-///             file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-///             field_ids: vec![FieldRef::Committed(0)],
-///             data_change: true,
-///             base: None,
-///         })],
+///         // A writer that just wrote this file would build the action and
+///         // certify its contract; this example only shows the shape.
+///         vec![Action::AddDataFile(AddDataFile::try_new_unchecked(
+///             Ref::Local(0),
+///             DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+///             vec![FieldRef::Committed(0)],
+///             None,
+///             true,
+///         )?)],
 ///     ),
 /// ]);
 ///
 /// // The steps are what a user did; the actions are the deltas they became.
 /// assert_eq!(operation.steps.len(), 2);
 /// assert_eq!(operation.iter_actions().count(), 2);
+/// # Ok::<(), lance_core::Error>(())
 /// ```
 ///
 /// Committing one goes through
@@ -464,53 +468,56 @@ mod tests {
 
     #[test]
     fn test_data_change_defaults_by_action_kind() {
-        let alter = Action::AlterField(AlterField {
-            field: FieldRef::Committed(1),
-            name: Some("renamed".into()),
-            nullable: None,
-        });
+        let alter =
+            Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_name("renamed"));
         assert!(!alter.is_data_change(), "a rename changes no row values");
 
-        let remove = Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(3),
-            data_change: true,
-        });
+        let remove = Action::RemoveFragment(RemoveFragment::new(Ref::Committed(3)));
         assert!(remove.is_data_change());
 
         // An index segment is derived state unless the writer says otherwise,
         // as the MemWAL index does for the rows it holds.
         for data_change in [false, true] {
-            let add = Action::AddIndexSegment(AddIndexSegment {
-                uuid: uuid::Uuid::from_u128(1),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(vec![Ref::Committed(0)]),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change,
-            });
+            let add = Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    uuid: uuid::Uuid::from_u128(1),
+                    name: "by_a".into(),
+                    fields: vec![FieldRef::Committed(0)],
+                    covering_fields: Vec::new(),
+                    index_details: None,
+                    index_version: 1,
+                    covered_fragments: Some(vec![Ref::Committed(0)]),
+                    files: Vec::new(),
+                    base: None,
+                    created_at: None,
+                    dataset_version: None,
+                    data_change,
+                })
+                .unwrap(),
+            );
             assert_eq!(add.is_data_change(), data_change);
-            let remove = Action::RemoveIndexSegment(RemoveIndexSegment {
-                uuid: uuid::Uuid::from_u128(1),
-                name: "by_a".into(),
-                data_change,
-            });
+            let remove = Action::RemoveIndexSegment(
+                RemoveIndexSegment::try_new_unchecked(
+                    uuid::Uuid::from_u128(1),
+                    "by_a",
+                    data_change,
+                )
+                .unwrap(),
+            );
             assert_eq!(remove.is_data_change(), data_change);
         }
 
-        let adjust = Action::AdjustIndexCoverage(AdjustIndexCoverage {
-            uuid: uuid::Uuid::from_u128(1),
-            name: "by_a".into(),
-            add_fragments: vec![Ref::Committed(1)],
-            remove_fragments: vec![0],
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-        });
+        let adjust = Action::AdjustIndexCoverage(
+            AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(1)],
+                remove_fragments: vec![0],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+            })
+            .unwrap(),
+        );
         assert!(
             !adjust.is_data_change(),
             "coverage changes no row a reader sees"
@@ -522,23 +529,21 @@ mod tests {
         let operation = CompositeOperation::new(vec![
             UserStep::new(
                 "first",
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(1),
-                    data_change: true,
-                })],
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    1,
+                )))],
             ),
             UserStep::new(
                 "second",
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(2),
-                    data_change: true,
-                })],
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    2,
+                )))],
             ),
         ]);
         let fragments = operation
             .iter_actions()
             .map(|action| match action {
-                Action::RemoveFragment(remove) => remove.fragment,
+                Action::RemoveFragment(remove) => remove.fragment(),
                 other => panic!("unexpected action {other}"),
             })
             .collect::<Vec<_>>();

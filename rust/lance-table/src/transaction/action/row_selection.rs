@@ -62,20 +62,29 @@ impl From<&RowSelection> for pb_actions::RowSelection {
 /// Decode one action's row selections, rejecting a fragment selected twice, a
 /// bitmap that does not deserialize, and a selection with no coverage.
 /// `action` names the action in the errors.
+/// Reject a fragment `rows` selects more than once, which would leave two
+/// answers for which of its rows `action` names.
+pub(super) fn reject_repeated_fragments(rows: &[RowSelection], action: &str) -> Result<()> {
+    let mut seen = HashSet::with_capacity(rows.len());
+    for selection in rows {
+        if !seen.insert(selection.fragment_id) {
+            return Err(Error::invalid_input(format!(
+                "{action} selects rows of fragment {} more than once",
+                selection.fragment_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn row_selections_from_proto(
     messages: Vec<pb_actions::RowSelection>,
     action: &str,
 ) -> Result<Vec<RowSelection>> {
-    let mut seen = HashSet::with_capacity(messages.len());
     messages
         .into_iter()
         .map(|selection| {
             let fragment_id = selection.fragment_id;
-            if !seen.insert(fragment_id) {
-                return Err(Error::invalid_input(format!(
-                    "{action} selects rows of fragment {fragment_id} more than once"
-                )));
-            }
             let rows = match selection.coverage {
                 Some(pb_actions::row_selection::Coverage::Full(())) => SelectedRows::Full,
                 Some(pb_actions::row_selection::Coverage::Bitmap(bytes)) => SelectedRows::Offsets(

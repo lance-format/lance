@@ -143,27 +143,30 @@ pub(super) fn nested_schema() -> Schema {
 pub(super) fn replace_field_data(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
     let field_ids = vec![FieldRef::Committed(field)];
     vec![
-        Action::TombstoneFieldData(super::TombstoneFieldData {
-            fragment: Ref::Committed(fragment),
-            field_ids: field_ids.clone(),
+        Action::TombstoneFieldData(super::TombstoneFieldData::new_unchecked(
+            Ref::Committed(fragment),
+            field_ids.clone(),
             data_change,
-        }),
-        Action::AddDataFile(super::AddDataFile {
-            fragment: Ref::Committed(fragment),
-            file: DataFile::new_unstarted("data/replaced.lance", ConcreteFileVersion::V2_0),
-            field_ids,
-            data_change,
-            base: None,
-        }),
+        )),
+        Action::AddDataFile(
+            super::AddDataFile::try_new_unchecked(
+                Ref::Committed(fragment),
+                DataFile::new_unstarted("data/replaced.lance", ConcreteFileVersion::V2_0),
+                field_ids,
+                None,
+                data_change,
+            )
+            .unwrap(),
+        ),
     ]
 }
 
 /// An action minting base token 0 at a location no fixture uses.
 pub(super) fn mint_base() -> Action {
-    Action::AddBase(super::AddBase {
-        local: 0,
-        base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
-    })
+    Action::AddBase(super::AddBase::new(
+        0,
+        BasePath::new(0, "s3://bucket/minted".into(), None, false),
+    ))
 }
 
 /// A v2 data file with one top-level column, as a writer hands it to
@@ -178,25 +181,29 @@ pub(super) fn one_column_file(path: &str) -> DataFile {
 
 /// Refresh every row of each fragment.
 pub(super) fn refresh(fragment_ids: &[u32]) -> Action {
-    Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-        rows: fragment_ids
-            .iter()
-            .map(|fragment_id| RowSelection {
-                fragment_id: *fragment_id,
-                rows: SelectedRows::Full,
-            })
-            .collect(),
-    })
+    Action::RefreshRowVersionMetadata(
+        RefreshRowVersionMetadata::try_new(
+            fragment_ids
+                .iter()
+                .map(|fragment_id| RowSelection {
+                    fragment_id: *fragment_id,
+                    rows: SelectedRows::Full,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Refresh the rows of fragment `fragment_id` at `offsets`.
 pub(super) fn refresh_rows(fragment_id: u32, offsets: &[u32]) -> Action {
-    Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-        rows: vec![RowSelection {
+    Action::RefreshRowVersionMetadata(
+        RefreshRowVersionMetadata::try_new(vec![RowSelection {
             fragment_id,
             rows: SelectedRows::Offsets(offsets.iter().copied().collect()),
-        }],
-    })
+        }])
+        .unwrap(),
+    )
 }
 
 /// Each row's `last_updated_at_version`, by offset.
@@ -227,8 +234,8 @@ pub(super) fn any_deletion_file() -> DeletionFile {
 /// `ROWS` rows each, every one backed by a file for field 0.
 pub(super) mod frag_reuse {
     use super::super::{
-        Action, AddDataFile, AddFragment, AppendFragReuseTransition, FieldRef, FragReuseMapping,
-        Ref, RemoveFragment,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AppendFragReuseTransition, FieldRef,
+        FragReuseMapping, Ref, RemoveFragment,
     };
     use crate::format::pb::fragment_reuse_index_details as pb_fri;
     use crate::format::{DataFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb};
@@ -322,10 +329,7 @@ pub(super) mod frag_reuse {
         let mut actions: Vec<Action> = sources
             .iter()
             .map(|&source| {
-                Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(source),
-                    data_change: false,
-                })
+                Action::RemoveFragment(RemoveFragment::new_unchecked(Ref::Committed(source), false))
             })
             .collect();
         let versions = || {
@@ -338,22 +342,27 @@ pub(super) mod frag_reuse {
             .iter()
             .flat_map(|source| source * ROWS..(source + 1) * ROWS)
             .collect();
-        actions.push(Action::AddFragment(AddFragment {
-            id: Ref::Local(token),
-            physical_rows: rows,
-            row_id_meta: stable_row_ids
-                .then(|| RowIdMeta::Inline(write_row_ids(&row_ids.as_slice().into()).into())),
-            last_updated_at_version_meta: stable_row_ids.then(versions),
-            created_at_version_meta: stable_row_ids.then(versions),
-            data_change: false,
-        }));
-        actions.push(Action::AddDataFile(AddDataFile {
-            fragment: Ref::Local(token),
-            file: super::one_column_file(&format!("data/compacted-{token}.lance")),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: false,
-            base: None,
-        }));
+        actions.push(Action::AddFragment(AddFragment::new_unchecked(
+            AddFragmentParts {
+                id: Ref::Local(token),
+                physical_rows: rows,
+                row_id_meta: stable_row_ids
+                    .then(|| RowIdMeta::Inline(write_row_ids(&row_ids.as_slice().into()).into())),
+                last_updated_at_version_meta: stable_row_ids.then(versions),
+                created_at_version_meta: stable_row_ids.then(versions),
+                data_change: false,
+            },
+        )));
+        actions.push(Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Local(token),
+                super::one_column_file(&format!("data/compacted-{token}.lance")),
+                vec![FieldRef::Committed(0)],
+                None,
+                false,
+            )
+            .unwrap(),
+        ));
         if let Some(mapping) = mapping {
             actions.push(transition(sources, &[Ref::Local(token)], mapping));
         }
@@ -361,11 +370,14 @@ pub(super) mod frag_reuse {
     }
 
     pub fn transition(sources: &[u64], destinations: &[Ref], mapping: FragReuseMapping) -> Action {
-        Action::AppendFragReuseTransition(AppendFragReuseTransition {
-            sources: sources.iter().copied().map(Ref::Committed).collect(),
-            destinations: destinations.to_vec(),
-            mapping,
-        })
+        Action::AppendFragReuseTransition(
+            AppendFragReuseTransition::try_new_unchecked(
+                sources.iter().copied().map(Ref::Committed).collect(),
+                destinations.to_vec(),
+                mapping,
+            )
+            .unwrap(),
+        )
     }
 
     pub fn digest(id: u64, physical_rows: u64) -> pb_fri::FragmentDigest {
