@@ -1247,15 +1247,21 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
+    /// Score IVF_RQ or SQ8 candidates using only stored index data.
     ///
     /// Unlike [`Self::refine`], indexed candidates are re-ranked without reading
-    /// their original vectors. It first discovers `factor * k` candidates with
+    /// their original vectors. IVF_RQ first discovers `factor * k` candidates with
     /// one-bit RQ scores and then re-ranks them with the index's most accurate
     /// stored RQ representation. Unindexed fragments and stale overlay rows still
     /// use flat fallback and may read original vectors. If exact refinement is also
     /// configured, the quantized stage emits enough candidates for that exact stage.
-    /// When a distance range is set, the selected partitions use Accurate RQ search
+    /// For IVF_SQ, the native eight-bit scan already scores every selected row;
+    /// the factor adds no precision or redundant rescore. IVF_HNSW_SQ expands the
+    /// graph candidate pool by `factor`, then scores those storage offsets with
+    /// SQ8. Explicit `ef` must cover `k * factor * exact_refine_factor`; the
+    /// default grows to cover that budget. The factor must be positive.
+    /// Unsupported quantizers, legacy indices and multivectors are rejected.
+    /// When IVF_RQ has a distance range, selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
     ///
     /// Completed partition results may be reused for identical queries in the
@@ -1263,7 +1269,7 @@ impl Scanner {
     /// cache accepts fully indexed single-vector queries without filters,
     /// fragment subsets, external masks, or stale vector overlays, and requires
     /// a proven manifest identity. It stores row IDs and quantized distances;
-    /// exact refinement and projections still run independently. Immutable RQ
+    /// exact refinement and projections still run independently. Immutable quantized
     /// index data is cached separately and can remain reusable across queries
     /// and snapshots even when completed results cannot be reused.
     ///

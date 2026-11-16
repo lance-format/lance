@@ -418,7 +418,10 @@ public class Query {
     }
 
     /**
-     * Reranks overfetched IVF_RQ candidates with the index's most accurate stored RQ data.
+     * Scores IVF_RQ or SQ8 candidates using stored index data.
+     *
+     * <p>IVF_RQ overfetches one-bit candidates and reranks them with its most accurate stored
+     * multi-bit representation.
      *
      * <p>Indexed candidates are reranked without reading their original vectors. Unindexed
      * fragments and stale overlay rows still use flat fallback and may read original vectors. It
@@ -427,7 +430,18 @@ public class Query {
      * selected partitions use Accurate RQ search directly so the range applies before top-k
      * truncation.
      *
-     * @param quantizedRefineFactor One-bit candidate overfetch factor; must be greater than zero.
+     * <p>IVF_SQ uses its native eight-bit scan directly; the factor adds no precision. IVF_HNSW_SQ
+     * expands the graph candidate pool and scores selected storage offsets with SQ8. Explicit ef
+     * must cover k * quantizedRefineFactor * refineFactor (missing factors are 1); the default
+     * grows with that budget. Legacy indices, other quantizers, and multivectors are unsupported.
+     *
+     * <pre>{@code
+     * Query query = new Query.Builder()
+     *     .setColumn("vector").setKey(new float[128]).setK(10)
+     *     .setQuantizedRefineFactor(4).build();
+     * }</pre>
+     *
+     * @param quantizedRefineFactor Candidate overfetch factor; must be greater than zero.
      * @return The Builder instance for method chaining.
      */
     public Builder setQuantizedRefineFactor(int quantizedRefineFactor) {

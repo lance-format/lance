@@ -14,6 +14,7 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use lance_arrow::ArrowFloatType;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::object_store::ObjectStore;
@@ -155,6 +156,8 @@ pub struct ScalarQuantizationStorage {
     /// Chunks of storage
     offsets: Vec<u32>,
     chunks: Vec<SQStorageChunk>,
+    /// Cached at materialization so ordinary graph queries do not scan row IDs.
+    has_tombstones: bool,
 }
 
 impl DeepSizeOf for ScalarQuantizationStorage {
@@ -191,12 +194,14 @@ impl ScalarQuantizationStorage {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
         offsets.push(0);
+        let mut has_tombstones = false;
         for mut batch in batches.into_iter() {
             if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
                 batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
             }
             offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;
+            has_tombstones |= chunk.row_ids.values().contains(&RowAddress::TOMBSTONE_ROW);
             chunks.push(chunk);
         }
         let quantizer = ScalarQuantizer::with_bounds(num_bits, chunks[0].dim(), bounds);
@@ -206,6 +211,7 @@ impl ScalarQuantizationStorage {
             distance_type,
             offsets,
             chunks,
+            has_tombstones,
         })
     }
 
@@ -360,6 +366,10 @@ impl VectorStore for ScalarQuantizationStorage {
         let mut storage = self.clone();
         let offset = self.len() as u32;
         let new_chunk = SQStorageChunk::new(new_batch)?;
+        storage.has_tombstones |= new_chunk
+            .row_ids
+            .values()
+            .contains(&RowAddress::TOMBSTONE_ROW);
         storage.offsets.push(offset + new_chunk.len() as u32);
         storage.chunks.push(new_chunk);
 
@@ -376,6 +386,10 @@ impl VectorStore for ScalarQuantizationStorage {
 
     fn len(&self) -> usize {
         *self.offsets.last().unwrap() as usize
+    }
+
+    fn has_tombstones(&self) -> bool {
+        self.has_tombstones
     }
 
     /// Return the [DistanceType] of the vectors.
