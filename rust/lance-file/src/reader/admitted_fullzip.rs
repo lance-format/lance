@@ -19,7 +19,7 @@ use lance_encoding::{
     EncodingsIo,
     compression::DefaultDecompressionStrategy,
     decoder::ColumnInfo,
-    encodings::logical::primitive::{FullZipArrayInput, FullZipScheduler},
+    encodings::logical::primitive::{AdmittedBytePageInput, AdmittedBytePageScheduler},
 };
 
 use super::{DecodeEngine, FileReader, ReaderProjection};
@@ -86,12 +86,12 @@ struct FullZipColumn {
     column: Arc<ColumnInfo>,
     page_index: usize,
     page_start: u64,
-    decoder: Option<Arc<FullZipScheduler>>,
+    decoder: Option<Arc<AdmittedBytePageScheduler>>,
 }
 
 pub(super) struct BatchDecodeJob {
     rows: Range<u64>,
-    inputs: Vec<FullZipArrayInput>,
+    inputs: Vec<AdmittedBytePageInput>,
     schema: Arc<ArrowSchema>,
     workspace: Reservation,
     row_ids: Option<PreparedRowIds>,
@@ -140,7 +140,8 @@ impl FileReader {
     /// Open an admitted cursor for this reader's base projection.
     ///
     /// Each selected field must be Binary/Utf8/LargeBinary/LargeUtf8, optionally
-    /// nested in List/LargeList, stored in dense FullZip pages in v2.2/v2.3.
+    /// nested in List/LargeList, stored in dense FullZip or byte-scalar Constant
+    /// pages in v2.2/v2.3.
     /// Every selected page's layout and Arrow shape are checked before output.
     /// Payload corruption and data-dependent codec errors can still fail later.
     /// Other layouts, Blob descriptors, structural-only projections and structs
@@ -332,7 +333,7 @@ impl FullZipColumn {
                 Error::corrupt_file_named("FullZip", "column row count overflows")
             })?;
             if page_end > rows.start {
-                FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {})?
+                AdmittedBytePageScheduler::try_from_page(page, &DefaultDecompressionStrategy {})?
                     .validate_array_type(data_type)?;
             }
             page_start = page_end;
@@ -357,7 +358,7 @@ impl FullZipColumn {
                 continue;
             }
             if self.decoder.is_none() {
-                self.decoder = Some(Arc::new(FullZipScheduler::try_from_page(
+                self.decoder = Some(Arc::new(AdmittedBytePageScheduler::try_from_page(
                     page,
                     &DefaultDecompressionStrategy {},
                 )?));
@@ -702,7 +703,6 @@ impl FullZipScan {
             let priority = column.column.page_infos[column.page_index].priority;
             let local = (rows.start - column.page_start)..(rows.end - column.page_start);
             let input = decoder
-                .clone()
                 .prepare_array_range_in(
                     local,
                     field.data_type().clone(),

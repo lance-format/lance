@@ -17,7 +17,7 @@ use super::*;
 /// selected run count, columns and nesting depth. This is not an RSS bound.
 pub struct PreparedFullZipTake {
     schema: Arc<ArrowSchema>,
-    columns: Vec<Vec<FullZipArrayInput>>,
+    columns: Vec<Vec<AdmittedBytePageInput>>,
 }
 
 impl PreparedFullZipTake {
@@ -199,8 +199,7 @@ impl DecodeEngine {
                 let decoder = column
                     .decoder
                     .as_ref()
-                    .ok_or_else(|| Error::internal("missing FullZip take decoder"))?
-                    .clone();
+                    .ok_or_else(|| Error::internal("missing FullZip take decoder"))?;
                 let priority = column.column.page_infos[column.page_index].priority;
                 let Some(input) = decoder
                     .prepare_array_range_in(

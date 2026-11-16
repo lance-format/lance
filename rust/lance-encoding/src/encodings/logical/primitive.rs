@@ -29,7 +29,9 @@ use crate::{
 use crate::format::EncodingUtils;
 
 pub mod blob;
+mod byte_page;
 mod chunk_index;
+pub use byte_page::{AdmittedBytePageInput, AdmittedBytePageScheduler};
 pub mod constant;
 pub mod dict;
 pub mod fullzip;

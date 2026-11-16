@@ -99,7 +99,10 @@ async fn admitted_scan_advances_without_reading_skipped_pages(
     // A bad next selection must not alter a drained cursor or retained output.
     let error = scan.advance_to_range(24..25).unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("FullZip"));
+    assert!(
+        error.to_string().contains("dense FullZip page")
+            || error.to_string().contains("stored byte scalar")
+    );
     assert_eq!(scan.position(), 4);
     assert_eq!(budget.reserved(), held_bytes);
     scan.advance_to_range(17..22).unwrap();
@@ -246,11 +249,11 @@ async fn admitted_scan_crosses_pages_without_read_ahead(
 
 #[tokio::test]
 async fn admitted_scan_empty_invalid_and_unsupported_selection() {
-    let constant: ArrayRef = Arc::new(LargeBinaryArray::from_vec(vec![b"same"; 8]));
+    let unsupported: ArrayRef = Arc::new(LargeBinaryArray::new_null(8));
     let (_fs, reader) = fixture_arrays(
         ConcreteFileVersion::V2_2,
         false,
-        vec![array(0, 0), constant],
+        vec![array(0, 0), unsupported],
     )
     .await;
     let stats = IoStats::new();
@@ -274,7 +277,7 @@ async fn admitted_scan_empty_invalid_and_unsupported_selection() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("FullZip"));
+    assert!(error.to_string().contains("stored byte scalar"));
     assert_eq!(
         stats.snapshot().iops,
         0,
@@ -308,6 +311,43 @@ async fn admitted_scan_empty_invalid_and_unsupported_selection() {
 
 #[rstest]
 #[tokio::test]
+async fn admitted_scan_mixes_constant_and_fullzip_pages(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+) {
+    let constant: ArrayRef = Arc::new(LargeBinaryArray::from_vec(vec![b"same"; 8]));
+    let expected = [constant.clone(), array(0, 0), constant];
+    let (_fs, reader) = fixture_arrays(version, lite, expected.to_vec()).await;
+    let budget = AllocationBudget::new(8192);
+    let mut scan = reader
+        .open_admitted_fullzip_scan(0..24, budget.clone(), 8192, 3)
+        .await
+        .unwrap();
+    let mut position = 0;
+    loop {
+        match scan.try_next().await.unwrap() {
+            FullZipScanOutcome::Batch { rows, batch } => {
+                assert_eq!(rows.start, position);
+                let source = &expected[position as usize / 8];
+                assert_eq!(
+                    batch.column(0).to_data(),
+                    source
+                        .slice(position as usize % 8, batch.num_rows())
+                        .to_data()
+                );
+                position = rows.end;
+                drop(batch);
+                assert_eq!(budget.reserved(), 0);
+            }
+            FullZipScanOutcome::Finished => break,
+            FullZipScanOutcome::NeedsCapacity => panic!("fixture must fit one shared workspace"),
+        }
+    }
+    assert_eq!(position, 24);
+}
+
+#[rstest]
+#[tokio::test]
 async fn admitted_scan_respects_nonzero_projection_and_schema(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
 ) {
@@ -321,7 +361,7 @@ async fn admitted_scan_respects_nonzero_projection_and_schema(
     let batches = (0..2)
         .map(|page| {
             // Deliberately unsupported outside the selected projection.
-            let other = Arc::new(LargeBinaryArray::from_vec(vec![b"constant"; 8]));
+            let other = Arc::new(LargeBinaryArray::new_null(8));
             RecordBatch::try_new(schema.clone(), vec![other, array(page, 0)]).unwrap()
         })
         .collect();
@@ -332,7 +372,10 @@ async fn admitted_scan_respects_nonzero_projection_and_schema(
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("dense FullZip page"));
+    assert!(
+        error.to_string().contains("dense FullZip page")
+            || error.to_string().contains("stored byte scalar")
+    );
     let mut schema = reader.core.base_projection.schema.as_ref().clone();
     schema.fields.remove(0);
     schema.fields[0].name = "renamed".to_string();

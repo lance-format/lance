@@ -20,10 +20,11 @@ impl FragmentReader {
     /// No implicit prefix reduction or cursor is involved. Cancellation releases
     /// owners when their actual I/O/CPU work ends.
     ///
-    /// Currently requires dense FullZip v2.2/v2.3 byte/string leaves optionally
-    /// nested in List/LargeList, with disjoint top-level fields across base files.
-    /// Non-FullZip pages (including Constant pages selected by a writer before
-    /// applying a dense-encoding hint) return `NotSupported` when selected.
+    /// Currently requires dense FullZip or byte-scalar Constant v2.2/v2.3 pages
+    /// with byte/string leaves optionally nested in List/LargeList, with disjoint
+    /// top-level fields across base files.
+    /// Other page layouts, including scalar-free all-null Constant pages, return
+    /// `NotSupported` when selected. Stored layout determines decoder dispatch.
     /// Struct ancestors, deleted-row filtering/markers, generated system columns,
     /// missing-column synthesis and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed

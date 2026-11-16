@@ -40,7 +40,7 @@ use super::{
 };
 
 mod admitted;
-mod array_admitted;
+pub(super) mod array_admitted;
 mod read_admitted;
 mod structure;
 mod unzip_admitted;

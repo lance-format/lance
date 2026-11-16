@@ -338,7 +338,7 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
 
 #[rstest]
 #[tokio::test]
-async fn admitted_fragment_preflights_constant_overlay_without_fallback(
+async fn admitted_fragment_reads_constant_overlay_in_shared_workspace(
     #[values(false, true)] lite: bool,
     #[values(false, true)] nested: bool,
 ) {
@@ -365,22 +365,50 @@ async fn admitted_fragment_preflights_constant_overlay_without_fallback(
         assert_eq!(ordinary.num_rows(), 2);
         assert!(ordinary["payload"].is_null(0));
         assert!(ordinary["payload"].is_valid(1));
-        let budget = AllocationBudget::new(65536);
-        // Preserve the original counterexample. A supported field type does not
-        // imply that every page uses the currently admitted FullZip layout.
-        for available in [512, 65536] {
-            let error = reader
+        let budget = AllocationBudget::new(2 * 65536);
+        // This formerly rejected real Constant layout now uses the same admitted
+        // operation as base reads and overlay assembly. Small credit is refusal,
+        // not a fallback to an ordinary decoder or partial result.
+        assert!(
+            reader
                 .try_take_admitted_fullzip(
                     &UInt32Array::from(vec![2, 3]),
-                    budget.try_reserve(available).unwrap(),
+                    budget.try_reserve(16).unwrap()
                 )
                 .await
-                .unwrap_err();
-            assert!(matches!(error, Error::NotSupported { .. }));
-            assert!(error.to_string().contains("dense FullZip page"));
-            assert_eq!(budget.reserved(), 0);
-        }
-        // An irrelevant unsupported overlay is pruned by the actual planner.
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(budget.reserved(), 0);
+        let output = reader
+            .try_take_admitted_fullzip(
+                &UInt32Array::from(vec![2, 3]),
+                budget.try_reserve(65536).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, ordinary);
+        drop(output);
+        assert_eq!(budget.reserved(), 0);
+        let indices = UInt32Array::from(vec![2, 3]);
+        let left = reader.try_take_admitted_fullzip(&indices, budget.try_reserve(65536).unwrap());
+        let right = reader.try_take_admitted_fullzip(&indices, budget.try_reserve(65536).unwrap());
+        let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(left, right)
+        })
+        .await
+        .expect("constant reads must progress with one CPU worker");
+        let left = left.unwrap().unwrap();
+        let right = right.unwrap().unwrap();
+        assert_eq!(left, ordinary);
+        assert_eq!(right, ordinary);
+        let alias = left.column(0).to_data().buffers()[0].slice_with_length(0, 1);
+        drop((left, right));
+        assert!(budget.reserved() > 0);
+        drop(alias);
+        assert_eq!(budget.reserved(), 0);
+        // Non-overlapping overlays remain pruned by the actual planner.
         let expected = reader.take_as_batch(&[0, 5], None).await.unwrap();
         let output = reader
             .try_take_admitted_fullzip(

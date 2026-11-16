@@ -34,14 +34,26 @@ enum ListLayer<'a> {
     Large(&'a FieldRef),
 }
 
-struct Shape<'a> {
-    leaf: &'a DataType,
+pub(in super::super) struct Shape<'a> {
+    pub(in super::super) leaf: &'a DataType,
     // Outer to inner, rebuilt in reverse after leaf validity is applied.
     lists: Vec<ListLayer<'a>>,
 }
 
 impl<'a> Shape<'a> {
     fn new(scheduler: &FullZipScheduler, data_type: &'a DataType) -> Result<Self> {
+        Self::from_layers(
+            data_type,
+            &scheduler.details.def_meaning,
+            Some(scheduler.bits_per_offset),
+        )
+    }
+
+    pub(in super::super) fn from_layers(
+        data_type: &'a DataType,
+        layers: &[crate::repdef::DefinitionInterpretation],
+        bits: Option<u8>,
+    ) -> Result<Self> {
         let mut leaf = data_type;
         let mut lists = Vec::new();
         loop {
@@ -66,8 +78,7 @@ impl<'a> Shape<'a> {
                 ));
             }
         };
-        let layers = &scheduler.details.def_meaning;
-        if offset_bits != scheduler.bits_per_offset
+        if bits.is_some_and(|bits| offset_bits != bits)
             || layers.len() != lists.len() + 1
             || layers.first().is_none_or(|layer| layer.is_list())
             || layers.iter().skip(1).any(|layer| !layer.is_list())
@@ -144,7 +155,7 @@ impl Shape<'_> {
         self.finish(page, count, workspace)
     }
 
-    fn finish(
+    pub(in super::super) fn finish(
         &self,
         page: DecodedPage,
         count: u64,

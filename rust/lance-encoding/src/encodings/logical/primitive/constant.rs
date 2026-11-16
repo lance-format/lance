@@ -28,6 +28,8 @@ use crate::{
 };
 
 mod admitted;
+mod admitted_input;
+pub(super) use admitted_input::{ConstantArrayInput, ConstantArrayScheduler};
 
 pub(crate) fn encode_constant_page(
     column_idx: u32,
