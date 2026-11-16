@@ -18,6 +18,7 @@ on:
       - python/Cargo.lock
       - java/lance-jni/Cargo.lock
       - .cargo/config.toml
+      - .config/nextest.toml
       - clippy.toml
       - deny.toml
       - ci/check_dependency_age.py
