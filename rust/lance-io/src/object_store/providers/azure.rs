@@ -316,6 +316,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
+            resource_pool: None,
             scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

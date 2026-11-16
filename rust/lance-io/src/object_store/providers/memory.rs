@@ -27,6 +27,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
+            resource_pool: None,
             scheme: String::from("memory"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

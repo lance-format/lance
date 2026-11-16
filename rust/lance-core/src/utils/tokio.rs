@@ -12,6 +12,11 @@ use futures::{Future, FutureExt};
 use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 
+mod io;
+mod resources;
+pub use io::io_task_with_resources;
+pub use resources::{CpuTaskResources, MemoryOwned, ResourceCpuTask, cpu_task_with_resources};
+
 /// We cache the call to num_cpus::get() because:
 ///
 /// 1. It shouldn't change during the lifetime of the program
@@ -449,6 +454,12 @@ fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Error, Result, utils::memory::MemoryReserver};
+    use rstest::rstest;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    };
 
     /// The successful path must hand back the closure's own output.
     ///
@@ -584,5 +595,610 @@ mod tests {
     fn allows_zero_when_minimum_is_zero() {
         // LANCE_IO_CORE_RESERVATION=0 is valid: no cores reserved for IO.
         assert_eq!(parse_env_usize("VAR", "0", 0).unwrap(), 0);
+    }
+    #[derive(Debug)]
+    pub(super) struct CpuTestPool {
+        pub(super) used: Arc<AtomicUsize>,
+        pub(super) limit: usize,
+    }
+
+    struct CpuTestReservation {
+        used: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for CpuTestReservation {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::Release);
+        }
+    }
+
+    impl MemoryReserver for CpuTestPool {
+        fn reserve(&self, stage: &str, bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            self.used
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= self.limit)
+                })
+                .map_err(|used| {
+                    Error::execution(format!(
+                        "{stage}: requested_bytes={bytes}, budget_bytes={}, used_bytes={used}",
+                        self.limit,
+                    ))
+                })?;
+            Ok(Box::new(CpuTestReservation {
+                used: self.used.clone(),
+                bytes,
+            }))
+        }
+    }
+
+    struct CapturedCpuInput {
+        values: Vec<u8>,
+        freed: Arc<AtomicBool>,
+    }
+
+    impl Drop for CapturedCpuInput {
+        fn drop(&mut self) {
+            self.values.clear();
+            self.values.shrink_to_fit();
+            self.freed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    struct CpuInputOwner {
+        _reservation: Box<dyn Send + Sync>,
+        freed: Arc<AtomicBool>,
+    }
+
+    thread_local! {
+        // A sticky marker identifies the blocking worker even after the user
+        // closure returns, when Tokio would drop an unclaimed task result.
+        static RESOURCE_CPU_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    struct CpuOwnerDropObserver(Arc<AtomicBool>);
+
+    impl Drop for CpuOwnerDropObserver {
+        fn drop(&mut self) {
+            self.0.store(RESOURCE_CPU_WORKER.get(), Ordering::Release);
+        }
+    }
+
+    impl Drop for CpuInputOwner {
+        fn drop(&mut self) {
+            assert!(
+                self.freed.load(Ordering::Relaxed),
+                "encoding input must be freed before returning its allowance"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::cancel_before_poll(false)]
+    #[case::control_limit(true)]
+    #[tokio::test]
+    async fn test_resource_cpu_task_not_dispatched(#[case] fail_control: bool) {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: if fail_control { 16 } else { 16 * 1024 },
+        });
+        let freed = Arc::new(AtomicBool::new(false));
+        let input_owner = Arc::new(CpuInputOwner {
+            _reservation: pool.reserve("input", 16).unwrap(),
+            freed: freed.clone(),
+        });
+        let input = CapturedCpuInput {
+            values: vec![1; 16],
+            freed: freed.clone(),
+        };
+        let task = cpu_task_with_resources(
+            pool.clone(),
+            "page encoding",
+            1024,
+            input_owner,
+            move || -> Result<Vec<u8>> {
+                drop(input);
+                panic!("an unpolled encoding task must not dispatch CPU work")
+            },
+        );
+        if fail_control {
+            let error = task.err().unwrap();
+            assert!(matches!(error, Error::Execution { .. }));
+            assert!(error.to_string().contains("CPU task control"));
+        } else {
+            let task = task.unwrap();
+            assert!(!freed.load(Ordering::Relaxed));
+            assert!(pool.used.load(Ordering::Relaxed) > 16);
+            drop(task);
+        }
+        assert!(freed.load(Ordering::Relaxed));
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resource_cpu_task_workspace_limit_precedes_cpu_work() {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        });
+        let task = cpu_task_with_resources(
+            pool.clone(),
+            "oversized page encoding",
+            pool.limit + 1,
+            Arc::new(()),
+            || -> Result<Vec<u8>> { panic!("workspace must be admitted before CPU dispatch") },
+        )
+        .unwrap();
+        let error = task.await.err().unwrap();
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains("oversized page encoding"));
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::success(false)]
+    #[case::error(true)]
+    #[tokio::test]
+    async fn test_resource_cpu_task_output_retains_its_reservations(#[case] fail_encoding: bool) {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        });
+        let freed = Arc::new(AtomicBool::new(false));
+        let input_owner = Arc::new(CpuInputOwner {
+            _reservation: pool.reserve("input", 16).unwrap(),
+            freed: freed.clone(),
+        });
+        let input = CapturedCpuInput {
+            values: vec![1; 16],
+            freed: freed.clone(),
+        };
+        let task = cpu_task_with_resources(
+            pool.clone(),
+            "page encoding",
+            1024,
+            input_owner,
+            move || {
+                if fail_encoding {
+                    return Err(Error::execution("page encoding failed"));
+                }
+                let data = input.values.clone();
+                drop(input);
+                Ok(data)
+            },
+        )
+        .unwrap();
+        let result = task.await;
+        assert!(freed.load(Ordering::Relaxed));
+        if fail_encoding {
+            let error = result.err().unwrap();
+            assert!(matches!(error, Error::Execution { .. }));
+            assert!(error.to_string().contains("page encoding failed"));
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.value().len(), 16);
+            assert_eq!(result.value().as_slice(), &[1; 16]);
+            assert_eq!(
+                result.reserved_bytes() + 16,
+                pool.used.load(Ordering::Relaxed)
+            );
+            let (page, reservations) = result.into_parts();
+            let charged = pool.used.load(Ordering::Relaxed);
+            assert!(charged > 16 + 1024);
+            drop(page);
+            assert_eq!(pool.used.load(Ordering::Relaxed), charged);
+            drop(reservations);
+        }
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn test_resource_cpu_task_cancel_after_dispatch() {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        });
+        let freed = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let dropped_on_cpu = Arc::new(AtomicBool::new(false));
+        let input_owner = Arc::new((
+            CpuOwnerDropObserver(dropped_on_cpu.clone()),
+            CpuInputOwner {
+                _reservation: pool.reserve("input", 16).unwrap(),
+                freed: freed.clone(),
+            },
+        ));
+        let owner_weak = Arc::downgrade(&input_owner);
+        let input = CapturedCpuInput {
+            values: vec![1; 16],
+            freed: freed.clone(),
+        };
+        let cpu_completed = completed.clone();
+        let mut task = cpu_task_with_resources(
+            pool.clone(),
+            "page encoding",
+            1024,
+            input_owner,
+            move || {
+                RESOURCE_CPU_WORKER.set(true);
+                assert!(owner_weak.strong_count() > 0);
+                // Pure CPU work: no worker waits for the cancellation observer.
+                let mut checksum = 1_u64;
+                for _ in 0..10_000 {
+                    checksum ^= checksum << 13;
+                    checksum ^= checksum >> 7;
+                    checksum ^= checksum << 17;
+                    checksum = std::hint::black_box(checksum ^ u64::from(input.values[0]));
+                }
+                assert!(owner_weak.strong_count() > 0);
+                let data = checksum.to_le_bytes().to_vec();
+                drop(input);
+                cpu_completed.store(true, Ordering::Release);
+                Ok(data)
+            },
+        )
+        .unwrap();
+        // The CPU task may finish on either side of cancellation. Its ownership
+        // contract must hold in both races, with no sleeps or parked CPU work.
+        if let std::task::Poll::Ready(result) = futures::poll!(&mut task) {
+            drop(result.unwrap());
+        }
+        drop(task);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pool.used.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(freed.load(Ordering::Acquire));
+        assert!(completed.load(Ordering::Acquire));
+        assert!(!dropped_on_cpu.load(Ordering::Acquire));
+    }
+    #[rstest]
+    #[case::large_closure(true)]
+    #[case::large_inline_result(false)]
+    #[test]
+    fn test_resource_cpu_task_inline_control_limit(#[case] capture: bool) {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        });
+        let error = if capture {
+            let input = [0_u8; 8192];
+            cpu_task_with_resources(pool.clone(), "large capture", 0, Arc::new(()), move || {
+                Ok(std::hint::black_box(input)[0])
+            })
+            .err()
+            .unwrap()
+        } else {
+            cpu_task_with_resources(pool.clone(), "large result", 0, Arc::new(()), || {
+                Ok([0_u8; 8192])
+            })
+            .err()
+            .unwrap()
+        };
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains("CPU task control"));
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn test_resource_cpu_task_panic_returns_its_reservations() {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        });
+        let task = cpu_task_with_resources(
+            pool.clone(),
+            "panicking task",
+            1024,
+            Arc::new(()),
+            || -> Result<()> { panic!("resource task panic payload") },
+        )
+        .unwrap();
+        let joined = tokio::spawn(async move { task.await.map(drop) }).await;
+        let panic = joined.unwrap_err().into_panic();
+        assert_eq!(
+            *panic.downcast::<&str>().unwrap(),
+            "resource task panic payload"
+        );
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[rstest]
+    #[case::success(false)]
+    #[case::error(true)]
+    #[tokio::test]
+    async fn test_resource_cpu_precharged_output_releases_temporary_inputs(#[case] fail: bool) {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 64 * 1024,
+        });
+        let input = Arc::new(
+            MemoryOwned::try_new(pool.as_ref(), "input", 8192, || Ok(vec![7_u8; 16])).unwrap(),
+        );
+        let output =
+            MemoryOwned::<Option<Result<Vec<u8>>>>::try_new(pool.as_ref(), "output", 64, || {
+                Ok(None)
+            })
+            .unwrap();
+        let work_input = input.clone();
+        let task = output
+            .into_cpu_task(pool.clone(), "precharged output", 4096, input, move |_| {
+                Ok(if fail {
+                    Err(Error::execution("copy failed"))
+                } else {
+                    Ok(work_input.value().clone())
+                })
+            })
+            .unwrap();
+        let output = task.await.unwrap();
+        assert_eq!(pool.used.load(Ordering::Acquire), output.reserved_bytes());
+        let output = output.try_map(|result| result);
+        if fail {
+            let error = output.err().unwrap();
+            assert!(matches!(error, Error::Execution { .. }));
+            assert!(error.to_string().contains("copy failed"));
+        } else {
+            assert_eq!(output.unwrap().value().as_slice(), &[7_u8; 16]);
+        }
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resource_cpu_precharged_output_panic_releases_on_driver() {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 64 * 1024,
+        });
+        let dropped_on_cpu = Arc::new(AtomicBool::new(false));
+        let output =
+            MemoryOwned::<Option<Vec<u8>>>::try_new(pool.as_ref(), "output", 64, || Ok(None))
+                .unwrap()
+                .with_owner(Arc::new(CpuOwnerDropObserver(dropped_on_cpu.clone())))
+                .unwrap();
+        let task = output
+            .into_cpu_task(
+                pool.clone(),
+                "panicking output",
+                4096,
+                Arc::new(()),
+                |_| -> Result<Vec<u8>> {
+                    RESOURCE_CPU_WORKER.set(true);
+                    panic!("precharged output panic");
+                },
+            )
+            .unwrap();
+        let panic = tokio::spawn(async move { task.await.map(drop) })
+            .await
+            .unwrap_err()
+            .into_panic();
+        assert_eq!(
+            *panic.downcast::<&str>().unwrap(),
+            "precharged output panic"
+        );
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+        assert!(!dropped_on_cpu.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn test_resource_cpu_task_large_inline_result_fits() {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 64 * 1024,
+        });
+        let task = cpu_task_with_resources(pool.clone(), "large result", 0, Arc::new(()), || {
+            Ok([7_u8; 8192])
+        })
+        .unwrap();
+        let result = task.await.unwrap();
+        assert_eq!(result.value(), &[7_u8; 8192]);
+        assert!(pool.used.load(Ordering::Relaxed) >= 2 * 8192);
+        drop(result);
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+    #[rstest]
+    #[case::success(false)]
+    #[case::error(true)]
+    #[test]
+    fn test_inline_memory_owned_value(#[case] fail_creation: bool) {
+        let pool = CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        };
+        let value = MemoryOwned::try_new(&pool, "inline metadata", 128, || {
+            if fail_creation {
+                Err(Error::execution("inline creation failed"))
+            } else {
+                Ok(vec![7_u8; 128])
+            }
+        });
+        if fail_creation {
+            let error = value.err().unwrap();
+            assert!(matches!(error, Error::Execution { .. }));
+            assert!(error.to_string().contains("inline creation failed"));
+        } else {
+            let value = value.unwrap();
+            assert_eq!(value.value(), &[7_u8; 128]);
+            assert!(pool.used.load(Ordering::Relaxed) > 128);
+            let (value, resources) = value.into_parts();
+            drop(value);
+            assert!(pool.used.load(Ordering::Relaxed) > 128);
+            drop(resources);
+        }
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::control(16, "inline allocation control")]
+    #[case::backing(2048, "inline metadata")]
+    #[test]
+    fn test_inline_memory_owned_admission_precedes_allocation(
+        #[case] limit: usize,
+        #[case] stage: &str,
+    ) {
+        let pool = CpuTestPool {
+            used: Arc::default(),
+            limit,
+        };
+        let error = MemoryOwned::<Vec<u8>>::try_new(&pool, "inline metadata", 4096, || {
+            panic!("allocation must not run before admission")
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains(stage));
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+    #[rstest]
+    #[case::success(false)]
+    #[case::error(true)]
+    #[test]
+    fn test_inline_memory_owned_mapping_retains_shared_owner(#[case] fail: bool) {
+        let pool = CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        };
+        let owner: Arc<dyn Send + Sync> = Arc::from(pool.reserve("shared schema", 64).unwrap());
+        let weak = Arc::downgrade(&owner);
+        let prepared = MemoryOwned::try_new(&pool, "prepared output", 128, || Ok(None::<Vec<u8>>))
+            .unwrap()
+            .with_owner(owner)
+            .unwrap();
+        let used = pool.used.load(Ordering::Relaxed);
+        assert_eq!(prepared.reserved_bytes() + 64, used);
+        let converted = prepared.try_map(|_| {
+            if fail {
+                Err(Error::execution("mapping failed"))
+            } else {
+                Ok(vec![7_u8; 128])
+            }
+        });
+        if fail {
+            let error = converted.err().unwrap();
+            assert!(matches!(error, Error::Execution { .. }));
+            assert!(error.to_string().contains("mapping failed"));
+        } else {
+            let value = converted.unwrap();
+            assert_eq!(value.value(), &[7; 128]);
+            assert_eq!(value.reserved_bytes() + 64, used);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(pool.used.load(Ordering::Relaxed), used);
+            drop(value);
+        }
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::inline(false)]
+    #[case::cpu(true)]
+    #[test]
+    fn test_inline_memory_owned_mapping_refuses_larger_envelope(#[case] cpu: bool) {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        });
+        let value = MemoryOwned::try_new(pool.as_ref(), "small output", 0, || Ok(0_u8)).unwrap();
+        let error = if cpu {
+            value
+                .into_cpu_task(
+                    pool.clone(),
+                    "larger output",
+                    0,
+                    Arc::new(()),
+                    |_| -> Result<[u8; 8192]> {
+                        panic!("larger result must be rejected before dispatch")
+                    },
+                )
+                .err()
+                .unwrap()
+        } else {
+            value
+                .try_map(|_| -> Result<[u8; 8192]> {
+                    panic!("larger result must be rejected before conversion")
+                })
+                .err()
+                .unwrap()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("inline size"));
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_inline_memory_owned_refuses_replacing_shared_owner() {
+        let pool = CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        };
+        let owner: Arc<dyn Send + Sync> = Arc::from(pool.reserve("shared schema", 64).unwrap());
+        let weak = Arc::downgrade(&owner);
+        let value = MemoryOwned::try_new(&pool, "small output", 0, || Ok(0_u8))
+            .unwrap()
+            .with_owner(owner)
+            .unwrap();
+        let replacement: Arc<dyn Send + Sync> =
+            Arc::from(pool.reserve("replacement schema", 64).unwrap());
+        let error = value.with_owner(replacement.clone()).err().unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("already has an additional owner")
+        );
+        assert!(weak.upgrade().is_none());
+        assert_eq!(pool.used.load(Ordering::Relaxed), 64);
+        drop(replacement);
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::inline(false)]
+    #[case::cpu(true)]
+    #[test]
+    fn test_memory_owned_total_allowance_overflow(#[case] cpu: bool) {
+        let pool = Arc::new(CpuTestPool {
+            used: Arc::default(),
+            limit: usize::MAX,
+        });
+        let result = if cpu {
+            cpu_task_with_resources(
+                pool.clone(),
+                "overflow",
+                usize::MAX,
+                Arc::new(()),
+                || -> Result<()> { panic!("overflow must fail before CPU dispatch") },
+            )
+            .map(drop)
+        } else {
+            MemoryOwned::try_new(pool.as_ref(), "overflow", usize::MAX, || -> Result<()> {
+                panic!("overflow must fail before allocation")
+            })
+            .map(drop)
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("total size overflow"));
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_memory_owned_fixed_lease_retains_original_allowance() {
+        let pool = CpuTestPool {
+            used: Arc::default(),
+            limit: 16 * 1024,
+        };
+        let mut value =
+            MemoryOwned::try_new(&pool, "fixed workspace", 1024, || Ok(vec![1_u8; 128])).unwrap();
+        let reserved = value.reserved_bytes();
+        assert!(!value.try_shrink_workspace(128).unwrap());
+        assert_eq!(value.reserved_bytes(), reserved);
+        assert_eq!(pool.used.load(Ordering::Relaxed), reserved);
+        let error = value.try_shrink_workspace(1025).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("workspace cannot grow"));
+        assert_eq!(value.value(), &[1_u8; 128]);
+        assert_eq!(pool.used.load(Ordering::Relaxed), reserved);
+        drop(value);
+        assert_eq!(pool.used.load(Ordering::Relaxed), 0);
     }
 }

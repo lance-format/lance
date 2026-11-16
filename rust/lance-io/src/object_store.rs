@@ -269,6 +269,7 @@ pub struct ObjectStore {
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
     local_fsync: bool,
+    resource_pool: Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -849,6 +850,7 @@ impl ObjectStore {
                 _external_blob_origin: None,
                 local_dir_operations: None,
                 local_fsync: false,
+                resource_pool: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -1154,6 +1156,11 @@ impl ObjectStore {
     /// Parameters
     /// - ``path``: Absolute path to the file.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
+        if let Some(pool) = &self.resource_pool {
+            return self
+                .open_with_memory_reserver(path, None, pool.clone())
+                .await;
+        }
         match self.scheme.as_str() {
             "file" if self.has_direct_local_paths() => {
                 LocalObjectReader::open_with_tracker(
@@ -1208,6 +1215,11 @@ impl ObjectStore {
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
     pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+        if let Some(pool) = &self.resource_pool {
+            return self
+                .open_with_memory_reserver(path, Some(known_size), pool.clone())
+                .await;
+        }
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
@@ -1327,8 +1339,154 @@ impl ObjectStore {
         object_store.open(&os_path).await
     }
 
+    /// Create a direct local store view whose readers and writers share an operation pool.
+    ///
+    /// This bypasses whole-file caches. The pool may retain an additional metadata
+    /// workspace owner, keeping its grant alive through detached native I/O.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # fn example(store: &ObjectStore, pool: Arc<dyn MemoryReserver>) -> Result<()> {
+    /// let metadata_store = store.with_memory_reserver(pool)?;
+    /// assert!(metadata_store.has_direct_local_paths());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_memory_reserver(
+        &self,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<Self> {
+        if self.scheme != "file" || !self.has_direct_local_paths() {
+            return Err(Error::not_supported(format!(
+                "resource-aware store view requires direct local storage: scheme={}",
+                self.scheme
+            )));
+        }
+        let mut store = self.clone();
+        store.resource_pool = Some(pool);
+        Ok(store)
+    }
+
+    /// Open a direct local reader with accounted file state, metadata calls and
+    /// reads. Unsupported backends fail before I/O; small objects are not cached
+    /// in an independent reader. A known size skips the metadata request.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// async fn open(store: &ObjectStore, path: &Path, pool: Arc<dyn MemoryReserver>) -> Result<()> {
+    ///     let reader = store.open_with_memory_reserver(path, None, pool).await?;
+    ///     let _size = reader.size().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn open_with_memory_reserver(
+        &self,
+        path: &Path,
+        known_size: Option<usize>,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<Box<dyn Reader>> {
+        if self.scheme != "file" || !self.has_direct_local_paths() {
+            return Err(Error::not_supported(format!(
+                "resource-aware reader opening is not implemented for storage scheme '{}'",
+                self.scheme
+            )));
+        }
+        LocalObjectReader::open_with_resources(
+            path,
+            self.block_size,
+            known_size,
+            Arc::new(self.io_tracker.clone()),
+            pool,
+        )
+        .await
+    }
+
+    /// Create a staged local output whose write buffers and blocking tasks use
+    /// the supplied memory allowance. Other backends currently reject this mode
+    /// before creating output. Successful shutdown atomically publishes the file;
+    /// abandoned unpublished staging files are reclaimed after I/O quiesces.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// async fn create(store: &ObjectStore, path: &Path, pool: Arc<dyn MemoryReserver>) -> Result<()> {
+    ///     let writer = store.create_with_memory_reserver(path, pool).await?;
+    ///     drop(writer);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn create_with_memory_reserver(
+        &self,
+        path: &Path,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<Box<dyn Writer>> {
+        if self.scheme != "file" || !self.has_direct_local_paths() {
+            return Err(Error::not_supported(format!(
+                "resource-aware destination writing is not implemented for storage scheme '{}'",
+                self.scheme
+            )));
+        }
+        Ok(Box::new(
+            crate::object_writer::ResourceLocalWriter::create(
+                path,
+                pool,
+                Arc::new(self.io_tracker.clone()),
+                self.local_fsync,
+            )
+            .await?,
+        ))
+    }
+
+    /// Publish a new resource-owned local file without replacing existing data.
+    /// The lifecycle receives publication acknowledgement from the actual I/O
+    /// task, even if its public await was cancelled.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_io::{object_store::ObjectStore, object_writer::OutputLifecycle};
+    /// # use object_store::path::Path;
+    /// async fn create(store: &ObjectStore, path: &Path, pool: Arc<dyn MemoryReserver>, owner: Arc<dyn OutputLifecycle>) -> Result<()> {
+    ///     let _writer = store.create_with_output_lifecycle(path, pool, owner).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn create_with_output_lifecycle(
+        &self,
+        path: &Path,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+        owner: Arc<dyn crate::object_writer::OutputLifecycle>,
+    ) -> Result<Box<dyn Writer>> {
+        if self.scheme != "file" || !self.has_direct_local_paths() {
+            return Err(Error::not_supported(format!(
+                "owned output publication is not implemented for storage scheme '{}'",
+                self.scheme
+            )));
+        }
+        Ok(Box::new(
+            crate::object_writer::ResourceLocalWriter::create_with_output_lifecycle(
+                path,
+                pool,
+                Arc::new(self.io_tracker.clone()),
+                Some(owner),
+                self.local_fsync,
+            )
+            .await?,
+        ))
+    }
+
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
+        if let Some(pool) = &self.resource_pool {
+            return self.create_with_memory_reserver(path, pool.clone()).await;
+        }
         match self.scheme.as_str() {
             "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
@@ -2120,6 +2278,16 @@ impl ObjectStore {
 
     /// Check a file exists.
     pub async fn exists(&self, path: &Path) -> Result<bool> {
+        if let Some(pool) = &self.resource_pool {
+            return match self
+                .open_with_memory_reserver(path, None, pool.clone())
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error) if error.is_not_found() => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
         match self.inner.head(path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { path: _, source: _ }) => Ok(false),
@@ -2129,6 +2297,13 @@ impl ObjectStore {
 
     /// Get file size.
     pub async fn size(&self, path: &Path) -> Result<u64> {
+        if let Some(pool) = &self.resource_pool {
+            let reader = self
+                .open_with_memory_reserver(path, None, pool.clone())
+                .await?;
+            return u64::try_from(reader.size().await?)
+                .map_err(|_| Error::invalid_input("local file size exceeds u64"));
+        }
         Ok(self.inner.head(path).await?.size)
     }
 
@@ -2556,6 +2731,7 @@ impl ObjectStore {
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
+            resource_pool: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -3886,6 +4062,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MultipartObservations {
+        backend_calls: AtomicUsize,
         part_count: AtomicUsize,
         abort_count: AtomicUsize,
         native_copy_count: AtomicUsize,
@@ -3958,6 +4135,9 @@ mod tests {
             bytes: PutPayload,
             opts: PutOptions,
         ) -> OSResult<PutResult> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner.put_opts(location, bytes, opts).await
         }
 
@@ -3966,6 +4146,9 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             let inner = self.inner.put_multipart_opts(location, opts).await?;
             Ok(Box::new(ObservedMultipartUpload {
                 inner,
@@ -3975,6 +4158,9 @@ mod tests {
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             let is_head = options.head;
             let mut result = self.inner.get_opts(location, options).await?;
             if is_head && location.filename() == Some("destination.bin") {
@@ -3988,6 +4174,9 @@ mod tests {
         }
 
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -3996,6 +4185,7 @@ mod tests {
             locations: BoxStream<'static, OSResult<Path>>,
         ) -> BoxStream<'static, OSResult<Path>> {
             let observations = self.observations.clone();
+            observations.backend_calls.fetch_add(1, Ordering::SeqCst);
             observations
                 .delete_stream_count
                 .fetch_add(1, Ordering::SeqCst);
@@ -4020,6 +4210,9 @@ mod tests {
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner.list(prefix)
         }
 
@@ -4028,19 +4221,104 @@ mod tests {
             prefix: Option<&Path>,
             offset: &Path,
         ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner.list_with_offset(prefix, offset)
         }
 
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.inner.list_with_delimiter(prefix).await
         }
 
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.observations
+                .backend_calls
+                .fetch_add(1, Ordering::SeqCst);
+            self.observations
                 .native_copy_count
                 .fetch_add(1, Ordering::SeqCst);
             self.inner.copy_opts(from, to, opts).await
         }
+    }
+
+    #[derive(Debug)]
+    struct RefusedResources;
+
+    impl lance_core::utils::memory::MemoryReserver for RefusedResources {
+        fn reserve(&self, stage: &str, bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            panic!("unsupported storage must refuse before reservation: {stage}, bytes={bytes}")
+        }
+    }
+
+    impl crate::object_writer::OutputLifecycle for RefusedResources {
+        fn published(&self) {
+            panic!("unsupported storage must never acknowledge publication")
+        }
+    }
+
+    #[rstest]
+    #[case::s3("s3")]
+    #[case::gcs("gs")]
+    #[case::azure("az")]
+    #[case::abfs("abfs")]
+    #[case::abfss("abfss")]
+    #[case::memory("memory")]
+    #[case::rooted_local("file")]
+    #[tokio::test]
+    async fn resource_storage_refuses_before_backend_work(#[case] scheme: &str) {
+        let observations = Arc::new(MultipartObservations::default());
+        let backend = Arc::new(ObservedMultipartStore {
+            inner: InMemory::new(),
+            observations: observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+        let mut store = ObjectStore::memory();
+        store.inner = backend.clone();
+        store.scheme = scheme.to_owned();
+        store.store_prefix = format!("{scheme}$rooted");
+        assert!(!store.has_direct_local_paths());
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::from_absolute_path(directory.path().join("refused")).unwrap();
+        let pool: Arc<dyn lance_core::utils::memory::MemoryReserver> = Arc::new(RefusedResources);
+        let owner = Arc::new(RefusedResources);
+        let errors = [
+            store.with_memory_reserver(pool.clone()).err().unwrap(),
+            store
+                .open_with_memory_reserver(&path, None, pool.clone())
+                .await
+                .err()
+                .unwrap(),
+            store
+                .create_with_memory_reserver(&path, pool.clone())
+                .await
+                .err()
+                .unwrap(),
+            store
+                .create_with_output_lifecycle(&path, pool, owner)
+                .await
+                .err()
+                .unwrap(),
+        ];
+        for error in errors {
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(error.to_string().contains(scheme), "{error}");
+        }
+        assert_eq!(observations.backend_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            backend
+                .inner
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[async_trait]
