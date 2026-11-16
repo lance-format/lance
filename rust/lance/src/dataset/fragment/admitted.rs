@@ -22,6 +22,8 @@ impl FragmentReader {
     ///
     /// Currently requires dense FullZip v2.2/v2.3 byte/string leaves optionally
     /// nested in List/LargeList, with disjoint top-level fields across base files.
+    /// Non-FullZip pages (including Constant pages selected by a writer before
+    /// applying a dense-encoding hint) return `NotSupported` when selected.
     /// Struct ancestors, deleted-row filtering/markers, generated system columns,
     /// missing-column synthesis and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed

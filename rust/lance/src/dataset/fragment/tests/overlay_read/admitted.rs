@@ -4,7 +4,9 @@
 use crate::dataset::fragment::FragmentReader;
 use arrow_array::{LargeBinaryArray, ListArray, StringArray, UInt32Array};
 use arrow_buffer::OffsetBuffer;
-use lance_core::{Error, utils::allocation::AllocationBudget};
+use lance_core::{Error, cache::LanceCache, utils::allocation::AllocationBudget};
+use lance_encoding::{decoder::PageEncoding, format::metadata::page_layout::Layout};
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use std::collections::HashMap;
 
@@ -63,14 +65,7 @@ async fn open(
         .unwrap()
 }
 
-#[rstest]
-#[tokio::test]
-async fn admitted_fragment_take_matches_actual_overlay_resolution(
-    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
-    #[values(false, true)] lite: bool,
-    #[values(false, true)] nested: bool,
-) {
-    const WORKSPACE: usize = 65536;
+async fn write_payload_dataset(version: LanceFileVersion, nested: bool) -> Dataset {
     let values = payload("base", 12, nested, 1);
     let schema = Arc::new(ArrowSchema::new(vec![
         fullzip_field("payload", values.data_type().clone()),
@@ -86,7 +81,7 @@ async fn admitted_fragment_take_matches_actual_overlay_resolution(
         ],
     )
     .unwrap();
-    let mut dataset = Dataset::write(
+    Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
         "memory://",
         Some(WriteParams {
@@ -96,7 +91,52 @@ async fn admitted_fragment_take_matches_actual_overlay_resolution(
         }),
     )
     .await
+    .unwrap()
+}
+
+// Field metadata is a dense-encoding preference, not a ban on Constant layout.
+// Check the stored fixture layout so admitted-path coverage cannot silently drift.
+async fn assert_overlay_layout(dataset: &Dataset, name: &str, is_constant: bool) {
+    let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::default());
+    let file = scheduler
+        .open_file(
+            &dataset.data_dir().join(format!("{name}.lance")),
+            &CachedFileSize::unknown(),
+        )
+        .await
+        .unwrap();
+    let reader = FileReader::try_open(
+        file,
+        None,
+        Default::default(),
+        &Arc::new(LanceCache::no_cache()),
+        FileReaderOptions::default(),
+    )
+    .await
     .unwrap();
+    let pages = &reader.metadata().column_infos[0].page_infos;
+    assert_eq!(pages.len(), 1);
+    let layout = match &pages[0].encoding {
+        PageEncoding::Structural(layout) => layout.clone(),
+        PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+        PageEncoding::Legacy(_) => panic!("current-format fixture must not use legacy pages"),
+    };
+    if is_constant {
+        assert!(matches!(layout.layout, Some(Layout::ConstantLayout(_))));
+    } else {
+        assert!(matches!(layout.layout, Some(Layout::FullZipLayout(_))));
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_fragment_take_matches_actual_overlay_resolution(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] nested: bool,
+) {
+    const WORKSPACE: usize = 65536;
+    let mut dataset = write_payload_dataset(version, nested).await;
     let field_id = dataset.schema().field("payload").unwrap().id;
     for fragment in 0..2 {
         dataset = commit_overlay(
@@ -114,11 +154,15 @@ async fn admitted_fragment_take_matches_actual_overlay_resolution(
             &format!("admitted-new-{fragment}"),
             fragment,
             &[field_id],
-            OverlayCoverage::dense(bitmap([2, 3])),
-            vec![payload("new", 2, nested, 0)],
+            // Two distinct non-null values keep v2.2's earlier Constant encoder
+            // from intercepting this dense-FullZip fixture. Null still wins at row 2.
+            OverlayCoverage::dense(bitmap([2, 3, 4])),
+            vec![payload("new", 3, nested, 0)],
             version,
         )
         .await;
+        assert_overlay_layout(&dataset, &format!("admitted-old-{fragment}"), false).await;
+        assert_overlay_layout(&dataset, &format!("admitted-new-{fragment}"), false).await;
     }
     assert_eq!(dataset.get_fragments().len(), 2);
     for fragment in 0..2 {
@@ -290,4 +334,64 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(error.to_string().contains("generated columns"));
     assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_fragment_preflights_constant_overlay_without_fallback(
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] nested: bool,
+) {
+    let version = LanceFileVersion::V2_2;
+    let mut dataset = write_payload_dataset(version, nested).await;
+    let field_id = dataset.schema().field("payload").unwrap().id;
+    for fragment in 0..2 {
+        let name = format!("constant-{fragment}");
+        dataset = commit_overlay(
+            dataset,
+            &name,
+            fragment,
+            &[field_id],
+            OverlayCoverage::dense(bitmap([2, 3])),
+            vec![payload("constant", 2, nested, 0)],
+            version,
+        )
+        .await;
+        assert_overlay_layout(&dataset, &name, true).await;
+    }
+    for fragment in 0..2 {
+        let reader = open(&dataset, fragment, dataset.schema(), lite).await;
+        let ordinary = reader.take_as_batch(&[2, 3], None).await.unwrap();
+        assert_eq!(ordinary.num_rows(), 2);
+        assert!(ordinary["payload"].is_null(0));
+        assert!(ordinary["payload"].is_valid(1));
+        let budget = AllocationBudget::new(65536);
+        // Preserve the original counterexample. A supported field type does not
+        // imply that every page uses the currently admitted FullZip layout.
+        for available in [512, 65536] {
+            let error = reader
+                .try_take_admitted_fullzip(
+                    &UInt32Array::from(vec![2, 3]),
+                    budget.try_reserve(available).unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("dense FullZip page"));
+            assert_eq!(budget.reserved(), 0);
+        }
+        // An irrelevant unsupported overlay is pruned by the actual planner.
+        let expected = reader.take_as_batch(&[0, 5], None).await.unwrap();
+        let output = reader
+            .try_take_admitted_fullzip(
+                &UInt32Array::from(vec![0, 5]),
+                budget.try_reserve(65536).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, expected);
+        drop(output);
+        assert_eq!(budget.reserved(), 0);
+    }
 }
