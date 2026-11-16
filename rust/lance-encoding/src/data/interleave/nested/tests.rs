@@ -245,3 +245,63 @@ fn errors_precede_capacity_refusal(#[case] case: usize, #[case] detail: &str) {
     assert_eq!(budget.reserved(), 0);
     assert_eq!(workspace.len(), 0);
 }
+
+#[rstest]
+#[case::flat(0)]
+#[case::list(1)]
+#[case::deep(3)]
+fn concat_matches_arrow_and_retains_owners(#[case] depth: usize) {
+    let mut array = leaf::<GenericBinaryType<i64>>();
+    for _ in 0..depth {
+        array = wrap::<i32>(array);
+    }
+    let sliced = array.slice(1, array.len() - 1);
+    let empty = array.slice(0, 0);
+    let sources = [sliced.as_ref(), empty.as_ref(), array.as_ref()];
+    let expected = arrow_select::concat::concat(&sources).unwrap();
+    let budget = AllocationBudget::new(4096);
+    let mut work = budget.try_reserve(4096).unwrap();
+    let output = try_concat_nested_binary_in(&sources, &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.to_data(), expected.to_data());
+    let charge = 4096 - work.len();
+    let alias = output.to_data().buffers()[0].slice_with_length(0, 1);
+    drop((output, work));
+    assert!(budget.reserved() > 1);
+    drop(alias);
+    assert_eq!(budget.reserved(), 0);
+    let mut short = budget.try_reserve(charge - 1).unwrap();
+    assert!(
+        try_concat_nested_binary_in(&sources, &mut short)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(short.len(), charge - 1);
+    drop(short);
+    let mut exact = budget.try_reserve(charge).unwrap();
+    let output = try_concat_nested_binary_in(&sources, &mut exact)
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.to_data(), expected.to_data());
+    assert!(exact.is_empty());
+    drop((output, exact));
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn concat_validates_sources_without_credit() {
+    let budget = AllocationBudget::new(0);
+    let mut work = budget.try_reserve(0).unwrap();
+    let bytes = leaf::<GenericBinaryType<i32>>();
+    let strings = leaf::<GenericStringType<i32>>();
+    let unsupported = Int32Array::from(vec![1]);
+    for sources in [vec![], vec![bytes.as_ref(), strings.as_ref()]] {
+        let error = try_concat_nested_binary_in(&sources, &mut work).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("interleave"));
+    }
+    let error = try_concat_nested_binary_in(&[&unsupported], &mut work).unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("Int32"));
+}

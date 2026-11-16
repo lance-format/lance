@@ -21,7 +21,7 @@ mod nested;
 #[cfg(test)]
 mod tests;
 
-pub use nested::try_interleave_nested_binary_in;
+pub use nested::{try_concat_nested_binary_in, try_interleave_nested_binary_in};
 
 // Recreate a selection for each planning/materialization pass. Nested lists
 // expand child ranges lazily instead of allocating one routing entry per child.

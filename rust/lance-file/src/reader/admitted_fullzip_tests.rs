@@ -37,6 +37,7 @@ use crate::{
 
 mod multi;
 mod scan;
+mod take;
 mod transform;
 
 fn array(page: usize, depth: usize) -> ArrayRef {

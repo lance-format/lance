@@ -25,6 +25,9 @@ use lance_encoding::{
 use super::FileReader;
 use crate::version::ConcreteFileVersion;
 
+mod take;
+pub use take::PreparedFullZipTake;
+
 mod deletions;
 use deletions::DeletionMode;
 mod row_ids;
@@ -191,6 +194,37 @@ impl FileReader {
                 "FullZip scan requires positive workspace/max_rows and an ordered row range",
             ));
         }
+        let (schema, columns, read_len) = self.prepare_fullzip_columns().await?;
+        if rows.end > read_len {
+            return Err(Error::invalid_input(format!(
+                "FullZip scan range {}..{} exceeds projected length {read_len}",
+                rows.start, rows.end
+            )));
+        }
+        for (column, field) in columns.iter().zip(schema.fields()) {
+            column.validate_range(&rows, field.data_type())?;
+        }
+        Ok(FullZipScan {
+            columns,
+            schema,
+            budget,
+            workspace_bytes,
+            is_partial_workspace_enabled: false,
+            max_rows,
+            read_len,
+            end: rows.end,
+            cursor: rows.start,
+            deleted_rows: None,
+            deletion_mode: DeletionMode::Filter,
+            row_ids: None,
+            row_versions: None,
+            has_started: false,
+        })
+    }
+
+    // Shared projection/metadata validation. Callers preflight only their selected
+    // pages before reading payload, so unsupported pages in gaps remain irrelevant.
+    async fn prepare_fullzip_columns(&self) -> Result<(Arc<ArrowSchema>, Vec<FullZipColumn>, u64)> {
         if !matches!(
             self.version(),
             ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
@@ -213,12 +247,6 @@ impl FileReader {
             ));
         }
         let (prepared, read_len) = self.prepare(projection.clone()).await?;
-        if rows.end > read_len {
-            return Err(Error::invalid_input(format!(
-                "FullZip scan range {}..{} exceeds projected length {read_len}",
-                rows.start, rows.end
-            )));
-        }
         let schema = Arc::new(ArrowSchema::from(
             prepared.decoder_projection.schema.as_ref(),
         ));
@@ -253,10 +281,6 @@ impl FileReader {
                 let page_end = page_start.checked_add(page.num_rows).ok_or_else(|| {
                     Error::corrupt_file_named("FullZip", "column row count overflows")
                 })?;
-                if !rows.is_empty() && page_start < rows.end && page_end > rows.start {
-                    FullZipScheduler::try_from_page(page, &DefaultDecompressionStrategy {})?
-                        .validate_array_type(data_type)?;
-                }
                 page_start = page_end;
             }
             if page_start != read_len {
@@ -273,22 +297,7 @@ impl FileReader {
                 decoder: None,
             });
         }
-        Ok(FullZipScan {
-            columns,
-            schema,
-            budget,
-            workspace_bytes,
-            is_partial_workspace_enabled: false,
-            max_rows,
-            read_len,
-            end: rows.end,
-            cursor: rows.start,
-            deleted_rows: None,
-            deletion_mode: DeletionMode::Filter,
-            row_ids: None,
-            row_versions: None,
-            has_started: false,
-        })
+        Ok((schema, columns, read_len))
     }
 }
 

@@ -13,9 +13,9 @@ use super::*;
 use crate::reader::{FullZipScanOutcome, ReaderProjection};
 
 #[derive(Debug)]
-struct RangeIo {
-    inner: Arc<dyn EncodingsIo>,
-    reads: Arc<Mutex<Vec<Range<u64>>>>,
+pub(super) struct RangeIo {
+    pub(super) inner: Arc<dyn EncodingsIo>,
+    pub(super) reads: Arc<Mutex<Vec<Range<u64>>>>,
 }
 
 impl EncodingsIo for RangeIo {
@@ -423,11 +423,11 @@ async fn admitted_scan_batch_error_keeps_cursor_and_refunds(
 }
 
 #[derive(Debug)]
-struct GateIo {
-    inner: Arc<dyn EncodingsIo>,
-    block: Arc<AtomicBool>,
-    fail: Arc<AtomicBool>,
-    entered: Arc<tokio::sync::Notify>,
+pub(super) struct GateIo {
+    pub(super) inner: Arc<dyn EncodingsIo>,
+    pub(super) block: Arc<AtomicBool>,
+    pub(super) fail: Arc<AtomicBool>,
+    pub(super) entered: Arc<tokio::sync::Notify>,
 }
 
 impl EncodingsIo for GateIo {

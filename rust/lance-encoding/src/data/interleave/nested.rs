@@ -49,6 +49,51 @@ pub fn try_interleave_nested_binary_in(
     build_tree(arrays, &selection, &plan, workspace).map(Some)
 }
 
+/// Concatenate a nonempty collection of byte-leaf trees in source order.
+///
+/// The supported shapes, null semantics and admission contract match
+/// [`try_interleave_nested_binary_in`]. No row-sized routing table is built.
+/// All output is planned before allocation; insufficient credit leaves the
+/// workspace unchanged. Inputs and the complete output overlap in the caller's
+/// reservation. Even a single input is copied; callers may retain it directly
+/// when no materialization is required.
+///
+/// ```
+/// use arrow_array::{Array, StringArray};
+/// use lance_core::utils::allocation::AllocationBudget;
+/// use lance_encoding::data::try_concat_nested_binary_in;
+/// let a = StringArray::from(vec![Some("a"), None]);
+/// let b = StringArray::from(vec!["b"]);
+/// let budget = AllocationBudget::new(128);
+/// let mut work = budget.try_reserve(128).unwrap();
+/// let result = try_concat_nested_binary_in(&[&a, &b], &mut work).unwrap().unwrap();
+/// assert_eq!(result.len(), 3);
+/// drop((result, work));
+/// assert_eq!(budget.reserved(), 0);
+/// ```
+pub fn try_concat_nested_binary_in(
+    arrays: &[&dyn Array],
+    workspace: &mut Reservation,
+) -> Result<Option<ArrayRef>> {
+    struct Concatenation<'a>(&'a [&'a dyn Array]);
+    impl Selection for Concatenation<'_> {
+        fn iter(&self) -> Box<dyn Iterator<Item = (usize, usize)> + '_> {
+            Box::new(
+                self.0
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(source, array)| (0..array.len()).map(move |row| (source, row))),
+            )
+        }
+    }
+    let selection = Concatenation(arrays);
+    let plan = plan_tree(arrays, &selection)?;
+    if plan.bytes() > workspace.len() {
+        return Ok(None);
+    }
+    build_tree(arrays, &selection, &plan, workspace).map(Some)
+}
+
 enum Plan {
     Bytes(BytePlan),
     Struct(StructPlan),
