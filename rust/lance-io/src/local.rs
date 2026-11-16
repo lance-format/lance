@@ -706,6 +706,7 @@ mod tests {
                 AsyncWriteExt::write_all(writer.as_mut(), &[7; 128])
                     .await
                     .unwrap();
+                AsyncWriteExt::flush(writer.as_mut()).await.unwrap();
             }
             let baseline = used.load(Ordering::Acquire);
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -720,7 +721,8 @@ mod tests {
                     Box::pin(async { Writer::shutdown(writer.as_mut()).await.map(|_| ()) })
                 } else {
                     Box::pin(async {
-                        AsyncWriteExt::write_all(writer.as_mut(), &[7; 128])
+                        AsyncWriteExt::write_all(writer.as_mut(), &[7; 128]).await?;
+                        AsyncWriteExt::flush(writer.as_mut())
                             .await
                             .map_err(Error::from)
                     })
@@ -742,6 +744,64 @@ mod tests {
             if publishing {
                 assert_eq!(std::fs::read(&local).unwrap(), [7; 128]);
             }
+        });
+    }
+
+    #[rstest::rstest]
+    #[test]
+    fn resource_local_output_cancelled_write_can_reuse_writer(
+        #[values(4, 70_000)] input_bytes: usize,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let local = directory.path().join("output");
+            let path = Path::from_absolute_path(&local).unwrap();
+            let pool = Arc::new(ReadPool {
+                limit: 256 * 1024,
+                ..Default::default()
+            });
+            let used = pool.used.clone();
+            let mut writer = ObjectStore::local()
+                .create_with_memory_reserver(&path, pool)
+                .await
+                .unwrap();
+            let baseline = used.load(Ordering::Acquire);
+            let (started, running) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+            });
+            running.await.unwrap();
+            let input = vec![b'A'; input_bytes];
+            let accepted = {
+                let mut write = Box::pin(writer.write(&input));
+                let std::task::Poll::Ready(result) = futures::poll!(write.as_mut()) else {
+                    panic!("an admitted buffer must be acknowledged before I/O completes");
+                };
+                result.unwrap()
+            };
+            assert_eq!(accepted, input_bytes.min(64 * 1024));
+            assert_eq!(writer.tell().await.unwrap(), accepted);
+            let mut cancelled = Box::pin(writer.write(b"discarded"));
+            assert!(futures::poll!(cancelled.as_mut()).is_pending());
+            drop(cancelled);
+            assert!(used.load(Ordering::Acquire) > baseline);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            assert_eq!(writer.write(b"BBBB").await.unwrap(), 4);
+            let result = Writer::shutdown(writer.as_mut()).await.unwrap();
+            assert_eq!(result.size, accepted + 4);
+            let mut expected = input[..accepted].to_vec();
+            expected.extend_from_slice(b"BBBB");
+            assert_eq!(std::fs::read(local).unwrap(), expected);
+            drop(writer);
+            assert_eq!(used.load(Ordering::Acquire), 0);
         });
     }
 

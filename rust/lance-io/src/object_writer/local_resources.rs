@@ -63,7 +63,7 @@ struct FinishedOutput {
 
 pub struct ResourceLocalWriter {
     file: Option<Arc<StagedFile>>,
-    pending: Option<BoxFuture<'static, io::Result<usize>>>,
+    pending: Option<BoxFuture<'static, io::Result<()>>>,
     finishing: Option<BoxFuture<'static, Result<FinishedOutput>>>,
     published_control: Option<Box<dyn Send + Sync>>,
     result: Option<WriteResult>,
@@ -139,29 +139,19 @@ impl ResourceLocalWriter {
         })
     }
 
-    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<usize>>> {
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let Some(task) = self.pending.as_mut() else {
-            return Poll::Ready(Ok(None));
+            return Poll::Ready(Ok(()));
         };
         let result = match Pin::new(task).poll(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => result,
         };
         self.pending = None;
-        match result {
-            Ok(bytes) => {
-                let Some(position) = self.position.checked_add(bytes) else {
-                    self.failed = true;
-                    return Poll::Ready(Err(io::Error::other("local output position overflow")));
-                };
-                self.position = position;
-                Poll::Ready(Ok(Some(bytes)))
-            }
-            Err(error) => {
-                self.failed = true;
-                Poll::Ready(Err(error))
-            }
+        if result.is_err() {
+            self.failed = true;
         }
+        Poll::Ready(result)
     }
 
     fn closed_error() -> io::Error {
@@ -178,10 +168,10 @@ impl AsyncWrite for ResourceLocalWriter {
         if self.failed || self.file.is_none() {
             return Poll::Ready(Err(Self::closed_error()));
         }
-        if self.pending.is_some() {
-            return self
-                .poll_pending(cx)
-                .map(|result| result.and_then(|bytes| bytes.ok_or_else(Self::closed_error)));
+        match self.poll_pending(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
         }
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
@@ -209,32 +199,56 @@ impl AsyncWrite for ResourceLocalWriter {
             self.failed = true;
             return Poll::Ready(Err(Self::closed_error()));
         };
-        let task = io_task_with_resources(self.pool.clone(), "local output write", move || {
-            // Both staging-file and buffer owners live in the actual I/O task.
-            // Report partial writes to AsyncWriteExt instead of assuming a
-            // successful syscall accepted the entire buffer.
+        let pool = self.pool.clone();
+        let task = io_task_with_resources(pool.clone(), "local output write", move || {
             let mut handle = &file.file;
-            handle.write(data.as_ref())
+            let result = handle.write(data.as_ref());
+            (result, file, data)
         });
-        let task = match task {
+        let mut task = match task {
             Ok(task) => task,
             Err(error) => {
                 self.failed = true;
                 return Poll::Ready(Err(io::Error::other(error)));
             }
         };
-        self.pending = Some(Box::pin(
-            async move { task.await.map_err(io::Error::other)? },
-        ));
-        self.poll_pending(cx)
-            .map(|result| result.and_then(|bytes| bytes.ok_or_else(Self::closed_error)))
+        self.pending = Some(Box::pin(async move {
+            let mut written = 0;
+            loop {
+                let (result, file, data) = task.await.map_err(io::Error::other)?;
+                match result {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "local output write made no progress",
+                        ));
+                    }
+                    Ok(bytes) => written += bytes,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+                if written == data.as_ref().len() {
+                    return Ok(());
+                }
+                task = io_task_with_resources(pool.clone(), "local output write", move || {
+                    let mut handle = &file.file;
+                    let result = handle.write(&data.as_ref()[written..]);
+                    (result, file, data)
+                })
+                .map_err(io::Error::other)?;
+            }
+        }));
+        // Acknowledge the admitted copy now. A later call must drain it before
+        // accepting its own buffer; flush/shutdown report actual I/O failures.
+        self.position += length;
+        Poll::Ready(Ok(length))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.failed {
             return Poll::Ready(Err(Self::closed_error()));
         }
-        self.poll_pending(cx).map(|result| result.map(|_| ()))
+        self.poll_pending(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
