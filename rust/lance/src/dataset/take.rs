@@ -1985,6 +1985,7 @@ mod test {
                 .await
                 .unwrap();
         }
+        let dataset = Arc::new(dataset);
 
         let checked = dataset
             .take_rows(&[1, 2], dataset.schema().clone())
