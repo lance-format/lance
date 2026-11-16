@@ -87,6 +87,7 @@ struct FullZipColumn {
 }
 
 pub(super) struct BatchDecodeJob {
+    rows: Range<u64>,
     inputs: Vec<FullZipArrayInput>,
     schema: Arc<ArrowSchema>,
     workspace: Reservation,
@@ -95,7 +96,14 @@ pub(super) struct BatchDecodeJob {
 }
 
 impl BatchDecodeJob {
-    pub(super) fn decode(mut self) -> Result<Option<RecordBatch>> {
+    pub(super) fn decode(self) -> Result<Option<RecordBatch>> {
+        self.decode_with(|_, batch, _| Ok(Some(batch)))
+    }
+
+    pub(super) fn decode_with<F>(mut self, transform: F) -> Result<Option<RecordBatch>>
+    where
+        F: FnOnce(Range<u64>, RecordBatch, &mut Reservation) -> Result<Option<RecordBatch>>,
+    {
         let mut arrays = Vec::with_capacity(self.inputs.len());
         for input in self.inputs {
             let Some(array) = input.decode_in(&mut self.workspace)? else {
@@ -110,7 +118,18 @@ impl BatchDecodeJob {
         if let Some(versions) = self.row_versions {
             versions.append_to(&mut arrays)?;
         }
-        Ok(Some(RecordBatch::try_new(self.schema, arrays)?))
+        let batch = RecordBatch::try_new(self.schema, arrays)?;
+        let expected_rows = batch.num_rows();
+        let result = transform(self.rows, batch, &mut self.workspace)?;
+        if let Some(batch) = &result
+            && batch.num_rows() != expected_rows
+        {
+            return Err(Error::invalid_input(format!(
+                "FullZip transform returned {} rows, expected {expected_rows}",
+                batch.num_rows()
+            )));
+        }
+        Ok(result)
     }
 }
 
@@ -674,6 +693,7 @@ impl FullZipScan {
             inputs.push(input);
         }
         dispatch(BatchDecodeJob {
+            rows,
             inputs,
             schema: self.schema.clone(),
             workspace,
@@ -688,6 +708,51 @@ impl FullZipScan {
     pub async fn try_next(&mut self) -> Result<FullZipScanOutcome> {
         self.try_next_with(|job| spawn_cpu(move || job.decode()))
             .await
+    }
+
+    /// Decode and transform a batch within the same admitted workspace.
+    ///
+    /// The transform receives the physical file-row range and owned decoded batch
+    /// on the CPU pool. It must preserve row identity/order and row count, but may
+    /// change the projection. Row count is checked before committing the cursor.
+    /// Charge any additional payload and scratch allocations to `workspace`; the
+    /// inputs remain charged while the transform uses them. This hook does not
+    /// account arbitrary callback allocations or captured data automatically.
+    /// Metadata and allocator overhead remain outside the payload budget.
+    ///
+    /// Return `Ok(None)` if the remaining workspace cannot accommodate assembly.
+    /// The entire attempt is dropped before retrying a smaller prefix, or returning
+    /// [`FullZipScanOutcome::NeedsCapacity`] for a single row. Do not wait for credit
+    /// or perform I/O, blocking synchronization or nested CPU dispatch in the callback.
+    /// It may be called multiple times and must not retain attempted batches or
+    /// publish side effects. Errors and cancellation leave the cursor unchanged;
+    /// CPU work that outlives cancellation retains its credit until it finishes.
+    ///
+    /// ```
+    /// use lance_core::Result;
+    /// use lance_file::reader::{FullZipScan, FullZipScanOutcome};
+    /// async fn project_first(scan: &mut FullZipScan) -> Result<FullZipScanOutcome> {
+    ///     scan.try_next_with_transform(|_rows, batch, _workspace| {
+    ///         // Projection borrows existing charged buffers without new payload.
+    ///         Ok(Some(batch.project(&[0])?))
+    ///     }).await
+    /// }
+    /// ```
+    pub async fn try_next_with_transform<F>(&mut self, transform: F) -> Result<FullZipScanOutcome>
+    where
+        F: Fn(Range<u64>, RecordBatch, &mut Reservation) -> Result<Option<RecordBatch>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let transform = Arc::new(transform);
+        self.try_next_with(move |job| {
+            let transform = transform.clone();
+            spawn_cpu(move || {
+                job.decode_with(|rows, batch, workspace| transform(rows, batch, workspace))
+            })
+        })
+        .await
     }
 
     // An owned handoff lets cancellation tests control the queue without parking

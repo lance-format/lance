@@ -37,6 +37,7 @@ use crate::{
 
 mod multi;
 mod scan;
+mod transform;
 
 fn array(page: usize, depth: usize) -> ArrayRef {
     let values = (0..8)
