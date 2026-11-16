@@ -1,33 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Nested list assembly without an expanded child routing table.
+//! Nested list/struct assembly without an expanded child routing table.
 
 use arrow_array::GenericListArray;
 use arrow_schema::FieldRef;
 
 use super::*;
 
+mod structure;
+use structure::{StructPlan, build_struct, plan_struct};
+
 #[cfg(test)]
 mod tests;
 
-/// Interleave byte arrays with any number of List/LargeList wrappers.
+/// Interleave byte arrays nested in List, LargeList or Struct arrays.
 ///
 /// Sources have the same Arrow type, with Binary/LargeBinary/Utf8/LargeUtf8
-/// leaves. Each index is `(source, row)`; order, duplicates, list fields and
+/// leaves. Each index is `(source, row)`; order, duplicates, fields and
 /// null/empty distinctions are preserved. Children hidden by null lists are
-/// omitted. Unsupported shapes and invalid input are errors, with no ordinary
+/// omitted. Struct children keep row alignment, including beneath null structs;
+/// their validity and the parent validity remain independent. Unsupported shapes
+/// and invalid input are errors, with no ordinary
 /// interleave fallback. Empty selections still validate the entire type tree.
 ///
 /// The complete output tree is planned before any payload allocation. `Ok(None)`
 /// leaves the workspace unchanged and means drain/replan, never EOF. No stage
 /// waits for credit or grows the workspace while holding input. Each list level
-/// owns admitted offsets/validity, and each leaf owns admitted offsets/values/
-/// validity. Buffer aliases retain their corresponding full physical charges.
+/// owns admitted offsets/validity, each struct owns its admitted validity bitmap,
+/// and each leaf owns admitted offsets/values/validity. Buffer aliases retain
+/// their corresponding full physical charges.
 ///
 /// Child selections are regenerated from borrowed list ranges on each pass,
 /// without an index table proportional to the number of child elements. Planning
-/// metadata scales with source count and nesting depth; it, Array/Arc headers,
+/// metadata scales with source count and schema size; it, Array/Arc headers,
 /// input/routing storage and allocator overhead are outside this payload budget.
 /// The caller must reserve the complete input/output overlap before reads.
 pub fn try_interleave_nested_binary_in(
@@ -45,6 +51,7 @@ pub fn try_interleave_nested_binary_in(
 
 enum Plan {
     Bytes(BytePlan),
+    Struct(StructPlan),
     List {
         own: BytePlan,
         child: Box<Self>,
@@ -56,6 +63,7 @@ impl Plan {
     fn bytes(&self) -> usize {
         match self {
             Self::Bytes(plan) => plan.total_bytes,
+            Self::Struct(plan) => plan.total_bytes,
             Self::List { total_bytes, .. } => *total_bytes,
         }
     }
@@ -125,6 +133,7 @@ fn plan_tree(arrays: &[&dyn Array], selection: &dyn Selection) -> Result<Plan> {
         }
         DataType::List(_) => plan_list::<i32>(arrays, selection),
         DataType::LargeList(_) => plan_list::<i64>(arrays, selection),
+        DataType::Struct(_) => plan_struct(arrays, selection).map(Plan::Struct),
         data_type => Err(Error::not_supported(format!(
             "admitted nested byte interleave does not support {data_type}"
         ))),
@@ -202,6 +211,9 @@ fn build_tree(
         }
         (DataType::LargeList(field), Plan::List { own, child, .. }) => {
             build_list::<i64>(arrays, selection, own, child, field, workspace)
+        }
+        (DataType::Struct(_), Plan::Struct(plan)) => {
+            build_struct(arrays, selection, plan, workspace)
         }
         _ => Err(Error::internal(
             "admitted interleave type differs from its complete plan",

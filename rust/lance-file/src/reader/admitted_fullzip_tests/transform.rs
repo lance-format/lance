@@ -6,6 +6,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use arrow_array::{StructArray, cast::AsArray};
 use lance_core::{Result, utils::allocation::Reservation, utils::tokio::spawn_cpu};
 use lance_encoding::data::try_interleave_nested_binary_in;
 
@@ -285,6 +286,108 @@ async fn admitted_transform_cancellation_retains_job_credit(
         batch.column(1).to_data(),
         array(17, 1).slice(0, 3).to_data()
     );
+    drop(batch);
+    assert_eq!(budget.reserved(), 0);
+}
+
+fn struct_spine(values: ArrayRef) -> ArrayRef {
+    // Borrow the decoded child's charged validity. Non-nullable children may
+    // contain nulls exactly where their parent masks them; no new bitmap here.
+    let nulls = values.nulls().cloned();
+    Arc::new(StructArray::new(
+        vec![Arc::new(Field::new(
+            "frames",
+            values.data_type().clone(),
+            false,
+        ))]
+        .into(),
+        vec![values],
+        nulls,
+    ))
+}
+
+fn assemble_struct(
+    rows: Range<u64>,
+    batch: RecordBatch,
+    workspace: &mut Reservation,
+) -> Result<Option<RecordBatch>> {
+    let sources = [
+        struct_spine(batch.column(0).clone()),
+        struct_spine(batch.column(1).clone()),
+    ];
+    let indices = rows
+        .enumerate()
+        .map(|(local, row)| ((row % 2) as usize, local))
+        .collect::<Vec<_>>();
+    let Some(output) = try_interleave_nested_binary_in(
+        &[sources[0].as_ref(), sources[1].as_ref()],
+        &indices,
+        workspace,
+    )?
+    else {
+        return Ok(None);
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        output.data_type().clone(),
+        true,
+    )]));
+    Ok(Some(RecordBatch::try_new(schema, vec![output])?))
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_transform_assembles_structs(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+) {
+    let budget = AllocationBudget::new(WORKSPACE);
+    let (_left_fs, _right_fs, mut scan, expected) =
+        merged_fixture(version, lite, 1, budget.clone()).await;
+    let expected = struct_spine(expected);
+    let FullZipScanOutcome::Batch { rows, batch } =
+        scan.try_next_with_transform(assemble_struct).await.unwrap()
+    else {
+        panic!("decoded files and struct assembly must fit one admission")
+    };
+    assert_eq!(rows, 0..3);
+    assert_eq!(batch.column(0).to_data(), expected.slice(0, 3).to_data());
+    let structs = batch.column(0).as_struct();
+    let parent = structs.nulls().unwrap().buffer().clone();
+    let descendant = structs
+        .column(0)
+        .as_list::<i32>()
+        .values()
+        .as_binary::<i64>()
+        .values()
+        .slice_with_length(0, 1);
+    drop(batch);
+    let retained = budget.reserved();
+    assert!(retained > 1 && retained < WORKSPACE);
+    assert!(matches!(
+        scan.try_next_with_transform(assemble_struct).await.unwrap(),
+        FullZipScanOutcome::NeedsCapacity
+    ));
+    assert_eq!(scan.position(), 3);
+    drop(parent);
+    assert_eq!(
+        budget.reserved(),
+        retained - 1,
+        "struct validity owns exactly one byte"
+    );
+    assert!(matches!(
+        scan.try_next_with_transform(assemble_struct).await.unwrap(),
+        FullZipScanOutcome::NeedsCapacity
+    ));
+    drop(descendant);
+    assert_eq!(budget.reserved(), 0);
+    let FullZipScanOutcome::Batch { rows, batch } =
+        scan.try_next_with_transform(assemble_struct).await.unwrap()
+    else {
+        panic!("consumer release must permit the next complete operation")
+    };
+    assert_eq!(rows, 3..6);
+    assert_eq!(batch.column(0).to_data(), expected.slice(3, 3).to_data());
     drop(batch);
     assert_eq!(budget.reserved(), 0);
 }

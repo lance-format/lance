@@ -25,14 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted FileReader assembly and cursor behavior
+      - name: Verify struct assembly and admitted file composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::transform:: -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib queued_batch_owns_all_columns_and_credit -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib multi_column_prefixes_align_pages_and_keep_one_budget -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib data::interleave:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib admitted_transform_assembles_structs -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding -p lance-file --all-features --all-targets --no-deps -- -D warnings
