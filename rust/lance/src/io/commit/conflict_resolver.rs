@@ -70,7 +70,7 @@ pub struct TransactionRebase<'a> {
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// to detect in-place column rewrites even after transaction cleanup,
     /// and fields a concurrent `Merge` removed or retyped.
-    read_fragments: Option<Arc<Vec<Fragment>>>,
+    read_fragments: Option<ReadFragments>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -82,6 +82,21 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+}
+
+/// The fragments a CreateIndex read, and the data files that replacements
+/// which only moved values wrote over them since.
+#[derive(Debug)]
+struct ReadFragments {
+    fragments: Arc<Vec<Fragment>>,
+    /// The paths of the files `data_change: false` replacements wrote since
+    /// the read version, by fragment id. The finish keeps coverage of a field
+    /// whose current file is one of these: a change checked before the move
+    /// already withdrew it in its own arm, and
+    /// [`TransactionRebase::track_moved_files`] is called only when no change
+    /// went unchecked. `None` when not tracking, and once a `Merge` is
+    /// checked, since only the finish catches its in-place rewrites.
+    moved_files: Option<HashMap<u64, HashSet<String>>>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -208,14 +223,18 @@ fn may_alter_nullability(operation: &Operation) -> bool {
 /// Whether `operation` can commit rows that falsify such a change: by writing
 /// a null into a scanned field, or by omitting a required column entirely (a
 /// stale append's fragments read as null for columns they predate). `Delete`
-/// only removes rows and `Rewrite` preserves the values it moves; `Project`
-/// already conflicts with projections and merges elsewhere.
+/// only removes rows, and `Rewrite` and a `DataReplacement` with
+/// `data_change: false` preserve the values they move; `Project` already conflicts
+/// with projections and merges elsewhere.
 fn supplies_values(operation: &Operation) -> bool {
     matches!(
         operation,
         Operation::Append { .. }
             | Operation::Update { .. }
-            | Operation::DataReplacement { .. }
+            | Operation::DataReplacement {
+                data_change: true,
+                ..
+            }
             | Operation::DataOverlay { .. }
     )
 }
@@ -273,6 +292,20 @@ impl<'a> TransactionRebase<'a> {
         )
     }
 
+    /// Whether this transaction is a replacement whose values only moved
+    /// (compaction). A concurrent drop or delete of its target then fails it
+    /// with a retryable conflict instead of an incompatible one, and a
+    /// concurrent index build does not conflict with it.
+    fn only_moves_values(&self) -> bool {
+        matches!(
+            self.transaction.operation,
+            Operation::DataReplacement {
+                data_change: false,
+                ..
+            }
+        )
+    }
+
     #[track_caller]
     fn data_replacement_target_removed_err(
         &self,
@@ -280,6 +313,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Error {
+        if self.only_moves_values() {
+            return self.retryable_conflict_err(other_transaction, other_version);
+        }
         Error::incompatible_transaction_source(
             format!(
                 "DataReplacement target fragment {} was removed by concurrent {} at version {}.",
@@ -297,6 +333,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Error {
+        if self.only_moves_values() {
+            return self.retryable_conflict_err(other_transaction, other_version);
+        }
         Error::incompatible_transaction_source(
             format!(
                 "DataReplacement target field {} in fragment {} was dropped by concurrent {} at version {}.",

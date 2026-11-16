@@ -20,6 +20,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -1237,6 +1238,10 @@ impl Scanner {
 
     /// Global offset-limit of the result of the input plan
     pub(super) fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        if self.limit == Some(0) {
+            // A zero fetch pushed into a sort would make DataFusion's TopK panic.
+            return Arc::new(EmptyExec::new(plan.schema()));
+        }
         Arc::new(GlobalLimitExec::new(
             plan,
             *self.offset.as_ref().unwrap_or(&0) as usize,

@@ -35,6 +35,7 @@ from lance.log import LOGGER
 
 from ._dataset.cleanup import CleanupPolicy, KeepOne, _cleanup_policy_to_json
 from ._dataset.delta import DatasetDelta, _DatasetDeltaBuilder
+from ._dataset.merge_insert import MergeInsertAnalysis as MergeInsertAnalysis
 from ._dataset.merge_insert import MergeInsertBuilder
 from ._dataset.optimize import AutoCleanupConfig, DatasetOptimizer
 from ._dataset.refs import (

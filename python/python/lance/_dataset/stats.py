@@ -47,8 +47,8 @@ class FragmentColumnLayoutStats(TypedDict):
     #: Number of schema fields each data file holds, in the fragment's file order.
     fields_per_file: List[int]
     #: Share of the fragment's field slots holding no live data (tombstoned by a
-    #: column update, or left by a dropped column). Spilled row lineage is not
-    #: counted. A fragment rewrite reclaims these slots.
+    #: column update or repack, or left by a dropped column). Spilled row
+    #: lineage is not counted. A fragment rewrite reclaims these slots.
     dead_slot_ratio: float
     #: Data overlay files attached to the fragment.
     overlay_count: int

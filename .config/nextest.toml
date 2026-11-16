@@ -1,0 +1,4 @@
+# Per-test timings in CI come from this JUnit report: it is uploaded as a
+# workflow artifact and to Codecov Test Analytics.
+[profile.ci.junit]
+path = "junit.xml"
