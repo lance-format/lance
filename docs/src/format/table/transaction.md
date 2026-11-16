@@ -420,6 +420,76 @@ Supports two execution modes: REWRITE_ROWS deletes rows in current fragments and
 
 </details>
 
+#### Inserted-Key Conflict Detection
+
+A merge-insert can commit as an Update operation: it may delete matched rows and
+insert unmatched rows in one transaction. Two concurrent merge-inserts can both
+observe a join key as absent and both insert it: neither fragment overlap nor
+row-address overlap reveals that collision. The optional `inserted_rows` field
+records the join keys the operation inserted so a concurrent writer can detect
+the overlap without reading data files.
+
+Enabling inserted-key conflict detection for ordinary ON columns requires
+explicit caller opt-in. Without that opt-in, merge-insert on columns that are not
+the declared unenforced primary key retains its existing behavior and records no
+`inserted_rows` filter. Existing primary-key filter production is unchanged,
+including exact ordered matching between the ON list and the unenforced primary
+key and the existing empty-filter behavior. With opt-in, the writer uses the ON
+list as the key list even when the table declares a different primary key.
+
+The field holds a `KeyExistenceFilter` built from the inserted rows' key values.
+The filter's `field_ids` are the key columns in encoding order. A writer records
+the keys whose concurrent insertion it wants to detect; a reader must not assume
+those keys match the table's unenforced primary key. A writer that does not track
+inserted keys omits the field. A present empty filter records no keys; it is
+valid and distinct from an absent field. Existing primary-key paths may emit it.
+The opt-in path may omit `inserted_rows` when it recorded no keyed inserted
+rows. If it emits the field, a present empty filter is valid, and it still
+conflicts with a concurrent Append as described below; an absent field does not.
+Implementations must not globally rewrite a present empty filter to absence.
+
+Conflict resolution compares the field as follows:
+
+- Both transactions carry it: if `field_ids` differ, the filters are not
+  comparable and the conflict is retryable. If they match, the filters are
+  intersected. A possible intersection, a filter encoding mismatch, or a filter
+  parameter mismatch makes the conflict retryable.
+- Only the rebasing transaction carries it: the committed transaction's inserted
+  keys are unknown, so the conflict is retryable.
+- Only the committed transaction carries it: the rebasing transaction recorded no
+  keys, so the field imposes no conflict.
+
+A retryable conflict is not rebased. The caller re-executes the merge against the
+latest version, re-scanning the source and replanning; exhausting the configured
+retry budget fails the operation.
+
+An Update that carries `inserted_rows` also treats a concurrent Append as a
+retryable conflict, because the appended rows' keys are unknown. The check is
+one-sided: an Append that commits over such an Update is not rejected, because
+Append does not inspect inserted-key filters.
+
+For the opt-in merge-insert path, a top-level NULL in an ON column contributes
+no key under the existing join equality. This exception applies only to
+top-level NULLs; a key value that contains a nested NULL, and any other
+non-NULL key the filter encoding cannot represent, must not silently drop the
+requested protection. The writer must either reject the operation or produce a
+filter that conservatively conflicts with every non-empty comparable filter. A
+saturated filter is one such conservative representation. Default primary-key
+paths retain their existing behavior.
+
+This field is a conflict-detection aid, not a uniqueness constraint. It does not
+detect duplicates written by appends, other update paths, merge-inserts that omit
+the field, or writers that do not implement the check, and it does not remove
+duplicates already present. No message field, field number, type, or filter
+encoding changes. Conflict detection is directional: only the later committing
+writer that carries a filter checks it. A writer that commits without the check
+can still produce duplicates. An unchanged wire schema does not make older
+writers enforce these rules.
+
+This section defines the meaning of `Update.inserted_rows` only.
+`AssertUniqueKeys` keeps its own `key_fields` requirement and its requirement
+that `filter.field_ids` be empty.
+
 #### Update Compatibility
 
 Here are the operations that conflict with Update:
@@ -434,6 +504,8 @@ Here are the operations that are retryable conflicts with Update:
 - Rewrite (only if overlapping fragments)
 - DataReplacement (only if overlapping fragments)
 - Merge (always)
+- Append (only when this Update carries `inserted_rows` and the Append
+  committed first)
 
 Similar to Delete, the Update operation can rebase other modifications to the deletion mask. Here are the operations that
 are rebaseable conflicts with Update:

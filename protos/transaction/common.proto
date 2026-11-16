@@ -76,16 +76,19 @@ message BloomFilter {
 }
 
 /*
- * A filter for checking key existence in the set of rows inserted by a
- * merge-insert operation.
+ * A filter over the keys of rows an operation inserted, used for conflict
+ * detection.
  *
- * Only created when the merge-insert's ON columns match the schema's unenforced
- * primary key; its presence indicates strict primary-key conflict detection.
+ * The containing operation defines the key columns, when the filter is
+ * produced, and its conflict rules. Update.inserted_rows and AssertUniqueKeys
+ * retain their own requirements; this shared message imposes no NULL or
+ * uniqueness rule.
+ *
  * Conflict detection intersects two filters, so the underlying representation
  * is either an exact set (small row counts) or a Bloom filter (large counts).
  */
 message KeyExistenceFilter {
-  // Field ids of the columns participating in the key (the unenforced primary key).
+  // Field ids of the key columns, in encoding order.
   repeated int32 field_ids = 1;
   // The underlying data structure storing the key hashes.
   oneof data {
