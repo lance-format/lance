@@ -1829,7 +1829,9 @@ impl Scanner {
         })
     }
 
-    /// Use global append-only corpus statistics independently of the selected candidates.
+    /// Use global corpus statistics independently of the selected candidates: the
+    /// statistics stored in the index segments, which still count rows deleted after
+    /// indexing, plus those of the live rows in unindexed fragments.
     /// Exact root scalar-text matches and phrases share this corpus with and without
     /// candidate restrictions. Other query shapes retain their existing planner.
     async fn plan_corpus_query(
