@@ -6,9 +6,9 @@
 use crate::RawJsonb;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::ops::RangeInclusive;
 
 use crate::number::Number;
 
@@ -54,7 +54,12 @@ pub enum Path<'a> {
     /// There can be more than one index, e.g. `$[0, last-1 to last, 5]` represents the first,
     /// the last two, and the sixth element in an Array.
     ArrayIndices(Vec<ArrayIndex>),
-    /// `?(<expression>)` represents selecting all elements in an object or array that match the filter expression, like `$.book[?(@.price < 10)]`.
+    /// `?(<expression>)` represents selecting all elements in an object or array that match the filter expression, like `$.book[*]?(@.price < 10)`.
+    ///
+    /// ```
+    /// # use lance_jsonb::jsonpath::parse_json_path;
+    /// assert!(parse_json_path(b"$.book[*]?(@.price < 10)").is_ok());
+    /// ```
     FilterExpr(Box<Expr<'a>>),
     /// `<expression>` standalone filter expression, like `$.book[*].price > 10`,
     /// and arithmetic expression, like `-$.a[*]` or `$.a + 3`
@@ -80,42 +85,46 @@ pub enum ArrayIndex {
 }
 
 impl ArrayIndex {
-    /// Converts an `ArrayIndex` to a `HashSet` of indices that should be selected from an Array.
+    /// Resolves this index selector against an array of `arr_len` elements to
+    /// the inclusive range of matched positions, or `None` when the selector
+    /// matches no position.
+    ///
+    /// The bounds are clamped like a bare index: a slice start before the
+    /// array clamps to 0 and an end past the last element clamps to
+    /// `arr_len - 1`.
     ///
     /// # Arguments
     ///
-    /// * `length` - The length of the array.
+    /// * `arr_len` - The length of the array.
     ///
     /// # Returns
     ///
-    /// A `HashSet<usize>` containing the indices to select.
-    pub(crate) fn to_indices(&self, length: usize) -> HashSet<usize> {
-        let length = length as i32;
+    /// A `RangeInclusive<usize>` of the positions to select, or `None` when
+    /// nothing matches (e.g. an index outside the array, or a slice whose
+    /// start lies past its clamped end).
+    pub(crate) fn to_range(&self, arr_len: usize) -> Option<RangeInclusive<usize>> {
+        let arr_len = arr_len as i32;
 
-        let mut indices = HashSet::new();
         match self {
             Self::Index(idx) => {
-                let idx = Self::convert_index(idx, length);
-                if idx >= 0 && idx < length {
-                    indices.insert(idx as usize);
+                let idx = Self::convert_index(idx, arr_len);
+                if idx >= 0 && idx < arr_len {
+                    Some(idx as usize..=idx as usize)
+                } else {
+                    None
                 }
             }
             Self::Slice((start, end)) => {
-                let start_idx = Self::convert_index(start, length);
-                let end_idx = Self::convert_index(end, length);
-
-                let start_idx = if start_idx < 0 { 0 } else { start_idx as usize };
-                let end_idx = if end_idx >= length {
-                    (length - 1) as usize
-                } else {
-                    end_idx as usize
-                };
-                for idx in start_idx..=end_idx {
-                    indices.insert(idx);
+                let start_idx = Self::convert_index(start, arr_len).max(0);
+                let end_idx = Self::convert_index(end, arr_len).min(arr_len - 1);
+                // Also covers a resolved end before the array (e.g. `last-10`
+                // on a short array), which clamps below every position.
+                if start_idx > end_idx {
+                    return None;
                 }
+                Some(start_idx as usize..=end_idx as usize)
             }
         }
-        indices
     }
 
     fn convert_index(index: &Index, length: i32) -> i32 {
