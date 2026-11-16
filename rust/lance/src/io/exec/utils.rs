@@ -15,7 +15,7 @@ use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -79,7 +79,7 @@ where
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
     FilteredRowIds(Arc<dyn ExecutionPlan>),
-    /// The prefilter input is a selection vector from an index query
+    /// The input is one serialized selection mask, including composed index and row-ID sources.
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
     /// There is no prefilter
     None,
@@ -1026,6 +1026,7 @@ impl IoMetrics {
 
 #[derive(Clone)]
 pub struct IndexMetrics {
+    selected_segments: Option<Arc<Mutex<BTreeSet<String>>>>,
     timings: [Time; IndexTiming::ALL.len()],
     indices_loaded: Count,
     parts_loaded: Count,
@@ -1044,6 +1045,7 @@ impl IndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             timings: IndexTiming::ALL.map(|stage| metrics.new_time(stage.name(), partition)),
+            selected_segments: None,
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
@@ -1061,9 +1063,26 @@ impl IndexMetrics {
     pub fn flush_io(&self) {
         self.io_metrics.record_stats(self.io_stats.snapshot());
     }
+
+    pub(crate) fn with_segment_tracking(mut self, segments: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.selected_segments = Some(segments);
+        self
+    }
 }
 
 impl MetricsCollector for IndexMetrics {
+    fn records_index_segments(&self) -> bool {
+        self.selected_segments.is_some()
+    }
+
+    fn record_index_segments(&self, segments: &[String]) {
+        if let Some(selected) = &self.selected_segments {
+            selected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(segments.iter().cloned());
+        }
+    }
     fn record_timing(&self, stage: IndexTiming, duration: std::time::Duration) {
         self.timings[stage as usize].add_duration(duration);
     }

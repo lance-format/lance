@@ -63,9 +63,11 @@ use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     execution::context::SessionContext,
-    logical_expr::{self, Expr},
+    logical_expr::{self, Expr, JoinType},
     physical_plan::{
-        ExecutionPlan, SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
+        ExecutionPlan, SendableRecordBatchStream,
+        joins::{HashJoinExec, PartitionMode, SortMergeJoinExec},
+        stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
     },
     prelude::DataFrame,
@@ -80,7 +82,7 @@ use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{InvalidInputSnafu, box_error},
 };
-use lance_datafusion::exec::{LanceExecutionOptions, OneShotPartitionStream};
+use lance_datafusion::exec::{ExecutionAnalysis, LanceExecutionOptions, OneShotPartitionStream};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
@@ -95,6 +97,10 @@ use std::{
     time::Duration,
 };
 
+use uuid::Uuid;
+
+pub(crate) mod analysis;
+pub use analysis::{MergeOperatorSpills, MergeSubplan};
 mod assign_action;
 mod builder;
 mod exec;
@@ -906,4 +912,120 @@ fn uncommitted_transaction(plan: &dyn ExecutionPlan) -> Option<Transaction> {
 fn created_blob_payloads(plan: &dyn ExecutionPlan) -> Option<&BlobPayloadInventory> {
     plan.downcast_ref::<exec::FullSchemaMergeInsertExec>()
         .map(|full_exec| full_exec.created_blob_payloads())
+}
+
+/// Diagnostics from an uncommitted merge execution.
+///
+/// Join operators and stage times are available in `execution.operators`, with
+/// their identity, partition, and metric kind preserved. Index segment counts
+/// and logical rows read are absent unless their producers expose them there.
+#[derive(Clone, Debug)]
+pub struct MergeInsertAnalysis {
+    /// Identifier shared with the analysis tracing span, never used as a process metric label.
+    pub operation_id: Uuid,
+    /// Formatted plan, execution outcome, independent wall time, and detailed metrics.
+    pub execution: ExecutionAnalysis,
+    /// Join strategy, type, and operator path from the physical plan that ran.
+    pub joins: Vec<MergeInsertJoin>,
+    /// Actual physical write strategy, including the delete-only sink. An
+    /// insert-only merge reports [`MergeInsertWriteStrategy::RewriteRows`].
+    pub write_mode: MergeInsertWriteStrategy,
+    /// Complete logical change counts and data-file bytes, or `None` on failure.
+    /// Bytes exclude deletion files, blob payloads, and scratch/replay/operator spills.
+    /// Analysis deletes these data files rather than committing them.
+    pub stats: Option<MergeStats>,
+    /// Existing fragments modified or removed; excludes newly inserted fragments.
+    /// `None` means the write sink did not produce a complete transaction.
+    pub fragments_touched: Option<usize>,
+    /// Separately executed plans. Paths within each plan are local to its unique id.
+    pub subplans: Vec<MergeSubplan>,
+    /// Operator spills across root and subplans, counted once per physical producer.
+    pub operator_spills: MergeOperatorSpills,
+    /// Operation-owned replay traffic, including zero when all replay remains buffered.
+    pub replay_spills: lance_datafusion::spill::ReplaySpillUsage,
+    /// Scratch measurements, absent when this route uses no diagnostic scratch owner.
+    /// Persistent row-lineage files and DataFusion/replay spills are not scratch files.
+    pub scratch_spills: Option<lance_io::spill::SpillUsage>,
+    /// Logical target read visits reported by scan producers, excluding deleted rows.
+    /// Repeated reads count again; absent when the selected reader does not measure them.
+    pub target_rows_read: Option<usize>,
+    /// Fragment read visits reported by scanners, not unique fragment ids. Absent if unmeasured.
+    pub fragments_read: Option<usize>,
+    /// Whether an index probe executed. False identifies a measured non-indexed join.
+    pub index_used: Option<bool>,
+    /// Number of selected join-index segments, absent when probes do not report selection.
+    /// A non-indexed join reports Some(0), regardless of unrelated dataset index metadata.
+    pub join_index_segments: Option<usize>,
+    /// Actual join-node time, overlapping the inclusive merge write time.
+    pub join_duration: Option<Duration>,
+    /// Inclusive sink/orchestration time, overlapping join time; absent when unmeasured.
+    pub merge_write_duration: Option<Duration>,
+    /// Rows emitted by join nodes before merge actions; not distinct target addresses.
+    pub joined_rows: Option<usize>,
+    /// Distinct mapped target addresses emitted by the index probe (an upper bound on matches).
+    pub mapped_target_rows: Option<usize>,
+}
+
+/// Resolved physical write behavior, distinct from the caller's rewrite policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeInsertWriteStrategy {
+    /// Write whole rows, replacing matched rows or appending unmatched inserts.
+    /// An insert-only merge also reports this strategy, even though it only appends.
+    RewriteRows,
+    /// Attach replacement column files to existing fragments.
+    RewriteColumns,
+    /// Write deletion files without writing replacement data rows.
+    DeleteOnly,
+}
+
+/// Join algorithm chosen by physical planning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeInsertJoinStrategy {
+    /// Hash join, including whether its build side is collected or partitioned.
+    Hash(PartitionMode),
+    /// Merge of sorted inputs, which can spill while sorting.
+    SortMerge,
+}
+
+/// A join in the analyzed physical plan, identified without parsing formatted text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeInsertJoin {
+    /// Owning subplan id; zero identifies the root execution.
+    pub subplan_id: usize,
+    /// Child indices from the plan root, matching the detailed operator metrics.
+    pub path: Vec<usize>,
+    /// Physical join algorithm.
+    pub strategy: MergeInsertJoinStrategy,
+    /// Physical join type after source/target side selection and optimization.
+    pub join_type: JoinType,
+}
+
+fn collect_merge_joins(plan: &dyn ExecutionPlan) -> Vec<MergeInsertJoin> {
+    fn visit(plan: &dyn ExecutionPlan, path: Vec<usize>, output: &mut Vec<MergeInsertJoin>) {
+        let join = if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+            Some((
+                MergeInsertJoinStrategy::Hash(*join.partition_mode()),
+                *join.join_type(),
+            ))
+        } else {
+            plan.downcast_ref::<SortMergeJoinExec>()
+                .map(|join| (MergeInsertJoinStrategy::SortMerge, join.join_type()))
+        };
+        if let Some((strategy, join_type)) = join {
+            output.push(MergeInsertJoin {
+                subplan_id: 0,
+                path: path.clone(),
+                strategy,
+                join_type,
+            });
+        }
+        for (index, child) in plan.children().into_iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            visit(child.as_ref(), child_path, output);
+        }
+    }
+    let mut joins = Vec::new();
+    visit(plan, Vec::new(), &mut joins);
+    joins
 }

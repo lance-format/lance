@@ -81,7 +81,7 @@ impl PageScheduler for PackedStructPageScheduler {
 
         let copy_struct_fields = self.fields.clone();
 
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             let bytes = bytes.await?;
 
             let mut combined_bytes = BytesMut::default();

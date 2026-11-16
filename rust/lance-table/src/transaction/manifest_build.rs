@@ -11,8 +11,8 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
-    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
     ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
     validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
@@ -625,19 +625,44 @@ impl Transaction {
                 let lineage =
                     crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
                         &current_indices,
-                        frag_reuse_ledger,
+                        frag_reuse_ledger.clone(),
                     )?;
-                let live: RoaringBitmap = manifest
-                    .fragments
-                    .iter()
-                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
-                    .collect();
+                let live = Self::live_fragment_bitmap(manifest);
                 Self::withdraw_in_place_rewrites(
                     &mut prepared,
                     rewrites,
                     &manifest.schema,
                     &live,
                     lineage.as_ref(),
+                );
+            }
+            // A deferred compaction leaves every covering segment's retired
+            // provenance in place for the reader to translate through the
+            // history. A segment whose type cannot do that would be left
+            // addressing provenance it can never translate, so its coverage
+            // of this compaction's sources is withdrawn in this same commit;
+            // the commit layer, which can read the index details, decided
+            // which segments those are.
+            if let FragReuseUpdate::Rewrite(assembly) = &frag_reuse
+                && !assembly.undeferrable_segments.is_empty()
+            {
+                let lineage =
+                    crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
+                        &current_indices,
+                        frag_reuse_ledger,
+                    )?;
+                let live = Self::live_fragment_bitmap(manifest);
+                let rewritten: RoaringBitmap = self
+                    .operation
+                    .rewritten_source_fragments()
+                    .filter_map(|id| u32::try_from(id).ok())
+                    .collect();
+                Self::withdraw_undeferrable_rewrite_coverage(
+                    &mut prepared,
+                    lineage.as_ref(),
+                    &live,
+                    &assembly.undeferrable_segments,
+                    &rewritten,
                 );
             }
         }
@@ -647,6 +672,15 @@ impl Transaction {
             prepared,
             frag_reuse,
         ))
+    }
+
+    /// The fragment ids `manifest` lists, as a bitmap.
+    fn live_fragment_bitmap(manifest: &Manifest) -> RoaringBitmap {
+        manifest
+            .fragments
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+            .collect()
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -2057,6 +2091,18 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
         }
+        // Derived the same way. Leaving it unset is the atomic reverse
+        // conversion the format asks for: every entry left is in the suffix
+        // layout, and the manifest writer stores them all that way. A
+        // single-key entry the bit once normalized reads back keys-only, so the
+        // bit stays until that entry goes too.
+        if final_indices
+            .iter()
+            .any(IndexMetadata::requires_independent_contract)
+        {
+            manifest.reader_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
+            manifest.writer_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
+        }
         apply_row_addr_index_feature_flag(&mut manifest, &final_indices);
 
         if let Some(current_manifest) = current_manifest {
@@ -2238,6 +2284,31 @@ impl Transaction {
             }
             _ => {}
         }
+
+        // Every schema change lands here: the Blob v2 promotion and the field
+        // metadata updates above, which can turn a nested field into a blob.
+        // An Overwrite defines a new table, so its schema is checked in full.
+        // Otherwise a field the parent schema already nested this way may stay,
+        // e.g. to be dropped.
+        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
+            field.is_blob_v2()
+                || matches!(
+                    manifest.data_storage_format.lance_file_format(),
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                )
+        };
+        let already_nested: HashSet<i32> = match current_manifest {
+            Some(current) if !matches!(self.operation, Operation::Overwrite { .. }) => current
+                .schema
+                .nested_blob_fields()
+                .filter(|prior| unsupported(current, prior))
+                .map(|prior| prior.id)
+                .collect(),
+            _ => HashSet::new(),
+        };
+        manifest.schema.check_blob_nesting(|field| {
+            unsupported(&manifest, field) && !already_nested.contains(&field.id)
+        })?;
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
@@ -3443,6 +3514,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: Some(7),
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -3640,6 +3712,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -4181,6 +4254,98 @@ mod tests {
             activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
         );
+    }
+
+    fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
+        IndexMetadata {
+            fields,
+            covering_fields,
+            ..sample_index_metadata(name)
+        }
+    }
+
+    /// The commit derives both covering bits from the index list it commits.
+    /// A suffix-layout entry needs only the covering bit, so a table with only
+    /// those stays readable by builds without the independent layout.
+    #[rstest]
+    #[case::uncovered(vec![], 0)]
+    #[case::suffix_only(vec![(vec![0, 1], vec![1])], FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(vec![(vec![0], vec![0, 1])], FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::mixed(vec![(vec![0, 1], vec![1]), (vec![0], vec![1])], FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    fn build_manifest_derives_the_covering_bits(
+        #[case] declarations: Vec<(Vec<i32>, Vec<i32>)>,
+        #[case] expected: u64,
+    ) {
+        let manifest = sample_manifest();
+        let new_indices = declarations
+            .into_iter()
+            .enumerate()
+            .map(|(i, (fields, covering_fields))| {
+                covered_index(&format!("idx_{i}"), fields, covering_fields)
+            })
+            .collect();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let (built, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let covering_flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert_eq!(built.reader_feature_flags & covering_flags, expected);
+        assert_eq!(built.writer_feature_flags & covering_flags, expected);
+    }
+
+    /// Dropping the last entry that needs the independent layout clears its
+    /// bit, and the covering bit with it unless a covered entry remains. The
+    /// remaining entries have the shapes a reader decodes from the manifest:
+    /// a single-key suffix entry the flag normalized reads back keys-only and
+    /// keeps the bit, while a composite one reads back in the suffix layout.
+    #[rstest]
+    #[case::last_covered_index(None, 0)]
+    #[case::normalized_entry_remains(Some((vec![0], vec![1])), FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::composite_suffix_entry_remains(Some((vec![0, 1, 1], vec![1])), FLAG_COVERED_INDEX_METADATA)]
+    fn dropping_the_last_independent_entry_clears_its_bit(
+        #[case] remaining: Option<(Vec<i32>, Vec<i32>)>,
+        #[case] expected: u64,
+    ) {
+        let covering_flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= covering_flags;
+        manifest.writer_feature_flags |= covering_flags;
+        let independent = covered_index("independent", vec![0], vec![0, 1]);
+        let keep_remaining = remaining.is_some();
+        let mut current_indices = vec![independent.clone()];
+        if let Some((fields, covering_fields)) = remaining {
+            current_indices.push(covered_index("remaining", fields, covering_fields));
+        }
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![independent],
+            },
+            None,
+        );
+
+        let (built, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                current_indices,
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+
+        assert_eq!(built.reader_feature_flags & covering_flags, expected);
+        assert_eq!(built.writer_feature_flags & covering_flags, expected);
+        assert_eq!(final_indices.len(), usize::from(keep_remaining));
     }
 
     #[test]

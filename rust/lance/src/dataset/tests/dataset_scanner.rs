@@ -25,10 +25,12 @@ use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
-use lance_datafusion::exec::execute_plan;
+use lance_core::utils::tracing::TRACE_EXECUTION;
+use lance_datafusion::exec::{ExecutionSummaryCounts, execute_plan};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
     SCORE_FIELD,
     query::{FtsQuery, MatchQuery, Operator, PhraseQuery},
@@ -41,15 +43,17 @@ use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
-use crate::dataset::NewColumnTransform;
-use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
+use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
+use crate::dataset::{ColumnAlteration, NewColumnTransform};
 use crate::{Dataset, Error};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 use rstest::rstest;
+use tracing_mock::{expect, subscriber};
 
 #[rstest]
 #[case::struct_null_check(false, "c IS NOT NULL", vec![0, 1, 2])]
@@ -111,6 +115,72 @@ async fn test_partial_projection_with_filter_on_same_column(
     let result = scan.try_into_batch().await.unwrap();
     assert_eq!(result.schema().as_ref(), &expected_schema, "{filter}");
     assert_eq!(result, expected, "{filter}");
+}
+
+/// A scan reports the most bytes its plan held reserved in DataFusion's memory
+/// pool, to its stats callback and in its `lance::execution` event: a sort
+/// reserves memory there, a plain scan reserves nothing.
+#[rstest]
+#[case::sorted(true)]
+#[case::unsorted(false)]
+#[tokio::test]
+async fn test_scan_reports_peak_reserved_bytes(#[case] sorted: bool) {
+    let batch = record_batch!(("k", Int32, [3, 1, 2, 0])).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let scan = || {
+        let mut scan = dataset.scan();
+        if sorted {
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first("k".to_string())]))
+                .unwrap();
+        }
+        scan
+    };
+
+    let summary = Arc::new(std::sync::Mutex::new(None));
+    let mut reported_scan = scan();
+    reported_scan.scan_stats_callback(Arc::new({
+        let summary = Arc::clone(&summary);
+        move |counts: &ExecutionSummaryCounts| *summary.lock().unwrap() = Some(counts.clone())
+    }));
+    let result = reported_scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 4);
+    let peak = summary
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .peak_reserved_bytes();
+    assert_eq!(peak.map(|bytes| bytes > 0), Some(sorted), "{peak:?}");
+
+    let peak_field = expect::field("peak_reserved_bytes");
+    let peak_field = if sorted {
+        peak_field
+    } else {
+        peak_field.with_value(&0usize)
+    };
+    let (subscriber, handle) = subscriber::mock()
+        .with_filter(|metadata| metadata.target() == TRACE_EXECUTION)
+        .event(expect::event().with_fields(peak_field))
+        .run_with_handle();
+    // While exactly one dispatcher is registered, tracing caches a callsite's
+    // interest from the default dispatcher of the thread that fires it first,
+    // so a scan finishing in a parallel test could disable the event for this
+    // mock. A second live dispatcher makes tracing consult every registered one.
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    let guard = tracing::subscriber::set_default(subscriber);
+    scan().try_into_batch().await.unwrap();
+    drop(guard);
+    handle.assert_finished();
 }
 
 /// A null struct must not read back as a valid struct with null children.
@@ -479,6 +549,66 @@ async fn test_vector_filter_fts_search() {
         &[300, 255],
     )
     .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector query bounds them.
+    let phrase_query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+    ));
+    // Case 7: Case 3 with limit 2
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[299, 300],
+    )
+    .await;
+
+    // Case 8: Case 5 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(false)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 3 with limit 0
+    let batch = dataset
+        .scan()
+        .full_text_search(phrase_query)
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[tokio::test]
@@ -622,6 +752,83 @@ async fn test_fts_filter_vector_search() {
         .try_into_stream()
         .await;
     assert!(stream.is_err());
+
+    // Case 7: postfilter FTS filter with .limit(): the limit applies to the
+    // rows the FTS filter keeps. The five nearest rows to [298; 4] are ids
+    // 296..=300; 296..=298 hold "noop" text and are dropped by the filter. A
+    // limit pushed below the filter would only let 298 and one of the tied
+    // 297/299 reach it.
+    let postfilter_query_vector = Float32Array::from(vec![298f32, 298f32, 298f32, 298f32]);
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &postfilter_query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(false)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[299, 300],
+    )
+    .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector search picks its neighbours from them.
+    // Case 8: Case 1 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 1 with limit 0
+    let batch = dataset
+        .scan()
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[rstest]
@@ -1252,4 +1459,896 @@ async fn test_decimal_column_filters_with_fractional_literals() {
         .count();
     dataset.delete("discount < 0.055").await.unwrap();
     assert_eq!(dataset.count_rows(None).await.unwrap(), 60 - deleted);
+}
+
+/// label, confidence, area
+type Detection = (&'static str, f32, f32);
+type Detections = Option<Vec<Option<Detection>>>;
+type DetectionCheck = fn(i32, &Detections) -> bool;
+
+const DETECTION_ROWS: i32 = 2000;
+
+/// Row `id` of the `any_element` fixture: (width, detections). Rows 0 to 5 are
+/// the edge cases; the rest are generated, with null lists and null detections.
+fn detection_row(id: i32) -> (i32, Detections) {
+    let det = |label: &'static str, confidence: f32, area: f32| Some((label, confidence, area));
+    match id {
+        // A low-confidence car next to a high-confidence person.
+        0 => (
+            3840,
+            Some(vec![det("car", 0.30, 20000.0), det("person", 0.95, 5000.0)]),
+        ),
+        // Confidence exactly at the boundary.
+        1 => (3840, Some(vec![det("car", 0.90, 20000.0)])),
+        // The area condition holds on another detection.
+        2 => (
+            3840,
+            Some(vec![det("car", 0.95, 9999.0), det("person", 0.1, 20000.0)]),
+        ),
+        // `carrot` is not `car`.
+        3 => (3840, Some(vec![det("carrot", 0.99, 20000.0)])),
+        4 => (3840, Some(vec![])),
+        5 => (3840, None),
+        _ => {
+            let i = id as usize;
+            let width = [1280, 1920, 2560, 3840][i % 4];
+            if i % 97 == 13 {
+                return (width, None);
+            }
+            let detections = (0..(i * 7) % 6)
+                .map(|j| {
+                    if (i + 3 * j).is_multiple_of(23) {
+                        return None;
+                    }
+                    let label = ["car", "person", "truck", "carrot"][(i * 5 + j * 3) % 4];
+                    let confidence = ((i * 37 + j * 11) % 101) as f32 / 100.0;
+                    let area = ((i * 13 + j * 29) % 41) as f32 * 500.0;
+                    det(label, confidence, area)
+                })
+                .collect();
+            (width, Some(detections))
+        }
+    }
+}
+
+/// SQL three-valued `any_element` over a fixture row: a null detection makes
+/// every comparison NULL.
+fn any_detection(detections: &Detections, predicate: impl Fn(&Detection) -> bool) -> Option<bool> {
+    let detections = detections.as_ref()?;
+    let mut is_unknown = false;
+    for detection in detections {
+        match detection {
+            Some(detection) if predicate(detection) => return Some(true),
+            Some(_) => {}
+            None => is_unknown = true,
+        }
+    }
+    if is_unknown { None } else { Some(false) }
+}
+
+fn detection_batch(ids: std::ops::Range<i32>) -> RecordBatch {
+    let fields = Fields::from(vec![
+        ArrowField::new("label", DataType::Utf8, true),
+        ArrowField::new("confidence", DataType::Float32, true),
+        ArrowField::new("area", DataType::Float32, true),
+    ]);
+    let item = Arc::new(ArrowField::new(
+        "item",
+        DataType::Struct(fields.clone()),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("width", DataType::Int32, false),
+        ArrowField::new("detections", DataType::List(item.clone()), true),
+    ]));
+    let (mut labels, mut confidences, mut areas) = (vec![], vec![], vec![]);
+    let (mut is_valid, mut lengths, mut is_list_valid, mut widths) =
+        (vec![], vec![], vec![], vec![]);
+    for id in ids.clone() {
+        let (width, detections) = detection_row(id);
+        widths.push(width);
+        is_list_valid.push(detections.is_some());
+        let detections = detections.unwrap_or_default();
+        lengths.push(detections.len());
+        for detection in detections {
+            is_valid.push(detection.is_some());
+            // A null detection hides values that would match every filter.
+            let (label, confidence, area) = detection.unwrap_or(("car", 0.99, 99999.0));
+            labels.push(label);
+            confidences.push(confidence);
+            areas.push(area);
+        }
+    }
+    let elements = StructArray::try_new(
+        fields,
+        vec![
+            Arc::new(StringArray::from(labels)) as ArrayRef,
+            Arc::new(Float32Array::from(confidences)),
+            Arc::new(Float32Array::from(areas)),
+        ],
+        Some(NullBuffer::from(is_valid)),
+    )
+    .unwrap();
+    let detections = ListArray::try_new(
+        item,
+        OffsetBuffer::from_lengths(lengths),
+        Arc::new(elements),
+        Some(NullBuffer::from(is_list_valid)),
+    )
+    .unwrap();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from_iter_values(ids)),
+            Arc::new(Int32Array::from(widths)),
+            Arc::new(detections),
+        ],
+    )
+    .unwrap()
+}
+
+/// Three fragments with a BTree on `width`, and with `element_index` a
+/// list-element index on `detections`, then a fourth fragment the indices do
+/// not cover.
+async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> Dataset {
+    let params = WriteParams {
+        max_rows_per_file: 500,
+        enable_stable_row_ids,
+        ..Default::default()
+    };
+    let indexed = detection_batch(0..1500);
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(indexed)], schema.clone()),
+        "memory://",
+        Some(params.clone()),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["width"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    if element_index {
+        dataset
+            .create_index(
+                &["detections"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::new("listelement".to_string())
+                    .with_params(&serde_json::json!({"keys": ["label", "confidence"]})),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(detection_batch(1500..DETECTION_ROWS))], schema),
+            Some(params),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    dataset
+}
+
+async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+    scan_any_element_ids(dataset, filter, use_scalar_index, false).await
+}
+
+/// With `fast_search`, only the fragments the indices cover are read.
+async fn scan_any_element_ids(
+    dataset: &Dataset,
+    filter: &str,
+    use_scalar_index: bool,
+    fast_search: bool,
+) -> Vec<i32> {
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(use_scalar_index);
+    if fast_search {
+        scanner.fast_search();
+    }
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+/// The ids of the fixture rows `keep` selects.
+fn detection_ids(keep: impl Fn(i32, &Detections) -> bool) -> Vec<i32> {
+    (0..DETECTION_ROWS)
+        .filter(|id| {
+            let (width, detections) = detection_row(*id);
+            keep(width, &detections)
+        })
+        .collect()
+}
+
+const CAR_ABOVE_09: &str = "any_element(detections, 'label = ''car'' AND confidence > 0.9')";
+
+fn is_car_above_09(detection: &Detection) -> bool {
+    detection.0 == "car" && detection.1 > 0.9
+}
+
+/// `exact`: whether a list-element index on `(label, confidence)` answers the
+/// filter without a recheck.
+#[rstest]
+#[case::same_element(
+    CAR_ABOVE_09,
+    |_, d: &Detections| any_detection(d, is_car_above_09) == Some(true),
+    true
+)]
+#[case::inclusive_range(
+    "any_element(detections, 'label = ''car'' AND confidence >= 0.9')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 >= 0.9) == Some(true),
+    true
+)]
+#[case::upper_range(
+    "any_element(detections, 'label = ''car'' AND confidence < 0.2')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 < 0.2) == Some(true),
+    true
+)]
+#[case::between(
+    "any_element(detections, 'label = ''person'' AND confidence BETWEEN 0.25 AND 0.5')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "person" && (0.25..=0.5).contains(&d.1)) == Some(true),
+    true
+)]
+#[case::first_key_only(
+    "any_element(detections, 'label = ''carrot''')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "carrot") == Some(true),
+    true
+)]
+#[case::in_list(
+    "any_element(detections, 'label IN (''truck'', ''carrot'') AND confidence > 0.95')",
+    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true),
+    true
+)]
+#[case::three_conditions(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9 AND area > 10000')",
+    |_, d: &Detections| any_detection(d, |d| is_car_above_09(d) && d.2 > 10000.0) == Some(true),
+    false
+)]
+#[case::negated(
+    "NOT any_element(detections, 'label = ''car'' AND confidence > 0.9')",
+    |_, d: &Detections| any_detection(d, is_car_above_09) == Some(false),
+    true
+)]
+#[case::and_indexed_column(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9') AND width > 1920",
+    |w, d: &Detections| any_detection(d, is_car_above_09) == Some(true) && w > 1920,
+    true
+)]
+#[case::or_indexed_column(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9') OR width = 1280",
+    |w, d: &Detections| any_detection(d, is_car_above_09) == Some(true) || w == 1280,
+    true
+)]
+#[case::lambda(
+    "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)",
+    |_, d: &Detections| any_detection(d, is_car_above_09) == Some(true),
+    true
+)]
+#[case::lambda_alias_and_subscript(
+    "any_match(detections, (x) -> x['label'] IN ('truck', 'carrot') AND x.confidence > 0.95)",
+    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true),
+    true
+)]
+#[case::lambda_negated_and_indexed_column(
+    "NOT array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9) AND width > 1920",
+    |w, d: &Detections| any_detection(d, is_car_above_09) == Some(false) && w > 1920,
+    true
+)]
+#[tokio::test]
+async fn test_any_element_filter(
+    #[case] filter: &str,
+    #[case] keep: DetectionCheck,
+    #[case] exact: bool,
+    #[values(false, true)] element_index: bool,
+) {
+    let dataset = detection_dataset(element_index, false).await;
+    let expected = detection_ids(keep);
+    assert!(!expected.is_empty(), "`{filter}` should match some rows");
+    for use_scalar_index in [true, false] {
+        assert_eq!(
+            any_element_ids(&dataset, filter, use_scalar_index).await,
+            expected,
+            "`{filter}`, index: {use_scalar_index}"
+        );
+    }
+    assert_eq!(
+        dataset.count_rows(Some(filter.to_string())).await.unwrap(),
+        expected.len()
+    );
+    if element_index {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("ListElement(detections"),
+            "`{filter}`: {plan}"
+        );
+        assert_eq!(!plan.contains("recheck"), exact, "`{filter}`: {plan}");
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_any_element_edge_rows(#[values(false, true)] element_index: bool) {
+    let dataset = detection_dataset(element_index, false).await;
+    let matched = any_element_ids(&dataset, CAR_ABOVE_09, true).await;
+    // Only row 2 has a car above 0.9 among the edge cases.
+    for id in [0, 1, 3, 4, 5] {
+        assert!(
+            !matched.contains(&id),
+            "row {id} must not match `{CAR_ABOVE_09}`"
+        );
+    }
+    assert!(matched.contains(&2));
+    // The empty list is FALSE, so NOT selects it; the null list is NULL, so
+    // neither does.
+    let negated = any_element_ids(&dataset, &format!("NOT {CAR_ABOVE_09}"), true).await;
+    assert!(negated.contains(&4) && !negated.contains(&5));
+}
+
+/// A predicate with no condition on the first key cannot seek the index, so
+/// `any_element` evaluates it on every row.
+#[tokio::test]
+async fn test_element_index_declines_without_first_key() {
+    let dataset = detection_dataset(true, false).await;
+    let filter = "any_element(detections, 'confidence > 0.95')";
+    assert_eq!(
+        any_element_ids(&dataset, filter, true).await,
+        detection_ids(|_, d| any_detection(d, |d| d.1 > 0.95) == Some(true))
+    );
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(!plan.contains("ListElement("), "{plan}");
+}
+
+/// With `fast_search` the unindexed fragment is skipped, until
+/// `optimize_indices` adds it to the index.
+#[tokio::test]
+async fn test_element_index_fast_search_and_update() {
+    let mut dataset = detection_dataset(true, false).await;
+    let expected = detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(true));
+    let indexed_only = expected
+        .iter()
+        .copied()
+        .filter(|id| *id < 1500)
+        .collect::<Vec<_>>();
+    assert_ne!(indexed_only, expected, "the appended rows should match too");
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        indexed_only
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        expected
+    );
+    let negated = format!("NOT {CAR_ABOVE_09}");
+    assert_eq!(
+        scan_any_element_ids(&dataset, &negated, true, true).await,
+        detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(false))
+    );
+}
+
+/// After deletes and compaction, the index answers alone (`fast_search`) for
+/// the rewritten fragments: compaction remaps its row addresses, with or
+/// without stable row ids.
+#[rstest]
+#[tokio::test]
+async fn test_element_index_delete_and_compaction(
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    let mut dataset = detection_dataset(true, enable_stable_row_ids).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let matching = detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(true));
+    // Updating the index keeps the rows it already held, which are addresses
+    // even when the table has stable row ids.
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        matching
+    );
+    let deleted = matching.iter().copied().step_by(2).collect::<Vec<_>>();
+    let deleted_list = deleted
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    dataset
+        .delete(&format!(
+            "id IN ({deleted_list}) OR (id >= 100 AND id < 600)"
+        ))
+        .await
+        .unwrap();
+    let is_kept = |id: &i32| !deleted.contains(id) && !(100..600).contains(id);
+    let expected = matching.into_iter().filter(is_kept).collect::<Vec<_>>();
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        expected
+    );
+
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(metrics.fragments_removed > 0);
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        expected
+    );
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, false, false).await,
+        expected
+    );
+    let negated = format!("NOT {CAR_ABOVE_09}");
+    assert_eq!(
+        scan_any_element_ids(&dataset, &negated, true, true).await,
+        detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(false))
+            .into_iter()
+            .filter(|id| !(100..600).contains(id))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The `detections` column of `detection_batch(ids)` with its element fields
+/// named `names` in place, values unmoved.
+fn detections_named(ids: std::ops::Range<i32>, names: [&str; 3]) -> RecordBatch {
+    let batch = detection_batch(ids);
+    let list = batch["detections"].as_list::<i32>();
+    let elements = list.values().as_struct();
+    let fields = elements
+        .fields()
+        .iter()
+        .zip(names)
+        .map(|(field, name)| field.as_ref().clone().with_name(name))
+        .collect::<Fields>();
+    let elements = StructArray::try_new(
+        fields.clone(),
+        elements.columns().to_vec(),
+        elements.nulls().cloned(),
+    )
+    .unwrap();
+    let item = Arc::new(ArrowField::new("item", DataType::Struct(fields), true));
+    let detections = ListArray::try_new(
+        item.clone(),
+        list.offsets().clone(),
+        Arc::new(elements),
+        list.nulls().cloned(),
+    )
+    .unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("width", DataType::Int32, false),
+        ArrowField::new("detections", DataType::List(item), true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            batch["id"].clone(),
+            batch["width"].clone(),
+            Arc::new(detections),
+        ],
+    )
+    .unwrap()
+}
+
+async fn explain(dataset: &Dataset, filter: &str) -> String {
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+    scanner.explain_plan(true).await.unwrap()
+}
+
+/// The index follows its key fields by ID. Swapping the names of `confidence`
+/// (a key) and `area` (not a key), both floats, must not let `confidence`
+/// conditions use the index; `area` conditions now do. An update after the swap,
+/// through an index opened before it, reads the key from its new name.
+#[tokio::test]
+async fn test_element_index_follows_renamed_key_fields() {
+    let mut dataset = detection_dataset(true, false).await;
+    // Open the index before the renames, so it is cached under the old names.
+    assert_eq!(
+        any_element_ids(&dataset, CAR_ABOVE_09, true).await,
+        detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(true))
+    );
+    for (from, to) in [
+        ("confidence", "tmp"),
+        ("area", "confidence"),
+        ("tmp", "area"),
+    ] {
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new(format!("detections.item.{from}")).rename(to.to_string())
+            ])
+            .await
+            .unwrap();
+    }
+    let batch = detections_named(
+        DETECTION_ROWS..DETECTION_ROWS + 400,
+        ["label", "area", "confidence"],
+    );
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Every row keeps the generated confidence in the field now named `area`
+    // and the generated area in the one now named `confidence`.
+    let all_ids = |keep: &dyn Fn(&Detections) -> bool| {
+        (0..DETECTION_ROWS + 400)
+            .filter(|id| keep(&detection_row(*id).1))
+            .collect::<Vec<_>>()
+    };
+    let key_filter = "any_element(detections, 'label = ''car'' AND area > 0.9')";
+    let expected = all_ids(&|d| any_detection(d, is_car_above_09) == Some(true));
+    for (use_scalar_index, fast_search) in [(true, false), (true, true), (false, false)] {
+        assert_eq!(
+            scan_any_element_ids(&dataset, key_filter, use_scalar_index, fast_search).await,
+            expected,
+            "index: {use_scalar_index}, fast_search: {fast_search}"
+        );
+    }
+    let plan = explain(&dataset, key_filter).await;
+    assert!(
+        plan.contains("ListElement(detections") && !plan.contains("recheck"),
+        "{plan}"
+    );
+
+    let non_key_filter = "any_element(detections, 'label = ''car'' AND confidence > 15000')";
+    let expected = all_ids(&|d| any_detection(d, |d| d.0 == "car" && d.2 > 15000.0) == Some(true));
+    assert!(!expected.is_empty());
+    for use_scalar_index in [true, false] {
+        assert_eq!(
+            any_element_ids(&dataset, non_key_filter, use_scalar_index).await,
+            expected,
+            "index: {use_scalar_index}"
+        );
+    }
+    let plan = explain(&dataset, non_key_filter).await;
+    assert!(plan.contains("recheck"), "{plan}");
+}
+
+/// Dropping a key field leaves the index in place but unusable: queries scan,
+/// and optimizing skips it.
+#[tokio::test]
+async fn test_element_index_dropped_key_field() {
+    let mut dataset = detection_dataset(true, false).await;
+    dataset
+        .drop_columns(&["detections.item.confidence"])
+        .await
+        .unwrap();
+    let filter = "any_element(detections, 'label = ''carrot''')";
+    let expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
+    assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+    assert!(!explain(&dataset, filter).await.contains("ListElement("));
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+}
+
+/// label, confidence, area, each possibly NULL.
+type NullableDetection = (Option<&'static str>, Option<f32>, Option<f32>);
+
+/// Elements on which three-valued predicates are UNKNOWN in different ways,
+/// one list per row, repeated over two fragments.
+fn null_detection_rows() -> Vec<Option<Vec<Option<NullableDetection>>>> {
+    let det = |l, c, a| Some((l, c, a));
+    let base = vec![
+        Some(vec![det(None, None, Some(200.0))]),
+        Some(vec![det(Some("dog"), Some(0.95), Some(200.0))]),
+        Some(vec![det(Some("car"), Some(0.95), Some(200.0))]),
+        Some(vec![det(Some("dog"), None, Some(200.0))]),
+        Some(vec![det(None, Some(0.5), Some(200.0))]),
+        Some(vec![det(None, Some(0.95), Some(200.0))]),
+        Some(vec![det(Some("car"), None, Some(200.0))]),
+        Some(vec![]),
+        None,
+        Some(vec![
+            det(None, None, Some(200.0)),
+            det(Some("car"), Some(0.95), Some(200.0)),
+        ]),
+        Some(vec![det(Some("cat"), Some(0.95), Some(200.0)), None]),
+        Some(vec![det(Some("car"), Some(0.95), None)]),
+        Some(vec![det(Some("car"), Some(0.95), Some(50.0))]),
+    ];
+    let mut rows = base.clone();
+    rows.extend(base);
+    rows
+}
+
+async fn null_detection_dataset(element_index: bool) -> Dataset {
+    let rows = null_detection_rows();
+    let fields = Fields::from(vec![
+        ArrowField::new("label", DataType::Utf8, true),
+        ArrowField::new("confidence", DataType::Float32, true),
+        ArrowField::new("area", DataType::Float32, true),
+    ]);
+    let (mut labels, mut confidences, mut areas, mut is_valid) = (vec![], vec![], vec![], vec![]);
+    let (mut lengths, mut is_list_valid) = (vec![], vec![]);
+    for row in &rows {
+        is_list_valid.push(row.is_some());
+        let row = row.clone().unwrap_or_default();
+        lengths.push(row.len());
+        for detection in row {
+            is_valid.push(detection.is_some());
+            let (label, confidence, area) =
+                detection.unwrap_or((Some("car"), Some(0.99), Some(999.0)));
+            labels.push(label);
+            confidences.push(confidence);
+            areas.push(area);
+        }
+    }
+    let elements = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(labels)) as ArrayRef,
+            Arc::new(Float32Array::from(confidences)),
+            Arc::new(Float32Array::from(areas)),
+        ],
+        Some(NullBuffer::from(is_valid)),
+    )
+    .unwrap();
+    let item = Arc::new(ArrowField::new("item", DataType::Struct(fields), true));
+    let detections = ListArray::try_new(
+        item.clone(),
+        OffsetBuffer::from_lengths(lengths),
+        Arc::new(elements),
+        Some(NullBuffer::from(is_list_valid)),
+    )
+    .unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("detections", DataType::List(item), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows.len() as i32)),
+            Arc::new(detections),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        max_rows_per_file: rows.len() / 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(params),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    if element_index {
+        dataset
+            .create_index(
+                &["detections"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::new("listelement".to_string())
+                    .with_params(&serde_json::json!({"keys": ["label", "confidence"]})),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+/// SQL three-valued AND.
+fn and3(conditions: &[Option<bool>]) -> Option<bool> {
+    if conditions.contains(&Some(false)) {
+        Some(false)
+    } else if conditions.contains(&None) {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+fn eq3<T: PartialEq>(value: Option<T>, wanted: T) -> Option<bool> {
+    value.map(|value| value == wanted)
+}
+
+fn gt3(value: Option<f32>, bound: f32) -> Option<bool> {
+    value.map(|value| value > bound)
+}
+
+/// SQL three-valued `any_element`: NULL for a NULL list; TRUE if an element is
+/// TRUE; otherwise NULL if one is UNKNOWN (a NULL element is); otherwise FALSE.
+fn any3(
+    list: &Option<Vec<Option<NullableDetection>>>,
+    predicate: &dyn Fn(&NullableDetection) -> Option<bool>,
+) -> Option<bool> {
+    let list = list.as_ref()?;
+    let results = list
+        .iter()
+        .map(|element| element.as_ref().and_then(predicate))
+        .collect::<Vec<_>>();
+    if results.contains(&Some(true)) {
+        Some(true)
+    } else if results.contains(&None) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// `exact`: whether the index answers the predicate, NULL rows included,
+/// without a recheck. When it cannot, `NOT` must not take its answer as exact.
+#[rstest]
+#[case::two_null_keys(
+    "label = ''car'' AND confidence > 0.9",
+    |d: &NullableDetection| and3(&[eq3(d.0, "car"), gt3(d.1, 0.9)]),
+    true
+)]
+#[case::null_in_list(
+    "label IN (''car'', NULL)",
+    |d: &NullableDetection| match d.0 {
+        Some("car") => Some(true),
+        _ => None,
+    },
+    false
+)]
+#[case::residual_conjunct(
+    "label = ''car'' AND confidence > 0.9 AND area > 100",
+    |d: &NullableDetection| and3(&[eq3(d.0, "car"), gt3(d.1, 0.9), gt3(d.2, 100.0)]),
+    false
+)]
+#[tokio::test]
+async fn test_any_element_three_valued_not(
+    #[case] predicate: &str,
+    #[case] element: fn(&NullableDetection) -> Option<bool>,
+    #[case] exact: bool,
+    #[values(false, true)] element_index: bool,
+) {
+    let dataset = null_detection_dataset(element_index).await;
+    let rows = null_detection_rows();
+    let call = format!("any_element(detections, '{predicate}')");
+    for (filter, keep) in [
+        (call.clone(), Some(true)),
+        (format!("NOT {call}"), Some(false)),
+    ] {
+        let expected = (0..rows.len() as i32)
+            .filter(|id| any3(&rows[*id as usize], &element) == keep)
+            .collect::<Vec<_>>();
+        assert!(!expected.is_empty(), "`{filter}` should match some rows");
+        for use_scalar_index in [true, false] {
+            assert_eq!(
+                any_element_ids(&dataset, &filter, use_scalar_index).await,
+                expected,
+                "`{filter}`, index: {use_scalar_index}"
+            );
+        }
+        assert_eq!(
+            dataset.count_rows(Some(filter.clone())).await.unwrap(),
+            expected.len(),
+            "count_rows(`{filter}`)"
+        );
+    }
+    if element_index {
+        let plan = explain(&dataset, &call).await;
+        assert!(plan.contains("ListElement(detections"), "{plan}");
+        assert_eq!(!plan.contains("recheck"), exact, "{plan}");
+    }
+}
+
+/// An overlay replaces a car list with a carrot list after the index was
+/// built. Optimizing must drop the old posting, whatever the row-id domain.
+#[rstest]
+#[tokio::test]
+async fn test_element_index_overlay_optimize(#[values(false, true)] enable_stable_row_ids: bool) {
+    let mut dataset = detection_dataset(true, enable_stable_row_ids).await;
+    let field_id = dataset.schema().field("detections").unwrap().id;
+    let filter = "any_element(detections, 'label = ''car''')";
+    assert!(any_element_ids(&dataset, filter, true).await.contains(&500));
+    // Row 500 is offset 0 of fragment 1; row 3's list holds only a carrot.
+    dataset = super::dataset_overlay_index_masking::commit_overlay(
+        dataset,
+        "det_overlay",
+        1,
+        &[field_id],
+        lance_table::format::overlay::OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([
+            0,
+        ])),
+        vec![detection_batch(3..4)["detections"].clone()],
+    )
+    .await;
+    let expected = any_element_ids(&dataset, filter, false).await;
+    assert!(!expected.contains(&500));
+    assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(any_element_ids(&dataset, filter, false).await, expected);
+    assert_eq!(
+        any_element_ids(&dataset, filter, true).await,
+        expected,
+        "a stale car posting survived optimize"
+    );
+}
+
+/// A predicate that names a column outside the element, or calls a function
+/// that is not immutable (compiled predicates are reused across queries, so
+/// `now()` would freeze), is rejected before any data is read.
+#[rstest]
+#[case::outside_column("any_element(detections, 'width > 1')", "width")]
+#[case::stable_function("any_element(detections, 'now() IS NOT NULL')", "calls now()")]
+#[tokio::test]
+async fn test_any_element_rejects_invalid_predicates(
+    #[case] filter: &str,
+    #[case] reason: &str,
+    #[values(false, true)] element_index: bool,
+) {
+    let dataset = detection_dataset(element_index, false).await;
+    let mut scanner = dataset.scan();
+    scanner.filter(filter).unwrap();
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("any_element") && message.contains(reason),
+        "{message}"
+    );
+    let err = dataset
+        .count_rows(Some(filter.to_string()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(reason), "{err}");
+}
+
+/// A lambda filter that `any_element` cannot express is rejected when the
+/// filter is parsed, with a message that says why.
+#[rstest]
+#[case::outside_column(
+    "array_any_match(detections, d -> d.label = 'car' AND width > 1)",
+    "`width` is outside the element"
+)]
+#[case::other_lambda_function(
+    "cardinality(array_filter(detections, d -> d.confidence > 0.5)) > 0",
+    "only accept lambdas as array_any_match"
+)]
+#[tokio::test]
+async fn test_lambda_filter_rejects_unsupported_forms(#[case] filter: &str, #[case] reason: &str) {
+    let dataset = detection_dataset(false, false).await;
+    let mut scanner = dataset.scan();
+    scanner.filter(filter).unwrap();
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    assert!(err.to_string().contains(reason), "{err}");
+    let err = dataset
+        .count_rows(Some(filter.to_string()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(reason), "{err}");
 }

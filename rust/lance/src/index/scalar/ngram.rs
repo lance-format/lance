@@ -47,7 +47,7 @@ pub(in crate::index) async fn merge_segments(
     // All source segments must belong to the same column.
     let reference_fields = segments[0].fields.as_slice();
     for segment in segments.iter().skip(1) {
-        if segment.fields.as_slice() != reference_fields {
+        if !segment.declares_same_fields(&segments[0]) {
             return Err(Error::invalid_input(format!(
                 "NGram merge_segments: segment {} has fields {:?}, expected {:?}",
                 segment.uuid, segment.fields, reference_fields,
@@ -125,8 +125,11 @@ pub(in crate::index) async fn merge_segments(
             fragment_bitmap,
         )
     } else {
+        // `open_and_merge_segments` refuses a row-id-domain segment on a
+        // stable-row-id dataset, and without stable row ids the two domains
+        // coincide, so the filters can always be address-domain.
         let (fragment_bitmap, old_data_filters) =
-            crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+            crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
                 .await?;
         let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
         (
@@ -200,6 +203,7 @@ pub(in crate::index) async fn open_and_merge_segments(
             segment.uuid
         )));
     }
+    let results_are_row_addresses = super::shared_segment_domain(dataset, "NGram", segments)?;
     let segments = segments.iter().map(|&s| s.clone()).collect::<Vec<_>>();
     let segment_stores = collect_ngram_segment_stores(dataset, &segments).await?;
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
@@ -211,6 +215,7 @@ pub(in crate::index) async fn open_and_merge_segments(
         new_store,
         old_data_filters,
         frag_reuse_index,
+        results_are_row_addresses,
     )
     .await
 }

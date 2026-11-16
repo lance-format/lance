@@ -48,7 +48,8 @@ use lance_index_core::scalar::OrderedScalarIndex;
 use tracing::info;
 
 use super::{
-    BTreeIndex, BTreeLookup, LazyIndexReader, Matches, OrderableScalarValue, partition_point,
+    BTreeIndex, BTreeLookup, LazyIndexReader, Matches, OrderableScalarValue, PageQuery,
+    partition_point,
 };
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::VALUE_COLUMN_NAME;
@@ -566,8 +567,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::{
-        BTREE_PAGES_NAME, BTreeIndex, Matches, OrderableScalarValue, merge_metadata_files,
-        part_lookup_file_path, part_page_data_file_path, train_btree_index,
+        BTREE_PAGES_NAME, BTreeIndex, Matches, OrderableScalarValue, PageQuery,
+        merge_metadata_files, part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
     use super::{READ_AHEAD_PAGES, RowSelection, ValuePages, check_page_order};
     use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};

@@ -37,6 +37,7 @@ use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
+use roaring::RoaringBitmap;
 use rstest::rstest;
 
 mod mask_replay;
@@ -46,7 +47,10 @@ use crate::dataset::scanner::test_dataset::{TestVectorDataset, batch_row_ids};
 use crate::dataset::scanner::{
     ColumnOrdering, FragmentSlice, RowAddrMask, RowAddrTreeMap, Scanner,
 };
-use crate::dataset::{Dataset, WriteMode, WriteParams};
+use crate::dataset::{
+    Dataset, MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteMode,
+    WriteParams,
+};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -401,6 +405,40 @@ async fn row_addr_mask_plain_scan_rejected_on_legacy() {
     assert!(
         err.to_string().contains("legacy-storage"),
         "unexpected: {err}"
+    );
+}
+
+#[rstest]
+#[case::row_addresses(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn row_addr_mask_empty_range(#[case] stable_row_ids: bool) {
+    let dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_ram_dataset_with_params(
+            FragmentCount::from(2),
+            FragmentRowCount::from(2),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let empty = RowAddrTreeMap::from(0..0);
+    let mut scan = dataset.scan();
+    scan.with_row_id_prefilter(RowAddrMask::from_allowed(empty.clone()));
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut scan = dataset.scan();
+    scan.with_row_id_prefilter(RowAddrMask::from_block(empty));
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["i"].as_primitive::<Int32Type>().values(),
+        &[0, 1, 2, 3]
     );
 }
 
@@ -1015,6 +1053,81 @@ async fn test_scan_order(
     assert_eq!(output.len(), 2);
     assert_eq!(output[0], batch2);
     assert_eq!(output[1], batch1);
+}
+
+/// Paging through an index-answered filter must return every matching row
+/// once, in fragment order. Rewriting a column in place drops fragment 0 from
+/// the index, so the first fragment in the manifest is not covered.
+#[tokio::test]
+async fn test_scan_limit_offset_with_uncovered_first_fragment() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, false),
+        ArrowField::new("other", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..20)),
+            Arc::new(Int32Array::from_iter_values(0..20)),
+            Arc::new(StringArray::from_iter_values(
+                (0..20).map(|i| i.to_string()),
+            )),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let update = arrow_array::record_batch!(("id", Int32, [0]), ("value", Int32, [100])).unwrap();
+    let update_schema = update.schema();
+    let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(vec![Ok(update)], update_schema))
+        .await
+        .unwrap();
+    let index = dataset.load_indices_by_name("value_idx").await.unwrap();
+    assert_eq!(
+        index[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter([1]))
+    );
+
+    let mut values = Vec::new();
+    for offset in (0..20).step_by(2) {
+        let mut scan = dataset.scan();
+        scan.filter("value < 1000")
+            .unwrap()
+            .limit(Some(2), Some(offset))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        values.extend_from_slice(batch["value"].as_primitive::<Int32Type>().values());
+    }
+    let expected = std::iter::once(100).chain(1..20).collect::<Vec<i32>>();
+    assert_eq!(values, expected);
 }
 
 #[rstest]
@@ -1858,6 +1971,57 @@ async fn test_limit_with_ordering_not_pushed_down() {
     assert_eq!(unsorted_values[0], 50);
     assert_eq!(unsorted_values[1], 20);
     assert_eq!(unsorted_values[2], 80);
+}
+
+#[rstest]
+#[case::plain(None, false, None)]
+#[case::filtered(Some("id > 2"), false, None)]
+#[case::full_text(None, true, None)]
+#[case::full_text_candidates(None, true, Some(4))]
+#[tokio::test]
+async fn test_zero_limit_with_ordering(
+    #[case] filter: Option<&str>,
+    #[case] has_full_text_query: bool,
+    #[case] candidate_limit: Option<i64>,
+    #[values(None, Some(0), Some(2))] offset: Option<i64>,
+    #[values(false, true)] is_sort_column_projected: bool,
+) {
+    let dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("text", array::cycle_utf8_literals(&["needle"]))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+        .await
+        .unwrap();
+
+    let columns = if is_sort_column_projected {
+        vec!["id", "text"]
+    } else {
+        vec!["text"]
+    };
+    let mut scanner = dataset.scan();
+    scanner.project(&columns).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+        .unwrap();
+    if let Some(filter) = filter {
+        scanner.filter(filter).unwrap();
+    }
+    if has_full_text_query {
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap();
+    }
+    let expected_schema = scanner.schema().await.unwrap();
+    scanner.limit(Some(0), offset).unwrap();
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), expected_schema);
 }
 
 #[tokio::test]
