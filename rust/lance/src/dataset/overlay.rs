@@ -37,6 +37,7 @@
 mod admitted;
 mod selection;
 pub mod writer;
+pub(crate) use admitted::PreparedOverlayBatch;
 pub use admitted::{
     AdmittedOverlayRouting, AdmittedStructValidityRouting, OverlayStructValidityInput,
 };

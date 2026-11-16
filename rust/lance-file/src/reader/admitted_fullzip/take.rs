@@ -104,12 +104,58 @@ impl FileReader {
         indices: &[u32],
         workspace: &mut Reservation,
     ) -> Result<Option<PreparedFullZipTake>> {
+        self.core
+            .prepare_admitted_fullzip_take_in(indices, self.base_projection().clone(), workspace)
+            .await
+    }
+}
+
+impl crate::reader::ProjectedFileReader {
+    /// Prepare sparse FullZip inputs using the projection-scoped metadata path.
+    ///
+    /// This has the admission, supported-type, sorted-unique-offset and failure
+    /// contract of [`FileReader::prepare_admitted_fullzip_take_in`]. `projection`
+    /// follows this reader's ordinary per-read projection rules, including exact
+    /// version validation and lazy metadata loading. No full-file metadata reader
+    /// or ordinary payload decode is constructed as a fallback.
+    ///
+    /// ```
+    /// use lance_core::{Result, utils::allocation::Reservation};
+    /// use lance_file::reader::{ProjectedFileReader, PreparedFullZipTake};
+    /// async fn prepare(reader: &ProjectedFileReader, work: &mut Reservation)
+    ///     -> Result<Option<PreparedFullZipTake>> {
+    ///     reader.prepare_admitted_fullzip_take_in(&[0, 2], None, work).await
+    /// }
+    /// ```
+    pub async fn prepare_admitted_fullzip_take_in(
+        &self,
+        indices: &[u32],
+        projection: Option<ReaderProjection>,
+        workspace: &mut Reservation,
+    ) -> Result<Option<PreparedFullZipTake>> {
+        self.core
+            .prepare_admitted_fullzip_take_in(
+                indices,
+                projection.unwrap_or_else(|| self.base_projection().clone()),
+                workspace,
+            )
+            .await
+    }
+}
+
+impl DecodeEngine {
+    async fn prepare_admitted_fullzip_take_in(
+        &self,
+        indices: &[u32],
+        projection: ReaderProjection,
+        workspace: &mut Reservation,
+    ) -> Result<Option<PreparedFullZipTake>> {
         if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(Error::invalid_input(
                 "admitted FullZip take requires sorted unique physical file offsets",
             ));
         }
-        let (schema, mut columns, read_len) = self.prepare_fullzip_columns().await?;
+        let (schema, mut columns, read_len) = self.prepare_fullzip_columns(projection).await?;
         if let Some(last) = indices.last()
             && u64::from(*last) >= read_len
         {

@@ -5,7 +5,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::UInt32Array;
+use arrow_array::{Array, UInt32Array};
 use lance_core::{Error, Result};
 use lance_io::ReadBatchParams;
 use roaring::RoaringBitmap;
@@ -21,6 +21,8 @@ enum Selection {
     // Arbitrary takes already supply explicit offsets. Preserve their bitmap
     // pruning cost without building one for a potentially huge scan.
     Indices(UInt32Array, RoaringBitmap),
+    // Admitted takes retain the caller-owned indices without an extra row bitmap.
+    SortedIndices(UInt32Array),
 }
 
 /// A batch keeps contiguous row identity without an offsets allocation.
@@ -38,6 +40,26 @@ pub struct OverlayReadSelection {
 }
 
 impl OverlayReadSelection {
+    /// Borrow validated take storage without constructing a second row-sized index.
+    /// The total stays u64 so the final u32 physical offset remains representable.
+    pub(crate) fn from_sorted_indices(indices: &UInt32Array, total: u64) -> Result<Self> {
+        if indices.null_count() != 0
+            || indices.values().windows(2).any(|pair| pair[0] >= pair[1])
+            || indices
+                .values()
+                .last()
+                .is_some_and(|row| u64::from(*row) >= total)
+        {
+            return Err(Error::invalid_input(
+                "admitted fragment take requires sorted unique non-null physical offsets within the fragment",
+            ));
+        }
+        Ok(Self {
+            selection: Selection::SortedIndices(indices.clone()),
+            num_rows: indices.len(),
+        })
+    }
+
     pub(crate) fn new(params: &ReadBatchParams, total: u32) -> Result<Self> {
         let range_len = |start: u64, end: u64| {
             if start > end || end > u64::from(total) {
@@ -100,6 +122,9 @@ impl OverlayReadSelection {
                 .iter()
                 .any(|range| coverage.range_cardinality(range.start as u32..range.end as u32) > 0),
             Selection::Indices(_, indices) => !coverage.is_disjoint(indices),
+            Selection::SortedIndices(indices) => {
+                indices.values().iter().any(|row| coverage.contains(*row))
+            }
         }
     }
 
@@ -118,7 +143,7 @@ impl OverlayReadSelection {
                 let begin = range.start + start as u32;
                 Ok(OverlayBatchSelection::Range(begin..begin + len as u32))
             }
-            Selection::Indices(indices, _) => {
+            Selection::Indices(indices, _) | Selection::SortedIndices(indices) => {
                 Ok(OverlayBatchSelection::Indices(indices.slice(start, len)))
             }
             Selection::Ranges { ranges, ends } => {
@@ -191,6 +216,38 @@ mod tests {
         let error = selection.batch(expected.len(), 1).err().unwrap();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("selected rows"));
+    }
+
+    #[test]
+    fn admitted_selection_retains_caller_storage_at_u32_boundary() {
+        let indices = UInt32Array::from(vec![0, 7, u32::MAX]);
+        let selection =
+            OverlayReadSelection::from_sorted_indices(&indices, u64::from(u32::MAX) + 1).unwrap();
+        let OverlayBatchSelection::Indices(batch) = selection.batch(1, 2).unwrap() else {
+            panic!("explicit indices must retain the supplied storage");
+        };
+        assert_eq!(batch.values().as_ptr(), indices.values()[1..].as_ptr());
+        assert_eq!(batch.values().as_ref(), &[7, u32::MAX]);
+        assert!(selection.intersects(&[u32::MAX].into_iter().collect()));
+        assert!(!selection.intersects(&[8].into_iter().collect()));
+        assert!(
+            !OverlayReadSelection::from_sorted_indices(&UInt32Array::from(Vec::<u32>::new()), 0)
+                .unwrap()
+                .intersects(&[0].into_iter().collect())
+        );
+    }
+
+    #[rstest]
+    #[case::null(UInt32Array::from(vec![Some(0), None]), 2)]
+    #[case::descending(UInt32Array::from(vec![1, 0]), 2)]
+    #[case::duplicate(UInt32Array::from(vec![1, 1]), 2)]
+    #[case::past_end(UInt32Array::from(vec![u32::MAX]), u64::from(u32::MAX))]
+    fn admitted_selection_rejects_invalid_rows(#[case] indices: UInt32Array, #[case] total: u64) {
+        let error = OverlayReadSelection::from_sorted_indices(&indices, total)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("sorted unique"));
     }
 
     #[test]

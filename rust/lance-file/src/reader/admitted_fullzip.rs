@@ -22,7 +22,7 @@ use lance_encoding::{
     encodings::logical::primitive::{FullZipArrayInput, FullZipScheduler},
 };
 
-use super::FileReader;
+use super::{DecodeEngine, FileReader, ReaderProjection};
 use crate::version::ConcreteFileVersion;
 
 mod take;
@@ -194,7 +194,10 @@ impl FileReader {
                 "FullZip scan requires positive workspace/max_rows and an ordered row range",
             ));
         }
-        let (schema, columns, read_len) = self.prepare_fullzip_columns().await?;
+        let (schema, columns, read_len) = self
+            .core
+            .prepare_fullzip_columns(self.base_projection().clone())
+            .await?;
         if rows.end > read_len {
             return Err(Error::invalid_input(format!(
                 "FullZip scan range {}..{} exceeds projected length {read_len}",
@@ -221,20 +224,24 @@ impl FileReader {
             has_started: false,
         })
     }
+}
 
+impl DecodeEngine {
     // Shared projection/metadata validation. Callers preflight only their selected
     // pages before reading payload, so unsupported pages in gaps remain irrelevant.
-    async fn prepare_fullzip_columns(&self) -> Result<(Arc<ArrowSchema>, Vec<FullZipColumn>, u64)> {
+    async fn prepare_fullzip_columns(
+        &self,
+        projection: ReaderProjection,
+    ) -> Result<(Arc<ArrowSchema>, Vec<FullZipColumn>, u64)> {
         if !matches!(
-            self.version(),
+            self.metadata_provider.version(),
             ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-        ) || !self.core.options.decoder_config.list_structure.is_empty()
+        ) || !self.options.decoder_config.list_structure.is_empty()
         {
             return Err(Error::not_supported(
                 "admitted FullZip scan requires v2.2/v2.3 full-value reads",
             ));
         }
-        let projection = self.base_projection();
         if projection.schema.fields.is_empty()
             || projection.column_indices.len() != projection.schema.fields.len()
             || projection
@@ -246,7 +253,15 @@ impl FileReader {
                 "admitted FullZip scan requires one non-Blob leaf path per field",
             ));
         }
-        let (prepared, read_len) = self.prepare(projection.clone()).await?;
+        let (prepared, read_len) = self
+            .read_projection
+            .prepare(
+                &self.metadata_provider,
+                &projection,
+                &self.scheduler,
+                &self.cache,
+            )
+            .await?;
         let schema = Arc::new(ArrowSchema::from(
             prepared.decoder_projection.schema.as_ref(),
         ));
@@ -290,7 +305,7 @@ impl FileReader {
                 ));
             }
             columns.push(FullZipColumn {
-                io: self.core.scheduler.clone(),
+                io: self.scheduler.clone(),
                 column,
                 page_index: 0,
                 page_start: 0,

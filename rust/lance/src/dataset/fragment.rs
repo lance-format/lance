@@ -3,6 +3,7 @@
 
 //! Wraps a Fragment of the dataset.
 
+mod admitted;
 mod aligned_update;
 pub mod session;
 pub mod write;
@@ -186,6 +187,27 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         projection: Arc<lance_core::datatypes::Schema>,
         take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
+
+    /// Prepare exact sorted unique physical rows in an existing reservation.
+    ///
+    /// Opt-in FullZip only; unsupported readers return an error without falling
+    /// back to ordinary decoding. Inputs, decoded output and downstream assembly
+    /// must fit the original operation admission. `None` requires dropping the
+    /// whole attempt before replanning. See
+    /// [`FragmentReader::try_take_admitted_fullzip`] for an end-to-end example.
+    fn prepare_admitted_fullzip_take<'a>(
+        &'a self,
+        _indices: &'a [u32],
+        _projection: Arc<Schema>,
+        _workspace: &'a mut lance_core::utils::allocation::Reservation,
+    ) -> BoxFuture<'a, Result<Option<lance_file::reader::PreparedFullZipTake>>> {
+        async {
+            Err(Error::not_supported(
+                "this file reader does not support admitted FullZip take",
+            ))
+        }
+        .boxed()
+    }
 
     /// Return the number of rows in the file
     fn len(&self) -> u32;
@@ -658,6 +680,25 @@ mod v2_adapter {
     }
 
     impl GenericFileReader for Reader {
+        fn prepare_admitted_fullzip_take<'a>(
+            &'a self,
+            indices: &'a [u32],
+            projection: Arc<Schema>,
+            workspace: &'a mut lance_core::utils::allocation::Reservation,
+        ) -> BoxFuture<'a, Result<Option<lance_file::reader::PreparedFullZipTake>>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    &projection,
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader
+                    .prepare_admitted_fullzip_take_in(indices, Some(projection), workspace)
+                    .await
+            }
+            .boxed()
+        }
+
         fn read_range_tasks(
             &self,
             range: Range<u64>,
@@ -4478,6 +4519,7 @@ mod tests {
     /// written, committed via the `DataOverlay` transaction, and then resolved on
     /// the `take` and scan read paths.
     mod overlay_read {
+        mod admitted;
         use std::sync::Arc;
 
         use arrow_array::{
