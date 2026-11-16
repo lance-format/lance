@@ -9,19 +9,19 @@ import textwrap
 
 
 def _run_without_numpy(code: str) -> subprocess.CompletedProcess:
-    # Block numpy at import time, then run the snippet in a fresh interpreter.
+    # Hide numpy from both `import` and `find_spec`, then run the snippet in a
+    # fresh interpreter.
     guard = textwrap.dedent(
         """
-        import builtins
+        import sys
 
-        _real_import = builtins.__import__
+        class _BlockNumpy:
+            def find_spec(self, name, path=None, target=None):
+                if name == "numpy" or name.startswith("numpy."):
+                    raise ModuleNotFoundError("No module named 'numpy'")
+                return None
 
-        def _no_numpy(name, *args, **kwargs):
-            if name == "numpy" or name.startswith("numpy."):
-                raise ModuleNotFoundError("No module named 'numpy'")
-            return _real_import(name, *args, **kwargs)
-
-        builtins.__import__ = _no_numpy
+        sys.meta_path.insert(0, _BlockNumpy())
         """
     )
     return subprocess.run(
