@@ -225,7 +225,9 @@ mod tests {
         one_column_file, unbacked_manifest,
     };
     use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
-    use crate::transaction::test_support::{make_stable_row_id_manifest, sample_index_metadata};
+    use crate::transaction::test_support::{
+        make_stable_row_id_manifest, overlay_with_field, sample_index_metadata,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
@@ -588,16 +590,22 @@ mod tests {
 
     /// Field 0 has no file in fragment 0, so it reads as null there, and the
     /// index recorded those nulls. Filling it in changes the values unless the
-    /// writer says otherwise.
+    /// writer says otherwise, and new values supersede an overlay shadowing
+    /// the field, as they do for a `DataReplacement`.
     #[rstest]
     #[case::new_values(true, false)]
     #[case::unchanged_values(false, true)]
-    fn test_add_data_file_withdraws_index_coverage_only_on_a_data_change(
+    fn test_add_data_file_supersedes_overlays_and_index_coverage_only_on_a_data_change(
         #[case] data_change: bool,
         #[case] kept: bool,
     ) {
-        let (_, indices) = apply_with_indices(
-            &unbacked_manifest(),
+        let mut manifest = unbacked_manifest();
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.overlays = vec![overlay_with_field(0, manifest.version)];
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let (next, indices) = apply_with_indices(
+            &manifest,
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(0),
                 file: one_column_file("data/x.lance"),
@@ -609,6 +617,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(next.fragments[0].overlays.len(), usize::from(kept));
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
             kept
@@ -616,7 +625,8 @@ mod tests {
     }
 
     /// A file adding `s.y` lists the struct `s` too, but `s` holds no values of
-    /// its own, so an index on its other child `s.x` still describes the data.
+    /// its own, so an index or overlay on its other child `s.x` still describes
+    /// the data.
     #[test]
     fn test_add_data_file_keeps_coverage_of_a_sibling_under_a_listed_parent() {
         let mut manifest = backed_manifest();
@@ -634,6 +644,7 @@ mod tests {
         let mut fragment = manifest.fragments[0].clone();
         fragment.files[0].fields = vec![0, 1].into();
         fragment.files[0].column_indices = vec![-1, 0].into();
+        fragment.overlays = vec![overlay_with_field(1, manifest.version)];
         manifest.fragments = Arc::new(vec![fragment]);
         let index_on_x = IndexMetadata {
             fields: vec![1],
@@ -642,7 +653,7 @@ mod tests {
         let mut file = one_column_file("data/y.lance");
         file.column_indices = vec![-1, 0].into();
 
-        let (_, indices) = apply_with_indices(
+        let (next, indices) = apply_with_indices(
             &manifest,
             vec![
                 Action::AddField(AddField {
@@ -663,6 +674,7 @@ mod tests {
         .unwrap();
 
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
+        assert_eq!(next.fragments[0].overlays.len(), 1);
     }
 
     #[test]
