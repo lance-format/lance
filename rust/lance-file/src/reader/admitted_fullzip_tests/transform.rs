@@ -8,7 +8,10 @@ use std::{
 
 use arrow_array::{StructArray, cast::AsArray};
 use lance_core::{Result, utils::allocation::Reservation, utils::tokio::spawn_cpu};
-use lance_encoding::data::{try_interleave_nested_binary_in, try_splice_struct_in};
+use lance_encoding::data::{
+    StructValiditySelection, try_interleave_nested_binary_in, try_replace_struct_validities_in,
+    try_splice_struct_in,
+};
 
 use super::*;
 use crate::reader::{FullZipScan, FullZipScanOutcome};
@@ -503,4 +506,131 @@ async fn admitted_transform_splices_structs(
     assert_eq!(batch.column(0).to_data(), expected_splice(3..6).to_data());
     drop(batch);
     assert_eq!(budget.reserved(), 0);
+}
+
+fn restore_decoded_validities(
+    _rows: Range<u64>,
+    batch: RecordBatch,
+    workspace: &mut Reservation,
+) -> Result<Option<RecordBatch>> {
+    let repeated = vec![(0, 0); batch.num_rows()];
+    let Some(values) =
+        try_interleave_nested_binary_in(&[batch.column(1).as_ref()], &repeated, workspace)?
+    else {
+        return Ok(None);
+    };
+    // The atomic values are already replaced, but both struct levels still carry
+    // base validity. Restoring just the root first would expose inner nulls.
+    let wrap = |child: ArrayRef| -> ArrayRef {
+        Arc::new(StructArray::new(
+            vec![Arc::new(Field::new(
+                "frames",
+                child.data_type().clone(),
+                false,
+            ))]
+            .into(),
+            vec![child],
+            batch.column(0).nulls().cloned(),
+        ))
+    };
+    let source = wrap(wrap(values));
+    let donor = struct_spine(batch.column(1).clone());
+    let sources = [donor.as_struct()];
+    let indices = (0..batch.num_rows())
+        .map(|row| (0, (row + 1) % batch.num_rows()))
+        .collect::<Vec<_>>();
+    let updates = [
+        StructValiditySelection {
+            path: &[],
+            sources: &sources,
+            indices: &indices,
+        },
+        StructValiditySelection {
+            path: &[0],
+            sources: &sources,
+            indices: &indices,
+        },
+    ];
+    let Some(output) = try_replace_struct_validities_in(source.as_struct(), &updates, workspace)?
+    else {
+        return Ok(None);
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        output.data_type().clone(),
+        true,
+    )]));
+    Ok(Some(RecordBatch::try_new(schema, vec![output])?))
+}
+
+fn expected_restored_validities(rows: Range<usize>) -> ArrayRef {
+    let overlay = array(17, 1).slice(rows.start, rows.len());
+    let values =
+        arrow_select::interleave::interleave(&[overlay.as_ref()], &vec![(0, 0); rows.len()])
+            .unwrap();
+    let nulls = NullBuffer::from(
+        (0..rows.len())
+            .map(|row| overlay.is_valid((row + 1) % rows.len()))
+            .collect::<Vec<_>>(),
+    );
+    let wrap = |child: ArrayRef| -> ArrayRef {
+        Arc::new(StructArray::new(
+            vec![Arc::new(Field::new(
+                "frames",
+                child.data_type().clone(),
+                false,
+            ))]
+            .into(),
+            vec![child],
+            Some(nulls.clone()),
+        ))
+    };
+    wrap(wrap(values))
+}
+
+#[rstest]
+#[tokio::test]
+async fn admitted_transform_restores_struct_validities(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+) {
+    let budget = AllocationBudget::new(WORKSPACE);
+    let (_left_fs, _right_fs, mut scan, _) = merged_fixture(version, lite, 1, budget.clone()).await;
+    for expected_rows in [0..3, 3..6] {
+        let FullZipScanOutcome::Batch { rows, batch } = scan
+            .try_next_with_transform(restore_decoded_validities)
+            .await
+            .unwrap()
+        else {
+            panic!("decode, atomic assembly and validity restoration must fit");
+        };
+        assert_eq!(rows, expected_rows.start as u64..expected_rows.end as u64);
+        assert_eq!(
+            batch.column(0).to_data(),
+            expected_restored_validities(expected_rows).to_data()
+        );
+        let outer = batch.column(0).as_struct();
+        let inner = outer.column(0).as_struct();
+        assert!(
+            outer.is_valid(2) && inner.is_valid(2),
+            "both formerly null levels must revive"
+        );
+        let parent_alias = outer.nulls().unwrap().buffer().clone();
+        let child_alias = inner.nulls().unwrap().buffer().clone();
+        drop(batch);
+        assert_eq!(
+            budget.reserved(),
+            2,
+            "only the two final bitmap owners remain"
+        );
+        assert!(matches!(
+            scan.try_next().await.unwrap(),
+            FullZipScanOutcome::NeedsCapacity
+        ));
+        assert_eq!(scan.position(), rows.end);
+        drop(parent_alias);
+        assert_eq!(budget.reserved(), 1);
+        drop(child_alias);
+        assert_eq!(budget.reserved(), 0);
+    }
 }

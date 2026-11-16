@@ -10,6 +10,9 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, bit_util};
 use arrow_schema::DataType;
 use lance_core::{Error, Result, utils::allocation::Reservation};
 
+mod validity;
+pub use validity::{StructValiditySelection, try_replace_struct_validities_in};
+
 /// Replace one child reached by a nonempty path of struct child indices.
 ///
 /// The replacement must have the target child's type and row count. Unchanged
@@ -74,23 +77,7 @@ impl<'a> Plan<'a> {
                 source.num_columns()
             ))
         })?;
-        for field in source.fields() {
-            if !field.is_nullable()
-                && matches!(
-                    field.data_type(),
-                    DataType::Null
-                        | DataType::Dictionary(_, _)
-                        | DataType::Union(_, _)
-                        | DataType::RunEndEncoded(_, _)
-                )
-            {
-                return Err(Error::not_supported(format!(
-                    "admitted struct splice cannot materialize logical nulls for required field '{}' of type {}",
-                    field.name(),
-                    field.data_type()
-                )));
-            }
-        }
+        check_required_fields(source)?;
         let child = if rest.is_empty() {
             if replacement.data_type() != field.data_type() || replacement.len() != source.len() {
                 return Err(Error::invalid_input(format!(
@@ -171,6 +158,27 @@ impl<'a> Plan<'a> {
             self.source.len(),
         )?))
     }
+}
+
+fn check_required_fields(source: &StructArray) -> Result<()> {
+    for field in source.fields() {
+        if !field.is_nullable()
+            && matches!(
+                field.data_type(),
+                DataType::Null
+                    | DataType::Dictionary(_, _)
+                    | DataType::Union(_, _)
+                    | DataType::RunEndEncoded(_, _)
+            )
+        {
+            return Err(Error::not_supported(format!(
+                "admitted struct splice cannot materialize logical nulls for required field '{}' of type {}",
+                field.name(),
+                field.data_type()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
