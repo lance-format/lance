@@ -39,7 +39,9 @@ pub(super) fn try_filter_in(
     };
     for (slot, row) in storage
         .as_mut()
-        .chunks_exact_mut(size_of::<u32>())
+        .as_chunks_mut::<{ size_of::<u32>() }>()
+        .0
+        .iter_mut()
         .zip(survivors())
     {
         slot.copy_from_slice(&row.to_ne_bytes());
