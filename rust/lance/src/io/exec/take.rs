@@ -41,13 +41,13 @@ use tracing::error;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
-use crate::dataset::rowids::row_ids_to_row_addrs;
 use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
+use super::column_width::MeasuredWidths;
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
-mod batch;
+pub mod batch;
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -207,7 +207,10 @@ impl TakeStream {
 
             if self.dataset.manifest.uses_stable_row_ids() {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                let resolved = row_ids_to_row_addrs(&self.dataset, row_id_array).await?;
+                let resolved = self
+                    .dataset
+                    .lookup_row_addresses(ROW_ID, row_id_array)
+                    .await?;
                 let valid =
                     BooleanArray::from(resolved.iter().map(Option::is_some).collect::<Vec<_>>());
                 let addresses = UInt64Array::from(
@@ -476,7 +479,7 @@ impl TakeStream {
                 let batch = batch?;
                 let this = self.clone();
                 Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                    lance_core::utils::tokio::spawn(this.map_batch(batch, batch_index as u32))
                         .map(|res| res.unwrap()),
                 )
             })
@@ -505,6 +508,11 @@ impl TakeStream {
     }
 }
 
+/// Deprecation: This node is replaced by a FilteredReadExec with a RowSelector.
+/// It remains in use for legacy reads and dedicated modern query paths such as
+/// MemWAL and top-k late materialization.
+///
+/// Prefer targeted correctness fixes over general optimization or refactoring.
 #[derive(Debug)]
 pub struct TakeExec {
     // The dataset to take from
@@ -637,7 +645,11 @@ impl TakeExec {
         );
 
         let schema_to_take = projection.into_schema_ref();
-        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_arrow.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         Ok(Some(Self {
             dataset,

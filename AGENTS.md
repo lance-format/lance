@@ -88,6 +88,8 @@ Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](pyth
 - Include multi-fragment scenarios for dataset operations (reads, indexes, scans).
 - Cover NULL edge cases in index tests: null items, all-null collections, empty collections, null columns.
 - Vector index tests must assert recall metrics (>=0.5 threshold), not just verify creation succeeds.
+- The automatic cross-version compatibility matrix must select only stable releases. Do not add alpha, beta, or release-candidate builds to the matrix or use a pre-release as a `min_version`.
+- Keep tests for current-branch feature behavior and pre-release capability boundaries in ordinary unit or integration tests, not in `python/tests/compat`. Compatibility cases must not assert version boundaries between pre-releases. Once a feature is in a stable release, compatibility cases must test that stable contract without depending on which pre-release introduced it.
 - For backwards compatibility, use the `test_data` directory with checked-in datasets from older versions. Include a `datagen.py` that asserts the Lance version used. Use `copy_test_data_to_tmp` to read this data.
 - Avoid `ignore` in doctests — write Rust doctests that compile a function instead:
   ```

@@ -55,7 +55,11 @@ impl BranchLocation {
                     branch_name, path_str,
                 ))
             })?;
-        let root_path_str = if root_path_str.ends_with('/') {
+        // A dataset can occupy the object-store root (for example memory://).
+        // Its store path is empty and its URI must retain the scheme delimiter.
+        let root_path_str = if root_path_str.is_empty() || root_path_str.ends_with("://") {
+            root_path_str.to_string()
+        } else if root_path_str.ends_with('/') {
             root_path_str.trim_end_matches('/').to_string()
         } else if cfg!(windows) {
             root_path_str.trim_end_matches('\\').to_string()
@@ -166,6 +170,7 @@ mod tests {
     use crate::dataset::branch_location::BranchLocation;
     use lance_core::utils::tempfile::TempStdDir;
     use object_store::path::Path;
+    use rstest::rstest;
     use std::fs;
     use std::path::PathBuf;
 
@@ -207,6 +212,26 @@ mod tests {
         assert_eq!(root_location.uri, location.uri);
         assert_eq!(root_location.branch, None);
         assert!(fs::create_dir_all(std::path::Path::new(root_location.uri.as_str())).is_ok());
+    }
+
+    #[rstest]
+    #[case::memory_root("", "memory://")]
+    #[case::bucket_root("", "s3://bucket")]
+    #[case::memory_path("dataset", "memory://dataset")]
+    fn test_branch_root_round_trip(
+        #[case] path: &str,
+        #[case] uri: &str,
+        #[values("exp", "feature/exp")] branch: &str,
+    ) {
+        let root = BranchLocation {
+            path: Path::parse(path).unwrap(),
+            uri: uri.to_string(),
+            branch: None,
+        };
+        assert_eq!(
+            root.find_branch(Some(branch)).unwrap().find_main().unwrap(),
+            root
+        );
     }
 
     #[test]

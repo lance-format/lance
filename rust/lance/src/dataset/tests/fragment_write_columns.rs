@@ -21,7 +21,11 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::constants::PACKED_STRUCT_META_KEY;
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::writer::FileWriterOptions;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use rstest::rstest;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
@@ -91,6 +95,68 @@ async fn stage(
     only_fragment(dataset)
         .write_columns(stream::iter([Ok(batch)]), schema)
         .await
+}
+
+async fn staged_page_count(dataset: &Dataset, options: FileWriterOptions) -> usize {
+    let schema = declared_schema(dataset, "value");
+    let batches = (0..8).map(|batch| {
+        Ok(arrow_array::record_batch!((
+            "value",
+            Int32,
+            (batch * 32..batch * 32 + 32).collect::<Vec<i32>>()
+        ))
+        .unwrap())
+    });
+    let group = only_fragment(dataset)
+        .write_columns_with_file_writer_options(stream::iter(batches), &schema, options)
+        .await
+        .unwrap();
+    let path = dataset.data_dir().join(group.1.path.as_str());
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::default_for_testing(),
+    );
+    let file = scheduler
+        .open_file(&path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let reader = lance_file::reader::FileReader::try_open(
+        file,
+        None,
+        Default::default(),
+        &dataset.metadata_cache.file_metadata_cache(&path),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.metadata().column_metadatas[0].pages.len()
+}
+
+#[rstest]
+#[case(LanceFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_3)]
+#[tokio::test]
+async fn replacement_applies_file_writer_cache_option(#[case] version: LanceFileVersion) {
+    let dataset = dataset_of(
+        arrow_array::record_batch!(("value", Int32, (0..256).collect::<Vec<_>>())).unwrap(),
+        Some(version),
+    )
+    .await;
+
+    let default_pages = staged_page_count(&dataset, FileWriterOptions::default()).await;
+    let bounded_pages = staged_page_count(
+        &dataset,
+        FileWriterOptions {
+            data_cache_bytes: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        bounded_pages > default_pages,
+        "the fragment replacement must not discard FileWriterOptions: default={default_pages}, bounded={bounded_pages}"
+    );
 }
 
 async fn commit(dataset: &Dataset, replacements: Vec<DataReplacementGroup>) -> Result<Dataset> {

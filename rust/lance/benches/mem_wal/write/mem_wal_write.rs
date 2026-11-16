@@ -602,6 +602,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                 let default_config = ShardWriterConfig::default();
                                 let config = ShardWriterConfig {
                                     shard_id,
+                                    dir_id: String::new(),
                                     shard_spec_id: 0,
                                     max_wal_persist_retries: 3,
                                     wal_persist_retry_base_delay: std::time::Duration::from_millis(

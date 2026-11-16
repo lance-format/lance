@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Fields};
 use async_trait::async_trait;
 use datafusion_execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
@@ -19,7 +19,10 @@ use lance_core::{
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
-use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+use crate::scalar::{
+    CreatedIndex, IndexStore, ScalarIndex,
+    expression::{ScalarIndexPlanner, ScalarQueryParser},
+};
 use lance_index_core::remapping::BatchRowIdRemapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
@@ -97,6 +100,17 @@ pub trait BasicTrainer: Send + Sync {
     ) -> Result<CreatedIndex>;
 }
 
+/// Whether a plugin's indices serve ordered search through
+/// [`ScalarIndex::as_ordered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndexOrderingCapability {
+    /// The index cannot stream keys in order.
+    Unordered,
+    /// The index streams keys in either direction, with nulls first or last.
+    Bidirectional,
+}
+
 /// A trait for scalar index plugins
 #[async_trait]
 pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
@@ -139,6 +153,59 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
 
+    /// Whether the persisted index described by these details supports remapping.
+    ///
+    /// This check must not read index files. It describes physical index segments,
+    /// not query-time wrappers that combine multiple segments. Details must belong
+    /// to this plugin.
+    ///
+    /// The default returns `true`, which keeps plugins written before this method
+    /// existed on the existing load-and-check path. Implementations should return
+    /// `Ok(false)` when they can determine the index cannot be remapped, or when
+    /// support cannot be determined safely; an error can prevent maintenance.
+    ///
+    /// ```
+    /// # fn example(details: &prost_types::Any) -> lance_core::Result<bool> {
+    /// let registry = lance_index::registry::IndexPluginRegistry::with_default_plugins();
+    /// let plugin = registry.get_plugin_by_details(details)?;
+    /// plugin.can_remap(details)
+    /// # }
+    /// ```
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether an index with these details serves ordered search through
+    /// [`ScalarIndex::as_ordered`], decided without loading the index.
+    ///
+    /// A loaded index can still return `None` from `as_ordered`, for example
+    /// when it spans several segments, or `NotSupported` from `search_ordered`,
+    /// for example when its files are out of key order, so a planner must keep
+    /// a fallback.
+    ///
+    /// ```
+    /// # use lance_index::pbold;
+    /// # use lance_index::scalar::bitmap::BitmapIndexPlugin;
+    /// # use lance_index::scalar::btree::BTreeIndexPlugin;
+    /// # use lance_index::scalar::registry::{IndexOrderingCapability, ScalarIndexPlugin};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BTreeIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Bidirectional
+    /// );
+    /// let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BitmapIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Unordered
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
+        IndexOrderingCapability::Unordered
+    }
+
     /// The version of the index plugin
     ///
     /// We assume that indexes are not forwards compatible.  If an index was written with a
@@ -166,6 +233,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_name: String,
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>>;
+
+    /// Returns a planner for an index keyed on more than one column
+    ///
+    /// `keys` holds the key columns in key order, each named by its field path. The
+    /// default returns None, so the index takes no part in query optimization. The
+    /// [`ScalarIndexPlanner`] docs have an example planner. Lance never calls this
+    /// method for a dataset on legacy V1 storage.
+    fn new_planner(
+        &self,
+        _index_name: String,
+        _index_details: &prost_types::Any,
+        _keys: &Fields,
+    ) -> Option<Box<dyn ScalarIndexPlanner>> {
+        None
+    }
 
     /// Load an index from storage
     ///

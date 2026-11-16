@@ -113,15 +113,17 @@ impl ShardManifestStore {
     ///
     /// * `object_store` - Object store for reading/writing manifests
     /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
+    /// * `dir_id` - The MemWAL's `dir_id` (empty for the legacy `_mem_wal`)
     /// * `shard_id` - Shard UUID
     /// * `manifest_scan_batch_size` - Batch size for parallel HEAD requests when scanning versions
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: &Path,
+        dir_id: &str,
         shard_id: Uuid,
         manifest_scan_batch_size: usize,
     ) -> Self {
-        let manifest_dir = shard_manifest_path(base_path, &shard_id);
+        let manifest_dir = shard_manifest_path(base_path, dir_id, &shard_id);
         Self {
             object_store,
             shard_id,
@@ -276,6 +278,7 @@ impl ShardManifestStore {
             wal_entry_position_last_seen: 0,
             current_generation: 1,
             sstables: vec![],
+            sealed_by: None,
             status: ShardStatus::Active,
         };
 
@@ -637,6 +640,7 @@ impl ShardManifestStore {
                     wal_entry_position_last_seen: 0,
                     current_generation: 1,
                     sstables: vec![],
+                    sealed_by: None,
                     status: ShardStatus::Active,
                 }
             };
@@ -847,6 +851,7 @@ mod tests {
             wal_entry_position_last_seen: 0,
             current_generation: 1,
             sstables: vec![],
+            sealed_by: None,
             status: ShardStatus::Active,
         }
     }
@@ -856,8 +861,8 @@ mod tests {
     async fn check_fenced_sees_a_peer_through_a_warm_cache() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let incumbent = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
-        let successor = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let incumbent = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let successor = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         // Claiming writes a manifest, warming the cache.
         let (epoch, _) = incumbent.claim_epoch(0).await.unwrap();
@@ -877,8 +882,8 @@ mod tests {
     async fn a_reader_only_store_never_caches() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
-        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let reader = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (epoch, _) = writer.claim_epoch(0).await.unwrap();
         assert_eq!(
@@ -912,8 +917,8 @@ mod tests {
     async fn commit_update_recovers_from_a_stale_cache() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let ours = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
-        let peer = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let ours = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let peer = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (epoch, _) = ours.claim_epoch(0).await.unwrap();
         ours.latest().await.unwrap().unwrap();
@@ -951,7 +956,7 @@ mod tests {
     async fn a_late_write_never_regresses_the_cache() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let older = create_test_manifest(shard_id, 1, 1);
         let newer = create_test_manifest(shard_id, 2, 1);
@@ -973,7 +978,7 @@ mod tests {
     async fn latest_serves_the_written_manifest() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let mut manifest = create_test_manifest(shard_id, 1, 1);
         manifest_store.write(&manifest).await.unwrap();
@@ -992,7 +997,7 @@ mod tests {
     async fn test_latest_empty() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let result = manifest_store.latest().await.unwrap();
         assert!(result.is_none());
@@ -1002,7 +1007,7 @@ mod tests {
     async fn test_write_and_read_manifest() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let manifest = create_test_manifest(shard_id, 1, 1);
         manifest_store.write(&manifest).await.unwrap();
@@ -1017,7 +1022,7 @@ mod tests {
     async fn test_multiple_versions() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         // Write multiple versions
         for version in 1..=5 {
@@ -1039,7 +1044,7 @@ mod tests {
     async fn test_read_specific_version() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         for version in 1..=3 {
             let manifest = create_test_manifest(shard_id, version, version * 10);
@@ -1055,7 +1060,7 @@ mod tests {
     async fn test_put_if_not_exists() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let manifest1 = create_test_manifest(shard_id, 1, 1);
         manifest_store.write(&manifest1).await.unwrap();
@@ -1070,7 +1075,7 @@ mod tests {
     async fn test_initialize_shard_writes_v1_with_epoch_zero() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let mut field_values = HashMap::new();
         field_values.insert("user_bucket".to_string(), 7i32.to_le_bytes().to_vec());
@@ -1093,7 +1098,7 @@ mod tests {
     async fn test_initialize_shard_idempotent_on_match() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let mut field_values = HashMap::new();
         field_values.insert("k".to_string(), b"v".to_vec());
@@ -1117,7 +1122,7 @@ mod tests {
         // a cursor update as a real claimant.
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (first_epoch, first) = manifest_store.claim_epoch(0).await.unwrap();
         assert_eq!(first_epoch, 1);
@@ -1143,7 +1148,7 @@ mod tests {
         // back to `Active` makes the shard claimable again (reversible).
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (epoch, claimed) = manifest_store.claim_epoch(0).await.unwrap();
         assert_eq!(claimed.status, ShardStatus::Active);
@@ -1151,6 +1156,7 @@ mod tests {
         // Seal it (drop-table prepare).
         let sealed = ShardManifest {
             version: claimed.version + 1,
+            sealed_by: None,
             status: ShardStatus::Sealed,
             ..claimed
         };
@@ -1170,6 +1176,7 @@ mod tests {
         // Roll back to Active (drop-table abort) → re-claimable.
         let active = ShardManifest {
             version: sealed.version + 1,
+            sealed_by: None,
             status: ShardStatus::Active,
             ..sealed
         };
@@ -1183,7 +1190,7 @@ mod tests {
     async fn test_initialize_shard_rejects_conflict_with_mismatch() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         manifest_store
             .initialize_shard(1, HashMap::new())
@@ -1205,7 +1212,7 @@ mod tests {
     async fn commit_update_rejects_a_closure_that_skips_a_version() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let ours = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let ours = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (epoch, claimed) = ours.claim_epoch(0).await.unwrap();
 
@@ -1245,8 +1252,8 @@ mod tests {
     async fn only_refresh_latest_adopts_a_position() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
-        let observer = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let observer = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (epoch, _) = writer.claim_epoch(0).await.unwrap();
 
@@ -1288,7 +1295,7 @@ mod tests {
     async fn concurrent_commits_on_one_handle_all_land() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let shared = Arc::new(ShardManifestStore::new(store, &base_path, shard_id, 2));
+        let shared = Arc::new(ShardManifestStore::new(store, &base_path, "", shard_id, 2));
         let (epoch, claimed) = shared.claim_epoch(0).await.unwrap();
 
         const COMMITS: u64 = 8;
@@ -1329,7 +1336,7 @@ mod tests {
     async fn write_reports_a_taken_version_as_a_collision() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let ours = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let ours = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
 
         let (_, claimed) = ours.claim_epoch(0).await.unwrap();
 
@@ -1358,7 +1365,7 @@ mod tests {
     }
 
     fn hint_path(base_path: &Path, shard_id: &Uuid) -> Path {
-        shard_manifest_path(base_path, shard_id).join("version_hint.json")
+        shard_manifest_path(base_path, "", shard_id).join("version_hint.json")
     }
 
     async fn write_hint(store: &ObjectStore, base_path: &Path, shard_id: &Uuid, version: u64) {
@@ -1401,14 +1408,14 @@ mod tests {
     async fn the_latest_version_survives_pruned_history() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 20).await;
         assert_eq!(writer.prune_versions_before(20).await.unwrap(), 19);
         assert_eq!(writer.list_versions().await.unwrap(), vec![20]);
 
         write_hint(&store, &base_path, &shard_id, 3).await;
-        let reader = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let reader = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 20);
 
         store
@@ -1416,7 +1423,7 @@ mod tests {
             .delete(&hint_path(&base_path, &shard_id))
             .await
             .unwrap();
-        let claimant = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let claimant = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         let (epoch, claimed) = claimant.claim_epoch(0).await.unwrap();
         assert_eq!((claimed.version, epoch), (21, 2));
     }
@@ -1426,7 +1433,7 @@ mod tests {
     async fn pruning_never_removes_the_latest_version() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 5).await;
 
@@ -1450,9 +1457,9 @@ mod tests {
     ) {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let stale = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let stale = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .with_ages(max_position_age, min_prune_age);
-        let peer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let peer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .with_ages(max_position_age, min_prune_age);
         let (stale_epoch, _) = stale.claim_epoch(0).await.unwrap();
         let (peer_epoch, _) = peer.claim_epoch(0).await.unwrap();
@@ -1482,7 +1489,7 @@ mod tests {
             matches!(result, Err(Error::Fenced { .. })),
             "the stale writer must be rejected: {result:?}"
         );
-        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let reader = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
         let tip = reader.refresh_latest().await.unwrap().unwrap();
         assert_eq!(
             (tip.version, tip.writer_epoch, tip.current_generation),
@@ -1496,7 +1503,7 @@ mod tests {
     async fn a_failed_listing_is_an_error() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         write_versions(&writer, shard_id, 3).await;
         store
             .inner
@@ -1505,7 +1512,7 @@ mod tests {
             .unwrap();
 
         let failing = failing_store(&store, "list", |_| true);
-        let reader = ShardManifestStore::new(failing, &base_path, shard_id, 2);
+        let reader = ShardManifestStore::new(failing, &base_path, "", shard_id, 2);
         assert!(reader.refresh_latest().await.is_err());
     }
 
@@ -1516,18 +1523,19 @@ mod tests {
     async fn a_failed_prune_leaves_the_versions_contiguous() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         write_versions(&writer, shard_id, 6).await;
 
-        let third = shard_manifest_path(&base_path, &shard_id).join(manifest_filename(3).as_str());
+        let third =
+            shard_manifest_path(&base_path, "", &shard_id).join(manifest_filename(3).as_str());
         let failing = failing_store(&store, "delete", move |path| *path == third);
-        let pruner = ShardManifestStore::new(failing, &base_path, shard_id, 2)
+        let pruner = ShardManifestStore::new(failing, &base_path, "", shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
         assert!(pruner.prune_versions_before(6).await.is_err());
         assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5, 6]);
 
         write_hint(&store, &base_path, &shard_id, 3).await;
-        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let reader = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 6);
     }
 
@@ -1537,12 +1545,12 @@ mod tests {
     async fn initializing_a_pruned_shard_keeps_its_tip() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 6).await;
         writer.prune_versions_before(6).await.unwrap();
 
-        let retry = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let retry = ShardManifestStore::new(store, &base_path, "", shard_id, 2);
         let existing = retry.initialize_shard(0, HashMap::new()).await.unwrap();
         assert_eq!(existing.version, 6);
         assert_eq!(writer.list_versions().await.unwrap(), vec![6]);
@@ -1554,7 +1562,7 @@ mod tests {
     async fn an_unreadable_hint_falls_back_to_listing() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 3).await;
         writer.prune_versions_before(3).await.unwrap();
@@ -1562,7 +1570,7 @@ mod tests {
         let failing = failing_store(&store, "get_opts", |path| {
             path.as_ref().ends_with("version_hint.json")
         });
-        let reader = ShardManifestStore::new(failing, &base_path, shard_id, 2);
+        let reader = ShardManifestStore::new(failing, &base_path, "", shard_id, 2);
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 3);
     }
 
@@ -1574,7 +1582,7 @@ mod tests {
         let shard_id = Uuid::new_v4();
 
         // The durable tip is v3, written by a peer that claimed epoch 2.
-        let peer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let peer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         for version in 1..=3u64 {
             let epoch = if version == 3 { 2 } else { 1 };
             peer.write(&create_test_manifest(shard_id, version, epoch))
@@ -1584,7 +1592,7 @@ mod tests {
 
         // The hint is written after the manifest and is best-effort, so lagging
         // by one is the ordinary state during any commit.
-        let hint_path = shard_manifest_path(&base_path, &shard_id).join("version_hint.json");
+        let hint_path = shard_manifest_path(&base_path, "", &shard_id).join("version_hint.json");
         store
             .inner
             .put(
@@ -1612,7 +1620,7 @@ mod tests {
         );
         let mut proxied = (*store).clone();
         proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy.clone()));
-        let ours = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+        let ours = ShardManifestStore::new(Arc::new(proxied), &base_path, "", shard_id, 2);
 
         let err = ours.refresh_latest().await.unwrap_err();
         assert!(

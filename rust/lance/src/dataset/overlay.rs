@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::{NullBuffer, NullBufferBuilder};
+use arrow_schema::Fields;
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
@@ -613,6 +614,14 @@ fn descend_by_ids(array: &ArrayRef, field: &Field, ancestor_ids: &[i32]) -> Resu
 /// Rebuild `array` with the array at `ancestor_ids` replaced by `new_atomic_field`, cloning
 /// the struct spine along the path and preserving each struct's null buffer and other
 /// children. With an empty path this is just `new_atomic_field` (whole-column replacement).
+///
+/// Each rebuilt level's null buffer is extended to mask its non-nullable children's
+/// nulls: the child just spliced in may be null on rows the base struct considered
+/// valid (an overlay's struct null is pushed into the children it stages), and arrow
+/// rejects a struct whose non-nullable child holds an unmasked null. Masking only
+/// adds nulls on rows where such a child is null, so the overlay-resolved validity
+/// applied afterwards by [`apply_struct_validities`] still decides the final
+/// per-row validity.
 fn splice_by_ids(
     array: &ArrayRef,
     field: &Field,
@@ -649,9 +658,29 @@ fn splice_by_ids(
         rest,
         new_atomic_field,
     )?;
+    let nulls = mask_non_nullable_children(&fields, &children, nulls);
     Ok(Arc::new(StructArray::try_new_with_length(
         fields, children, nulls, len,
     )?))
+}
+
+/// Extend a struct's own nulls to also mask every non-nullable child's nulls, so
+/// the rebuilt struct is valid Arrow even while some children still carry base
+/// values whose nulls reflect the base struct validity rather than the merged one.
+fn mask_non_nullable_children(
+    fields: &Fields,
+    children: &[ArrayRef],
+    nulls: Option<NullBuffer>,
+) -> Option<NullBuffer> {
+    let mut nulls = nulls;
+    for (field, child) in fields.iter().zip(children) {
+        if !field.is_nullable()
+            && let Some(child_nulls) = child.nulls()
+        {
+            nulls = NullBuffer::union(nulls.as_ref(), Some(child_nulls));
+        }
+    }
+    nulls
 }
 
 /// Replace only the validity of the struct at `ancestor_ids`, preserving its
@@ -759,7 +788,13 @@ fn apply_struct_validities(
     columns: &mut [ArrayRef],
     struct_validities: StructValidityMap,
 ) -> Result<()> {
-    for candidates in struct_validities.into_values() {
+    // Restore deeper structs first. Rebuilding a struct makes arrow check that every
+    // required child has no null the parent does not mask, and a nested struct still
+    // carrying its base validity can fail that check until its own candidate is
+    // applied, so an ancestor must be rebuilt only after its descendants are final.
+    let mut candidates = struct_validities.into_values().collect::<Vec<_>>();
+    candidates.sort_by_key(|candidates| std::cmp::Reverse(candidates.ancestor_ids.len()));
+    for candidates in candidates {
         let Some(idx) = schema.index_of(&candidates.top_field.name).ok() else {
             continue;
         };
@@ -976,6 +1011,9 @@ pub async fn merge_overlay_batch(
 
     // Child values resolve independently, but a struct cell has one shared
     // validity, selected from the newest overlay contributing any descendant.
+    // The splices above mask each rebuilt level's non-nullable children, which
+    // may over-null rows the base considered valid; this resolves the final
+    // per-row validity from the overlays' own struct validity.
     apply_struct_validities(schema.as_ref(), &mut columns, struct_validities)?;
     Ok(RecordBatch::try_new(schema, columns)?)
 }

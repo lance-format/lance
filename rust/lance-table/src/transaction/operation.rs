@@ -190,6 +190,9 @@ pub enum Operation {
         fields_modified: Vec<u32>,
         /// MemWAL SSTables to mark as compacted after this transaction.
         compacted_sstables: Vec<CompactedSsTable>,
+        /// The `dir_id` of the MemWAL `compacted_sstables` belongs to; required
+        /// when it is non-empty.
+        mem_wal_dir_id: Option<String>,
         /// The fields that used to judge whether to preserve the new frag's id into
         /// the frag bitmap of the specified indices.
         fields_for_preserving_frag_bitmap: Vec<u32>,
@@ -217,9 +220,9 @@ pub enum Operation {
     /// Update the dataset configuration and metadata.
     ///
     /// Schema or field metadata updates conflict with a concurrent
-    /// [`Self::Merge`] in either commit order. A merge carries complete schema
-    /// state from its read version, so rebasing the operations could discard
-    /// metadata installed by the other transaction.
+    /// [`Self::Merge`] or [`Self::Project`] in either commit order. Merge and
+    /// Project carry complete schema state from their read version, so rebasing
+    /// the operations could discard metadata installed by the other transaction.
     UpdateConfig {
         config_updates: Option<UpdateMap>,
         table_metadata_updates: Option<UpdateMap>,
@@ -232,6 +235,9 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
+        /// The `dir_id` of the MemWAL this update was built for; rejected with
+        /// [`lance_core::Error::StaleMemWal`] unless the manifest carries it.
+        dir_id: String,
     },
 
     /// Clone a dataset.
@@ -333,19 +339,30 @@ pub struct TaggedRewriteAssembly {
     /// rewrite groups redistribute rows, so index bitmaps keep the retired
     /// source ids as provenance instead of following the rewrite.
     pub reordered_sources: RoaringBitmap,
+    /// The segments the commit layer classified as unable to translate their
+    /// stored addresses through this history, by uuid. Their coverage of the
+    /// rewritten sources is withdrawn in this same commit instead of being
+    /// left pointing at provenance they can never translate; every other
+    /// segment keeps its provenance and translates as usual. Established per
+    /// attempt against the manifest the attempt builds on, like the entry
+    /// itself, because a concurrent commit can add such a segment.
+    pub undeferrable_segments: Vec<uuid::Uuid>,
 }
 
 impl TaggedRewriteAssembly {
-    /// Bundle an assembled entry with the transitions it appended.
+    /// Bundle an assembled entry with the transitions it appended and the
+    /// segments whose coverage of their sources this rewrite withdraws.
     pub fn new(
         entry: IndexMetadata,
         base_entry_version: Option<u64>,
         transitions: &[crate::format::pb::fragment_reuse_index_details::Transition],
+        undeferrable_segments: Vec<uuid::Uuid>,
     ) -> lance_core::Result<Self> {
         Ok(Self {
             entry,
             base_entry_version,
             reordered_sources: reordered_sources(transitions)?,
+            undeferrable_segments,
         })
     }
 }
@@ -432,5 +449,17 @@ impl Operation {
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
         }
+    }
+
+    /// The fragment ids a `Rewrite` retires, in group order; empty for every
+    /// other operation.
+    pub fn rewritten_source_fragments(&self) -> impl Iterator<Item = u64> + '_ {
+        let groups = match self {
+            Self::Rewrite { groups, .. } => groups.as_slice(),
+            _ => &[],
+        };
+        groups
+            .iter()
+            .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
     }
 }

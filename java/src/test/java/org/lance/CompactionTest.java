@@ -20,6 +20,7 @@ import org.lance.compaction.CompactionOptions;
 import org.lance.compaction.CompactionPlan;
 import org.lance.compaction.CompactionTask;
 import org.lance.compaction.RewriteResult;
+import org.lance.compaction.SourceBudgetMode;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -61,14 +62,19 @@ public class CompactionTest {
         CompactionOptions compactionOptions =
             CompactionOptions.builder()
                 .withTargetRowsPerFragment(100)
+                .withMinBytesPerFile(1024 * 1024)
                 .withNumThreads(1)
                 .withMaxSourceRows(1000)
                 .withMaxSourceBytes(10L * 1024 * 1024)
+                .withSourceBudgetMode(SourceBudgetMode.SOFT)
                 .withDataStorageVersion(version)
                 .build();
         compactionOptions = serializeAndDeserialize(compactionOptions);
+        assertEquals(Optional.of(1024L * 1024), compactionOptions.getMinBytesPerFile());
         assertEquals(
             Optional.of(version.toRustString()), compactionOptions.getDataStorageVersion());
+        assertEquals(
+            Optional.of(SourceBudgetMode.SOFT.getValue()), compactionOptions.getSourceBudgetMode());
         if (version == DataStorageVersion.LEGACY) {
           CompactionOptions legacyOptions = compactionOptions;
           IllegalArgumentException error =
@@ -84,6 +90,9 @@ public class CompactionTest {
                 : version == DataStorageVersion.NEXT ? "2.3" : version.toRustString();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
 
+        assertEquals(
+            Optional.of(1024L * 1024), compactionPlan.getCompactionOptions().getMinBytesPerFile());
+
         // The source budgets are loose, so the plan is unaffected and the
         // options must survive the JNI round trip.
         assertEquals(Optional.of(1000L), compactionPlan.getCompactionOptions().getMaxSourceRows());
@@ -93,6 +102,9 @@ public class CompactionTest {
         assertEquals(
             Optional.of(exactVersion),
             compactionPlan.getCompactionOptions().getDataStorageVersion());
+        assertEquals(
+            Optional.of(SourceBudgetMode.SOFT.getValue()),
+            compactionPlan.getCompactionOptions().getSourceBudgetMode());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
@@ -296,11 +308,13 @@ public class CompactionTest {
     assertEquals(
         Optional.of(CompactionMode.TRY_BINARY_COPY.getValue()), options.getCompactionMode());
     assertEquals(Optional.of(4L), options.getMaxSourceFragments());
+    assertEquals(Optional.empty(), options.getMinBytesPerFile());
     // Fields absent from the old stream deserialize as unset.
     assertEquals(Optional.empty(), options.getMaxSourceRows());
     assertEquals(Optional.empty(), options.getMaxSourceBytes());
     assertEquals(Collections.emptyList(), options.getExcludedFragmentIds());
     assertEquals(Optional.empty(), options.getDataStorageVersion());
+    assertEquals(Optional.empty(), options.getSourceBudgetMode());
   }
 
   @Test
@@ -309,6 +323,52 @@ public class CompactionTest {
         assertThrows(
             IllegalArgumentException.class, () -> DataStorageVersion.fromRustString("unknown"));
     assertEquals("Unknown data storage version: unknown", error.getMessage());
+  }
+
+  @Test
+  public void testMinBytesPerFile(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("threshold").toString());
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 10).close();
+      try (Dataset dataset = fixture.write(2, 10)) {
+        for (long bytes : new long[] {0, -1, 1024 * 1024 + 1}) {
+          CompactionOptions invalid =
+              CompactionOptions.builder()
+                  .withMaxBytesPerFile(1024 * 1024)
+                  .withMinBytesPerFile(bytes)
+                  .build();
+          assertTrue(
+              assertThrows(
+                      IllegalArgumentException.class,
+                      () -> Compaction.planCompaction(dataset, invalid))
+                  .getMessage()
+                  .contains("min_bytes_per_file"));
+          assertTrue(
+              assertThrows(IllegalArgumentException.class, () -> dataset.compact(invalid))
+                  .getMessage()
+                  .contains("min_bytes_per_file"));
+        }
+        CompactionOptions skip =
+            CompactionOptions.builder()
+                .withMaxBytesPerFile(1024 * 1024)
+                .withMinBytesPerFile(1)
+                .build();
+        assertTrue(Compaction.planCompaction(dataset, skip).getCompactionTasks().isEmpty());
+        long version = dataset.version();
+        dataset.compact(skip);
+        assertEquals(version, dataset.version());
+        CompactionOptions compact =
+            CompactionOptions.builder()
+                .withMaxBytesPerFile(1024 * 1024)
+                .withMinBytesPerFile(1024 * 1024)
+                .build();
+        assertEquals(1, Compaction.planCompaction(dataset, compact).getCompactionTasks().size());
+        dataset.compact(compact);
+        assertEquals(1, dataset.getFragments().size());
+      }
+    }
   }
 
   private static <T> T serializeAndDeserialize(T object)

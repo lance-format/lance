@@ -258,6 +258,12 @@ fn register_bounds() {
     for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
+    for (name, values) in lance_core::cache::histogram_bounds() {
+        bounds.insert((*name).to_string(), Arc::from(*values));
+    }
+    for (name, values) in lance_core::memory::histogram_bounds() {
+        bounds.insert((*name).to_string(), Arc::from(*values));
+    }
 }
 
 /// Describe every metric-emitting subsystem so the catalog is populated. Must
@@ -265,6 +271,9 @@ fn register_bounds() {
 /// `describe_metrics()` here.
 fn describe_all() {
     lance_io::object_store::metrics::describe_metrics();
+    lance_core::cache::describe_metrics();
+    lance_core::memory::describe_metrics();
+    lance_io::spill::describe_metrics();
 }
 
 enum MetricValue {
@@ -419,14 +428,100 @@ pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
     let Some(registry) = REGISTRY.get() else {
         return Vec::new();
     };
-    let points = py.detach(|| collect_points(registry));
+    let points = py.detach(|| {
+        lance_core::cache::refresh_metrics();
+        lance_core::memory::refresh_metrics();
+        collect_points(registry)
+    });
     points.into_iter().map(PyMetricPoint::from).collect()
+}
+
+/// Switch memory observation on or off; see `lance_core::memory::set_observation`.
+#[pyfunction]
+pub fn set_memory_observation(enabled: bool) {
+    lance_core::memory::set_observation(enabled);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_io::spill::{LocalSpillStore, SpillStore};
     use metrics::HistogramFn;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn scratch_traffic_is_exported() {
+        // The recorder is process-global; isolate it from every other bridge test.
+        if std::env::var_os("LANCE_SPILL_EXPORT_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "otel::tests::scratch_traffic_is_exported"])
+                .env("LANCE_SPILL_EXPORT_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let registry = Arc::new(Registry::new(LanceStorage));
+        assert!(
+            metrics::set_global_recorder(LanceRecorder {
+                registry: registry.clone()
+            })
+            .is_ok()
+        );
+        describe_all();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = LocalSpillStore::with_cap(6).unwrap();
+                let (mut writer, spill) = store.new_spill().await.unwrap();
+                writer.write_all(b"hello").await.unwrap();
+                writer.flush().await.unwrap();
+                let error = writer.write_all(b"xx").await.unwrap_err();
+                assert!(matches!(
+                    lance_core::Error::from(error),
+                    lance_core::Error::DiskCapExceeded { .. }
+                ));
+                writer.shutdown().await.unwrap();
+                drop(writer);
+                let reader = spill.reader().await.unwrap();
+                assert_eq!(reader.get_all().await.unwrap().as_ref(), b"hello");
+                assert_eq!(reader.get_all().await.unwrap().as_ref(), b"hello");
+                drop(reader);
+                drop(spill);
+                assert_eq!(store.metrics().snapshot().charged_bytes, 0);
+            });
+        let points = collect_points(&registry);
+        for (name, expected) in [
+            ("lance_spill_accepted_bytes_total", 5.0),
+            ("lance_spill_write_bytes_total", 5.0),
+            ("lance_spill_read_bytes_total", 10.0),
+            ("lance_spill_quota_failures_total", 1.0),
+            ("lance_spill_charged_bytes", 0.0),
+            ("lance_spill_live_files", 0.0),
+        ] {
+            let point = points.iter().find(|point| point.name == name).unwrap();
+            assert!(
+                matches!(point.value, MetricValue::Scalar(value) if value == expected),
+                "{name}"
+            );
+            assert!(point.attributes.is_empty());
+        }
+        let histograms: Vec<_> = points
+            .iter()
+            .filter(|point| point.name == "lance_spill_io_duration_seconds")
+            .collect();
+        assert_eq!(histograms.len(), 2);
+        for point in histograms {
+            assert_eq!(point.attributes.len(), 1);
+            assert!(matches!(
+                point.attributes["operation"].as_str(),
+                "read" | "write"
+            ));
+            assert!(matches!(point.value, MetricValue::Histogram { count, .. } if count > 0));
+        }
+    }
 
     fn bucket_count(buckets: &[(String, u64)], le: &str) -> u64 {
         buckets
@@ -617,7 +712,9 @@ mod tests {
     }
 
     #[test]
-    fn describe_all_covers_object_store_metrics() {
+    fn describe_all_covers_emitted_metrics() {
+        use lance_core::cache::telemetry as cache;
+        use lance_core::memory;
         use lance_io::object_store::metrics as os;
 
         let registry = Arc::new(Registry::new(LanceStorage));
@@ -636,5 +733,54 @@ mod tests {
         assert!(matches!(kind(os::METRIC_RETRYABLE), MetricKind::Counter));
         assert!(matches!(kind(os::METRIC_IN_FLIGHT), MetricKind::Gauge));
         assert!(matches!(kind(os::METRIC_DURATION), MetricKind::Histogram));
+        assert!(matches!(
+            kind("lance_spill_write_bytes_total"),
+            MetricKind::Counter
+        ));
+        assert!(matches!(
+            kind("lance_spill_charged_bytes"),
+            MetricKind::Gauge
+        ));
+        assert_eq!(
+            catalog["lance_spill_charged_bytes"].unit.as_deref(),
+            Some("B")
+        );
+        assert!(matches!(kind(cache::METRIC_LOOKUPS), MetricKind::Counter));
+        assert!(matches!(kind(cache::METRIC_LOADS), MetricKind::Counter));
+        assert!(matches!(
+            kind(cache::METRIC_LOAD_DURATION),
+            MetricKind::Histogram
+        ));
+        assert!(matches!(
+            kind(cache::METRIC_ENTRY_SIZE),
+            MetricKind::Histogram
+        ));
+        assert!(matches!(kind(cache::METRIC_CAPACITY), MetricKind::Gauge));
+        for gauge in [
+            memory::METRIC_RSS,
+            memory::METRIC_RSS_PEAK,
+            memory::METRIC_CGROUP,
+            memory::METRIC_CGROUP_LIMIT,
+        ] {
+            assert!(matches!(kind(gauge), MetricKind::Gauge), "{gauge}");
+        }
+        assert!(matches!(
+            kind(memory::METRIC_STAGE_PEAK),
+            MetricKind::Histogram
+        ));
+        assert!(matches!(
+            kind(memory::METRIC_OPERATION_PEAK),
+            MetricKind::Histogram
+        ));
+    }
+
+    #[test]
+    fn register_bounds_covers_memory_peaks() {
+        use lance_core::memory;
+
+        register_bounds();
+        for name in [memory::METRIC_STAGE_PEAK, memory::METRIC_OPERATION_PEAK] {
+            assert_eq!(&*bounds_for(name), memory::PEAK_BOUNDS, "{name}");
+        }
     }
 }

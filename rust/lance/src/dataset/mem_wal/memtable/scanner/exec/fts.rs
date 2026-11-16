@@ -31,12 +31,13 @@ use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
 use super::super::builder::FtsQuery;
 use super::{newest_pk_positions, scan_record_batch};
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsEntry, FtsMemQuery, MemMatches, SearchContext, SearchOptions, search_cross_column,
 };
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Score column name in output.
 pub const SCORE_COLUMN: &str = "_score";

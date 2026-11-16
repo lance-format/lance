@@ -48,7 +48,7 @@ use super::plugin::{
     MemIndexSpec, ResolveContext, ResolvedIndex,
 };
 use super::query::{MemMatches, MemQuery, RankedMatch, SearchContext, VectorMemQuery};
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::details::{vector_index_details_default, vector_params_from_details};
 
 pub use super::RowPosition;
@@ -872,6 +872,27 @@ mod tests {
             .build()
             .unwrap()
             .install(insert)
+    }
+
+    #[test]
+    fn test_index_rejects_unallocatable_m_at_insert_boundary() {
+        let m = usize::MAX / 2;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(m).ef_construction(m),
+            1,
+            1,
+        );
+
+        let error = index.insert(&make_batch(0, 1, 8), 0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("neighbor_capacity"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(index.len(), 0);
     }
 
     fn make_batch(start_id: i32, n: usize, dim: usize) -> RecordBatch {

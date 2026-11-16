@@ -618,52 +618,5 @@ macro_rules! declare_bitpacker {
                 most_significant_bit(or_collapse_to_u32(accumulator))
             }
         }
-
-        #[cfg(any())]
-        mod tests {
-            use super::super::UnsafeBitPacker;
-            use super::UnsafeBitPackerImpl;
-            use crate::Available;
-            use crate::tests::{DeltaKind, test_suite_compress_decompress};
-
-            #[test]
-            fn test_num_bits() {
-                if UnsafeBitPackerImpl::available() {
-                    for num_bits in 0..32 {
-                        for pos in 0..32 {
-                            let mut vals = [0u32; UnsafeBitPackerImpl::BLOCK_LEN];
-                            if num_bits > 0 {
-                                vals[pos] = 1 << (num_bits - 1);
-                            }
-                            assert_eq!(
-                                unsafe { UnsafeBitPackerImpl::num_bits(&vals[..]) },
-                                num_bits
-                            );
-                        }
-                    }
-                }
-            }
-
-            #[test]
-            fn test_bitpacker() {
-                if UnsafeBitPackerImpl::available() {
-                    test_suite_compress_decompress::<UnsafeBitPackerImpl>(DeltaKind::NoDelta);
-                }
-            }
-
-            #[test]
-            fn test_bitpacker_delta() {
-                if UnsafeBitPackerImpl::available() {
-                    test_suite_compress_decompress::<UnsafeBitPackerImpl>(DeltaKind::Delta);
-                }
-            }
-
-            #[test]
-            fn test_bitpacker_strict_delta() {
-                if UnsafeBitPackerImpl::available() {
-                    test_suite_compress_decompress::<UnsafeBitPackerImpl>(DeltaKind::StrictDelta);
-                }
-            }
-        }
     };
 }
