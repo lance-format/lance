@@ -14,7 +14,7 @@
 //! The tile math lives in `amx_fp16.c` (compiled by `build.rs` with a compiler
 //! new enough for `-mamx-fp16`, which sets `kernel_support = "amx_fp16"`). This
 //! module holds the FFI declarations, the B-operand packing the GEMM's tile
-//! layout requires, and the runtime safety gate. Everything here is
+//! layout requires, and the `FEATURES` its kernels need from the host. Everything here is
 //! crate-internal; the safe public entry points are
 //! [`crate::distance::dot_f16::dot_f16_batch_16`] for the batch-16 shape and
 //! `PackedCentroidsF16` for the GEMM (named, not linked, for the same reason as
@@ -198,6 +198,10 @@ pub(crate) fn tilecfg_image(cfg_kind: i32) -> Option<[u8; 64]> {
 }
 
 /// [`dot_f16_batch_16_amx`] as a `dot_f16_batch_16` dispatch candidate.
+///
+/// Built by hand because `target_kernel!` would put
+/// `#[target_feature(enable = "amx-fp16")]` on a Rust wrapper, which is
+/// unstable; the tile code is in the C object anyway.
 #[cfg(all(
     kernel_support = "amx_fp16",
     target_arch = "x86_64",

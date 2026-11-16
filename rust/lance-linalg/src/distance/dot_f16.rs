@@ -48,6 +48,8 @@ lance_core::dispatch! {
     ];
 }
 
+// `dot_f16_batch_16_fallback` as a dispatch candidate. The plain function stays
+// so the `dim < 32` path and the tests can call it directly and inline it.
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(DOT_F16_BATCH_16_FALLBACK: Batch16Kernel)]
@@ -95,7 +97,8 @@ pub fn dot_f16_batch_16(query: &[f16], candidates: &[&[f16]; 16], len: usize) ->
     }
     let kernel = DOT_F16_BATCH_16.get().as_fn();
     // SAFETY: `get` checked the host features, and every kernel checks its own
-    // arguments.
+    // arguments. The asserts above still run first so both paths panic the
+    // same way.
     unsafe { kernel(query, candidates, len) }
 }
 
