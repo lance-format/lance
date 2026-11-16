@@ -37,6 +37,51 @@ const MAX_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
 // Compression and prediction add decoding work; marginal savings do not justify it.
 const MIN_SAVING_PERCENT: u128 = 5;
 
+/// Applies the predictor to every whole span of a buffer, in place.
+type TransformFn = unsafe fn(&mut [u8], &AxisLayout);
+
+lance_core::dispatch! {
+    static ENCODE_SPANS: Dispatch<TransformFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86_64::ENCODE_AVX2, ENCODE_SCALAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[ENCODE_SCALAR]
+        }
+    };
+}
+
+lance_core::dispatch! {
+    static DECODE_SPANS: Dispatch<TransformFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86_64::DECODE_AVX2, DECODE_SCALAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[DECODE_SCALAR]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(ENCODE_SCALAR: TransformFn)]
+    fn encode_scalar(bytes: &mut [u8], layout: &AxisLayout) {
+        layout.transform_scalar::<false>(bytes);
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(DECODE_SCALAR: TransformFn)]
+    fn decode_scalar(bytes: &mut [u8], layout: &AxisLayout) {
+        layout.transform_scalar::<true>(bytes);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AxisLayout {
     axis_length: usize,
@@ -119,20 +164,13 @@ impl AxisLayout {
     }
 
     fn transform_values<const DECODE: bool>(self, bytes: &mut [u8]) {
-        #[cfg(target_arch = "x86_64")]
-        if self.axis_length * self.inner_stride * self.element_bytes >= 16
-            && std::is_x86_feature_detected!("avx2")
-        {
-            let stride_bytes = self.inner_stride * self.element_bytes;
-            let span_bytes = self.axis_length * stride_bytes;
-            // SAFETY: Runtime detection guarantees AVX2. Layout validation and
-            // the caller's buffer check guarantee complete, element-aligned spans.
-            unsafe {
-                x86_64::transform::<DECODE>(bytes, span_bytes, stride_bytes, self.element_bytes);
-            }
+        // Spans shorter than one vector have no SIMD path in any kernel.
+        if self.axis_length * self.inner_stride * self.element_bytes < 16 {
+            self.transform_scalar::<DECODE>(bytes);
             return;
         }
-        self.transform_scalar::<DECODE>(bytes);
+        let dispatch = if DECODE { &DECODE_SPANS } else { &ENCODE_SPANS };
+        dispatch.get().call(bytes, &self);
     }
 
     fn transform_scalar<const DECODE: bool>(self, bytes: &mut [u8]) {
@@ -710,15 +748,11 @@ mod tests {
         assert_eq!(data.data.as_ref(), input);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[rstest::rstest]
-    fn simd_matches_scalar_at_boundaries(
+    fn candidates_match_scalar_at_boundaries(
         #[values(1, 2, 4, 8)] element_bytes: usize,
         #[values(1, 2, 3, 5, 7, 8, 15, 16, 17, 31, 32, 33)] inner_stride: usize,
     ) {
-        if !std::is_x86_feature_detected!("avx2") {
-            return;
-        }
         let mut rng = StdRng::seed_from_u64(731);
         for axis_length in [1, 2, 3, 7, 15, 16, 17, 31, 32, 33, 65] {
             let layout = AxisLayout {
@@ -727,40 +761,32 @@ mod tests {
                 elements: 2 * axis_length * inner_stride,
                 element_bytes,
             };
-            let span_bytes = axis_length * inner_stride * element_bytes;
             // Multiple spans and tensors catch predictor carry leaking across
             // boundaries. Sentinels detect writes outside unaligned slices.
             let input: Vec<u8> = (0..3 * layout.row_bytes()).map(|_| rng.random()).collect();
             let mut expected = input.clone();
             layout.transform_scalar::<false>(&mut expected);
-            for offset in [0, 1, 5, 31] {
-                let end = offset + input.len();
-                let mut actual = vec![0xa7; end + 32];
-                actual[offset..end].copy_from_slice(&input);
-                // SAFETY: AVX2 is checked above and the generated buffer/layout
-                // satisfy the complete-span contract, including short spans.
-                unsafe {
-                    x86_64::transform::<false>(
-                        &mut actual[offset..end],
-                        span_bytes,
-                        inner_stride * element_bytes,
-                        element_bytes,
-                    );
+            for (encode, decode) in ENCODE_SPANS
+                .candidates()
+                .iter()
+                .zip(DECODE_SPANS.candidates())
+            {
+                let (Some(encode_kernel), Some(decode_kernel)) = (encode.kernel(), decode.kernel())
+                else {
+                    continue;
+                };
+                for offset in [0, 1, 5, 31] {
+                    let end = offset + input.len();
+                    let mut actual = vec![0xa7; end + 32];
+                    actual[offset..end].copy_from_slice(&input);
+                    encode_kernel.call(&mut actual[offset..end], &layout);
+                    assert_eq!(&actual[offset..end], expected, "{}", encode.name());
+                    // Decode independently generated scalar bytes.
+                    decode_kernel.call(&mut actual[offset..end], &layout);
+                    assert_eq!(&actual[offset..end], input, "{}", decode.name());
+                    assert!(actual[..offset].iter().all(|b| *b == 0xa7));
+                    assert!(actual[end..].iter().all(|b| *b == 0xa7));
                 }
-                assert_eq!(&actual[offset..end], expected);
-                // Decode independently generated scalar bytes with SIMD.
-                // SAFETY: the same buffer and layout as the encode call above.
-                unsafe {
-                    x86_64::transform::<true>(
-                        &mut actual[offset..end],
-                        span_bytes,
-                        inner_stride * element_bytes,
-                        element_bytes,
-                    );
-                }
-                assert_eq!(&actual[offset..end], input);
-                assert!(actual[..offset].iter().all(|b| *b == 0xa7));
-                assert!(actual[end..].iter().all(|b| *b == 0xa7));
             }
         }
     }

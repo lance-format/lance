@@ -6,6 +6,8 @@
 
 use std::arch::x86_64::*;
 
+use super::{AxisLayout, TransformFn};
+
 #[inline]
 fn update_tail<const DECODE: bool, const WIDTH: usize>(
     span: &mut [u8],
@@ -60,23 +62,47 @@ unsafe fn combine256<const DECODE: bool, const WIDTH: usize>(
     }
 }
 
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(pub(super) ENCODE_AVX2: TransformFn)]
+    fn encode_avx2(bytes: &mut [u8], layout: &AxisLayout) {
+        transform::<false>(bytes, layout);
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(pub(super) DECODE_AVX2: TransformFn)]
+    fn decode_avx2(bytes: &mut [u8], layout: &AxisLayout) {
+        transform::<true>(bytes, layout);
+    }
+}
+
 /// Transform complete predictor spans without touching neighboring bytes.
+/// Unaligned buffers are supported.
 ///
-/// # Safety
-/// AVX2 must be available. Width must be 1, 2, 4, or 8; stride and span size
-/// must be positive multiples of width, with stride dividing span size.
-/// The buffer must contain complete spans. Unaligned buffers are supported.
+/// # Panics
+/// Panics unless `bytes` holds whole spans of `layout`.
 #[target_feature(enable = "avx2")]
-pub(super) unsafe fn transform<const DECODE: bool>(
-    bytes: &mut [u8],
-    span_bytes: usize,
-    stride: usize,
-    width: usize,
-) {
-    // SAFETY: The caller validates the CPU and layout; dispatch fixes the lane
-    // width outside all element loops.
+fn transform<const DECODE: bool>(bytes: &mut [u8], layout: &AxisLayout) {
+    let stride = layout.inner_stride * layout.element_bytes;
+    let span_bytes = layout.axis_length * stride;
+    // The vector paths load at least 16 bytes from each span.
+    if span_bytes < 16 {
+        layout.transform_scalar::<DECODE>(bytes);
+        return;
+    }
+    // The vector paths read and write through raw pointers within each span,
+    // so a partial span would put them out of bounds.
+    assert!(
+        bytes.len().is_multiple_of(span_bytes),
+        "AxisDelta buffer of {} bytes is not whole spans of {span_bytes} bytes",
+        bytes.len()
+    );
+    // SAFETY: AVX2 is enabled on this function. Spans are whole and at least
+    // 16 bytes, and the stride is a whole number of elements dividing the span.
     unsafe {
-        match width {
+        match layout.element_bytes {
             1 => transform_width::<DECODE, 1>(bytes, span_bytes, stride),
             2 => transform_width::<DECODE, 2>(bytes, span_bytes, stride),
             4 => transform_width::<DECODE, 4>(bytes, span_bytes, stride),
