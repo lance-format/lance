@@ -190,7 +190,9 @@ pub trait Dot: Num {
     /// The default calls [`Dot::dot`] per vector. `f32` overrides it with one
     /// batch kernel call, so the SIMD tier is chosen once for the whole batch
     /// instead of once per vector. `f64` overrides it off x86_64 to specialize
-    /// the loop for the common PQ sub-vector lengths.
+    /// the loop for the common PQ sub-vector lengths. `f16` and `bf16` call the
+    /// portable scalar kernel directly when the build has no C half kernels, so
+    /// that it inlines; otherwise they keep selecting per vector.
     ///
     /// # Panics
     ///
@@ -211,6 +213,25 @@ impl Dot for bf16 {
         assert_equal_lengths(x.len(), y.len());
         DOT_BF16.get().call(x, y)
     }
+
+    #[inline]
+    fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            #[cfg(not(any(kernel_support = "half", kernel_support = "avx512_bf16")))]
+            {
+                // Without C half kernels `DOT_BF16` has a single portable
+                // candidate. Calling it through the dispatch function pointer
+                // keeps the scalar kernel out of line, adding a call per
+                // vector to the PQ table build loop.
+                *product = dot_scalar::<Self, f32, 32>(x, y);
+            }
+            #[cfg(any(kernel_support = "half", kernel_support = "avx512_bf16"))]
+            {
+                *product = Self::dot(x, y);
+            }
+        }
+    }
 }
 
 impl Dot for f16 {
@@ -218,6 +239,23 @@ impl Dot for f16 {
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
         DOT_F16.get().call(x, y)
+    }
+
+    #[inline]
+    fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            #[cfg(not(any(kernel_support = "half", kernel_support = "avx512_f16")))]
+            {
+                // See `dot_batch_into` for bf16: inline the only portable
+                // candidate instead of calling it through the dispatch.
+                *product = dot_scalar::<Self, f32, 32>(x, y);
+            }
+            #[cfg(any(kernel_support = "half", kernel_support = "avx512_f16"))]
+            {
+                *product = Self::dot(x, y);
+            }
+        }
     }
 }
 
@@ -1437,8 +1475,8 @@ mod tests {
     }
 
     /// `dot_batch_into` must agree with the per-vector `dot`. The f32 batch
-    /// kernel may differ in rounding; the f64 batch loops run the pair
-    /// kernel's arithmetic, so f64 must match bit for bit.
+    /// kernel may differ in rounding; the f64 and half batches run the pair
+    /// kernel's arithmetic, so they must match bit for bit.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_12(12)]
@@ -1477,6 +1515,8 @@ mod tests {
                 }
             }
         }
+        check::<f16>(dimension, true);
+        check::<bf16>(dimension, true);
         check::<f32>(dimension, false);
         check::<f64>(dimension, true);
     }
