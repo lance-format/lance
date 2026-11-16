@@ -54,19 +54,9 @@ fn build_prefilter_bitset<'a>(
     prefilter: &dyn PreFilter,
     generator: &'a mut VisitedGenerator,
 ) -> Option<Visited<'a>> {
-    if !prefilter.is_mask_equivalent() {
-        let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
-        let mut bitset = generator.generate(storage.len());
-        for index in indices {
-            bitset.insert(index as u32);
-        }
-        return (bitset.count_ones() != storage.len()).then_some(bitset);
-    }
-
-    let prepared = prefilter.prepared_mask();
-    if let Some(mask) = prepared
-        .as_ref()
-        .filter(|mask| mask.is_dense_selection_eligible(storage.row_ids().size_hint().0))
+    if prefilter.is_mask_equivalent()
+        && let Some(mask) = prefilter.prepared_mask()
+        && mask.is_dense_selection_eligible(storage.row_ids().size_hint().0)
     {
         // Scan the accepted prefix once; on the first rejected row, switch to
         // writing selected positions without revisiting that prefix.
@@ -100,46 +90,14 @@ fn build_prefilter_bitset<'a>(
         return Some(bitset);
     }
 
+    // Keep fragment-run selection for masks and partitions that cannot use
+    // the prepared view. Per-row mask lookups are expensive for sparse filters.
+    let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
     let mut bitset = generator.generate(storage.len());
-    let mut prefix = 0..storage.len();
-    let mut is_prefix = true;
-    let mut select = |position: usize, _: u64| {
-        // A consecutive prefix need not touch the bitmap until a rejection is
-        // observed. All-pass queries then avoid both its dirty log and clearing.
-        if is_prefix && position == prefix.start && prefix.next().is_some() {
-            return;
-        }
-        if is_prefix {
-            for index in 0..prefix.start {
-                bitset.insert(index as u32);
-            }
-            is_prefix = false;
-        }
-        bitset.insert(position as u32);
-    };
-    if let Some(mask) = prepared {
-        mask.for_each_selected(storage.row_ids(), &mut select);
-    } else {
-        let mask = prefilter.mask();
-        for (position, &row_id) in storage.row_ids().enumerate() {
-            if mask.selected(row_id) {
-                select(position, row_id);
-            }
-        }
+    for index in indices {
+        bitset.insert(index as u32);
     }
-
-    if is_prefix {
-        if prefix.is_empty() {
-            // Every actual input position was checked, in order, through N-1.
-            // This is not a proof from mask cardinality or fragment metadata.
-            return None;
-        }
-        // A rejected suffix has no later selected callback to reveal its gap.
-        for index in 0..prefix.start {
-            bitset.insert(index as u32);
-        }
-    }
-    Some(bitset)
+    (bitset.count_ones() != storage.len()).then_some(bitset)
 }
 
 /// Fixed seed for HNSW node-level assignment.
@@ -2322,11 +2280,10 @@ mod tests {
         let storage = prefilter_test_storage(row_ids);
         let legacy = LegacyPreFilter { mask: mask.clone() };
         let expected = legacy.filter_row_ids(Box::new(storage.row_ids()));
-        let base: Arc<dyn PreFilter> = Arc::new(MaskPreFilter { mask: mask.clone() });
-        // Another initial partition can fund the shared view for a small one.
         struct PreparedFilter {
             mask: Arc<RowAddrMask>,
-            view: Arc<lance_select::PreparedRowAddrMask>,
+            view: Option<Arc<lance_select::PreparedRowAddrMask>>,
+            bulk_calls: AtomicUsize,
         }
         #[async_trait]
         impl PreFilter for PreparedFilter {
@@ -2340,30 +2297,30 @@ mod tests {
                 self.mask.clone()
             }
             fn prepared_mask(&self) -> Option<Arc<lance_select::PreparedRowAddrMask>> {
-                Some(self.view.clone())
+                self.view.clone()
             }
             fn is_mask_equivalent(&self) -> bool {
                 true
             }
-            fn filter_row_ids<'a>(
-                &self,
-                _rows: Box<dyn Iterator<Item = &'a u64> + 'a>,
-            ) -> Vec<u64> {
-                panic!("prepared membership must preserve the mask-only path")
+            fn filter_row_ids<'a>(&self, rows: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+                self.bulk_calls.fetch_add(1, Ordering::Relaxed);
+                self.mask.selected_indices(rows)
             }
         }
-        let prepared: Arc<dyn PreFilter> = Arc::new(PreparedFilter {
-            view: Arc::new(
-                lance_select::PreparedRowAddrMask::try_new(mask.clone(), [4096]).unwrap(),
-            ),
-            mask,
-        });
-        assert!(prepared.prepared_mask().is_some());
+        // Another initial partition can fund the shared view for a small one.
+        let view =
+            Arc::new(lance_select::PreparedRowAddrMask::try_new(mask.clone(), [4096]).unwrap());
+        let eligible = view.is_dense_selection_eligible(storage.row_ids().size_hint().0);
         let mut generator = VisitedGenerator::new(0);
-        for _ in 0..2 {
-            for filter in [&base, &prepared] {
+        for (view, expected_bulk_calls) in [(None, 2), (Some(view), if eligible { 0 } else { 2 })] {
+            let filter = PreparedFilter {
+                mask: mask.clone(),
+                view,
+                bulk_calls: AtomicUsize::new(0),
+            };
+            for _ in 0..2 {
                 {
-                    let bitset = build_prefilter_bitset(&storage, filter.as_ref(), &mut generator);
+                    let bitset = build_prefilter_bitset(&storage, &filter, &mut generator);
                     assert_eq!(bitset.is_none(), expected.len() == count);
                     if let Some(bitset) = bitset {
                         assert_eq!(
@@ -2378,6 +2335,10 @@ mod tests {
                 let clean = generator.generate(count);
                 assert_eq!(clean.count_ones(), 0);
             }
+            assert_eq!(
+                filter.bulk_calls.load(Ordering::Relaxed),
+                expected_bulk_calls
+            );
         }
     }
 
