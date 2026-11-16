@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::{Range, RangeBounds, RangeInclusive};
@@ -559,6 +560,53 @@ impl RowAddrSelection {
     }
 }
 
+impl RowAddrSelection {
+    /// Stands in for a selection taken out of a map by value; allocates nothing.
+    fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::Partial(RoaringBitmap::new()))
+    }
+
+    /// The rows of one fragment held by both sides, or `None` if there are
+    /// none. An owned `lhs` is narrowed in place, a borrowed one is not copied
+    /// first. The one definition behind `&=` and
+    /// [`RowAddrTreeMap::intersection`].
+    fn intersection(lhs: Cow<'_, Self>, rhs: &Self) -> Option<Self> {
+        let selection = match (lhs, rhs) {
+            (lhs, Self::Full) => lhs.into_owned(),
+            (Cow::Borrowed(Self::Full) | Cow::Owned(Self::Full), rhs) => rhs.clone(),
+            (Cow::Borrowed(Self::Partial(lhs)), Self::Partial(rhs)) => Self::Partial(lhs & rhs),
+            (Cow::Owned(Self::Partial(mut lhs)), Self::Partial(rhs)) => {
+                lhs &= rhs;
+                Self::Partial(lhs)
+            }
+        };
+        let is_empty = matches!(&selection, Self::Partial(set) if set.is_empty());
+        (!is_empty).then_some(selection)
+    }
+
+    /// The rows of one fragment that `lhs` holds and `rhs` does not, or `None`
+    /// if there are none. An owned `lhs` is narrowed in place, a borrowed one
+    /// is not copied first. The one definition behind `-=` and
+    /// [`RowAddrTreeMap::difference`].
+    fn difference(lhs: Cow<'_, Self>, rhs: &Self) -> Option<Self> {
+        let set = match (lhs, rhs) {
+            (_, Self::Full) => return None,
+            (Cow::Borrowed(Self::Full) | Cow::Owned(Self::Full), Self::Partial(rhs)) => {
+                // This generally won't be hit.
+                let mut set = RoaringBitmap::full();
+                set -= rhs;
+                return Some(Self::Partial(set));
+            }
+            (Cow::Borrowed(Self::Partial(lhs)), Self::Partial(rhs)) => lhs - rhs,
+            (Cow::Owned(Self::Partial(mut lhs)), Self::Partial(rhs)) => {
+                lhs -= rhs;
+                lhs
+            }
+        };
+        (!set.is_empty()).then_some(Self::Partial(set))
+    }
+}
+
 impl RowAddrTreeMap {
     /// Rows held by both maps, allocating only the result.
     pub fn intersection(&self, other: &Self) -> Self {
@@ -566,21 +614,11 @@ impl RowAddrTreeMap {
             .inner
             .iter()
             .filter_map(|(fragment, lhs)| {
-                let selection = match (lhs, other.inner.get(fragment)?) {
-                    (RowAddrSelection::Full, RowAddrSelection::Full) => RowAddrSelection::Full,
-                    (RowAddrSelection::Full, RowAddrSelection::Partial(set))
-                    | (RowAddrSelection::Partial(set), RowAddrSelection::Full) => {
-                        RowAddrSelection::Partial(set.clone())
-                    }
-                    (RowAddrSelection::Partial(lhs), RowAddrSelection::Partial(rhs)) => {
-                        RowAddrSelection::Partial(lhs & rhs)
-                    }
-                };
-                // Like `BitAndAssign`, keep no fragment without rows, whichever
-                // side the empty set came from.
-                let is_empty =
-                    matches!(&selection, RowAddrSelection::Partial(set) if set.is_empty());
-                (!is_empty).then_some((*fragment, selection))
+                let rhs = other.inner.get(fragment)?;
+                Some((
+                    *fragment,
+                    RowAddrSelection::intersection(Cow::Borrowed(lhs), rhs)?,
+                ))
             })
             .collect();
         Self { inner }
@@ -592,21 +630,9 @@ impl RowAddrTreeMap {
             .inner
             .iter()
             .filter_map(|(fragment, lhs)| {
-                let selection = match (lhs, other.inner.get(fragment)) {
-                    (_, Some(RowAddrSelection::Full)) => return None,
-                    (lhs, None) => lhs.clone(),
-                    (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => {
-                        let mut set = RoaringBitmap::full();
-                        set -= rhs;
-                        RowAddrSelection::Partial(set)
-                    }
-                    (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
-                        let set = lhs - rhs;
-                        if set.is_empty() {
-                            return None;
-                        }
-                        RowAddrSelection::Partial(set)
-                    }
+                let selection = match other.inner.get(fragment) {
+                    Some(rhs) => RowAddrSelection::difference(Cow::Borrowed(lhs), rhs)?,
+                    None => lhs.clone(),
                 };
                 Some((*fragment, selection))
             })
@@ -1161,29 +1187,15 @@ impl std::ops::BitAndAssign<Self> for RowAddrTreeMap {
 
 impl std::ops::BitAndAssign<&Self> for RowAddrTreeMap {
     fn bitand_assign(&mut self, rhs: &Self) {
-        // Remove fragment that aren't on the RHS
-        self.inner
-            .retain(|fragment, _| rhs.inner.contains_key(fragment));
-
-        // For fragments that are on the RHS, intersect the bitmaps
-        for (fragment, mut lhs_set) in &mut self.inner {
-            match (&mut lhs_set, rhs.inner.get(fragment)) {
-                (_, None) => {} // Already handled by retain
-                (_, Some(RowAddrSelection::Full)) => {
-                    // Everything selected on RHS, so can leave LHS untouched.
-                }
-                (RowAddrSelection::Partial(lhs_set), Some(RowAddrSelection::Partial(rhs_set))) => {
-                    *lhs_set &= rhs_set;
-                }
-                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs_set))) => {
-                    *lhs_set = RowAddrSelection::Partial(rhs_set.clone());
-                }
-            }
-        }
-        // Some bitmaps might now be empty. If they are, we should remove them.
-        self.inner.retain(|_, set| match set {
-            RowAddrSelection::Partial(set) => !set.is_empty(),
-            RowAddrSelection::Full => true,
+        self.inner.retain(|fragment, lhs| {
+            let kept = rhs
+                .inner
+                .get(fragment)
+                .and_then(|rhs| RowAddrSelection::intersection(Cow::Owned(lhs.take()), rhs));
+            kept.is_some_and(|kept| {
+                *lhs = kept;
+                true
+            })
         });
     }
 }
@@ -1208,34 +1220,15 @@ impl std::ops::Sub<&Self> for RowAddrTreeMap {
 
 impl std::ops::SubAssign<&Self> for RowAddrTreeMap {
     fn sub_assign(&mut self, rhs: &Self) {
-        for (fragment, rhs_set) in &rhs.inner {
-            match self.inner.get_mut(fragment) {
-                None => {}
-                Some(RowAddrSelection::Full) => {
-                    // If the fragment is already selected then there is nothing to do
-                    match rhs_set {
-                        RowAddrSelection::Full => {
-                            self.inner.remove(fragment);
-                        }
-                        RowAddrSelection::Partial(rhs_set) => {
-                            // This generally won't be hit.
-                            let mut set = RoaringBitmap::full();
-                            set -= rhs_set;
-                            self.inner.insert(*fragment, RowAddrSelection::Partial(set));
-                        }
-                    }
+        for (fragment, rhs) in &rhs.inner {
+            let Some(lhs) = self.inner.get_mut(fragment) else {
+                continue;
+            };
+            match RowAddrSelection::difference(Cow::Owned(lhs.take()), rhs) {
+                Some(kept) => *lhs = kept,
+                None => {
+                    self.inner.remove(fragment);
                 }
-                Some(RowAddrSelection::Partial(lhs_set)) => match rhs_set {
-                    RowAddrSelection::Full => {
-                        self.inner.remove(fragment);
-                    }
-                    RowAddrSelection::Partial(rhs_set) => {
-                        *lhs_set -= rhs_set;
-                        if lhs_set.is_empty() {
-                            self.inner.remove(fragment);
-                        }
-                    }
-                },
             }
         }
     }
@@ -1618,12 +1611,12 @@ mod tests {
             (8, whole()),          // absent from `lhs`
                                    // 4 and 9: whole and partial absent from `rhs`
         ]);
-        let other_block = tree(vec![(1, partial(&[6])), (6, whole())]);
+        let block_rows = tree(vec![(1, partial(&[6])), (6, whole())]);
 
         let allow = RowAddrMask::from_allowed(lhs);
         let other_allow = RowAddrMask::from_allowed(rhs.clone());
         let block = RowAddrMask::from_block(rhs);
-        let other_block = RowAddrMask::from_block(other_block);
+        let other_block = RowAddrMask::from_block(block_rows);
         for (a, b) in [
             (&allow, &other_allow),
             (&other_allow, &allow),

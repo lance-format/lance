@@ -1516,18 +1516,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Self {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::from_cached_with_remapper(reader, ivf, metadata, distance_type, frag_reuse_index)
-    }
-
-    #[doc(hidden)]
-    pub fn from_cached_with_remapper(
-        reader: FileReader,
-        ivf: IvfModel,
-        metadata: Q::Metadata,
-        distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Self {
-        Self::from_cached_with_quantizer(
+        Self::from_cached_with_remapper(
             reader,
             ivf,
             metadata,
@@ -1537,11 +1526,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         )
     }
 
-    /// [`Self::from_cached_with_remapper`] with a quantizer built earlier for
-    /// the same metadata, so reconstructing an index does not rebuild it (and
-    /// its prepared targets) from the metadata each time.
+    /// `quantizer` is one built earlier for the same metadata, so that
+    /// reconstructing an index does not rebuild it (and its prepared targets)
+    /// from the metadata each time.
     #[doc(hidden)]
-    pub fn from_cached_with_quantizer(
+    pub fn from_cached_with_remapper(
         reader: FileReader,
         ivf: IvfModel,
         metadata: Q::Metadata,
@@ -1750,6 +1739,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     pub fn partition_size(&self, part_id: usize) -> usize {
         self.ivf.partition_size(part_id)
+    }
+
+    /// The quantizer this storage keeps, if its quantization retains one.
+    /// Unlike [`Self::quantizer`], never builds one from the metadata.
+    pub fn retained_quantizer(&self) -> Option<&Quantizer> {
+        self.quantizer.as_ref()
     }
 
     pub fn quantizer(&self) -> Result<Quantizer> {

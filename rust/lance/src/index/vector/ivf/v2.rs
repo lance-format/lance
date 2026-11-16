@@ -2843,9 +2843,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
             // The storage's own copy, when it retains one: building another
             // would widen the codebook and prepare its targets a second time.
-            quantizer: Q::retain_quantizer_for_partition_storage()
-                .then(|| self.storage.quantizer().ok())
-                .flatten(),
+            quantizer: self.storage.retained_quantizer().cloned(),
         }))
     }
 }
@@ -3910,7 +3908,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 
     let quantizer = state.quantizer.clone();
     let make_storage = |legacy| {
-        IvfQuantizationStorage::from_cached_with_quantizer(
+        IvfQuantizationStorage::from_cached_with_remapper(
             aux_reader,
             state.aux_ivf.clone(),
             state.metadata.clone(),
