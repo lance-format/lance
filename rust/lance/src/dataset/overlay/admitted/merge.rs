@@ -14,7 +14,8 @@ struct PreparedField {
     inputs: Vec<PreparedFullZipTake>,
 }
 
-pub(crate) struct PreparedOverlayBatch {
+/// Prepared overlay inputs and routing awaiting the admitted base batch.
+pub struct PreparedOverlayBatch {
     fields: Vec<PreparedField>,
 }
 

@@ -13,7 +13,7 @@ use lance_encoding::data::try_interleave_nested_binary_in;
 use super::*;
 
 mod merge;
-pub(crate) use merge::PreparedOverlayBatch;
+pub use merge::PreparedOverlayBatch;
 mod validity;
 pub use validity::{AdmittedStructValidityRouting, OverlayStructValidityInput};
 
