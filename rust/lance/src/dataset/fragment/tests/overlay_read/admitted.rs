@@ -97,7 +97,7 @@ async fn write_payload_dataset(version: LanceFileVersion, nested: bool) -> Datas
 // Field metadata is a dense-encoding preference, not a ban on Constant layout.
 // Check the stored fixture layout so admitted-path coverage cannot silently drift.
 async fn assert_overlay_layout(dataset: &Dataset, name: &str, is_constant: bool) {
-    let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::default());
+    let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::new(1024));
     let file = scheduler
         .open_file(
             &dataset.data_dir().join(format!("{name}.lance")),
