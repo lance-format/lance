@@ -13,8 +13,7 @@ use crate::{
     data::{AllNullDataBlock, DataBlock},
     decoder::{PageEncoding, PageInfo},
     encodings::physical::sequence::{SequenceDecoder, SequenceMetadata},
-    format::{EncodingUtils, metadata::page_layout::Layout, pb23},
-    repdef::DefinitionInterpretation,
+    format::{metadata::page_layout::Layout, pb23},
 };
 
 #[derive(Debug)]
@@ -36,11 +35,7 @@ impl AllNullScheduler {
                 if layout.inline_value.is_some() || !page.buffer_offsets_and_sizes.is_empty() {
                     return Ok(None);
                 }
-                if layout.layers.as_slice()
-                    != [EncodingUtils::def_inter_to_repdef_layer(
-                        DefinitionInterpretation::NullableItem,
-                    )]
-                {
+                if layout.layers.as_slice() != [pb23::RepDefLayer::RepdefNullableItem as i32] {
                     // With nested layers, no values does not imply null parent rows.
                     return Ok(None);
                 }

@@ -12,6 +12,8 @@ use super::*;
 use crate::{
     compression::DefaultDecompressionStrategy,
     encodings::{logical::primitive::AdmittedBytePageScheduler, physical::range::RangeEncoder},
+    format::EncodingUtils,
+    repdef::DefinitionInterpretation,
 };
 
 fn sparse_validity(rows: u64, null_positions: bool) -> pb23::SparseValiditySet {
