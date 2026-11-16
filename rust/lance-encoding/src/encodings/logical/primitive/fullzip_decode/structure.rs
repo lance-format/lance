@@ -93,7 +93,7 @@ impl FullZipScheduler {
                         return Err(corrupt("Variable values have no row index"));
                     };
                     let row_bytes = bytes
-                        .checked_add(details.ctrl_word_parser.bytes_per_word() as u64)
+                        .checked_add(details.bytes_per_word() as u64)
                         .ok_or_else(|| corrupt("Fixed row size overflow"))?;
                     for row in range.clone() {
                         let start = row
@@ -455,6 +455,7 @@ mod tests {
             def_meaning: layers.into(),
             ctrl_word_parser: ControlWordParser::new(1, def_bits),
             max_rep: 1,
+            is_padded: false,
         })
     }
 

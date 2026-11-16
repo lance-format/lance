@@ -863,10 +863,11 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
 
 #[derive(Debug)]
 enum VariableFullZipRowIndex {
-    /// No control words (`ControlWordParser::NIL`): every row is a single valid,
-    /// visible item, so row `i` maps directly to offset `i` and byte offset `offsets[i]`.
+    /// No control words and no padding (`ControlWordParser::NIL`): every row is a single
+    /// valid, visible item, so row `i` maps directly to offset `i` and byte offset `offsets[i]`.
     Flat,
-    /// General case with repetition and/or definition control words.
+    /// General case with repetition and/or definition control words, and NIL pages padded
+    /// with a zero byte per value (see `FullZipDecodeDetails::is_padded`).
     Indexed {
         repdef_starts: Vec<usize>,
         data_starts: Vec<usize>,
@@ -960,6 +961,10 @@ impl VariableFullZipDecoder {
         in_bits_per_length: u8,
         out_bits_per_offset: u8,
     ) -> Result<Self> {
+        debug_assert!(
+            !details.is_padded || matches!(details.ctrl_word_parser, ControlWordParser::NIL),
+            "only NIL control-word pages can be padded"
+        );
         // A padded NIL page takes the indexed walk, which skips the padding byte with
         // each control word.
         let is_flat =
@@ -3009,28 +3014,50 @@ mod tests {
             .collect()
     }
 
-    /// Writers before #9018 could put a zero byte before each value of a NIL page.
+    /// Writers before #9018 could put a zero byte before each value of a NIL page. A padded
+    /// page reads like the unpadded one, whole or one row at a time.
     #[rstest]
-    #[case::unpadded(None)]
-    #[case::padded(Some(0))]
-    fn variable_full_zip_reads_nil_page(#[case] padding: Option<u8>) {
-        let mut decoder = VariableFullZipDecoder::new(
-            truncated_tail_details(),
-            std::collections::VecDeque::from([LanceBuffer::from(nil_variable_page(padding))]),
-            2,
-            32,
-            32,
-        )
-        .unwrap();
-        let DataBlock::VariableWidth(block) = decoder.drain(2).unwrap().decode().unwrap().data
-        else {
-            panic!("expected a variable-width block");
+    fn variable_full_zip_reads_nil_page(
+        #[values(None, Some(0))] padding: Option<u8>,
+        #[values(1, 2)] rows_per_drain: u64,
+    ) {
+        let new_decoder = |padding| {
+            VariableFullZipDecoder::new(
+                truncated_tail_details(),
+                std::collections::VecDeque::from([LanceBuffer::from(nil_variable_page(padding))]),
+                2,
+                32,
+                32,
+            )
+            .unwrap()
         };
-        assert_eq!(block.data.as_ref(), b"abcxyz");
-        assert_eq!(
-            block.offsets.borrow_to_typed_slice::<u32>().as_ref(),
-            [0, 3, 6]
-        );
+        let mut decoder = new_decoder(padding);
+        let mut unpadded = new_decoder(None);
+        let mut values = Vec::new();
+        for _ in 0..2 / rows_per_drain {
+            assert_eq!(
+                decoder.decoded_bytes(rows_per_drain).unwrap(),
+                unpadded.decoded_bytes(rows_per_drain).unwrap()
+            );
+            unpadded.drain(rows_per_drain).unwrap();
+            let DataBlock::VariableWidth(block) = decoder
+                .drain(rows_per_drain)
+                .unwrap()
+                .decode()
+                .unwrap()
+                .data
+            else {
+                panic!("expected a variable-width block");
+            };
+            let offsets = block.offsets.borrow_to_typed_slice::<u32>();
+            values.extend(
+                offsets
+                    .as_ref()
+                    .windows(2)
+                    .map(|w| block.data.as_ref()[w[0] as usize..w[1] as usize].to_vec()),
+            );
+        }
+        assert_eq!(values, [b"abc".to_vec(), b"xyz".to_vec()]);
     }
 
     /// Only zero padding is accepted; otherwise the error from the NIL walk is reported.
