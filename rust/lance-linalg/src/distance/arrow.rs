@@ -11,7 +11,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use num_traits::AsPrimitive;
 
 use super::{
-    Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, dot_distance_batch_into, hamming,
+    Cosine, DistanceType, Dot, L2, Normalize, dot_distance_batch_into, hamming,
     l2_distance_batch_into, norm_l2,
 };
 use crate::Result;
@@ -92,9 +92,22 @@ impl Operation<'_> {
                 }
                 Ok(distances)
             }
-            Self::Multivec(metric, rows) => {
-                Ok(multivec(query, values, dim, rows, metric.try_func()?))
-            }
+            Self::Multivec(metric, rows) => match metric {
+                DistanceType::Cosine => {
+                    // `cosine` is defined as `cosine_fast(x, norm_l2(x), other)`,
+                    // so hoisting each query sub-vector's norm out of the
+                    // pairwise loop is bit-identical while dropping one O(dim)
+                    // query pass per (row, stored sub-vector) pair.
+                    let query_norms: Vec<f32> = query.chunks_exact(dim).map(norm_l2).collect();
+                    Ok(multivec(query, values, dim, rows, |query_index, q, v| {
+                        T::cosine_fast(q, query_norms[query_index], v)
+                    }))
+                }
+                _ => {
+                    let distance = metric.try_func()?;
+                    Ok(multivec(query, values, dim, rows, |_, q, v| distance(q, v)))
+                }
+            },
             Self::Norm(Norm::L2) => Ok(values.chunks_exact(dim).map(norm_l2).collect()),
             Self::Norm(Norm::Squared) => Ok(values
                 .chunks_exact(dim)
@@ -127,7 +140,9 @@ impl Operation<'_> {
                 Ok(hamming::hamming_distance_batch(query, values, dim).collect())
             }
             Self::Multivec(DistanceType::Hamming, rows) => {
-                Ok(multivec(query, values, dim, rows, hamming::hamming))
+                Ok(multivec(query, values, dim, rows, |_, q, v| {
+                    hamming::hamming(q, v)
+                }))
             }
             _ => Err(self.error("UInt8 values require Hamming distance")),
         }
@@ -230,13 +245,10 @@ where
     )
 }
 
-fn multivec<T>(
-    query: &[T],
-    values: &[T],
-    dim: usize,
-    rows: &ListArray,
-    distance: DistanceFunc<T>,
-) -> Vec<f32> {
+fn multivec<T, F>(query: &[T], values: &[T], dim: usize, rows: &ListArray, distance: F) -> Vec<f32>
+where
+    F: Fn(usize, &[T], &[T]) -> f32,
+{
     rows.value_offsets()
         .windows(2)
         .enumerate()
@@ -247,14 +259,183 @@ fn multivec<T>(
             let values = &values[offsets[0] as usize * dim..offsets[1] as usize * dim];
             query
                 .chunks_exact(dim)
-                .map(|q| {
+                .enumerate()
+                .map(|(query_index, q)| {
                     values
                         .chunks_exact(dim)
-                        .map(|v| distance(q, v))
+                        .map(|v| distance(query_index, q, v))
                         .min_by(f32::total_cmp)
                         .unwrap_or(f32::NAN)
                 })
                 .sum()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::Field;
+    use num_traits::{Num, One, Zero};
+    use std::cell::Cell;
+    use std::ops::{Add, Div, Mul, Rem, Sub};
+    use std::sync::Arc;
+
+    thread_local! {
+        /// `CountedF32` norm computations on this thread.
+        static NORM_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Scalar test type whose norm computations are counted, so tests can
+    /// observe how often a distance path recomputes a query norm.
+    ///
+    /// The kernels are plain scalar math; `Cosine` uses every default method,
+    /// which is exactly the combination the multivector path relies on: the
+    /// default `cosine` derives the norm through `Normalize::norm_l2`, while a
+    /// caller that already knows the norm goes straight to `cosine_fast`.
+    #[derive(Clone, Copy, PartialEq)]
+    struct CountedF32(f32);
+
+    impl Zero for CountedF32 {
+        fn zero() -> Self {
+            Self(0.0)
+        }
+        fn is_zero(&self) -> bool {
+            self.0 == 0.0
+        }
+    }
+
+    impl One for CountedF32 {
+        fn one() -> Self {
+            Self(1.0)
+        }
+    }
+
+    impl Add for CountedF32 {
+        type Output = Self;
+        fn add(self, rhs: Self) -> Self {
+            Self(self.0 + rhs.0)
+        }
+    }
+
+    impl Sub for CountedF32 {
+        type Output = Self;
+        fn sub(self, rhs: Self) -> Self {
+            Self(self.0 - rhs.0)
+        }
+    }
+
+    impl Mul for CountedF32 {
+        type Output = Self;
+        fn mul(self, rhs: Self) -> Self {
+            Self(self.0 * rhs.0)
+        }
+    }
+
+    impl Div for CountedF32 {
+        type Output = Self;
+        fn div(self, rhs: Self) -> Self {
+            Self(self.0 / rhs.0)
+        }
+    }
+
+    impl Rem for CountedF32 {
+        type Output = Self;
+        fn rem(self, rhs: Self) -> Self {
+            Self(self.0 % rhs.0)
+        }
+    }
+
+    impl Num for CountedF32 {
+        type FromStrRadixErr = <f32 as Num>::FromStrRadixErr;
+        fn from_str_radix(
+            str: &str,
+            radix: u32,
+        ) -> std::result::Result<Self, Self::FromStrRadixErr> {
+            <f32 as Num>::from_str_radix(str, radix).map(Self)
+        }
+    }
+
+    impl L2 for CountedF32 {
+        fn l2(x: &[Self], y: &[Self]) -> f32 {
+            x.iter().zip(y).map(|(a, b)| (a.0 - b.0).powi(2)).sum()
+        }
+    }
+
+    impl Dot for CountedF32 {
+        fn dot(x: &[Self], y: &[Self]) -> f32 {
+            x.iter().zip(y).map(|(a, b)| a.0 * b.0).sum()
+        }
+    }
+
+    impl Normalize for CountedF32 {
+        fn norm_l2(vector: &[Self]) -> f32 {
+            NORM_CALLS.with(|count| count.set(count.get() + 1));
+            vector.iter().map(|v| v.0 * v.0).sum::<f32>().sqrt()
+        }
+    }
+
+    impl AsPrimitive<f32> for CountedF32 {
+        fn as_(self) -> f32 {
+            self.0
+        }
+    }
+
+    impl AsPrimitive<f64> for CountedF32 {
+        fn as_(self) -> f64 {
+            self.0 as f64
+        }
+    }
+
+    impl Cosine for CountedF32 {}
+
+    /// Two `List<FixedSizeList<Float32, 2>>` rows of two sub-vectors each,
+    /// plus the matching flattened values `Operation::numeric` indexes into.
+    fn rows_of_two_subvectors() -> (ListArray, Vec<f32>) {
+        let values = vec![1.0, 0.0, 0.0, 1.0, 3.0, 4.0, 0.0, 2.0];
+        let fsl =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values.clone()), 2).unwrap();
+        let field = Arc::new(Field::new("item", fsl.data_type().clone(), true));
+        let offsets = OffsetBuffer::from_lengths([2_usize, 2]);
+        let rows = ListArray::try_new(field, offsets, Arc::new(fsl), None).unwrap();
+        (rows, values)
+    }
+
+    /// Cosine multivector search must norm each query sub-vector exactly once
+    /// rather than once per (row, stored sub-vector) pair: with 2 query
+    /// sub-vectors, 2 rows and 2 stored sub-vectors per row the pairwise path
+    /// computes 8 norms where 2 suffice. The distances themselves must not
+    /// change: `cosine` is defined as `cosine_fast(x, norm_l2(x), other)`.
+    #[test]
+    fn multivec_cosine_norms_each_query_sub_vector_once() {
+        let (rows, values) = rows_of_two_subvectors();
+        let query: Vec<CountedF32> = [1.0, 0.0, 0.0, 2.0].map(CountedF32).to_vec();
+        let values: Vec<CountedF32> = values.into_iter().map(CountedF32).collect();
+
+        NORM_CALLS.with(|count| count.set(0));
+        let distances = Operation::Multivec(DistanceType::Cosine, &rows)
+            .numeric::<CountedF32>(&query, &values, 2)
+            .unwrap();
+        let norm_calls = NORM_CALLS.with(Cell::get);
+
+        assert_eq!(
+            norm_calls, 2,
+            "cosine multivec must norm each of the 2 query sub-vectors exactly once, \
+             got {norm_calls} norm computations"
+        );
+
+        // Row 0 ([1,0], [0,1]): both query sub-vectors match exactly, sum 0.
+        // Row 1 ([3,4], [0,2]): q0=[1,0] is closest to [3,4] at 1-3/5, and
+        // q1=[0,2] matches [0,2] exactly, sum 0.4.
+        assert_eq!(distances.len(), 2, "{distances:?}");
+        assert!(
+            (distances[0] - 0.0).abs() < 1e-6,
+            "row 0 distance: {distances:?}"
+        );
+        assert!(
+            (distances[1] - 0.4).abs() < 1e-6,
+            "row 1 distance: {distances:?}"
+        );
+    }
 }

@@ -756,6 +756,9 @@ fn process_row_range(
 ) -> PairwiseResult {
     let n = hashes.len();
     let mut result = PairwiseResult::new();
+    // Reused across rows to avoid per-row allocator churn; hamming_batch_u64
+    // overwrites every slot of the exact-size slice it is handed.
+    let mut distances = Vec::new();
 
     for i in start_row..end_row {
         let remaining = n - i - 1;
@@ -763,8 +766,9 @@ fn process_row_range(
             continue;
         }
 
-        let mut distances = vec![0u32; remaining];
-        hamming_batch_u64(hashes[i], &hashes[i + 1..], &mut distances);
+        distances.clear();
+        distances.resize(remaining, 0);
+        hamming_batch_u64(hashes[i], &hashes[i + 1..], distances.as_mut_slice());
 
         let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
         for (j_offset, &dist) in distances.iter().enumerate() {
@@ -1112,6 +1116,8 @@ mod tests {
     use super::*;
     use lance_arrow::FixedSizeListArrayExt;
     use rstest::rstest;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
 
     #[test]
     fn test_result_schemas_are_initialized_once() {
@@ -2093,6 +2099,71 @@ mod tests {
 
         assert_eq!(result.num_clusters(), 2);
         assert_eq!(result.num_duplicates(), 5); // 2 + 3
-        assert_eq!(result.num_unique(), 2);
+        assert_eq!(result.num_unique(), 2); // 5 + 1
+    }
+
+    thread_local! {
+        /// Allocation events (alloc/alloc_zeroed/realloc) on this thread.
+        /// Thread-local so tests running in parallel on other threads do not
+        /// pollute the count.
+        static ALLOCATION_EVENTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Forwards to the system allocator while counting allocation events on
+    /// the calling thread, so a test can observe allocations made by the code
+    /// it runs directly. Rayon worker threads stay invisible, which keeps the
+    /// count deterministic for tests that call the row-range kernels inline.
+    struct CountingSystemAllocator;
+
+    unsafe impl GlobalAlloc for CountingSystemAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCATION_EVENTS.with(|count| count.set(count.get() + 1));
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOCATION_EVENTS.with(|count| count.set(count.get() + 1));
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCATION_EVENTS.with(|count| count.set(count.get() + 1));
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: CountingSystemAllocator = CountingSystemAllocator;
+
+    /// The per-row distance buffer in `process_row_range` must be reused
+    /// across rows like its sibling `process_row_range_binary`, instead of
+    /// allocating a fresh `Vec` per row. Distinct hashes with a zero threshold
+    /// keep the result vectors empty, so the counted allocations are the
+    /// distance-buffer allocations alone: one per row (63) before the hoist,
+    /// one in total after it.
+    #[test]
+    fn test_process_row_range_reuses_distance_buffer_across_rows() {
+        let hashes: Vec<u64> = (0..64u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+
+        ALLOCATION_EVENTS.with(|count| count.set(0));
+        let result = process_row_range(&hashes, None, 0, 0, hashes.len());
+        let allocations = ALLOCATION_EVENTS.with(Cell::get);
+
+        assert!(
+            allocations < hashes.len() / 2,
+            "process_row_range made {allocations} allocations for {} rows; the \
+             distance buffer must be reused across rows, not reallocated per row",
+            hashes.len()
+        );
+        assert!(
+            result.is_empty(),
+            "distinct hashes with a zero threshold must not report pairs"
+        );
     }
 }
