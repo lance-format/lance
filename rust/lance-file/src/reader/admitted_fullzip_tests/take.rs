@@ -80,12 +80,8 @@ async fn sparse_take_matches_arrow_and_skips_pages(
 async fn sparse_take_preflights_all_selected_pages(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
 ) {
-    let (_fs, reader) = fixture_arrays(
-        version,
-        false,
-        vec![array(0, 0), Arc::new(LargeBinaryArray::new_null(8))],
-    )
-    .await;
+    let (_fs, reader) = fixture_arrays(version, false, vec![array(0, 0), array(1, 0)]).await;
+    let reader = with_unsupported_page(reader, 0, 1);
     let reads = Arc::new(Mutex::new(Vec::new()));
     let reader = reader.with_scheduler(Arc::new(RangeIo {
         inner: reader.core.scheduler.clone(),
@@ -108,14 +104,7 @@ async fn sparse_take_preflights_all_selected_pages(
         .err()
         .unwrap();
     assert!(matches!(error, Error::NotSupported { .. }));
-    // v2.2's all-null Constant page has no byte scalar. v2.3 emits a
-    // planar sparse layout. Both must fail preflight without payload reads.
-    let expected_reason = if version == ConcreteFileVersion::V2_2 {
-        "admitted Constant pages require a stored byte scalar"
-    } else {
-        "expected a dense FullZip page"
-    };
-    assert!(error.to_string().contains(expected_reason));
+    assert!(error.to_string().contains("dense FullZip page"));
     assert!(
         reads.lock().unwrap().is_empty(),
         "later selected layout must fail before earlier reads"

@@ -423,3 +423,68 @@ async fn admitted_fragment_reads_constant_overlay_in_shared_workspace(
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[rstest]
+#[tokio::test]
+async fn admitted_fragment_null_overlay_wins_over_older_values(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+    #[values(false, true)] lite: bool,
+) {
+    let mut dataset = write_payload_dataset(version, false).await;
+    let field_id = dataset.schema().field("payload").unwrap().id;
+    for fragment in 0..2 {
+        dataset = commit_overlay(
+            dataset,
+            &format!("older-{fragment}"),
+            fragment,
+            &[field_id],
+            OverlayCoverage::dense(bitmap([1, 2])),
+            vec![payload("old", 2, false, usize::MAX)],
+            version,
+        )
+        .await;
+        dataset = commit_overlay(
+            dataset,
+            &format!("null-{fragment}"),
+            fragment,
+            &[field_id],
+            OverlayCoverage::dense(bitmap([2, 3, 4])),
+            vec![Arc::new(LargeBinaryArray::new_null(3))],
+            version,
+        )
+        .await;
+    }
+    for fragment in 0..2 {
+        let reader = open(&dataset, fragment, dataset.schema(), lite).await;
+        let expected = reader.take_as_batch(&[0, 1, 2, 4, 5], None).await.unwrap();
+        assert!(expected["payload"].is_valid(1));
+        assert!(expected["payload"].is_null(2));
+        assert!(expected["payload"].is_null(3));
+        let indices = UInt32Array::from(vec![0, 1, 2, 4, 5]);
+        let budget = AllocationBudget::new(2 * 65536);
+        assert!(
+            reader
+                .try_take_admitted_fullzip(&indices, budget.try_reserve(16).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(budget.reserved(), 0);
+        let left = reader.try_take_admitted_fullzip(&indices, budget.try_reserve(65536).unwrap());
+        let right = reader.try_take_admitted_fullzip(&indices, budget.try_reserve(65536).unwrap());
+        let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(left, right)
+        })
+        .await
+        .expect("null overlay reads must progress with one CPU worker");
+        let left = left.unwrap().unwrap();
+        let right = right.unwrap().unwrap();
+        assert_eq!(left, expected);
+        assert_eq!(right, expected);
+        let alias = left["payload"].nulls().unwrap().clone();
+        drop((left, right));
+        assert!(budget.reserved() > 0);
+        drop(alias);
+        assert_eq!(budget.reserved(), 0);
+    }
+}

@@ -44,24 +44,13 @@ async fn admitted_scan_advances_without_reading_skipped_pages(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
 ) {
-    // Repeated binary values use dense FullZip in v2.3. All-null values instead
-    // produce an unsupported layout in both versions, independently of the
-    // cursor's validation: structural ConstantLayout or planar sparse structure.
-    let unsupported: ArrayRef = Arc::new(LargeBinaryArray::new_null(8));
     let (_fs, reader) = fixture_arrays(
         version,
         lite,
-        vec![array(0, 0), array(1, 0), array(2, 0), unsupported],
+        vec![array(0, 0), array(1, 0), array(2, 0), array(3, 0)],
     )
     .await;
-    match &reader.metadata().column_infos[0].page_infos[3].encoding {
-        PageEncoding::Structural(layout) => assert!(matches!(
-            &layout.layout,
-            Some(lance_encoding::format::metadata::page_layout::Layout::ConstantLayout(_))
-        )),
-        PageEncoding::Planar(layout) => assert!(layout.sparse().is_some()),
-        PageEncoding::Legacy(_) => panic!("fixture must use a current-format layout"),
-    }
+    let reader = with_unsupported_page(reader, 0, 3);
     let skipped_buffers = reader.metadata().column_infos[0].page_infos[1]
         .buffer_offsets_and_sizes
         .iter()
@@ -249,13 +238,14 @@ async fn admitted_scan_crosses_pages_without_read_ahead(
 
 #[tokio::test]
 async fn admitted_scan_empty_invalid_and_unsupported_selection() {
-    let unsupported: ArrayRef = Arc::new(LargeBinaryArray::new_null(8));
+    let unsupported = array(1, 0);
     let (_fs, reader) = fixture_arrays(
         ConcreteFileVersion::V2_2,
         false,
         vec![array(0, 0), unsupported],
     )
     .await;
+    let reader = with_unsupported_page(reader, 0, 1);
     let stats = IoStats::new();
     let reader = reader.with_io_stats(stats.recorder());
     let budget = AllocationBudget::new(8192);
@@ -277,7 +267,7 @@ async fn admitted_scan_empty_invalid_and_unsupported_selection() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("stored byte scalar"));
+    assert!(error.to_string().contains("dense FullZip page"));
     assert_eq!(
         stats.snapshot().iops,
         0,
@@ -360,12 +350,13 @@ async fn admitted_scan_respects_nonzero_projection_and_schema(
     ]));
     let batches = (0..2)
         .map(|page| {
-            // Deliberately unsupported outside the selected projection.
-            let other = Arc::new(LargeBinaryArray::new_null(8));
+            // Dispatch below will mark the unselected column unsupported.
+            let other = array(page, 0);
             RecordBatch::try_new(schema.clone(), vec![other, array(page, 0)]).unwrap()
         })
         .collect();
     let (fs, reader) = fixture_batches(version, false, batches, 1).await;
+    let reader = with_unsupported_page(reader, 0, 0);
     let budget = AllocationBudget::new(8192);
     let error = reader
         .open_admitted_fullzip_scan(0..16, budget.clone(), 8192, 8)

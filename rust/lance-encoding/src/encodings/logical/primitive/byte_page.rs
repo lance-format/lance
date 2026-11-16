@@ -22,15 +22,21 @@ use crate::{
     format::metadata::page_layout::Layout,
 };
 
+mod all_null;
+use all_null::{AllNullInput, AllNullScheduler};
+
 #[derive(Debug)]
 enum Scheduler {
+    AllNull(AllNullScheduler),
     FullZip(Arc<FullZipScheduler>),
     Constant(Arc<ConstantArrayScheduler>),
 }
 
 /// Metadata-only dispatch for dense FullZip and Constant byte/string pages.
-/// List/LargeList nesting is supported. Other page layouts return an error;
-/// this API never falls back to unadmitted decoding. Metadata is not charged.
+/// List/LargeList nesting is supported for pages with values. Flat all-null
+/// byte/string pages with metadata-only validity are also supported. Other layouts
+/// return an error; this API never falls back to unadmitted decoding. Metadata is
+/// not charged.
 #[derive(Debug)]
 pub struct AdmittedBytePageScheduler(Scheduler);
 
@@ -38,6 +44,9 @@ impl AdmittedBytePageScheduler {
     /// Validate the stored layout before payload reads. Use with
     /// [`Self::prepare_array_range_in`] inside an existing operation reservation.
     pub fn try_from_page(page: &PageInfo, codecs: &dyn DecompressionStrategy) -> Result<Self> {
+        if let Some(scheduler) = AllNullScheduler::try_from_page(page)? {
+            return Ok(Self(Scheduler::AllNull(scheduler)));
+        }
         let planar;
         let layout = match &page.encoding {
             PageEncoding::Structural(layout) => Some(layout),
@@ -63,6 +72,7 @@ impl AdmittedBytePageScheduler {
     /// Check the projected Arrow shape without payload I/O or allocation.
     pub fn validate_array_type(&self, data_type: &DataType) -> Result<()> {
         match &self.0 {
+            Scheduler::AllNull(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::FullZip(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::Constant(scheduler) => scheduler.validate_array_type(data_type),
         }
@@ -99,6 +109,9 @@ impl AdmittedBytePageScheduler {
         Fut: Future<Output = Result<ReservedBuffer>>,
     {
         Ok(match &self.0 {
+            Scheduler::AllNull(scheduler) => Some(AdmittedBytePageInput(Input::AllNull(
+                scheduler.prepare(rows, data_type)?,
+            ))),
             Scheduler::FullZip(scheduler) => scheduler
                 .clone()
                 .prepare_array_range_in(rows, data_type, workspace, read)
@@ -114,6 +127,7 @@ impl AdmittedBytePageScheduler {
 
 #[derive(Debug)]
 enum Input {
+    AllNull(AllNullInput),
     FullZip(FullZipArrayInput),
     Constant(ConstantArrayInput),
 }
@@ -129,6 +143,7 @@ impl AdmittedBytePageInput {
     /// `None` means discard/replan the whole operation, never partial success.
     pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {
         match self.0 {
+            Input::AllNull(input) => input.decode_in(workspace),
             Input::FullZip(input) => input.decode_in(workspace),
             Input::Constant(input) => input.decode_in(workspace),
         }

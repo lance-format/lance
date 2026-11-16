@@ -28,13 +28,15 @@ use lance_io::{
 };
 use rstest::rstest;
 
-use super::{FileReader, FileReaderOptions};
+use super::{FileMetadataProvider, FileReader, FileReaderOptions};
 use crate::{
     testing::{FsFixture, write_lance_file},
     version::ConcreteFileVersion,
     writer::FileWriterOptions,
 };
+use lance_encoding::format::metadata::{PageLayout, page_layout::Layout};
 
+mod all_null;
 mod multi;
 mod scan;
 mod take;
@@ -671,4 +673,37 @@ async fn admitted_file_array_materialization_error_is_not_a_smaller_prefix() {
         "one combined page/index read; no smaller retry"
     );
     assert_eq!(budget.reserved(), 0);
+}
+
+// Inject an explicitly unsupported dispatch variant. This guard must not depend
+// on which layout the current writer happens to choose for an all-null array.
+fn with_unsupported_page(reader: FileReader, column: usize, page: usize) -> FileReader {
+    let FileReader { mut core, metadata } = reader;
+    drop(metadata);
+    let FileMetadataProvider::Full(mut metadata) = core.metadata_provider else {
+        panic!("fixture requires eager metadata");
+    };
+    let columns = &mut Arc::get_mut(&mut metadata).unwrap().column_infos;
+    let column = Arc::make_mut(&mut columns[column]);
+    assert!(page < column.page_infos.len());
+    column.page_infos = column
+        .page_infos
+        .iter()
+        .enumerate()
+        .map(|(index, old)| PageInfo {
+            num_rows: old.num_rows,
+            priority: old.priority,
+            encoding: if index == page {
+                PageEncoding::Structural(PageLayout {
+                    layout: Some(Layout::MiniBlockLayout(Default::default())),
+                })
+            } else {
+                old.encoding.clone()
+            },
+            buffer_offsets_and_sizes: old.buffer_offsets_and_sizes.clone(),
+        })
+        .collect::<Vec<_>>()
+        .into();
+    core.metadata_provider = FileMetadataProvider::Full(metadata.clone());
+    FileReader { core, metadata }
 }
