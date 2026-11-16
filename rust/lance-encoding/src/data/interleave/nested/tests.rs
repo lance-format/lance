@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{BinaryArray, Int32Array, ListArray};
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::Field;
 use lance_core::utils::allocation::AllocationBudget;
 use rstest::rstest;

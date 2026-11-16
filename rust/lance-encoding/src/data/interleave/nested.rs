@@ -4,7 +4,6 @@
 //! Nested list assembly without an expanded child routing table.
 
 use arrow_array::GenericListArray;
-use arrow_buffer::ArrowNativeType;
 use arrow_schema::FieldRef;
 
 use super::*;
@@ -48,7 +47,7 @@ enum Plan {
     Bytes(BytePlan),
     List {
         own: BytePlan,
-        child: Box<Plan>,
+        child: Box<Self>,
         total_bytes: usize,
     },
 }
