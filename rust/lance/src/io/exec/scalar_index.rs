@@ -20,7 +20,6 @@ use crate::{
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::physical_expr::PhysicalExpr;
@@ -48,15 +47,17 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
+    Index, IndexType,
     metrics::MetricsCollector,
     scalar::{
-        SargableQuery, ScalarIndex,
+        AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex,
+        ScalarIndexParams, SearchOptions, SearchResult, UpdateCriteria,
         expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
     },
 };
 use lance_select::{
-    IndexExprResult, MaskDomain, NullableIndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps,
-    result::IndexExprResultWireFormat,
+    IndexExprResult, MaskDomain, NullableIndexExprResult, NullableRowAddrSet, RowAddrMask,
+    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -95,6 +96,134 @@ impl ScalarIndexLoader for Dataset {
     }
 }
 
+fn restrict_treemap_to_fragments(rows: &mut RowAddrTreeMap, fragments: &RoaringBitmap) {
+    let covered = rows
+        .iter()
+        .map(|(fragment, _)| *fragment)
+        .filter(|fragment| fragments.contains(*fragment))
+        .collect::<Vec<_>>();
+    rows.retain_fragments(covered);
+}
+
+fn restrict_search_result_to_fragments(
+    result: SearchResult,
+    fragments: &RoaringBitmap,
+) -> SearchResult {
+    let restrict = |set: NullableRowAddrSet| {
+        if set.selected_rows().is_empty() && set.null_rows().is_empty() {
+            return set;
+        }
+        let (mut selected, mut nulls) = set.into_parts();
+        restrict_treemap_to_fragments(&mut selected, fragments);
+        restrict_treemap_to_fragments(&mut nulls, fragments);
+        NullableRowAddrSet::new(selected, nulls)
+    };
+    match result {
+        SearchResult::Exact(set) => SearchResult::Exact(restrict(set)),
+        SearchResult::AtMost(set) => SearchResult::AtMost(restrict(set)),
+        SearchResult::AtLeast(set) => SearchResult::AtLeast(restrict(set)),
+    }
+}
+
+/// Query-time wrapper that restricts physical-address [`SearchResult`] hits to
+/// a scan's `fragment_scope` while preserving the inner index's native row domain.
+#[derive(Debug)]
+struct FragmentScopedScalarIndex {
+    inner: Arc<dyn ScalarIndex>,
+    fragments: RoaringBitmap,
+}
+
+impl DeepSizeOf for FragmentScopedScalarIndex {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context) + self.fragments.serialized_size()
+    }
+}
+
+#[async_trait]
+impl Index for FragmentScopedScalarIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        self.inner.statistics()
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        self.inner.prewarm().await
+    }
+
+    fn index_type(&self) -> IndexType {
+        self.inner.index_type()
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        self.inner.calculate_included_frags().await
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for FragmentScopedScalarIndex {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let result = self
+            .inner
+            .search_with_options(query, options, metrics)
+            .await?;
+        Ok(restrict_search_result_to_fragments(result, &self.fragments))
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        self.inner.results_are_row_addresses()
+    }
+
+    async fn remap(
+        &self,
+        _mapping: &lance_core::utils::row_addr_remap::RowAddrRemap,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::not_supported(
+            "FragmentScopedScalarIndex is a query-time wrapper and does not support remap",
+        ))
+    }
+
+    async fn update(
+        &self,
+        _new_data: datafusion::physical_plan::SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+        _old_data_filter: Option<OldIndexDataFilter>,
+    ) -> Result<CreatedIndex> {
+        Err(Error::not_supported(
+            "FragmentScopedScalarIndex is a query-time wrapper and does not support update",
+        ))
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        self.inner.update_criteria()
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        self.inner.derive_index_params()
+    }
+}
+
 struct ScopedScalarIndexLoader<'a> {
     dataset: &'a Dataset,
     fragments: Option<&'a RoaringBitmap>,
@@ -109,7 +238,7 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        open_scalar_index_segments(
+        let index = open_scalar_index_segments(
             self.dataset,
             column,
             index_name,
@@ -117,7 +246,22 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
             self.segment_uuids,
             metrics,
         )
-        .await
+        .await?;
+        // A shared segment can match rows outside this scan. When the index
+        // reports physical row addresses (including row-ID indices on datasets
+        // without stable row IDs, where row IDs are physical addresses), bound
+        // leaf results (`selected` and `nulls`) to `fragments` so out-of-scope
+        // branches collapse immediately while preserving native domains.
+        if let Some(fragments) = self.fragments
+            && fragments != self.dataset.fragment_bitmap().as_ref()
+            && (index.results_are_row_addresses() || !self.dataset.manifest.uses_stable_row_ids())
+        {
+            return Ok(Arc::new(FragmentScopedScalarIndex {
+                inner: index,
+                fragments: fragments.clone(),
+            }));
+        }
+        Ok(index)
     }
 
     async fn row_id_result_to_row_addrs(
@@ -252,12 +396,11 @@ impl ScalarIndexExec {
 
     /// Restrict which physical scalar index segments are loaded.
     ///
-    /// This only restricts which segments of the index are searched — a result
-    /// (address- or row-id-domain alike) can still cover rows outside `fragments`
-    /// if a shared index segment matches them, so the consumer remains
-    /// responsible for applying the exact fragment scope, deletion mask, and
-    /// any data-level recheck. Codecs can inspect this setting with
-    /// [`Self::fragment_scope`].
+    /// Physical-address results are also bounded to `fragments`, while native
+    /// row-id results under stable row ids can still cover other fragments if a
+    /// shared index segment matches them, so the consumer remains responsible
+    /// for applying the exact fragment scope, deletion mask, and any data-level
+    /// recheck. Codecs can inspect this setting with [`Self::fragment_scope`].
     ///
     /// ```
     /// # use lance::io::exec::scalar_index::ScalarIndexExec;
@@ -303,8 +446,9 @@ impl ScalarIndexExec {
         self.result_format
     }
 
-    /// Fragment scope used for index loading. `None` searches every selected
-    /// segment. A result is not otherwise bounded by this scope — see
+    /// Fragment scope used for index loading and physical-address leaf bounds.
+    /// `None` searches every selected segment. Native row-id results under
+    /// stable row ids are not bounded by this scope — see
     /// [`Self::with_fragment_scope`] for an example.
     pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
         self.fragment_scope.as_deref()
@@ -317,34 +461,51 @@ impl ScalarIndexExec {
         self.segment_uuids.as_ref()
     }
 
-    #[async_recursion]
+    fn unique_index_keys(index_expr: &ScalarIndexExpr) -> Vec<(&str, &str)> {
+        let mut stack = vec![index_expr];
+        let mut seen = HashSet::new();
+        let mut indices = Vec::new();
+        while let Some(node) = stack.pop() {
+            match node {
+                ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+                    // Push rhs first so lhs is visited first.
+                    stack.push(rhs);
+                    stack.push(lhs);
+                }
+                ScalarIndexExpr::Not(inner) => stack.push(inner),
+                ScalarIndexExpr::Query(search_key) => {
+                    let key = (search_key.column.as_str(), search_key.index_name.as_str());
+                    if seen.insert(key) {
+                        indices.push(key);
+                    }
+                }
+            }
+        }
+        indices
+    }
+
     pub async fn fragments_covered_by_index_query(
         index_expr: &ScalarIndexExpr,
         dataset: &Dataset,
     ) -> Result<RoaringBitmap> {
-        match index_expr {
-            ScalarIndexExpr::And(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Or(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Not(expr) => {
-                Self::fragments_covered_by_index_query(expr, dataset).await
-            }
-            ScalarIndexExpr::Query(search_key) => {
-                scalar_index_fragment_bitmap(dataset, &search_key.column, &search_key.index_name)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "Index not found even though it must have been found earlier: {}",
-                            search_key.index_name
-                        ))
-                    })
-            }
+        let indices = Self::unique_index_keys(index_expr);
+        let mut covered: Option<RoaringBitmap> = None;
+        for (column, index_name) in indices {
+            let bitmap = scalar_index_fragment_bitmap(dataset, column, index_name)
+                .await?
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "Index not found even though it must have been found earlier: {}",
+                        index_name
+                    ))
+                })?;
+            covered = Some(match covered {
+                None => bitmap,
+                Some(acc) => acc & bitmap,
+            });
         }
+        covered
+            .ok_or_else(|| Error::internal("ScalarIndexExpr must contain at least one Query leaf"))
     }
 
     async fn do_execute(
@@ -1452,15 +1613,17 @@ mod tests {
         IndexType,
         metrics::NoOpMetricsCollector,
         scalar::{
-            BuiltinIndexType, SargableQuery, ScalarIndexParams,
+            BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
             expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
             zonemap::ZoneMapIndexBuilderParams,
         },
     };
     use lance_select::{
-        MaskDomain, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet,
-        RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+        IndexExprResult, MaskDomain, NullableIndexExprResult, NullableRowAddrMask,
+        NullableRowAddrSet, RowAddrMask, RowAddrTreeMap, RowSetOps,
+        result::IndexExprResultWireFormat,
     };
+    use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use crate::{
@@ -2127,5 +2290,587 @@ mod tests {
         let plan =
             MaterializeIndexExec::new(arc_dasaset.clone(), query, arc_dasaset.fragments().clone());
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+    }
+
+    fn btree_eq_expr(column: &str, index_name: &str, value: ScalarValue) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: index_name.to_string(),
+            index_type: "BTree".to_string(),
+            query: Arc::new(SargableQuery::Equals(value)),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
+    fn assert_treemap_only_contains_target_rows(map: &RowAddrTreeMap, target_rows: &[u64]) {
+        for addr in map.row_addrs().unwrap() {
+            let row = u64::from(addr);
+            assert!(
+                target_rows.contains(&row),
+                "unexpected out-of-scope row {row} (expected subset of {target_rows:?})"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::physical_row_addr(false)]
+    #[case::stable_row_id(true)]
+    #[tokio::test]
+    async fn test_scoped_loader_restricts_shared_index_to_fragment_scope(
+        #[case] enable_stable_row_ids: bool,
+    ) {
+        let batch = record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            (
+                "col",
+                Utf8,
+                vec![
+                    // Fragment 0
+                    Some("other_only"),
+                    Some("shared"),
+                    None,
+                    Some("other_extra"),
+                    // Fragment 1 (target fragment)
+                    Some("target_only"),
+                    Some("shared"),
+                    None,
+                    Some("keep"),
+                    // Fragment 2
+                    Some("other_only"),
+                    None,
+                    Some("shared"),
+                    Some("keep"),
+                ]
+            ),
+            (
+                "other",
+                Int32,
+                vec![
+                    // Fragment 0
+                    Some(1),
+                    Some(2),
+                    Some(1),
+                    None,
+                    // Fragment 1 (target fragment)
+                    Some(1),
+                    Some(2),
+                    Some(1),
+                    None,
+                    // Fragment 2
+                    Some(1),
+                    Some(2),
+                    Some(1),
+                    None,
+                ]
+            ),
+            (
+                "zm",
+                Int32,
+                vec![
+                    // Fragment 0
+                    Some(10),
+                    Some(10),
+                    None,
+                    Some(10),
+                    // Fragment 1 (target fragment)
+                    Some(20),
+                    Some(20),
+                    None,
+                    Some(25),
+                    // Fragment 2
+                    Some(30),
+                    Some(30),
+                    None,
+                    Some(30),
+                ]
+            )
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 3);
+
+        dataset
+            .create_index(
+                &["col"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["other"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let zm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::to_value(ZoneMapIndexBuilderParams::new(4)).unwrap());
+        dataset
+            .create_index(&["zm"], IndexType::ZoneMap, None, &zm_params, true)
+            .await
+            .unwrap();
+
+        for idx_name in ["col_idx", "other_idx", "zm_idx"] {
+            let indices = dataset.load_indices_by_name(idx_name).await.unwrap();
+            assert_eq!(indices.len(), 1);
+            assert_eq!(
+                indices[0].fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1, 2])
+            );
+        }
+
+        let target_frag = dataset.fragments()[1].clone();
+        let target_frag_id = target_frag.id as u32;
+        assert_eq!(target_frag_id, 1);
+        let scope = RoaringBitmap::from_iter([target_frag_id]);
+        let target_row =
+            |offset: u32| u64::from(RowAddress::new_from_parts(target_frag_id, offset));
+        let target_rows = [target_row(0), target_row(1), target_row(2), target_row(3)];
+
+        let full_scope_loader = ScopedScalarIndexLoader {
+            dataset: &dataset,
+            fragments: Some(dataset.fragment_bitmap().as_ref()),
+            segment_uuids: None,
+        };
+        let full_loaded = full_scope_loader
+            .load_index("zm", "zm_idx", &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            full_loaded
+                .as_any()
+                .downcast_ref::<super::FragmentScopedScalarIndex>()
+                .is_none()
+        );
+
+        let loader = ScopedScalarIndexLoader {
+            dataset: &dataset,
+            fragments: Some(&scope),
+            segment_uuids: None,
+        };
+        let scoped_loaded = loader
+            .load_index("zm", "zm_idx", &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            scoped_loaded
+                .as_any()
+                .downcast_ref::<super::FragmentScopedScalarIndex>()
+                .is_some()
+        );
+
+        // ZoneMap always emits physical row addresses regardless of `enable_stable_row_ids`.
+        // Verify address-domain leaves collapse out-of-fragment hits on BOTH modes.
+        let zm_eq = |val: i32| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "zm".to_string(),
+                index_name: "zm_idx".to_string(),
+                index_type: "ZoneMap".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::Int32(Some(val)))),
+                needs_recheck: true,
+                fragment_bitmap: None,
+            })
+        };
+        let col_eq =
+            |val: &str| btree_eq_expr("col", "col_idx", ScalarValue::Utf8(Some(val.to_string())));
+        let other_eq =
+            |val: i32| btree_eq_expr("other", "other_idx", ScalarValue::Int32(Some(val)));
+
+        let zm_out_of_scope_and =
+            ScalarIndexExpr::And(Box::new(zm_eq(30)), Box::new(col_eq("shared")));
+        let res = zm_out_of_scope_and
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(!res.is_exact());
+        assert!(res.is_at_most());
+        assert_eq!(res.upper, RowAddrMask::allow_nothing());
+
+        // ZoneMap does not populate `null_rows()` on value predicates (`zm = 30`), while
+        // Fragment 1 has `zm = NULL` at `target_row(2)`: out-of-scope `AtMost` must stay
+        // non-exact so `Not(zm = 30)` never falsely claims all rows are exact matches.
+        let not_zm_out_of_scope = ScalarIndexExpr::Not(Box::new(zm_eq(30)));
+        let not_zm_res = not_zm_out_of_scope
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(!not_zm_res.is_exact());
+
+        let zm_is_null = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "zm".to_string(),
+            index_name: "zm_idx".to_string(),
+            index_type: "ZoneMap".to_string(),
+            query: Arc::new(SargableQuery::IsNull()),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let zm_is_not_null = ScalarIndexExpr::Not(Box::new(zm_is_null));
+        let res = zm_is_not_null
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(res.is_exact());
+        assert_eq!(res.domain, MaskDomain::RowAddress);
+        assert_eq!(
+            res.lower,
+            RowAddrMask::from_block(RowAddrTreeMap::from_iter([target_row(2)]))
+        );
+
+        let zm_pos_or = ScalarIndexExpr::Or(Box::new(zm_eq(20)), Box::new(zm_eq(30)));
+        let res = zm_pos_or
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(res.domain, MaskDomain::RowAddress);
+        assert_eq!(
+            res.upper,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(target_rows))
+        );
+
+        // Directly verify `restrict_search_result_to_fragments` restricts both `selected` and
+        // `nulls`, preserving Kleene 3VL under `!` and retaining `AtMost` / `AtLeast` bounds.
+        let mixed_selected = RowAddrTreeMap::from_iter([
+            u64::from(RowAddress::new_from_parts(0, 1)),
+            u64::from(RowAddress::new_from_parts(1, 0)),
+            u64::from(RowAddress::new_from_parts(2, 3)),
+        ]);
+        let mixed_nulls = RowAddrTreeMap::from_iter([
+            u64::from(RowAddress::new_from_parts(0, 2)),
+            u64::from(RowAddress::new_from_parts(1, 2)),
+            u64::from(RowAddress::new_from_parts(2, 1)),
+        ]);
+        let SearchResult::Exact(restricted_set) = super::restrict_search_result_to_fragments(
+            SearchResult::Exact(NullableRowAddrSet::new(
+                mixed_selected.clone(),
+                mixed_nulls.clone(),
+            )),
+            &scope,
+        ) else {
+            panic!("expected Exact search result");
+        };
+        let restricted =
+            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(restricted_set));
+        assert!(restricted.is_exact());
+        assert_eq!(
+            restricted.lower,
+            NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter([target_row(0)]),
+                RowAddrTreeMap::from_iter([target_row(2)]),
+            ))
+        );
+        let negated = !restricted;
+        let NullableRowAddrMask::BlockList(neg_set) = &negated.lower else {
+            panic!("expected BlockList, got {:?}", negated.lower);
+        };
+        assert_eq!(
+            neg_set.null_rows(),
+            &RowAddrTreeMap::from_iter([target_row(2)])
+        );
+        assert_treemap_only_contains_target_rows(neg_set.selected_rows(), &target_rows);
+        assert!(!negated.lower.selected(target_row(0)));
+        assert!(negated.lower.selected(target_row(1)));
+        assert!(!negated.lower.selected(target_row(2)));
+        assert!(negated.lower.selected(target_row(3)));
+
+        let other_frag_addrs = RowAddrTreeMap::from_iter([
+            u64::from(RowAddress::new_from_parts(0, 0)),
+            u64::from(RowAddress::new_from_parts(2, 1)),
+        ]);
+        let restricted_at_most = super::restrict_search_result_to_fragments(
+            SearchResult::AtMost(NullableRowAddrSet::new(
+                other_frag_addrs,
+                RowAddrTreeMap::new(),
+            )),
+            &scope,
+        );
+        assert!(matches!(
+            restricted_at_most,
+            SearchResult::AtMost(set) if set.selected_rows().is_empty() && set.null_rows().is_empty()
+        ));
+
+        let SearchResult::AtLeast(at_least_set) = super::restrict_search_result_to_fragments(
+            SearchResult::AtLeast(NullableRowAddrSet::new(mixed_selected, mixed_nulls)),
+            &scope,
+        ) else {
+            panic!("expected AtLeast search result");
+        };
+        let neg_at_least =
+            !NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(at_least_set));
+        assert!(!neg_at_least.is_exact());
+        assert_eq!(neg_at_least.lower, NullableRowAddrMask::allow_nothing());
+        assert!(!neg_at_least.upper.selected(target_row(0)));
+        assert!(neg_at_least.upper.selected(target_row(1)));
+        assert!(neg_at_least.upper.selected(target_row(3)));
+
+        // On non-stable datasets BTree uses native row-ID domain (v0, where row IDs are physical
+        // addresses), and on stable-row-ID datasets it uses native row-address domain (v1).
+        // Verify BOTH modes bound physical-address hits to `scope` while preserving native domain!
+        let expected_btree_domain = if enable_stable_row_ids {
+            MaskDomain::RowAddress
+        } else {
+            MaskDomain::RowId
+        };
+
+        let pos_and = ScalarIndexExpr::And(Box::new(col_eq("shared")), Box::new(other_eq(2)));
+        let res = pos_and
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(res.is_exact());
+        assert_eq!(res.domain, expected_btree_domain);
+        assert_eq!(
+            res.lower,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([target_row(1)]))
+        );
+
+        let out_of_scope_and =
+            ScalarIndexExpr::And(Box::new(col_eq("other_only")), Box::new(other_eq(1)));
+        let res = out_of_scope_and
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(res.is_exact());
+        assert_eq!(res.domain, expected_btree_domain);
+        assert_eq!(res.lower, RowAddrMask::allow_nothing());
+
+        let pos_or = ScalarIndexExpr::Or(
+            Box::new(col_eq("target_only")),
+            Box::new(col_eq("other_only")),
+        );
+        let res = pos_or
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(res.is_exact());
+        assert_eq!(res.domain, expected_btree_domain);
+        assert_eq!(
+            res.lower,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([target_row(0)]))
+        );
+
+        let not_other = ScalarIndexExpr::Not(Box::new(col_eq("other_only")));
+        let nullable_not_other = not_other
+            .evaluate_nullable(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(nullable_not_other.is_exact());
+        assert_eq!(nullable_not_other.domain, expected_btree_domain);
+        let NullableRowAddrMask::BlockList(set) = &nullable_not_other.lower else {
+            panic!("expected BlockList, got {:?}", nullable_not_other.lower);
+        };
+        assert_eq!(set.null_rows(), &RowAddrTreeMap::from_iter([target_row(2)]));
+        assert_treemap_only_contains_target_rows(set.selected_rows(), &target_rows);
+        assert!(nullable_not_other.lower.selected(target_row(0)));
+        assert!(nullable_not_other.lower.selected(target_row(1)));
+        assert!(!nullable_not_other.lower.selected(target_row(2)));
+        assert!(nullable_not_other.lower.selected(target_row(3)));
+
+        let dropped_not_other = not_other
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(dropped_not_other.is_exact());
+        assert_eq!(dropped_not_other.domain, expected_btree_domain);
+        assert_eq!(
+            dropped_not_other.lower,
+            RowAddrMask::from_block(RowAddrTreeMap::from_iter([target_row(2)]))
+        );
+
+        let not_target = ScalarIndexExpr::Not(Box::new(col_eq("target_only")));
+        let nullable_not_target = not_target
+            .evaluate_nullable(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(nullable_not_target.is_exact());
+        assert_eq!(nullable_not_target.domain, expected_btree_domain);
+        let NullableRowAddrMask::BlockList(set) = &nullable_not_target.lower else {
+            panic!("expected BlockList, got {:?}", nullable_not_target.lower);
+        };
+        assert_eq!(set.null_rows(), &RowAddrTreeMap::from_iter([target_row(2)]));
+        assert_treemap_only_contains_target_rows(set.selected_rows(), &target_rows);
+        assert!(!nullable_not_target.lower.selected(target_row(0)));
+        assert!(nullable_not_target.lower.selected(target_row(1)));
+        assert!(!nullable_not_target.lower.selected(target_row(2)));
+        assert!(nullable_not_target.lower.selected(target_row(3)));
+
+        let compound_not = ScalarIndexExpr::Not(Box::new(ScalarIndexExpr::And(
+            Box::new(col_eq("target_only")),
+            Box::new(other_eq(1)),
+        )));
+        let nullable_compound = compound_not
+            .evaluate_nullable(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(nullable_compound.is_exact());
+        assert_eq!(nullable_compound.domain, expected_btree_domain);
+        let NullableRowAddrMask::BlockList(set) = &nullable_compound.lower else {
+            panic!("expected BlockList, got {:?}", nullable_compound.lower);
+        };
+        assert_eq!(set.null_rows(), &RowAddrTreeMap::from_iter([target_row(2)]));
+        assert_treemap_only_contains_target_rows(set.selected_rows(), &target_rows);
+        assert!(!nullable_compound.lower.selected(target_row(0)));
+        assert!(nullable_compound.lower.selected(target_row(1)));
+        assert!(!nullable_compound.lower.selected(target_row(2)));
+        assert!(nullable_compound.lower.selected(target_row(3)));
+
+        // ScalarIndexExec with_fragment_scope restricts address-domain ZoneMap output on BOTH modes.
+        let exec = ScalarIndexExec::new(
+            Arc::new(dataset.clone()),
+            ScalarIndexExpr::Or(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(zm_eq(20)),
+                    Box::new(zm_eq(20)),
+                )),
+                Box::new(zm_eq(30)),
+            ),
+            IndexExprResultWireFormat::TwoMask,
+        )
+        .with_fragment_scope(scope.clone());
+        let exec_batches = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let (exec_result, covered_frags) = IndexExprResult::deserialize(&exec_batches[0]).unwrap();
+        assert_eq!(covered_frags, scope);
+        assert_eq!(
+            exec_result.upper,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(target_rows))
+        );
+
+        // End-to-end fragment-scoped scan verifying SQL 3VL results on both BTree and ZoneMap.
+        let scan_cases: &[(&str, &[i32])] = &[
+            ("col = 'shared' AND other = 2", &[5]),
+            ("col = 'other_only' AND other = 1", &[]),
+            ("col = 'target_only' OR col = 'other_only'", &[4]),
+            ("NOT (col = 'other_only')", &[4, 5, 7]),
+            ("NOT (col = 'target_only')", &[5, 7]),
+            ("NOT (col = 'other_only') AND other = 1", &[4]),
+            ("NOT (col = 'target_only' AND other = 1)", &[5, 7]),
+            ("zm = 20 AND other = 1", &[4]),
+            ("zm = 30 AND other = 1", &[]),
+            ("zm = 20 OR zm = 30", &[4, 5]),
+            ("zm IS NULL", &[6]),
+            ("zm IS NOT NULL", &[4, 5, 7]),
+        ];
+        for (filter, expected_ids) in scan_cases {
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(vec![target_frag.clone()])
+                .project(&["id"])
+                .unwrap()
+                .filter(filter)
+                .unwrap();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndex"), "{filter}: {plan}");
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut actual = batch["id"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec();
+            actual.sort_unstable();
+            assert_eq!(
+                actual, *expected_ids,
+                "filter={filter}, enable_stable_row_ids={enable_stable_row_ids}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fragments_covered_by_index_query_deduplicates_repeated_leaves() {
+        let batch = record_batch!(
+            ("a", Int32, (0..12).collect::<Vec<_>>()),
+            ("b", Int32, (0..12).collect::<Vec<_>>()),
+            ("c", Int32, (0..12).collect::<Vec<_>>())
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 3);
+
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index_builder(&["a"], IndexType::BTree, &params)
+            .fragments(vec![0, 1])
+            .await
+            .unwrap();
+        dataset
+            .create_index_builder(&["b"], IndexType::BTree, &params)
+            .fragments(vec![1, 2])
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["c"], IndexType::BTree, None, &params, true)
+            .await
+            .unwrap();
+
+        let make_branch = |i: i32| {
+            let a = btree_eq_expr("a", "a_idx", ScalarValue::Int32(Some(i)));
+            let b = btree_eq_expr("b", "b_idx", ScalarValue::Int32(Some(i)));
+            let c = btree_eq_expr("c", "c_idx", ScalarValue::Int32(Some(i)));
+            ScalarIndexExpr::And(
+                Box::new(a),
+                Box::new(ScalarIndexExpr::Or(
+                    Box::new(ScalarIndexExpr::Not(Box::new(b))),
+                    Box::new(c),
+                )),
+            )
+        };
+
+        let mut expr = make_branch(0);
+        for i in 1..256 {
+            expr = ScalarIndexExpr::Or(Box::new(expr), Box::new(make_branch(i)));
+        }
+
+        // 256 branches * 3 leaves = 768 leaves, deduplicated to 3 unique keys in first-seen order.
+        assert_eq!(
+            ScalarIndexExec::unique_index_keys(&expr),
+            vec![("a", "a_idx"), ("b", "b_idx"), ("c", "c_idx")]
+        );
+        let covered = ScalarIndexExec::fragments_covered_by_index_query(&expr, &dataset)
+            .await
+            .unwrap();
+        assert_eq!(covered, RoaringBitmap::from_iter([1u32]));
+
+        // Missing index must still report an error even after repeated valid leaves.
+        let missing = ScalarIndexExpr::And(
+            Box::new(expr),
+            Box::new(btree_eq_expr(
+                "a",
+                "missing_idx",
+                ScalarValue::Int32(Some(0)),
+            )),
+        );
+        let err = ScalarIndexExec::fragments_covered_by_index_query(&missing, &dataset)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing_idx"), "{err}");
     }
 }
