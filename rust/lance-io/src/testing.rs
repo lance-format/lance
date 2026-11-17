@@ -12,6 +12,14 @@ use object_store::{
 };
 use std::future::Future;
 
+/// Install the `ring` rustls provider, as the crate docs ask an application to.
+///
+/// With `tls-no-provider`, reqwest panics when it builds a client before a
+/// provider is installed.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 mock! {
     pub ObjectStore {}
 

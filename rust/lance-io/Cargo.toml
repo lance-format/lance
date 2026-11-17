@@ -14,6 +14,8 @@ rust-version.workspace = true
 [dependencies]
 
 object_store = { workspace = true }
+# Only here to pick the TLS crypto provider of object_store's reqwest client.
+reqwest = { workspace = true, optional = true }
 opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
 opendal-service-goosefs = { workspace = true, optional = true }
@@ -72,6 +74,7 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-mock = { workspace = true }
 metrics-util = { workspace = true }
 wiremock.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [[bench]]
 name = "scheduler"
@@ -82,8 +85,11 @@ default = ["aws", "azure", "gcp", "tls-aws-lc-rs"]
 metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
+# The object_store `gcp` and `azure` features force aws-lc-rs, so take the `-base`
+# features and let the tls-* features below pick the crypto provider.
 gcp = [
-    "object_store/gcp",
+    "object_store/gcp-base",
+    "object_store/reqwest",
     "dep:opendal",
     "opendal/services-gcs",
     "dep:object_store_opendal",
@@ -94,7 +100,7 @@ gcp = [
     "dep:quick-xml",
 ]
 aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal", "dep:quick-xml"]
-azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal", "dep:quick-xml"]
+azure = ["object_store/azure-base", "object_store/reqwest", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal", "dep:quick-xml"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 goosefs = [
     "dep:opendal",
@@ -109,8 +115,18 @@ tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
 # Granular opendal transports (not the reqwest-rustls-* aliases, which also pull aws-lc-rs); tls-no-provider needs an app-installed rustls provider.
-tls-aws-lc-rs = ["opendal?/http-transport-reqwest-rustls"]
-tls-no-provider = ["opendal?/http-transport-reqwest-rustls-no-provider"]
+tls-aws-lc-rs = [
+    "opendal?/http-transport-reqwest-rustls",
+    "object_store/aws-lc-rs",
+    "dep:reqwest",
+    "reqwest/rustls",
+]
+tls-no-provider = [
+    "opendal?/http-transport-reqwest-rustls-no-provider",
+    "object_store/ring",
+    "dep:reqwest",
+    "reqwest/rustls-no-provider",
+]
 tos-test = ["tos"]
 test-util = []
 

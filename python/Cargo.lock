@@ -4553,6 +4553,7 @@ dependencies = [
  "reqsign-core",
  "reqsign-file-read-tokio",
  "reqsign-google",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tempfile",
