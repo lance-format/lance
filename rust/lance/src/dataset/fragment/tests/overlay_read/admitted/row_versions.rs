@@ -109,16 +109,28 @@ async fn version_outputs_reserve_exact_credit_and_keep_aliases(#[case] mode: usi
     let other = Arc::new(RowDatasetVersionSequence::from_versions(&updated));
     for fragment in 0..2 {
         for (has_created, has_updated) in [(true, false), (false, true), (true, true)] {
-            let mut reader = open(&dataset, fragment, &Schema::default(), false).await;
+            // Empty payload projections require system columns at open, before
+            // substituting the immutable snapshots used by this budget fixture.
+            let mut reader = dataset
+                .get_fragment(fragment)
+                .unwrap()
+                .open(
+                    &Schema::default(),
+                    FragReadConfig::default()
+                        .with_row_created_at_version(has_created)
+                        .with_row_last_updated_at_version(has_updated),
+                )
+                .await
+                .unwrap();
             if has_created {
-                reader.with_row_created_at_version((mode != 0).then(|| source.clone()));
+                reader.created_at_sequence = (mode != 0).then(|| source.clone());
             }
             if has_updated {
-                reader.with_row_last_updated_at_version(match mode {
+                reader.last_updated_at_sequence = match mode {
                     0 => None,
                     1 => Some(source.clone()),
                     _ => Some(other.clone()),
-                });
+                };
             }
             // Generated columns must follow output-schema placement.
             reader.output_schema = ArrowSchema::new(
