@@ -11,6 +11,8 @@ use super::*;
 mod deletions;
 mod row_ids;
 mod row_versions;
+mod scan;
+pub use scan::{AdmittedFragmentScan, AdmittedFragmentScanOutcome};
 
 impl FragmentReader {
     /// Take sorted unique physical offsets within one already-admitted workspace.

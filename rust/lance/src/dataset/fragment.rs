@@ -4,6 +4,7 @@
 //! Wraps a Fragment of the dataset.
 
 mod admitted;
+pub use admitted::{AdmittedFragmentScan, AdmittedFragmentScanOutcome};
 mod aligned_update;
 pub mod session;
 pub mod write;

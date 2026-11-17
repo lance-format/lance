@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use super::*;
 
+mod cursor;
 mod deletions;
 mod markers;
 mod missing;
