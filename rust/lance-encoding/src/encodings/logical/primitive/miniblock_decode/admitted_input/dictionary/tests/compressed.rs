@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
+use arrow_array::Array;
 
 fn encoded(bits: u8, count: usize, raw: &[u8]) -> (Dictionary, Vec<u8>) {
     let bytes = ::lz4::block::compress(raw, None, true).unwrap();
