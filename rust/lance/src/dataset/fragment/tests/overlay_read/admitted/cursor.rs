@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::admitted::AdmissionMode;
 use crate::dataset::{
     fragment::AdmittedFragmentScanOutcome as Outcome, schema_evolution::NewColumnTransform,
 };
-use std::{future::pending, task::Poll};
+use std::{cell::RefCell, future::pending, task::Poll};
 
 #[rstest]
 #[tokio::test]
@@ -189,7 +190,7 @@ async fn cursor_reuses_capacity_without_repeating_every_large_attempt() {
     let mut batches = 0;
     while delivered < 128 {
         let result = scan
-            .try_next_with(|indices, workspace| {
+            .next_with(AdmissionMode::Try, |indices, workspace| {
                 attempts.push(indices.len());
                 let reader = &reader;
                 async move { reader.try_take_admitted_fullzip(&indices, workspace).await }
@@ -217,6 +218,124 @@ async fn cursor_reuses_capacity_without_repeating_every_large_attempt() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum WaitExit {
+    Complete,
+    Cancel,
+    Error,
+}
+
+#[rstest]
+#[case::complete(WaitExit::Complete)]
+#[case::cancel(WaitExit::Cancel)]
+#[case::error(WaitExit::Error)]
+#[tokio::test]
+async fn cursor_keeps_reduced_attempt_only_until_waiting_call_ends(#[case] exit: WaitExit) {
+    let reader = null_reader(16).await;
+    let budget = AllocationBudget::new(64);
+    let mut scan = reader
+        .try_scan_admitted_fullzip(0..16, 8, 64, budget.clone())
+        .unwrap();
+    let original_hint = scan.row_limit;
+    let attempts = RefCell::new(Vec::new());
+    let competing = RefCell::new(None);
+    let mut waiting = Box::pin(scan.next_with(AdmissionMode::Wait, |indices, workspace| {
+        attempts.borrow_mut().push(indices.len());
+        let first = attempts.borrow().len() == 1;
+        let reader = &reader;
+        let budget = &budget;
+        let competing = &competing;
+        async move {
+            // Use the real decoder: eight null rows cannot fit, but four can.
+            // Another request acquires all credit before the smaller retry.
+            if first {
+                let result = reader
+                    .try_take_admitted_fullzip(&indices, workspace)
+                    .await?;
+                assert!(result.is_none());
+                drop(indices);
+                *competing.borrow_mut() = Some(budget.try_reserve(64).unwrap());
+                return Ok(None);
+            }
+            if matches!(exit, WaitExit::Error) {
+                return Err(Error::corrupt_file_named(
+                    "fixture",
+                    "post-wait decode failure",
+                ));
+            }
+            reader.try_take_admitted_fullzip(&indices, workspace).await
+        }
+    }));
+    // Decoder dispatch can suspend before reaching the deliberately held credit.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while competing.borrow().is_none() {
+            assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rejected prefix must reach the competing admission");
+    assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+    assert_eq!(attempts.borrow().as_slice(), &[8]);
+    assert_eq!(
+        budget.reserved(),
+        64,
+        "only the competing request owns credit"
+    );
+
+    if matches!(exit, WaitExit::Cancel) {
+        drop(waiting);
+        assert_eq!(scan.position(), 0);
+        assert_eq!(scan.row_limit, original_hint);
+        assert_eq!(budget.reserved(), 64);
+        drop(competing.borrow_mut().take());
+    } else {
+        drop(competing.borrow_mut().take());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("credit release must resume the smaller attempt");
+        assert_eq!(attempts.borrow().as_slice(), &[8, 4]);
+        if matches!(exit, WaitExit::Complete) {
+            let Some(Outcome::Batch { rows, batch }) = result.unwrap() else {
+                panic!("the reduced prefix fits after admission");
+            };
+            assert_eq!(rows, 0..4);
+            assert_eq!(
+                batch,
+                reader.take_as_batch(&[0, 1, 2, 3], None).await.unwrap()
+            );
+            assert_eq!(scan.position(), 4);
+            assert_eq!(scan.row_limit.rows(), 4);
+            drop(batch);
+            assert_eq!(budget.reserved(), 0);
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("post-wait decode failure"));
+        assert_eq!(scan.position(), 0);
+        assert_eq!(scan.row_limit, original_hint);
+    }
+    assert_eq!(budget.reserved(), 0);
+    // An abandoned call must not persist a speculative smaller hint.
+    attempts.borrow_mut().clear();
+    let result = scan
+        .next_with(AdmissionMode::Try, |indices, workspace| {
+            attempts.borrow_mut().push(indices.len());
+            let reader = &reader;
+            async move { reader.try_take_admitted_fullzip(&indices, workspace).await }
+        })
+        .await
+        .unwrap();
+    assert_eq!(attempts.borrow().as_slice(), &[8, 4]);
+    let Some(Outcome::Batch { rows, batch }) = result else {
+        panic!("retry must return the original unconsumed prefix");
+    };
+    assert_eq!(rows, 0..4);
+    drop(batch);
+    assert_eq!(budget.reserved(), 0);
+}
+
 #[tokio::test]
 async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
     let reader = null_reader(128).await;
@@ -227,7 +346,7 @@ async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
     // Model a first-row decode that only fits alone. Later rows use the real
     // missing-column decoder, so a sticky one-row hint would be unnecessary.
     let first = scan
-        .try_next_with(|indices, workspace| {
+        .next_with(AdmissionMode::Try, |indices, workspace| {
             let reader = &reader;
             async move {
                 if indices.len() > 1 {
@@ -244,18 +363,21 @@ async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
     assert_eq!(rows, 0..1);
     drop(batch);
     let committed_hint = scan.row_limit;
-    let mut cancelled = Box::pin(scan.try_next_with(|indices, workspace| async move {
-        pending::<()>().await;
-        drop((indices, workspace));
-        Ok(None)
-    }));
+    let mut cancelled = Box::pin(scan.next_with(
+        AdmissionMode::Try,
+        |indices, workspace| async move {
+            pending::<()>().await;
+            drop((indices, workspace));
+            Ok(None)
+        },
+    ));
     assert!(matches!(futures::poll!(cancelled.as_mut()), Poll::Pending));
     drop(cancelled);
     assert_eq!(scan.position(), 1);
     assert_eq!(scan.row_limit, committed_hint);
     assert_eq!(budget.reserved(), 0);
     let error = scan
-        .try_next_with(|indices, workspace| async move {
+        .next_with(AdmissionMode::Try, |indices, workspace| async move {
             drop((indices, workspace));
             Err(Error::corrupt_file_named("fixture", "wide-prefix failure"))
         })
@@ -306,13 +428,16 @@ async fn cursor_refusal_and_cancel_do_not_consume_rows_or_hold_credit() {
     assert_eq!(scan.position(), 1);
     drop(held);
 
-    let mut cancelled = Box::pin(scan.try_next_with(|indices, workspace| async move {
-        assert_eq!(indices.values().as_ref(), &[1, 2, 3]);
-        assert_eq!(workspace.len(), 64 - 3 * size_of::<u32>());
-        pending::<()>().await;
-        drop((indices, workspace));
-        Ok(None)
-    }));
+    let mut cancelled = Box::pin(scan.next_with(
+        AdmissionMode::Try,
+        |indices, workspace| async move {
+            assert_eq!(indices.values().as_ref(), &[1, 2, 3]);
+            assert_eq!(workspace.len(), 64 - 3 * size_of::<u32>());
+            pending::<()>().await;
+            drop((indices, workspace));
+            Ok(None)
+        },
+    ));
     assert!(matches!(futures::poll!(cancelled.as_mut()), Poll::Pending));
     assert_eq!(budget.reserved(), 64);
     drop(cancelled);
@@ -320,7 +445,7 @@ async fn cursor_refusal_and_cancel_do_not_consume_rows_or_hold_credit() {
     assert_eq!(budget.reserved(), 0);
 
     let error = scan
-        .try_next_with(|indices, workspace| async move {
+        .next_with(AdmissionMode::Try, |indices, workspace| async move {
             drop((indices, workspace));
             Err(Error::corrupt_file_named(
                 "fixture",
@@ -338,7 +463,7 @@ async fn cursor_refusal_and_cancel_do_not_consume_rows_or_hold_credit() {
     // must remain an admission refusal, not a conclusion that one row cannot fit.
     let mut competing = None;
     let attempt = scan
-        .try_next_with(|indices, workspace| {
+        .next_with(AdmissionMode::Try, |indices, workspace| {
             drop((indices, workspace));
             competing = budget.try_reserve(64);
             assert!(competing.is_some());
@@ -410,7 +535,7 @@ async fn cursor_validates_ranges_and_preserves_final_u32_offset() {
         )
         .unwrap();
     let result = final_row
-        .try_next_with(|indices, workspace| async move {
+        .next_with(AdmissionMode::Try, |indices, workspace| async move {
             assert_eq!(indices.values().as_ref(), &[u32::MAX]);
             drop((indices, workspace));
             Ok(Some(RecordBatch::new_empty(Arc::new(ArrowSchema::empty()))))

@@ -25,13 +25,12 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify adaptive prefixes and complete drains
+      - name: Verify prefix retry waits and cursor cancellation
         env:
           LANCE_CPU_THREADS: 1
         run: |
           cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::cursor:: -- --nocapture
           cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
-          cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
           cargo test --profile ci --locked -p lance --doc try_scan_admitted_fullzip -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}

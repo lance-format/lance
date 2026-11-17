@@ -11,7 +11,7 @@ use lance_core::{
 };
 
 use super::FragmentReader;
-use crate::dataset::admitted::RowLimit;
+use crate::dataset::admitted::{AdmissionMode, RowLimit};
 
 /// A complete physical prefix, a retryable refusal, or the end of a fragment scan.
 #[derive(Debug)]
@@ -123,18 +123,19 @@ impl AdmittedFragmentScan<'_> {
     /// Attempt the next complete prefix, without waiting for credit or reading ahead.
     pub async fn try_next(&mut self) -> Result<AdmittedFragmentScanOutcome> {
         Ok(self
-            .try_next_admitted()
+            .next_admitted(AdmissionMode::Try)
             .await?
             .unwrap_or(AdmittedFragmentScanOutcome::NeedsCapacity))
     }
 
     // None is exclusively a failed pool admission. An admitted minimal prefix
     // that cannot fit returns Some(NeedsCapacity), which must not wait for credit.
-    pub(crate) async fn try_next_admitted(
+    pub(crate) async fn next_admitted(
         &mut self,
+        admission: AdmissionMode,
     ) -> Result<Option<AdmittedFragmentScanOutcome>> {
         let reader = self.reader;
-        self.try_next_with(|indices, workspace| async move {
+        self.next_with(admission, |indices, workspace| async move {
             reader.try_take_admitted_fullzip(&indices, workspace).await
         })
         .await
@@ -142,8 +143,9 @@ impl AdmittedFragmentScan<'_> {
 
     // Own the handoff so cancellation tests can suspend an attempt without
     // blocking a CPU worker. Production uses the actual fragment take above.
-    pub(in crate::dataset::fragment) async fn try_next_with<Run, Done>(
+    pub(in crate::dataset::fragment) async fn next_with<Run, Done>(
         &mut self,
+        admission: AdmissionMode,
         mut take: Run,
     ) -> Result<Option<AdmittedFragmentScanOutcome>>
     where
@@ -160,8 +162,17 @@ impl AdmittedFragmentScan<'_> {
             .min((self.workspace_bytes / size_of::<u32>()).max(1) as u64);
         let first_attempt = count;
         loop {
-            let Some(mut workspace) = self.budget.try_reserve(self.workspace_bytes) else {
-                return Ok(None);
+            let mut workspace = loop {
+                if let Some(workspace) = self.budget.try_reserve(self.workspace_bytes) {
+                    break workspace;
+                }
+                if matches!(admission, AdmissionMode::Try) {
+                    return Ok(None);
+                }
+                // A refused attempt has released all its input/output before
+                // this wait. Keep only its reduced count, so contention cannot
+                // restart an expensive prefix already known not to fit.
+                self.budget.wait_for_capacity(self.workspace_bytes).await?;
             };
             let bytes = usize::try_from(count)
                 .ok()

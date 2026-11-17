@@ -45,6 +45,13 @@ struct ActiveFragment {
     row_limit: RowLimit,
 }
 
+/// Whether a caller can suspend while no attempted payload is held.
+#[derive(Clone, Copy)]
+pub enum AdmissionMode {
+    Try,
+    Wait,
+}
+
 /// A scheduling hint only; every attempted prefix still uses full admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowLimit {
@@ -234,7 +241,7 @@ impl AdmittedDatasetScan {
     /// Attempt a complete prefix without waiting for credit or prefetching fragments.
     pub async fn try_next(&mut self) -> Result<AdmittedDatasetScanOutcome> {
         Ok(self
-            .try_next_admitted()
+            .next_admitted(AdmissionMode::Try)
             .await?
             .unwrap_or(AdmittedDatasetScanOutcome::NeedsCapacity))
     }
@@ -246,6 +253,9 @@ impl AdmittedDatasetScan {
     /// parking a CPU worker. A minimal prefix that cannot fit an admitted workspace
     /// still returns `NeedsCapacity` immediately: waiting cannot make it fit.
     /// A workspace exceeding the pool limit returns an error instead of waiting.
+    /// A smaller prefix selected after a decode refusal survives intervening
+    /// capacity waits within this call. Cancellation discards that local retry
+    /// state; only a complete batch updates the cursor and future batch-size hint.
     ///
     /// Drop previously returned output before awaiting this method, or arrange an
     /// independent consumer to drain it. Waiting while retaining the only data
@@ -268,18 +278,16 @@ impl AdmittedDatasetScan {
     /// }
     /// ```
     pub async fn next_when_available(&mut self) -> Result<AdmittedDatasetScanOutcome> {
-        loop {
-            if let Some(outcome) = self.try_next_admitted().await? {
-                return Ok(outcome);
-            }
-            // The failed admission retains no operation payload. Subscribe/check
-            // through the pool primitive so a concurrent refund cannot be lost.
-            self.budget.wait_for_capacity(self.workspace_bytes).await?;
-        }
+        self.next_admitted(AdmissionMode::Wait)
+            .await?
+            .ok_or_else(|| Error::internal("waiting scan returned without admission"))
     }
 
     // None distinguishes pool contention from an admitted decode refusal.
-    async fn try_next_admitted(&mut self) -> Result<Option<AdmittedDatasetScanOutcome>> {
+    async fn next_admitted(
+        &mut self,
+        admission: AdmissionMode,
+    ) -> Result<Option<AdmittedDatasetScanOutcome>> {
         loop {
             let Some(position) = self.position() else {
                 return Ok(Some(AdmittedDatasetScanOutcome::Finished));
@@ -316,7 +324,7 @@ impl AdmittedDatasetScan {
                 self.budget.clone(),
             )?;
             scan.row_limit = active.row_limit;
-            let result = scan.try_next_admitted().await?;
+            let result = scan.next_admitted(admission).await?;
             let row_limit = scan.row_limit;
             drop(scan);
             let Some(result) = result else {
