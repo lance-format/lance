@@ -55,6 +55,24 @@ use lance_core::{Error, Result};
 
 pub mod emeans;
 
+use emeans::{EMeansParams, train_emeans};
+
+/// The clustering each node of hierarchical k-means runs to split its vectors
+/// into [`KMeansParams::hierarchical_k`] sub-clusters. The tree around the
+/// nodes (size-proportional quotas, sibling sub-trees trained in parallel,
+/// leaves as member means, optional global refinement) is the same for both.
+#[derive(Debug, Clone, Default)]
+pub enum HierarchicalNodeAlgorithm {
+    /// Lloyd iterations bounded by [`KMeansParams::max_iters`] and
+    /// [`KMeansParams::tolerance`], with [`KMeansParams::redos`] restarts.
+    #[default]
+    Lloyd,
+    /// Mini-batch e-means, see [`emeans::train_emeans`]. Supports only the
+    /// L2 distance. Each node's seed is derived from [`KMeansParams::seed`],
+    /// so [`EMeansParams::seed`] is ignored.
+    EMeans(EMeansParams),
+}
+
 /// KMean initialization method.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KMeanInit {
@@ -96,6 +114,10 @@ pub struct KMeansParams {
     /// Hierarchical k-means is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
 
+    /// The clustering each node of the hierarchy runs. Default is Lloyd.
+    /// Non-hierarchical training always runs Lloyd and ignores it.
+    pub hierarchical_node_algorithm: HierarchicalNodeAlgorithm,
+
     /// Number of global Lloyd iterations run over the whole training sample after
     /// the hierarchical tree is built, with every centroid competing for every
     /// vector. The tree fits each centroid only against its own sub-tree's
@@ -124,6 +146,10 @@ impl std::fmt::Debug for KMeansParams {
             .field("distance_type", &self.distance_type)
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
+            .field(
+                "hierarchical_node_algorithm",
+                &self.hierarchical_node_algorithm,
+            )
             .field("refine_iters", &self.refine_iters)
             .field("seed", &self.seed)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
@@ -141,6 +167,7 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            hierarchical_node_algorithm: HierarchicalNodeAlgorithm::default(),
             refine_iters: 0,
             seed: None,
             on_progress: None,
@@ -187,6 +214,16 @@ impl KMeansParams {
     /// See [`KMeansParams::hierarchical_k`].
     pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
         self.hierarchical_k = hierarchical_k;
+        self
+    }
+
+    /// Set the clustering each node of the hierarchy runs.
+    /// See [`KMeansParams::hierarchical_node_algorithm`].
+    pub fn with_hierarchical_node_algorithm(
+        mut self,
+        algorithm: HierarchicalNodeAlgorithm,
+    ) -> Self {
+        self.hierarchical_node_algorithm = algorithm;
         self
     }
 
@@ -1506,7 +1543,19 @@ impl KMeans {
         };
         let training =
             Self::create_array_from_indices::<T>(training_indices, data_values, dimension)?;
-        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &node_params)?;
+        let kmeans = match &params.hierarchical_node_algorithm {
+            HierarchicalNodeAlgorithm::Lloyd => {
+                Self::train_kmeans::<T, Algo>(&training, k, &node_params)?
+            }
+            HierarchicalNodeAlgorithm::EMeans(emeans_params) => {
+                let emeans_params = EMeansParams {
+                    seed: node_params.seed,
+                    ..emeans_params.clone()
+                };
+                train_emeans(&training, k, &emeans_params)
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?
+            }
+        };
         drop(training);
         let membership = Self::membership_of_rows::<T, Algo>(
             kmeans.centroids.as_primitive::<T>().values(),
@@ -1761,6 +1810,16 @@ impl KMeans {
         // 2. kmeans with k=256 is small enough that we don't need to use hierarchical clustering for efficiency
         if k > 256 && params.hierarchical_k > 1 {
             log::debug!("Using hierarchical clustering for k={}", k);
+            if matches!(
+                params.hierarchical_node_algorithm,
+                HierarchicalNodeAlgorithm::EMeans(_)
+            ) && params.distance_type != DistanceType::L2
+            {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "KMeans: hierarchical e-means supports only the l2 distance, got {}",
+                    params.distance_type
+                )));
+            }
             return match (data.value_type(), params.distance_type) {
                 (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                     Self::train_hierarchical_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(
@@ -3438,8 +3497,10 @@ mod tests {
         assert_eq!(indices, expected);
     }
 
-    #[test]
-    fn test_hierarchical_kmeans_sorted_groups() {
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_hierarchical_kmeans_sorted_groups(#[case] node_algorithm: HierarchicalNodeAlgorithm) {
         const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
         // Ordered groups include exactly K distinct vectors, so successful
         // hierarchical training must recover every group.
@@ -3451,6 +3512,7 @@ mod tests {
         let params = KMeansParams {
             max_iters: 5,
             hierarchical_k: 2,
+            hierarchical_node_algorithm: node_algorithm,
             seed: Some(42),
             ..Default::default()
         };
@@ -3471,14 +3533,19 @@ mod tests {
         assert!(assigned_sizes(&kmeans, &data).iter().all(|&size| size > 0));
     }
 
-    #[test]
-    fn test_hierarchical_kmeans_is_seeded_and_balanced() {
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_hierarchical_kmeans_is_seeded_and_balanced(
+        #[case] node_algorithm: HierarchicalNodeAlgorithm,
+    ) {
         const DIM: usize = 16;
         const K: usize = 300;
         let data = skewed_training_data(K * 32, DIM);
         let params = KMeansParams {
             max_iters: 10,
             hierarchical_k: 16,
+            hierarchical_node_algorithm: node_algorithm,
             seed: Some(42),
             ..Default::default()
         };
@@ -3513,8 +3580,10 @@ mod tests {
         assert!(max <= 4.0 * mean, "largest partition {max} vs mean {mean}");
     }
 
-    #[test]
-    fn test_hierarchical_refinement_lowers_loss() {
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_hierarchical_refinement_lowers_loss(#[case] node_algorithm: HierarchicalNodeAlgorithm) {
         const DIM: usize = 16;
         const K: usize = 300;
         let data = skewed_training_data(K * 16, DIM);
@@ -3522,6 +3591,7 @@ mod tests {
             let params = KMeansParams {
                 max_iters: 5,
                 hierarchical_k: 8,
+                hierarchical_node_algorithm: node_algorithm.clone(),
                 refine_iters,
                 seed: Some(7),
                 ..Default::default()
@@ -3536,6 +3606,45 @@ mod tests {
         assert!(
             refined <= unrefined * 1.001,
             "refinement raised the loss from {unrefined} to {refined}"
+        );
+    }
+
+    #[test]
+    fn test_hierarchical_emeans_matches_lloyd_loss() {
+        const DIM: usize = 16;
+        const K: usize = 300;
+        let data = skewed_training_data(K * 32, DIM);
+        let loss_of = |node_algorithm: HierarchicalNodeAlgorithm| {
+            let params = KMeansParams {
+                hierarchical_node_algorithm: node_algorithm,
+                seed: Some(42),
+                ..Default::default()
+            };
+            KMeans::new_with_params(&data, K, &params)
+                .unwrap()
+                .compute_loss(&data)
+                .unwrap()
+        };
+        let lloyd = loss_of(HierarchicalNodeAlgorithm::Lloyd);
+        let emeans = loss_of(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()));
+        assert!(
+            emeans <= lloyd * 1.02,
+            "hierarchical e-means loss {emeans} exceeds Lloyd loss {lloyd}"
+        );
+    }
+
+    #[test]
+    fn test_hierarchical_emeans_rejects_dot() {
+        let data = skewed_training_data(300 * 4, 4);
+        let params = KMeansParams {
+            distance_type: DistanceType::Dot,
+            hierarchical_node_algorithm: HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()),
+            ..Default::default()
+        };
+        let err = KMeans::new_with_params(&data, 300, &params).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(message) if message.contains("e-means")),
+            "{err}"
         );
     }
 

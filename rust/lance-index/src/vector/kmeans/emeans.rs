@@ -26,6 +26,7 @@
 //! For cosine similarity, normalize the vectors to unit length first.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use arrow_array::types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, FixedSizeListArray, PrimitiveArray, cast::AsArray};
@@ -54,6 +55,16 @@ const SPLIT_PERTURBATION: f64 = 1.0 / 128.0;
 /// Above this many training vectors the paper divides the batch law by 8, as
 /// smaller batches gave the same throughput.
 const LARGE_DATASET_ROWS: usize = 2_000_000;
+/// Minimum vector-centroid coordinate pairs a parallel assignment task scores,
+/// about 20 µs of work, so per-task scheduling overhead stays negligible even
+/// for the 16-centroid nodes of hierarchical training.
+const MIN_TASK_DISTANCE_TERMS: usize = 1 << 16;
+/// Upper bound on the parallel tasks one batch is split into, which bounds the
+/// private sum tables a batch allocates.
+const MAX_BATCH_TASKS: usize = 64;
+/// Centroid sum tables up to this size are replicated per assignment task; see
+/// [`assign_batch`].
+const TASK_SUMS_MAX_BYTES: usize = 1024 * 1024;
 
 /// Parameters of [`train_emeans`].
 #[derive(Debug, Clone)]
@@ -214,6 +225,7 @@ impl Trainer<'_> {
     fn train<T: ArrowPrimitiveType>(&self, data: &FixedSizeListArray) -> Result<KMeans>
     where
         T::Native: Float + L2,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         let Self {
             dimension,
@@ -243,61 +255,28 @@ impl Trainer<'_> {
         let batches_per_epoch = n / batch_size;
         let total_updates = params.epochs as usize * batches_per_epoch;
         let mut order: Vec<usize> = (0..n).collect();
-        let mut batch_counts = vec![0.0; k];
-        let mut batch_sums = vec![0.0; k * dimension];
-        let mut final_counts = vec![0usize; k];
-        let mut final_sums = vec![0.0; k * dimension];
-        let mut final_loss = 0.0;
+        // Every vector of the last epoch, summed per cluster, for the
+        // last-epoch-mean finalization.
+        let mut last_epoch_stats = BatchStats::zeros(k, dimension);
         let mut t = 0;
         for epoch in 0..params.epochs {
-            let last_epoch = epoch + 1 == params.epochs;
+            let is_last_epoch = epoch + 1 == params.epochs;
             order.shuffle(&mut rng);
             // The tail that does not fill a batch is skipped; the next shuffle
             // puts other vectors there.
             for batch in order.chunks_exact(batch_size) {
-                let assignments: Vec<Option<(u32, f32)>> = batch
-                    .par_iter()
-                    .map_init(
-                        || vec![0.0f32; k],
-                        |distances, &row| {
-                            let vector = &values[row * dimension..(row + 1) * dimension];
-                            l2_distance_batch_into(vector, &centroids, dimension, distances);
-                            argmin_value_float(distances.iter().copied())
-                        },
-                    )
-                    .collect();
-
-                batch_counts.fill(0.0);
-                batch_sums.fill(0.0);
-                for (&row, assignment) in batch.iter().zip(&assignments) {
-                    // A vector with NaN distances to every centroid joins none.
-                    let Some((cluster, distance)) = *assignment else {
-                        continue;
-                    };
-                    let cluster = cluster as usize;
-                    let vector = &values[row * dimension..(row + 1) * dimension];
-                    batch_counts[cluster] += 1.0;
-                    add_vector(
-                        &mut batch_sums[cluster * dimension..(cluster + 1) * dimension],
-                        vector,
-                    );
-                    if last_epoch {
-                        final_counts[cluster] += 1;
-                        add_vector(
-                            &mut final_sums[cluster * dimension..(cluster + 1) * dimension],
-                            vector,
-                        );
-                        final_loss += f64::from(distance);
-                    }
-                }
+                let batch_stats = assign_batch(values, dimension, &centroids, k, batch);
 
                 let step = step_at(peak_step, t, total_updates);
                 let decay = 1.0 - step;
-                for (count, batch_count) in counts.iter_mut().zip(&batch_counts) {
+                for (count, batch_count) in counts.iter_mut().zip(&batch_stats.counts) {
                     *count = decay * *count + step * batch_count;
                 }
-                for (sum, batch_sum) in sums.iter_mut().zip(&batch_sums) {
+                for (sum, batch_sum) in sums.iter_mut().zip(&batch_stats.sums) {
                     *sum = decay * *sum + step * batch_sum;
+                }
+                if is_last_epoch {
+                    last_epoch_stats.merge(&batch_stats);
                 }
                 t += 1;
                 if params.revival_threshold > 0.0 && t % REVIVAL_PERIOD == 0 {
@@ -313,24 +292,136 @@ impl Trainer<'_> {
             }
         }
 
-        // Last-epoch-mean finalization; a cluster that caught no vector in the
-        // last epoch keeps its EMA centroid.
-        for (cluster, &count) in final_counts.iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let range = cluster * dimension..(cluster + 1) * dimension;
-            for (centroid, sum) in centroids[range.clone()].iter_mut().zip(&final_sums[range]) {
-                *centroid = from_f64(sum / count as f64);
-            }
-        }
+        // Last-epoch-mean finalization: the last epoch's counts and sums are
+        // exactly those of its recorded assignments. A cluster that caught no
+        // vector in the last epoch keeps its EMA centroid.
+        read_centroids(
+            &last_epoch_stats.counts,
+            &last_epoch_stats.sums,
+            dimension,
+            &mut centroids,
+        );
 
         Ok(KMeans {
-            centroids: std::sync::Arc::new(PrimitiveArray::<T>::from_iter_values(centroids)),
+            centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
             dimension,
             distance_type: DistanceType::L2,
-            loss: final_loss,
+            loss: last_epoch_stats.loss,
         })
+    }
+}
+
+/// What one batch contributes to every cluster: `n_j`, `s_j` and the squared
+/// distances of its vectors to their centroids.
+struct BatchStats {
+    counts: Vec<f64>,
+    sums: Vec<f64>,
+    loss: f64,
+}
+
+impl BatchStats {
+    fn zeros(k: usize, dimension: usize) -> Self {
+        Self {
+            counts: vec![0.0; k],
+            sums: vec![0.0; k * dimension],
+            loss: 0.0,
+        }
+    }
+
+    fn add<N: Float>(&mut self, cluster: usize, vector: &[N], distance: f32) {
+        let dimension = vector.len();
+        self.counts[cluster] += 1.0;
+        for (sum, value) in self.sums[cluster * dimension..(cluster + 1) * dimension]
+            .iter_mut()
+            .zip(vector)
+        {
+            *sum += to_f64(*value);
+        }
+        self.loss += f64::from(distance);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (count, other) in self.counts.iter_mut().zip(&other.counts) {
+            *count += other;
+        }
+        for (sum, other) in self.sums.iter_mut().zip(&other.sums) {
+            *sum += other;
+        }
+        self.loss += other.loss;
+    }
+}
+
+/// Rows of a batch per parallel task: enough that a task scores at least
+/// `MIN_TASK_DISTANCE_TERMS` vector-centroid coordinate pairs, so the
+/// scheduling cost of a task stays small next to its work, and few enough that
+/// a batch yields at most `MAX_BATCH_TASKS` tasks. Derived only from the
+/// problem shape, never the thread count, so the summation order, and with it
+/// the trained centroids, is the same on every host.
+fn rows_per_task(batch_len: usize, k: usize, dimension: usize) -> usize {
+    let min_rows = MIN_TASK_DISTANCE_TERMS.div_ceil(k * dimension);
+    min_rows.max(batch_len.div_ceil(MAX_BATCH_TASKS)).max(1)
+}
+
+/// Assigns every vector of `batch` (row ids into `values`) to its nearest
+/// centroid and returns the batch's per-cluster statistics.
+///
+/// The batch is split into tasks of [`rows_per_task`] rows that run on the
+/// rayon pool, so it nests under the sibling sub-trees of hierarchical
+/// training and idle threads steal tasks from either. With a small centroid
+/// table each task also sums its own rows into a private table, merged in task
+/// order; a large table would be costly to replicate per task, so its tasks
+/// only assign and the sums are taken in one pass afterwards. A vector whose
+/// distances to every centroid are NaN joins no cluster.
+fn assign_batch<N: Float + L2 + Sync>(
+    values: &[N],
+    dimension: usize,
+    centroids: &[N],
+    k: usize,
+    batch: &[usize],
+) -> BatchStats {
+    let rows_per_task = rows_per_task(batch.len(), k, dimension);
+    let vector = |row: usize| &values[row * dimension..(row + 1) * dimension];
+    let nearest = |row: usize, distances: &mut [f32]| {
+        l2_distance_batch_into(vector(row), centroids, dimension, distances);
+        argmin_value_float(distances.iter().copied())
+    };
+
+    if k * dimension * size_of::<f64>() <= TASK_SUMS_MAX_BYTES {
+        let partials: Vec<BatchStats> = batch
+            .par_chunks(rows_per_task)
+            .map(|rows| {
+                let mut stats = BatchStats::zeros(k, dimension);
+                let mut distances = vec![0.0f32; k];
+                for &row in rows {
+                    if let Some((cluster, distance)) = nearest(row, &mut distances) {
+                        stats.add(cluster as usize, vector(row), distance);
+                    }
+                }
+                stats
+            })
+            .collect();
+        let mut stats = BatchStats::zeros(k, dimension);
+        for partial in &partials {
+            stats.merge(partial);
+        }
+        stats
+    } else {
+        let assignments: Vec<Vec<Option<(u32, f32)>>> = batch
+            .par_chunks(rows_per_task)
+            .map(|rows| {
+                let mut distances = vec![0.0f32; k];
+                rows.iter()
+                    .map(|&row| nearest(row, &mut distances))
+                    .collect()
+            })
+            .collect();
+        let mut stats = BatchStats::zeros(k, dimension);
+        for (&row, assignment) in batch.iter().zip(assignments.iter().flatten()) {
+            if let Some((cluster, distance)) = *assignment {
+                stats.add(cluster as usize, vector(row), distance);
+            }
+        }
+        stats
     }
 }
 
@@ -340,12 +431,6 @@ fn to_f64<N: Float>(value: N) -> f64 {
 
 fn from_f64<N: Float>(value: f64) -> N {
     num_traits::cast(value).unwrap_or_else(N::nan)
-}
-
-fn add_vector<N: Float>(sum: &mut [f64], vector: &[N]) {
-    for (sum, value) in sum.iter_mut().zip(vector) {
-        *sum += to_f64(*value);
-    }
 }
 
 /// Read every centroid off as `S_j / N_j` (Equation 4). A cluster whose count
