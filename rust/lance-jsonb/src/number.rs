@@ -530,7 +530,7 @@ impl Number {
                     return Err(Error::Message("Division by zero".to_string()));
                 }
                 // wrapping_rem returns the exact 0 for i64::MIN % -1.
-                Ok(Number::Int64(a.wrapping_rem(b)))
+                Ok(Self::Int64(a.wrapping_rem(b)))
             }
             (Self::UInt64(a), Self::UInt64(b)) => {
                 if b == 0 {
