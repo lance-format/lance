@@ -22,21 +22,28 @@ import org.lance.ipc.FragmentSlice;
 import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.AllocationListener;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
@@ -48,12 +55,17 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,9 +98,9 @@ public class AsyncScannerTest {
 
     Field pendingTasksField = AsyncScanner.class.getDeclaredField("pendingTasks");
     pendingTasksField.setAccessible(true);
-    ConcurrentHashMap<Long, CompletableFuture<Long>> pendingTasks =
-        (ConcurrentHashMap<Long, CompletableFuture<Long>>) pendingTasksField.get(scanner);
-    CompletableFuture<Long> pendingTask = new CompletableFuture<>();
+    ConcurrentHashMap<Long, CompletableFuture<ArrowReader>> pendingTasks =
+        (ConcurrentHashMap<Long, CompletableFuture<ArrowReader>>) pendingTasksField.get(scanner);
+    CompletableFuture<ArrowReader> pendingTask = new CompletableFuture<>();
     pendingTasks.put(1L, pendingTask);
 
     Method failTask = AsyncScanner.class.getDeclaredMethod("failTask", long.class, String.class);
@@ -98,6 +110,325 @@ public class AsyncScannerTest {
     CompletionException failure = assertThrows(CompletionException.class, pendingTask::join);
     assertEquals(LanceException.class, failure.getCause().getClass());
     assertEquals("scan I/O failed", failure.getCause().getMessage());
+    assertTrue(pendingTasks.isEmpty());
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void testCloseTerminatesPendingAndRejectsLateResults() throws Exception {
+    Constructor<AsyncScanner> constructor = AsyncScanner.class.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    AsyncScanner scanner = constructor.newInstance();
+    Field field = AsyncScanner.class.getDeclaredField("pendingTasks");
+    field.setAccessible(true);
+    ConcurrentHashMap<Long, CompletableFuture<ArrowReader>> tasks =
+        (ConcurrentHashMap<Long, CompletableFuture<ArrowReader>>) field.get(scanner);
+    CompletableFuture<ArrowReader> future = new CompletableFuture<>();
+    tasks.put(42L, future);
+    scanner.close();
+    assertTrue(future.isCancelled());
+    assertTrue(tasks.isEmpty());
+    Method complete = AsyncScanner.class.getDeclaredMethod("completeTask", long.class, long.class);
+    complete.setAccessible(true);
+    assertEquals(false, complete.invoke(scanner, 42L, 0L));
+    scanner.close();
+  }
+
+  @Test
+  void testImportErrorCompletesFutureAndReleasesProducer() throws Exception {
+    try (RootAllocator root = new RootAllocator();
+        ScanCompletion completion =
+            new ScanCompletion(
+                root,
+                interceptAllocations(
+                    root,
+                    () -> {
+                      throw new OutOfMemoryError("injected import failure");
+                    }))) {
+      assertTrue(completion.deliver());
+      ExecutionException failure =
+          assertThrows(ExecutionException.class, () -> completion.future.get(1, TimeUnit.SECONDS));
+      assertInstanceOf(OutOfMemoryError.class, failure.getCause());
+      assertEquals("injected import failure", failure.getCause().getMessage());
+      assertTrue(completion.tasks.isEmpty());
+      assertEquals(1, completion.releases.get());
+      completion.scanner.close();
+      assertTrue(completion.future.isCompletedExceptionally());
+    }
+  }
+
+  private enum CompletedTask {
+    TIMEOUT,
+    FAILURE,
+    CANCELLATION,
+    SUCCESS
+  }
+
+  @ParameterizedTest
+  @EnumSource(CompletedTask.class)
+  void testLateResultRemovesCompletedTaskAndReleasesProducer(CompletedTask state) throws Exception {
+    try (RootAllocator root = new RootAllocator();
+        ScanCompletion completion = new ScanCompletion(root, root)) {
+      switch (state) {
+        case TIMEOUT:
+          completion.future.completeExceptionally(new TimeoutException("deadline"));
+          break;
+        case FAILURE:
+          completion.future.completeExceptionally(new IllegalStateException("caller failed"));
+          break;
+        case CANCELLATION:
+          completion.future.cancel(false);
+          break;
+        case SUCCESS:
+          completion.future.complete(null);
+          break;
+        default:
+          throw new AssertionError(state);
+      }
+      assertFalse(completion.deliver());
+      assertTrue(completion.tasks.isEmpty());
+      assertEquals(1, completion.releases.get());
+    }
+  }
+
+  @Test
+  void testProducedStreamDeliveredAfterCloseIsReleasedOnce() throws Exception {
+    try (RootAllocator root = new RootAllocator();
+        ScanCompletion completion = new ScanCompletion(root, root)) {
+      completion.scanner.close();
+      assertTrue(completion.future.isCancelled());
+      assertFalse(completion.deliver());
+      assertEquals(1, completion.releases.get());
+      assertFalse(completion.deliver());
+      assertEquals(1, completion.releases.get());
+    }
+  }
+
+  @Test
+  void testDeliveredReaderKeepsProducerUntilReaderCloses() throws Exception {
+    try (RootAllocator root = new RootAllocator();
+        ScanCompletion completion = new ScanCompletion(root, root)) {
+      assertTrue(completion.deliver());
+      ArrowReader reader = completion.future.get(1, TimeUnit.SECONDS);
+      completion.scanner.close();
+      assertEquals(0, completion.releases.get());
+      reader.close();
+      assertEquals(1, completion.releases.get());
+    }
+  }
+
+  private enum ImportTermination {
+    PUBLIC_FUTURE,
+    SCANNER_CLOSE,
+    IMPORT_ERROR
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = ImportTermination.class,
+      names = {"PUBLIC_FUTURE", "SCANNER_CLOSE"})
+  void testCancellationDuringImportReleasesProducer(ImportTermination action) throws Exception {
+    CompletableFuture<Void> entered = new CompletableFuture<>();
+    CompletableFuture<Void> resume = new CompletableFuture<>();
+    try (RootAllocator root = new RootAllocator();
+        ScanCompletion completion =
+            new ScanCompletion(
+                root, interceptAllocations(root, () -> awaitImport(entered, resume)))) {
+      CompletableFuture<Boolean> callback =
+          CompletableFuture.supplyAsync(
+              () -> {
+                try {
+                  return completion.deliver();
+                } catch (Exception error) {
+                  throw new CompletionException(error);
+                }
+              });
+      try {
+        entered.get(10, TimeUnit.SECONDS);
+        assertTrue(completion.tasks.containsKey(42L));
+        if (action == ImportTermination.PUBLIC_FUTURE) {
+          completion.future.cancel(false);
+        } else {
+          completion.scanner.close();
+        }
+        assertTrue(completion.future.isCancelled());
+      } finally {
+        resume.complete(null);
+      }
+      assertTrue(callback.get(10, TimeUnit.SECONDS));
+      assertTrue(completion.tasks.isEmpty());
+      assertEquals(1, completion.releases.get());
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(ImportTermination.class)
+  void testNativeTerminationDuringImport(ImportTermination action, @TempDir Path tempDir)
+      throws Exception {
+    CompletableFuture<Void> entered = new CompletableFuture<>();
+    CompletableFuture<Void> resume = new CompletableFuture<>();
+    CompletableFuture<Void> released = new CompletableFuture<>();
+    AtomicInteger releases = new AtomicInteger();
+    AllocationListener listener =
+        new AllocationListener() {
+          @Override
+          public void onRelease(long size) {
+            releases.incrementAndGet();
+            released.complete(null);
+          }
+        };
+    try (RootAllocator datasetAllocator = new RootAllocator();
+        RootAllocator importAllocator = new RootAllocator(listener, Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(
+              datasetAllocator, tempDir.resolve("native_cancel").toString());
+      fixture.createEmptyDataset().close();
+      try (Dataset dataset = fixture.write(1, 4);
+          AsyncScanner scanner =
+              AsyncScanner.create(
+                  dataset,
+                  new ScanOptions.Builder().build(),
+                  interceptAllocations(
+                      importAllocator,
+                      () -> {
+                        awaitImport(entered, resume);
+                        if (action == ImportTermination.IMPORT_ERROR) {
+                          throw new OutOfMemoryError("injected native import failure");
+                        }
+                      }))) {
+        CompletableFuture<ArrowReader> future = scanner.scanBatchesAsync();
+        try {
+          entered.get(10, TimeUnit.SECONDS);
+          if (action == ImportTermination.PUBLIC_FUTURE) {
+            future.cancel(false);
+          } else if (action == ImportTermination.SCANNER_CLOSE) {
+            scanner.close();
+          }
+          if (action != ImportTermination.IMPORT_ERROR) {
+            assertTrue(future.isCancelled());
+          }
+        } finally {
+          resume.complete(null);
+        }
+        if (action == ImportTermination.IMPORT_ERROR) {
+          ExecutionException failure =
+              assertThrows(ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS));
+          assertInstanceOf(OutOfMemoryError.class, failure.getCause());
+          assertEquals("injected native import failure", failure.getCause().getMessage());
+        } else {
+          released.get(10, TimeUnit.SECONDS);
+        }
+        // The dispatcher is serial: this callback also waits for the cancelled import to finish.
+        try (AsyncScanner next =
+                AsyncScanner.create(dataset, new ScanOptions.Builder().build(), datasetAllocator);
+            ArrowReader reader = next.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(4, rows);
+        }
+        assertEquals(action == ImportTermination.IMPORT_ERROR ? 0 : 1, releases.get());
+        assertEquals(0, importAllocator.getAllocatedMemory());
+        scanner.close();
+        assertTrue(future.isDone());
+      }
+    }
+  }
+
+  private static void awaitImport(CompletableFuture<Void> entered, CompletableFuture<Void> resume) {
+    entered.complete(null);
+    try {
+      resume.get(10, TimeUnit.SECONDS);
+    } catch (InterruptedException error) {
+      Thread.currentThread().interrupt();
+      throw new AssertionError(error);
+    } catch (ExecutionException | TimeoutException error) {
+      throw new AssertionError(error);
+    }
+  }
+
+  private static BufferAllocator interceptAllocations(BufferAllocator allocator, Runnable before) {
+    return (BufferAllocator)
+        Proxy.newProxyInstance(
+            BufferAllocator.class.getClassLoader(),
+            new Class<?>[] {BufferAllocator.class},
+            (proxy, method, args) -> {
+              if (method.getName().equals("buffer")) {
+                before.run();
+              }
+              return method.invoke(allocator, args);
+            });
+  }
+
+  private static class ScanCompletion implements AutoCloseable {
+    final AsyncScanner scanner;
+    final CompletableFuture<ArrowReader> future = new CompletableFuture<>();
+    final ConcurrentHashMap<Long, CompletableFuture<ArrowReader>> tasks;
+    final AtomicInteger releases = new AtomicInteger();
+    final ArrowArrayStream stream;
+    final Method callback;
+
+    @SuppressWarnings("unchecked")
+    ScanCompletion(BufferAllocator root, BufferAllocator importer) throws Exception {
+      Constructor<AsyncScanner> constructor = AsyncScanner.class.getDeclaredConstructor();
+      constructor.setAccessible(true);
+      scanner = constructor.newInstance();
+      Field allocator = AsyncScanner.class.getDeclaredField("allocator");
+      allocator.setAccessible(true);
+      allocator.set(scanner, importer);
+      Field pending = AsyncScanner.class.getDeclaredField("pendingTasks");
+      pending.setAccessible(true);
+      tasks = (ConcurrentHashMap<Long, CompletableFuture<ArrowReader>>) pending.get(scanner);
+      tasks.put(42L, future);
+      callback = AsyncScanner.class.getDeclaredMethod("completeTask", long.class, long.class);
+      callback.setAccessible(true);
+      ArrowReader producer =
+          new ArrowReader(root) {
+            @Override
+            public boolean loadNextBatch() {
+              return false;
+            }
+
+            @Override
+            public long bytesRead() {
+              return 0;
+            }
+
+            @Override
+            protected void closeReadSource() {
+              releases.incrementAndGet();
+            }
+
+            @Override
+            protected Schema readSchema() {
+              return new Schema(Collections.emptyList());
+            }
+          };
+      stream = ArrowArrayStream.allocateNew(root);
+      Data.exportArrayStream(root, producer, stream);
+    }
+
+    boolean deliver() throws Exception {
+      try {
+        return (boolean) callback.invoke(scanner, 42L, stream.memoryAddress());
+      } finally {
+        // Mirror the dispatcher's drop: Arrow clears release when it moves the stream.
+        if (stream.snapshot().release != 0) {
+          stream.release();
+        }
+      }
+    }
+
+    @Override
+    public void close() throws Exception {
+      scanner.close();
+      if (stream.snapshot().release != 0) {
+        stream.release();
+      }
+      stream.close();
+      assertEquals(1, releases.get());
+    }
   }
 
   /**
