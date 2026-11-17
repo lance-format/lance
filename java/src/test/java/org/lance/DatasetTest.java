@@ -1782,6 +1782,28 @@ public class DatasetTest {
   }
 
   @Test
+  void testMigrateToStableRowIds(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("migrate").toString());
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 5).close();
+      try (Dataset ds = testDataset.write(2, 5)) {
+        assertFalse(ds.hasStableRowIds());
+
+        ds.migrateToStableRowIds();
+        assertTrue(ds.hasStableRowIds());
+        assertEquals(10, ds.countRows());
+
+        // A second call is a no-op and commits no new version.
+        long version = ds.version();
+        ds.migrateToStableRowIds();
+        assertEquals(version, ds.version());
+      }
+    }
+  }
+
+  @Test
   void testGetRowAddresses(@TempDir Path tempDir) throws IOException {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =

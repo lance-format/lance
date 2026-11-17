@@ -63,7 +63,7 @@ Enable stable row IDs when creating the dataset:
     }
     ```
 
-Passing this option on later writes does not migrate an existing dataset. Migration is a separate operation, currently exposed in Rust as `Dataset::migrate_to_stable_row_ids`. Before migration, quiesce data writers and index builds, drop secondary indexes, and recreate them after migration. See the [Row ID and Lineage Specification](../format/table/row_id_lineage.md#enabling-stable-row-ids) for the complete migration protocol.
+Passing this option on later writes does not migrate an existing dataset. Migration is a separate operation, exposed as `Dataset::migrate_to_stable_row_ids` in Rust, `LanceDataset.migrate_to_stable_row_ids` in Python and `Dataset.migrateToStableRowIds` in Java. Before migration, quiesce data writers and index builds, drop secondary indexes, and recreate them after migration. See the [Row ID and Lineage Specification](../format/table/row_id_lineage.md#enabling-stable-row-ids) for the complete migration protocol.
 
 ## Read Stable Row IDs
 

@@ -5212,6 +5212,28 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
+    def migrate_to_stable_row_ids(self) -> None:
+        """
+        Enable stable row IDs on an existing dataset.
+
+        Passing ``enable_stable_row_ids=True`` to a later write does not migrate
+        an existing dataset; this method does. It commits a new version and
+        refreshes this object to it. It is a no-op when the dataset already uses
+        stable row IDs.
+
+        The migration is rejected while the dataset has secondary indices; drop
+        them first and recreate them afterwards. It also fails if a concurrent
+        write commits during the migration, so quiesce writers first.
+
+        Raises
+        ------
+        ValueError
+            If the dataset has secondary indices.
+        OSError
+            If a concurrent write conflicts with the migration.
+        """
+        self._ds.migrate_to_stable_row_ids()
+
     def delete_config_keys(self, keys: list[str]) -> None:
         """Delete specified configuration keys from the dataset.
 
