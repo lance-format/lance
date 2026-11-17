@@ -9,6 +9,9 @@ use lance_core::utils::allocation::AllocationBudget;
 use rstest::rstest;
 use std::sync::Mutex;
 
+#[cfg(feature = "lz4")]
+mod compressed;
+
 fn fixture(bits: u8, values: &[Vec<u8>]) -> (Dictionary, Vec<u8>) {
     let width = usize::from(bits / 8);
     let start = (values.len() + 3) * width;

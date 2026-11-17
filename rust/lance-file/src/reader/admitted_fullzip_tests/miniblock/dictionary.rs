@@ -115,37 +115,6 @@ async fn actual_dictionary_layout_and_admission_boundaries(
     }
     const WORKSPACE: usize = 128 * 1024;
     let budget = AllocationBudget::new(WORKSPACE);
-    if default_compression {
-        // Preserve the original writer counterexample. Unsupported compressed
-        // dictionaries must not fall back to whole-page reads/decompression.
-        let reads = Arc::new(Mutex::new(Vec::new()));
-        let reader = reader.with_scheduler(Arc::new(RangeIo {
-            inner: reader.core.scheduler.clone(),
-            reads: reads.clone(),
-        }));
-        let error = reader
-            .open_admitted_fullzip_scan(0..rows as u64, budget.clone(), WORKSPACE, 37)
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("raw variable-width values"));
-        assert!(reads.lock().unwrap().is_empty());
-        assert_eq!(budget.reserved(), 0);
-        let mut work = budget.try_reserve(WORKSPACE).unwrap();
-        let error = reader
-            .prepare_admitted_fullzip_take_in(&[0, 3], &mut work)
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("raw variable-width values"));
-        assert_eq!(work.len(), WORKSPACE);
-        assert!(reads.lock().unwrap().is_empty());
-        drop(work);
-        assert_eq!(budget.reserved(), 0);
-        return;
-    }
     let mut scan = reader
         .open_admitted_fullzip_scan(0..rows as u64, budget.clone(), WORKSPACE, 37)
         .await

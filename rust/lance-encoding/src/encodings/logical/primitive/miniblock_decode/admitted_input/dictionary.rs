@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Read selected raw dictionary values without retaining the complete dictionary.
+//! Read selected dictionary values without retaining the complete dictionary.
 
 use super::*;
 use crate::{
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     format::metadata::{CompressiveEncoding, compressive_encoding::Compression},
 };
+
+#[cfg(feature = "lz4")]
+mod compressed;
+#[cfg(feature = "lz4")]
+mod lz4;
 
 // Bounds both offset traversal and selected value-copy scratch per read.
 const WINDOW: usize = 4096;
@@ -17,6 +22,7 @@ pub(super) struct Dictionary {
     bytes: Range<u64>,
     count: u64,
     width: usize,
+    is_lz4: bool,
 }
 
 fn word(bytes: &[u8]) -> u64 {
@@ -31,6 +37,26 @@ impl Dictionary {
         bytes: Range<u64>,
         count: u64,
     ) -> Result<Self> {
+        let (encoding, is_lz4) = match &encoding.compression {
+            Some(Compression::General(general)) => {
+                if !cfg!(feature = "lz4")
+                    || general.compression.as_ref().map(|c| c.scheme())
+                        != Some(crate::format::metadata::CompressionScheme::CompressionAlgorithmLz4)
+                {
+                    return Err(Error::not_supported(
+                        "admitted dictionary supports only raw or LZ4 variable-width values",
+                    ));
+                }
+                (
+                    general
+                        .values
+                        .as_deref()
+                        .ok_or_else(|| corrupt("missing dictionary compression child"))?,
+                    true,
+                )
+            }
+            _ => (encoding, false),
+        };
         let Some(Compression::Variable(variable)) = &encoding.compression else {
             return Err(Error::not_supported(
                 "admitted dictionary requires raw variable-width values",
@@ -57,13 +83,19 @@ impl Dictionary {
         let minimum = count
             .checked_add(3)
             .and_then(|n| n.checked_mul(width as u64));
-        if count == 0 || minimum.is_none_or(|n| n > bytes.end - bytes.start) {
+        if bytes.start > bytes.end
+            || count == 0
+            || minimum.is_none()
+            || (!is_lz4 && minimum.is_some_and(|n| n > bytes.end - bytes.start))
+            || (is_lz4 && bytes.end - bytes.start < 5)
+        {
             return Err(corrupt("dictionary count/header exceeds its buffer"));
         }
         Ok(Self {
             bytes,
             count,
             width,
+            is_lz4,
         })
     }
 
@@ -156,6 +188,14 @@ impl Dictionary {
             if word(value) >= self.count {
                 return Err(corrupt("dictionary index exceeds entry count"));
             }
+        }
+        #[cfg(feature = "lz4")]
+        if self.is_lz4 {
+            return self.expand_lz4(indices, output_bits, work, read).await;
+        }
+        #[cfg(not(feature = "lz4"))]
+        if self.is_lz4 {
+            return Err(Error::not_supported("LZ4 dictionary support is disabled"));
         }
         let ranges_bytes = count
             .checked_mul(16)

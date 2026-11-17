@@ -43,8 +43,11 @@ enum Scheduler {
 /// summaries are checked against charged decoded levels before reconstruction.
 /// Raw variable-width page dictionaries validate offsets in bounded windows and
 /// expand only selected entries, with indices, selected ranges, I/O scratch and
-/// output sharing the original workspace. Compressed dictionaries and deeper
-/// repetition-index formats are not yet supported. Dictionary index decoding runs
+/// output sharing the original workspace. Default LZ4 dictionaries use two full
+/// streaming passes with at most 64 KiB history and 4 KiB input scratch, retaining
+/// only selected records and values. This trades extra I/O/CPU for bounded payload
+/// storage; performance is not yet qualified. Other dictionary codecs and deeper
+/// repetition-index formats are not supported. Dictionary index decoding runs
 /// on the CPU pool before dependent async value reads; reconstruction stays in the
 /// caller's final decode job. No CPU job waits on I/O or additional credit.
 /// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
