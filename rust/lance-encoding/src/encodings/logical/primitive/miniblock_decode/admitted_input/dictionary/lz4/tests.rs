@@ -78,7 +78,15 @@ fn extension(mut extra: usize, bytes: &mut Vec<u8>) {
 
 #[rstest]
 #[case::overlap(1, 131073)]
+#[case::two_byte_period(2, 131073)]
+#[case::unaligned_period(3, 131073)]
+#[case::dictionary_period(32, 131073)]
+#[case::before_window(4095, 131073)]
+#[case::whole_window(4096, 131073)]
+#[case::after_window(4097, 131073)]
+#[case::wrapped_seed(65534, 131073)]
 #[case::farthest(65535, 8193)]
+#[case::short_wrapped_match(65535, 19)]
 #[tokio::test]
 async fn hand_encoded_matches_cross_history_and_output_boundaries(
     #[case] offset: usize,

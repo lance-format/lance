@@ -157,14 +157,8 @@ impl Plan {
             let mut left = length;
             while left != 0 {
                 let len = left.min(WINDOW - produced % WINDOW);
-                // Forward copying is required: offset=1 repeats the last byte,
-                // and a match can cross both the emitted span and ring boundary.
-                for _ in 0..len {
-                    let ring_len = history.len();
-                    let byte = history[(produced - offset) % ring_len];
-                    history[produced % ring_len] = byte;
-                    produced += 1;
-                }
+                extend_match(history, produced, offset, len);
+                produced += len;
                 left -= len;
                 if produced.is_multiple_of(WINDOW) {
                     emit(history, produced - WINDOW, WINDOW, visit)?;
@@ -172,6 +166,29 @@ impl Plan {
                 }
             }
         }
+    }
+}
+
+// The caller splits output at WINDOW boundaries, which also keeps the target
+// contiguous in the history ring. Seed at most one match period from preceding
+// history, then double the initialized prefix. A whole-span memmove alone would
+// be wrong when the match overlaps output that has not been produced yet.
+fn extend_match(history: &mut [u8], produced: usize, offset: usize, len: usize) {
+    let at = produced % history.len();
+    let source = (produced - offset) % history.len();
+    let seed = len.min(offset);
+    let first = seed.min(history.len() - source);
+    history.copy_within(source..source + first, at);
+    if first < seed {
+        // Since seed <= offset, the wrapped source ends at or before `at`;
+        // the first copy cannot have overwritten this remaining seed.
+        history.copy_within(..seed - first, at + first);
+    }
+    let mut written = seed;
+    while written < len {
+        let count = written.min(len - written);
+        history.copy_within(at..at + count, at + written);
+        written += count;
     }
 }
 

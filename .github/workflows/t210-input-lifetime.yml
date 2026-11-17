@@ -25,12 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify complete-drain dictionary harness correctness
+      - name: Verify bounded dictionary decoding and complete drains
         env:
           LANCE_CPU_THREADS: 1
         run: |
+          cargo test --profile ci --locked -p lance-encoding --lib admitted_input::dictionary:: -- --nocapture
           cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding -p lance --all-features --all-targets --no-deps -- -D warnings
