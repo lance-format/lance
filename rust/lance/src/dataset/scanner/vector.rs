@@ -35,6 +35,7 @@ use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
 use lance_core::error::LanceOptionExt;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pb::{VectorIndexDetails, vector_index_details::Compression};
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DOC_INDEX_COL;
 use lance_index::vector::warp::DEFAULT_WARP_NPROBE;
@@ -234,15 +235,27 @@ impl Scanner {
                 if selected_index_segments.is_empty() {
                     None
                 } else {
-                    let idx = self
-                        .dataset
-                        .open_vector_index(
-                            q.column.as_str(),
-                            &selected_index_segments[0].uuid,
-                            &NoOpMetricsCollector,
-                        )
-                        .await?;
-                    let index_metric = idx.metric_type();
+                    let index_metric = if self.quantized_refine_factor.is_some()
+                        && self.dataset.fragments().is_empty()
+                    {
+                        // A definition-only index has no files to open.
+                        crate::index::vector::details::metric_type_from_index_metadata(
+                            &selected_index_segments[0],
+                        ).ok_or_else(|| Error::not_supported(format!(
+                            "quantized refinement requires current vector index details for empty segment {}",
+                            selected_index_segments[0].uuid
+                        )))?
+                    } else {
+                        let idx = self
+                            .dataset
+                            .open_vector_index(
+                                q.column.as_str(),
+                                &selected_index_segments[0].uuid,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?;
+                        idx.metric_type()
+                    };
                     let use_this_index = match q.metric_type {
                         Some(user_metric) => {
                             if user_metric == index_metric {
@@ -321,7 +334,11 @@ impl Scanner {
                             self.dataset.load_indices_by_name(&index.name).await?,
                         );
                         let index_frags = self.get_indexed_frags(&index_segments);
-                        if !index_segments.is_empty() && !index_frags.is_empty() {
+                        if !index_segments.is_empty()
+                            && (!index_frags.is_empty()
+                                || (self.quantized_refine_factor.is_some()
+                                    && self.dataset.fragments().is_empty()))
+                        {
                             Some((index.name.clone(), index_segments, index_metric))
                         } else {
                             None
@@ -371,6 +388,67 @@ impl Scanner {
         }
 
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
+            if let Some(factor) = self.quantized_refine_factor {
+                let candidate_count = q.k
+                    .checked_mul(q.refine_factor.unwrap_or(1) as usize)
+                    .and_then(|count| count.checked_mul(factor as usize))
+                    .ok_or_else(|| Error::invalid_input(format!(
+                        "quantized refinement candidate count overflows: k={}, quantized_refine_factor={factor}, exact_refine_factor={}",
+                        q.k, q.refine_factor.unwrap_or(1)
+                    )))?;
+                if matches!(&vector_type, DataType::List(_)) {
+                    return Err(Error::not_supported(
+                        "quantized refinement is not supported for multivector columns",
+                    ));
+                }
+                for segment in &index_segments {
+                    let unsupported_index = || {
+                        Error::not_supported(format!(
+                            "quantized refinement requires an IVF_RQ flat, IVF_SQ, or IVF_HNSW_SQ index, got {} (segment {})",
+                            segment
+                                .index_details
+                                .as_ref()
+                                .map(|details| {
+                                    crate::index::vector::details::derive_vector_index_type(details)
+                                })
+                                .unwrap_or_else(|| "legacy index".to_string()),
+                            segment.uuid
+                        ))
+                    };
+                    let raw_details = segment
+                        .index_details
+                        .as_ref()
+                        .ok_or_else(unsupported_index)?;
+                    let details = raw_details
+                        .to_msg::<VectorIndexDetails>()
+                        .map_err(|error| {
+                            Error::index(format!(
+                                "invalid vector index details for segment {}: {error}",
+                                segment.uuid
+                            ))
+                        })?;
+                    match &details.compression {
+                        Some(Compression::Rq(_)) if details.hnsw_index_config.is_none() => {}
+                        Some(Compression::Sq(sq)) => {
+                            if sq.num_bits != 8 {
+                                return Err(Error::not_supported(format!(
+                                    "quantized refinement requires SQ8, got SQ num_bits={}",
+                                    sq.num_bits
+                                )));
+                            }
+                            if details.hnsw_index_config.is_some()
+                                && let Some(ef) = q.ef
+                                && ef < candidate_count
+                            {
+                                return Err(Error::invalid_input(format!(
+                                    "ef must be greater than or equal to the quantized refinement candidate count: ef={ef}, candidate_count={candidate_count}"
+                                )));
+                            }
+                        }
+                        _ => return Err(unsupported_index()),
+                    }
+                }
+            }
             if self.is_batch_nearest {
                 validate_distance_type_for(index_metric, &element_type)?;
                 return self
@@ -393,6 +471,9 @@ impl Scanner {
                 return Err(Error::invalid_input(
                     "Refine factor cannot be zero".to_string(),
                 ));
+            }
+            if self.quantized_refine_factor.is_some() && self.dataset.fragments().is_empty() {
+                return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(false))));
             }
             // Mask data overlay files: compute which row addresses within each segment have
             // been updated by a newer overlay so their ANN entries may be stale.
@@ -444,11 +525,6 @@ impl Scanner {
                     .await?
                 }
                 DataType::List(_) => {
-                    if self.quantized_refine_factor.is_some() {
-                        return Err(Error::not_supported(
-                            "quantized refinement is not supported for multivector columns",
-                        ));
-                    }
                     // XTR remains for the indices WARP cannot search.
                     if warp_supports_segments(&self.dataset, &q.column, &index_segments).await? {
                         self.multivec_warp_ann(
@@ -495,7 +571,7 @@ impl Scanner {
         } else {
             if self.quantized_refine_factor.is_some() {
                 return Err(Error::not_supported(
-                    "quantized refinement requires an IVF_RQ vector index",
+                    "quantized refinement requires an IVF_RQ flat, IVF_SQ, or IVF_HNSW_SQ vector index",
                 ));
             }
             if self.fast_search {
@@ -617,8 +693,7 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Quantized refinement reranks with Accurate RQ scores, which the shared
-        // batch path does not implement. Fall back to the per-query loop.
+        // Quantized refinement uses the per-query candidate/scoring path.
         if self.quantized_refine_factor.is_some() {
             return Ok(false);
         }

@@ -643,6 +643,25 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64>;
 
+    /// Whether physical storage slots include tombstoned row IDs.
+    ///
+    /// Graph traversal may route through these slots, but they must not consume
+    /// the result budget. Stores that retain tombstones must override this hint;
+    /// stores containing only live rows keep the default fast path.
+    ///
+    /// ```
+    /// use lance_core::utils::address::RowAddress;
+    /// use lance_index::vector::storage::VectorStore;
+    /// fn check_storage(storage: &impl VectorStore) {
+    ///     if storage.has_tombstones() {
+    ///         assert!(storage.row_ids().any(|id| *id == RowAddress::TOMBSTONE_ROW));
+    ///     }
+    /// }
+    /// ```
+    fn has_tombstones(&self) -> bool {
+        false
+    }
+
     /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
@@ -1385,6 +1404,8 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Graph node IDs address physical storage slots, including deleted rows.
+    has_preserved_row_offsets: bool,
     /// Address-only views under the current file and translation identity.
     row_address_cache: Option<WeakLanceCache>,
     /// See [`Self::origin_latency`].
@@ -1495,6 +1516,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            has_preserved_row_offsets: false,
             row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
@@ -1540,6 +1562,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            has_preserved_row_offsets: false,
             row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
@@ -1548,6 +1571,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             resident_attach: ResidentAttach::default(),
             attach_schemas: AttachSchemas::default(),
         }
+    }
+
+    /// Keep deleted rows as tombstone IDs so graph node offsets remain valid.
+    /// Without this mode, quantizer storage may compact deleted rows on load.
+    ///
+    /// ```
+    /// use lance_index::vector::{sq::ScalarQuantizer, storage::IvfQuantizationStorage};
+    /// fn for_graph(storage: IvfQuantizationStorage<ScalarQuantizer>) -> IvfQuantizationStorage<ScalarQuantizer> {
+    ///     storage.with_preserved_row_offsets(true)
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub fn with_preserved_row_offsets(mut self, has_preserved_row_offsets: bool) -> Self {
+        self.has_preserved_row_offsets = has_preserved_row_offsets;
+        self
     }
 
     /// Set the batch row-ID remapper used when decoding each partition.
@@ -1759,6 +1797,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     async fn remap_partition_batch(
         &self,
         batch: RecordBatch,
+        has_preserved_row_offsets: bool,
     ) -> Result<(RecordBatch, Option<Arc<dyn RowIdRemapper>>)> {
         if let Some(remapping) = &self.batch_remapper {
             lance_index_core::remapping::check_batch_remapping_entry()?;
@@ -1766,7 +1805,28 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let (batch, remapper) =
                 remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
                     .await?;
-            Ok((batch, Some(remapper)))
+            let remapper = (!has_preserved_row_offsets).then_some(remapper);
+            Ok((batch, remapper))
+        } else if has_preserved_row_offsets && let Some(remapper) = &self.frag_reuse_index {
+            let row_id_idx = batch.schema().index_of(ROW_ID)?;
+            let row_ids = batch
+                .column_by_name(ROW_ID)
+                .ok_or_else(|| Error::index("missing row-ID column"))?
+                .as_primitive::<UInt64Type>();
+            let translated = UInt64Array::from(
+                row_ids
+                    .values()
+                    .iter()
+                    .map(|id| {
+                        remapper
+                            .remap_row_id(*id)
+                            .unwrap_or(RowAddress::TOMBSTONE_ROW)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let mut columns = batch.columns().to_vec();
+            columns[row_id_idx] = Arc::new(translated);
+            Ok((RecordBatch::try_new(batch.schema(), columns)?, None))
         } else {
             Ok((batch, self.frag_reuse_index.clone()))
         }
@@ -1790,7 +1850,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let batch = self
             .read_partition_batch(part_id, io_stats.as_ref())
             .await?;
-        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let (batch, remapper) = self
+            .remap_partition_batch(batch, self.has_preserved_row_offsets)
+            .await?;
         match &self.quantizer {
             Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
                 batch,
@@ -1950,7 +2012,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             None => RecordBatch::new_empty(schema),
             Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
         };
-        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let (batch, remapper) = self
+            .remap_partition_batch(batch, self.has_preserved_row_offsets)
+            .await?;
         let storage = match &self.quantizer {
             Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
                 batch,
@@ -2089,7 +2153,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             )),
             columns,
         )?;
-        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let (batch, remapper) = self
+            .remap_partition_batch(batch, self.has_preserved_row_offsets)
+            .await?;
         Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
@@ -2940,7 +3006,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let source = self
                 .read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
                 .await?;
-            let (source, remapper) = self.remap_partition_batch(source).await?;
+            let (source, remapper) = self.remap_partition_batch(source, false).await?;
             EncodedPartition::Memory(
                 stage_pairwise_batches(scorer.clone(), source, batch_size, remapper)
                     .try_collect()
@@ -2956,7 +3022,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 let source = self
                     .read_pairwise_codes(partition_id, start..end, &quantizer)
                     .await?;
-                let (source, remapper) = self.remap_partition_batch(source).await?;
+                let (source, remapper) = self.remap_partition_batch(source, false).await?;
                 let mut batches =
                     stage_pairwise_batches(scorer.clone(), source, batch_size, remapper);
                 while let Some(batch) = batches.try_next().await? {
@@ -3120,6 +3186,29 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         let quantizer = self.quantizer.clone();
+        if self.has_preserved_row_offsets {
+            let batch =
+                spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
+            let (batch, remapper) = self
+                .remap_partition_batch(batch, self.has_preserved_row_offsets)
+                .await?;
+            return spawn_prewarm_materialization(move || match &quantizer {
+                Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                    batch,
+                    quantizer,
+                    &metadata,
+                    distance_type,
+                    remapper,
+                ),
+                None => Q::Storage::try_from_batch_with_remapper(
+                    batch,
+                    &metadata,
+                    distance_type,
+                    remapper,
+                ),
+            })
+            .await;
+        }
         if let Some(remapping) = &self.batch_remapper {
             // Tagged asynchronous path.
             lance_index_core::remapping::check_batch_remapping_entry()?;

@@ -28,6 +28,7 @@ use lance_datafusion::exec::ExecutionSummaryCounts;
 use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
@@ -50,7 +51,8 @@ use crate::dataset::tests::dataset_scanner_segments::FragmentVectorFixture;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{Dataset, UpdateBuilder, WriteDestination, WriteParams};
 use crate::index::DatasetIndexExt;
-use crate::index::vector::VectorIndexParams;
+use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::vector::{StageParams, VectorIndexParams};
 use crate::io::exec::PreFilterSource;
 use crate::session::index_caches::{
     DSIndexCache, QuantizedRefinementCache, QuantizedRefinementOptions,
@@ -3067,6 +3069,48 @@ async fn test_nearest_rejects_query_type_mismatch(#[case] has_fragments: bool) {
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RefinementIndex {
+    Rq(u8),
+    Sq,
+    HnswSq,
+}
+
+impl RefinementIndex {
+    fn params(self, metric: DistanceType) -> VectorIndexParams {
+        let ivf = IvfBuildParams::new(2);
+        match self {
+            Self::Rq(bits) => VectorIndexParams::with_ivf_rq_params(
+                metric,
+                ivf,
+                RQBuildParams::with_rotation_type(bits, RQRotationType::Fast),
+            ),
+            Self::Sq => {
+                VectorIndexParams::with_ivf_sq_params(metric, ivf, SQBuildParams::default())
+            }
+            Self::HnswSq => VectorIndexParams::with_ivf_hnsw_sq_params(
+                metric,
+                ivf,
+                HnswBuildParams::default().num_edges(4).ef_construction(16),
+                SQBuildParams::default(),
+            ),
+        }
+    }
+
+    async fn build(self, dataset: &mut Dataset) {
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".to_string()),
+                &self.params(DistanceType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+}
+
 async fn refinement_cache_activity(dataset: &Dataset) -> CacheActivity {
     dataset
         .index_cache
@@ -3217,14 +3261,16 @@ async fn test_quantized_refinement_cache_snapshot_identity(#[case] change: fn(&m
 }
 
 #[rstest]
-#[case::rq4(4)]
-#[case::rq8(8)]
+#[case::rq4(RefinementIndex::Rq(4))]
+#[case::rq8(RefinementIndex::Rq(8))]
+#[case::sq8(RefinementIndex::Sq)]
+#[case::hnsw_sq8(RefinementIndex::HnswSq)]
 #[tokio::test]
-async fn test_quantized_refinement_cache_queries(#[case] num_bits: u8) {
+async fn test_quantized_refinement_cache_queries(#[case] index: RefinementIndex) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
         .await
         .unwrap();
-    fixture.make_rq_vector_index(num_bits).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     let dataset = &fixture.dataset;
     let first = assert_refinement_cache(dataset, false).await;
     assert_eq!(assert_refinement_cache(dataset, true).await, first);
@@ -3283,13 +3329,15 @@ async fn test_quantized_refinement_cache_queries(#[case] num_bits: u8) {
 #[case::deferred_row_addresses(false, true)]
 #[tokio::test]
 async fn test_quantized_refinement_cache_snapshot_lifecycle(
+    #[values(RefinementIndex::Rq(8), RefinementIndex::Sq, RefinementIndex::HnswSq)]
+    index: RefinementIndex,
     #[case] stable_row_ids: bool,
     #[case] defer_remap: bool,
 ) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
         .await
         .unwrap();
-    fixture.make_rq_vector_index(8).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     let original_version = fixture.dataset.version().version;
     let original = assert_refinement_cache(&fixture.dataset, false).await;
     assert_refinement_cache(&fixture.dataset, true).await;
@@ -3317,8 +3365,55 @@ async fn test_quantized_refinement_cache_snapshot_lifecycle(
             fixture.dataset.version().version > version,
             "compaction must commit a new snapshot"
         );
-        assert_refinement_cache(&fixture.dataset, false).await;
+        fixture.dataset.prewarm_index("idx").await.unwrap();
+        if matches!(index, RefinementIndex::HnswSq) && defer_remap {
+            let metadata = fixture.dataset.load_indices().await.unwrap();
+            let metadata = metadata.iter().find(|index| index.name == "idx").unwrap();
+            let opened = fixture
+                .dataset
+                .open_vector_index("vec", &metadata.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let mut exported_rows = 0;
+            for partition_id in 0..opened.total_partitions() {
+                for batch in opened
+                    .partition_storage_batches(partition_id)
+                    .await
+                    .unwrap()
+                {
+                    assert!(
+                        batch[ROW_ID]
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .all(|id| *id != RowAddress::TOMBSTONE_ROW)
+                    );
+                    exported_rows += batch.num_rows();
+                }
+            }
+            assert_eq!(exported_rows, 399);
+        }
+        let result = assert_refinement_cache(&fixture.dataset, false).await;
         assert_refinement_cache(&fixture.dataset, true).await;
+        let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+        let mut exact = fixture.dataset.scan();
+        exact
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .use_index(false)
+            .with_row_id()
+            .project(&[ROW_ID])
+            .unwrap();
+        let expected = batch_row_ids(&exact.try_into_batch().await.unwrap());
+        let recall = batch_row_ids(&result)
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count() as f64
+            / 10.0;
+        assert!(
+            recall >= 0.5,
+            "recall={recall}, index={index:?}, defer_remap={defer_remap}"
+        );
     }
 
     fixture.append_new_data().await.unwrap();
@@ -3346,7 +3441,7 @@ async fn test_quantized_refinement_cache_snapshot_lifecycle(
         .unwrap();
     assert_refinement_cache(&fixture.dataset, false).await;
 
-    fixture.make_rq_vector_index(8).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     assert_refinement_cache(&fixture.dataset, false).await;
     let old = fixture
         .dataset
@@ -3362,11 +3457,15 @@ async fn test_quantized_refinement_cache_snapshot_lifecycle(
 #[case::external_mask(2)]
 #[case::unproven_manifest(3)]
 #[tokio::test]
-async fn test_quantized_refinement_cache_bypass(#[case] restriction: u8) {
+async fn test_quantized_refinement_cache_bypass(
+    #[values(RefinementIndex::Rq(8), RefinementIndex::Sq, RefinementIndex::HnswSq)]
+    index: RefinementIndex,
+    #[case] restriction: u8,
+) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
         .await
         .unwrap();
-    fixture.make_rq_vector_index(8).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     assert_refinement_cache(&fixture.dataset, false).await;
     if restriction == 3 {
         Arc::make_mut(&mut fixture.dataset.manifest).transaction_file = None;
@@ -3526,12 +3625,16 @@ async fn test_quantized_refinement_cache_cross_column_refinement(#[case] batch: 
     }
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_quantized_refinement_cache_shallow_clone_divergence() {
+async fn test_quantized_refinement_cache_shallow_clone_divergence(
+    #[values(RefinementIndex::Rq(8), RefinementIndex::Sq, RefinementIndex::HnswSq)]
+    index: RefinementIndex,
+) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
         .await
         .unwrap();
-    fixture.make_rq_vector_index(8).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     let original = assert_refinement_cache(&fixture.dataset, false).await;
     let clone_uri = TempStrDir::default();
     let mut cloned = fixture
@@ -3550,14 +3653,18 @@ async fn test_quantized_refinement_cache_shallow_clone_divergence() {
 }
 
 #[rstest]
-#[case::rq4(4)]
-#[case::rq8(8)]
+#[case::rq4(RefinementIndex::Rq(4))]
+#[case::rq8(RefinementIndex::Rq(8))]
+#[case::sq8(RefinementIndex::Sq)]
+#[case::hnsw_sq8(RefinementIndex::HnswSq)]
 #[tokio::test]
-async fn test_quantized_refinement_cache_saves_scoring_without_vector_reads(#[case] num_bits: u8) {
+async fn test_quantized_refinement_cache_saves_scoring_without_vector_reads(
+    #[case] index: RefinementIndex,
+) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
         .await
         .unwrap();
-    fixture.make_rq_vector_index(num_bits).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     // Delete only this test's temporary data files. A fully indexed row-ID-only
     // query must work on both misses and hits without those original vectors.
     for fragment in fixture.dataset.fragments().iter() {
@@ -3652,13 +3759,15 @@ async fn test_quantized_refinement_cache_saves_scoring_without_vector_reads(#[ca
 #[case::stable_overlay(true, true)]
 #[tokio::test]
 async fn test_quantized_refinement_cache_vector_update(
+    #[values(RefinementIndex::Rq(8), RefinementIndex::Sq, RefinementIndex::HnswSq)]
+    index: RefinementIndex,
     #[case] stable_row_ids: bool,
     #[case] is_overlay: bool,
 ) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
         .await
         .unwrap();
-    fixture.make_rq_vector_index(8).await.unwrap();
+    index.build(&mut fixture.dataset).await;
     let original = assert_refinement_cache(&fixture.dataset, false).await;
     if is_overlay {
         let field_id = fixture.dataset.schema().field("vec").unwrap().id;
@@ -3670,8 +3779,19 @@ async fn test_quantized_refinement_cache_vector_update(
         let vectors =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![100000.0; 32]), 32)
                 .unwrap();
+        // The first fragment's row IDs equal its offsets under both fixture
+        // schemes. Update an actual result, including when HNSW omitted row 0.
+        let offset = batch_row_ids(&original)
+            .into_iter()
+            .find(|id| *id < 80)
+            .unwrap();
         let update = RecordBatch::try_from_iter([
-            (ROW_ADDR, Arc::new(UInt64Array::from(vec![0])) as ArrayRef),
+            (
+                ROW_ADDR,
+                Arc::new(UInt64Array::from(vec![u64::from(
+                    RowAddress::new_from_parts(0, offset as u32),
+                )])) as ArrayRef,
+            ),
             ("vec", Arc::new(vectors) as ArrayRef),
         ])
         .unwrap();
@@ -3733,7 +3853,7 @@ async fn test_quantized_refinement_cache_vector_update(
     if is_overlay {
         // Appending segments does not consume overlays of already indexed rows.
         // A replacement index incorporates their current vector values.
-        fixture.make_rq_vector_index(8).await.unwrap();
+        index.build(&mut fixture.dataset).await;
     }
     assert_refinement_cache(&fixture.dataset, false).await;
     assert_refinement_cache(&fixture.dataset, true).await;
@@ -3819,11 +3939,13 @@ async fn test_ivf_rq_quantized_refinement(#[case] num_bits: u8) {
 }
 
 #[rstest]
-#[case::rq4(4)]
-#[case::rq8(8)]
+#[case::rq4(RefinementIndex::Rq(4))]
+#[case::rq8(RefinementIndex::Rq(8))]
+#[case::sq8(RefinementIndex::Sq)]
+#[case::hnsw_sq8(RefinementIndex::HnswSq)]
 #[tokio::test]
 async fn test_quantized_refinement_merges_unindexed_distance_scales(
-    #[case] num_bits: u8,
+    #[case] index: RefinementIndex,
     #[values(DistanceType::Cosine, DistanceType::L2, DistanceType::Dot)] metric: DistanceType,
     #[values(false, true)] exact_refine: bool,
     #[values(None, Some((0.15, 0.25)), Some((0.28, 0.32)))] range: Option<(f32, f32)>,
@@ -3852,7 +3974,27 @@ async fn test_quantized_refinement_merges_unindexed_distance_scales(
         )])
         .unwrap()
     };
-    let indexed = make_batch(128, 0.8, 0.04);
+    let mut indexed = make_batch(128, 0.8, 0.04);
+    if matches!(index, RefinementIndex::Sq | RefinementIndex::HnswSq) {
+        // Keep the query within SQ's training bounds. Clipping a query outside
+        // those bounds changes its stored-distance range and its exact recall.
+        let mut values = indexed["vec"]
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        values[127 * DIM..].fill(0.0);
+        values[127 * DIM] = 1.0;
+        indexed = RecordBatch::try_from_iter([(
+            "vec",
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                    .unwrap(),
+            ) as ArrayRef,
+        )])
+        .unwrap();
+    }
     let centroids = indexed["vec"].as_fixed_size_list().slice(0, 4);
     let tmp = TempStrDir::default();
     let mut dataset = Dataset::write(
@@ -3865,33 +4007,38 @@ async fn test_quantized_refinement_merges_unindexed_distance_scales(
     )
     .await
     .unwrap();
-    let mut rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
-    let mut rotation = RabitQuantizer::new::<Float32Type>(num_bits, DIM as i32)
-        .metadata_ref()
-        .clone();
-    // Reuse a fixed rotation so recall assertions are deterministic.
-    for (index, signs) in rotation
-        .fast_rotation_signs
-        .as_mut()
-        .unwrap()
-        .iter_mut()
-        .enumerate()
-    {
-        *signs = (index * 37 + 19) as u8;
-    }
-    rq_params.rotation = Some(rotation);
+    let ivf = IvfBuildParams::try_with_centroids(4, Arc::new(centroids)).unwrap();
+    let params = match index {
+        RefinementIndex::Rq(num_bits) => {
+            let mut rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
+            let mut rotation = RabitQuantizer::new::<Float32Type>(num_bits, DIM as i32)
+                .metadata_ref()
+                .clone();
+            // Reuse a fixed rotation so recall assertions are deterministic.
+            for (index, signs) in rotation
+                .fast_rotation_signs
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                *signs = (index * 37 + 19) as u8;
+            }
+            rq_params.rotation = Some(rotation);
+            VectorIndexParams::with_ivf_rq_params(metric, ivf, rq_params)
+        }
+        RefinementIndex::Sq => {
+            VectorIndexParams::with_ivf_sq_params(metric, ivf, SQBuildParams::default())
+        }
+        RefinementIndex::HnswSq => VectorIndexParams::with_ivf_hnsw_sq_params(
+            metric,
+            ivf,
+            HnswBuildParams::default().num_edges(4).ef_construction(16),
+            SQBuildParams::default(),
+        ),
+    };
     dataset
-        .create_index(
-            &["vec"],
-            IndexType::Vector,
-            None,
-            &VectorIndexParams::with_ivf_rq_params(
-                metric,
-                IvfBuildParams::try_with_centroids(4, Arc::new(centroids)).unwrap(),
-                rq_params,
-            ),
-            true,
-        )
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
     let appended = make_batch(16, 0.7, 0.0);
@@ -3913,7 +4060,7 @@ async fn test_quantized_refinement_merges_unindexed_distance_scales(
         1.0
     };
     // Fixture ranges are expressed as 1 - cos. L2 on unit vectors is twice
-    // that, as are native RQ cosine scores without exact refinement.
+    // that, as are native quantized cosine scores without exact refinement.
     let metric_scale = if metric == DistanceType::L2 { 2.0 } else { 1.0 };
     let mut exact = dataset.scan();
     exact
@@ -3952,7 +4099,7 @@ async fn test_quantized_refinement_merges_unindexed_distance_scales(
     let plan = scanner.explain_plan(false).await.unwrap();
     if !exact_refine {
         // Only the unindexed scan computes vector distances. Indexed rows
-        // retain their RQ scores without taking their original vectors.
+        // retain their quantized scores without taking their original vectors.
         assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
         assert!(!plan.contains("Take:"), "{plan}");
     }
@@ -4019,8 +4166,169 @@ async fn test_quantized_refinement_scores_selective_prefilter_shortcut_rows() {
     );
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_quantized_refinement_rejects_non_rq_index() {
+async fn test_sq_quantized_refinement(
+    #[values(RefinementIndex::Sq, RefinementIndex::HnswSq)] index: RefinementIndex,
+    #[values(DistanceType::L2, DistanceType::Cosine, DistanceType::Dot)] metric: DistanceType,
+    #[values(1, 3)] factor: u32,
+    #[values(false, true)] exact_refine: bool,
+    #[values(false, true)] filtered: bool,
+) {
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_dataset_with_params(
+            "memory://",
+            FragmentCount::from(2),
+            FragmentRowCount::from(32),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &index.params(metric),
+            true,
+        )
+        .await
+        .unwrap();
+    let query = Float32Array::from(vec![0.3; 8]);
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &query, 5)
+        .unwrap()
+        .distance_metric(metric)
+        .nprobes(2)
+        .ef(64)
+        .with_row_id()
+        .project(&[ROW_ID])
+        .unwrap();
+    let stats = Arc::new(Mutex::new(ExecutionSummaryCounts::default()));
+    let captured = stats.clone();
+    scan.scan_stats_callback(Arc::new(move |summary| {
+        *captured.lock().unwrap() = summary.clone();
+    }));
+    if filtered {
+        scan.filter("id % 3 = 0").unwrap().prefilter(true);
+    }
+    let mut ground_truth = scan.clone();
+    ground_truth.use_index(false);
+    let ground_truth = ground_truth.try_into_batch().await.unwrap();
+    let native = scan.try_into_batch().await.unwrap();
+    let native_comparisons = stats.lock().unwrap().index_comparisons;
+    scan.quantized_refine(factor);
+    if exact_refine {
+        scan.refine(2);
+    }
+    let result = scan.try_into_batch().await.unwrap();
+    if matches!(index, RefinementIndex::Sq) && !exact_refine {
+        assert_eq!(stats.lock().unwrap().index_comparisons, native_comparisons);
+    }
+    let expected = if exact_refine { &ground_truth } else { &native };
+    assert_eq!(batch_row_ids(&result), batch_row_ids(expected));
+    assert_eq!(result[DIST_COL].as_ref(), expected[DIST_COL].as_ref());
+    let exact_ids = batch_row_ids(&ground_truth);
+    let recall = batch_row_ids(&result)
+        .iter()
+        .filter(|id| exact_ids.contains(id))
+        .count() as f64
+        / 5.0;
+    assert!(
+        recall >= 0.5,
+        "recall={recall}, index={index:?}, metric={metric:?}"
+    );
+
+    // Bounds must be honored on the stored SQ scale before top-k truncation.
+    let lower = native[DIST_COL].as_primitive::<Float32Type>().value(1);
+    scan.distance_range(Some(lower), None);
+    let bounded = scan.try_into_batch().await.unwrap();
+    assert!(
+        bounded[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|distance| *distance >= lower)
+    );
+    if !exact_refine {
+        assert!(!batch_row_ids(&bounded).contains(&batch_row_ids(&native)[0]));
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sq_quantized_refinement_rejects_unsupported_precision(
+    #[values(RefinementIndex::Sq, RefinementIndex::HnswSq)] index: RefinementIndex,
+) {
+    let mut dataset = gen_batch()
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    let mut params = index.params(DistanceType::L2);
+    for stage in &mut params.stages {
+        if let StageParams::SQ(sq) = stage {
+            sq.num_bits = 4;
+        }
+    }
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &Float32Array::from(vec![0.3; 8]), 5)
+        .unwrap()
+        .quantized_refine(2);
+    let error = scan.try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("requires SQ8, got SQ num_bits=4"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_sq_quantized_refinement_validates_ef() {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    RefinementIndex::HnswSq.build(&mut fixture.dataset).await;
+    let mut scan = refinement_scan(&fixture.dataset);
+    scan.ef(399); // k=10, factor=40 requires 400 candidates.
+    let error = scan.try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("ef=399, candidate_count=400"),
+        "{error}"
+    );
+    scan.ef(400).refine(2);
+    let error = scan.try_into_batch().await.unwrap_err();
+    assert!(
+        error.to_string().contains("ef=400, candidate_count=800"),
+        "{error}"
+    );
+    let query = Float32Array::from(vec![0.0; 32]);
+    scan.nearest("vec", &query, usize::MAX)
+        .unwrap()
+        .quantized_refine(2);
+    let error = scan.try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("candidate count overflows"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_quantized_refinement_rejects_unsupported_index() {
     let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
         .await
         .unwrap();
@@ -4032,7 +4340,11 @@ async fn test_quantized_refinement_rejects_non_rq_index() {
         .unwrap()
         .quantized_refine(2);
     let error = scanner.try_into_batch().await.unwrap_err();
-    assert!(error.to_string().contains("requires an IVF_RQ flat index"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires an IVF_RQ flat, IVF_SQ, or IVF_HNSW_SQ index")
+    );
 }
 
 #[tokio::test]
