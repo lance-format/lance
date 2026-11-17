@@ -3516,14 +3516,17 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use arrow_array::{Array, Float32Array, NullArray};
+    use lance_core::utils::tokio::{limit_compute_concurrency, with_compute_concurrency};
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::v3::shuffler::{
         ShufflePartition, ShufflePartitionWindow, ShufflePartitionWindowPlan,
     };
+    use tokio::sync::Notify;
 
     struct SingleBatchReader {
         batch: RecordBatch,
@@ -3563,6 +3566,7 @@ mod tests {
     struct WindowedBatchReader {
         batches: Vec<RecordBatch>,
         windows_read: Arc<AtomicUsize>,
+        first_window_gate: Option<Arc<Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -3614,13 +3618,17 @@ mod tests {
             let plan = self.plan_partition_window(start_partition_id, max_decoded_bytes)?;
             self.windows_read.fetch_add(1, Ordering::Relaxed);
             if start_partition_id == 0 {
-                tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                    while self.windows_read.load(Ordering::Relaxed) < 2 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .map_err(|_| Error::internal("second partition window was not admitted"))?;
+                if let Some(gate) = &self.first_window_gate {
+                    gate.notified().await;
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while self.windows_read.load(Ordering::Relaxed) < 2 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .map_err(|_| Error::internal("second partition window was not admitted"))?;
+                }
             }
             let partitions = plan
                 .partition_range
@@ -3734,6 +3742,7 @@ mod tests {
         let reader = Arc::new(WindowedBatchReader {
             batches: (0..num_partitions).map(flat_partition_batch).collect(),
             windows_read: windows_read.clone(),
+            first_window_gate: None,
         });
         let mut build_stream = build_fresh_partitions_windowed(
             reader,
@@ -3771,6 +3780,70 @@ mod tests {
             merged_partition_ids,
             (0..num_partitions).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_partition_build_respects_compute_concurrency() {
+        let num_partitions = 3;
+        let windows_read = Arc::new(AtomicUsize::new(0));
+        let first_window_gate = Arc::new(Notify::new());
+        let reader = Arc::new(WindowedBatchReader {
+            batches: (0..num_partitions).map(flat_partition_batch).collect(),
+            windows_read: windows_read.clone(),
+            first_window_gate: Some(first_window_gate.clone()),
+        });
+        let build_partition = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::build_partition_fn(
+            DistanceType::L2,
+            FlatQuantizer::new(2, DistanceType::L2),
+            (),
+            "vector".to_string(),
+            None,
+            None,
+        );
+        let build_partition: BuildPartitionFn = Arc::new(move |partition_id, batches, loss| {
+            // Check propagation even when the host's global pool has only one CPU.
+            assert_eq!(limit_compute_concurrency(usize::MAX), 1);
+            build_partition(partition_id, batches, loss)
+        });
+
+        with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+            let mut build_stream = build_fresh_partitions_windowed(
+                reader,
+                num_partitions,
+                build_partition,
+                FreshPartitionBuildLimits {
+                    window_bytes: 1,
+                    decoded_budget_bytes: num_partitions,
+                },
+            )
+            .unwrap();
+
+            // The byte budget admits every window. Only the compute-stage limit
+            // prevents another read while the first window is pending.
+            assert!(futures::poll!(build_stream.try_next()).is_pending());
+            assert_eq!(windows_read.load(Ordering::Relaxed), 1);
+            assert!(futures::poll!(build_stream.try_next()).is_pending());
+            assert_eq!(windows_read.load(Ordering::Relaxed), 1);
+            first_window_gate.notify_one();
+
+            let mut built_partition_ids = Vec::with_capacity(num_partitions);
+            while let Some(result) = build_stream.try_next().await.unwrap() {
+                let built = result.value.built.as_ref().unwrap();
+                let rows: usize = built
+                    .storage_batches
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum();
+                assert_eq!(rows, 1);
+                built_partition_ids.push(result.value.partition_id);
+            }
+            assert_eq!(built_partition_ids, vec![0, 1, 2]);
+            assert_eq!(windows_read.load(Ordering::Relaxed), num_partitions);
+        })
+        .await;
+        assert_eq!(limit_compute_concurrency(usize::MAX), usize::MAX);
     }
 
     #[test]
