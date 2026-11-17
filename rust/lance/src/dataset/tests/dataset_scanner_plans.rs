@@ -1347,7 +1347,8 @@ FilterExec: _distance@... IS NOT NULL
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=6), expr=...
                 KNNVectorDistance: metric=l2
-                  LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+                  LanceRead: uri=..., projection=[vec], num_fragments=1, range_before=None, range_after=None, \
+                  row_id=true, row_addr=false, full_filter=--, refine_filter=--
           LanceRead: uri=..., projection=[vec], source=stream(_rowid)
             SortExec: TopK(fetch=6), expr=...
               ANNSubIndex: name=..., k=6, deltas=1, metric=L2
@@ -1400,7 +1401,8 @@ FilterExec: i@3 > 10
                 FilterExec: _distance@... IS NOT NULL
                   SortExec: TopK(fetch=15), expr=...
                     KNNVectorDistance: metric=l2
-                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+                      LanceRead: uri=..., projection=[vec], num_fragments=1, range_before=None, range_after=None, \
+                      row_id=true, row_addr=false, full_filter=--, refine_filter=--
               LanceRead: uri=..., projection=[vec], source=stream(_rowid)
                 SortExec: TopK(fetch=15), expr=...
                   ANNSubIndex: name=..., k=15, deltas=1, metric=L2
@@ -1424,12 +1426,12 @@ CoalesceBatchesExec: target_batch_size=8192
       KNNVectorDistance: metric=l2
         CoalescePartitionsExec
           UnionExec
-            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
               FilterExec: _distance@... IS NOT NULL
                 SortExec: TopK(fetch=5), expr=...
                   KNNVectorDistance: metric=l2
-                    FilterExec: i@1 > 10
-                      LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i, vec], row_id=true, row_addr=false, ordered=false, range=None
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=5), expr=...
@@ -1445,12 +1447,12 @@ FilterExec: _distance@... IS NOT NULL
     KNNVectorDistance: metric=l2
       CoalescePartitionsExec
         UnionExec
-          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=5), expr=...
                 KNNVectorDistance: metric=l2
-                  FilterExec: i@1 > 10
-                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                  LanceRead: uri=..., projection=[i, vec], num_fragments=1, range_before=None, range_after=None, \
+                  row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
           LanceRead: uri=..., projection=[vec], source=stream(_rowid)
             SortExec: TopK(fetch=5), expr=...
               ANNSubIndex: name=..., k=5, deltas=1, metric=L2
@@ -1551,12 +1553,12 @@ CoalesceBatchesExec: target_batch_size=8192
       KNNVectorDistance: metric=l2
         CoalescePartitionsExec
           UnionExec
-            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
               FilterExec: _distance@... IS NOT NULL
                 SortExec: TopK(fetch=8), expr=...
                   KNNVectorDistance: metric=l2
-                    FilterExec: i@1 > 10
-                      LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i, vec], row_id=true, row_addr=false, ordered=false, range=None
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=8), expr=...
@@ -1571,12 +1573,12 @@ FilterExec: _distance@... IS NOT NULL
     KNNVectorDistance: metric=l2
       CoalescePartitionsExec
         UnionExec
-          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=8), expr=...
                 KNNVectorDistance: metric=l2
-                  FilterExec: i@1 > 10
-                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                  LanceRead: uri=..., projection=[i, vec], num_fragments=1, range_before=None, range_after=None, \
+                  row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
           LanceRead: uri=..., projection=[vec], source=stream(_rowid)
             SortExec: TopK(fetch=8), expr=...
               ANNSubIndex: name=..., k=8, deltas=1, metric=L2
@@ -1606,12 +1608,12 @@ CoalesceBatchesExec: target_batch_size=8192
       KNNVectorDistance: metric=l2
         CoalescePartitionsExec
           UnionExec
-            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
               FilterExec: _distance@... IS NOT NULL
                 SortExec: TopK(fetch=11), expr=...
                   KNNVectorDistance: metric=l2
-                    FilterExec: i@1 > 10
-                      LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i, vec], row_id=true, row_addr=false, ordered=false, range=None
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=11), expr=...
@@ -1626,12 +1628,12 @@ FilterExec: _distance@... IS NOT NULL
     KNNVectorDistance: metric=l2
       CoalescePartitionsExec
         UnionExec
-          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@1 as vec]
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=11), expr=...
                 KNNVectorDistance: metric=l2
-                  FilterExec: i@1 > 10
-                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+                  LanceRead: uri=..., projection=[i, vec], num_fragments=1, range_before=None, range_after=None, \
+                  row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
           LanceRead: uri=..., projection=[vec], source=stream(_rowid)
             SortExec: TopK(fetch=11), expr=...
               ANNSubIndex: name=..., k=11, deltas=1, metric=L2
@@ -2073,7 +2075,8 @@ SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS L
           FilterExec: _distance@2 IS NOT NULL
             SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
               KNNVectorDistance: metric=l2
-                LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+                LanceRead: uri=..., projection=[vec], num_fragments=1, range_before=None, \
+                range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
         LanceRead: uri=..., projection=[vec], source=stream(_rowid)
           SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
             ANNSubIndex: name=idx, k=34, deltas=1, metric=L2

@@ -949,26 +949,31 @@ impl Scanner {
 
         // Flat KNN for unindexed (new-data) fragments.
         if has_fallback {
-            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns)?);
+            let vector_scan_projection = self
+                .dataset
+                .empty_projection()
+                .with_row_id()
+                .union_columns(&columns, OnMissing::Error)?;
             // Note: we could try and use the scalar indices here to reduce the scope of this scan
             // but the most common case is that fragments newer than the vector index are also
             // newer than the scalar indices.
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                false,
-                false,
-                vector_scan_projection,
-                Arc::new(fallback_fragments),
-                // Can't pushdown limit/offset in an ANN search
-                None,
-                // We are re-ordering anyways, so no need to get data in a deterministic order.
-                false,
-            );
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
-            }
+            let mut refine_plan = filter_plan.clone();
+            refine_plan.make_refine_only();
+            // As a prefilter read, both the new and the legacy read apply the refine filter.
+            let PlannedFilteredScan {
+                plan: scan_node, ..
+            } = self
+                .filtered_read(
+                    &refine_plan,
+                    vector_scan_projection,
+                    /*make_deletions_null=*/ false,
+                    Some(Arc::new(fallback_fragments)),
+                    // Can't pushdown limit/offset in an ANN search
+                    None,
+                    /*is_prefilter=*/ true,
+                    None,
+                )
+                .await?;
             // Appended fragments are not covered by the index, so the external
             // row-address mask must be applied to them here.
             let scan_node = match self.external_row_mask.clone() {
@@ -986,7 +991,7 @@ impl Scanner {
         // incur near-zero overhead.
         if has_stale {
             // Fetch vector + filter columns for the stale rows. `flat_knn` sorts by row id, so the
-            // take must carry it (the fallback scan above gets it via `scan_fragments`).
+            // take must carry it (the fallback read above projects it explicitly).
             let mut take_proj = self
                 .dataset
                 .empty_projection()

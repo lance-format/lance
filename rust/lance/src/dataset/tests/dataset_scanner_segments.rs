@@ -184,6 +184,53 @@ async fn test_full_snapshot_prefilter_preserves_deleted_and_unindexed_rows(
 
 #[rstest]
 #[tokio::test]
+async fn test_unindexed_fragments_flat_knn_respects_filter_and_deletions(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
+    #[values(false, true)] filtered: bool,
+) {
+    let mut test_ds = TestVectorDataset::new(version, false).await.unwrap();
+    test_ds.make_vector_index().await.unwrap();
+    // Two unindexed fragments; row `start + k` holds the vector [k; 32].
+    test_ds.append_data_with_range(400, 410).await.unwrap();
+    test_ds.append_data_with_range(410, 420).await.unwrap();
+    test_ds.dataset.delete("i IN (402, 413)").await.unwrap();
+
+    let distance = |i: i32| {
+        let k = (if i >= 410 { i - 410 } else { i - 400 }) as f32;
+        32.0 * k * k
+    };
+    // Every indexed vector is at least sum((0..32)^2) away from the zero query, far
+    // above any appended vector, so the exact top-k is the surviving appended rows.
+    let expected: BTreeSet<i32> = (400..420)
+        .filter(|i| ![402, 413].contains(i) && (!filtered || i % 2 == 0))
+        .collect();
+
+    let mut scanner = test_ds.dataset.scan();
+    scanner.prefilter(true);
+    scanner
+        .nearest("vec", &Float32Array::from(vec![0.0; 32]), expected.len())
+        .unwrap();
+    if filtered {
+        scanner.filter("i % 2 = 0").unwrap();
+    }
+    let batch = scanner.try_into_batch().await.unwrap();
+    let actual: BTreeSet<i32> = batch["i"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(batch.num_rows(), expected.len());
+    let ids = batch["i"].as_primitive::<Int32Type>();
+    let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+    for (i, d) in ids.values().iter().zip(distances.values()) {
+        assert_eq!(*d, distance(*i), "distance of row i={i}");
+    }
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_full_snapshot_prefilter_4bit_pq_recall(
     #[values(MetricType::L2, MetricType::Dot)] metric: MetricType,
     #[values(false, true)] postfilter: bool,
