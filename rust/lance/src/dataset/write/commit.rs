@@ -62,6 +62,9 @@ pub struct CommitBuilder<'a> {
     /// The complete desired clustering definitions list for an `UpdateConfig`
     /// commit; see [`ManifestBuildConfig::clustering_definitions`].
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    /// When set, require the current dataset head to be exactly this version
+    /// and commit with one non-rebasing attempt.
+    expected_latest_version: Option<u64>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -90,6 +93,7 @@ impl<'a> CommitBuilder<'a> {
             deep_clone_files_copied: false,
             inherited_field_ids: false,
             clustering_definitions: None,
+            expected_latest_version: None,
         }
     }
 
@@ -250,6 +254,27 @@ impl<'a> CommitBuilder<'a> {
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
+        self
+    }
+
+    /// Require the current dataset head to be exactly `expected_latest_version`.
+    ///
+    /// The transaction's read version must equal this value. If the head has
+    /// changed, the first attempt fails with a retryable commit conflict and
+    /// the commit is not rebased. Strict commits use one attempt regardless of
+    /// [`Self::with_max_retries`], so a retry cannot replace the original
+    /// expected-head witness.
+    ///
+    /// This is only supported for existing, non-detached datasets and for
+    /// commit handlers that can reject a concurrent write for the same manifest
+    /// version. The default [`crate::dataset::CommitBuilder`] destinations use
+    /// such handlers; `UnsafeCommitHandler` and handlers that do not opt in are
+    /// rejected with an unsupported error.
+    ///
+    /// The caller should reload and revalidate the dataset after a conflict
+    /// before submitting a new transaction with a new expected version.
+    pub fn with_expected_latest_version(mut self, expected_latest_version: u64) -> Self {
+        self.expected_latest_version = Some(expected_latest_version);
         self
     }
 
@@ -490,6 +515,33 @@ impl<'a> CommitBuilder<'a> {
             ));
         }
 
+        if let Some(expected_latest_version) = self.expected_latest_version {
+            if self.detached {
+                return Err(Error::invalid_input(
+                    "strict expected-head commits cannot be detached".to_string(),
+                ));
+            }
+            if dest.dataset().is_none() {
+                return Err(Error::invalid_input(
+                    "strict expected-head commits require an existing dataset".to_string(),
+                ));
+            }
+            if transaction.read_version != expected_latest_version {
+                return Err(Error::invalid_input(format!(
+                    "expected latest version {expected_latest_version} does not match the \
+                     transaction read version {}",
+                    transaction.read_version
+                )));
+            }
+            if !commit_handler.supports_expected_head_commit() {
+                return Err(Error::not_supported_source(
+                    "strict expected-head commits require a commit handler that rejects a \
+                     concurrent write for the same manifest version"
+                        .into(),
+                ));
+            }
+        }
+
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
             WriteDestination::Uri(uri) => (
@@ -553,7 +605,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
-                    None,
+                    self.expected_latest_version,
                 )
                 .await?
             }
@@ -669,6 +721,17 @@ impl<'a> CommitBuilder<'a> {
             return Err(Error::not_supported_source(
                 "Only append transactions are supported in batch commits".into(),
             ));
+        }
+
+        if let Some(expected_latest_version) = self.expected_latest_version
+            && transactions
+                .iter()
+                .any(|transaction| transaction.read_version != expected_latest_version)
+        {
+            return Err(Error::invalid_input(format!(
+                "strict expected latest version {expected_latest_version} does not match every \
+                 transaction read version"
+            )));
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();

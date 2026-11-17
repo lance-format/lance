@@ -276,6 +276,10 @@ mod tests {
 
     #[async_trait]
     impl CommitHandler for AppendBeforeCommit {
+        fn supports_expected_head_commit(&self) -> bool {
+            self.inner.supports_expected_head_commit()
+        }
+
         async fn commit(
             &self,
             manifest: &mut Manifest,

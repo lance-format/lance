@@ -31,6 +31,7 @@ impl BlockingDataset {
         use_stable_row_ids: Option<bool>,
         storage_format: Option<LanceFileVersion>,
         max_retries: u32,
+        expected_latest_version: Option<u64>,
         skip_auto_cleanup: bool,
         commit_handler: Option<Arc<dyn CommitHandler>>,
         commit_timeout: Option<std::time::Duration>,
@@ -48,6 +49,9 @@ impl BlockingDataset {
         }
         if max_retries > 0 {
             builder = builder.with_max_retries(max_retries);
+        }
+        if let Some(expected_latest_version) = expected_latest_version {
+            builder = builder.with_expected_latest_version(expected_latest_version);
         }
         if skip_auto_cleanup {
             builder = builder.with_skip_auto_cleanup(true);
