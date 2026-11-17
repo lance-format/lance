@@ -69,6 +69,60 @@ fn observe(f: &mut Fixture, outcome: &'static str) -> Arc<AtomicUsize> {
 }
 
 #[rstest]
+#[case::raw_small(false, 32, 4, true)]
+#[case::raw_large(false, 32768, 4, false)]
+#[case::raw_many_rows(false, 0, 257, false)]
+#[case::fsst_small(true, 32, 4, false)]
+#[case::fsst_expansion(true, 32768, 4, false)]
+#[tokio::test]
+async fn inline_work_requires_small_uncompressed_input(
+    #[case] fsst: bool,
+    #[case] value_len: usize,
+    #[case] count: usize,
+    #[case] small: bool,
+) {
+    let values = (0..count)
+        .map(|row| vec![b'a' + (row % 26) as u8; value_len])
+        .collect::<Vec<_>>();
+    let mut f = fixture_with_values(32, fsst, "flat", values.clone());
+    let source = source(&mut f);
+    let scheduler = Arc::new(f.scheduler);
+    let budget = AllocationBudget::new(2 * 1024 * 1024);
+    let mut work = budget.try_reserve(2 * 1024 * 1024).unwrap();
+    let input = scheduler
+        .prepare_array_range_in(
+            0..count as u64,
+            DataType::Binary,
+            &mut work,
+            reader(source, Arc::default(), Fault::None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let remaining = work.len();
+    let estimate = input.decode_work_estimate();
+    assert_eq!(estimate.is_some_and(|work| work <= 256 * 1024), small);
+    if fsst {
+        assert_eq!(estimate, None, "compression must not qualify by input size");
+    }
+    assert_eq!(
+        work.len(),
+        remaining,
+        "scheduling does not allocate payload"
+    );
+    let output = input.decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(
+        output.to_data(),
+        BinaryArray::from_iter_values(values.iter()).to_data()
+    );
+    let alias = output.slice(0, 1);
+    drop((output, work));
+    assert!(budget.reserved() > 0);
+    drop(alias);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
 #[tokio::test(flavor = "current_thread")]
 async fn array_cpu_dispatch_preserves_selected_values(
     #[values(32, 64)] bits: u8,

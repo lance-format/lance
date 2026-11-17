@@ -26,6 +26,32 @@ enum TakeSource {
 }
 
 impl PreparedFullZipTake {
+    /// Estimate work for a small decode that needs no concatenation or codecs.
+    ///
+    /// Returns `None` for missing columns, multiple runs, deep nesting or
+    /// compressed inputs. The sum uses the page decoder's byte-pass estimate,
+    /// not retained memory or elapsed time. Callers must separately bound their
+    /// own post-decode work before choosing inline execution. Validation and
+    /// payload admission still occur in [`Self::decode_in`].
+    ///
+    /// ```
+    /// use lance_file::reader::PreparedFullZipTake;
+    /// fn small(input: &PreparedFullZipTake) -> bool {
+    ///     input.decode_work_estimate().is_some_and(|work| work <= 65536)
+    /// }
+    /// ```
+    pub fn decode_work_estimate(&self) -> Option<usize> {
+        let TakeSource::Stored(columns) = &self.source else {
+            return None;
+        };
+        columns.iter().try_fold(0usize, |total, inputs| {
+            let [input] = inputs.as_slice() else {
+                return None;
+            };
+            total.checked_add(input.decode_work_estimate()?)
+        })
+    }
+
     /// Prepare null placeholders for fields absent from a fragment's data files.
     ///
     /// This creates only descriptors; [`Self::decode_in`] charges all new typed

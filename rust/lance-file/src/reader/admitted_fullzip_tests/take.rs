@@ -10,6 +10,41 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn small_raw_take_keeps_nested_values_and_alias_credit(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(0, 2)] depth: usize,
+) {
+    let expected = array(0, depth);
+    let (_fs, reader) = fixture_arrays(version, false, vec![expected.clone()]).await;
+    let indices = (0..expected.len() as u32).collect::<Vec<_>>();
+    let budget = AllocationBudget::new(65536);
+    let mut work = budget.try_reserve(65536).unwrap();
+    let input = reader
+        .prepare_admitted_fullzip_take_in(&indices, &mut work)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        input
+            .decode_work_estimate()
+            .is_some_and(|work| work <= 256 * 1024)
+    );
+    let output = input.decode_in(&mut work).unwrap().unwrap();
+    assert_eq!(output.column(0).to_data(), expected.to_data());
+    let alias = output.column(0).slice(0, 1);
+    drop((output, work));
+    let held = budget.reserved();
+    assert!(held > 0);
+    let peer = budget.try_reserve(65536 - held).unwrap();
+    assert!(budget.try_reserve(1).is_none());
+    drop(alias);
+    assert_eq!(budget.reserved(), peer.len());
+    drop(peer);
+    assert_eq!(budget.reserved(), 0);
+}
+
 #[test]
 fn null_placeholder_without_columns_preserves_row_count() {
     let budget = AllocationBudget::new(0);
@@ -129,6 +164,11 @@ async fn sparse_take_matches_arrow_and_skips_pages(
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        input.decode_work_estimate(),
+        None,
+        "sparse runs need concat"
+    );
     assert!(work.len() < 65536, "prepared input owns physical credit");
     let output = input.decode_in(&mut work).unwrap().unwrap();
     assert_eq!(output.column(0).to_data(), expected.to_data());

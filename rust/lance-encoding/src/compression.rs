@@ -1540,6 +1540,13 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 }
 
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
+    /// Whether values are already decoded and work is linear in input bytes.
+    /// Used only for bounded inline scheduling, never to skip validation or
+    /// admission. Unknown/custom codecs default to CPU-pool scheduling.
+    fn is_identity(&self) -> bool {
+        false
+    }
+
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
 

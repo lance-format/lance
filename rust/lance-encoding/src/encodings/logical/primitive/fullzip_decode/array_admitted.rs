@@ -187,6 +187,27 @@ pub struct FullZipArrayInput {
 }
 
 impl FullZipArrayInput {
+    // Count repeated byte/level passes and per-row work, including Arrow
+    // reconstruction. Restrict this heuristic to shallow identity codecs: a
+    // small compressed input does not imply a small decode. This is neither an
+    // allocation plan nor permission to skip full payload validation.
+    pub(in super::super) fn decode_work_estimate(&self) -> Option<usize> {
+        let super::PerValueDecompressor::Variable(codec) =
+            &self.scheduler.details.value_decompressor
+        else {
+            return None;
+        };
+        let depth = self.scheduler.details.def_meaning.len();
+        if !codec.is_identity() || depth > 3 || self.count > 256 {
+            return None;
+        }
+        self.input
+            .capacity()
+            .checked_mul(4 * depth)
+            .and_then(|bytes| bytes.checked_add(self.count as usize * 32))
+            .and_then(|bytes| bytes.checked_add(4096))
+    }
+
     /// Consume input and decode using the remainder of its original workspace.
     /// Performs no I/O, pool dispatch or allocation wait. `None` means the entire
     /// compound attempt must be dropped and replanned, never EOF. Reused raw

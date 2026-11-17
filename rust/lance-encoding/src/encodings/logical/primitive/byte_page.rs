@@ -182,6 +182,24 @@ enum Input {
 pub struct AdmittedBytePageInput(Input);
 
 impl AdmittedBytePageInput {
+    /// Estimate byte-pass work for shallow, uncompressed FullZip input only.
+    /// `None` leaves scheduling to the CPU pool. The estimate includes structural
+    /// passes and row/array overhead; it is not an allocation or duration bound.
+    /// It never decodes payload or replaces [`Self::decode_in`]'s validation.
+    ///
+    /// ```
+    /// use lance_encoding::encodings::logical::primitive::AdmittedBytePageInput;
+    /// fn known_work(input: &AdmittedBytePageInput) -> Option<usize> {
+    ///     input.decode_work_estimate()
+    /// }
+    /// ```
+    pub fn decode_work_estimate(&self) -> Option<usize> {
+        match &self.0 {
+            Input::FullZip(input) => input.decode_work_estimate(),
+            _ => None,
+        }
+    }
+
     /// Consume input and reconstruct Arrow within its original workspace.
     /// Pure CPU work: no I/O, nested dispatch, additional admission or waits.
     /// `None` means discard/replan the whole operation, never partial success.

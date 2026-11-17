@@ -20,7 +20,9 @@ impl FragmentReader {
     /// This opt-in path uses this fragment's actual file readers, field-ID mapping,
     /// overlay coverage planner and newest-first sources. Base and sparse overlay
     /// inputs prepare asynchronously, then decode/concatenate/interleave together
-    /// in one CPU job. Every payload owner remains charged until its final alias
+    /// in one CPU job. Small shallow raw batches without overlays or generated
+    /// columns can decode inline, with cooperative yielding. Every payload owner
+    /// remains charged until its final alias
     /// drops; no dependent stage waits for more credit or uses ordinary decoding.
     /// `None` means discard/replan the complete attempt, never EOF/partial rows.
     /// No implicit prefix reduction or cursor is involved. Cancellation releases
@@ -177,7 +179,22 @@ impl FragmentReader {
             };
             base_inputs.push((input, columns));
         }
-        spawn_cpu(move || {
+        // Avoid a thread handoff for small known-linear decodes. The estimate
+        // charges structural passes and per-row overhead, not compressed size.
+        // Unknown codecs, concatenation and output assembly stay on the pool.
+        const MAX_INLINE_WORK: usize = 256 * 1024;
+        let inline = plans.is_empty()
+            && !self.with_row_id
+            && !self.with_row_addr
+            && !self.with_row_created_at_version
+            && !self.with_row_last_updated_at_version
+            && base_inputs
+                .iter()
+                .try_fold(0usize, |total, (input, _)| {
+                    total.checked_add(input.decode_work_estimate()?)
+                })
+                .is_some_and(|work| work <= MAX_INLINE_WORK);
+        let decode = move || {
             // Keep a copied selection's physical owner in the same admitted
             // operation through output construction, alongside decoded inputs.
             let rows = indices.len();
@@ -206,7 +223,13 @@ impl FragmentReader {
                 .collect::<Result<Vec<_>>>()?;
             let base = RecordBatch::try_new(schema, columns)?;
             overlays.decode_and_merge_in(base, &mut workspace)
-        })
-        .await
+        };
+        if inline {
+            // Repeated ready reads must still give other async tasks a turn.
+            tokio::task::consume_budget().await;
+            decode()
+        } else {
+            spawn_cpu(decode).await
+        }
     }
 }

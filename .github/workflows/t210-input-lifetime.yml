@@ -25,16 +25,15 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify owned read scheduling and actual file composition
+      - name: Verify bounded inline decode and actual file composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-io --lib scheduler:: -- --nocapture
-          cargo test --profile ci --locked -p lance-io --doc read_single_into -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::multi:: -- --nocapture
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib fullzip_decode::unzip_admitted::tests::read::cpu:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::take:: -- --nocapture
+          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted:: -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding -p lance-file --doc decode_work_estimate -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-io --all-targets --no-deps -- -D warnings
-          cargo clippy --profile ci --locked -p lance-file --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings
