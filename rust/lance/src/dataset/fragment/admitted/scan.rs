@@ -11,6 +11,7 @@ use lance_core::{
 };
 
 use super::FragmentReader;
+use crate::dataset::admitted::RowLimit;
 
 /// A complete physical prefix, a retryable refusal, or the end of a fragment scan.
 #[derive(Debug)]
@@ -38,7 +39,7 @@ pub struct AdmittedFragmentScan<'a> {
     reader: &'a FragmentReader,
     cursor: u64,
     end: u64,
-    max_rows: u64,
+    pub(crate) row_limit: RowLimit,
     workspace_bytes: usize,
     budget: Arc<AllocationBudget>,
 }
@@ -51,6 +52,8 @@ impl FragmentReader {
     /// share that reservation. A refused attempt drops completely before retrying
     /// a smaller prefix, down to one row. No whole-fragment selection is built.
     /// The row ceiling is a per-batch candidate, not a total-result cap.
+    /// Successful smaller prefixes are reused, with periodic growth attempts to
+    /// recover after wide rows. This hint does not replace allocation admission.
     ///
     /// `try_next` never waits for allocation credit. Consume/drop returned output
     /// before requesting the next batch, or provide an independent drain path.
@@ -104,7 +107,7 @@ impl FragmentReader {
             reader: self,
             cursor: rows.start,
             end: rows.end,
-            max_rows: u64::from(max_rows),
+            row_limit: RowLimit::new(max_rows),
             workspace_bytes,
             budget,
         })
@@ -151,9 +154,11 @@ impl AdmittedFragmentScan<'_> {
             return Ok(Some(AdmittedFragmentScanOutcome::Finished));
         }
         let mut count = self
-            .max_rows
+            .row_limit
+            .rows()
             .min(self.end - self.cursor)
             .min((self.workspace_bytes / size_of::<u32>()).max(1) as u64);
+        let first_attempt = count;
         loop {
             let Some(mut workspace) = self.budget.try_reserve(self.workspace_bytes) else {
                 return Ok(None);
@@ -188,6 +193,7 @@ impl AdmittedFragmentScan<'_> {
                 // No await follows the commit. Empty filtered output is still a
                 // fully consumed physical prefix, not EOF or a retry.
                 self.cursor = rows.end;
+                self.row_limit.record_success(first_attempt, count);
                 return Ok(Some(AdmittedFragmentScanOutcome::Batch { rows, batch }));
             }
             if count == 1 {

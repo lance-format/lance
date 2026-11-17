@@ -339,6 +339,61 @@ async fn dataset_cursor_replans_without_restarting_or_skipping_a_row() {
 }
 
 #[tokio::test]
+async fn dataset_cursor_carries_prefix_hint_and_resets_for_replanning() {
+    let dataset = null_dataset(21).await;
+    let budget = AllocationBudget::new(512);
+    let mut scan = dataset
+        .try_scan_admitted_fullzip(
+            dataset.schema().project(&["late"]).unwrap(),
+            Default::default(),
+            7,
+            64,
+            budget.clone(),
+        )
+        .unwrap();
+    let Outcome::Batch { rows, batch, .. } = scan.try_next().await.unwrap() else {
+        panic!("a reduced prefix fits");
+    };
+    assert_eq!(rows.start, 0);
+    let accepted = rows.end;
+    assert!(accepted > 1 && accepted * 2 < 7);
+    drop(batch);
+    // Repeating the same workspace setting must not forget the successful size.
+    scan.set_workspace_bytes(64).unwrap();
+    let Outcome::Batch { rows, batch, .. } = scan.try_next().await.unwrap() else {
+        panic!("the next prefix fits");
+    };
+    assert_eq!(rows, accepted..accepted * 2);
+    drop(batch);
+    scan.set_workspace_bytes(512).unwrap();
+    let mut delivered = accepted * 2;
+    while let Outcome::Batch {
+        fragment_id,
+        rows,
+        batch,
+    } = scan.try_next().await.unwrap()
+    {
+        assert_eq!(
+            rows.end, 7,
+            "replanned or new fragment uses its full ceiling"
+        );
+        if fragment_id != 0 {
+            assert_eq!(rows.start, 0);
+        }
+        assert_eq!(batch.num_rows() as u64, rows.end - rows.start);
+        assert_eq!(
+            batch["late"].as_ref(),
+            arrow_array::new_null_array(&DataType::LargeBinary, batch.num_rows()).as_ref()
+        );
+        delivered += rows.end - rows.start;
+        drop(batch);
+        assert_eq!(budget.reserved(), 0);
+    }
+    assert_eq!(delivered, 21);
+    assert!(scan.position().is_none());
+}
+
+#[tokio::test]
 async fn dataset_cursor_empty_snapshot_and_invalid_options() {
     let dataset = null_dataset(0).await;
     assert!(dataset.fragments().is_empty());

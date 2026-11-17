@@ -42,6 +42,47 @@ pub enum AdmittedDatasetScanOutcome {
 struct ActiveFragment {
     reader: FragmentReader,
     end: u64,
+    row_limit: RowLimit,
+}
+
+/// A scheduling hint only; every attempted prefix still uses full admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowLimit {
+    ceiling: u64,
+    rows: u64,
+    successes: u8,
+}
+
+impl RowLimit {
+    pub fn new(ceiling: u32) -> Self {
+        Self {
+            ceiling: u64::from(ceiling),
+            rows: u64::from(ceiling),
+            successes: 0,
+        }
+    }
+
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    pub fn record_success(&mut self, first_attempt: u64, accepted: u64) {
+        if accepted < first_attempt {
+            self.rows = accepted;
+            self.successes = 0;
+        } else if accepted == self.rows && self.rows < self.ceiling {
+            // Amortize a rejected growth attempt over eight complete batches,
+            // while allowing recovery after a wide region. This is a performance
+            // heuristic, never evidence that a larger prefix fits the workspace.
+            const SUCCESSES_BEFORE_GROWTH: u8 = 8;
+            self.successes += 1;
+            if self.successes == SUCCESSES_BEFORE_GROWTH {
+                // Both values are bounded by the original u32 row ceiling.
+                self.rows = (self.rows * 2).min(self.ceiling);
+                self.successes = 0;
+            }
+        }
+    }
 }
 
 /// Lazy, sequential scan with one shared payload budget across all fragments.
@@ -70,6 +111,9 @@ impl Dataset {
     /// future-fragment read-ahead or whole-dataset selection. The per-batch row
     /// ceiling and workspace do not cap cumulative output. Decoder support and
     /// exclusions are those of [`FragmentReader::try_take_admitted_fullzip`].
+    /// Within each fragment, reuse successful prefix sizes and periodically probe
+    /// growth. A new fragment or changed workspace resets this scheduling hint;
+    /// every attempt still needs full admission and complete decoding.
     ///
     /// Each attempt reserves the same `workspace_bytes` from `budget`, including
     /// selection, dependent input, scratch and output. `NeedsCapacity` is not EOF:
@@ -166,7 +210,12 @@ impl AdmittedDatasetScan {
                 "admitted dataset scan requires positive workspace_bytes",
             ));
         }
-        self.workspace_bytes = workspace_bytes;
+        if self.workspace_bytes != workspace_bytes {
+            if let Some(active) = self.active.as_mut() {
+                active.row_limit = RowLimit::new(self.max_rows);
+            }
+            self.workspace_bytes = workspace_bytes;
+        }
         Ok(())
     }
 
@@ -249,11 +298,15 @@ impl AdmittedDatasetScan {
                 let reader = fragment
                     .open(&self.projection, self.read_config.clone())
                     .await?;
-                self.active = Some(ActiveFragment { reader, end });
+                self.active = Some(ActiveFragment {
+                    reader,
+                    end,
+                    row_limit: RowLimit::new(self.max_rows),
+                });
             }
             let active = self
                 .active
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::internal("admitted dataset scan lost its active fragment"))?;
             let end = active.end;
             let mut scan = active.reader.try_scan_admitted_fullzip(
@@ -262,13 +315,16 @@ impl AdmittedDatasetScan {
                 self.workspace_bytes,
                 self.budget.clone(),
             )?;
+            scan.row_limit = active.row_limit;
             let result = scan.try_next_admitted().await?;
+            let row_limit = scan.row_limit;
             drop(scan);
             let Some(result) = result else {
                 return Ok(None);
             };
             match result {
                 AdmittedFragmentScanOutcome::Batch { rows, batch } => {
+                    active.row_limit = row_limit;
                     self.row_offset = rows.end;
                     if self.row_offset == end {
                         // Commit and release the old reader before the next open.

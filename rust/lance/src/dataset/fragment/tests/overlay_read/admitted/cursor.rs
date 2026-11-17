@@ -178,6 +178,111 @@ async fn cursor_drains_more_than_its_workspace_and_honors_alias_backpressure(#[c
 }
 
 #[tokio::test]
+async fn cursor_reuses_capacity_without_repeating_every_large_attempt() {
+    let reader = null_reader(128).await;
+    let budget = AllocationBudget::new(64);
+    let mut scan = reader
+        .try_scan_admitted_fullzip(0..128, 16, 64, budget.clone())
+        .unwrap();
+    let mut attempts = Vec::new();
+    let mut delivered = 0;
+    let mut batches = 0;
+    while delivered < 128 {
+        let result = scan
+            .try_next_with(|indices, workspace| {
+                attempts.push(indices.len());
+                let reader = &reader;
+                async move { reader.try_take_admitted_fullzip(&indices, workspace).await }
+            })
+            .await;
+        let Some(Outcome::Batch { rows, batch }) = result.unwrap() else {
+            panic!("a null prefix fits the fixed workspace");
+        };
+        assert_eq!(rows.start, delivered);
+        assert_eq!(batch.num_rows() as u64, rows.end - rows.start);
+        assert_eq!(
+            batch["late"].as_ref(),
+            arrow_array::new_null_array(&DataType::LargeBinary, batch.num_rows()).as_ref()
+        );
+        delivered = rows.end;
+        batches += 1;
+        drop(batch);
+        assert_eq!(budget.reserved(), 0);
+    }
+    assert_eq!(delivered, 128);
+    assert!(attempts[0] > attempts[attempts.len() - 1]);
+    assert!(
+        (attempts.len() - batches) * 2 < batches,
+        "uniform input must not repeat rejected larger prefixes for every batch: {attempts:?}"
+    );
+}
+
+#[tokio::test]
+async fn cursor_recovers_after_a_wide_prefix_without_committing_failed_hints() {
+    let reader = null_reader(128).await;
+    let budget = AllocationBudget::new(1024);
+    let mut scan = reader
+        .try_scan_admitted_fullzip(0..128, 8, 1024, budget.clone())
+        .unwrap();
+    // Model a first-row decode that only fits alone. Later rows use the real
+    // missing-column decoder, so a sticky one-row hint would be unnecessary.
+    let first = scan
+        .try_next_with(|indices, workspace| {
+            let reader = &reader;
+            async move {
+                if indices.len() > 1 {
+                    return Ok(None);
+                }
+                reader.try_take_admitted_fullzip(&indices, workspace).await
+            }
+        })
+        .await
+        .unwrap();
+    let Some(Outcome::Batch { rows, batch }) = first else {
+        panic!("first row fits alone");
+    };
+    assert_eq!(rows, 0..1);
+    drop(batch);
+    let committed_hint = scan.row_limit;
+    let mut cancelled = Box::pin(scan.try_next_with(|indices, workspace| async move {
+        pending::<()>().await;
+        drop((indices, workspace));
+        Ok(None)
+    }));
+    assert!(matches!(futures::poll!(cancelled.as_mut()), Poll::Pending));
+    drop(cancelled);
+    assert_eq!(scan.position(), 1);
+    assert_eq!(scan.row_limit, committed_hint);
+    assert_eq!(budget.reserved(), 0);
+    let error = scan
+        .try_next_with(|indices, workspace| async move {
+            drop((indices, workspace));
+            Err(Error::corrupt_file_named("fixture", "wide-prefix failure"))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("wide-prefix failure"));
+    assert_eq!(scan.row_limit, committed_hint);
+    let mut delivered = 1;
+    let mut recovered = false;
+    while let Outcome::Batch { rows, batch } = scan.try_next().await.unwrap() {
+        assert_eq!(rows.start, delivered);
+        assert_eq!(batch.num_rows() as u64, rows.end - rows.start);
+        assert_eq!(batch["late"].null_count(), batch.num_rows());
+        recovered |= batch.num_rows() == 8;
+        delivered = rows.end;
+        drop(batch);
+        assert_eq!(budget.reserved(), 0);
+    }
+    assert_eq!(delivered, 128);
+    assert!(
+        recovered,
+        "one wide prefix must not force permanent one-row output"
+    );
+}
+
+#[tokio::test]
 async fn cursor_refusal_and_cancel_do_not_consume_rows_or_hold_credit() {
     let reader = null_reader(6).await;
     let budget = AllocationBudget::new(64);
