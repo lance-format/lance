@@ -716,6 +716,10 @@ pub fn remap_graph_connected<S: VectorStore + Sync>(
     storage: &S,
 ) -> Result<RecordBatch> {
     let remapped = remap_graph_batch(graph, new_ids)?;
+    // With no survivor the remap is an empty batch without graph metadata.
+    if remapped.num_rows() == 0 {
+        return Ok(remapped);
+    }
     let (reached, total) = level0_reachability(&remapped)?;
     if reached == total {
         return Ok(remapped);
@@ -1111,10 +1115,14 @@ mod tests {
 
     #[test]
     fn test_remap_removing_every_node() {
-        let (_, hnsw) = build(64);
+        let (vectors, hnsw) = build(64);
         let batch = hnsw.to_batch().unwrap();
         let remapped = remap_graph_batch(&batch, &[None; 64]).unwrap();
         assert_eq!(remapped.num_rows(), 0);
+        assert!(HNSW::load(remapped).unwrap().is_empty());
+
+        let empty_store = FlatFloatStorage::new(vectors.slice(0, 0), DistanceType::L2);
+        let remapped = remap_graph_connected(&batch, &[None; 64], &empty_store).unwrap();
         assert!(HNSW::load(remapped).unwrap().is_empty());
     }
 
