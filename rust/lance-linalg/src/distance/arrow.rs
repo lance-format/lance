@@ -11,8 +11,8 @@ use lance_arrow::FixedSizeListArrayExt;
 use num_traits::AsPrimitive;
 
 use super::{
-    Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, cosine_distance_batch_into,
-    dot_distance_batch_into, hamming, l2_distance_batch_into, norm_l2,
+    Cosine, DistanceType, Dot, L2, Normalize, cosine_distance_batch_into, dot_distance_batch_into,
+    hamming, l2_distance_batch_into, norm_l2,
 };
 use crate::Result;
 
