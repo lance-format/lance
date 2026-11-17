@@ -257,15 +257,15 @@ async fn cursor_propagates_unsupported_input_without_skipping() {
 async fn cursor_validates_ranges_and_preserves_final_u32_offset() {
     let mut reader = null_reader(1).await;
     let budget = AllocationBudget::new(64);
-    for (rows, max, bytes, text) in [
-        (2..1, 1, 64, "physical domain"),
-        (0..2, 1, 64, "physical domain"),
-        (0..1, 0, 64, "positive"),
-        (0..1, 1, 0, "positive"),
+    for (start, end, max, bytes, text) in [
+        (2, 1, 1, 64, "physical domain"),
+        (0, 2, 1, 64, "physical domain"),
+        (0, 1, 0, 64, "positive"),
+        (0, 1, 1, 0, "positive"),
     ] {
-        let error = match reader.try_scan_admitted_fullzip(rows, max, bytes, budget.clone()) {
-            Ok(_) => panic!("invalid range or workspace was accepted"),
-            Err(error) => error,
+        let Err(error) = reader.try_scan_admitted_fullzip(start..end, max, bytes, budget.clone())
+        else {
+            panic!("invalid range or workspace was accepted");
         };
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains(text));
