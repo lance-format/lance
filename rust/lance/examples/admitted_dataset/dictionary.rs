@@ -76,16 +76,19 @@ pub async fn verify_layout(dataset: &Dataset) -> Result<()> {
                         }
                         _ => None,
                     };
+                    // Null children have empty physical bytes. The structural
+                    // encoder moves validity to rep/def before interning those
+                    // bytes, so 31 visible frames can produce a 32nd empty item.
                     scheme == Some(CompressionScheme::CompressionAlgorithmLz4)
                         && layout.num_dictionary_items > 1
-                        && layout.num_dictionary_items <= 31
+                        && layout.num_dictionary_items <= 32
                         && layout.repetition_index_depth == 1
                 } else {
                     false
                 };
                 if !is_valid {
                     return Err(format!(
-                        "file {} requires MiniBlock/LZ4 with 2..=31 dictionary frames: {layout:?}; encoder hints alone do not qualify this fixture",
+                        "file {} requires MiniBlock/LZ4 with 2..=32 dictionary items (31 frame values plus an optional empty null-slot value): {layout:?}; encoder hints alone do not qualify this fixture",
                         file.path
                     ).into());
                 }
@@ -186,6 +189,8 @@ mod tests {
         let dataset = Dataset::open(&uri).await.unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
         assert_eq!(dataset.count_rows(None).await.unwrap(), 145);
+        let tail = dataset.iter_fragments().last().unwrap();
+        assert!(error.to_string().contains(&tail.files[0].path), "{error}");
         // A failed layout qualification never licenses overwriting the fixture.
         let error = prepare(Fixture::Dictionary, &uri, 256, 1024, 128)
             .await
