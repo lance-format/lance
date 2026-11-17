@@ -2,15 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use lance_encoding::constants::{COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY};
+use lance_encoding::constants::{
+    COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
+};
 use lance_encoding::format::metadata::compressive_encoding::Compression;
 
 #[rstest]
 #[tokio::test]
-async fn actual_dictionary_scan_take_and_concurrent_progress(
+async fn actual_dictionary_layout_and_admission_boundaries(
     #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
     #[values(false, true)] lite: bool,
     #[values(false, true)] nested: bool,
+    #[values(false, true)] default_compression: bool,
 ) {
     let values = (0..1024)
         .map(|i| {
@@ -38,15 +41,24 @@ async fn actual_dictionary_scan_take_and_concurrent_progress(
     } else {
         leaf
     };
+    let mut metadata = HashMap::from([
+        (
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        ),
+        (COMPRESSION_META_KEY.to_string(), "none".to_string()),
+        (DICT_DIVISOR_META_KEY.to_string(), "1".to_string()),
+    ]);
+    if !default_compression {
+        // Dictionary values have independent compression metadata; the ordinary
+        // value setting above does not override their default LZ4 wrapper.
+        metadata.insert(
+            DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+            "none".to_string(),
+        );
+    }
     let schema = Arc::new(Schema::new(vec![
-        Field::new("payload", expected.data_type().clone(), true).with_metadata(HashMap::from([
-            (
-                STRUCTURAL_ENCODING_META_KEY.to_string(),
-                STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
-            ),
-            (COMPRESSION_META_KEY.to_string(), "none".to_string()),
-            (DICT_DIVISOR_META_KEY.to_string(), "1".to_string()),
-        ])),
+        Field::new("payload", expected.data_type().clone(), true).with_metadata(metadata),
     ]));
     let rows = expected.len();
     let batches = (0..2)
@@ -67,19 +79,61 @@ async fn actual_dictionary_scan_take_and_concurrent_progress(
         let Some(Layout::MiniBlockLayout(layout)) = layout.layout else {
             panic!("stored MiniBlock required");
         };
-        assert!(matches!(
-            layout
-                .dictionary
-                .as_ref()
-                .and_then(|d| d.compression.as_ref()),
-            Some(Compression::Variable(_))
-        ));
+        let dictionary = layout
+            .dictionary
+            .as_ref()
+            .and_then(|d| d.compression.as_ref());
+        if default_compression {
+            let Some(Compression::General(general)) = dictionary else {
+                panic!("default dictionary must retain General compression: {dictionary:?}");
+            };
+            assert_eq!(
+                general.compression.as_ref().unwrap().scheme(),
+                lance_encoding::format::metadata::CompressionScheme::CompressionAlgorithmLz4
+            );
+        } else {
+            assert!(
+                matches!(dictionary, Some(Compression::Variable(_))),
+                "explicit raw dictionary required: {dictionary:?}"
+            );
+        }
         assert!(layout.num_dictionary_items > 1);
         assert_eq!(layout.repetition_index_depth, u32::from(nested));
         assert_eq!(page.buffer_offsets_and_sizes.len(), 3 + usize::from(nested));
     }
     const WORKSPACE: usize = 128 * 1024;
     let budget = AllocationBudget::new(WORKSPACE);
+    if default_compression {
+        // Preserve the original writer counterexample. Unsupported compressed
+        // dictionaries must not fall back to whole-page reads/decompression.
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reader = reader.with_scheduler(Arc::new(RangeIo {
+            inner: reader.core.scheduler.clone(),
+            reads: reads.clone(),
+        }));
+        let error = reader
+            .open_admitted_fullzip_scan(0..rows as u64, budget.clone(), WORKSPACE, 37)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("raw variable-width values"));
+        assert!(reads.lock().unwrap().is_empty());
+        assert_eq!(budget.reserved(), 0);
+        let mut work = budget.try_reserve(WORKSPACE).unwrap();
+        let error = reader
+            .prepare_admitted_fullzip_take_in(&[0, 3], &mut work)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("raw variable-width values"));
+        assert_eq!(work.len(), WORKSPACE);
+        assert!(reads.lock().unwrap().is_empty());
+        drop(work);
+        assert_eq!(budget.reserved(), 0);
+        return;
+    }
     let mut scan = reader
         .open_admitted_fullzip_scan(0..rows as u64, budget.clone(), WORKSPACE, 37)
         .await

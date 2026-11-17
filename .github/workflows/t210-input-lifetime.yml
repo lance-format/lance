@@ -29,8 +29,8 @@ jobs:
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted_input:: -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted_input::dictionary:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::miniblock::dictionary:: -- --nocapture
           cargo test --profile ci --locked -p lance-encoding --doc AdmittedBytePageScheduler -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}

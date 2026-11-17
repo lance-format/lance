@@ -178,7 +178,7 @@ impl Dictionary {
             .data
             .as_ref()
             .chunks_exact(index_width)
-            .zip(ranges.as_mut().chunks_exact_mut(16))
+            .zip(ranges.as_mut().as_chunks_mut::<16>().0)
         {
             let offset = self.bytes.start + (word(index) + 2) * self.width as u64;
             let pair = Self::read(offset..offset + (2 * self.width) as u64, work, read).await?;
