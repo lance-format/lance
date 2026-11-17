@@ -25,11 +25,11 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify dataset dictionary overlays and shared admission
+      - name: Verify complete-drain dictionary harness correctness
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance --lib admitted::dataset_cursor::dictionary:: -- --nocapture
+          cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |

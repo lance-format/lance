@@ -5,6 +5,12 @@
 //!
 //! `prepare URI ROWS FRAME_BYTES FRAGMENT_ROWS` creates one immutable fixture and
 //! prints its complete ordered payload hash. URI may be an authorized S3 prefix.
+//! `prepare-dictionary` accepts the same arguments and generates 31 repeated
+//! frame values with the writer's default index and dictionary compression.
+//! It verifies that every stored frames page is MiniBlock with an LZ4 dictionary.
+//! A short final fragment or unsuitable page size can fail this check; that
+//! fixture is not qualified and is not overwritten on a retry. Both workloads
+//! use the same run/run-many commands; fixture validation is outside measured reads.
 //! `run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US`
 //! drains it without collecting batches. MODE is `ordinary` or `admitted`.
 //! `run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES`
@@ -50,7 +56,16 @@ use lance_file::version::LanceFileVersion;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use serde::Serialize;
 
+#[path = "admitted_dataset/dictionary.rs"]
+mod dictionary;
+
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+#[derive(Clone, Copy, Debug)]
+enum Fixture {
+    FullZip,
+    Dictionary,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -156,7 +171,21 @@ impl Sink {
     }
 }
 
-fn fixture_schema() -> Arc<Schema> {
+fn frame_field(fixture: Fixture) -> Arc<Field> {
+    let field = Field::new("item", DataType::LargeBinary, true);
+    Arc::new(match fixture {
+        Fixture::FullZip => field,
+        Fixture::Dictionary => field.with_metadata(HashMap::from([
+            (
+                "lance-encoding:structural-encoding".into(),
+                "miniblock".into(),
+            ),
+            ("lance-encoding:dict-divisor".into(), "1".into()),
+        ])),
+    })
+}
+
+fn fixture_schema(fixture: Fixture) -> Arc<Schema> {
     let fullzip = |name, data_type, nullable| {
         Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
             "lance-encoding:structural-encoding".into(),
@@ -165,21 +194,27 @@ fn fixture_schema() -> Arc<Schema> {
     };
     Arc::new(Schema::new(vec![
         fullzip("key", DataType::LargeBinary, false),
-        fullzip(
-            "frames",
-            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
-            true,
+        Field::new("frames", DataType::List(frame_field(fixture)), true).with_metadata(
+            HashMap::from([(
+                "lance-encoding:structural-encoding".into(),
+                match fixture {
+                    Fixture::FullZip => "fullzip",
+                    Fixture::Dictionary => "miniblock",
+                }
+                .into(),
+            )]),
         ),
     ]))
 }
 
 fn fixture_batch(
+    fixture: Fixture,
     start: u64,
     count: usize,
     width: usize,
 ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
     let mut keys = LargeBinaryBuilder::new();
-    let mut lists = ListBuilder::new(LargeBinaryBuilder::new());
+    let mut lists = ListBuilder::new(LargeBinaryBuilder::new()).with_field(frame_field(fixture));
     for row in start..start + count as u64 {
         keys.append_value(row.to_le_bytes());
         if row % 17 == 0 {
@@ -191,12 +226,25 @@ fn fixture_batch(
                 if frame == 1 && row % 23 == 0 {
                     lists.values().append_null();
                 } else {
-                    // Stable incompressible image-like bytes, regenerated per frame.
-                    let mut hash = blake3::Hasher::new();
-                    hash.update(&row.to_le_bytes());
-                    hash.update(&frame.to_le_bytes());
                     let mut bytes = vec![0; width];
-                    hash.finalize_xof().fill(&mut bytes);
+                    match fixture {
+                        Fixture::FullZip => {
+                            // Preserve the original incompressible image-like fixture.
+                            let mut hash = blake3::Hasher::new();
+                            hash.update(&row.to_le_bytes());
+                            hash.update(&frame.to_le_bytes());
+                            hash.finalize_xof().fill(&mut bytes);
+                        }
+                        Fixture::Dictionary => {
+                            // Repeat 31 distinct frames. Each frame repeats a 32-byte
+                            // pattern, so dictionary-value compression has real work.
+                            let value = ((row % 31) * 2 + frame) % 31;
+                            let pattern = blake3::hash(&value.to_le_bytes());
+                            for (index, byte) in bytes.iter_mut().enumerate() {
+                                *byte = pattern.as_bytes()[index % 32];
+                            }
+                        }
+                    }
                     lists.values().append_value(bytes);
                 }
             }
@@ -204,12 +252,18 @@ fn fixture_batch(
         }
     }
     RecordBatch::try_new(
-        fixture_schema(),
+        fixture_schema(fixture),
         vec![Arc::new(keys.finish()), Arc::new(lists.finish())],
     )
 }
 
-async fn prepare(uri: &str, rows: u64, width: usize, fragment_rows: usize) -> Result<Output> {
+async fn prepare(
+    fixture: Fixture,
+    uri: &str,
+    rows: u64,
+    width: usize,
+    fragment_rows: usize,
+) -> Result<Output> {
     if rows == 0 || width == 0 || fragment_rows == 0 {
         return Err("rows, frame bytes and fragment rows must be positive".into());
     }
@@ -217,10 +271,15 @@ async fn prepare(uri: &str, rows: u64, width: usize, fragment_rows: usize) -> Re
     let batch_rows =
         (8 * 1024 * 1024 / width.checked_mul(2).ok_or("frame width overflow")?).clamp(1, 256);
     let batches = (0..rows).step_by(batch_rows).map(move |start| {
-        fixture_batch(start, (rows - start).min(batch_rows as u64) as usize, width)
+        fixture_batch(
+            fixture,
+            start,
+            (rows - start).min(batch_rows as u64) as usize,
+            width,
+        )
     });
-    Dataset::write(
-        RecordBatchIterator::new(batches, fixture_schema()),
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(batches, fixture_schema(fixture)),
         uri,
         Some(WriteParams {
             max_rows_per_file: fragment_rows,
@@ -230,11 +289,15 @@ async fn prepare(uri: &str, rows: u64, width: usize, fragment_rows: usize) -> Re
         }),
     )
     .await?;
+    if matches!(fixture, Fixture::Dictionary) {
+        dictionary::verify_layout(&dataset).await?;
+    }
     // Regenerate the expected logical stream independently of all file readers.
     // This bounded second pass is fixture preparation, never measured scan time.
     let mut expected = Sink::new(None);
     for start in (0..rows).step_by(batch_rows) {
         expected.consume(&fixture_batch(
+            fixture,
             start,
             (rows - start).min(batch_rows as u64) as usize,
             width,
@@ -388,9 +451,10 @@ fn peak_rss_kib() -> Option<u64> {
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("prepare") if args.len() == 5 => {
-            let output = prepare(&args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?).await?;
-            serde_json::json!({"fixture":args[1],"rows":output.rows,"frame_bytes":args[3],"fragment_rows":args[4],"expected":output})
+        Some("prepare" | "prepare-dictionary") if args.len() == 5 => {
+            let fixture = if args[0] == "prepare-dictionary" { Fixture::Dictionary } else { Fixture::FullZip };
+            let output = prepare(fixture, &args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?).await?;
+            serde_json::json!({"preparation":args[0],"fixture":args[1],"rows":output.rows,"frame_bytes":args[3],"fragment_rows":args[4],"expected":output})
         }
         Some("run" | "run-many") if (args[0] == "run" && args.len() == 8) || (args[0] == "run-many" && args.len() == 10) => {
             let source_head = option_env!("T210_SOURCE_HEAD")
@@ -420,7 +484,7 @@ async fn main() -> Result<()> {
             }
             result
         }
-        _ => return Err("usage: prepare URI ROWS FRAME_BYTES FRAGMENT_ROWS | run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US | run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES".into()),
+        _ => return Err("usage: prepare|prepare-dictionary URI ROWS FRAME_BYTES FRAGMENT_ROWS | run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US | run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES".into()),
     };
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &result)?;
@@ -446,7 +510,9 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
-        let expected = prepare(&uri, rows, width, fragment_rows).await.unwrap();
+        let expected = prepare(Fixture::FullZip, &uri, rows, width, fragment_rows)
+            .await
+            .unwrap();
         let dataset = Dataset::open(&uri).await.unwrap();
         for mode in [Mode::Ordinary, Mode::Admitted] {
             let config = DrainConfig {
@@ -476,8 +542,10 @@ mod tests {
     async fn refusal_is_not_success_and_fixture_is_not_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
-        let expected = prepare(&uri, 3, 4096, 2).await.unwrap();
-        let error = prepare(&uri, 3, 4096, 2).await.unwrap_err();
+        let expected = prepare(Fixture::FullZip, &uri, 3, 4096, 2).await.unwrap();
+        let error = prepare(Fixture::FullZip, &uri, 3, 4096, 2)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("exist"));
         let dataset = Dataset::open(&uri).await.unwrap();
         let config = DrainConfig {
@@ -516,12 +584,16 @@ mod tests {
     #[test]
     fn sink_rejects_reordered_rows_and_checks_all_payload_bytes() {
         let mut sink = Sink::new(None);
-        let error = sink.consume(&fixture_batch(1, 1, 32).unwrap()).unwrap_err();
+        let error = sink
+            .consume(&fixture_batch(Fixture::FullZip, 1, 1, 32).unwrap())
+            .unwrap_err();
         assert!(error.to_string().contains("out-of-order"));
         let mut original = Sink::new(None);
-        original.consume(&fixture_batch(0, 3, 32).unwrap()).unwrap();
+        original
+            .consume(&fixture_batch(Fixture::FullZip, 0, 3, 32).unwrap())
+            .unwrap();
         let original = original.finish();
-        let batch = fixture_batch(0, 3, 32).unwrap();
+        let batch = fixture_batch(Fixture::FullZip, 0, 3, 32).unwrap();
         let lists = batch["frames"].as_list::<i32>();
         let values = lists.values().as_binary::<i64>();
         let mut payloads = values
@@ -570,7 +642,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
-        let expected = prepare(&uri, 55, 4096, 7).await.unwrap();
+        let expected = prepare(Fixture::FullZip, &uri, 55, 4096, 7).await.unwrap();
         let dataset = Dataset::open(&uri).await.unwrap();
         for mode in [Mode::Ordinary, Mode::Admitted] {
             let config = DrainConfig {
@@ -614,7 +686,7 @@ mod tests {
     async fn group_failure_and_cancel_release_credit_before_retry() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
-        let expected = prepare(&uri, 9, 67, 3).await.unwrap();
+        let expected = prepare(Fixture::FullZip, &uri, 9, 67, 3).await.unwrap();
         let dataset = Dataset::open(&uri).await.unwrap();
         let config = DrainConfig {
             mode: Mode::Admitted,
@@ -684,7 +756,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
-        let expected = prepare(&uri, 3, 67, 2).await.unwrap();
+        let expected = prepare(Fixture::FullZip, &uri, 3, 67, 2).await.unwrap();
         let dataset = Dataset::open(&uri).await.unwrap();
         let config = DrainConfig {
             mode: Mode::Admitted,
