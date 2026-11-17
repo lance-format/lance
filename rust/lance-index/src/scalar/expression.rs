@@ -2780,8 +2780,23 @@ fn visit_binary_expr(
         }
         Operator::And => visit_and(expr, index_info, depth),
         Operator::Or => visit_or(expr, index_info, depth),
+        Operator::RegexMatch | Operator::RegexIMatch => Ok(visit_regex_match(expr, index_info)),
         _ => Ok(None),
     }
+}
+
+/// `col ~ 'pat'` is `regexp_like(col, 'pat')`; `~*` adds the `i` flag.
+fn visit_regex_match(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, data_type, query_parser) = maybe_indexed_column(&expr.left, index_info)?;
+    let mut args = vec![expr.left.as_ref().clone(), expr.right.as_ref().clone()];
+    if expr.op == Operator::RegexIMatch {
+        args.push(Expr::Literal(ScalarValue::Utf8(Some("i".into())), None));
+    }
+    let regexp_like = datafusion_functions::regex::regexp_like();
+    query_parser.visit_scalar_function(&column, &data_type, &regexp_like, &args)
 }
 
 fn visit_scalar_fn(
