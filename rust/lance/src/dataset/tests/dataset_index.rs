@@ -5224,10 +5224,90 @@ async fn test_fts_9058_deleted_candidates_stay_excluded(
         &[None],
     )
     .await;
-    // Deletions retain their established corpus-statistics semantics. The new
-    // restriction path must preserve live candidates and never revive postings.
+    // The shared-corpus plan also runs on tables with deletions; it must keep
+    // deleted rows out of the results.
     assert_restricted_match_membership(
         &format!("9058-deleted-{name}-stable-{stable_row_ids}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+/// Deletes one row from the indexed fragment and one from the residual tail.
+async fn restricted_match_dataset_with_deletions(stable_row_ids: bool) -> Dataset {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete("id = 1 OR id = 6").await.unwrap();
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    assert!(fragments[0].metadata().deletion_file.is_some());
+    assert!(fragments[2].metadata().deletion_file.is_some());
+    dataset
+}
+
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 5, 7])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
+#[case::filter(RestrictedMatchDomain::Filter("id != 3"), &[0, 2, 4, 5, 7])]
+#[tokio::test]
+async fn test_fts_9058_deletions_corpus_scores(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.stage == "before_optimize")
+    {
+        assert_contains!(observation.plan.as_ref().unwrap(), "MatchCorpus");
+    }
+    // Indexed statistics are those stored at index time, so they still count
+    // deleted row 1, and the append optimize leaves them in place; the residual
+    // scan and the new segment are deletion-aware and omit row 6.
+    let corpus: Vec<_> = RESTRICTED_MATCH_CORPUS
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != 6)
+        .collect();
+    assert_restricted_match_oracle(
+        &format!("9058-deletions-scores-{domain:?}-stable-{stable_row_ids}.json"),
+        &corpus,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::indexed_fragment("indexed-fragment", "id <= 2 OR id = 6", &[3, 4, 7])]
+#[case::residual_fragment("residual-fragment", "id >= 5 OR id = 1", &[0, 2, 3, 4])]
+#[tokio::test]
+async fn test_fts_9058_fully_deleted_fragment(
+    #[case] name: &str,
+    #[case] deletion: &str,
+    #[case] expected_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete(deletion).await.unwrap();
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Filter("id >= 0"),
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    assert_restricted_match_membership(
+        &format!("9058-fully-deleted-{name}-stable-{stable_row_ids}.json"),
         expected_ids,
         &observations,
     );
@@ -5621,6 +5701,63 @@ async fn test_fts_9058_phrase_corpus(
             assert_contains!(plan, "PhraseQuery:");
         }
     }
+}
+
+/// The phrase matches rows 0 and 1 in the indexed fragment and rows 5 and 8 in
+/// the unindexed tail; one of each is deleted.
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 6, 7, 8, 9])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
+#[case::residual_filter(RestrictedMatchDomain::Filter("id >= 5"), &[6, 7, 8, 9])]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 2]), &[0, 2, 3, 7, 8, 9])]
+#[tokio::test]
+async fn test_fts_9058_phrase_deletions_corpus_scores(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, stable_row_ids).await;
+    dataset.delete("id = 1 OR id = 5").await.unwrap();
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    assert!(fragments[0].metadata().deletion_file.is_some());
+    assert!(fragments[1].metadata().deletion_file.is_some());
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, phrase_corpus_query())
+                    .await,
+            );
+        }
+    }
+    for observation in &observations[..2] {
+        let plan = observation.plan.as_ref().unwrap();
+        assert_contains!(plan, "MatchCorpus");
+        assert_contains!(plan, "PhraseQuery:");
+    }
+    // Indexed statistics are those stored at index time, so they still count
+    // deleted row 1, and the append optimize leaves them in place; the
+    // unindexed scan and the new segment are deletion-aware and omit row 5.
+    let corpus: Vec<_> = PHRASE_CORPUS
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != 5)
+        .collect();
+    assert_restricted_oracle(
+        &format!("9058-phrase-deletions-{domain:?}-stable-{stable_row_ids}.json"),
+        &corpus,
+        raw_phrase_oracle(&corpus, "alpha beta"),
+        domain,
+        candidate_ids,
+        &observations,
+    );
 }
 
 #[tokio::test]
