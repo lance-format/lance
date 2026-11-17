@@ -665,7 +665,10 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert "ScalarIndexQuery" in plan
     assert "MaterializeIndex" not in plan
     assert "KNNVectorDistance" in plan
-    assert "LanceScan" in plan
+    # The flat KNN over the unindexed fragment reads via FilteredReadExec
+    # (prints as `LanceRead` with a fragment count), not a `LanceScan`.
+    assert "num_fragments=1" in plan
+    assert "LanceScan" not in plan
     assert make_vec_search(ds).to_table().num_rows == 12
 
     plan = make_fts_search(ds).explain_plan()
