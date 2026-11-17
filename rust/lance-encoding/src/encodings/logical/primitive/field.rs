@@ -25,16 +25,17 @@ use crate::EncodingsIo;
 use crate::compression::DecompressionStrategy;
 use crate::data::{concat_decoded_arrays, dictionary_batch_limit};
 use crate::decoder::{
-    ColumnInfo, DecodePageTask, DecodedArray, FilterExpression, IO_REQUEST_BATCH_BYTES,
-    LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch, ScheduledScanLine,
-    SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
-    StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
+    ColumnInfo, DecodePageTask, DecodedArray, DrainLimit, FilterExpression, IO_REQUEST_BATCH_BYTES,
+    ListReadMode, LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch,
+    ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
+    StructuralFieldScheduler, StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
 };
 use crate::encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler};
 use crate::format::metadata::PageLayout;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation};
 
+use super::structure::StructuralProjection;
 use super::{
     CachedPage, CachedPageData, ComplexAllNullScheduler, FullZipScheduler, LevelCodec,
     MiniBlockScheduler, NoCachedPageData, PageDataCacheKey, PageInitialization,
@@ -139,6 +140,7 @@ struct PageSchedulerSource {
     decompressors: Arc<dyn DecompressionStrategy>,
     cache_repetition_index: bool,
     target_field: Field,
+    list_read_mode: Option<ListReadMode>,
 }
 
 /// A scheduler for a leaf node
@@ -192,6 +194,7 @@ impl StructuralPrimitiveFieldScheduler {
                 decompressors,
                 cache_repetition_index,
                 target_field,
+                None,
             )?);
             row_start = row_end;
         }
@@ -226,8 +229,19 @@ impl StructuralPrimitiveFieldScheduler {
                 decompressors,
                 cache_repetition_index,
                 target_field: target_field.clone(),
+                list_read_mode: None,
             }),
         })
+    }
+
+    pub(crate) fn with_optional_list_read_mode(mut self, mode: Option<ListReadMode>) -> Self {
+        if let Some(source) = &mut self.page_source {
+            source.list_read_mode = mode;
+        }
+        if mode.is_some() {
+            self.target_data_type_tag = format!("{}:structure", self.target_data_type_tag).into();
+        }
+        self
     }
 
     /// Exclusive end row of every page of `column_info`, in page order.
@@ -321,6 +335,7 @@ impl StructuralPrimitiveFieldScheduler {
                     source.decompressors.as_ref(),
                     source.cache_repetition_index,
                     &source.target_field,
+                    source.list_read_mode,
                 )?);
             }
             if !missing.is_empty() {
@@ -352,16 +367,24 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        list_read_mode: Option<ListReadMode>,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use metadata::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
-            Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
-                &page_info.buffer_offsets_and_sizes,
-                page_info.priority,
-                mini_block.num_items,
-                mini_block,
-                decompressors,
-            )?),
+            Layout::MiniBlockLayout(mini_block) => {
+                let mut scheduler = MiniBlockScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    mini_block.num_items,
+                    mini_block,
+                    decompressors,
+                )?;
+                scheduler.structural_projection = list_read_mode.map(|mode| StructuralProjection {
+                    mode,
+                    data_type: target_field.data_type(),
+                });
+                Box::new(scheduler)
+            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -371,28 +394,54 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                 )?;
                 scheduler.enable_cache = cache_repetition_index;
+                scheduler.structural_projection = list_read_mode.map(|mode| StructuralProjection {
+                    mode,
+                    data_type: target_field.data_type(),
+                });
                 Box::new(scheduler)
             }
             Layout::ConstantLayout(constant_layout) => {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+                    .collect::<Result<Vec<_>>>()?;
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
                     || page_info.buffer_offsets_and_sizes.len() == 3;
                 if has_scalar_value {
-                    Box::new(constant::ConstantPageScheduler::try_new(
+                    let mut scheduler = constant::ConstantPageScheduler::try_new(
                         page_info.buffer_offsets_and_sizes.clone(),
                         constant_layout.inline_value.clone(),
                         target_field.data_type(),
                         def_meaning.into(),
-                    )?) as Box<dyn StructuralPageScheduler>
+                    )?;
+                    scheduler.structural_projection =
+                        list_read_mode.map(|mode| StructuralProjection {
+                            mode,
+                            data_type: target_field.data_type(),
+                        });
+                    Box::new(scheduler) as Box<dyn StructuralPageScheduler>
                 } else if def_meaning.len() == 1
                     && def_meaning[0] == DefinitionInterpretation::NullableItem
                 {
-                    Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
+                    if matches!(target_field.data_type(), DataType::Struct(fields) if fields.is_empty())
+                    {
+                        // Dense empty structs use the all-null layout only as
+                        // a row-count marker. Preserve their all-valid read
+                        // behavior; sparse pages carry real struct validity.
+                        Box::new(ComplexAllNullScheduler::new(
+                            vec![(0, 0), (0, 0)].into(),
+                            Arc::new([DefinitionInterpretation::AllValidItem]),
+                            LevelCodec::Uncompressed,
+                            LevelCodec::Uncompressed,
+                            0,
+                            0,
+                        )) as Box<dyn StructuralPageScheduler>
+                    } else {
+                        Box::new(SimpleAllNullScheduler::default())
+                            as Box<dyn StructuralPageScheduler>
+                    }
                 } else {
                     // RLE levels select a validated cache representation; other
                     // block compressions keep flowing through the eager decompressor.
@@ -422,26 +471,33 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    None,
                 )?;
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+                    .collect::<Result<Vec<_>>>()?;
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
-                    Box::new(BlobDescriptionPageScheduler::new(
-                        inner_scheduler,
-                        def_meaning.into(),
-                    ))
+                    let mut scheduler =
+                        BlobDescriptionPageScheduler::new(inner_scheduler, def_meaning.into());
+                    scheduler.structural_projection =
+                        list_read_mode.map(|mode| StructuralProjection {
+                            mode,
+                            data_type: target_field.data_type(),
+                        });
+                    Box::new(scheduler)
                 } else {
                     // User wants to decode blob into binary data
-                    Box::new(BlobPageScheduler::new(
+                    let mut scheduler = BlobPageScheduler::new(
                         inner_scheduler,
                         page_info.priority,
                         page_info.num_rows,
                         def_meaning.into(),
-                    ))
+                    );
+                    scheduler.omit_values = list_read_mode.is_some();
+                    Box::new(scheduler)
                 }
             }
         })
@@ -454,15 +510,24 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        list_read_mode: Option<ListReadMode>,
     ) -> Result<PageInfoAndScheduler> {
         if let PageEncoding::Planar(layout) = &page_info.encoding {
             let scheduler = if layout.sparse().is_some() {
-                Box::new(sparse::planar::PlanarSparseScheduler::try_new(
-                    page_info,
-                    layout,
-                    target_field,
-                    decompressors,
-                )?) as Box<dyn StructuralPageScheduler>
+                Box::new(
+                    sparse::planar::PlanarSparseScheduler::try_new(
+                        page_info,
+                        layout,
+                        target_field,
+                        decompressors,
+                    )?
+                    .with_structural_projection(list_read_mode.map(|mode| {
+                        StructuralProjection {
+                            mode,
+                            data_type: target_field.data_type(),
+                        }
+                    })),
+                ) as Box<dyn StructuralPageScheduler>
             } else {
                 planar::validate_page(page_info, layout, target_field, decompressors)?;
                 Self::page_layout_to_scheduler(
@@ -471,6 +536,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    list_read_mode,
                 )?
             };
             return Ok(PageInfoAndScheduler {
@@ -486,6 +552,7 @@ impl StructuralPrimitiveFieldScheduler {
             decompressors,
             cache_repetition_index,
             target_field,
+            list_read_mode,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
@@ -865,6 +932,12 @@ impl StructuralCompositeDecodeArrayTask {
     ) -> Result<Arc<dyn Array>> {
         let validity = unraveler.unravel_validity(array.len())?;
         let Some(validity) = validity else {
+            if matches!(array.data_type(), DataType::Struct(fields) if fields.is_empty()) {
+                return Ok(Arc::new(arrow_array::StructArray::new_empty_fields(
+                    array.len(),
+                    None,
+                )));
+            }
             return Ok(array);
         };
         if array.data_type() == &DataType::Null {
@@ -984,7 +1057,13 @@ impl StructuralPrimitiveFieldDecoder {
                 page.num_rows()
             };
             let take = available.min(remaining);
-            total += page.decoded_bytes(take)?;
+            total = total
+                .checked_add(page.decoded_bytes(take)?)
+                .ok_or_else(|| {
+                    lance_core::Error::not_supported(
+                        "plan_decoded_bytes: decoded byte count overflowed u64".to_string(),
+                    )
+                })?;
             remaining -= take;
         }
         if remaining > 0 {
@@ -999,12 +1078,18 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
-    fn max_dictionary_rows(&self) -> Option<u64> {
-        self.page_decoders
+    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+        let dictionary_rows = self
+            .page_decoders
             .iter()
             .filter_map(|page| page.dictionary_len())
             .filter_map(|len| dictionary_batch_limit(self.field.data_type(), len))
-            .min()
+            .min();
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: 0,
+            dictionary_rows,
+        })
     }
 
     fn accept_page(&mut self, child: LoadedPageShard) -> Result<()> {
@@ -1092,7 +1177,7 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             return Ok([0u64; 8]);
         }
 
-        // Variable-width: walk page decoders for exact byte counts.
+        // Variable-width: walk page decoders for exact counts or conservative bounds.
         let mut out = [0u64; 8];
         for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
             let rows = (c as u64).min(rows_remaining);

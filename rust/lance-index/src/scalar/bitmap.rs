@@ -30,7 +30,7 @@ use lance_core::{
     Error, ROW_ADDR, Result,
     cache::{
         CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-        KeyBuilder, LanceCache, WeakLanceCache,
+        CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::tokio::get_num_compute_intensive_cpus,
@@ -54,7 +54,7 @@ use crate::cache_pb::BitmapIndexHeader;
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    progress::IndexBuildProgress,
+    progress::{IndexBuildProgress, stage_until_first_batch},
     scalar::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
@@ -996,6 +996,7 @@ impl Index for BitmapIndex {
                 })?;
                 let cache_key = BitmapKey::try_new(row_offset)?;
                 self.index_cache
+                    .with_load_origin(CacheLoadOrigin::Warm)
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
             }
@@ -1979,6 +1980,7 @@ impl BitmapIndexPlugin {
     ) -> Result<IndexFile> {
         let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
         let file_name = bitmap_shard_file_name(partition_id);
+        let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
@@ -2653,7 +2655,13 @@ impl BasicTrainer for BitmapIndexPlugin {
                     .to_string(),
             ));
         } else {
-            Self::train_bitmap_index(data, index_store).await?
+            let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
+            progress
+                .stage_start("write_bitmap_index", None, "files")
+                .await?;
+            let file = Self::train_bitmap_index(data, index_store).await?;
+            progress.stage_complete("write_bitmap_index").await?;
+            file
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -2666,6 +2674,10 @@ impl BasicTrainer for BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -4703,6 +4715,14 @@ mod tests {
                 to_keep.contains(RowAddress::from(row_addr).fragment_id())
             }
             Some(OldIndexDataFilter::RowIds(valid)) => valid.contains(row_addr),
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            }) => {
+                to_keep.contains(RowAddress::from(row_addr).fragment_id())
+                    && !deleted_rows.contains(row_addr)
+            }
             None => true,
         }
     }
@@ -4738,7 +4758,7 @@ mod tests {
                 let rows = (0..rng.random_range(1..=8))
                     .map(|_| rand_row(&mut rng))
                     .collect::<Vec<_>>();
-                filters.push(match rng.random_range(0..4) {
+                filters.push(match rng.random_range(0..5) {
                     0 => None,
                     1 => Some(OldIndexDataFilter::Fragments {
                         // The bitmap merge reads only `to_keep`.
@@ -4751,6 +4771,15 @@ mod tests {
                             .map(|(_, row_addr)| *row_addr)
                             .collect(),
                     )),
+                    3 => Some(OldIndexDataFilter::RowAddresses {
+                        to_keep: (0..FRAGMENTS).filter(|_| rng.random_bool(0.6)).collect(),
+                        to_remove: RoaringBitmap::new(),
+                        deleted_rows: rows
+                            .iter()
+                            .filter(|_| rng.random_bool(0.4))
+                            .map(|(_, row_addr)| *row_addr)
+                            .collect(),
+                    }),
                     _ => Some(OldIndexDataFilter::Fragments {
                         to_keep: RoaringBitmap::new(),
                         to_remove: RoaringBitmap::new(),

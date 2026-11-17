@@ -466,6 +466,7 @@ mod tests {
                     entry: appended_entry(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 },
             ))
         } else {
@@ -526,6 +527,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             "data_overlay" => Operation::DataOverlay {
                 groups: vec![DataOverlayGroup {
@@ -565,6 +567,7 @@ mod tests {
                 field_metadata_updates: HashMap::new(),
             },
             "update_mem_wal_state" => Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![],
             },
             "clone" => Operation::Clone {

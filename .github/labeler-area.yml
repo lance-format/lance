@@ -19,6 +19,7 @@ A-index:
   - changed-files:
       - any-glob-to-any-file:
           - "rust/lance-index/**"
+          - "rust/lance-geo/**"
           - "rust/lance-linalg/**"
           - "rust/lance-tokenizer/**"
 
@@ -30,9 +31,9 @@ A-encoding:
           - "rust/lance-file/**"
 
 # On-disk format: persisted proto definitions and the format spec docs. Keep the
-# explicit proto lists here in sync. Execution-plan schemas (ann,
-# filtered_read, and table_identifier) are intentionally excluded. Format docs
-# are excluded from A-docs (see below) so format changes get A-format only.
+# explicit proto lists here in sync. Execution-plan schemas (ann, filtered_read,
+# fts, and table_identifier) are intentionally excluded. Format docs are
+# excluded from A-docs (see below) so format changes get A-format only.
 A-format:
   - changed-files:
       - any-glob-to-any-file:
@@ -47,7 +48,7 @@ A-format:
           - "protos/rowids.proto"
           - "protos/table.proto"
           - "protos/fragment_metadata.proto"
-          - "protos/transaction.proto"
+          - "protos/transaction/*.proto"
           - "docs/src/format/**"
 
 # Drives the format-spec vote gate (.github/workflows/format-vote-gate.yml):
@@ -68,7 +69,7 @@ format-change:
           - "protos/rowids.proto"
           - "protos/table.proto"
           - "protos/fragment_metadata.proto"
-          - "protos/transaction.proto"
+          - "protos/transaction/*.proto"
           - "docs/src/format/**"
 
 # Lockfiles are intentionally not excluded: a pure dependency bump gets both

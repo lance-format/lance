@@ -132,7 +132,14 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let fragment_bitmap = effective_old_frags.clone();
-    let old_data_filter = if deleted_old_frags.is_empty() {
+    // A live fragment can have deleted rows even when no whole fragment was
+    // retired. Clean both value postings and list-null rows in that case too.
+    let has_partial_deletions = effective_old_frags.iter().any(|id| {
+        dataset
+            .find_fragment(u64::from(id))
+            .is_some_and(|fragment| fragment.deletion_file.is_some())
+    });
+    let old_data_filter = if deleted_old_frags.is_empty() && !has_partial_deletions {
         None
     } else {
         crate::index::append::build_old_data_filter(
@@ -188,6 +195,8 @@ pub(in crate::index) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }

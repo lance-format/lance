@@ -45,69 +45,93 @@ fn fwht_in_place(values: &mut [f32]) {
     }
 }
 
-#[inline]
-fn flip_signs_scalar(values: &mut [f32], signs: &[u8]) {
-    // Apply a random diagonal matrix with +/-1 entries by toggling the f32 sign bit.
-    // One bit in `signs` controls one element in `values`.
-    for (byte_idx, &mask) in signs.iter().enumerate() {
-        let start = byte_idx * 8;
-        if start >= values.len() {
-            break;
+/// Applies a random diagonal matrix with +/-1 entries by toggling the f32
+/// sign bit: bit `i` of `signs` (LSB first) flips `values[i]`.
+type FlipSignsFn = unsafe fn(&mut [f32], &[u8]);
+
+lance_core::dispatch! {
+    static FLIP_SIGNS: Dispatch<FlipSignsFn> = {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            &[x86::FLIP_SIGNS_AVX2, FLIP_SIGNS_SCALAR]
         }
-        let end = (start + 8).min(values.len());
-        for (bit_idx, value) in values[start..end].iter_mut().enumerate() {
-            let sign_mask = (((mask >> bit_idx) & 1) as u32) << 31;
-            *value = f32::from_bits(value.to_bits() ^ sign_mask);
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            &[FLIP_SIGNS_SCALAR]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FLIP_SIGNS_SCALAR: FlipSignsFn)]
+    #[inline]
+    fn flip_signs_scalar(values: &mut [f32], signs: &[u8]) {
+        for (byte_idx, &mask) in signs.iter().enumerate() {
+            let start = byte_idx * 8;
+            if start >= values.len() {
+                break;
+            }
+            let end = (start + 8).min(values.len());
+            for (bit_idx, value) in values[start..end].iter_mut().enumerate() {
+                let sign_mask = (((mask >> bit_idx) & 1) as u32) << 31;
+                *value = f32::from_bits(value.to_bits() ^ sign_mask);
+            }
         }
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
+mod x86 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    // Vectorized variant of `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
-    // The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
-    let full_chunks = values.len() / 8;
-    let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
-    let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
+    use super::{FlipSignsFn, flip_signs_scalar};
 
-    for (chunk_idx, &mask) in signs.iter().take(full_chunks).enumerate() {
-        let mask = mask as i32;
-        let mask_bits = _mm256_set1_epi32(mask);
-        let test = _mm256_and_si256(mask_bits, bit_select);
-        let cmp = _mm256_cmpeq_epi32(test, bit_select);
-        let xor_mask = _mm256_and_si256(cmp, sign_flip);
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) FLIP_SIGNS_AVX2: FlipSignsFn)]
+        pub(super) fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
+            // Vectorized variant of `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
+            // The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
+            let full_chunks = values.len() / 8;
+            let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
+            let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
 
-        let ptr = unsafe { values.as_mut_ptr().add(chunk_idx * 8) };
-        let vec = unsafe { _mm256_loadu_ps(ptr) };
-        let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
-        unsafe { _mm256_storeu_ps(ptr, out) };
-    }
+            for (chunk_idx, &mask) in signs.iter().take(full_chunks).enumerate() {
+                let mask = mask as i32;
+                let mask_bits = _mm256_set1_epi32(mask);
+                let test = _mm256_and_si256(mask_bits, bit_select);
+                let cmp = _mm256_cmpeq_epi32(test, bit_select);
+                let xor_mask = _mm256_and_si256(cmp, sign_flip);
 
-    if full_chunks * 8 < values.len() {
-        flip_signs_scalar(&mut values[full_chunks * 8..], &signs[full_chunks..]);
+                let ptr = unsafe { values.as_mut_ptr().add(chunk_idx * 8) };
+                let vec = unsafe { _mm256_loadu_ps(ptr) };
+                let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
+                unsafe { _mm256_storeu_ps(ptr, out) };
+            }
+
+            if full_chunks * 8 < values.len() {
+                flip_signs_scalar(&mut values[full_chunks * 8..], &signs[full_chunks..]);
+            }
+        }
     }
 }
 
 #[inline]
 fn flip_signs(values: &mut [f32], signs: &[u8]) {
     debug_assert!(signs.len() * 8 >= values.len());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: guarded by runtime feature detection.
-            unsafe {
-                flip_signs_avx2(values, signs);
-            }
-            return;
-        }
+    // `CpuFeatures` has no runtime detection on 32-bit x86, so `FLIP_SIGNS`
+    // would only pick AVX2 there when the build enables it; check directly.
+    #[cfg(target_arch = "x86")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the host supports AVX2.
+        unsafe { x86::flip_signs_avx2(values, signs) };
+        return;
     }
-    flip_signs_scalar(values, signs);
+    FLIP_SIGNS.get().call(values, signs);
 }
 
 #[inline]
@@ -215,12 +239,41 @@ pub fn apply_fast_rotation_in_place(output: &mut [f32], signs: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
     fn test_fast_rotation_sign_bytes() {
         assert_eq!(random_fast_rotation_signs(128).len(), 64);
         assert_eq!(random_fast_rotation_signs(130).len(), 68);
+    }
+
+    /// Every host-supported sign-flip kernel matches a per-element reference
+    /// bit for bit, across full 8-lane chunks and tails.
+    #[rstest::rstest]
+    fn test_flip_signs_candidates_match_reference(
+        #[values(0, 1, 7, 8, 9, 15, 16, 17, 64, 129)] len: usize,
+    ) {
+        let values: Vec<f32> = (0..len).map(|i| i as f32 - 3.5).collect();
+        let signs = random_fast_rotation_signs(len);
+        let signs = &signs[..sign_bytes_per_round(len)];
+        let expected: Vec<u32> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v.to_bits() ^ (u32::from((signs[i / 8] >> (i % 8)) & 1) << 31))
+            .collect();
+        for candidate in FLIP_SIGNS.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut actual = values.clone();
+            kernel.call(&mut actual, signs);
+            let actual: Vec<u32> = actual.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(actual, expected, "{} len={len}", candidate.name());
+        }
     }
 
     #[test]
@@ -230,5 +283,85 @@ mod tests {
         let signs = random_fast_rotation_signs(129);
         apply_fast_rotation(&input, &mut output, &signs);
         assert_eq!(output.len(), 129);
+    }
+
+    /// Deterministic sign bytes so sign-flip decisions are reproducible.
+    fn deterministic_signs(dim: usize) -> Vec<u8> {
+        (0..fast_rotation_signs_len(dim))
+            .map(|i| (i.wrapping_mul(37) ^ 0x5a) as u8)
+            .collect()
+    }
+
+    /// RaBitQ's error bounds require the rotation to be orthonormal.
+    ///
+    /// Applying the transform to every basis vector yields the rotation matrix
+    /// column by column; `R^T R` must then be the identity. This covers both
+    /// the power-of-two FWHT path and the truncated FWHT plus Kac path (e.g.
+    /// 24 and 200), where a wrong scale factor would otherwise go unnoticed.
+    fn assert_orthonormal(dim: usize) {
+        let signs = deterministic_signs(dim);
+        let mut rotation = vec![0.0f32; dim * dim];
+        let mut basis = vec![0.0f32; dim];
+        for i in 0..dim {
+            basis.fill(0.0);
+            basis[i] = 1.0;
+            apply_fast_rotation(&basis, &mut rotation[i * dim..(i + 1) * dim], &signs);
+        }
+
+        for i in 0..dim {
+            for j in 0..dim {
+                let dot: f64 = (0..dim)
+                    .map(|k| f64::from(rotation[i * dim + k]) * f64::from(rotation[j * dim + k]))
+                    .sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1e-4,
+                    "dim={dim}: column dot product ({i}, {j}) = {dot}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    // Power-of-two dimensions use plain FWHT rounds; the others exercise the
+    // truncated FWHT plus Kac path. RaBitQ only accepts dimensions divisible
+    // by 8.
+    #[rstest]
+    #[case::dim8(8)]
+    #[case::dim16(16)]
+    #[case::dim24(24)]
+    #[case::dim32(32)]
+    #[case::dim128(128)]
+    #[case::dim200(200)]
+    #[case::dim256(256)]
+    fn test_fast_rotation_is_orthonormal(#[case] dim: usize) {
+        assert_orthonormal(dim);
+    }
+
+    /// Random inputs must keep their norm under the rotation.
+    ///
+    /// `R^T R = I` is checked above; this covers the error-bound assumption
+    /// on arbitrary vectors, including the truncated FWHT plus Kac path.
+    #[rstest]
+    #[case::dim8(8)]
+    #[case::dim16(16)]
+    #[case::dim24(24)]
+    #[case::dim32(32)]
+    #[case::dim128(128)]
+    #[case::dim200(200)]
+    #[case::dim256(256)]
+    fn test_fast_rotation_preserves_vector_norms(#[case] dim: usize) {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let signs = deterministic_signs(dim);
+        for _ in 0..8 {
+            let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+            let mut output = vec![0.0f32; dim];
+            apply_fast_rotation(&input, &mut output, &signs);
+            let in_sq: f32 = input.iter().map(|v| v * v).sum();
+            let out_sq: f32 = output.iter().map(|v| v * v).sum();
+            assert!(
+                (in_sq - out_sq).abs() < 1e-5 * in_sq.max(1.0),
+                "dim={dim}: input norm {in_sq}, output norm {out_sq}"
+            );
+        }
     }
 }

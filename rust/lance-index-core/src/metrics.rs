@@ -90,6 +90,14 @@ impl Drop for IndexTimer<'_> {
 /// window events here. Benchmark-only instrumentation belongs in test- or
 /// benchmark-local hooks.
 pub trait MetricsCollector: Send + Sync {
+    /// Whether this collector requests identities of segments actually selected for opening.
+    /// Disabled by default to avoid allocating diagnostic labels in normal queries.
+    fn records_index_segments(&self) -> bool {
+        false
+    }
+
+    /// Record selected physical segment identities, including cache-served opens.
+    fn record_index_segments(&self, _segments: &[String]) {}
     /// Record a coarse stage duration; existing collectors may ignore timings.
     fn record_timing(&self, _stage: IndexTiming, _duration: Duration) {}
 

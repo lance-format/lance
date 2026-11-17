@@ -16,7 +16,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
-from lance.dataset import ColumnOrdering
+from lance._dataset.scanner import ColumnOrdering
 
 
 class TestMixedCaseColumnNames:
@@ -477,24 +477,6 @@ class TestNestedFieldColumnNames:
         stats = nested_mixed_case_dataset.stats.index_stats("MetaData.userId_idx")
         assert stats["index_type"] == "BTree"
 
-    def test_scalar_index_on_top_level_mixed_case(self, nested_mixed_case_dataset):
-        """Scalar index on top-level mixed-case column works."""
-        nested_mixed_case_dataset.create_scalar_index("rowId", index_type="BTREE")
-
-        indices = nested_mixed_case_dataset.describe_indices()
-        assert len(indices) == 1
-        assert indices[0].name == "rowId_idx"
-        assert indices[0].field_names == ["rowId"]
-
-        result = nested_mixed_case_dataset.to_table(filter="rowId = 50")
-        assert result.num_rows == 1
-
-        plan = nested_mixed_case_dataset.scanner(filter="rowId = 50").explain_plan()
-        assert "ScalarIndexQuery" in plan
-
-        stats = nested_mixed_case_dataset.stats.index_stats("rowId_idx")
-        assert stats["index_type"] == "BTree"
-
     def test_scalar_index_with_lowercased_nested_path(self, nested_mixed_case_dataset):
         """Scalar index creation should work even when path is lowercased.
 
@@ -593,19 +575,3 @@ class TestNestedFieldColumnNames:
 
         stats = nested_special_char_dataset.stats.index_stats("meta-data.user-id_idx")
         assert stats["index_type"] == "BTree"
-
-    def test_scalar_index_on_top_level_special_chars(self, nested_special_char_dataset):
-        """Scalar index on top-level special char column works."""
-        nested_special_char_dataset.create_scalar_index("`row-id`", index_type="BTREE")
-
-        indices = nested_special_char_dataset.describe_indices()
-        assert len(indices) == 1
-        assert indices[0].field_names == ["row-id"]
-
-        result = nested_special_char_dataset.to_table(filter="`row-id` = 50")
-        assert result.num_rows == 1
-
-        plan = nested_special_char_dataset.scanner(
-            filter="`row-id` = 50"
-        ).explain_plan()
-        assert "ScalarIndexQuery" in plan

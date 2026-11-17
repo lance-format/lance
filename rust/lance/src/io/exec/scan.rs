@@ -9,7 +9,9 @@ use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -44,6 +46,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
+use super::column_width::{self, MeasuredWidths};
 use super::utils::{
     IoMetrics, buffered_fragment_opens, estimated_bytes_per_row, estimated_total_byte_size,
 };
@@ -320,7 +323,7 @@ impl LanceStream {
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
-                > = tokio::spawn(
+                > = lance_core::utils::tokio::spawn(
                     (async move {
                         let mut frag_config = FragReadConfig::default()
                             .with_row_id(config.with_row_id)
@@ -628,6 +631,12 @@ impl Default for LanceScanConfig {
 }
 
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
+///
+/// Deprecation: This node is being replaced by FilteredReadExec. It remains in use
+/// for v1 files and whole-fragment fallback scans on modern datasets, including
+/// index coverage gaps and ordinary full scans.
+///
+/// Prefer targeted correctness fixes over general optimization or refactoring.
 #[derive(Debug)]
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
@@ -682,6 +691,30 @@ impl DisplayAs for LanceScanExec {
 
 impl LanceScanExec {
     #[allow(clippy::too_many_arguments)]
+    /// Returns this node with widths measured by earlier scans folded in.
+    ///
+    /// Separate from [`Self::new`] because reading them is async. A caller that
+    /// does not call this keeps the schema-only estimate.
+    pub fn with_measured_widths(&self, measured: &MeasuredWidths) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            fragments: self.fragments.clone(),
+            range: self.range.clone(),
+            projection: self.projection.clone(),
+            bytes_per_row: estimated_bytes_per_row(
+                self.output_schema.as_ref(),
+                self.dataset.schema(),
+                measured,
+            ),
+            output_schema: self.output_schema.clone(),
+            properties: self.properties.clone(),
+            config: self.config.clone(),
+            // Shared: the rewritten node stands in for this one, so execution
+            // must report through the metrics handle the caller already holds.
+            metrics: self.metrics.clone(),
+        }
+    }
+
     pub fn new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
@@ -712,7 +745,11 @@ impl LanceScanExec {
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -773,6 +810,13 @@ impl ExecutionPlan for LanceScanExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -808,9 +852,31 @@ impl ExecutionPlan for LanceScanExec {
             )
         });
         let lance_stream = lance_fut_stream.try_flatten();
+
+        // Measure what the scan decodes and record it when the scan finishes.
+        // Only a scan over the dataset's own current fragment list measures the
+        // column rather than a slice of it. A matching count or matching ids is
+        // not enough: callers can pass duplicates or stale fragments that happen
+        // to have the same shape.
+        let representative = self.range.is_none()
+            && Arc::ptr_eq(&self.fragments, self.dataset.fragments())
+            && !self.config.with_make_deletions_null;
+        let measured_stream = column_width::measuring(
+            lance_stream.boxed(),
+            self.dataset.metadata_cache.clone(),
+            self.dataset.manifest().version,
+            self.dataset
+                .manifest_location
+                .e_tag
+                .clone()
+                .map(Arc::<str>::from),
+            self.schema(),
+            representative,
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            lance_stream,
+            measured_stream,
         )))
     }
 
@@ -894,6 +960,8 @@ impl ExecutionPlan for LanceScanExec {
 mod tests {
     use arrow_array::types::Int32Type;
     use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion::prelude::SessionConfig;
     use futures::TryStreamExt;
     use lance_datagen::{array, gen_batch};
@@ -901,6 +969,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture};
 
     use super::*;
@@ -984,7 +1053,9 @@ mod tests {
             LanceScanConfig::default(),
         );
 
-        let stats = scan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&scan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
         // Nullable int32 plus a four-float vector, including estimated validity.
         assert_eq!(
@@ -1015,7 +1086,9 @@ mod tests {
             LanceScanConfig::default(),
         );
 
-        let stats = scan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&scan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(TOTAL_ROWS));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8300));
         assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
@@ -1053,7 +1126,13 @@ mod tests {
             },
         );
 
-        assert_eq!(scan.partition_statistics(None).unwrap().num_rows, expected);
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(&scan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            expected
+        );
         if range.is_none() {
             assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
         }
@@ -1154,7 +1233,13 @@ mod tests {
             .indent(true)
             .to_string();
         assert!(description.contains(scan_node), "{description}");
-        assert_eq!(plan.partition_statistics(None).unwrap().num_rows, expected);
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            expected
+        );
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 8);
         assert_eq!(batch["_rowid"].null_count(), usize::from(deleted));
@@ -1203,7 +1288,9 @@ mod tests {
             },
         );
 
-        let stats = exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .unwrap();
         let emitted = scanned_rows(&exec).await;
 
         assert_eq!(
@@ -1216,6 +1303,229 @@ mod tests {
         assert_eq!(
             stats.total_byte_size,
             Precision::Inexact((expected_rows as f64 * 12.25).ceil() as usize)
+        );
+    }
+
+    /// Execution is the only place that sees a string column's real width, so a
+    /// completed scan has to leave it behind.
+    #[tokio::test]
+    async fn executing_a_scan_records_a_measured_width() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use super::super::column_width::MeasuredWidthKey;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let written = gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(written.uri())
+                .with_session(written.session())
+                .load()
+                .await
+                .unwrap(),
+        );
+        let schema = dataset.schema().into();
+        let name: &arrow_schema::Schema = &schema;
+        let name = name.field_with_name("name").unwrap();
+        let generation = dataset
+            .manifest_location
+            .e_tag
+            .as_deref()
+            .expect("a local dataset has an e-tag");
+        let key = MeasuredWidthKey {
+            generation,
+            version: dataset.version().version,
+            column: name.name(),
+            layout: name.data_type(),
+        };
+
+        assert!(
+            dataset.metadata_cache.get_with_key(&key).await.is_none(),
+            "nothing is measured before the scan runs"
+        );
+
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+        let stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let emitted: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(emitted, 100, "fixture no longer emits what it claims");
+
+        let measured = dataset.metadata_cache.get_with_key(&key).await;
+        let width = measured.expect("the drained scan must record a width").0;
+        assert!(
+            width > 0.0,
+            "a string column cannot measure as free, got {width}"
+        );
+    }
+
+    /// A fragment list with the dataset's fragment count is not necessarily the
+    /// dataset's fragment set. Publishing a width from one would let a later
+    /// unrestricted scan believe a subset speaks for the whole column.
+    #[tokio::test]
+    async fn a_same_count_fragment_subset_does_not_publish_a_width() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use super::super::column_width;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let written = gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(written.uri())
+                .with_session(written.session())
+                .load()
+                .await
+                .unwrap(),
+        );
+        let arrow_schema: arrow_schema::Schema = dataset.schema().into();
+        let name = arrow_schema.field_with_name("name").unwrap();
+        let projection = Arc::new(dataset.schema().clone());
+        let build = |fragments| {
+            LanceScanExec::new(
+                dataset.clone(),
+                fragments,
+                None,
+                projection.clone(),
+                LanceScanConfig::default(),
+            )
+        };
+        let resolve = || {
+            column_width::resolve(
+                &dataset.metadata_cache,
+                dataset.version().version,
+                dataset.manifest_location.e_tag.as_deref(),
+                [name].into_iter(),
+            )
+        };
+
+        // Same count as the dataset, but fragment 0 twice instead of both
+        // fragments. The scan still drains successfully; it just must not speak
+        // for the column.
+        let duplicate = Arc::new(vec![
+            dataset.fragments()[0].clone(),
+            dataset.fragments()[0].clone(),
+        ]);
+        assert_eq!(duplicate.len(), dataset.fragments().len());
+        let subset = build(duplicate);
+        let _: Vec<_> = subset
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            resolve().await.get(name).is_none(),
+            "a same-count fragment subset must not publish a version-wide width"
+        );
+
+        let full = build(dataset.fragments().clone());
+        let _: Vec<_> = full
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            resolve().await.get(name).is_some(),
+            "the dataset's own fragment list must still publish a width"
+        );
+    }
+
+    /// A scan over a string column reports no byte size until one has measured it.
+    #[tokio::test]
+    async fn a_scan_reports_a_byte_size_once_a_width_has_been_measured() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use super::super::column_width;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let written = gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(written.uri())
+                .with_session(written.session())
+                .load()
+                .await
+                .unwrap(),
+        );
+        let version = dataset.version().version;
+        let build = || {
+            LanceScanExec::new(
+                dataset.clone(),
+                dataset.fragments().clone(),
+                None,
+                Arc::new(dataset.schema().clone()),
+                LanceScanConfig::default(),
+            )
+        };
+
+        let uninformed = build();
+        // Unmeasured, the string column reports the decoder's 64-byte seed.
+        let Precision::Inexact(seeded) = StatisticsContext::new()
+            .compute(&uninformed, &StatisticsArgs::new())
+            .unwrap()
+            .total_byte_size
+        else {
+            panic!("an unmeasured string column still reports the seed");
+        };
+
+        let stream = uninformed
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let _: Vec<_> = stream.try_collect().await.unwrap();
+
+        let measured = column_width::resolve(
+            &dataset.metadata_cache,
+            version,
+            dataset.manifest_location.e_tag.as_deref(),
+            build().schema().fields().iter().map(|f| f.as_ref()),
+        )
+        .await;
+        let informed = build().with_measured_widths(&measured);
+        let stats = StatisticsContext::new()
+            .compute(&informed, &StatisticsArgs::new())
+            .unwrap();
+
+        let Precision::Inexact(measured) = stats.total_byte_size else {
+            panic!("expected a byte size, got {:?}", stats.total_byte_size);
+        };
+        assert!(measured > 0, "100 rows of text cannot cost nothing");
+        assert!(
+            measured < seeded,
+            "the measurement must replace the seed: seeded={seeded}, measured={measured}"
         );
     }
 

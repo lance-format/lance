@@ -149,6 +149,47 @@ def test_delta_validation_errors():
         ds.delta(compared_against=1, begin_version=1, end_version=1)
 
 
+@pytest.mark.parametrize("method", ["get_inserted_rows", "get_updated_rows"])
+@pytest.mark.parametrize("begin_version", [0, 1, 3])
+def test_delta_row_changes_require_stable_row_ids(method, begin_version):
+    ds = write_dataset(pa.table({"id": [1, 2]}), "memory://", max_rows_per_file=1)
+    ds.insert(pa.table({"id": [3]}))
+    ds.update({"id": "4"}, where="id = 1")
+    delta = ds.delta(begin_version=begin_version, end_version=3)
+
+    # Transaction history is available without row-level version tracking.
+    assert len(delta.list_transactions()) == 3 - begin_version
+    with pytest.raises(ValueError, match="require stable row ids, version"):
+        getattr(delta, method)()
+
+
+@pytest.mark.parametrize(
+    "column", ["_row_created_at_version", "_row_last_updated_at_version"]
+)
+@pytest.mark.parametrize(
+    "read,error_type",
+    [
+        ("projection", ValueError),
+        ("expression", ValueError),
+        ("filter", ValueError),
+        ("take", OSError),
+    ],
+)
+def test_row_version_columns_require_stable_row_ids(column, read, error_type):
+    ds = write_dataset(pa.table({"id": [1, 2]}), "memory://", max_rows_per_file=1)
+    ds.insert(pa.table({"id": [3]}))
+
+    with pytest.raises(error_type, match="requires stable row ids"):
+        if read == "projection":
+            ds.to_table(columns=["id", column])
+        elif read == "expression":
+            ds.to_table(columns={"version": f"{column} + 1"})
+        elif read == "filter":
+            ds.to_table(filter=f"{column} > 1")
+        else:
+            ds.take([2], columns=[column])
+
+
 def test_delta_get_deleted_row_ids():
     table = pa.table(
         {

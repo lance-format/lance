@@ -175,6 +175,39 @@ public final class LanceMetrics {
     return Collections.unmodifiableList(snapshotLanceMetricsNative());
   }
 
+  /**
+   * Switch memory observation on or off for this process.
+   *
+   * <p>Memory observation is off by default. The {@code LANCE_MEMORY_OBSERVE} environment variable
+   * turns it on with a boolean such as {@code 1}/{@code 0}, {@code true}/{@code false}, {@code
+   * on}/{@code off} or {@code yes}/{@code no}, and any other value makes index builds fail with an
+   * {@link IllegalArgumentException}. A running JVM cannot change its own environment, so this call
+   * takes over from the variable. Until the first call the variable decides; from then on, for the
+   * rest of the process, the latest call decides, whatever the variable holds.
+   *
+   * <p>An operation, such as an index build, checks the switch once, before its first stage:
+   * switched off later, it still reports in full, and one that checked while observation was off
+   * reports nothing. While observation is off, the memory gauges keep their last values. The switch
+   * is process-wide; {@link #instrument(MeterProvider)} and {@link #close()} neither read nor reset
+   * it, and another JVM, such as a Spark executor in cluster mode, needs its own call or variable.
+   * On Linux, observation reads the process and cgroup memory, keeps the peak of every operation
+   * and stage, and emits the memory events. Events need no recorder; the gauges and histograms need
+   * the {@code metrics} feature and a recorder, so instrument before the operations to observe. The
+   * component gauge is independent of the platform, and counts the I/O schedulers, DataFusion pools
+   * and MemWAL writers created while observation is on, never one created before:
+   *
+   * <pre>{@code
+   * LanceMetrics.instrument();
+   * LanceMetrics.setMemoryObservation(true);
+   * }</pre>
+   *
+   * @param enabled whether to observe the memory of the operations that start from now on
+   */
+  public static void setMemoryObservation(boolean enabled) {
+    JniLoader.ensureLoaded();
+    setMemoryObservationNative(enabled);
+  }
+
   static List<MetricDescription> supportedMetrics(List<MetricDescription> catalog) {
     List<MetricDescription> supported = new ArrayList<>();
     for (MetricDescription desc : catalog) {
@@ -280,4 +313,6 @@ public final class LanceMetrics {
   private static native List<MetricDescription> lanceMetricsCatalogNative();
 
   private static native List<MetricPoint> snapshotLanceMetricsNative();
+
+  private static native void setMemoryObservationNative(boolean enabled);
 }

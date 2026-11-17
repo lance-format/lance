@@ -15,13 +15,9 @@
 //! with a clear "please upgrade" error instead of silently misreading data. The
 //! set of bits a build understands is `READER_KNOWN_FLAGS` / `WRITER_KNOWN_FLAGS`.
 //!
-//! This is the mechanism only: no manifest feature is defined yet, so the known
-//! masks are `0` and nothing is ever set — every current manifest reads and
-//! writes unchanged. The first format change that needs forward-compatibility
-//! protection adds its bit to the known masks and stamps it on write; from then
-//! on, builds without that bit refuse the new format rather than misreading it.
-//! Manifests written before this mechanism carry no flag keys, which parse as
-//! `0` and stay compatible with every build.
+//! Escaped object IDs reserve `$` for hierarchy and percent-escape `$` and `%`
+//! within names. The rewrite that upgrades an unflagged catalog also sets both
+//! flags, so older clients refuse to misinterpret or overwrite the new IDs.
 
 use std::collections::HashMap;
 
@@ -33,12 +29,13 @@ pub const READER_FEATURE_FLAGS_KEY: &str = "lance.namespace.manifest.reader_feat
 /// `table_metadata` key holding the writer feature-flag bitmask (decimal `u64`).
 pub const WRITER_FEATURE_FLAGS_KEY: &str = "lance.namespace.manifest.writer_feature_flags";
 
-/// Reader feature-flag bits this build understands. No manifest feature is
-/// defined yet, so this build understands none and refuses any non-zero reader
-/// flag. A future format change adds its bit here.
-const READER_KNOWN_FLAGS: u64 = 0;
+/// Object ID components escape `%` as `%25` and `$` as `%24`.
+pub const FLAG_ESCAPED_OBJECT_IDS: u64 = 1;
+
+/// Reader feature-flag bits this build understands.
+const READER_KNOWN_FLAGS: u64 = FLAG_ESCAPED_OBJECT_IDS;
 /// Writer feature-flag bits this build understands.
-const WRITER_KNOWN_FLAGS: u64 = 0;
+const WRITER_KNOWN_FLAGS: u64 = FLAG_ESCAPED_OBJECT_IDS;
 
 /// Whether this build can read a `__manifest` whose persisted reader feature
 /// flags are `reader_flags` — i.e. it understands every set bit.
@@ -158,13 +155,14 @@ mod tests {
 
     #[test]
     fn any_unknown_flag_is_refused() {
-        // This build understands no feature flags, so any non-zero bit is refused.
-        assert!(!can_read_manifest(1));
-        assert!(!can_write_manifest(1));
+        assert!(can_read_manifest(FLAG_ESCAPED_OBJECT_IDS));
+        assert!(can_write_manifest(FLAG_ESCAPED_OBJECT_IDS));
+        assert!(!can_read_manifest(2));
+        assert!(!can_write_manifest(2));
         assert!(!can_read_manifest(1 << 30));
         assert!(!can_write_manifest(1 << 63));
 
-        let reader = meta(&[(READER_FEATURE_FLAGS_KEY, "1")]);
+        let reader = meta(&[(READER_FEATURE_FLAGS_KEY, "2")]);
         let err = ensure_readable(&reader).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("upgrade"));
         assert!(is_incompatible_manifest_error(&err));
