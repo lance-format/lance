@@ -27,7 +27,7 @@ use std::{
 };
 
 use arrow_array::{
-    Array, LargeBinaryArray, RecordBatch, RecordBatchIterator,
+    Array, RecordBatch, RecordBatchIterator,
     builder::{LargeBinaryBuilder, ListBuilder},
     cast::AsArray,
 };
@@ -360,6 +360,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::LargeBinaryArray;
     use rstest::rstest;
 
     #[rstest]
