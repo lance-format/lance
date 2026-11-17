@@ -190,8 +190,9 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Prepare exact sorted unique physical rows in an existing reservation.
     ///
-    /// Opt-in FullZip only; unsupported readers return an error without falling
-    /// back to ordinary decoding. Inputs, decoded output and downstream assembly
+    /// Opt-in supported pages/null placeholders; unsupported readers return an
+    /// error without falling back to ordinary decoding. Inputs, decoded output
+    /// and downstream assembly
     /// must fit the original operation admission. `None` requires dropping the
     /// whole attempt before replanning. See
     /// [`FragmentReader::try_take_admitted_fullzip`] for an end-to-end example.
@@ -852,6 +853,28 @@ impl NullReader {
 }
 
 impl GenericFileReader for NullReader {
+    fn prepare_admitted_fullzip_take<'a>(
+        &'a self,
+        indices: &'a [u32],
+        projection: Arc<Schema>,
+        _workspace: &'a mut lance_core::utils::allocation::Reservation,
+    ) -> BoxFuture<'a, Result<Option<lance_file::reader::PreparedFullZipTake>>> {
+        async move {
+            if indices.windows(2).any(|pair| pair[0] >= pair[1])
+                || indices.last().is_some_and(|&row| row >= self.num_rows)
+            {
+                return Err(Error::invalid_input(
+                    "admitted null take requires sorted unique in-range physical offsets",
+                ));
+            }
+            Ok(Some(lance_file::reader::PreparedFullZipTake::all_null(
+                Self::nullable_schema(&projection),
+                indices.len(),
+            )))
+        }
+        .boxed()
+    }
+
     fn read_range_tasks(
         &self,
         range: Range<u64>,

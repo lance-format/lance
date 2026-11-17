@@ -3,7 +3,7 @@
 
 //! Sparse reads composed with routing/output inside an existing admission.
 
-use arrow_array::{Array, make_array};
+use arrow_array::{Array, RecordBatchOptions, make_array};
 use lance_encoding::data::{AllNullDataBlock, DataBlock, try_concat_nested_binary_in};
 
 use super::*;
@@ -17,10 +17,45 @@ use super::*;
 /// selected run count, columns and nesting depth. This is not an RSS bound.
 pub struct PreparedFullZipTake {
     schema: Arc<ArrowSchema>,
-    columns: Vec<Vec<AdmittedBytePageInput>>,
+    source: TakeSource,
+}
+
+enum TakeSource {
+    Stored(Vec<Vec<AdmittedBytePageInput>>),
+    Nulls(usize),
 }
 
 impl PreparedFullZipTake {
+    /// Prepare null placeholders for fields absent from a fragment's data files.
+    ///
+    /// This creates only descriptors; [`Self::decode_in`] charges all new typed
+    /// buffers to the caller's original workspace, including empty offsets and
+    /// nested children. It performs no file reads. The caller establishes the
+    /// physical selection and row count. Schema fields must accept all-null
+    /// values; unsupported types or invalid nullability fail during decoding.
+    /// Metadata/Arrow descriptors are outside the payload budget.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_schema::{DataType, Field, Schema};
+    /// use lance_core::{Result, utils::allocation::AllocationBudget};
+    /// use lance_file::reader::PreparedFullZipTake;
+    /// fn missing() -> Result<()> {
+    ///     let schema = Arc::new(Schema::new(vec![Field::new("late", DataType::LargeBinary, true)]));
+    ///     let budget = AllocationBudget::new(33); // Four offsets and one bitmap byte.
+    ///     let mut work = budget.try_reserve(33).unwrap();
+    ///     let batch = PreparedFullZipTake::all_null(schema, 3).decode_in(&mut work)?.unwrap();
+    ///     assert_eq!(batch.column(0).null_count(), 3);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn all_null(schema: Arc<ArrowSchema>, rows: usize) -> Self {
+        Self {
+            schema,
+            source: TakeSource::Nulls(rows),
+        }
+    }
+
     /// Decode and concatenate exactly the prepared selection, without I/O or waits.
     ///
     /// Use the same original reservation as preparation and include routing,
@@ -34,8 +69,28 @@ impl PreparedFullZipTake {
     ///
     /// See [`FileReader::prepare_admitted_fullzip_take_in`] for a complete example.
     pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<RecordBatch>> {
-        let mut arrays = Vec::with_capacity(self.columns.len());
-        for (inputs, field) in self.columns.into_iter().zip(self.schema.fields()) {
+        let columns = match self.source {
+            TakeSource::Stored(columns) => columns,
+            TakeSource::Nulls(rows) => {
+                let block = DataBlock::AllNull(AllNullDataBlock {
+                    num_values: rows as u64,
+                });
+                let mut arrays = Vec::with_capacity(self.schema.fields().len());
+                for field in self.schema.fields() {
+                    let Some(data) = block.try_to_arrow_in(field.data_type(), workspace)? else {
+                        return Ok(None);
+                    };
+                    arrays.push(make_array(data));
+                }
+                return Ok(Some(RecordBatch::try_new_with_options(
+                    self.schema,
+                    arrays,
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )?));
+            }
+        };
+        let mut arrays = Vec::with_capacity(columns.len());
+        for (inputs, field) in columns.into_iter().zip(self.schema.fields()) {
             let mut chunks = Vec::with_capacity(inputs.len());
             for input in inputs {
                 let Some(array) = input.decode_in(workspace)? else {
@@ -218,7 +273,7 @@ impl DecodeEngine {
         }
         Ok(Some(PreparedFullZipTake {
             schema,
-            columns: inputs,
+            source: TakeSource::Stored(inputs),
         }))
     }
 }

@@ -25,17 +25,18 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted fragment row versions
+      - name: Verify admitted missing-column composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          # Encoding and FileReader sources are unchanged from b685a881e's
-          # successful qualification. Exercise the changed version boundary
-          # and every existing real fragment/overlay admitted composition.
+          # Typed materialization is unchanged; exercise the new placeholder
+          # boundary and existing sparse takes sharing the prepared input type.
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::take:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc all_null -- --nocapture
           cargo test --profile ci --locked -p lance --lib dataset::fragment::admitted:: -- --nocapture
           cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted:: -- --nocapture
           cargo test --profile ci --locked -p lance --doc try_take_admitted_fullzip -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

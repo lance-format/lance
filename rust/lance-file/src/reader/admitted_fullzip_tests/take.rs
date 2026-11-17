@@ -3,11 +3,96 @@
 
 use super::scan::{GateIo, RangeIo};
 use super::*;
+use crate::reader::PreparedFullZipTake;
 use arrow_array::{UInt32Array, cast::AsArray};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+#[test]
+fn null_placeholder_without_columns_preserves_row_count() {
+    let budget = AllocationBudget::new(0);
+    let mut work = budget.try_reserve(0).unwrap();
+    let output = PreparedFullZipTake::all_null(Arc::new(Schema::empty()), 7)
+        .decode_in(&mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.num_rows(), 7);
+    assert_eq!(output.num_columns(), 0);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn null_placeholders_release_prior_columns_on_refusal() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bytes", DataType::LargeBinary, true),
+        Field::new("number", DataType::UInt64, true),
+    ]));
+    let budget = AllocationBudget::new(128);
+    // Three rows: byte offsets/validity = 33, u64 values/validity = 25.
+    let mut short = budget.try_reserve(57).unwrap();
+    assert!(
+        PreparedFullZipTake::all_null(schema.clone(), 3)
+            .decode_in(&mut short)
+            .unwrap()
+            .is_none()
+    );
+    drop(short);
+    assert_eq!(budget.reserved(), 0);
+    let mut work = budget.try_reserve(58).unwrap();
+    let output = PreparedFullZipTake::all_null(schema.clone(), 3)
+        .decode_in(&mut work)
+        .unwrap()
+        .unwrap();
+    let expected = RecordBatch::try_new(
+        schema.clone(),
+        schema
+            .fields()
+            .iter()
+            .map(|field| arrow_array::new_null_array(field.data_type(), 3))
+            .collect(),
+    )
+    .unwrap();
+    assert_eq!(output, expected);
+    drop(work);
+    assert_eq!(budget.reserved(), 58);
+    drop(output);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[case::unsupported(false)]
+#[case::required(true)]
+fn invalid_null_placeholders_release_prior_columns(#[case] required: bool) {
+    let field = if required {
+        Field::new("bad", DataType::UInt64, false)
+    } else {
+        Field::new(
+            "bad",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bytes", DataType::LargeBinary, true),
+        field,
+    ]));
+    let budget = AllocationBudget::new(128);
+    let mut work = budget.try_reserve(128).unwrap();
+    let error = PreparedFullZipTake::all_null(schema, 3)
+        .decode_in(&mut work)
+        .unwrap_err();
+    if required {
+        assert!(matches!(error, Error::Arrow { .. }));
+        assert!(error.to_string().contains("non-nullable"));
+    } else {
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("no admitted null"));
+    }
+    drop(work);
+    assert_eq!(budget.reserved(), 0);
+}
 
 #[rstest]
 #[tokio::test]

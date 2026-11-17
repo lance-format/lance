@@ -52,8 +52,10 @@ impl FragmentReader {
     /// with credit reserved before payload reads. Deletion markers do not null
     /// version values. Shared inline metadata is outside this payload budget;
     /// spilled version columns are unsupported even if already cached by open.
-    /// Struct ancestors, missing-column synthesis and legacy readers are
-    /// explicitly unsupported.
+    /// Missing top-level columns use typed all-null placeholders with child and
+    /// bitmap buffers charged to the same workspace. Missing children within a
+    /// stored struct still require unsupported ancestor reconstruction.
+    /// Struct ancestors and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed
     /// selection's physical storage; metadata/transport/cache/allocator overhead
     /// remain outside this payload bound. Performance is not qualified.

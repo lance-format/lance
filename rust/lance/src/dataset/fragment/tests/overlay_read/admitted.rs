@@ -14,6 +14,7 @@ use super::*;
 
 mod deletions;
 mod markers;
+mod missing;
 mod row_ids;
 mod row_versions;
 
