@@ -17,7 +17,9 @@ use datafusion_expr::{
     Expr,
     expr::{Like, ScalarFunction},
 };
-use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
+use inverted::query::{
+    FtsCorpusScope, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column,
+};
 use lance_core::Result;
 
 use lance_datafusion_exec::udf::CONTAINS_TOKENS_UDF;
@@ -121,6 +123,10 @@ pub struct FullTextSearchQuery {
     /// Increasing this value will reduce the recall and improve the performance
     /// 1.0 is the value that would give the best performance without recall loss
     pub wand_factor: Option<f32>,
+
+    /// Which unindexed documents count toward the BM25 corpus statistics.
+    /// See [`FtsCorpusScope`].
+    pub corpus_scope: FtsCorpusScope,
 }
 
 impl FullTextSearchQuery {
@@ -131,6 +137,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            corpus_scope: FtsCorpusScope::Global,
         }
     }
 
@@ -141,6 +148,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            corpus_scope: FtsCorpusScope::Global,
         }
     }
 
@@ -150,6 +158,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            corpus_scope: FtsCorpusScope::Global,
         }
     }
 
@@ -179,6 +188,25 @@ impl FullTextSearchQuery {
         self
     }
 
+    /// Choose which unindexed documents count toward the BM25 corpus statistics.
+    ///
+    /// The default, [`FtsCorpusScope::Global`], keeps scores independent of the
+    /// filter but reads every unindexed row. [`FtsCorpusScope::Scanned`] reads
+    /// only the unindexed rows that pass the filter, at the cost of scores that
+    /// change with the filter and with index coverage.
+    ///
+    /// ```
+    /// # use lance_index::scalar::FullTextSearchQuery;
+    /// # use lance_index::scalar::inverted::query::FtsCorpusScope;
+    /// let query = FullTextSearchQuery::new("hello".to_string())
+    ///     .corpus_scope(FtsCorpusScope::Scanned);
+    /// assert_eq!(query.params().corpus_scope, FtsCorpusScope::Scanned);
+    /// ```
+    pub fn corpus_scope(mut self, corpus_scope: FtsCorpusScope) -> Self {
+        self.corpus_scope = corpus_scope;
+        self
+    }
+
     pub fn columns(&self) -> HashSet<String> {
         self.query.columns()
     }
@@ -187,6 +215,7 @@ impl FullTextSearchQuery {
         FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
             .with_wand_factor(self.wand_factor.unwrap_or(1.0))
+            .with_corpus_scope(self.corpus_scope)
     }
 }
 
