@@ -3,6 +3,7 @@
 
 """Coverage for the version snapshot the compat tests are parametrized over."""
 
+import json
 import shutil
 import subprocess
 import sys
@@ -30,14 +31,7 @@ from compat import compat_decorator
 def _fetch_stable_versions():
     extra = ["8.0.0"] if os.environ.get("PYTEST_XDIST_WORKER") == "gw1" else []
     return sorted(Version(v) for v in ["6.0.0", "7.0.0", *extra])
-
-
-def _fetch_last_beta_release():
-    return "7.1.0b1"
-
-
 compat_decorator._fetch_stable_versions = _fetch_stable_versions
-compat_decorator._fetch_last_beta_release = _fetch_last_beta_release
 """
 
 # Not run with --run-compat: the generated cases stay collected but skipped, which
@@ -109,76 +103,48 @@ def test_workers_share_the_controller_version_snapshot(tmp_path):
     assert result.returncode == 0, output
 
 
-def _stub_pip_index(monkeypatch, available: str) -> None:
-    """Stand in for the `pip index versions` call, checking how it asks.
+def test_stable_release_discovery_excludes_prereleases(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
 
-    Pre-releases are only listed when `--pre` and the fury.io indices are
-    passed, so a stub that ignored its arguments would keep passing if the
-    command lost them.
-    """
+        def __exit__(self, *args):
+            pass
 
-    class PipIndexResult:
-        returncode = 0
-        stdout = f"pylance (14.0.0)\nAvailable versions: {available}\n"
+        def read(self):
+            releases = {
+                "14.0.0": [],
+                "15.0.0b8": [],
+                "15.0.0rc1": [],
+                "15.0.0.dev1": [],
+                "not-a-version": [],
+            }
+            return json.dumps({"releases": releases}).encode()
 
-    def fake_run(args, **kwargs):
-        assert "--pre" in args, args
-        assert any("fury.io" in arg for arg in args), args
-        return PipIndexResult()
+    monkeypatch.setattr(
+        compat_decorator.urllib.request, "urlopen", lambda *args, **kwargs: Response()
+    )
 
-    monkeypatch.setattr(compat_decorator.subprocess, "run", fake_run)
-
-
-@pytest.mark.parametrize(
-    ("available", "build", "expected"),
-    [
-        # The beta published from main carries the version the branch builds.
-        ("14.0.0b16, 14.0.0b15, 14.0.0b14", "14.0.0b16", "14.0.0b15"),
-        # The automation can be a release ahead of the branch.
-        ("14.0.0b17, 14.0.0b16, 14.0.0b15", "14.0.0b16", "14.0.0b15"),
-        # Ordering is by version, not by the order pip printed them.
-        ("14.0.0b14, 14.0.0b15, 13.0.0", "14.0.0b16", "14.0.0b15"),
-        # A stable release is not a pre-release, however recent it is.
-        ("14.0.0b16, 13.5.0, 13.0.0b1", "14.0.0b16", "13.0.0b1"),
-        # A version the index offers that does not parse is skipped.
-        ("14.0.0b16, not-a-version, 14.0.0b15", "14.0.0b16", "14.0.0b15"),
-        # Nothing older to pin leaves the slot empty rather than guessing.
-        ("14.0.0b16", "14.0.0b16", None),
-    ],
-)
-def test_beta_slot_takes_the_newest_release_older_than_the_build(
-    monkeypatch, available, build, expected
-):
-    """A compat test's older build has to be older than the build under test.
-
-    The beta slot is resolved from an index that carries the release just cut
-    from main, and that one has the same version as every branch built since.
-    Pinning it makes the "older build" the build under test.
-    """
-    _stub_pip_index(monkeypatch, available)
-    assert compat_decorator._fetch_last_beta_release(build) == expected
+    assert [str(v) for v in compat_decorator._fetch_stable_versions()] == ["14.0.0"]
 
 
-def test_beta_slot_measures_against_the_installed_build(monkeypatch):
-    """The default bound is the installed build, in the spelling it reports.
-
-    `lance.__version__` carries Cargo's spelling of a pre-release, so the
-    published wheel's normalized version has to compare equal to it rather
-    than older.
-    """
-    _stub_pip_index(monkeypatch, "14.0.0b16, 14.0.0b15")
-    monkeypatch.setattr(compat_decorator, "_build_version", lambda: "14.0.0-beta.16")
-    assert compat_decorator._fetch_last_beta_release() == "14.0.0b15"
+def test_version_snapshot_rejects_prereleases():
+    compat_decorator.use_version_snapshot({"stable": ["14.0.0", "15.0.0b8"]})
+    try:
+        with pytest.raises(ValueError, match="only stable releases"):
+            compat_decorator.pylance_stable_versions()
+    finally:
+        compat_decorator.use_version_snapshot({"stable": []})
 
 
-def test_beta_slot_stays_empty_without_a_build_to_measure_against(monkeypatch):
-    """A host that only drives provisioned venvs has no pylance of its own."""
-    monkeypatch.setattr(compat_decorator, "_build_version", lambda: None)
-    assert compat_decorator._fetch_last_beta_release() is None
+def test_compat_versions_select_recent_stable_majors():
+    compat_decorator.use_version_snapshot(
+        {"stable": ["0.39.0", "12.0.0", "13.0.0", "14.0.0", "14.0.2"]}
+    )
+    assert compat_decorator.compat_versions() == ["14.0.2", "13.0.0", "12.0.0"]
 
 
-def test_build_version_is_unavailable_rather_than_fatal(monkeypatch, capsys):
-    """An uninstalled pylance says so, instead of reading as a failed query."""
-    monkeypatch.setitem(sys.modules, "lance", None)
-    assert compat_decorator._build_version() is None
-    assert "build's own version" in capsys.readouterr().err
+@pytest.mark.parametrize("version", ["15.0.0b8", "15.0.0-beta.8", "15.0.0rc1"])
+def test_compat_test_rejects_prerelease_minimum(version):
+    with pytest.raises(ValueError, match="only stable releases"):
+        compat_decorator.compat_test(min_version=version)

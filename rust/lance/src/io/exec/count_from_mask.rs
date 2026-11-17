@@ -24,6 +24,9 @@ use std::sync::Arc;
 
 use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
@@ -406,6 +409,18 @@ impl ExecutionPlan for CountFromMaskExec {
         }
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        apply_expression_roots(
+            self.aggregate_funcs
+                .iter()
+                .flat_map(|aggregate_func| aggregate_func.expressions()),
+            f,
+        )
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -488,6 +503,7 @@ mod tests {
     use datafusion::execution::TaskContext;
     use datafusion::functions_aggregate;
     use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::scalar::ScalarValue;
@@ -518,6 +534,7 @@ mod tests {
             &df_schema,
             input_schema.as_ref(),
             &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
         )
         .with_name(expr.schema_name().to_string())
         .with_human_display(expr.human_display().to_string())

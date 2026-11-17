@@ -241,7 +241,16 @@ impl LabelListIndex {
         if single_set {
             return Ok(intersect_bitmap);
         }
-        while let Some(next) = sets.try_next().await? {
+        // An empty intersection can never recover, so stop pulling the stream
+        // once the accumulator is empty: every remaining pull is a per-label
+        // bitmap search (a disk round trip on a cold cache) for a result that
+        // is already decided. This is exact here because `search_exact`
+        // clears nulls on every element, so `is_empty` (which tests only the
+        // selected set) cannot miss rows hiding in `nulls`, and `&=` cannot
+        // make an empty selected set non-empty again.
+        while !intersect_bitmap.is_empty()
+            && let Some(next) = sets.try_next().await?
+        {
             intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
@@ -318,12 +327,12 @@ impl ScalarIndex for LabelListIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     fn results_are_row_addresses(&self) -> bool {
         self.values_index.results_are_row_addresses()
+    }
+
+    fn can_remap(&self) -> bool {
+        true
     }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
@@ -729,17 +738,23 @@ async fn train_label_list_index_with_plan(
     data: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
     mem_pool_size: Option<u64>,
+    progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<(IndexFile, Arc<dyn ExecutionPlan>)> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
     let data = track_list_nulls(data, list_nulls.clone());
     let data = unnest_chunks(data)?;
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
+    let sorted = crate::progress::stage_until_first_batch(progress, "sort_values", sorted).await?;
 
+    progress
+        .stage_start("write_label_list_index", None, "files")
+        .await?;
     let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
         Ok(list_nulls.lock().unwrap().clone())
     })
     .await?;
+    progress.stage_complete("write_label_list_index").await?;
     Ok((file, sort_plan))
 }
 
@@ -747,8 +762,9 @@ async fn train_label_list_index_with_plan(
 async fn train_label_list_index(
     data: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
+    progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<IndexFile> {
-    train_label_list_index_with_plan(data, index_store, None)
+    train_label_list_index_with_plan(data, index_store, None, progress)
         .await
         .map(|(file, _sort_plan)| file)
 }
@@ -1080,7 +1096,7 @@ impl BasicTrainer for LabelListIndexPlugin {
         // index covering exactly those rows is produced. Segments are recombined by
         // `merge_label_list_indices`.
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let schema = data.schema();
         let field = schema
@@ -1096,7 +1112,7 @@ impl BasicTrainer for LabelListIndexPlugin {
 
         validate_label_list_data_type(field.data_type())?;
 
-        let file = train_label_list_index(data, index_store).await?;
+        let file = train_label_list_index(data, index_store, progress.as_ref()).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
@@ -1108,6 +1124,10 @@ impl BasicTrainer for LabelListIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1231,6 +1251,8 @@ mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
+    use std::sync::atomic::Ordering;
+
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -1239,6 +1261,8 @@ mod tests {
     use super::super::bitmap::BitmapIndexState;
     use super::super::btree::OrderableScalarValue;
     use super::*;
+    use crate::metrics::LocalMetricsCollector;
+    use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::bitmap::test_util::{self, row_addrs};
     use lance_core::utils::tempfile::TempObjDir;
 
@@ -1374,9 +1398,14 @@ mod tests {
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index_with_plan(stream, store.as_ref(), Some(32 * 1024 * 1024))
-            .await
-            .expect("the wide-list fixture must build with the selected pool");
+        train_label_list_index_with_plan(
+            stream,
+            store.as_ref(),
+            Some(32 * 1024 * 1024),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .expect("the wide-list fixture must build with the selected pool");
 
         // Every row carries every label, so each posting covers all rows.
         let expected = IndexContents {
@@ -1523,16 +1552,20 @@ mod tests {
 
     async fn build_label_list_index(rows: &[SampleRow]) -> IndexContents {
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(rows),
+            store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         read_index_contents(store.as_ref()).await
     }
 
     // Every LabelList build or update now sorts through DataFusion with spilling
     // enabled. Most tests below get that from the default, process-cached
     // session, whose pool `LANCE_MEM_POOL_SIZE` governs, and so share that
-    // resource group -- see the same pattern in btree.rs, json.rs and rtree.rs.
+    // resource group -- see the same pattern in btree.rs and json.rs.
     // The spill-forcing test below passes an explicit `mem_pool_size` for the
     // spilling half, but its baseline build goes through the default session
     // like everything else, so it joins the group too.
@@ -1577,6 +1610,7 @@ mod tests {
             sample_rows_to_stream(&rows),
             store.as_ref(),
             Some(SPILL_FORCING_POOL_BYTES),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1642,10 +1676,14 @@ mod tests {
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        let (_file, sort_plan) =
-            train_label_list_index_with_plan(stream, store.as_ref(), Some(POOL_BYTES))
-                .await
-                .expect("wide labels must build when a large pool's sort spills");
+        let (_file, sort_plan) = train_label_list_index_with_plan(
+            stream,
+            store.as_ref(),
+            Some(POOL_BYTES),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .expect("wide labels must build when a large pool's sort spills");
 
         let metrics = sort_plan.metrics().expect("SortExec must report metrics");
         assert!(
@@ -1673,9 +1711,13 @@ mod tests {
 
     async fn build_label_list_segment(rows: &[SampleRow]) -> (TempObjDir, Arc<LabelListIndex>) {
         let (tmpdir, store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(rows),
+            store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         let index = LabelListIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
@@ -1704,6 +1746,56 @@ mod tests {
         );
     }
 
+    /// `set_intersection` must stop pulling the per-label search stream once
+    /// the accumulator is empty: each remaining pull is a bitmap load (a disk
+    /// round trip on a cold cache) whose result cannot revive an empty
+    /// intersection. Counted through the metrics collector, so the assertion
+    /// is deterministic rather than a timing claim.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_has_all_labels_stops_searching_once_intersection_is_empty() {
+        // 'a' covers rows 0, 1 and 12 and 'b' covers rows 2-3 -- disjoint, so
+        // the accumulator empties after the second label and none of
+        // 'c'..='j', each present in the index, can change the answer. Row 12
+        // (a null element) must not leak into the null rows; row 13 (a null
+        // list) must stay NULL after the early stop.
+        let mut rows: Vec<SampleRow> = vec![
+            (0, Some(vec![Some("a".to_string())])),
+            (1, Some(vec![Some("a".to_string())])),
+            (2, Some(vec![Some("b".to_string())])),
+            (3, Some(vec![Some("b".to_string())])),
+        ];
+        for (offset, label) in ('c'..='j').enumerate() {
+            rows.push((4 + offset as u64, Some(vec![Some(label.to_string())])));
+        }
+        rows.push((12, Some(vec![Some("a".to_string()), None])));
+        rows.push((13, None));
+        let (_dir, index) = build_label_list_segment(&rows).await;
+
+        let labels: Vec<ScalarValue> = ('a'..='j')
+            .map(|label| ScalarValue::Utf8(Some(label.to_string())))
+            .collect();
+        let query = LabelListQuery::HasAllLabels(labels);
+        // The segment loads through a no-op cache, so every label search that
+        // runs records exactly one part load.
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+
+        let SearchResult::Exact(found) = result else {
+            panic!("label list search must be exact");
+        };
+        assert!(
+            found.true_rows().is_empty(),
+            "disjoint 'a' and 'b' must select no rows"
+        );
+        assert_eq!(row_addrs(found.null_rows()), vec![13]);
+        assert_eq!(
+            metrics.parts_loaded.load(Ordering::Relaxed),
+            2,
+            "the search must stop after the label that empties the intersection"
+        );
+    }
+
     /// `remap` carries `list_nulls` in a global buffer written through the
     /// streaming writer, and nothing else covers that path. If the buffer or its
     /// metadata key were dropped, `read_list_nulls` would return an empty set and
@@ -1720,9 +1812,13 @@ mod tests {
         // Built here rather than via build_label_list_segment so the source
         // store stays reachable, to compare against after the remap.
         let (_src_dir, src_store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(&rows),
+            src_store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         let index = LabelListIndex::load(src_store.clone(), None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
@@ -2267,9 +2363,13 @@ mod tests {
             }
             "remap" => {
                 let (_src_dir, src_store) = test_util::index_store();
-                train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
-                    .await
-                    .unwrap();
+                train_label_list_index(
+                    sample_rows_to_stream(&rows),
+                    src_store.as_ref(),
+                    &NoopIndexBuildProgress,
+                )
+                .await
+                .unwrap();
                 let index = LabelListIndex::load(src_store, None, &LanceCache::no_cache(), true)
                     .await
                     .unwrap();

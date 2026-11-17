@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import platform
+import re
+import subprocess
+
 import lance
 import lance.arrow
+import lance.lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -10,6 +15,25 @@ import pyarrow.dataset as pa_ds
 import pytest
 from lance.util import validate_vector_index
 from lance.vector import vec_to_table
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin" or platform.machine() != "arm64",
+    reason=(
+        "macOS arm64 linker regression: "
+        "https://github.com/lance-format/lance/issues/10588"
+    ),
+)
+def test_macos_arm64_startup_section():
+    load_commands = subprocess.check_output(
+        ["otool", "-arch", "arm64", "-l", lance.lance.__file__], text=True
+    )
+    sections = set(re.findall(r"^\s*sectname\s+(\S+)$", load_commands, re.MULTILINE))
+    # Constructors must remain registered, but their code must share __text's
+    # branch islands even when the extension grows beyond 128 MiB.
+    assert "__mod_init_func" in sections
+    assert "__text" in sections
+    assert "__text_startup" not in sections
 
 
 def test_table_roundtrip(tmp_path, provide_pandas):

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 /// Bits per value for FixedWidth dictionary values (legacy default for 128-bit values)
 pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
@@ -14,6 +11,7 @@ pub const DICT_INDICES_BITS_PER_VALUE: u64 = 32;
 use arrow_array::{
     Array, DictionaryArray, PrimitiveArray, UInt64Array,
     cast::AsArray,
+    make_array,
     types::{
         ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
         UInt32Type, UInt64Type,
@@ -22,7 +20,7 @@ use arrow_array::{
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use arrow_select::take::TakeOptions;
-use lance_core::{Error, Result, error::LanceOptionExt, utils::hash::U8SliceKey};
+use lance_core::{Error, Result, error::LanceOptionExt};
 
 use crate::{
     buffer::LanceBuffer,
@@ -172,6 +170,100 @@ pub(super) fn clear_out_of_range_null_keys(array: Arc<dyn Array>) -> Result<Arc<
     }
 }
 
+/// Returns the values the structural encoder can store for any slice of one dictionary
+/// chunk.
+///
+/// The encoder moves null values into the keys and drops the key validity, so the key
+/// under a null slot selects a value as well.  When a slice holds a null slot whose key is
+/// out of range, the encoder points all of that slice's null slots at key 0 instead.  The
+/// result therefore holds the first value, the value of every valid key, and the value of
+/// every in-range key under a null slot.  The first value is also where an all-null chunk
+/// without values points its keys.  A chunk without values yields an empty array.
+pub fn encoded_dictionary_values(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+    let array = normalize_dict_nulls(array)?;
+    let dictionary = array.as_any_dictionary_opt().expect_ok()?;
+    let values = dictionary.values();
+    if values.is_empty() {
+        return Ok(values.clone());
+    }
+    // The physical key of every slot, null or not.  A key that is negative or does not fit
+    // `i64` is out of range.
+    let physical_keys = make_array(
+        dictionary
+            .keys()
+            .to_data()
+            .into_builder()
+            .nulls(None)
+            .build()?,
+    );
+    let physical_keys = arrow_cast::cast(&physical_keys, &DataType::Int64)?;
+    let mut is_selected = vec![false; values.len()];
+    is_selected[0] = true;
+    for key in physical_keys.as_primitive::<Int64Type>().iter().flatten() {
+        if let Some(is_selected) = usize::try_from(key)
+            .ok()
+            .and_then(|key| is_selected.get_mut(key))
+        {
+            *is_selected = true;
+        }
+    }
+    let indices = is_selected
+        .iter()
+        .enumerate()
+        .filter_map(|(index, is_selected)| is_selected.then_some(index as u64))
+        .collect::<UInt64Array>();
+    Ok(arrow_select::take::take(values, &indices, None)?)
+}
+
+const EMPTY_INTERNER_SLOT: u32 = u32::MAX;
+
+#[inline]
+fn mix_u64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn mix_u128(v: u128) -> u64 {
+    let lo = v as u64;
+    let hi = (v >> 64) as u64;
+    mix_u64(lo ^ hi.wrapping_mul(0x9e3779b97f4a7c15))
+}
+
+struct CompactInterner {
+    slots: Vec<u32>,
+    mask: usize,
+}
+
+impl CompactInterner {
+    fn new(max_dict_entries: u32, num_items: usize) -> Self {
+        let init_entries = (max_dict_entries as usize).min(num_items).clamp(16, 1024);
+        let table_len = (init_entries * 2).next_power_of_two();
+        Self {
+            slots: vec![EMPTY_INTERNER_SLOT; table_len],
+            mask: table_len - 1,
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self, count: usize, mut hash_of: impl FnMut(usize) -> u64) -> Option<()> {
+        let new_len = self.slots.len().checked_mul(2)?;
+        let new_mask = new_len - 1;
+        let mut new_slots = vec![EMPTY_INTERNER_SLOT; new_len];
+        for idx in 0..count {
+            let mut slot = (hash_of(idx) as usize) & new_mask;
+            while new_slots[slot] != EMPTY_INTERNER_SLOT {
+                slot = (slot + 1) & new_mask;
+            }
+            new_slots[slot] = idx as u32;
+        }
+        self.slots = new_slots;
+        self.mask = new_mask;
+        Some(())
+    }
+}
+
 fn dict_encode_variable_width<T>(
     variable_width_data_block: &VariableWidthBlock,
     bits_per_offset: u8,
@@ -183,12 +275,20 @@ where
     T: ArrowNativeType,
     usize: TryFrom<T>,
 {
-    use std::collections::hash_map::Entry;
-    let mut map = HashMap::new();
     let offsets = variable_width_data_block
         .offsets
         .borrow_to_typed_slice::<T>();
     let offsets = offsets.as_ref();
+    let num_items = offsets.len().saturating_sub(1);
+    let bytes_per_offset = (bits_per_offset / 8) as usize;
+    let total_indices_bytes = num_items.saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+
+    if num_items > 0
+        && (max_dict_entries == 0
+            || total_indices_bytes.saturating_add(bytes_per_offset * 2) > max_encoded_size)
+    {
+        return None;
+    }
 
     let max_len = variable_width_data_block
         .get_stat(Stat::MaxLength)
@@ -203,58 +303,82 @@ where
         .min(max_dict_data_len)
         .min(max_encoded_size);
 
+    let init_entries = (max_dict_entries as usize).min(num_items).clamp(16, 1024);
+    let mut interner = CompactInterner::new(max_dict_entries, num_items);
+    let mut hashes: Vec<u64> = Vec::with_capacity(init_entries);
     let mut dictionary_buffer: Vec<u8> = Vec::with_capacity(dict_data_capacity);
-    let mut dictionary_offsets_buffer = vec![T::default()];
-    let mut curr_idx = 0;
+    let mut dictionary_offsets_buffer = Vec::with_capacity(init_entries + 1);
+    dictionary_offsets_buffer.push(T::default());
+    let mut curr_idx: i32 = 0;
     let mut indices_buffer = Vec::with_capacity(variable_width_data_block.num_values as usize);
-    let bytes_per_offset = (bits_per_offset / 8) as usize;
+
+    let raw_data = variable_width_data_block.data.as_ref();
+    let mut prev: Option<(&[u8], i32)> = None;
 
     for window in offsets.windows(2) {
         let start = usize::try_from(window[0]).ok()?;
         let end = usize::try_from(window[1]).ok()?;
-        if start > end || end > variable_width_data_block.data.len() {
+        if start > end || end > raw_data.len() {
             return None;
         }
 
-        let key = &variable_width_data_block.data[start..end];
+        let key = &raw_data[start..end];
+        if let Some((prev_key, prev_idx)) = prev
+            && prev_key == key
+        {
+            indices_buffer.push(prev_idx);
+            continue;
+        }
 
-        let idx = match map.entry(U8SliceKey(key)) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                if max_dict_entries == 0 || curr_idx as u32 >= max_dict_entries {
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        let mut slot = (hash as usize) & interner.mask;
+        let idx = loop {
+            let entry = interner.slots[slot];
+            if entry == EMPTY_INTERNER_SLOT {
+                if max_dict_entries == 0
+                    || curr_idx as u32 >= max_dict_entries
+                    || curr_idx == i32::MAX
+                {
                     return None;
                 }
-                if curr_idx == i32::MAX {
+                let next_dict_bytes = dictionary_buffer.len().checked_add(key.len())?;
+                if next_dict_bytes > max_dict_bytes {
                     return None;
                 }
-                if dictionary_buffer.len() + key.len() > max_dict_bytes {
+                let next_offsets_bytes =
+                    (dictionary_offsets_buffer.len() + 1).saturating_mul(bytes_per_offset);
+                let projected_encoded_size = next_dict_bytes
+                    .saturating_add(total_indices_bytes)
+                    .saturating_add(next_offsets_bytes);
+                if projected_encoded_size > max_encoded_size {
                     return None;
                 }
+
                 dictionary_buffer.extend_from_slice(key);
                 let dict_offset = T::from_usize(dictionary_buffer.len())?;
                 dictionary_offsets_buffer.push(dict_offset);
-                let idx = curr_idx;
-                entry.insert(idx);
+                hashes.push(hash);
+                let assigned = curr_idx;
+                interner.slots[slot] = assigned as u32;
                 curr_idx += 1;
-                idx
+                if (curr_idx as usize) * 2 > interner.slots.len() {
+                    interner.grow(curr_idx as usize, |i| hashes[i])?;
+                }
+                break assigned;
             }
+            let e = entry as usize;
+            if hashes[e] == hash {
+                let d_start = usize::try_from(dictionary_offsets_buffer[e]).ok()?;
+                let d_end = usize::try_from(dictionary_offsets_buffer[e + 1]).ok()?;
+                if &dictionary_buffer[d_start..d_end] == key {
+                    break entry as i32;
+                }
+            }
+            slot = (slot + 1) & interner.mask;
         };
 
+        prev = Some((key, idx));
         indices_buffer.push(idx);
-
-        let indices_bytes = indices_buffer
-            .len()
-            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
-        let offsets_bytes = dictionary_offsets_buffer
-            .len()
-            .saturating_mul(bytes_per_offset);
-        let encoded_size = dictionary_buffer
-            .len()
-            .saturating_add(indices_bytes)
-            .saturating_add(offsets_bytes);
-        if encoded_size > max_encoded_size {
-            return None;
-        }
     }
 
     let mut dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
@@ -270,6 +394,97 @@ where
         data: LanceBuffer::reinterpret_vec(indices_buffer),
         bits_per_value: DICT_INDICES_BITS_PER_VALUE,
         num_values: variable_width_data_block.num_values,
+        block_info: BlockInfo::default(),
+    });
+    indices_data_block.compute_stat();
+
+    Some((indices_data_block, dictionary_data_block))
+}
+
+fn dict_encode_fixed_scalar<V>(
+    values: &[V],
+    num_values: u64,
+    bits_per_value: u64,
+    max_dict_entries: u32,
+    max_encoded_size: usize,
+    mut hash_fn: impl FnMut(V) -> u64,
+) -> Option<(DataBlock, DataBlock)>
+where
+    V: ArrowNativeType + Copy + Eq,
+{
+    let bytes_per_value = std::mem::size_of::<V>();
+    let total_indices_bytes = values
+        .len()
+        .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+    if !values.is_empty()
+        && (max_dict_entries == 0
+            || total_indices_bytes.saturating_add(bytes_per_value) > max_encoded_size)
+    {
+        return None;
+    }
+
+    let init_entries = (max_dict_entries as usize)
+        .min(values.len())
+        .clamp(16, 1024);
+    let mut interner = CompactInterner::new(max_dict_entries, values.len());
+    let mut dictionary_buffer = Vec::with_capacity(init_entries);
+    let mut indices_buffer = Vec::with_capacity(values.len());
+    let mut curr_idx: i32 = 0;
+    let mut prev: Option<(V, i32)> = None;
+
+    for &value in values {
+        if let Some((prev_val, prev_idx)) = prev
+            && prev_val == value
+        {
+            indices_buffer.push(prev_idx);
+            continue;
+        }
+
+        let hash = hash_fn(value);
+        let mut slot = (hash as usize) & interner.mask;
+        let idx = loop {
+            let entry = interner.slots[slot];
+            if entry == EMPTY_INTERNER_SLOT {
+                if max_dict_entries == 0
+                    || curr_idx as u32 >= max_dict_entries
+                    || curr_idx == i32::MAX
+                {
+                    return None;
+                }
+                let next_dict_bytes = (dictionary_buffer.len() + 1).saturating_mul(bytes_per_value);
+                if next_dict_bytes.saturating_add(total_indices_bytes) > max_encoded_size {
+                    return None;
+                }
+                dictionary_buffer.push(value);
+                let assigned = curr_idx;
+                interner.slots[slot] = assigned as u32;
+                curr_idx += 1;
+                if (curr_idx as usize) * 2 > interner.slots.len() {
+                    interner.grow(curr_idx as usize, |i| hash_fn(dictionary_buffer[i]))?;
+                }
+                break assigned;
+            }
+            if dictionary_buffer[entry as usize] == value {
+                break entry as i32;
+            }
+            slot = (slot + 1) & interner.mask;
+        };
+
+        prev = Some((value, idx));
+        indices_buffer.push(idx);
+    }
+
+    let mut dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
+        bits_per_value,
+        num_values: curr_idx as u64,
+        block_info: BlockInfo::default(),
+    });
+    dictionary_data_block.compute_stat();
+    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(indices_buffer),
+        bits_per_value: DICT_INDICES_BITS_PER_VALUE,
+        num_values,
         block_info: BlockInfo::default(),
     });
     indices_data_block.compute_stat();
@@ -294,125 +509,29 @@ pub fn dictionary_encode(
 ) -> Option<(DataBlock, DataBlock)> {
     match data_block {
         DataBlock::FixedWidth(fixed_width_data_block) => {
-            use std::collections::hash_map::Entry;
-
-            let bytes_per_value = match fixed_width_data_block.bits_per_value {
-                64 => 8usize,
-                128 => 16usize,
-                _ => return None,
-            };
-
             match fixed_width_data_block.bits_per_value {
                 64 => {
-                    let mut map = HashMap::new();
                     let u64_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u64>();
-                    let u64_slice = u64_slice.as_ref();
-                    let mut dictionary_buffer =
-                        Vec::with_capacity((fixed_width_data_block.num_values as usize).min(1024));
-                    let mut indices_buffer =
-                        Vec::with_capacity(fixed_width_data_block.num_values as usize);
-                    let mut curr_idx: i32 = 0;
-
-                    for &value in u64_slice.iter() {
-                        let idx = match map.entry(value) {
-                            Entry::Occupied(entry) => *entry.get(),
-                            Entry::Vacant(entry) => {
-                                if max_dict_entries == 0 || curr_idx as u32 >= max_dict_entries {
-                                    return None;
-                                }
-                                if curr_idx == i32::MAX {
-                                    return None;
-                                }
-                                dictionary_buffer.push(value);
-                                let idx = curr_idx;
-                                entry.insert(idx);
-                                curr_idx += 1;
-                                idx
-                            }
-                        };
-                        indices_buffer.push(idx);
-                        let dict_bytes = dictionary_buffer.len().saturating_mul(bytes_per_value);
-                        let indices_bytes = indices_buffer
-                            .len()
-                            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
-                        let encoded_size = dict_bytes.saturating_add(indices_bytes);
-                        if encoded_size > max_encoded_size {
-                            return None;
-                        }
-                    }
-
-                    let mut dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                        bits_per_value: 64,
-                        num_values: curr_idx as u64,
-                        block_info: BlockInfo::default(),
-                    });
-                    dictionary_data_block.compute_stat();
-                    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::reinterpret_vec(indices_buffer),
-                        bits_per_value: DICT_INDICES_BITS_PER_VALUE,
-                        num_values: fixed_width_data_block.num_values,
-                        block_info: BlockInfo::default(),
-                    });
-                    indices_data_block.compute_stat();
-
-                    Some((indices_data_block, dictionary_data_block))
+                    dict_encode_fixed_scalar(
+                        u64_slice.as_ref(),
+                        fixed_width_data_block.num_values,
+                        64,
+                        max_dict_entries,
+                        max_encoded_size,
+                        mix_u64,
+                    )
                 }
                 128 => {
-                    // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
-                    let mut map = HashMap::new();
-                    let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
-                    let u128_slice = u128_slice.as_ref();
-                    let mut dictionary_buffer =
-                        Vec::with_capacity((fixed_width_data_block.num_values as usize).min(1024));
-                    let mut indices_buffer =
-                        Vec::with_capacity(fixed_width_data_block.num_values as usize);
-                    let mut curr_idx: i32 = 0;
-
-                    for &value in u128_slice.iter() {
-                        let idx = match map.entry(value) {
-                            Entry::Occupied(entry) => *entry.get(),
-                            Entry::Vacant(entry) => {
-                                if max_dict_entries == 0 || curr_idx as u32 >= max_dict_entries {
-                                    return None;
-                                }
-                                if curr_idx == i32::MAX {
-                                    return None;
-                                }
-                                dictionary_buffer.push(value);
-                                let idx = curr_idx;
-                                entry.insert(idx);
-                                curr_idx += 1;
-                                idx
-                            }
-                        };
-                        indices_buffer.push(idx);
-                        let dict_bytes = dictionary_buffer.len().saturating_mul(bytes_per_value);
-                        let indices_bytes = indices_buffer
-                            .len()
-                            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
-                        let encoded_size = dict_bytes.saturating_add(indices_bytes);
-                        if encoded_size > max_encoded_size {
-                            return None;
-                        }
-                    }
-
-                    let mut dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                        bits_per_value: DICT_FIXED_WIDTH_BITS_PER_VALUE,
-                        num_values: curr_idx as u64,
-                        block_info: BlockInfo::default(),
-                    });
-                    dictionary_data_block.compute_stat();
-                    let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::reinterpret_vec(indices_buffer),
-                        bits_per_value: DICT_INDICES_BITS_PER_VALUE,
-                        num_values: fixed_width_data_block.num_values,
-                        block_info: BlockInfo::default(),
-                    });
-                    indices_data_block.compute_stat();
-
-                    Some((indices_data_block, dictionary_data_block))
+                    // `i128` implements `ArrowNativeType` and is bit-identical to `u128` for equality/hashing.
+                    let i128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<i128>();
+                    dict_encode_fixed_scalar(
+                        i128_slice.as_ref(),
+                        fixed_width_data_block.num_values,
+                        DICT_FIXED_WIDTH_BITS_PER_VALUE,
+                        max_dict_entries,
+                        max_encoded_size,
+                        |v| mix_u128(v as u128),
+                    )
                 }
                 _ => None,
             }
@@ -461,25 +580,53 @@ pub(super) fn encode_fixed_rows(
     if indices_bytes > max_encoded_size {
         return None;
     }
-    let mut map = HashMap::new();
-    let mut items = Vec::new();
+
+    let max_entries_capped = max_dict_entries.min(i32::MAX as u32);
+    let init_entries = (max_entries_capped as usize).min(count).clamp(16, 1024);
+    let mut interner = CompactInterner::new(max_entries_capped, count);
+    let mut hashes: Vec<u64> = Vec::with_capacity(init_entries);
+    let mut items = Vec::with_capacity(init_entries.saturating_mul(width).min(max_encoded_size));
     let mut indices = Vec::with_capacity(count);
+    let mut num_entries: u32 = 0;
+    let mut prev: Option<(&[u8], u32)> = None;
+
     for value in data.data.chunks_exact(width) {
-        let next = u32::try_from(map.len()).ok()?;
-        let index = match map.entry(U8SliceKey(value)) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                if next >= max_dict_entries.min(i32::MAX as u32)
+        if let Some((prev_val, prev_idx)) = prev
+            && prev_val == value
+        {
+            indices.push(prev_idx);
+            continue;
+        }
+
+        let hash = xxhash_rust::xxh3::xxh3_64(value);
+        let mut slot = (hash as usize) & interner.mask;
+        let index = loop {
+            let entry = interner.slots[slot];
+            if entry == EMPTY_INTERNER_SLOT {
+                if num_entries >= max_entries_capped
                     || items.len().checked_add(width)?.checked_add(indices_bytes)?
                         > max_encoded_size
                 {
                     return None;
                 }
                 items.extend_from_slice(value);
-                entry.insert(next);
-                next
+                hashes.push(hash);
+                let assigned = num_entries;
+                interner.slots[slot] = assigned;
+                num_entries = num_entries.checked_add(1)?;
+                if (num_entries as usize) * 2 > interner.slots.len() {
+                    interner.grow(num_entries as usize, |i| hashes[i])?;
+                }
+                break assigned;
             }
+            let e = entry as usize;
+            if hashes[e] == hash && &items[e * width..(e + 1) * width] == value {
+                break entry;
+            }
+            slot = (slot + 1) & interner.mask;
         };
+
+        prev = Some((value, index));
         indices.push(index);
     }
     let mut indices = DataBlock::FixedWidth(FixedWidthDataBlock {
@@ -494,7 +641,7 @@ pub(super) fn encode_fixed_rows(
         FixedWidthDataBlock {
             data: LanceBuffer::from(items),
             bits_per_value: data.bits_per_value,
-            num_values: map.len() as u64,
+            num_values: num_entries as u64,
             block_info: BlockInfo::new(),
         },
     ))
@@ -507,8 +654,39 @@ mod tests {
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
     };
-    use arrow_array::{Array, StringArray};
+    use arrow_array::{Array, Int8Array, StringArray};
+    use arrow_buffer::{NullBuffer, ScalarBuffer};
+    use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    // Index 3 is reached only through a null slot; index 100 is out of range and skipped.
+    #[case::keys_under_nulls(
+        vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e")],
+        vec![1, 3, 100],
+        vec![true, false, false],
+        vec!["a", "b", "d"]
+    )]
+    // The null value moves into the keys, so only the valid values remain.
+    #[case::null_values(
+        vec![Some("a"), None, Some("c")],
+        vec![0, 1, 2],
+        vec![true, true, true],
+        vec!["a", "c"]
+    )]
+    fn test_encoded_dictionary_values(
+        #[case] values: Vec<Option<&str>>,
+        #[case] keys: Vec<i8>,
+        #[case] validity: Vec<bool>,
+        #[case] expected: Vec<&str>,
+    ) {
+        let keys = Int8Array::new(ScalarBuffer::from(keys), Some(NullBuffer::from(validity)));
+        let dictionary =
+            DictionaryArray::<Int8Type>::try_new(keys, Arc::new(StringArray::from(values)))
+                .unwrap();
+        let encoded = encoded_dictionary_values(Arc::new(dictionary)).unwrap();
+        assert_eq!(encoded.as_string::<i32>(), &StringArray::from(expected));
+    }
 
     #[test]
     fn test_fixed_row_dictionary_preserves_float_bits_and_budgets() {
@@ -747,5 +925,39 @@ mod tests {
         let (_, dictionary) =
             dictionary_encode(&data_block, 1000, max_encoded_size, 25_600).unwrap();
         assert_eq!(dictionary.num_values(), 100);
+    }
+
+    #[test]
+    fn test_compact_interner_growth_and_runs_preserve_first_seen_ids() {
+        // 1,600 distinct strings (> 1,024 initial cap, triggering CompactInterner::grow)
+        // interleaved with consecutive runs (exercising 1-entry MRU fast path).
+        let cardinality = 1_600usize;
+        let mut values = Vec::with_capacity(cardinality * 4);
+        for i in 0..cardinality {
+            let s = format!("tenant-tag-{i:05}-payload");
+            values.push(s.clone());
+            values.push(s);
+        }
+        for i in (0..cardinality).rev() {
+            let s = format!("tenant-tag-{i:05}-payload");
+            values.push(s.clone());
+            values.push(s);
+        }
+        let array = StringArray::from(values.clone());
+        let block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
+        let (indices_blk, dict_blk) =
+            dictionary_encode(&block, 4_096, usize::MAX, usize::MAX).unwrap();
+        assert_eq!(dict_blk.num_values(), cardinality as u64);
+
+        let reconstructed = crate::data::DictionaryDataBlock::from_parts(
+            indices_blk.as_fixed_width().unwrap(),
+            dict_blk,
+        )
+        .decode()
+        .unwrap()
+        .into_arrow(DataType::Utf8, true)
+        .unwrap();
+        let actual = make_array(reconstructed);
+        assert_eq!(actual.as_ref(), &StringArray::from(values) as &dyn Array);
     }
 }

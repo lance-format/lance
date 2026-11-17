@@ -322,7 +322,13 @@ impl Writer {
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
         self.options.validate()?;
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
+            let cache_owners = schema
+                .fields
+                .iter()
+                .map(super::cache_owner_count)
+                .sum::<usize>()
+                .max(1);
+            data_cache_bytes / cache_owners as u64
         } else {
             8 * 1024 * 1024
         };
@@ -499,6 +505,12 @@ impl Writer {
         self.write_pages(encoding_tasks).await?;
 
         Ok(())
+    }
+
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.column_writers {
+            encoder.prepare_for_flush();
+        }
     }
 
     /// Write a single column, advancing only that column's row counter.

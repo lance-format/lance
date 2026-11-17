@@ -165,7 +165,7 @@ fn spawn_lister(
     total: Arc<std::sync::OnceLock<usize>>,
     tx_err: tokio::sync::mpsc::Sender<Result<ScannedManifest>>,
 ) {
-    tokio::spawn(async move {
+    lance_core::utils::tokio::spawn(async move {
         let result: Result<()> = async {
             let mut locations = commit_handler.list_manifest_locations(&base, &object_store, false);
             let mut count = 0usize;
@@ -205,7 +205,7 @@ fn spawn_reader(
     mem_notify: Arc<tokio::sync::Notify>,
 ) {
     let inflight_mem = inflight_mem.clone();
-    tokio::spawn(async move {
+    lance_core::utils::tokio::spawn(async move {
         let max_parallelism = object_store.io_parallelism();
         type ScanResult = Result<ScannedManifest>;
         let mut in_flight: FuturesUnordered<

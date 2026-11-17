@@ -6,6 +6,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use arrow::array::{MutableArrayData, make_array};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeListArray, GenericListArray,
@@ -48,6 +49,9 @@ pub(super) fn compact_blank_source(
     write_schema: Option<&Schema>,
 ) -> Result<RecordBatch> {
     debug_assert_eq!(source.num_rows(), 1);
+    // Unlike `apply_blank_plan`, this can use arrow's validating `take`: the source row
+    // was read back from storage, and the map decoder builds maps with
+    // `MapArray::try_new`, so the maps `copy_rows_unvalidated` exists for never get here.
     let source = arrow_select::take::take_record_batch(source, &UInt32Array::from(vec![0]))?;
     let plans = blank_plans(&source, storage_version, write_schema)?;
     let columns = source
@@ -732,6 +736,51 @@ fn apply_fixed_size_list_blank_plan(
     )?))
 }
 
+/// Whether `data_type` is or nests a `Map`.
+fn contains_map(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Map(_, _) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => contains_map(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|field| contains_map(field.data_type())),
+        DataType::Dictionary(_, value) => contains_map(value),
+        _ => false,
+    }
+}
+
+/// Copy the rows at `indices` out of `array` without validating the result.
+///
+/// A map only takes the [`BlankPlan::Take`] fallback when its entries break the
+/// Arrow spec (see [`blank_plan`]), and arrow's `take` rebuilds maps through the
+/// validating `MapArray::try_new`, which rejects exactly those maps. Copying the
+/// buffers keeps the source's shape, which is what `take` produced before arrow
+/// 59 added that validation.
+fn copy_rows_unvalidated(
+    array: &ArrayRef,
+    indices: &UInt32Array,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    let data = array.to_data();
+    let mut copy = MutableArrayData::new(vec![&data], false, indices.len());
+    // The selection is mostly ascending runs of live rows, so copy runs at once.
+    let mut values = indices.values().iter().map(|&index| index as usize);
+    if let Some(first) = values.next() {
+        let (mut start, mut end) = (first, first + 1);
+        for index in values {
+            if index == end {
+                end += 1;
+            } else {
+                copy.try_extend(0, start, end)?;
+                (start, end) = (index, index + 1);
+            }
+        }
+        copy.try_extend(0, start, end)?;
+    }
+    Ok(make_array(copy.freeze()))
+}
+
 fn apply_blank_plan(
     array: &ArrayRef,
     plan: &BlankPlan,
@@ -739,13 +788,16 @@ fn apply_blank_plan(
     interleave_indices: Option<&[(usize, usize)]>,
 ) -> std::result::Result<ArrayRef, ArrowError> {
     match plan {
-        BlankPlan::Take => arrow::compute::take(
-            array.as_ref(),
-            take_indices.ok_or_else(|| {
+        BlankPlan::Take => {
+            let take_indices = take_indices.ok_or_else(|| {
                 ArrowError::InvalidArgumentError("take indices are missing".to_string())
-            })?,
-            None,
-        ),
+            })?;
+            if contains_map(array.data_type()) {
+                copy_rows_unvalidated(array, take_indices)
+            } else {
+                arrow::compute::take(array.as_ref(), take_indices, None)
+            }
+        }
         BlankPlan::Interleave(filler) => interleave(
             &[array.as_ref(), filler.as_ref()],
             interleave_indices.ok_or_else(|| {

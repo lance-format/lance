@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::version::ConcreteFileVersion;
@@ -259,6 +260,17 @@ impl DataFile {
         }
     }
 
+    /// The ids of the fields this file answers for in a `DataReplacement`:
+    /// those of [`Self::schema`], which adds a nested parent with no column
+    /// of its own, and every id in [`Self::fields`].
+    pub fn covered_field_ids(&self, full_schema: &Schema) -> HashSet<i32> {
+        self.schema(full_schema)
+            .field_ids()
+            .into_iter()
+            .chain(self.fields.iter().copied())
+            .collect()
+    }
+
     fn uses_v1_data_file_encoding(&self) -> bool {
         self.file_major_version == 0 && self.file_minor_version < 3
     }
@@ -481,6 +493,8 @@ impl DataFileFieldInterner {
             physical_rows,
             last_updated_at_version_meta,
             created_at_version_meta,
+            clustering_id: p.clustering_id,
+            metadata: p.metadata,
         })
     }
 }
@@ -510,6 +524,43 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
+    /// The serialized Roaring bitmap of deleted row offsets, when the deletion
+    /// vector is stored in the manifest rather than in a file. `Bytes`, so the
+    /// many clones of a fragment share it instead of copying it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "inline_deletion_bytes"
+    )]
+    pub inline: Option<Bytes>,
+}
+
+/// `Option<Bytes>` as serde sees a byte sequence, without the `serde` feature of `bytes`.
+mod inline_deletion_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Bytes>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => serializer.serialize_some(&bytes[..]),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Bytes>, D::Error> {
+        Option::<Vec<u8>>::deserialize(deserializer).map(|bytes| bytes.map(Bytes::from))
+    }
+}
+
+impl DeletionFile {
+    /// Whether the deletion vector lives in the manifest, so no file exists for it.
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -536,6 +587,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             file_type,
             num_deleted_rows,
             base_id: value.base_id,
+            inline: value.inline,
         })
     }
 }
@@ -578,6 +630,19 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// The clustering definition this fragment was organized under when it
+    /// was created, by `Manifest::clustering` id. Operations on the same
+    /// fragment keep it; a fragment written from this one does not inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clustering_id: Option<u32>,
+
+    /// Arbitrary metadata attached to this fragment, like
+    /// `Manifest::table_metadata`. Operations on the same fragment preserve
+    /// every entry, including keys this build does not understand; new
+    /// fragments carry only what their writer sets.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
 }
 
 impl Fragment {
@@ -591,6 +656,8 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -629,6 +696,8 @@ impl Fragment {
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
+            clustering_id: _,
+            metadata: _,
         } = self;
         files
             .iter()
@@ -650,6 +719,8 @@ impl Fragment {
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
+            clustering_id: _,
+            metadata: _,
         } = self;
         files
             .iter_mut()
@@ -769,6 +840,8 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -819,6 +892,135 @@ impl Fragment {
     pub fn add_file_legacy(&mut self, path: &str, schema: &Schema) {
         self.files
             .push(DataFile::new_legacy(path, schema, None, None));
+    }
+
+    /// Swap `new_files` into this fragment, applied in order: what a
+    /// `DataReplacement` commit does to the data files of a fragment.
+    ///
+    /// A new file replaces an existing file holding exactly its fields with the
+    /// same file version numbers, or is appended when the fragment has no data
+    /// for its fields, or, when the fragment holds all of them, is appended
+    /// after they are tombstoned where they live. A V1 file cannot tombstone a
+    /// field, so a field one holds takes only an exact match. In the
+    /// tombstoning case, every file then left with no field of `schema` and
+    /// none of the fragment's spilled row lineage is dropped. Pure: no IO,
+    /// only `files` changes. A new file that changes nothing is an error.
+    pub fn replace_files(&self, schema: &Schema, new_files: &[DataFile]) -> Result<Self> {
+        new_files
+            .iter()
+            .try_fold(self.clone(), |fragment, new_file| {
+                fragment.replace_file(schema, new_file)
+            })
+    }
+
+    fn replace_file(&self, schema: &Schema, new_file: &DataFile) -> Result<Self> {
+        let mut new_frag = self.clone();
+
+        // Physical mappings differ across V2 encodings (a nested
+        // parent may have no column of its own). Choosing the arm and
+        // tombstoning use the logical field coverage; the exact-match swap
+        // compares `fields` as written.
+        let replacement_ids = new_file.covered_field_ids(schema);
+
+        // TODO(rmeng): check new file and fragment are the same length
+
+        let mut columns_covered = HashSet::new();
+        // Set when an existing file covers exactly the replaced
+        // fields, so the whole file swaps rather than part of it.
+        let mut replaced_in_place = false;
+        for file in &mut new_frag.files {
+            if file.fields == new_file.fields
+                && file.file_major_version == new_file.file_major_version
+                && file.file_minor_version == new_file.file_minor_version
+            {
+                // assign the new file path / size / metadata size / base to the fragment
+                file.path = new_file.path.clone();
+                file.file_size_bytes = new_file.file_size_bytes.clone();
+                file.file_metadata_size_bytes = new_file.file_metadata_size_bytes;
+                file.base_id = new_file.base_id;
+                replaced_in_place = true;
+            }
+            columns_covered.extend(file.covered_field_ids(schema));
+        }
+        // Reject a file whose version does not decode before any
+        // arm publishes it.
+        new_file.file_version()?;
+
+        // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
+        // Then it means it's a all-NULL column that is being replaced with real data
+        // just append it to this fragment. Push the DataFile as
+        // given so every field (including base_id) is preserved.
+        if columns_covered.is_disjoint(&replacement_ids) {
+            new_frag.files.push(new_file.clone());
+        } else if !replaced_in_place
+            && replacement_ids.is_subset(&columns_covered)
+            && new_frag.files.iter().all(|file| {
+                file.file_version()
+                    .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                    || file
+                        .fields
+                        .iter()
+                        .all(|field| !replacement_ids.contains(field))
+            })
+        {
+            // Tombstone the replaced fields where they live and
+            // append the new file to answer for them, the idiom
+            // `update_columns` uses. Compaction decides that layout,
+            // so the fields may sit in one wider file or span
+            // several.
+            //
+            // Legacy V1 is excluded: its reader derives the page table
+            // offset from the first field in the metadata, so
+            // tombstoning one field leaves its siblings decoding from
+            // the wrong pages. A field a V1 file covers keeps
+            // exact-match replacement.
+            for file in &mut new_frag.files {
+                // Same reason as the guard above.
+                if file.file_version()? == ConcreteFileVersion::V1 {
+                    continue;
+                }
+                file.fields = file
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        if replacement_ids.contains(field) {
+                            TOMBSTONE_FIELD_ID
+                        } else {
+                            *field
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            // Every data file must share at least one field with
+            // the dataset schema: a file kept alive only by
+            // tombstones or by ids the schema no longer defines is
+            // unreachable to readers and uncollectable by cleanup.
+            // The exception is a file carrying one of the fragment's
+            // spilled row lineage sequences: their reserved ids are
+            // never in the schema, the file holds their only copy,
+            // and the replaced user columns in it are dead space
+            // until compaction.
+            let live_ids = schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<HashSet<i32>>();
+            let spilled = new_frag.spilled_row_lineage_field_ids();
+            new_frag.files.retain(|file| {
+                file.fields
+                    .iter()
+                    .any(|f| live_ids.contains(f) || spilled.contains(f))
+            });
+            new_frag.files.push(new_file.clone());
+        }
+
+        // Nothing changed in the current fragment, which is not expected -- error out
+        if &new_frag == self {
+            return Err(Error::invalid_input(
+                "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
+            ));
+        }
+        Ok(new_frag)
     }
 
     // Helper method to infer the Lance version from a set of fragments
@@ -888,6 +1090,8 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            clustering_id: p.clustering_id,
+            metadata: p.metadata,
         })
     }
 }
@@ -905,6 +1109,7 @@ impl From<&Fragment> for pb::DataFragment {
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
                 base_id: f.base_id,
+                inline: f.inline.clone(),
             }
         });
 
@@ -926,8 +1131,8 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id: f.clustering_id,
+            metadata: f.metadata.clone(),
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
@@ -1082,6 +1287,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -1263,6 +1469,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();

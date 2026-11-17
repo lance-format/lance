@@ -383,8 +383,8 @@ pub(in super::super) struct PackedPostingListGroup {
     // Every query builds one posting view per (partition, term), so what a
     // view reads is resolved from `batch` once: views neither search the
     // schema nor chase `ArrayRef`s into cold array objects. Only those buffers
-    // are kept, since each group holds them inline and prewarm caches one
-    // group per 128 dictionary rows of every partition.
+    // are kept, since each group holds them inline and prewarm caches compact
+    // contiguous ranges of dictionary rows.
     posting_offsets: OffsetBuffer<i32>,
     posting_blocks: LargeBinaryArray,
     // Inline (max_score, length) values; absent when the reader supplies them.
