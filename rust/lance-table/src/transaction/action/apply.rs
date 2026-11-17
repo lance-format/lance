@@ -1396,7 +1396,7 @@ mod tests {
     };
     use crate::transaction::action::test_support::{
         added_field, any_deletion_file, apply, apply_after_reading, apply_with_indices,
-        backed_manifest, manifest_with_base, mint_base, one_column_file,
+        backed_manifest, manifest_with_base, mint_base, one_column_file, replace_field_data,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
@@ -1656,6 +1656,56 @@ mod tests {
         .unwrap();
 
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+    }
+
+    /// A child the operation itself adds is not in the schema it builds on, so
+    /// its ancestry has to come from the schema being built for a rewrite of
+    /// its parent to reach an index on it.
+    #[test]
+    fn test_rewriting_a_struct_prunes_an_index_on_a_child_added_in_the_same_operation() {
+        let mut manifest = backed_manifest();
+        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "x",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )]))
+        .unwrap();
+
+        let mut actions = vec![
+            Action::AddField(AddField {
+                local: 0,
+                parent: Some(FieldRef::Committed(0)),
+                def: added_field("z"),
+            }),
+            Action::AddIndexSegment(AddIndexSegment {
+                uuid: Uuid::from_u128(1),
+                name: "idx".into(),
+                fields: vec![FieldRef::Local(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            }),
+        ];
+        actions.extend(replace_field_data(0, 0, true));
+
+        let (_, indices) = apply_with_indices(&manifest, actions, Vec::new()).unwrap();
+
+        let index = indices.iter().find(|index| index.name == "idx").unwrap();
+        assert!(
+            !index.fragment_bitmap.as_ref().unwrap().contains(0),
+            "rewriting s in fragment 0 should prune it from the index on s.z, got {:?}",
+            index.fragment_bitmap
+        );
     }
 
     /// An index from before fragment bitmaps has no record of what it covers,
