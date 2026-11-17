@@ -2832,20 +2832,24 @@ mod composite {
     //! action vocabulary buys -- steps that reference each other's minted ids can
     //! be squashed into one atomic manifest change.
     //!
-    //! The commit path checks that a referenced data file exists, so these tests
-    //! point their actions at files the fixture dataset already wrote. The
-    //! resulting datasets are inspected through their manifests rather than read --
-    //! the files hold the wrong columns for where they end up attached.
+    //! The commit path checks that a referenced data file exists, so most tests
+    //! point their actions at files the fixture dataset already wrote and inspect
+    //! the resulting manifests rather than read values -- the files hold the
+    //! wrong columns for where they end up attached. Tests that need real values
+    //! write a fixture whose columns stay aligned and read through the scanner.
 
     use std::sync::Arc;
 
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::{Dataset, Error, Result};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream;
     use lance_core::datatypes::Field as LanceField;
+    use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::{
@@ -3478,6 +3482,100 @@ mod composite {
         let field = schema.field("a").unwrap();
         assert_ne!(field.id, 0);
         assert_eq!(field.logical_type.to_string(), "int64");
+    }
+
+    /// A legacy V1 reader finds a field's pages by its position among the file's
+    /// fields, so dropping the first column must not tombstone its slot while a
+    /// sibling in the same file is still live. Reading the survivor through the
+    /// scanner is the check: if the file's field list shifts, `b` decodes `a`'s
+    /// pages and returns the wrong values at the wrong row ids.
+    #[tokio::test]
+    async fn test_dropping_the_first_field_of_a_v1_file_keeps_the_surviving_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values([10, 11, 12, 13])),
+                // Disjoint from `a`: decoding the wrong pages gives values that
+                // cannot be mistaken for the right ones.
+                Arc::new(Int32Array::from_iter_values([100, 101, 102, 103])),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                enable_stable_row_ids: true,
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.fragments().len(), 2);
+        for fragment in dataset.fragments().iter() {
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(
+                fragment.files[0].file_version().unwrap(),
+                LanceFileVersion::Legacy.resolve()
+            );
+            assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
+        }
+        let before = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        assert_eq!(
+            before["a"].as_primitive::<Int32Type>().values(),
+            &[10, 11, 12, 13]
+        );
+        assert_eq!(
+            before["b"].as_primitive::<Int32Type>().values(),
+            &[100, 101, 102, 103]
+        );
+        let row_ids = before["_rowid"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        assert_eq!(row_ids, vec![0, 1, 2, 3]);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(0),
+            })],
+        )
+        .await;
+
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert!(dataset.schema().field("b").is_some());
+        for fragment in dataset.fragments().iter() {
+            assert_eq!(fragment.files.len(), 1);
+            // The slot the dropped field was written at stays in place while
+            // `b` is live, so the reader can still find `b`'s pages.
+            assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
+        }
+
+        let after = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        assert!(after.column_by_name("a").is_none());
+        assert_eq!(
+            after["b"].as_primitive::<Int32Type>().values(),
+            &[100, 101, 102, 103]
+        );
+        assert_eq!(
+            after["_rowid"].as_primitive::<UInt64Type>().values(),
+            row_ids.as_slice()
+        );
+        // Values and row ids must still agree pair-wise, not just as sets.
+        for (value, row_id) in after["b"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .zip(after["_rowid"].as_primitive::<UInt64Type>().values())
+        {
+            assert_eq!(*value - 100, *row_id as i32);
+        }
     }
 
     #[tokio::test]
