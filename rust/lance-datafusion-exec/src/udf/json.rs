@@ -142,28 +142,30 @@ mod common {
         lance_arrow::json::parse_json_path(path).map_err(|e| execution_error(e.to_string()))
     }
 
-    /// Return the parse already memoized in `memo`, or parse `path` and memoize it.
+    /// The parse of the JSONPath string the previous row used.
     ///
-    /// Scalar path arguments reach the row loops as 1-element arrays that
-    /// [`get_string_value_at`] broadcasts to every row, so a single parse can
-    /// serve the whole batch instead of one parse per row. The parse stays
-    /// lazy (deferred to the first row that uses the path) so an invalid path
-    /// errors only for batches with at least one usable row, matching the
-    /// previous per-row error timing.
-    pub fn get_or_parse_path<'memo, 'path>(
-        memo: &'memo mut Option<JsonPath<'path>>,
-        path: &'path str,
-    ) -> Result<&'memo JsonPath<'path>> {
-        if memo.is_none() {
-            *memo = Some(parse_json_path(path)?);
+    /// A scalar path argument reaches the row loops as a 1-element array that
+    /// [`get_string_value_at`] broadcasts to every row, and a path column often
+    /// repeats one string, so a row whose path equals the previous row's reuses
+    /// that parse. Parsing stays lazy, so an invalid path still errors only at
+    /// the first row that uses it.
+    #[derive(Default)]
+    pub struct PathCache<'a> {
+        last: Option<(&'a str, JsonPath<'a>)>,
+    }
+
+    impl<'a> PathCache<'a> {
+        pub fn get(&mut self, path: &'a str) -> Result<&JsonPath<'a>> {
+            let last = match self.last.take() {
+                Some(last) if last.0 == path => last,
+                _ => (path, parse_json_path(path)?),
+            };
+            Ok(&self.last.insert(last).1)
         }
-        Ok(memo
-            .as_ref()
-            .expect("a parse result is stored by the branch above"))
     }
 
     // Test-only count of parse_json_path invocations, used to assert that a
-    // broadcast-scalar path is parsed once per batch instead of once per row.
+    // repeated path is parsed once per batch instead of once per row.
     // Thread-local so parallel test threads do not pollute each other's
     // counts (the row loops are synchronous, so one test stays on one thread).
     #[cfg(test)]
@@ -365,19 +367,13 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let path_array = common::extract_string_array(args, 1)?;
     let mut builder = StringBuilder::with_capacity(jsonb_array.len(), 1024);
 
-    let mut broadcast_path: Option<JsonPath> = None;
-    let mut row_path;
+    let mut paths = common::PathCache::default();
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) {
             builder.append_null();
         } else if let Some(path) = common::get_string_value_at(path_array, i) {
-            let json_path = if path_array.len() == 1 {
-                common::get_or_parse_path(&mut broadcast_path, path)?
-            } else {
-                row_path = common::parse_json_path(path)?;
-                &row_path
-            };
+            let json_path = paths.get(path)?;
             let jsonb_bytes = jsonb_array.value(i);
             match extract_json_path(jsonb_bytes, path, json_path)? {
                 Some(value) => builder.append_value(&value),
@@ -404,20 +400,14 @@ fn json_extract_with_type_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut value_builder = LargeBinaryBuilder::with_capacity(jsonb_array.len(), 1024);
     let mut type_builder = UInt8Builder::with_capacity(jsonb_array.len());
 
-    let mut broadcast_path: Option<JsonPath> = None;
-    let mut row_path;
+    let mut paths = common::PathCache::default();
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) {
             value_builder.append_null();
             type_builder.append_value(JsonbType::Null.as_u8());
         } else if let Some(path) = common::get_string_value_at(path_array, i) {
-            let json_path = if path_array.len() == 1 {
-                common::get_or_parse_path(&mut broadcast_path, path)?
-            } else {
-                row_path = common::parse_json_path(path)?;
-                &row_path
-            };
+            let json_path = paths.get(path)?;
             let jsonb_bytes = jsonb_array.value(i);
             match extract_json_path_with_type(jsonb_bytes, path, json_path)? {
                 Some((value_bytes, type_tag)) => {
@@ -554,19 +544,13 @@ fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
-    let mut broadcast_path: Option<JsonPath> = None;
-    let mut row_path;
+    let mut paths = common::PathCache::default();
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) {
             builder.append_null();
         } else if let Some(path) = common::get_string_value_at(path_array, i) {
-            let json_path = if path_array.len() == 1 {
-                common::get_or_parse_path(&mut broadcast_path, path)?
-            } else {
-                row_path = common::parse_json_path(path)?;
-                &row_path
-            };
+            let json_path = paths.get(path)?;
             let jsonb_bytes = jsonb_array.value(i);
             let exists = check_json_path_exists(jsonb_bytes, path, json_path)?;
             builder.append_value(exists);
@@ -902,8 +886,7 @@ fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
-    let mut broadcast_path: Option<JsonPath> = None;
-    let mut row_path;
+    let mut paths = common::PathCache::default();
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) {
@@ -914,12 +897,7 @@ fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
             match (path, value) {
                 (Some(p), Some(v)) => {
-                    let json_path = if path_array.len() == 1 {
-                        common::get_or_parse_path(&mut broadcast_path, p)?
-                    } else {
-                        row_path = common::parse_json_path(p)?;
-                        &row_path
-                    };
+                    let json_path = paths.get(p)?;
                     let jsonb_bytes = jsonb_array.value(i);
                     let contains = check_array_contains(jsonb_bytes, p, json_path, v)?;
                     builder.append_value(contains);
@@ -1014,19 +992,13 @@ fn json_array_length_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     let mut builder = Int64Builder::with_capacity(jsonb_array.len());
 
-    let mut broadcast_path: Option<JsonPath> = None;
-    let mut row_path;
+    let mut paths = common::PathCache::default();
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) {
             builder.append_null();
         } else if let Some(path) = common::get_string_value_at(path_array, i) {
-            let json_path = if path_array.len() == 1 {
-                common::get_or_parse_path(&mut broadcast_path, path)?
-            } else {
-                row_path = common::parse_json_path(path)?;
-                &row_path
-            };
+            let json_path = paths.get(path)?;
             let jsonb_bytes = jsonb_array.value(i);
             match get_array_length(jsonb_bytes, path, json_path)? {
                 Some(len) => builder.append_value(len),
@@ -1558,8 +1530,7 @@ mod tests {
     fn test_scalar_path_parsed_once_per_batch() {
         // A scalar path argument arrives as a 1-element array that
         // get_string_value_at broadcasts to every row, so all five JSONPath
-        // row loops must parse it once per batch. Per-row (column) paths keep
-        // one parse per row.
+        // row loops must parse it once per batch.
         let json = r#"{"user": {"name": "Alice"}, "tags": ["a", "b"]}"#;
         let jsonb_bytes = create_test_jsonb(json);
         const ROWS: usize = 32;
@@ -1598,17 +1569,17 @@ mod tests {
         json_array_length_impl(&[jsonb_array.clone(), scalar_path]).unwrap();
         assert_eq!(common::parse_calls(), 1, "json_array_length");
 
-        // A per-row path column still parses once per non-null row (the
-        // trailing null row skips the path entirely).
-        let column_path: ArrayRef =
-            Arc::new(StringArray::from_iter((0..=ROWS).map(|_| Some("$.tags"))));
+        // A path column parses again only where the path changes.
+        let column_path: ArrayRef = Arc::new(StringArray::from_iter(
+            (0..=ROWS).map(|i| Some(if i < ROWS / 2 { "$.tags" } else { "$.user" })),
+        ));
         common::reset_parse_calls();
         json_array_length_impl(&[jsonb_array, column_path]).unwrap();
-        assert_eq!(common::parse_calls(), ROWS);
+        assert_eq!(common::parse_calls(), 2);
     }
 
-    #[tokio::test]
-    async fn test_json_udfs_broadcast_scalar_path() -> Result<()> {
+    #[test]
+    fn test_json_udfs_broadcast_scalar_path() -> Result<()> {
         // Results with a broadcast scalar path (1-element array) must be
         // identical to the equivalent per-row path column, including null
         // rows, and a null scalar path must null every output row.
