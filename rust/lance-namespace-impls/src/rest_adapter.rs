@@ -33,9 +33,9 @@ use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::*;
 
-/// Default [`RestAdapterConfig::max_request_body_size`]: large enough for
-/// real Arrow IPC batches sent to the data-upload endpoints, while still
-/// bounding per-request memory on untrusted networks.
+/// Default [`RestAdapter::with_max_request_body_size`]: large enough for the
+/// Arrow IPC batches sent to the data-upload endpoints, while still bounding
+/// per-request memory.
 const DEFAULT_MAX_REQUEST_BODY_SIZE: usize = 512 * 1024 * 1024;
 
 /// Configuration for the REST server
@@ -45,12 +45,6 @@ pub struct RestAdapterConfig {
     pub host: String,
     /// Port to listen on
     pub port: u16,
-    /// Maximum request body size accepted by the server, in bytes. Bodies
-    /// over this size are rejected before the backend namespace runs.
-    /// Without this, axum silently caps request bodies at 2 MiB, which
-    /// rejects the Arrow IPC payloads the data-upload endpoints (`create`,
-    /// `insert`, `merge_insert`) exist to receive.
-    pub max_request_body_size: usize,
 }
 
 impl Default for RestAdapterConfig {
@@ -58,7 +52,6 @@ impl Default for RestAdapterConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 2333,
-            max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
         }
     }
 }
@@ -67,12 +60,24 @@ impl Default for RestAdapterConfig {
 pub struct RestAdapter {
     backend: Arc<dyn LanceNamespace>,
     config: RestAdapterConfig,
+    max_request_body_size: usize,
 }
 
 impl RestAdapter {
     /// Create a new REST server with the given backend namespace
     pub fn new(backend: Arc<dyn LanceNamespace>, config: RestAdapterConfig) -> Self {
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
+        }
+    }
+
+    /// Set the largest request body the server accepts, in bytes (512 MiB by
+    /// default). Larger requests are rejected with 413 before the backend runs.
+    pub fn with_max_request_body_size(mut self, max_request_body_size: usize) -> Self {
+        self.max_request_body_size = max_request_body_size;
+        self
     }
 
     /// Build the Axum router with all REST API routes
@@ -181,9 +186,9 @@ impl RestAdapter {
             .route("/v1/table", get(list_all_tables))
             .layer(axum::middleware::map_response(rejection_to_error_response))
             .layer(TraceLayer::new_for_http())
-            // Raise axum's 2 MiB default body limit so the Arrow IPC payloads
-            // of the data-upload endpoints are not rejected with 413.
-            .layer(DefaultBodyLimit::max(self.config.max_request_body_size))
+            // axum caps request bodies at 2 MiB by default, which rejects the
+            // Arrow IPC payloads of the data-upload endpoints.
+            .layer(DefaultBodyLimit::max(self.max_request_body_size))
             .with_state(self.backend.clone())
     }
 
@@ -457,15 +462,13 @@ fn json_response<T: Serialize>(status: StatusCode, response: T) -> Response {
 }
 
 /// Answers axum's plain-text rejection of a malformed request (bad JSON, a
-/// missing content type, an unparsable query, an over-size body) with the
-/// spec's 400 error model.
+/// missing content type, an unparsable query) with the spec's 400 error model.
 async fn rejection_to_error_response(response: Response) -> Response {
     let rejected = matches!(
         response.status(),
         StatusCode::BAD_REQUEST
             | StatusCode::UNSUPPORTED_MEDIA_TYPE
             | StatusCode::UNPROCESSABLE_ENTITY
-            | StatusCode::PAYLOAD_TOO_LARGE
     );
     let is_json = response
         .headers()
@@ -2341,41 +2344,28 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn test_body_over_configured_limit_answers_spec_error() {
-            // A body over the configured limit is rejected by the router
-            // before the backend runs; the rejection must carry the spec's
-            // JSON error model, not axum's plain text.
+        async fn test_body_over_configured_limit_is_rejected() {
+            // A body over the configured limit is rejected before the
+            // backend runs.
             let recorder = Arc::new(RecordingNamespace::default());
             let config = RestAdapterConfig {
                 port: 0,
-                // Any limit below the fixture size exercises the rejection.
-                max_request_body_size: 16,
                 ..Default::default()
             };
-            let server = RestAdapter::new(recorder.clone(), config);
+            let server = RestAdapter::new(recorder.clone(), config).with_max_request_body_size(16);
             let server_handle = server.start().await.unwrap();
-            let namespace = RestNamespaceBuilder::new(url(&server_handle))
-                .delimiter("$")
-                .build();
 
-            let result = namespace
-                .create_table(
-                    CreateTableRequest {
-                        id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                        mode: Some("Create".to_string()),
-                        ..Default::default()
-                    },
-                    create_test_arrow_data(),
-                )
-                .await;
-
-            let err_msg = result.unwrap_err().to_string();
-            assert!(
-                err_msg.contains("Invalid input"),
-                "size rejection must be the spec error model, got: {}",
-                err_msg
-            );
-            // The rejected request never reached the backend.
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/test_namespace$test_table/create",
+                    server_handle.port()
+                ))
+                .header(CONTENT_TYPE, "application/vnd.apache.arrow.stream")
+                .body(create_test_arrow_data().to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
             assert!(
                 recorder.received("create_table").is_null(),
                 "rejected upload must not reach the backend"
