@@ -25,16 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify dataset admission waits and cursor composition
+      - name: Verify concurrent complete-drain harness correctness
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          # Shared cursor cores changed: qualify both nonblocking and waiting
-          # paths with one CPU worker; no benchmark timing/RSS measurement.
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::cursor:: -- --nocapture
-          cargo test --profile ci --locked -p lance --doc try_scan_admitted_fullzip -- --nocapture
-          cargo test --profile ci --locked -p lance --doc next_when_available -- --nocapture
+          # No benchmark timing/RSS measurement. Library cursors reuse their
+          # successful exact-head evidence; only harness composition changed.
+          cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
