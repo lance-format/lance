@@ -442,9 +442,9 @@ def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
             query = query.value
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
-    elif isinstance(query, (list, tuple)) or (
-        _check_for_numpy(query) and isinstance(query, np.ndarray)
-    ):
+    elif isinstance(query, (list, tuple)):
+        query = pa.array(query, type=pa.float32(), from_pandas=True)
+    elif _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
     elif not isinstance(query, pa.Array):

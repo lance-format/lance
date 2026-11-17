@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=18", "lance-namespace>=0.13.0,<0.14"]
+dependencies = ["pyarrow>=14", "lance-namespace>=0.13.0,<0.14"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -53,6 +53,7 @@ tests = [
     "datasets==4.4.0",
     "duckdb>=1.5.0,<1.6.0",
     "ml_dtypes",
+    "numpy>=1.22",
     "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
@@ -77,6 +78,7 @@ tests = [
     "datasets==4.4.0",
     "duckdb>=1.5.0,<1.6.0",
     "ml_dtypes==0.5.3",
+    "numpy>=1.22",
     "pillow==11.3.0",
     "pandas==2.3.3",
     "polars[pyarrow,pandas]==1.34.0",
