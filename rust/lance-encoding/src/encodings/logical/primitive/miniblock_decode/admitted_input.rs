@@ -306,9 +306,12 @@ impl MiniBlockArrayInput {
                 self.task.num_buffers,
                 self.task.has_large_chunk,
             )?;
-            // The on-disk level count is u16 and may wrap. On flat pages every
-            // item has one level; chunk metadata independently proves the count.
-            if u64::from(sections.num_levels) != chunk.items_in_chunk % 65536 {
+            // The count is meaningful only with structural buffers: the writer
+            // emits zero when rep/def are absent. With flat definition levels,
+            // chunk metadata independently proves the possibly wrapped u16 count.
+            if self.task.def_decompressor.is_some()
+                && u64::from(sections.num_levels) != chunk.items_in_chunk % 65536
+            {
                 return Err(corrupt("chunk level header disagrees with flat item count"));
             }
         }

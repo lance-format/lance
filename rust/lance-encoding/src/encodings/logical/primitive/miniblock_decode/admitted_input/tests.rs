@@ -22,10 +22,13 @@ fn fixture(bits: u8, large: bool, nullable: bool, chunks: usize) -> (PageInfo, V
     }
     payload.extend_from_slice(b"abcd");
     payload.resize(payload.len().next_multiple_of(width), 0);
-    let mut chunk = 4_u16.to_le_bytes().to_vec();
-    for len in nullable.then_some(8).into_iter().chain([payload.len()]) {
-        chunk.extend_from_slice(&(len as u32).to_le_bytes()[..if large { 4 } else { 2 }]);
+    // The writer emits zero levels when there is no rep/def. Only value-buffer
+    // lengths widen with the chunk format; structural lengths stay u16.
+    let mut chunk = if nullable { 4_u16 } else { 0 }.to_le_bytes().to_vec();
+    if nullable {
+        chunk.extend_from_slice(&8_u16.to_le_bytes());
     }
+    chunk.extend_from_slice(&(payload.len() as u32).to_le_bytes()[..if large { 4 } else { 2 }]);
     chunk.resize(chunk.len().next_multiple_of(MINIBLOCK_ALIGNMENT), 0);
     if nullable {
         chunk.extend_from_slice(bytemuck::cast_slice(&[0_u16, 1, 0, 0]));
@@ -289,7 +292,7 @@ fn malformed_page_descriptors_are_rejected_before_reads() {
 
 #[tokio::test]
 async fn chunk_header_count_is_checked_before_decode_output() {
-    let (page, mut bytes, expected) = fixture(32, false, false, 2);
+    let (page, mut bytes, expected) = fixture(32, false, true, 2);
     let start = page.buffer_offsets_and_sizes[1].0 as usize;
     bytes[start..start + 2].copy_from_slice(&3_u16.to_le_bytes());
     let budget = AllocationBudget::new(8192);
