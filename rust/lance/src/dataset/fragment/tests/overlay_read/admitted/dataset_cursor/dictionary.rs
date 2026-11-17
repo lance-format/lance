@@ -69,7 +69,10 @@ fn values(prefix: &str, rows: usize, nested: bool) -> ArrayRef {
 async fn assert_dictionary(dataset: &Dataset, file: &DataFile, field: i32, nested: bool) {
     let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::new(1024));
     let source = scheduler
-        .open_file(&dataset.data_dir().join(&file.path), &file.file_size_bytes)
+        .open_file(
+            &dataset.data_dir().join(file.path.as_str()),
+            &file.file_size_bytes,
+        )
         .await
         .unwrap();
     let reader = FileReader::try_open(
