@@ -37,6 +37,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -164,6 +165,38 @@ public class VectorSearchTest {
             assertFalse(reader.loadNextBatch(), "Expected only one batch");
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void test_quantized_refine_rejects_non_rq_index() throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_quantized_refine_rejects_non_rq_index"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        testVectorDataset.createIndex(dataset);
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .nearest(
+                    new Query.Builder()
+                        .setColumn(TestVectorDataset.vectorColumnName)
+                        .setKey(new float[32])
+                        .setK(5)
+                        .setQuantizedRefineFactor(2)
+                        .build())
+                .build();
+
+        IOException error =
+            assertThrows(
+                IOException.class,
+                () -> {
+                  try (Scanner scanner = dataset.newScan(options);
+                      ArrowReader reader = scanner.scanBatches()) {
+                    reader.loadNextBatch();
+                  }
+                });
+        assertTrue(
+            error.getMessage().contains("requires an IVF_RQ flat index"), error.getMessage());
       }
     }
   }

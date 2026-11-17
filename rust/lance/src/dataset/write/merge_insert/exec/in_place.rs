@@ -7,8 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext, context::SessionContext},
     physical_plan::{
@@ -408,6 +412,13 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -459,6 +470,8 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let write_time =
+            MetricBuilder::new(&self.metrics).subset_time("merge_write_time", partition);
         let metrics = MergeInsertMetrics::new(&self.metrics, partition);
 
         let input_stream = self.input.execute(partition, context)?;
@@ -469,12 +482,15 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let mem_wal_dir_id = self.params.mem_wal_dir_id.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let spill_session_context = self.spill_session_context.clone();
         let spill_execution_options = self.spill_execution_options.clone();
         let write_params = self.write_params.clone();
 
         let result_stream = stream::once(async move {
+            // Time lazy execution, including upstream waits, rather than stream construction.
+            let _write_timer = write_time.timer();
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // A guess: a compatible transaction can commit before this one, in
             // which case the real commit version is later. `matched_offsets`
@@ -523,6 +539,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_dir_id,
                 compacted_sstables,
                 // In-place patches leave every row where it was, so no index's
                 // fragment bitmap needs extending.

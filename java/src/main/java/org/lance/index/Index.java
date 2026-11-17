@@ -18,7 +18,9 @@ import com.google.common.base.MoreObjects;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -41,6 +43,8 @@ public class Index {
   private final Long sizeBytes;
   private final List<IndexFile> files;
   private final IndexType indexType;
+  private final Long clusteringId;
+  private final Map<String, String> metadata;
 
   private Index(
       UUID uuid,
@@ -55,7 +59,14 @@ public class Index {
       Integer baseId,
       Long sizeBytes,
       List<IndexFile> files,
-      IndexType indexType) {
+      IndexType indexType,
+      Long clusteringId,
+      Map<String, String> metadata) {
+    this.clusteringId = clusteringId;
+    this.metadata =
+        metadata == null
+            ? Collections.emptyMap()
+            : Collections.unmodifiableMap(new HashMap<>(metadata));
     this.uuid = uuid;
     this.fields = fields;
     this.coveringFields = coveringFields;
@@ -99,12 +110,13 @@ public class Index {
   }
 
   /**
-   * Fields whose values this index carries but is not keyed on. Always a suffix of {@link
-   * #fields()}, and never all of it, so the first entry of {@code fields()} is always a column the
-   * index is keyed on. Empty for an index that carries no extra columns.
+   * Fields whose values this index carries. Empty for an index that carries no extra columns.
    *
-   * <p>These ids also appear in {@link #fields()} — that is deliberate, so that every consumer
-   * reading {@code fields()} as the index's dependency set also covers them with no change.
+   * <p>When these ids are a shorter trailing slice of {@link #fields()}, those trailing entries of
+   * {@code fields()} are carried, not keyed on, and the first entry of {@code fields()} is a column
+   * the index is keyed on. Otherwise every entry of {@code fields()} is a key, and this list may
+   * repeat entries of {@code fields()}. A consumer reading the index's dependency set reads both
+   * lists.
    *
    * @return the covering field IDs
    */
@@ -130,10 +142,25 @@ public class Index {
     return datasetVersion;
   }
 
+  /**
+   * Fragment IDs recorded in this index segment's manifest bitmap.
+   *
+   * <p>This reflects the raw fragment bitmap stored for the segment and may still include fragment
+   * IDs that have since been removed by deletes or compactions until index maintenance rewrites the
+   * segment.
+   *
+   * @return the recorded fragment IDs, or empty if no fragment bitmap is present
+   */
   public Optional<List<Integer>> fragments() {
     return Optional.ofNullable(fragments);
   }
 
+  /**
+   * Raw protobuf-encoded {@code google.protobuf.Any} index details stored in the manifest, or empty
+   * when the segment was committed without index details.
+   *
+   * @return the encoded index details bytes, or empty if absent
+   */
   public Optional<byte[]> indexDetails() {
     return Optional.ofNullable(indexDetails);
   }
@@ -179,10 +206,35 @@ public class Index {
   /**
    * Get the type of the index (e.g., BTREE, BITMAP, VECTOR).
    *
+   * <p>Resolved from {@link #indexDetails()} when present, or inferred from the index metadata and
+   * dataset files when {@code index_details} was not persisted in the manifest.
+   *
    * @return the index type, or null if unknown
    */
   public IndexType indexType() {
     return indexType;
+  }
+
+  /**
+   * The clustering definition this segment was built under, by its id in the manifest. Changes to
+   * the same segment keep it; a segment built from this one does not inherit it. The value is
+   * within the unsigned 32-bit range.
+   *
+   * @return the clustering definition id, or empty when the segment has none
+   */
+  public Optional<Long> clusteringId() {
+    return Optional.ofNullable(clusteringId);
+  }
+
+  /**
+   * Generic metadata attached to this segment, like the dataset's table metadata. Changes to the
+   * same segment preserve every entry, including keys this library does not understand; new
+   * segments carry only what their creator sets.
+   *
+   * @return the metadata, never null; empty when there is none
+   */
+  public Map<String, String> metadata() {
+    return metadata;
   }
 
   @Override
@@ -202,7 +254,9 @@ public class Index {
         && Objects.equals(baseId, index.baseId)
         && Objects.equals(sizeBytes, index.sizeBytes)
         && Objects.equals(files, index.files)
-        && indexType == index.indexType;
+        && indexType == index.indexType
+        && Objects.equals(clusteringId, index.clusteringId)
+        && Objects.equals(metadata, index.metadata);
   }
 
   @Override
@@ -220,7 +274,9 @@ public class Index {
             sizeBytes,
             files,
             fragments,
-            indexType);
+            indexType,
+            clusteringId,
+            metadata);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -239,6 +295,8 @@ public class Index {
         .add("baseId", baseId)
         .add("sizeBytes", sizeBytes)
         .add("files", files)
+        .add("clusteringId", clusteringId)
+        .add("metadata", metadata)
         .toString();
   }
 
@@ -266,6 +324,8 @@ public class Index {
     private Long sizeBytes;
     private List<IndexFile> files;
     private IndexType indexType;
+    private Long clusteringId;
+    private Map<String, String> metadata = Collections.emptyMap();
 
     private Builder() {}
 
@@ -334,6 +394,21 @@ public class Index {
       return this;
     }
 
+    /**
+     * The clustering definition id this segment was built under, or null for none. Must be within
+     * the unsigned 32-bit range.
+     */
+    public Builder clusteringId(Long clusteringId) {
+      this.clusteringId = clusteringId;
+      return this;
+    }
+
+    /** Generic metadata attached to this segment; null is treated as empty. */
+    public Builder metadata(Map<String, String> metadata) {
+      this.metadata = metadata;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -348,7 +423,9 @@ public class Index {
           baseId,
           sizeBytes,
           files,
-          indexType);
+          indexType,
+          clusteringId,
+          metadata);
     }
   }
 }

@@ -218,22 +218,35 @@ impl Default for CapturedRowIds {
     }
 }
 
-/// Returns the physical field for a view type, or `None` if no conversion is needed.
+/// Returns the physical field when it contains view arrays, including nested ones.
 fn physical_field(field: &ArrowField) -> Option<ArrowField> {
-    match field.data_type() {
-        DataType::Utf8View => Some(
-            ArrowField::new(field.name(), DataType::Utf8, field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        ),
-        DataType::BinaryView => Some(
-            ArrowField::new(field.name(), DataType::Binary, field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        ),
-        _ => None,
-    }
+    let data_type = match field.data_type() {
+        DataType::Utf8View => DataType::Utf8,
+        DataType::BinaryView => DataType::Binary,
+        DataType::Struct(fields) => {
+            let mut physical_fields = None;
+            for (index, child) in fields.iter().enumerate() {
+                if let Some(physical) = physical_field(child) {
+                    physical_fields.get_or_insert_with(|| fields.to_vec())[index] =
+                        Arc::new(physical);
+                }
+            }
+            DataType::Struct(physical_fields?.into())
+        }
+        DataType::List(child) => DataType::List(Arc::new(physical_field(child)?)),
+        DataType::LargeList(child) => DataType::LargeList(Arc::new(physical_field(child)?)),
+        DataType::FixedSizeList(child, size) => {
+            DataType::FixedSizeList(Arc::new(physical_field(child)?), *size)
+        }
+        DataType::Map(entries, sorted) => {
+            DataType::Map(Arc::new(physical_field(entries)?), *sorted)
+        }
+        _ => return None,
+    };
+    Some(field.clone().with_data_type(data_type))
 }
 
-/// Cast `Utf8View`/`BinaryView` columns in a batch to their classic offset equivalents.
+/// Cast view arrays to offset arrays, preserving nested fields and extension metadata.
 fn downcast_view_columns(
     batch: &RecordBatch,
 ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
@@ -270,7 +283,7 @@ fn downcast_view_columns(
 }
 
 /// Converts between the Arrow representations callers use and the ones Lance
-/// stores: Arrow JSON text ↔ Lance JSONB, and top-level view arrays → offset
+/// stores: Arrow JSON text ↔ Lance JSONB, and view arrays → offset
 /// arrays.
 ///
 /// Dataset writes convert once, in the data file writer
@@ -316,13 +329,12 @@ impl SchemaAdapter {
     fn physical_schema(logical_schema: &ArrowSchemaRef) -> ArrowSchemaRef {
         let mut new_fields = Vec::with_capacity(logical_schema.fields().len());
         for field in logical_schema.fields() {
-            if has_arrow_json_fields(field) {
-                new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
-            } else if let Some(phys) = physical_field(field) {
-                new_fields.push(Arc::new(phys));
+            let field = if has_arrow_json_fields(field) {
+                Arc::new(arrow_json_to_lance_json(field))
             } else {
-                new_fields.push(Arc::clone(field));
-            }
+                Arc::clone(field)
+            };
+            new_fields.push(physical_field(&field).map(Arc::new).unwrap_or(field));
         }
         Arc::new(ArrowSchema::new_with_metadata(
             new_fields,
@@ -396,6 +408,59 @@ impl SchemaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Array, StringArray, StringViewArray, StructArray};
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+    #[test]
+    fn nested_views_and_json_reader_schema_matches_batches() {
+        let fields = vec![
+            Arc::new(ArrowField::new("name", DataType::Utf8View, true)),
+            Arc::new(
+                ArrowField::new("document", DataType::Utf8, true).with_metadata(
+                    [(
+                        ARROW_EXT_NAME_KEY.to_string(),
+                        ARROW_JSON_EXT_NAME.to_string(),
+                    )]
+                    .into(),
+                ),
+            ),
+        ];
+        let values = StructArray::new(
+            fields.into(),
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    Some("a sufficiently long view"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
+            ],
+            None,
+        );
+        let field = ArrowField::new("data", values.data_type().clone(), true)
+            .with_metadata([("custom".into(), "preserved".into())].into());
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let adapter = SchemaAdapter::new(schema.clone());
+        assert!(adapter.requires_physical_conversion());
+        let mut reader = adapter.to_physical_reader(Box::new(RecordBatchIterator::new(
+            [Ok(batch.clone())],
+            schema,
+        )));
+        let converted = reader.next().unwrap().unwrap();
+        assert_eq!(converted.schema(), reader.schema());
+        assert_eq!(converted, adapter.to_physical_batch(batch).unwrap());
+        let DataType::Struct(fields) = converted.schema().field(0).data_type().clone() else {
+            panic!("expected a struct");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        assert_eq!(fields[1].data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            converted.schema().field(0).metadata()["custom"],
+            "preserved"
+        );
+        assert!(!SchemaAdapter::new(converted.schema()).requires_physical_conversion());
+    }
 
     #[test]
     fn capture_created_at_extends_a_run_across_batches() {

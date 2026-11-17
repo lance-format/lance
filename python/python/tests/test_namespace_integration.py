@@ -260,6 +260,8 @@ def create_tracking_namespace(
 
     inner_ns_client = DirectoryNamespace(**dir_props)
     ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+    # Table operations require their parent namespace to exist.
+    ns_client.create_namespace(CreateNamespaceRequest(id=["test_ns"], mode="ExistOk"))
     return ns_client, inner_ns_client
 
 
@@ -1117,6 +1119,9 @@ def test_basic_create_and_drop_on_s3(s3_bucket: str, use_custom: bool):
     dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
     inner_ns_client = DirectoryNamespace(**dir_props)
     ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+
+    # createTable requires the parent namespace to exist.
+    ns_client.create_namespace(CreateNamespaceRequest(id=["test_ns"]))
 
     table_name = "basic_test_table"
     table_data = create_test_table_data()

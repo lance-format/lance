@@ -1,0 +1,3 @@
+   id                     title  _score
+0   1  Albino elephant sighting  2.7726
+1   2      Safari packing guide  1.3440

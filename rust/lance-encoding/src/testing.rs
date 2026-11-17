@@ -11,8 +11,7 @@ use crate::{
     },
 };
 
-use arrow_array::{Array, StructArray, UInt64Array, make_array};
-use arrow_data::transform::{Capacities, MutableArrayData};
+use arrow_array::{Array, StructArray, UInt64Array};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, Field as ArrowField, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
@@ -942,6 +941,7 @@ fn tag(e: &Compression) -> &'static str {
         Delta(_) => "delta",
         AxisDelta(_) => "axis_delta",
         Alp(_) => "alp",
+        Pcodec(_) => "pcodec",
     }
 }
 
@@ -989,6 +989,7 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
             Some(children)
         }
         FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        Pcodec(p) => p.values.as_ref().map(|b| vec![b.as_ref()]),
         VariablePackedStruct(v) => {
             let nested: Vec<&CompressiveEncoding> = v
                 .fields
@@ -1379,19 +1380,6 @@ async fn check_round_trip_encoding_inner(
     // that Arrow's lossy merge cannot combine).
     let concat_data = if test_cases.skip_validation || expected_override.is_some() {
         None
-    } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
-        // TODO(tsaucer) When arrow upgrades to 56, remove this if statement
-        // This is due to a check for concat_struct in arrow-rs. See https://github.com/lance-format/lance/pull/4598
-        let capacities = Capacities::Array(num_rows as usize);
-        let array_data: Vec<_> = data.iter().map(|a| a.to_data()).collect::<Vec<_>>();
-        let array_data = array_data.iter().collect();
-        let mut mutable = MutableArrayData::with_capacities(array_data, false, capacities);
-
-        for (i, a) in data.iter().enumerate() {
-            mutable.extend(i, 0, a.len())
-        }
-
-        Some(make_array(mutable.freeze()))
     } else {
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
@@ -1572,6 +1560,11 @@ async fn check_round_trip_random(
                 };
 
                 for num_ingest_batches in test_cases.ingest_batch_counts.iter().copied() {
+                    // A single slice covering the whole array at offset 0 is the
+                    // same array as the unsliced single batch.
+                    if use_slicing && num_ingest_batches == 1 {
+                        continue;
+                    }
                     let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                     let mut data = Vec::new();
 
