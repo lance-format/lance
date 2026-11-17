@@ -14,7 +14,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -932,7 +932,8 @@ impl FromStr for SchedulerErrorMode {
 /// Note: The 2.X file readers already do this so this is only a concern if you are
 /// using the ScanScheduler directly.
 pub struct ScanScheduler {
-    memory_pool: Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>,
+    // Freeze admission on first open, including an explicitly unaccounted reader.
+    memory_pool: OnceLock<Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>>,
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
@@ -1066,7 +1067,7 @@ impl ScanScheduler {
             IoQueueType::Standard(io_queue)
         };
         let scheduler = Arc::new(Self {
-            memory_pool: None,
+            memory_pool: OnceLock::new(),
             object_store,
             io_queue,
             stats,
@@ -1099,7 +1100,9 @@ impl ScanScheduler {
     /// Returned buffers retain their charges through cloning and slicing. The
     /// reader must implement [`Reader::configure_memory_reserver`]; unsupported
     /// backends return an error on open rather than issuing unaccounted reads.
-    /// This does not account for decoded arrays or scheduler request metadata.
+    /// Configuration is allowed once, including when shared with memory observers,
+    /// and must precede the first file open. This does not account for decoded
+    /// arrays or scheduler request metadata.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -1111,20 +1114,14 @@ impl ScanScheduler {
     /// }
     /// ```
     pub fn with_memory_reserver(
-        mut self: Arc<Self>,
+        self: Arc<Self>,
         pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
     ) -> Result<Arc<Self>> {
-        let scheduler = Arc::get_mut(&mut self).ok_or_else(|| {
+        self.memory_pool.set(Some(pool)).map_err(|_| {
             Error::invalid_input(
-                "scheduler memory reserver must be configured before sharing the scheduler",
+                "scheduler memory reserver must be configured before opening files and can only be configured once",
             )
         })?;
-        if scheduler.memory_pool.is_some() {
-            return Err(Error::invalid_input(
-                "scheduler memory reserver is already configured",
-            ));
-        }
-        scheduler.memory_pool = Some(pool);
         Ok(self)
     }
 
@@ -1142,7 +1139,7 @@ impl ScanScheduler {
         base_priority: u64,
         file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
-        let reader = if let Some(pool) = &self.memory_pool {
+        let reader = if let Some(pool) = self.memory_pool.get_or_init(|| None) {
             // SmallReader caches the entire object. Open the actual backend in
             // this mode, including admission and ownership for open/HEAD tasks.
             let known_size = file_size_bytes

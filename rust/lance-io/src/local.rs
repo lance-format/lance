@@ -848,9 +848,11 @@ mod tests {
         });
         let mut config = SchedulerConfig::new(4096);
         config.use_lite_scheduler = Some(lite);
-        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), config)
-            .with_memory_reserver(pool)
-            .unwrap();
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), config);
+        // Memory observation retains a weak reference before admission is configured.
+        let observed = Arc::downgrade(&scheduler);
+        let scheduler = scheduler.with_memory_reserver(pool).unwrap();
+        assert!(Arc::ptr_eq(&scheduler, &observed.upgrade().unwrap()));
         let reader = scheduler
             .open_file(
                 &Path::from_filesystem_path(file.path()).unwrap(),
@@ -869,6 +871,41 @@ mod tests {
         assert!(used.load(Ordering::Acquire) >= 12 + 1024);
         drop(remaining);
         assert_eq!(used.load(Ordering::Acquire), 0);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_read_scheduler_rejects_reconfiguration(
+        #[values(false, true)] lite: bool,
+        #[values(false, true)] configured: bool,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 16 * 1024,
+            ..Default::default()
+        });
+        let mut config = SchedulerConfig::new(4096);
+        config.use_lite_scheduler = Some(lite);
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), config);
+        let scheduler = if configured {
+            scheduler.with_memory_reserver(pool.clone()).unwrap()
+        } else {
+            let _reader = scheduler
+                .open_file(
+                    &Path::from_filesystem_path(file.path()).unwrap(),
+                    &CachedFileSize::unknown(),
+                )
+                .await
+                .unwrap();
+            scheduler
+        };
+        let error = scheduler.with_memory_reserver(pool).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(
+                "must be configured before opening files and can only be configured once"
+            )
+        );
     }
 
     #[rstest::rstest]
