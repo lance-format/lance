@@ -8,7 +8,7 @@ use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::session::session_from_handle;
-use crate::traits::{FromJString, IntoJava};
+use crate::traits::{FromJObjectWithEnv, FromJString, IntoJava, import_vec_to_rust};
 use crate::utils::{
     extract_base_store_params, extract_storage_options, extract_write_params, to_rust_map,
 };
@@ -346,6 +346,39 @@ fn inner_native_migrate_manifest_paths_v2(env: &mut JNIEnv, java_dataset: JObjec
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     block_on(dataset_guard.inner.migrate_manifest_paths_v2())?;
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeAddBases(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    new_bases: JObject,              // List<BasePath>
+    transaction_properties: JObject, // Optional<Map<String, String>>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_native_add_bases(&mut env, java_dataset, new_bases, transaction_properties)
+    )
+}
+
+fn inner_native_add_bases(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    new_bases: JObject,
+    transaction_properties: JObject,
+) -> Result<()> {
+    let new_bases = import_vec_to_rust(env, &new_bases, |env, base| base.extract_object(env))?;
+    let transaction_properties = env.get_optional(&transaction_properties, |env, map_obj| {
+        let jmap = JMap::from_env(env, &map_obj)?;
+        to_rust_map(env, &jmap)
+    })?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let new_dataset = block_on(
+        Arc::new(dataset_guard.inner.clone()).add_bases(new_bases, transaction_properties),
+    )?;
+    dataset_guard.inner = new_dataset;
     Ok(())
 }
 
