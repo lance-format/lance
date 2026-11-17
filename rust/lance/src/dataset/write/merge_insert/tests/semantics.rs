@@ -1724,7 +1724,7 @@ async fn test_merge_insert_spill_for_retry_false_fails_fast() {
                 "true".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("value", DataType::UInt32, false),
     ]));

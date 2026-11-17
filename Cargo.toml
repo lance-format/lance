@@ -87,19 +87,19 @@ all_asserts = "2.3.1"
 approx = "0.5.1"
 argminmax = "0.7.1"
 # Note that this one does not include pyarrow
-arrow = { version = "59.3.2", optional = false, features = ["prettyprint"] }
-lance-arrow-scalar = { version = "=59.0.0", path = "./rust/arrow-scalar" }
-lance-arrow-stats = { version = "=59.0.0", path = "./rust/arrow-stats" }
-arrow-arith = "59.3.2"
-arrow-array = "59.3.2"
-arrow-buffer = "59.3.2"
-arrow-cast = "59.3.2"
-arrow-data = "59.3.2"
-arrow-ipc = { version = "59.3.2", features = ["zstd"] }
-arrow-ord = "59.3.2"
-arrow-row = "59.3.2"
-arrow-schema = "59.3.2"
-arrow-select = "59.3.2"
+arrow = { version = "60.0.0", optional = false, features = ["prettyprint"] }
+lance-arrow-scalar = { version = "=60.0.0", path = "./rust/arrow-scalar" }
+lance-arrow-stats = { version = "=60.0.0", path = "./rust/arrow-stats" }
+arrow-arith = "60.0.0"
+arrow-array = "60.0.0"
+arrow-buffer = "60.0.0"
+arrow-cast = "60.0.0"
+arrow-data = "60.0.0"
+arrow-ipc = { version = "60.0.0", features = ["zstd"] }
+arrow-ord = "60.0.0"
+arrow-row = "60.0.0"
+arrow-schema = "60.0.0"
+arrow-select = "60.0.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 axum = "0.7"
@@ -135,7 +135,9 @@ criterion = { version = "0.8.2", features = [
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
-datafusion = { version = "55.2.0", default-features = false, features = [
+# DataFusion 56's Arrow 60 integration is not published yet. Pin its RC source
+# until https://github.com/apache/datafusion/issues/24461 is released.
+datafusion = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c", default-features = false, features = [
     "crypto_expressions",
     "datetime_expressions",
     "encoding_expressions",
@@ -145,15 +147,15 @@ datafusion = { version = "55.2.0", default-features = false, features = [
     "string_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "55.2.0"
-datafusion-functions = { version = "55.2.0", default-features = false, features = ["regex_expressions"] }
-datafusion-sql = "55.2.0"
-datafusion-execution = "55.2.0"
-datafusion-expr = "55.2.0"
-datafusion-functions-nested = "55.2.0"
-datafusion-physical-expr = "55.2.0"
-datafusion-physical-plan = "55.2.0"
-datafusion-substrait = { version = "55.2.0", default-features = false }
+datafusion-common = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-functions = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c", default-features = false, features = ["regex_expressions"] }
+datafusion-sql = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-execution = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-expr = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-functions-nested = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-physical-expr = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-physical-plan = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-substrait = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
 env_logger = "0.11.7"
@@ -161,9 +163,11 @@ nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=15.0.0-beta.23", path = "./rust/compression/fsst" }
 futures = "0.3"
-geoarrow-array = "0.9"
-geoarrow-schema = "0.9"
-geodatafusion = "0.6.0"
+geoarrow-array = "0.10"
+geoarrow-schema = "0.10"
+# The support commit only updates dependencies on the published 0.6.0 source.
+# Replace it with a registry release once upstream supports Arrow 60.
+geodatafusion = { version = "0.6.0", git = "https://github.com/dentiny/geodatafusion.git", rev = "9e3ad767c74a929ea313d3841d5ed7c8a37ab11c" }
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
 hex = "0.4.3"
@@ -204,7 +208,7 @@ goosefs-sdk = { version = "0.2.2", default-features = false }
 # Cache features (`metadata-cache`, `page-cache-io-uring`) belong on the
 # consumer (`lance-io`'s `goosefs` feature), not this workspace pin.
 opendal-service-goosefs = { version = "0.59.2", default-features = false }
-parquet = { version = "59.3.2", default-features = false, features = [
+parquet = { version = "60.0.0", default-features = false, features = [
     "arrow",
     "async",
 ] }

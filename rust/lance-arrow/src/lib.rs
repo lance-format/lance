@@ -28,7 +28,9 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBufferBuilder, MutableBuffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
+use arrow_schema::{
+    ArrowError, DataType, Field, Fields, IntervalUnit, Metadata, Schema, SortOptions,
+};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -613,11 +615,11 @@ pub trait RecordBatchExt {
     fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch>;
 
     /// metadata of the schema.
-    fn metadata(&self) -> &HashMap<String, String>;
+    fn metadata(&self) -> &Metadata;
 
     /// Add metadata to the schema.
     fn add_metadata(&self, key: String, value: String) -> Result<RecordBatch> {
-        let mut metadata = self.metadata().clone();
+        let mut metadata = HashMap::from(self.metadata());
         metadata.insert(key, value);
         self.with_metadata(metadata)
     }
@@ -787,13 +789,13 @@ impl RecordBatchExt for RecordBatch {
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
     }
 
-    fn metadata(&self) -> &HashMap<String, String> {
+    fn metadata(&self) -> &Metadata {
         self.schema_ref().metadata()
     }
 
     fn with_metadata(&self, metadata: HashMap<String, String>) -> Result<RecordBatch> {
         let mut schema = self.schema_ref().as_ref().clone();
-        schema.metadata = metadata;
+        schema.metadata = metadata.into();
         Self::try_new(schema.into(), self.columns().into())
     }
 
@@ -2812,7 +2814,7 @@ mod tests {
                 Field::new("a", DataType::Int32, true),
                 Field::new("b", DataType::Utf8, true),
             ])
-            .with_metadata(metadata.clone().into()),
+            .with_metadata(metadata.clone()),
         );
         let batch = RecordBatch::try_new(
             schema,
@@ -2828,7 +2830,7 @@ mod tests {
         // Empty schema
         let empty_schema = Schema::empty();
         let empty_projected = batch.project_by_schema(&empty_schema).unwrap();
-        let expected_schema = empty_schema.with_metadata(metadata.clone().into());
+        let expected_schema = empty_schema.with_metadata(metadata.clone());
         assert_eq!(
             empty_projected,
             RecordBatch::from(StructArray::new_empty_fields(batch.num_rows(), None))
@@ -2842,7 +2844,7 @@ mod tests {
             Field::new("a", DataType::Int32, true),
         ]);
         let reordered_projected = batch.project_by_schema(&reordered_schema).unwrap();
-        let expected_schema = Arc::new(reordered_schema.with_metadata(metadata.clone().into()));
+        let expected_schema = Arc::new(reordered_schema.with_metadata(metadata.clone()));
         assert_eq!(
             reordered_projected,
             RecordBatch::try_new(
@@ -2860,7 +2862,7 @@ mod tests {
         // Sub schema
         let sub_schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let sub_projected = batch.project_by_schema(&sub_schema).unwrap();
-        let expected_schema = Arc::new(sub_schema.with_metadata(metadata.into()));
+        let expected_schema = Arc::new(sub_schema.with_metadata(metadata));
         assert_eq!(
             sub_projected,
             RecordBatch::try_new(

@@ -1494,6 +1494,6 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
         })?;
     Ok(Schema {
         fields,
-        metadata: arrow_schema.metadata.clone(),
+        metadata: (&arrow_schema.metadata).into(),
     })
 }

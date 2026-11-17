@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
@@ -70,7 +70,7 @@ pub fn py_write_pk_sidecar(
     data: &Bound<'_, PyAny>,
     pk_columns: Vec<String>,
 ) -> PyResult<()> {
-    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+    let reader = RecordBatchStreamReader::from_pyarrow_bound(data)
         .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
     let batches: Vec<RecordBatch> = reader
         .collect::<Result<_, _>>()
@@ -245,7 +245,7 @@ struct ClosedShardWriterState {
 }
 
 fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
-    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+    let reader = RecordBatchStreamReader::from_pyarrow_bound(data)
         .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
     reader
         .collect::<Result<_, _>>()

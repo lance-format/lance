@@ -52,8 +52,8 @@ use arrow_array::{
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
+use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::hash_utils::{RandomState, with_hashes};
-use datafusion_common::utils::normalize_float_zero;
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -1912,7 +1912,7 @@ impl KeysByValue {
         // DataFusion normalizes signed zeros before equality comparisons. Doing
         // the same here keeps both the hash and comparator consistent with
         // `search(Equals)`.
-        let keys = normalize_float_zero(&keys);
+        let keys = normalize_floats(&keys);
         let random_state = RandomState::default();
         let mut table: HashTable<(u64, u32)> = HashTable::new();
         let mut groups: Vec<Vec<u32>> = Vec::new();
@@ -1944,7 +1944,7 @@ impl KeysByValue {
 
     /// The page rows whose value equals some key.
     fn match_page(&self, values: &ArrayRef, rows: &UInt64Array) -> Result<PageKeyMatches> {
-        let values = normalize_float_zero(values);
+        let values = normalize_floats(values);
         let value_eq = make_comparator(&values, &self.keys, SortOptions::default())?;
         let mut matches = PageKeyMatches {
             rows: Vec::new(),

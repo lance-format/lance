@@ -16,12 +16,12 @@ use datafusion::{
     config::ConfigOptions,
     error::Result as DFResult,
     physical_optimizer::{
-        PhysicalOptimizerRule,
+        ConfigOnlyContext, PhysicalOptimizerContext, PhysicalOptimizerRule,
         enforce_distribution::{
             DistributionContext, PlanWithKeyRequirements, adjust_input_keys_ordering,
-            ensure_distribution, reorder_join_keys_to_inputs,
+            ensure_distribution_with_stats, reorder_join_keys_to_inputs,
         },
-        optimizer::PhysicalOptimizer,
+        optimizer::{PhysicalOptimizer, with_statistics_context},
     },
     physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
@@ -230,6 +230,15 @@ impl PhysicalOptimizerRule for EnforceDistribution {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.optimize_with_context(plan, &ConfigOnlyContext::new(config))
+    }
+
+    fn optimize_with_context(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        context: &dyn PhysicalOptimizerContext,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let config = context.config_options();
         let plan = if config.optimizer.top_down_join_key_reordering {
             PlanWithKeyRequirements::new_default(plan)
                 .transform_down(adjust_input_keys_ordering)
@@ -241,10 +250,14 @@ impl PhysicalOptimizerRule for EnforceDistribution {
         };
 
         // Distribution enforcement needs to be applied bottom-up.
-        Ok(DistributionContext::new_default(plan)
-            .transform_up(|context| ensure_distribution(context, config))
-            .data()?
-            .plan)
+        with_statistics_context(context, |stats| {
+            Ok(DistributionContext::new_default(plan)
+                .transform_up(|distribution| {
+                    ensure_distribution_with_stats(distribution, config, stats)
+                })
+                .data()?
+                .plan)
+        })
     }
 
     fn name(&self) -> &str {

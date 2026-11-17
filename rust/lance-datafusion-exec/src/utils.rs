@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use async_trait::async_trait;
@@ -68,7 +68,7 @@ pub trait StreamingWriteSource: Send {
     fn into_stream(self) -> SendableRecordBatchStream;
 }
 
-impl StreamingWriteSource for ArrowArrayStreamReader {
+impl StreamingWriteSource for RecordBatchStreamReader {
     #[inline]
     fn arrow_schema(&self) -> SchemaRef {
         RecordBatchReader::schema(self)

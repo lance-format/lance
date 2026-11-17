@@ -770,7 +770,7 @@ fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
     let ipc_schema = message
         .header_as_schema()
         .ok_or_else(|| Error::internal("IPC message does not contain a schema".to_string()))?;
-    let schema = arrow_ipc::convert::fb_to_schema(ipc_schema);
+    let schema = arrow_ipc::convert::try_fb_to_schema(ipc_schema)?;
     Ok(Arc::new(schema))
 }
 

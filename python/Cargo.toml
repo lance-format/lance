@@ -4,7 +4,7 @@ version = "15.0.0-beta.23"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 exclude = ["python/lance/conftest.py"]
 publish = false
 
@@ -19,20 +19,16 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "59.3.2", features = ["pyarrow"] }
-arrow-array = "59.3.2"
-arrow-cast = "59.3.2"
-arrow-data = "59.3.2"
-arrow-schema = "59.3.2"
+arrow = { version = "60.0.0", features = ["pyarrow"] }
+arrow-array = "60.0.0"
+arrow-cast = "60.0.0"
+arrow-data = "60.0.0"
+arrow-schema = "60.0.0"
 object_store = "0.14.2"
 url = "2.5.7"
-datafusion = { version = "55.2.0", default-features = false }
-datafusion-ffi = "55.2.0"
-datafusion-common = "55.2.0"
-# Keep the Python FFI build on the working Brotli allocator resolution until
-# datafusion-ffi no longer enables datafusion-proto/default.
-# See https://github.com/lance-format/lance/issues/7271.
-alloc-stdlib = "=0.2.2"
+datafusion = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c", default-features = false }
+datafusion-ffi = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
+datafusion-common = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
 async-trait = "0.1"
 chrono = "0.4.42"
 env_logger = "0.11.7"

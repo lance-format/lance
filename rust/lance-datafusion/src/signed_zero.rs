@@ -391,7 +391,7 @@ fn negative_infinity(value: &ScalarValue) -> Option<ScalarValue> {
 /// physical literal value and index query.
 fn raw_float_literal(value: ScalarValue, metadata: Option<&FieldMetadata>) -> Expr {
     let mut inner: BTreeMap<String, String> = metadata
-        .map(|metadata| metadata.inner().clone())
+        .map(|metadata| metadata.inner().clone().into())
         .unwrap_or_default();
     inner.insert(RAW_FLOAT_LITERAL_MARKER.to_string(), "1".to_string());
     Expr::Literal(value, Some(FieldMetadata::new(inner)))

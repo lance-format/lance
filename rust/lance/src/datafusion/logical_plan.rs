@@ -38,7 +38,7 @@ impl TableProvider for Dataset {
     async fn scan(
         &self,
         _: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         _: &[Expr],
         limit: Option<usize>,
     ) -> DatafusionResult<Arc<dyn ExecutionPlan>> {

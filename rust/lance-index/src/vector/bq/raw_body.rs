@@ -190,11 +190,12 @@ fn parse_schema(message: &[u8]) -> Result<Schema> {
     let schema = message
         .header_as_schema()
         .ok_or_else(|| corrupt("schema message holds no schema".to_string()))?;
-    // `fb_to_schema` assumes the field list is present.
+    // Keep the missing-field-list diagnostic specific to the BQ body.
     if schema.fields().is_none() {
         return Err(corrupt("schema message has no field list".to_string()));
     }
-    Ok(arrow_ipc::convert::fb_to_schema(schema))
+    arrow_ipc::convert::try_fb_to_schema(schema)
+        .map_err(|e| corrupt(format!("invalid schema: {e}")))
 }
 
 /// A bounds-checked cursor over a raw body.

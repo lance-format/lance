@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow::pyarrow::FromPyArrow;
 use arrow_array::RecordBatchReader;
 use arrow_schema::SchemaRef;
@@ -71,7 +71,7 @@ impl PartitionStream for ReplayablePartition {
                             .context("Failed to open replayable merge source")
                     })?;
                     let reader =
-                        ArrowArrayStreamReader::from_pyarrow_bound(&source).map_err(|error| {
+                        RecordBatchStreamReader::from_pyarrow_bound(&source).map_err(|error| {
                             DataFusionError::External(Box::new(error))
                                 .context("Failed to import replayable merge source reader")
                         })?;

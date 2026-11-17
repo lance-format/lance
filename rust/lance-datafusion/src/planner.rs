@@ -114,14 +114,14 @@ fn parse_decimal(number: &str, negative: bool) -> Option<ScalarValue> {
 // The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
 // Reject empty or multi-character escape strings rather than silently treating
 // them as "no escape" or truncating to the first character.
-fn parse_like_escape_char(escape_char: &Option<ValueWithSpan>) -> Result<Option<char>> {
+fn parse_like_escape_char(escape_char: &Option<Box<SQLExpr>>) -> Result<Option<char>> {
     let Some(value) = escape_char else {
         return Ok(None);
     };
-    let ValueWithSpan {
+    let SQLExpr::Value(ValueWithSpan {
         value: Value::SingleQuotedString(escape),
         ..
-    } = value
+    }) = value.as_ref()
     else {
         return Err(Error::invalid_input(format!(
             "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"
@@ -2303,6 +2303,8 @@ mod tests {
             "s LIKE 'x' ESCAPE 'ab'",
             "s ILIKE 'x' ESCAPE ''",
             "s ILIKE 'x' ESCAPE 'ab'",
+            "s LIKE 'x' ESCAPE chr(33)",
+            "s ILIKE 'x' ESCAPE NULL",
         ] {
             let err = planner.parse_filter(filter).unwrap_err();
             assert!(

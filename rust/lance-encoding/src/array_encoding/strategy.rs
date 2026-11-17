@@ -212,7 +212,7 @@ impl ArrayFieldEncodingStrategy {
         reachable: Option<&BooleanBuffer>,
     ) -> Option<BooleanBuffer> {
         let values_len = array.values().len();
-        let offsets = array.offsets();
+        let offsets = array.value_offsets();
         if reachable.is_none()
             && array.null_count() == 0
             && offsets.first().map(|offset| offset.as_usize()) == Some(0)
@@ -239,7 +239,7 @@ impl ArrayFieldEncodingStrategy {
         reachable: Option<&BooleanBuffer>,
     ) -> Option<BooleanBuffer> {
         let values_len = array.entries().len();
-        let offsets = array.offsets();
+        let offsets = array.value_offsets();
         if reachable.is_none()
             && array.null_count() == 0
             && offsets.first().copied() == Some(0)
@@ -271,8 +271,8 @@ impl ArrayFieldEncodingStrategy {
             (0, 0)
         } else {
             (
-                array.value_offset(0) as usize,
-                array.value_offset(array.len() - 1) as usize + dimension,
+                array.value_offset_at(0),
+                array.value_offset_at(array.len() - 1) + dimension,
             )
         };
         if reachable.is_none()
@@ -286,7 +286,7 @@ impl ArrayFieldEncodingStrategy {
         let mut child_reachable = vec![false; values_len];
         for index in 0..array.len() {
             if Self::is_reachable(reachable, index) && array.is_valid(index) {
-                let start = array.value_offset(index) as usize;
+                let start = array.value_offset_at(index);
                 for is_reachable in child_reachable.iter_mut().skip(start).take(dimension) {
                     *is_reachable = true;
                 }

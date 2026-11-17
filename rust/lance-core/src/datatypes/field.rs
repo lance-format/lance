@@ -1243,7 +1243,7 @@ impl TryFrom<&ArrowField> for Field {
     type Error = Error;
 
     fn try_from(field: &ArrowField) -> Result<Self> {
-        let mut metadata = field.metadata().clone();
+        let mut metadata = HashMap::from(field.metadata());
         let id = match metadata.remove(LANCE_FIELD_ID_KEY) {
             Some(val) => val
                 .parse::<i32>()

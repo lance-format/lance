@@ -70,7 +70,7 @@ impl SidecarRewrite {
         let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
             field.name(),
             field.is_nullable(),
-            field.metadata().clone(),
+            field.metadata().into(),
         );
         for (row, row_addr) in rows.iter().copied().enumerate() {
             let Some(blob) = StoredBlob::parse(values, row)? else {

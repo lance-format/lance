@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -133,7 +133,7 @@ pub fn write_dataset(
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = RecordBatchStreamReader::from_pyarrow_bound(reader)?;
         rt().block_on(
             Some(py),
             LanceDataset::write(batches, dest.as_dest(), params),

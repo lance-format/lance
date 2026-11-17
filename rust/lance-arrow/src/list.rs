@@ -47,7 +47,7 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayExt for GenericListArray<OffsetSize> 
         let mut should_keep = BooleanBufferBuilder::new(self.values().len());
 
         // Handle case where offsets do not start at 0
-        let preamble_len = self.offsets().first().unwrap().to_usize().unwrap();
+        let preamble_len = self.value_offsets().first().unwrap().to_usize().unwrap();
         should_keep.append_n(preamble_len, false);
 
         let mut new_offsets: Vec<OffsetSize> = Vec::with_capacity(self.len() + 1);
@@ -89,12 +89,12 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayExt for GenericListArray<OffsetSize> 
 
     fn trimmed_values(&self) -> Arc<dyn Array> {
         let first_value = self
-            .offsets()
+            .value_offsets()
             .first()
             .map(|v| v.to_usize().unwrap())
             .unwrap_or(0);
         let last_value = self
-            .offsets()
+            .value_offsets()
             .last()
             .map(|v| v.to_usize().unwrap())
             .unwrap_or(0);
@@ -105,7 +105,7 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayExt for GenericListArray<OffsetSize> 
 
     fn trimmed_offsets(&self) -> OffsetBuffer<OffsetSize> {
         let offsets = self.offsets();
-        let Some(&first) = offsets.first() else {
+        let Some(&first) = offsets.as_ref().first() else {
             return offsets.clone();
         };
         if first == OffsetSize::zero() {

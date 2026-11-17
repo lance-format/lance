@@ -59,7 +59,7 @@ tests = [
     "pytest==8.4.2",
     "pytest-xdist==3.8.0",
     "tqdm",
-    "datafusion>=55,<56",
+    "datafusion @ git+https://github.com/nuno-faria/datafusion-python.git@b1b413ac9927b094cfa304f92cb5d1235ee1ba66",
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
@@ -83,7 +83,7 @@ tests = [
     "pytest==8.4.2",
     "pytest-xdist==3.8.0",
     "tqdm==4.67.1",
-    "datafusion==55.0.0",
+    "datafusion @ git+https://github.com/nuno-faria/datafusion-python.git@b1b413ac9927b094cfa304f92cb5d1235ee1ba66",
     "opentelemetry-sdk==1.30.0",
 ]
 dev = [

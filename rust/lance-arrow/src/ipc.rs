@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
-use arrow_ipc::convert::fb_to_schema;
+use arrow_ipc::convert::try_fb_to_schema;
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::writer::StreamWriter;
 use arrow_ipc::{Block, MessageHeader, MetadataVersion, root_as_message};
@@ -217,9 +217,11 @@ fn decode_ipc_stream(data: &Bytes) -> Result<(Vec<RecordBatch>, usize), ArrowErr
     } = schema_message;
     let schema_msg = root_as_message(&buffer[prefix_len..metadata_len])
         .map_err(|e| ArrowError::ParseError(format!("IPC schema parse error: {e}")))?;
-    let schema = Arc::new(fb_to_schema(schema_msg.header_as_schema().ok_or_else(
-        || ArrowError::ParseError("IPC stream: first message is not a schema".into()),
-    )?));
+    let schema = Arc::new(try_fb_to_schema(
+        schema_msg.header_as_schema().ok_or_else(|| {
+            ArrowError::ParseError("IPC stream: first message is not a schema".into())
+        })?,
+    )?);
     let mut decoder = FileDecoder::new(schema, version);
 
     let mut batches = Vec::new();

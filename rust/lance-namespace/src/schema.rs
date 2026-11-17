@@ -22,7 +22,7 @@ pub fn arrow_schema_to_json(arrow_schema: &ArrowSchema) -> Result<JsonArrowSchem
     let metadata = if arrow_schema.metadata().is_empty() {
         None
     } else {
-        Some(arrow_schema.metadata().clone())
+        Some(arrow_schema.metadata().into())
     };
 
     Ok(JsonArrowSchema {
@@ -42,7 +42,7 @@ fn arrow_field_to_json(arrow_field: &Field) -> Result<JsonArrowField> {
         metadata: if arrow_field.metadata().is_empty() {
             None
         } else {
-            Some(arrow_field.metadata().clone())
+            Some(arrow_field.metadata().into())
         },
     })
 }
@@ -124,7 +124,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 metadata: if field.metadata().is_empty() {
                     None
                 } else {
-                    Some(field.metadata().clone())
+                    Some(field.metadata().into())
                 },
             };
             Ok(JsonArrowDataType {
@@ -142,7 +142,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 metadata: if field.metadata().is_empty() {
                     None
                 } else {
-                    Some(field.metadata().clone())
+                    Some(field.metadata().into())
                 },
             };
             Ok(JsonArrowDataType {
@@ -160,7 +160,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 metadata: if field.metadata().is_empty() {
                     None
                 } else {
-                    Some(field.metadata().clone())
+                    Some(field.metadata().into())
                 },
             };
             Ok(JsonArrowDataType {
@@ -204,7 +204,7 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
                 metadata: if entries_field.metadata().is_empty() {
                     None
                 } else {
-                    Some(entries_field.metadata().clone())
+                    Some(entries_field.metadata().into())
                 },
             };
             Ok(JsonArrowDataType {

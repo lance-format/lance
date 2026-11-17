@@ -97,7 +97,7 @@ impl FieldExt for Field {
         const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
         PACKED_KEYS.iter().any(|key| {
             field_metadata
-                .get(*key)
+                .get(key)
                 .map(|value| value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         })

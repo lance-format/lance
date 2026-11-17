@@ -5,7 +5,7 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::FromJString;
 use crate::{Error, JNIEnvExt, RT, block_on};
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{JNI_TRUE, jboolean, jlong};
@@ -113,7 +113,7 @@ fn sql_builder(
     // to a C-Data stream on the Java side; import it to RecordBatches and register it under its name.
     for (name, addr) in names.into_iter().zip(addrs) {
         let stream_ptr = addr as *mut FFI_ArrowArrayStream;
-        let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr)? };
+        let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr)? };
         let mut batches = Vec::new();
         for batch in reader {
             batches.push(batch.map_err(|e| Error::input_error(e.to_string()))?);

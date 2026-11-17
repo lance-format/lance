@@ -481,13 +481,10 @@ impl TryFrom<&LogicalType> for DataType {
                     match inner_type.as_str() {
                         BFLOAT16_EXT_NAME => {
                             let field = ArrowField::new("item", Self::FixedSizeBinary(2), true)
-                                .with_metadata(
-                                    [
-                                        (ARROW_EXT_NAME_KEY.into(), BFLOAT16_EXT_NAME.into()),
-                                        (ARROW_EXT_META_KEY.into(), "".into()),
-                                    ]
-                                    .into(),
-                                );
+                                .with_metadata([
+                                    (ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME),
+                                    (ARROW_EXT_META_KEY, ""),
+                                ]);
                             Ok(FixedSizeList(Arc::new(field), size))
                         }
                         data_type => {

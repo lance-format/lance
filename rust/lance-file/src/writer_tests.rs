@@ -1077,7 +1077,7 @@ mod tests {
             )
         });
         let tags_field = ArrowField::new("tags", tags.data_type().clone(), true)
-            .with_metadata(metadata.into_iter().collect());
+            .with_metadata(metadata.into_iter().collect::<arrow_schema::Metadata>());
         let schema = Arc::new(ArrowSchema::new(vec![tags_field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![tags]).unwrap();
         let fs = FsFixture::default();

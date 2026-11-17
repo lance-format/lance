@@ -286,7 +286,7 @@ impl Hnsw {
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         rt().block_on(Some(py), async {
             let batch = self.hnsw.to_batch()?;
-            let metadata = batch.schema_ref().metadata().clone();
+            let metadata = std::collections::HashMap::from(batch.schema_ref().metadata());
             writer.write(&[batch]).await?;
             writer.finish_with_metadata(&metadata).await?;
             Result::Ok(())

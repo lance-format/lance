@@ -15,8 +15,8 @@ use crate::utils::{
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
-use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow::record_batch::RecordBatchIterator;
 use jni::JNIEnv;
 use jni::objects::{JMap, JObject, JString, JValue};
@@ -425,7 +425,7 @@ fn inner_create_with_ffi_stream<'local>(
     namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
 
     // Create the namespace wrapper for commit handling (if provided)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;

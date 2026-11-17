@@ -13,8 +13,8 @@ use crate::index_progress::JavaIndexBuildProgress;
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec_to_rust};
 use crate::utils::{get_scalar_index_params, get_vector_index_params};
 use crate::{block_on, traits::IntoJava};
-use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong};
@@ -207,7 +207,7 @@ fn inner_create_index<'local>(
     let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
     let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
         let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
-        let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+        let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
         Some(reader)
     } else {
         None
@@ -362,7 +362,7 @@ fn execute_create_index(
     name: Option<String>,
     fragment_ids: Option<Vec<u32>>,
     index_uuid: Option<Uuid>,
-    batch_reader: Option<ArrowArrayStreamReader>,
+    batch_reader: Option<RecordBatchStreamReader>,
     progress: Option<Arc<dyn IndexBuildProgress>>,
     skip_commit: bool,
 ) -> Result<IndexMetadata> {

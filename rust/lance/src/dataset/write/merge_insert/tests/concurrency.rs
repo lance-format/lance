@@ -806,7 +806,7 @@ async fn test_inserted_rows_filter_bloom_conflict_detection_concurrent() {
                 "true".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("value", DataType::UInt32, false),
     ]));
@@ -1441,7 +1441,7 @@ async fn test_merge_insert_conflict_with_update_without_filter() {
                 "true".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("value", DataType::UInt32, false),
     ]));
@@ -1522,7 +1522,7 @@ async fn test_merge_insert_conflict_with_append() {
                 "true".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("value", DataType::UInt32, false),
     ]));

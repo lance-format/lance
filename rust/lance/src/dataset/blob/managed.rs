@@ -402,7 +402,7 @@ pub async fn preserve_managed_descriptors(
     let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
         field.name(),
         field.is_nullable(),
-        field.metadata().clone(),
+        field.metadata().into(),
     );
     let mut locator = BlobLocator::new(dataset, field_id);
     for (row, row_addr) in row_addrs.iter().copied().enumerate() {

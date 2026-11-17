@@ -73,7 +73,7 @@ async fn write_pq_codes(writer: &mut dyn Writer, arrays: &[&dyn Array]) -> Resul
         if let Some(values) = array.as_any().downcast_ref::<PrimitiveArray<UInt8Type>>() {
             write_primitive_values(writer, values).await?;
         } else if let Some(codes) = array.as_any().downcast_ref::<FixedSizeListArray>() {
-            let value_offset = codes.value_offset(0) as usize;
+            let value_offset = codes.value_offset_at(0);
             let value_len = codes.len() * codes.value_length() as usize;
             let values = codes.values().slice(value_offset, value_len);
             let values = values
@@ -650,7 +650,7 @@ async fn build_and_write_hnsw(
     mut writer: V1FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
-    let metadata = batch.schema_ref().metadata().clone();
+    let metadata = std::collections::HashMap::from(batch.schema_ref().metadata());
     writer.write(&[batch]).await?;
     Ok(writer.finish_with_metadata(&metadata).await?.num_rows as usize)
 }

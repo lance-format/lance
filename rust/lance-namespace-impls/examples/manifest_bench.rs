@@ -161,7 +161,7 @@ fn manifest_schema() -> Arc<ArrowSchema> {
                 "0".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("object_type", DataType::Utf8, false),
         Field::new("location", DataType::Utf8, true),

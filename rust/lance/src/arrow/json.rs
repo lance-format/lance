@@ -200,7 +200,7 @@ impl TryFrom<&Field> for JsonField {
         let metadata = if field.metadata().is_empty() {
             None
         } else {
-            Some(field.metadata().clone())
+            Some(field.metadata().into())
         };
 
         Ok(Self {
@@ -248,7 +248,7 @@ impl TryFrom<&Schema> for JsonSchema {
         let metadata = if schema.metadata.is_empty() {
             None
         } else {
-            Some(schema.metadata.clone())
+            Some((&schema.metadata).into())
         };
         Ok(Self { fields, metadata })
     }

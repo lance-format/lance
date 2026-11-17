@@ -720,7 +720,7 @@ async fn test_merge_insert_subcols_v2_bloom_filter() {
                 "true".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("value", DataType::UInt32, true),
         Field::new("tag", DataType::Utf8, true),
@@ -748,7 +748,7 @@ async fn test_merge_insert_subcols_v2_bloom_filter() {
                 "true".to_string(),
             )]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
         Field::new("value", DataType::UInt32, true),
     ]));

@@ -1699,14 +1699,8 @@ impl ManifestNamespace {
     fn manifest_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             // Set unenforced primary key on object_id for bloom filter conflict detection
-            Field::new("object_id", DataType::Utf8, false).with_metadata(
-                [(
-                    LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
-                    "0".to_string(),
-                )]
-                .into_iter()
-                .collect(),
-            ),
+            Field::new("object_id", DataType::Utf8, false)
+                .with_metadata([(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")]),
             Field::new("object_type", DataType::Utf8, false),
             Field::new("location", DataType::Utf8, true),
             Field::new("metadata", DataType::Utf8, true),

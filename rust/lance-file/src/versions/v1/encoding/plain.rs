@@ -135,7 +135,7 @@ impl<'a> PlainEncoder<'a> {
                         array.data_type()
                     ))
                 })?;
-            let offset = list_array.value_offset(0) as usize;
+            let offset = list_array.value_offset_at(0);
             let length = list_array.len();
             let value_length = list_array.value_length() as usize;
             let value_array = list_array.values().slice(offset, length * value_length);

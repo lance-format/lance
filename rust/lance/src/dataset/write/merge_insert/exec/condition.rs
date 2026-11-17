@@ -150,7 +150,7 @@ impl MergeConditionExec {
                     (qualifier.cloned(), field.clone())
                 })
                 .collect(),
-            Default::default(),
+            arrow_schema::Metadata::default(),
         )?;
         let eval_df_schema = match &take {
             Some(take) => read.join(&DFSchema::try_from_qualified_schema(

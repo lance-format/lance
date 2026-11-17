@@ -6,8 +6,8 @@ use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use arrow::ffi::FFI_ArrowSchema;
-use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow_schema::Schema as ArrowSchema;
 use jni::JNIEnv;
 use jni::objects::{JObject, JString};
@@ -239,7 +239,7 @@ fn inner_add_columns_by_reader(
 ) -> Result<()> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
 
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
 
     let transform = NewColumnTransform::Reader(Box::new(reader));
 

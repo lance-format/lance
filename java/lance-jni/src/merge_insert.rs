@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::traits::import_vec_to_rust;
 use crate::traits::{FromJString, IntoJava};
 use crate::{Error, JNIEnvExt, block_on};
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
@@ -106,7 +106,7 @@ fn inner_merge_insert<'local>(
         let merge_insert_job = builder.try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
-        let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
+        let source_stream = RecordBatchStreamReader::from_raw(stream_ptr)?;
 
         if analyze {
             drop(dataset);

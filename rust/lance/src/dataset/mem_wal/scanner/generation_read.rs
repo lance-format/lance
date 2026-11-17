@@ -593,7 +593,7 @@ mod tests {
         Field::new(name, data_type, true).with_metadata(
             [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         )
     }
 

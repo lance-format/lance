@@ -167,7 +167,7 @@ pub(crate) fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
                 prepared_blob_field_with_metadata(
                     field.name(),
                     field.is_nullable(),
-                    field.metadata().clone(),
+                    field.metadata().into(),
                 ),
                 field,
             ),

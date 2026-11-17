@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::num::NonZero;
 use std::sync::Arc;
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use futures::TryFutureExt;
@@ -447,7 +447,7 @@ impl FileFragment {
         reader: &Bound<PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = RecordBatchStreamReader::from_pyarrow_bound(reader)?;
         let transforms = NewColumnTransform::Reader(Box::new(batches));
         let (fragment, schema, _cleanup) =
             self.add_columns_with_cleanup_inner(transforms, None, batch_size)?;
@@ -460,7 +460,7 @@ impl FileFragment {
         reader: &Bound<PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<PyFragmentAddColumnsResult> {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = RecordBatchStreamReader::from_pyarrow_bound(reader)?;
         let transforms = NewColumnTransform::Reader(Box::new(batches));
         self.add_columns_with_cleanup_inner(transforms, None, batch_size)
     }
@@ -493,7 +493,7 @@ impl FileFragment {
 
     fn merge(
         &mut self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: PyArrowType<RecordBatchStreamReader>,
         left_on: String,
         right_on: String,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
@@ -511,7 +511,7 @@ impl FileFragment {
     #[pyo3(signature=(reader, left_on, right_on, with_offsets=false, strategy="auto", max_hash_rows=None, max_hash_bytes=None, external_memory_pool_bytes=None, max_temp_directory_bytes=None))]
     fn update_columns(
         &mut self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: PyArrowType<RecordBatchStreamReader>,
         left_on: String,
         right_on: String,
         with_offsets: bool,
@@ -564,7 +564,7 @@ impl FileFragment {
     #[pyo3(signature=(reader, batch_size=None, with_offsets=false))]
     fn update_columns_from_stream(
         &self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: PyArrowType<RecordBatchStreamReader>,
         batch_size: Option<u32>,
         with_offsets: bool,
     ) -> PyResult<UpdateColumnsResult> {
@@ -850,7 +850,7 @@ fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader +
         )??;
         Ok(Box::new(reader))
     } else {
-        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
+        Ok(Box::new(RecordBatchStreamReader::from_pyarrow_bound(
             reader,
         )?))
     }

@@ -2541,7 +2541,7 @@ impl TableProvider for ChangingScanProvider {
     async fn scan(
         &self,
         session: &dyn datafusion::catalog::Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {

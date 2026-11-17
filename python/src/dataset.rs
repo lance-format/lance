@@ -6,7 +6,7 @@ use std::str;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::ffi_stream::RecordBatchStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, make_array};
@@ -301,7 +301,7 @@ fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader +
                 .map_err(|err| PyValueError::new_err(err.to_string()))?,
         ))
     } else {
-        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
+        Ok(Box::new(RecordBatchStreamReader::from_pyarrow_bound(
             reader,
         )?))
     }
@@ -1740,7 +1740,7 @@ impl Dataset {
 
     fn merge(
         &mut self,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: PyArrowType<RecordBatchStreamReader>,
         left_on: String,
         right_on: String,
     ) -> PyResult<()> {
@@ -3237,7 +3237,7 @@ impl Dataset {
         reader: &Bound<'_, PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<()> {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let batches = RecordBatchStreamReader::from_pyarrow_bound(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 

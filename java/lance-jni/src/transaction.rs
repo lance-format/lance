@@ -1561,7 +1561,7 @@ fn convert_arrow_schema(
                 .iter()
                 .map(|field| Field::try_from(field.as_ref()))
                 .collect::<lance_core::Result<_>>()?,
-            metadata: arrow_schema.metadata.clone(),
+            metadata: (&arrow_schema.metadata).into(),
         }
     } else {
         LanceSchema::try_from(arrow_schema).map_err(|e| {
@@ -1708,7 +1708,7 @@ impl SchemaExt for LanceSchema {
                 .iter()
                 .map(|f| Field::try_from(f.as_ref()))
                 .collect::<lance_core::Result<_>>()?,
-            metadata: arrow_schema.metadata.clone(),
+            metadata: (&arrow_schema.metadata).into(),
         };
         schema.set_field_id_from_schema(base_schema, max_existing_id)?;
         schema.validate()?;

@@ -1785,9 +1785,7 @@ fn deserialize_appender_batches(bytes: Bytes) -> Result<DecodedEntry> {
     })
 }
 
-fn target_from_metadata(
-    metadata: &std::collections::HashMap<String, String>,
-) -> Result<Option<MemTableDataTarget>> {
+fn target_from_metadata(metadata: &arrow_schema::Metadata) -> Result<Option<MemTableDataTarget>> {
     let values = [
         metadata.get(TARGET_GENERATION_KEY),
         metadata.get(TARGET_GENERATION_DIR_KEY),

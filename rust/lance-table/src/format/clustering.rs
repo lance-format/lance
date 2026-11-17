@@ -1065,7 +1065,7 @@ mod tests {
         let nested = |parent: &str, sibling_metadata: Option<(&str, &str)>| {
             let mut sibling = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
             if let Some((k, v)) = sibling_metadata {
-                sibling = sibling.with_metadata([(k.to_string(), v.to_string())].into());
+                sibling = sibling.with_metadata([(k.to_string(), v.to_string())]);
             }
             lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
                 arrow_schema::Field::new(

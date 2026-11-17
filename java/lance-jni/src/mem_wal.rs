@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
     RecordBatchReader, StructArray, make_array,
@@ -169,7 +169,7 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_nativePut(
 
 fn inner_put(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> {
     let stream_ptr = stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
     let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
     if batches.is_empty() {
         return Ok(());
@@ -192,7 +192,7 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_nativeDelete(
 
 fn inner_delete(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> {
     let stream_ptr = stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
     let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
     if batches.is_empty() {
         return Ok(());
@@ -233,7 +233,7 @@ fn inner_write_pk_sidecar(
     let gen_path: String = env.get_string(&gen_path)?.into();
     let pk_columns = env.get_strings(&pk_columns)?;
     let stream_ptr = stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
     let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
     let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
     block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;

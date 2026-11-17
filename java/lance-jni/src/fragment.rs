@@ -3,7 +3,7 @@
 
 use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
-use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use jni::objects::{JByteArray, JIntArray, JMap, JValue, JValueGen};
 use jni::{
@@ -283,7 +283,7 @@ fn inner_create_with_ffi_stream<'local>(
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
 
     create_fragment(
         env,
@@ -498,7 +498,7 @@ fn inner_merge_column<'local>(
     };
 
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
 
@@ -557,7 +557,7 @@ fn inner_update_column<'local>(
         }
     };
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
     let r = block_on(fragment.update_columns_with_offsets(reader, &left_on_str, &right_on_str))?;
@@ -736,7 +736,7 @@ fn inner_add_columns_by_reader<'local>(
     };
 
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
-    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let reader = unsafe { RecordBatchStreamReader::from_raw(stream_ptr) }?;
     let batch_size = match env.get_long_opt(&batch_size)? {
         Some(value) => Some(
             value

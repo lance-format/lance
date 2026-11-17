@@ -3,7 +3,7 @@ name = "lance-jni"
 version = "15.0.0-beta.23"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
-rust-version = "1.94"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
@@ -34,11 +34,11 @@ lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = 
 lance-core = { path = "../../rust/lance-core", features = ["metrics"] }
 lance-file = { path = "../../rust/lance-file" }
 lance-table = { path = "../../rust/lance-table" }
-arrow = { version = "59.3.2", features = ["ffi"] }
-arrow-array = "59.3.2"
-arrow-schema = "59.3.2"
-datafusion = { version = "55.2.0", default-features = false }
-datafusion-common = "55.2.0"
+arrow = { version = "60.0.0", features = ["ffi"] }
+arrow-array = "60.0.0"
+arrow-schema = "60.0.0"
+datafusion = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c", default-features = false }
+datafusion-common = { version = "56.0.0", git = "https://github.com/apache/datafusion.git", rev = "cce6374e6256b3b8892ec60674578cf32bc3a32c" }
 object_store = { version = "0.14.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
