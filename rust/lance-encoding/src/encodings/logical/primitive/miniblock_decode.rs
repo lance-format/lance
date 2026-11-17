@@ -39,7 +39,10 @@ use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
 mod admitted;
+mod admitted_input;
 mod structure;
+
+pub(super) use admitted_input::{MiniBlockArrayInput, MiniBlockArrayScheduler};
 
 use super::chunk_index::{
     ItemCounts, MiniBlockChunkIndex, PrefixSums, RowMapping, parse_nested_rep,

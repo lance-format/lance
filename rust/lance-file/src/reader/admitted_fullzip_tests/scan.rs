@@ -89,7 +89,7 @@ async fn admitted_scan_advances_without_reading_skipped_pages(
     let error = scan.advance_to_range(24..25).unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(
-        error.to_string().contains("dense FullZip page")
+        error.to_string().contains("repetition indexes")
             || error.to_string().contains("stored byte scalar")
     );
     assert_eq!(scan.position(), 4);
@@ -267,7 +267,7 @@ async fn admitted_scan_empty_invalid_and_unsupported_selection() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("dense FullZip page"));
+    assert!(error.to_string().contains("repetition indexes"));
     assert_eq!(
         stats.snapshot().iops,
         0,
@@ -364,7 +364,7 @@ async fn admitted_scan_respects_nonzero_projection_and_schema(
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
     assert!(
-        error.to_string().contains("dense FullZip page")
+        error.to_string().contains("repetition indexes")
             || error.to_string().contains("stored byte scalar")
     );
     let mut schema = reader.core.base_projection.schema.as_ref().clone();

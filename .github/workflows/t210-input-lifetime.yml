@@ -25,14 +25,14 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify concurrent complete-drain harness correctness
+      - name: Verify bounded MiniBlock input and actual file composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          # No benchmark timing/RSS measurement. Library cursors reuse their
-          # successful exact-head evidence; only harness composition changed.
-          cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --lib miniblock_decode::admitted_input:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests -- --nocapture
+          cargo test --profile ci --locked -p lance-encoding --doc AdmittedBytePageScheduler -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance-encoding -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

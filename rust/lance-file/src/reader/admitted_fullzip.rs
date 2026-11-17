@@ -141,7 +141,8 @@ impl FileReader {
     ///
     /// Each selected field must be Binary/Utf8/LargeBinary/LargeUtf8, optionally
     /// nested in List/LargeList, stored in dense FullZip or byte-scalar Constant
-    /// pages in v2.2/v2.3.
+    /// pages in v2.2/v2.3. Flat MiniBlock byte/string pages are also supported;
+    /// their page dictionaries and repetition indexes remain unsupported.
     /// Every selected page's layout and Arrow shape are checked before output.
     /// Payload corruption and data-dependent codec errors can still fail later.
     /// Other layouts, Blob descriptors, structural-only projections and structs

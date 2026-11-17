@@ -15,6 +15,7 @@ use lance_core::{
 use super::{
     FullZipArrayInput, FullZipScheduler,
     constant::{ConstantArrayInput, ConstantArrayScheduler},
+    miniblock_decode::{MiniBlockArrayInput, MiniBlockArrayScheduler},
     sparse::admitted_lists::{NullListInput, NullListScheduler},
 };
 use crate::{
@@ -32,9 +33,12 @@ enum Scheduler {
     AllNull(AllNullScheduler),
     FullZip(Arc<FullZipScheduler>),
     Constant(Arc<ConstantArrayScheduler>),
+    MiniBlock(MiniBlockArrayScheduler),
 }
 
 /// Metadata-only dispatch for admitted byte/string pages.
+/// Flat MiniBlock byte/string pages use a bounded metadata window and only read
+/// selected chunks. Repetition indexes and page dictionaries are not yet supported.
 /// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
 /// pages require metadata-only validity. V2_3 List chains with null byte leaves
 /// support metadata or Flat/Bitpacked/Delta parent validity, nonempty positions,
@@ -73,6 +77,12 @@ impl AdmittedBytePageScheduler {
             Ok(Self(Scheduler::Constant(Arc::new(
                 ConstantArrayScheduler::try_new(page, layout)?,
             ))))
+        } else if let Some(Layout::MiniBlockLayout(layout)) =
+            layout.and_then(|layout| layout.layout.as_ref())
+        {
+            Ok(Self(Scheduler::MiniBlock(
+                MiniBlockArrayScheduler::try_new(page, layout, codecs)?,
+            )))
         } else {
             Ok(Self(Scheduler::FullZip(Arc::new(
                 FullZipScheduler::try_from_page(page, codecs)?,
@@ -87,6 +97,7 @@ impl AdmittedBytePageScheduler {
             Scheduler::AllNull(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::FullZip(scheduler) => scheduler.validate_array_type(data_type),
             Scheduler::Constant(scheduler) => scheduler.validate_array_type(data_type),
+            Scheduler::MiniBlock(scheduler) => scheduler.validate_array_type(data_type),
         }
     }
 
@@ -133,6 +144,10 @@ impl AdmittedBytePageScheduler {
                 .prepare_array_range_in(rows, data_type, workspace, read)
                 .await?
                 .map(|input| AdmittedBytePageInput(Input::FullZip(input))),
+            Scheduler::MiniBlock(scheduler) => scheduler
+                .prepare(rows, data_type, workspace, read)
+                .await?
+                .map(|input| AdmittedBytePageInput(Input::MiniBlock(input))),
             Scheduler::Constant(scheduler) => scheduler
                 .prepare(rows, data_type, workspace, read)
                 .await?
@@ -147,6 +162,7 @@ enum Input {
     AllNull(AllNullInput),
     FullZip(FullZipArrayInput),
     Constant(ConstantArrayInput),
+    MiniBlock(MiniBlockArrayInput),
 }
 
 /// Charged page input prepared by [`AdmittedBytePageScheduler`].
@@ -164,6 +180,7 @@ impl AdmittedBytePageInput {
             Input::AllNull(input) => input.decode_in(workspace),
             Input::FullZip(input) => input.decode_in(workspace),
             Input::Constant(input) => input.decode_in(workspace),
+            Input::MiniBlock(input) => input.decode_in(workspace),
         }
     }
 }

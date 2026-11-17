@@ -38,6 +38,7 @@ use lance_encoding::format::metadata::{PageLayout, page_layout::Layout};
 
 mod all_null;
 mod empty_list;
+mod miniblock;
 mod multi;
 mod scan;
 mod take;
@@ -696,7 +697,12 @@ fn with_unsupported_page(reader: FileReader, column: usize, page: usize) -> File
             priority: old.priority,
             encoding: if index == page {
                 PageEncoding::Structural(PageLayout {
-                    layout: Some(Layout::MiniBlockLayout(Default::default())),
+                    layout: Some(Layout::MiniBlockLayout(
+                        lance_encoding::format::metadata::MiniBlockLayout {
+                            repetition_index_depth: 1,
+                            ..Default::default()
+                        },
+                    )),
                 })
             } else {
                 old.encoding.clone()

@@ -189,7 +189,7 @@ async fn sparse_take_preflights_all_selected_pages(
         .err()
         .unwrap();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("dense FullZip page"));
+    assert!(error.to_string().contains("repetition indexes"));
     assert!(
         reads.lock().unwrap().is_empty(),
         "later selected layout must fail before earlier reads"

@@ -28,7 +28,8 @@ impl FragmentReader {
     ///
     /// Currently requires dense FullZip or byte-scalar Constant v2.2/v2.3 pages
     /// with byte/string leaves optionally nested in List/LargeList, with disjoint
-    /// top-level fields across base files.
+    /// top-level fields across base files. Flat MiniBlock byte/string pages are
+    /// also supported, without page dictionaries or repetition indexes.
     /// Flat all-null byte/string pages require metadata-only validity. V2_3 List
     /// chains with metadata-proven null leaves support metadata or
     /// Flat/Bitpacked/Delta parent validity, nonempty positions and counts.
