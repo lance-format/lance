@@ -467,10 +467,7 @@ impl Number {
     /// This method returns an error if the product would overflow.
     pub(crate) fn mul(&self, other: Self) -> Result<Self> {
         match (self, other) {
-            (Self::Int64(a), Self::Int64(b)) => a
-                .checked_mul(b)
-                .map(Number::Int64)
-                .ok_or(Error::Message("Int64 overflow".to_string())),
+            (Self::Int64(a), Self::Int64(b)) => exact_i128(i128::from(*a) * i128::from(b)),
             (Self::UInt64(a), Self::UInt64(b)) => a
                 .checked_mul(b)
                 .map(Number::UInt64)
@@ -532,9 +529,8 @@ impl Number {
                 if b == 0 {
                     return Err(Error::Message("Division by zero".to_string()));
                 }
-                a.checked_rem(b)
-                    .map(Number::Int64)
-                    .ok_or(Error::Message("Int64 overflow".to_string()))
+                // wrapping_rem returns the exact 0 for i64::MIN % -1.
+                Ok(Number::Int64(a.wrapping_rem(b)))
             }
             (Self::UInt64(a), Self::UInt64(b)) => {
                 if b == 0 {
@@ -565,12 +561,9 @@ impl Number {
                     return Err(Error::Message("Division by zero".to_string()));
                 }
                 if b < 0 {
-                    // The truncated remainder of a positive dividend is
-                    // non-negative: compute it in the u64 domain instead of
-                    // narrowing a through a wrapping `as i64` cast.
-                    a.checked_rem(b.unsigned_abs())
-                        .map(Number::UInt64)
-                        .ok_or(Error::Message("UInt64 overflow".to_string()))
+                    // Compute in i128 instead of narrowing a through a wrapping
+                    // `as i64` cast; the remainder is below |b| <= 2^63.
+                    exact_i128(i128::from(*a) % i128::from(b))
                 } else {
                     a.checked_rem(b as u64)
                         .map(Number::UInt64)
@@ -1743,6 +1736,27 @@ mod tests {
     }
 
     #[test]
+    fn test_int64_mul_rem_bounds() {
+        assert!(matches!(
+            Number::Int64(i64::MIN).mul(Number::Int64(-1)),
+            Ok(Number::UInt64(9223372036854775808))
+        ));
+        assert!(matches!(
+            Number::Int64(-5).mul(Number::Int64(3)),
+            Ok(Number::Int64(-15))
+        ));
+        assert!(Number::Int64(i64::MIN).mul(Number::Int64(2)).is_err());
+        assert!(matches!(
+            Number::Int64(i64::MIN).rem(Number::Int64(-1)),
+            Ok(Number::Int64(0))
+        ));
+        assert!(matches!(
+            Number::UInt64(10).rem(Number::Int64(-3)),
+            Ok(Number::Int64(1))
+        ));
+    }
+
+    #[test]
     fn test_neg_integer_bounds() {
         assert!(matches!(
             Number::UInt64(9223372036854775808).neg(),
@@ -1752,6 +1766,8 @@ mod tests {
             Number::Int64(i64::MIN).neg(),
             Ok(Number::UInt64(9223372036854775808))
         ));
+        assert!(matches!(Number::Int64(-5).neg(), Ok(Number::Int64(5))));
+        assert!(matches!(Number::UInt64(5).neg(), Ok(Number::Int64(-5))));
         let err = Number::UInt64(9223372036854775809).neg().unwrap_err();
         assert!(
             matches!(&err, Error::Message(m) if m == "Int64 overflow"),
@@ -1812,7 +1828,7 @@ mod tests {
         );
         assert_eq!(
             Number::UInt64(u64::MAX).rem(Number::Int64(-2)).unwrap(),
-            Number::UInt64(1)
+            Number::Int64(1)
         );
         // |i64::MIN| < u64::MAX, so the remainder is the dividend itself and
         // must not take the i64::MIN % -1 overflow path.
