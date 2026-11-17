@@ -13,16 +13,17 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Shared};
 use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_select::{PreparedRowAddrMask, RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
@@ -38,6 +39,133 @@ use crate::dataset::rowids::load_row_id_sequence;
 use crate::utils::future::SharedPrerequisite;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
+
+/// Query-owned completion and a lock-free result for synchronous scoring.
+/// Neither the task nor its result retains the DatasetPreFilter owner.
+pub(super) struct MembershipPreparation {
+    result: Arc<OnceLock<Option<Arc<PreparedRowAddrMask>>>>,
+    completion: Option<Shared<BoxFuture<'static, ()>>>,
+}
+
+impl MembershipPreparation {
+    fn start(proof: Option<impl FnOnce() -> Option<PreparedRowAddrMask> + Send + 'static>) -> Self {
+        let result = Arc::new(OnceLock::new());
+        let Some(proof) = proof else {
+            let _ = result.set(None);
+            return Self {
+                result,
+                completion: None,
+            };
+        };
+        let destination = result.clone();
+        let task = tokio::spawn(async move {
+            let prepared = spawn_cpu(move || Ok::<_, crate::Error>(proof())).await?;
+            let _ = destination.set(prepared.map(Arc::new));
+            Ok::<_, crate::Error>(())
+        });
+        let destination = result.clone();
+        let completion = async move {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "optional membership preparation failed"),
+                Err(error) => tracing::warn!(%error, "optional membership preparation task failed"),
+            }
+            // Publish fallback before notifying any waiter, including on panic.
+            if destination.get().is_none() {
+                let _ = destination.set(None);
+            }
+        }
+        .boxed()
+        .shared();
+        Self {
+            result,
+            completion: Some(completion),
+        }
+    }
+
+    async fn wait_ready(&self) {
+        if let Some(completion) = &self.completion {
+            completion.clone().await;
+        }
+    }
+}
+
+/// Prepares the exact interval view of `inner`'s final mask once per query.
+///
+/// When `inner` is the query's dataset filter itself, the preparation lives in
+/// that filter's query-level cell and is shared by every index segment that
+/// searches with it. A mask-equivalent wrapper with a final mask of its own,
+/// such as a segment ownership filter, keeps a cell of its own; the parallel
+/// probes of that segment share the wrapper and so share its preparation.
+struct QueryMembershipPreFilter {
+    inner: Arc<dyn PreFilter>,
+    dataset: Option<Arc<DatasetPreFilter>>,
+    own: tokio::sync::OnceCell<MembershipPreparation>,
+    partition_row_counts: Box<dyn Fn() -> Vec<usize> + Send + Sync>,
+}
+
+impl QueryMembershipPreFilter {
+    fn preparation(&self) -> &tokio::sync::OnceCell<MembershipPreparation> {
+        self.dataset
+            .as_ref()
+            .map_or(&self.own, |dataset| &dataset.query_membership)
+    }
+}
+
+#[async_trait]
+impl PreFilter for QueryMembershipPreFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        self.inner.wait_for_ready().await?;
+        let preparation = self
+            .preparation()
+            .get_or_init(|| async {
+                // No await between starting and publishing the shared task: a
+                // cancelled first waiter must not start another CPU proof.
+                MembershipPreparation::start(PreparedRowAddrMask::prepare(
+                    self.inner.mask(),
+                    std::iter::once_with(|| (self.partition_row_counts)()).flatten(),
+                ))
+            })
+            .await;
+        preparation.wait_ready().await;
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn selects_nothing(&self) -> bool {
+        self.inner.selects_nothing()
+    }
+
+    fn needs_partition_row_ids(&self) -> bool {
+        self.inner.needs_partition_row_ids()
+    }
+
+    fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
+        self.inner.is_empty_for(rows)
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        self.inner.mask()
+    }
+
+    fn prepared_mask(&self) -> Option<Arc<PreparedRowAddrMask>> {
+        self.preparation()
+            .get()
+            .and_then(|preparation| preparation.result.get())
+            .and_then(Clone::clone)
+    }
+
+    fn is_mask_equivalent(&self) -> bool {
+        self.inner.is_mask_equivalent()
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        self.inner.filter_row_ids(row_ids)
+    }
+}
 
 /// Hash of a fragment set for mask cache keys, so masks restricted to different
 /// fragment sets do not share an entry. `RoaringBitmap` doesn't implement `Hash`,
@@ -71,9 +199,58 @@ pub struct DatasetPreFilter {
     pub(super) overlay_block: Option<RowAddrMask>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
+    // The first guaranteed-work budget, including a rejected None, is query-local.
+    // A later delta retains fallback rather than repeating the proof.
+    pub(super) query_membership: tokio::sync::OnceCell<MembershipPreparation>,
 }
 
 impl DatasetPreFilter {
+    /// Attach lazy, query-local preparation only to this exact final-mask owner.
+    /// Partition loading still precedes the existing async ready boundary.
+    pub(crate) fn with_query_membership(
+        self: &Arc<Self>,
+        candidate: Arc<dyn PreFilter>,
+        partition_row_counts: impl Fn() -> Vec<usize> + Send + Sync + 'static,
+    ) -> Arc<dyn PreFilter> {
+        let base: Arc<dyn PreFilter> = self.clone();
+        if candidate.is_empty()
+            || !candidate.is_mask_equivalent()
+            || !Arc::ptr_eq(&base, &candidate)
+            || self
+                .query_membership
+                .get()
+                .is_some_and(|state| state.result.get().is_some())
+        {
+            return candidate;
+        }
+        Arc::new(QueryMembershipPreFilter {
+            inner: candidate,
+            dataset: Some(self.clone()),
+            own: tokio::sync::OnceCell::new(),
+            partition_row_counts: Box::new(partition_row_counts),
+        })
+    }
+
+    /// Attach the same lazy preparation to a mask-equivalent restriction of
+    /// this query's filter whose final mask differs from it, such as a segment
+    /// ownership filter. The caller must have derived `restricted` from this
+    /// query's filter. The wrapper prepares its own final mask once; the
+    /// parallel probes of that segment share it.
+    pub(crate) fn with_restricted_membership(
+        restricted: Arc<dyn PreFilter>,
+        partition_row_counts: impl Fn() -> Vec<usize> + Send + Sync + 'static,
+    ) -> Arc<dyn PreFilter> {
+        if restricted.is_empty() || !restricted.is_mask_equivalent() {
+            return restricted;
+        }
+        Arc::new(QueryMembershipPreFilter {
+            inner: restricted,
+            dataset: None,
+            own: tokio::sync::OnceCell::new(),
+            partition_row_counts: Box::new(partition_row_counts),
+        })
+    }
+
     pub fn new(
         dataset: Arc<Dataset>,
         indices: &[IndexMetadata],
@@ -116,6 +293,7 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
+            query_membership: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -143,6 +321,7 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
+            query_membership: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -314,6 +493,7 @@ impl DatasetPreFilter {
             deleted_fragments,
             overlay_block,
             final_mask: _,
+            query_membership: _,
         } = self;
         filtered_ids.is_none() && deleted_fragments.is_none() && overlay_block.is_none()
     }
@@ -576,6 +756,17 @@ impl PreFilter for DatasetPreFilter {
             .is_some_and(|mask| mask_selects_nothing(mask))
     }
 
+    fn is_mask_equivalent(&self) -> bool {
+        true
+    }
+
+    fn prepared_mask(&self) -> Option<Arc<PreparedRowAddrMask>> {
+        self.query_membership
+            .get()
+            .and_then(|preparation| preparation.result.get())
+            .and_then(Clone::clone)
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -590,10 +781,202 @@ impl PreFilter for DatasetPreFilter {
 
 #[cfg(test)]
 mod test {
+    use lance_core::utils::address::RowAddress;
     use lance_select::RowSetOps;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// Only an empty allow list selects nothing; a block list, even of
     /// every row the caller knows about, never proves it.
+    fn query_mask() -> RowAddrMask {
+        RowAddrMask::from_allowed(
+            (0..32)
+                .flat_map(|key| {
+                    (0..32).map(move |offset| u64::from(RowAddress::new_from_parts(key, offset)))
+                })
+                .collect(),
+        )
+    }
+
+    fn query_filter(mask: Option<RowAddrMask>) -> Arc<DatasetPreFilter> {
+        Arc::new(DatasetPreFilter {
+            deleted_ids: None,
+            filtered_ids: mask
+                .map(|mask| SharedPrerequisite::spawn(async move { Ok(Arc::new(mask)) })),
+            deleted_fragments: None,
+            overlay_block: None,
+            final_mask: Mutex::new(OnceCell::new()),
+            query_membership: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn query_membership_concurrent_waiters_share_one_proof() {
+        let base = query_filter(Some(query_mask()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count_calls = calls.clone();
+        let filter = base.with_query_membership(base.clone(), move || {
+            count_calls.fetch_add(1, Ordering::SeqCst);
+            vec![4096]
+        });
+        futures::future::join_all((0..32).map(|_| filter.wait_for_ready()))
+            .await
+            .into_iter()
+            .for_each(|result| result.unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let prepared = filter.prepared_mask().unwrap();
+        assert!(base.query_membership.get().unwrap().completion.is_some());
+        for _ in 0..32 {
+            assert!(Arc::ptr_eq(&prepared, &filter.prepared_mask().unwrap()));
+        }
+        let rows = [0, 1, 31, 32, u64::from(RowAddress::new_from_parts(31, 31))];
+        assert_eq!(
+            prepared.selected_indices(rows.iter()),
+            filter.filter_row_ids(Box::new(rows.iter()))
+        );
+        let owner = Arc::downgrade(&base);
+        drop(filter);
+        drop(base);
+        assert!(
+            owner.upgrade().is_none(),
+            "the query task must not retain its Dataset owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_membership_cancelled_first_waiter_keeps_shared_task() {
+        let base = query_filter(Some(query_mask()));
+        base.wait_for_ready().await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count_calls = calls.clone();
+        let filter = base.with_query_membership(base.clone(), move || {
+            count_calls.fetch_add(1, Ordering::SeqCst);
+            vec![4096]
+        });
+        {
+            let wait = filter.wait_for_ready();
+            futures::pin_mut!(wait);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+        }
+        tokio::time::timeout(Duration::from_secs(2), filter.wait_for_ready())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(filter.prepared_mask().is_some());
+    }
+
+    #[tokio::test]
+    async fn query_membership_failed_task_publishes_fallback() {
+        let preparation = MembershipPreparation::start(Some(|| -> Option<PreparedRowAddrMask> {
+            panic!("injected optional proof failure")
+        }));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            futures::future::join_all((0..16).map(|_| preparation.wait_ready())),
+        )
+        .await
+        .unwrap();
+        assert!(preparation.result.get().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn query_membership_low_budget_is_sticky_without_dispatch() {
+        let base = query_filter(Some(query_mask()));
+        let filter = base.with_query_membership(base.clone(), || vec![1]);
+        filter.wait_for_ready().await.unwrap();
+        assert!(filter.prepared_mask().is_none());
+        let state = base.query_membership.get().unwrap();
+        assert!(state.completion.is_none());
+        let result = state.result.clone();
+        let later = base.with_query_membership(base.clone(), || {
+            panic!("a later budget must not be consumed")
+        });
+        later.wait_for_ready().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &result,
+            &base.query_membership.get().unwrap().result
+        ));
+        assert!(later.prepared_mask().is_none());
+    }
+
+    #[rstest]
+    #[case::all(RowAddrMask::all_rows())]
+    #[case::empty(RowAddrMask::allow_nothing())]
+    #[case::block(RowAddrMask::from_block([0].into_iter().collect()))]
+    #[tokio::test]
+    async fn query_membership_unsupported_shape_does_not_consume_counts(#[case] mask: RowAddrMask) {
+        let base = query_filter(Some(mask));
+        let filter = base.with_query_membership(base.clone(), || {
+            panic!("unsupported shapes must reject before metadata")
+        });
+        filter.wait_for_ready().await.unwrap();
+        assert!(filter.prepared_mask().is_none());
+        assert!(base.query_membership.get().unwrap().completion.is_none());
+        assert_eq!(filter.selects_nothing(), base.selects_nothing());
+    }
+
+    #[tokio::test]
+    async fn query_membership_holes_keep_exact_fallback() {
+        let excluded = u64::from(RowAddress::new_from_parts(3, 7));
+        let mask = query_mask().also_block([excluded].into_iter().collect());
+        let base = query_filter(Some(mask));
+        let filter = base.with_query_membership(base.clone(), || vec![4096]);
+        filter.wait_for_ready().await.unwrap();
+        assert!(filter.prepared_mask().is_none());
+        assert!(base.query_membership.get().unwrap().completion.is_some());
+        let rows = [excluded - 1, excluded, excluded + 1];
+        assert_eq!(filter.filter_row_ids(Box::new(rows.iter())), [0, 2]);
+    }
+
+    #[tokio::test]
+    async fn query_membership_no_filter_or_different_owner_retains_arc() {
+        let no_filter = query_filter(None);
+        let original: Arc<dyn PreFilter> = no_filter.clone();
+        let returned =
+            no_filter.with_query_membership(original.clone(), || panic!("no-filter metadata"));
+        assert!(Arc::ptr_eq(&original, &returned));
+        assert!(no_filter.query_membership.get().is_none());
+        let base = query_filter(Some(query_mask()));
+        let other: Arc<dyn PreFilter> = query_filter(Some(query_mask()));
+        let returned =
+            base.with_query_membership(other.clone(), || panic!("different-owner metadata"));
+        assert!(Arc::ptr_eq(&other, &returned));
+        assert!(base.query_membership.get().is_none());
+    }
+
+    struct AdditionalHook;
+
+    #[async_trait]
+    impl PreFilter for AdditionalHook {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn mask(&self) -> Arc<RowAddrMask> {
+            Arc::new(RowAddrMask::all_rows())
+        }
+        fn filter_row_ids<'a>(&self, rows: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            rows.enumerate()
+                .filter_map(|(position, row)| (row % 2 == 0).then_some(position as u64))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn query_membership_custom_hook_retains_original_arc() {
+        let base = query_filter(Some(query_mask()));
+        let custom: Arc<dyn PreFilter> = Arc::new(AdditionalHook);
+        let returned = base.with_query_membership(custom.clone(), || panic!("custom metadata"));
+        assert!(Arc::ptr_eq(&custom, &returned));
+        returned.wait_for_ready().await.unwrap();
+        let rows = [2, 3, 4];
+        assert_eq!(returned.filter_row_ids(Box::new(rows.iter())), [0, 2]);
+        assert!(base.query_membership.get().is_none());
+    }
+
     #[test]
     fn selects_nothing_needs_an_empty_allow_list() {
         use super::mask_selects_nothing;

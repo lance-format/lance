@@ -1874,6 +1874,12 @@ impl PreFilter for SegmentPreFilter {
             .clone()
     }
 
+    /// `filter_row_ids` below is exactly `mask().selected_indices`: the
+    /// ownership restriction is already part of the final mask.
+    fn is_mask_equivalent(&self) -> bool {
+        true
+    }
+
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
         self.mask().selected_indices(row_ids)
     }
@@ -2763,6 +2769,37 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             None
                         };
 
+                        let segment_pre_filter = if raw_index.supports_prepared_partition_search()
+                            && query.k != 0
+                            && query.refine_factor != Some(0)
+                            && !segment_pre_filter.is_empty()
+                            && segment_pre_filter.is_mask_equivalent()
+                        {
+                            let index = raw_index.clone();
+                            let partitions = part_ids.clone();
+                            let initial_probes = query.minimum_nprobes.min(partitions.len());
+                            // Only initial probes are guaranteed to execute. Late
+                            // probes may stop early and cannot fund preparation.
+                            let partition_row_counts = move || {
+                                (0..initial_probes)
+                                    .map(|idx| index.partition_size(partitions.value(idx) as usize))
+                                    .collect()
+                            };
+                            let dataset_filter: Arc<dyn PreFilter> = pre_filter.clone();
+                            if Arc::ptr_eq(&dataset_filter, &segment_pre_filter) {
+                                pre_filter.with_query_membership(segment_pre_filter, partition_row_counts)
+                            } else {
+                                // A segment ownership filter derived from this query's
+                                // filter: prepare its own final mask.
+                                DatasetPreFilter::with_restricted_membership(
+                                    segment_pre_filter,
+                                    partition_row_counts,
+                                )
+                            }
+                        } else {
+                            segment_pre_filter
+                        };
+
                         let early_search = Self::initial_search(
                             raw_index.clone(),
                             query.clone(),
@@ -3069,6 +3106,71 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
+
+    #[tokio::test]
+    async fn query_membership_wraps_small_segment_filter_without_preparation() {
+        let base = empty_prefilter().await;
+        let segment: Arc<dyn PreFilter> = Arc::new(SegmentPreFilter::new(
+            base.clone(),
+            Arc::new(RowAddrMask::from_allowed([0_u64, 2].into_iter().collect())),
+        ));
+        assert!(segment.is_mask_equivalent());
+        // Structural rejection (fewer than 32 fragments) precedes reading any
+        // partition counts.
+        let returned = DatasetPreFilter::with_restricted_membership(segment.clone(), || {
+            panic!("an ineligible mask must not consume preparation metadata")
+        });
+        assert!(!Arc::ptr_eq(&segment, &returned));
+        returned.wait_for_ready().await.unwrap();
+        let rows = [0, 1, 2];
+        assert_eq!(returned.filter_row_ids(Box::new(rows.iter())), [0, 2]);
+        assert!(returned.prepared_mask().is_none());
+    }
+
+    /// A segment ownership filter prepares its own final mask (filter ∩
+    /// ownership); the view agrees with the segment's position filter and the
+    /// dataset filter's query-level preparation is left untouched.
+    #[tokio::test]
+    async fn query_membership_prepares_segment_final_mask() {
+        let row = |fragment: u32, offset: u32| {
+            u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                fragment, offset,
+            ))
+        };
+        let filter = RowAddrMask::from_allowed(
+            (0..40)
+                .flat_map(|fragment| (0..10).map(move |offset| row(fragment, offset)))
+                .collect(),
+        );
+        let base = prefilter_with_mask(Some(filter)).await;
+        let mut owned = RowAddrTreeMap::new();
+        for fragment in (0..40).filter(|fragment| *fragment != 5) {
+            owned.insert_fragment(fragment);
+        }
+        let segment: Arc<dyn PreFilter> = Arc::new(SegmentPreFilter::new(
+            base.clone(),
+            Arc::new(RowAddrMask::from_allowed(owned)),
+        ));
+        let returned = DatasetPreFilter::with_restricted_membership(segment.clone(), || vec![4096]);
+        assert!(!Arc::ptr_eq(&segment, &returned));
+        returned.wait_for_ready().await.unwrap();
+        let prepared = returned
+            .prepared_mask()
+            .expect("the segment's final mask is prepared");
+        assert!(base.prepared_mask().is_none());
+        let rows = [
+            row(0, 3),
+            row(5, 3),
+            row(7, 10),
+            row(39, 9),
+            row(40, 0),
+            row(0, 3),
+        ];
+        let expected = segment.filter_row_ids(Box::new(rows.iter()));
+        assert_eq!(expected, [0, 3, 5]);
+        assert_eq!(prepared.selected_indices(rows.iter()), expected);
+        assert_eq!(returned.filter_row_ids(Box::new(rows.iter())), expected);
+    }
 
     pub(super) fn base_query() -> Query {
         Query {
@@ -5997,6 +6099,28 @@ mod tests {
         );
         empty.wait_for_ready().await.unwrap();
         assert!(empty.selects_nothing());
+    }
+
+    /// Segment position filtering is exactly membership of its final mask
+    /// (filter ∩ ownership), so consumers may test that mask directly.
+    #[tokio::test]
+    async fn segment_prefilter_positions_are_final_mask_membership() {
+        let other_fragment =
+            u64::from(lance_core::utils::address::RowAddress::new_from_parts(1, 0));
+        let mut allowed = RowAddrTreeMap::new();
+        for row in [0_u64, 1, 2, other_fragment] {
+            allowed.insert(row);
+        }
+        let base = prefilter_with_mask(Some(RowAddrMask::from_allowed(allowed))).await;
+        let mut owned = RowAddrTreeMap::new();
+        owned.insert_fragment(0);
+        let segment = SegmentPreFilter::new(base, Arc::new(RowAddrMask::from_allowed(owned)));
+        assert!(segment.is_mask_equivalent());
+        segment.wait_for_ready().await.unwrap();
+        let rows = [2_u64, 7, other_fragment, 0, 2];
+        let positions = segment.filter_row_ids(Box::new(rows.iter()));
+        assert_eq!(positions, segment.mask().selected_indices(rows.iter()));
+        assert_eq!(positions, [0, 3, 4]);
     }
 
     /// After the barrier, a delta whose prefilter selects nothing is

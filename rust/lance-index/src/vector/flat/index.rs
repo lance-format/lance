@@ -33,6 +33,30 @@ use crate::{
 
 use super::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 
+/// Collect partition offsets for the scoring kernels. When a prepared
+/// interval view covers the partition, it avoids the generic bitmap lookup.
+/// Other masks and short partitions retain bulk bitmap selection.
+fn select_partition_offsets<'a>(
+    prefilter: &dyn PreFilter,
+    row_ids: impl Iterator<Item = &'a u64> + 'a,
+    offsets: &mut Vec<u32>,
+) {
+    if let Some(prepared) = prefilter
+        .is_mask_equivalent()
+        .then(|| prefilter.prepared_mask())
+        .flatten()
+        .filter(|view| view.is_dense_selection_eligible(row_ids.size_hint().0))
+    {
+        offsets.clear();
+        // An index partition contains fewer than u32::MAX rows.
+        offsets.extend(row_ids.enumerate().filter_map(|(position, &row_id)| {
+            prepared.selected(row_id).then_some(position as u32)
+        }));
+    } else {
+        prefilter.mask().selected_offsets_into(row_ids, offsets);
+    }
+}
+
 #[inline(always)]
 fn push_candidate_local<T: Eq>(
     res: &mut BinaryHeap<OrderedNode<T>>,
@@ -173,9 +197,7 @@ fn search_candidates_with_scratch(
             }
         }
     } else {
-        prefilter
-            .mask()
-            .selected_offsets_into(row_ids, &mut scratch.u32);
+        select_partition_offsets(prefilter.as_ref(), row_ids, &mut scratch.u32);
         if is_range_query {
             let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
             let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -324,9 +346,7 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                prefilter
-                    .mask()
-                    .selected_offsets_into(row_ids, &mut scratch.u32);
+                select_partition_offsets(prefilter.as_ref(), row_ids, &mut scratch.u32);
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -479,9 +499,7 @@ impl IvfSubIndex for FlatIndex {
                 // The selection and the calculator's candidate buffer share the
                 // u32 scratch: take it for the selection and keep the larger of
                 // the two afterwards.
-                prefilter
-                    .mask()
-                    .selected_offsets_into(row_ids, &mut scratch.u32);
+                select_partition_offsets(prefilter.as_ref(), row_ids, &mut scratch.u32);
                 let selected = std::mem::take(&mut scratch.u32);
                 dist_calc.accumulate_filtered_topk_with_scratch(
                     k,
@@ -715,10 +733,11 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use lance_select::{PreparedRowAddrMask, RowAddrMask, RowAddrTreeMap};
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+    use crate::vector::quantizer::QuantizerStorage;
 
     #[test]
     fn test_schema_is_initialized_once() {
@@ -731,6 +750,7 @@ mod tests {
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,
+        prepared: Option<Arc<PreparedRowAddrMask>>,
     }
 
     #[async_trait]
@@ -747,8 +767,170 @@ mod tests {
             self.mask.clone()
         }
 
+        fn is_mask_equivalent(&self) -> bool {
+            true
+        }
+        fn prepared_mask(&self) -> Option<Arc<PreparedRowAddrMask>> {
+            self.prepared.clone()
+        }
+
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
             self.mask.selected_indices(row_ids)
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::topk(false)]
+    #[case::range(true)]
+    fn prepared_membership_matches_all_flat_consumers(#[case] range_query: bool) {
+        // Every row address differs from its partition offset, including the
+        // nearest candidates returned by this fixture.
+        let rows: Vec<u64> = (1..=32)
+            .flat_map(|key| {
+                (0..128).map(move |offset| {
+                    u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                        key, offset,
+                    ))
+                })
+            })
+            .collect();
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..rows.len())
+                    .flat_map(|i| [i as f32 / 16.0, 0.0])
+                    .collect::<Vec<_>>(),
+            ),
+            2,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                lance_core::ROW_ID,
+                Arc::new(UInt64Array::from(rows.clone())) as ArrayRef,
+            ),
+            (FLAT_COLUMN, Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+        let storage = FlatFloatStorage::try_from_batch(
+            batch,
+            &FlatMetadata { dim: 2 },
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        let mask = Arc::new(RowAddrMask::from_allowed(
+            rows.iter()
+                .copied()
+                .filter(|row| (*row as u32) < 64)
+                .collect(),
+        ));
+        let view = Arc::new(PreparedRowAddrMask::try_new(mask.clone(), [rows.len()]).unwrap());
+        assert!(view.is_dense_selection_eligible(storage.row_ids().size_hint().0));
+        let legacy: Arc<dyn PreFilter> = Arc::new(MaskPreFilter {
+            mask: mask.clone(),
+            prepared: None,
+        });
+        let prepared: Arc<dyn PreFilter> = Arc::new(MaskPreFilter {
+            mask: mask.clone(),
+            prepared: Some(view),
+        });
+        let params = || FlatQueryParams {
+            lower_bound: range_query.then_some(0.125),
+            upper_bound: range_query.then_some(100.0),
+            ..Default::default()
+        };
+        let key = || Arc::new(Float32Array::from(vec![0.0, 0.0])) as ArrayRef;
+        let index = FlatIndex::default();
+        let a = index
+            .search(
+                key(),
+                8,
+                params(),
+                &storage,
+                legacy.clone(),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let b = index
+            .search(
+                key(),
+                8,
+                params(),
+                &storage,
+                prepared.clone(),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(a, b);
+        let expected: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &row)| {
+                let distance = (i as f32 / 16.0).powi(2);
+                (mask.selected(row) && (!range_query || (0.125..100.0).contains(&distance)))
+                    .then_some(row)
+            })
+            .take(8)
+            .collect();
+        assert_eq!(
+            batch_results(a).iter().map(|x| x.0).collect::<Vec<_>>(),
+            expected
+        );
+        let mut a = BinaryHeap::new();
+        let mut b = BinaryHeap::new();
+        index
+            .accumulate_topk(
+                key(),
+                8,
+                params(),
+                &storage,
+                legacy.clone(),
+                &mut a,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        index
+            .accumulate_topk(
+                key(),
+                8,
+                params(),
+                &storage,
+                prepared.clone(),
+                &mut b,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(heap_results(a), heap_results(b));
+        let a = search_candidates_with_scratch(
+            key(),
+            16,
+            &params(),
+            &storage,
+            legacy,
+            &NoOpMetricsCollector,
+            None,
+            &mut QueryScratch::default(),
+        )
+        .unwrap()
+        .into_sorted_vec();
+        let b = search_candidates_with_scratch(
+            key(),
+            16,
+            &params(),
+            &storage,
+            prepared,
+            &NoOpMetricsCollector,
+            None,
+            &mut QueryScratch::default(),
+        )
+        .unwrap()
+        .into_sorted_vec();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        for candidate in b {
+            let (offset, row_id) = candidate.id;
+            assert_eq!(row_id, rows[offset as usize]);
+            assert!(mask.selected(row_id));
         }
     }
 
@@ -837,6 +1019,7 @@ mod tests {
             mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 0_u64, 3, 4,
             ]))),
+            prepared: None,
         });
         let search_results = batch_results(
             index

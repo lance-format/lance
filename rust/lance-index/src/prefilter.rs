@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{PreparedRowAddrMask, RowAddrMask, RowAddrTreeMap};
 
 /// A trait to be implemented by anything supplying a prefilter row addr mask
 ///
@@ -68,6 +68,44 @@ pub trait PreFilter: Send + Sync {
     /// segment whose own mask selects nothing, so implementations answer
     /// from their stored mask without scanning it.
     fn selects_nothing(&self) -> bool {
+        false
+    }
+
+    /// Optional exact membership view of this query's immutable final mask.
+    /// Call after [`Self::wait_for_ready`]. Custom filters retain the original path.
+    ///
+    /// ```
+    /// # use lance_index::prefilter::PreFilter;
+    /// # async fn example(filter: &dyn PreFilter) -> lance_core::Result<()> {
+    /// filter.wait_for_ready().await?;
+    /// if let Some(view) = filter.prepared_mask() { let _ = view.selected(1); }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn prepared_mask(&self) -> Option<Arc<PreparedRowAddrMask>> {
+        None
+    }
+
+    /// Whether position filtering is exactly the membership of [`Self::mask`].
+    ///
+    /// Call after [`Self::wait_for_ready`]. This also promises the same input
+    /// ordering and duplicate-row behavior, with no additional filtering rules.
+    /// The default retains [`Self::filter_row_ids`] for custom filters and
+    /// ownership wrappers that have not established this equivalence.
+    ///
+    /// ```
+    /// # use lance_index::prefilter::PreFilter;
+    /// # async fn example(filter: &dyn PreFilter) -> lance_core::Result<()> {
+    /// filter.wait_for_ready().await?;
+    /// if filter.is_mask_equivalent() {
+    ///     let rows = [1_u64, 1, 5];
+    ///     assert_eq!(filter.mask().selected_indices(rows.iter()),
+    ///         filter.filter_row_ids(Box::new(rows.iter())));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_mask_equivalent(&self) -> bool {
         false
     }
 

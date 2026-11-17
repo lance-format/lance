@@ -18,8 +18,10 @@ use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 
 mod nullable;
+mod prepared;
 
 pub use nullable::{NullableRowAddrMask, NullableRowAddrSet};
+pub use prepared::PreparedRowAddrMask;
 
 /// A mask that selects or deselects rows based on an allow-list or block-list.
 #[derive(Clone, Debug, DeepSizeOf, PartialEq)]

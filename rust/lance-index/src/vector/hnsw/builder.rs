@@ -49,6 +49,57 @@ use crate::vector::{ApproxMode, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
+fn build_prefilter_bitset<'a>(
+    storage: &impl VectorStore,
+    prefilter: &dyn PreFilter,
+    generator: &'a mut VisitedGenerator,
+) -> Option<Visited<'a>> {
+    if prefilter.is_mask_equivalent()
+        && let Some(mask) = prefilter.prepared_mask()
+        && mask.is_dense_selection_eligible(storage.row_ids().size_hint().0)
+    {
+        // Scan the accepted prefix once; on the first rejected row, switch to
+        // writing selected positions without revisiting that prefix.
+        let mut rows = storage.row_ids();
+        let mut prefix = 0;
+        let rejected = loop {
+            match rows.next() {
+                Some(&row_id) if mask.selected(row_id) => prefix += 1,
+                Some(_) => break true,
+                None => break false,
+            }
+        };
+        // Prove all actual positions, rather than inferring All from metadata
+        // or mask cardinality. The all-pass path need not generate a bitmap.
+        if !rejected && prefix == storage.len() {
+            return None;
+        }
+        let mut bitset = generator.generate(storage.len());
+        for position in 0..prefix {
+            bitset.insert(position as u32);
+        }
+        if rejected {
+            // The first rejected row has already been consumed. Continue once
+            // from the next position; never rescan the accepted prefix.
+            for (offset, &row_id) in rows.enumerate() {
+                if mask.selected(row_id) {
+                    bitset.insert((prefix + 1 + offset) as u32);
+                }
+            }
+        }
+        return Some(bitset);
+    }
+
+    // Keep fragment-run selection for masks and partitions that cannot use
+    // the prepared view. Per-row mask lookups are expensive for sparse filters.
+    let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
+    let mut bitset = generator.generate(storage.len());
+    for index in indices {
+        bitset.insert(index as u32);
+    }
+    (bitset.count_ones() != storage.len()).then_some(bitset)
+}
+
 /// Fixed seed for HNSW node-level assignment.
 ///
 /// A constant seed makes graph construction reproducible (same data + params =>
@@ -1738,39 +1789,34 @@ impl IvfSubIndex for HNSW {
         let (mut results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
-            // the bitset must be moved into a callee on every path so its
-            // borrow of `prefilter_generator` ends before the push below
-            let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
-            let mut prefilter_bitset = prefilter_generator.generate(storage.len());
-            for index in indices {
-                prefilter_bitset.insert(index as u32);
-            }
-            let remained = prefilter_bitset.count_ones();
-            if remained == storage.len() {
-                // mask passes every row: same as unfiltered
-                drop(prefilter_bitset);
-                self.search_basic(query, k, &params, None, storage)?
-            } else if remained < self.len() * 10 / 100 {
-                // few matching rows: brute force is cheaper and exact
-                self.flat_search(storage, query, k, prefilter_bitset, &params)
-            } else if params.use_acorn {
-                let (acorn_results, acorn_comparisons) =
-                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
-                // under-delivery means the budget ran out on a fragmented
-                // mask, except range-bounded queries which return short
-                // legitimately
-                let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
-                if !bounded && acorn_results.len() < top_k.min(remained) {
-                    // the abandoned ACORN traversal still cost its distances
-                    let (results, basic_comparisons) =
-                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
-                    (results, acorn_comparisons + basic_comparisons)
+            if let Some(prefilter_bitset) =
+                build_prefilter_bitset(storage, prefilter.as_ref(), &mut prefilter_generator)
+            {
+                let remained = prefilter_bitset.count_ones();
+                if remained < self.len() * 10 / 100 {
+                    // few matching rows: brute force is cheaper and exact
+                    self.flat_search(storage, query, k, prefilter_bitset, &params)
+                } else if params.use_acorn {
+                    let (acorn_results, acorn_comparisons) =
+                        self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
+                    // under-delivery means the budget ran out on a fragmented
+                    // mask, except range-bounded queries which return short
+                    // legitimately
+                    let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
+                    if !bounded && acorn_results.len() < top_k.min(remained) {
+                        // the abandoned ACORN traversal still cost its distances
+                        let (results, basic_comparisons) =
+                            self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                        (results, acorn_comparisons + basic_comparisons)
+                    } else {
+                        drop(prefilter_bitset);
+                        (acorn_results, acorn_comparisons)
+                    }
                 } else {
-                    drop(prefilter_bitset);
-                    (acorn_results, acorn_comparisons)
+                    self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
                 }
             } else {
-                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                self.search_basic(query, k, &params, None, storage)?
             }
         };
         metrics.record_comparisons(comparisons);
@@ -1936,10 +1982,12 @@ mod tests {
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+        UInt64Array,
     };
     use arrow_schema::{Schema, SchemaRef};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::address::RowAddress;
     use lance_core::{Error, Result, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
@@ -1957,16 +2005,20 @@ mod tests {
 
     use super::{
         HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
-        ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
+        ImmutableHnswLevelView, MIN_HNSW_M, build_prefilter_bitset, random_level_with,
     };
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::prefilter::{NoFilter, PreFilter};
     use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
+    use crate::vector::quantizer::QuantizerStorage;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
+        flat::{
+            index::FlatMetadata,
+            storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
+        },
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
@@ -2002,8 +2054,291 @@ mod tests {
             self.mask.clone()
         }
 
+        fn is_mask_equivalent(&self) -> bool {
+            true
+        }
+
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
             self.mask.selected_indices(row_ids)
+        }
+    }
+
+    struct LegacyPreFilter {
+        mask: Arc<RowAddrMask>,
+    }
+
+    #[async_trait]
+    impl PreFilter for LegacyPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            // Custom hooks may enforce restrictions beyond their exposed mask.
+            Arc::new(RowAddrMask::all_rows())
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
+    }
+
+    fn prefilter_test_storage(row_ids: Vec<u64>) -> FlatFloatStorage {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0; row_ids.len()]),
+            1,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                lance_core::ROW_ID,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ),
+            ("flat", Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+        FlatFloatStorage::try_from_batch(batch, &FlatMetadata { dim: 1 }, DistanceType::L2, None)
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::empty(vec![], vec![], false, vec![])]
+    #[case::all((0..8).collect(), (0..8).collect(), false, (0..8).collect())]
+    #[case::none((0..8).collect(), vec![], false, vec![])]
+    #[case::prefix((0..8).collect(), vec![0, 1, 2], false, vec![0, 1, 2])]
+    #[case::suffix((0..8).collect(), vec![5, 6, 7], false, vec![5, 6, 7])]
+    #[case::middle_gap(
+        (0..8).collect(), vec![0, 1, 2, 4, 5, 6, 7], false, vec![0, 1, 2, 4, 5, 6, 7]
+    )]
+    #[case::last_rejected((0..8).collect(), (0..7).collect(), false, (0..7).collect())]
+    #[case::holes((0..8).collect(), vec![1, 3, 5], false, vec![1, 3, 5])]
+    #[case::block_list((0..8).collect(), vec![2, 4], true, vec![0, 1, 3, 5, 6, 7])]
+    #[case::duplicate_unordered(vec![7, 2, 7, 3, 2, 9], vec![2, 7], false, vec![0, 1, 2, 4])]
+    #[case::duplicate_all(vec![7, 2, 7, 3], vec![2, 3, 7], false, vec![0, 1, 2, 3])]
+    #[case::equal_mask_cardinality(
+        (0..8).collect(), vec![0, 1, 2, 3, 4, 5, 6, 99], false, (0..7).collect()
+    )]
+    #[case::noncontiguous_fragments(
+        vec![
+            u64::from(RowAddress::new_from_parts(7, 5)),
+            u64::from(RowAddress::new_from_parts(1, 9)),
+            u64::from(RowAddress::new_from_parts(17, 2)),
+            u64::from(RowAddress::new_from_parts(7, 5)),
+        ],
+        vec![
+            u64::from(RowAddress::new_from_parts(1, 9)),
+            u64::from(RowAddress::new_from_parts(7, 5)),
+        ],
+        false,
+        vec![0, 1, 3]
+    )]
+    fn test_fused_prefilter_positions(
+        #[case] row_ids: Vec<u64>,
+        #[case] mask_rows: Vec<u64>,
+        #[case] is_block_list: bool,
+        #[case] expected: Vec<u64>,
+    ) {
+        let storage = prefilter_test_storage(row_ids);
+        let rows = RowAddrTreeMap::from_iter(mask_rows);
+        let mask = Arc::new(if is_block_list {
+            RowAddrMask::from_block(rows)
+        } else {
+            RowAddrMask::from_allowed(rows)
+        });
+        let fused = MaskPreFilter { mask: mask.clone() };
+        let legacy = LegacyPreFilter { mask };
+        assert!(fused.is_mask_equivalent());
+        assert!(!legacy.is_mask_equivalent());
+        assert_eq!(legacy.filter_row_ids(Box::new(storage.row_ids())), expected);
+
+        for filter in [&fused as &dyn PreFilter, &legacy as &dyn PreFilter] {
+            let mut generator = VisitedGenerator::new(0);
+            for _ in 0..2 {
+                {
+                    let bitset = build_prefilter_bitset(&storage, filter, &mut generator);
+                    assert_eq!(bitset.is_none(), expected.len() == storage.len());
+                    if let Some(bitset) = bitset {
+                        assert_eq!(bitset.count_ones(), expected.len());
+                        assert_eq!(
+                            bitset
+                                .iter_ones()
+                                .map(|position| position as u64)
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                        for position in 0..storage.len() {
+                            assert_eq!(
+                                bitset.contains(position as u32),
+                                expected.contains(&(position as u64))
+                            );
+                        }
+                    }
+                }
+                let clean = generator.generate(storage.len());
+                assert_eq!(clean.count_ones(), 0);
+                assert!((0..storage.len()).all(|position| !clean.contains(position as u32)));
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_membership_reaches_hnsw_bitset_once() {
+        struct Filter {
+            mask: Arc<RowAddrMask>,
+            view: Arc<lance_select::PreparedRowAddrMask>,
+            lookups: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl PreFilter for Filter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_empty(&self) -> bool {
+                false
+            }
+            fn mask(&self) -> Arc<RowAddrMask> {
+                self.mask.clone()
+            }
+            fn is_mask_equivalent(&self) -> bool {
+                true
+            }
+            fn prepared_mask(&self) -> Option<Arc<lance_select::PreparedRowAddrMask>> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Some(self.view.clone())
+            }
+            fn filter_row_ids<'a>(
+                &self,
+                _rows: Box<dyn Iterator<Item = &'a u64> + 'a>,
+            ) -> Vec<u64> {
+                panic!("the prepared HNSW consumer must not use the legacy selection hook")
+            }
+        }
+        let rows: Vec<u64> = (0..32)
+            .flat_map(|key| {
+                (0..128).map(move |offset| u64::from(RowAddress::new_from_parts(key, offset)))
+            })
+            .collect();
+        let storage = prefilter_test_storage(rows.clone());
+        let mask = Arc::new(RowAddrMask::from_allowed(
+            rows.iter()
+                .copied()
+                .filter(|row| (*row as u32) < 64)
+                .collect(),
+        ));
+        let view = Arc::new(
+            lance_select::PreparedRowAddrMask::try_new(mask.clone(), [rows.len()]).unwrap(),
+        );
+        let expected = mask.selected_indices(rows.iter());
+        let filter = Filter {
+            mask,
+            view,
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut generator = VisitedGenerator::new(0);
+        let bits = build_prefilter_bitset(&storage, &filter, &mut generator).unwrap();
+        assert_eq!(
+            bits.iter_ones()
+                .map(|position| position as u64)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(filter.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case::all(256, vec![])]
+    #[case::first_rejected(256, vec![0])]
+    #[case::second_rejected(256, vec![1])]
+    #[case::middle_rejected(256, vec![127])]
+    #[case::last_rejected(256, vec![255])]
+    #[case::rejected_suffix(256, (128..256).collect())]
+    #[case::alternating(256, (0..256).step_by(2).collect())]
+    #[case::none_selected(256, (0..256).collect())]
+    #[case::small_partition_fallback(16, vec![0, 15])]
+    #[case::empty_partition_fallback(0, vec![])]
+    fn test_prepared_prefilter_prefix_boundary(#[case] count: usize, #[case] rejected: Vec<usize>) {
+        let mask = Arc::new(RowAddrMask::from_allowed(
+            (0..32)
+                .flat_map(|fragment| {
+                    (1..=3)
+                        .map(move |offset| u64::from(RowAddress::new_from_parts(fragment, offset)))
+                })
+                .collect(),
+        ));
+        let row_ids = (0..count)
+            .map(|position| {
+                // Duplicate, unordered row addresses must still select positions.
+                let fragment = ((position * 7) % 32) as u32;
+                let offset = if rejected.contains(&position) { 4 } else { 2 };
+                u64::from(RowAddress::new_from_parts(fragment, offset))
+            })
+            .collect();
+        let storage = prefilter_test_storage(row_ids);
+        let legacy = LegacyPreFilter { mask: mask.clone() };
+        let expected = legacy.filter_row_ids(Box::new(storage.row_ids()));
+        struct PreparedFilter {
+            mask: Arc<RowAddrMask>,
+            view: Option<Arc<lance_select::PreparedRowAddrMask>>,
+            bulk_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl PreFilter for PreparedFilter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_empty(&self) -> bool {
+                false
+            }
+            fn mask(&self) -> Arc<RowAddrMask> {
+                self.mask.clone()
+            }
+            fn prepared_mask(&self) -> Option<Arc<lance_select::PreparedRowAddrMask>> {
+                self.view.clone()
+            }
+            fn is_mask_equivalent(&self) -> bool {
+                true
+            }
+            fn filter_row_ids<'a>(&self, rows: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+                self.bulk_calls.fetch_add(1, Ordering::Relaxed);
+                self.mask.selected_indices(rows)
+            }
+        }
+        // Another initial partition can fund the shared view for a small one.
+        let view =
+            Arc::new(lance_select::PreparedRowAddrMask::try_new(mask.clone(), [4096]).unwrap());
+        let eligible = view.is_dense_selection_eligible(storage.row_ids().size_hint().0);
+        let mut generator = VisitedGenerator::new(0);
+        for (view, expected_bulk_calls) in [(None, 2), (Some(view), if eligible { 0 } else { 2 })] {
+            let filter = PreparedFilter {
+                mask: mask.clone(),
+                view,
+                bulk_calls: AtomicUsize::new(0),
+            };
+            for _ in 0..2 {
+                {
+                    let bitset = build_prefilter_bitset(&storage, &filter, &mut generator);
+                    assert_eq!(bitset.is_none(), expected.len() == count);
+                    if let Some(bitset) = bitset {
+                        assert_eq!(
+                            bitset
+                                .iter_ones()
+                                .map(|position| position as u64)
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                }
+                let clean = generator.generate(count);
+                assert_eq!(clean.count_ones(), 0);
+            }
+            assert_eq!(
+                filter.bulk_calls.load(Ordering::Relaxed),
+                expected_bulk_calls
+            );
         }
     }
 
@@ -2969,16 +3304,30 @@ mod tests {
                 dist_q_c: 0.0,
                 use_acorn,
             };
+            let mask = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                allowed,
+            )));
             let batch = hnsw
                 .search(
                     query_key.clone(),
                     k,
                     params,
                     store.as_ref(),
-                    masked_prefilter(allowed),
+                    Arc::new(MaskPreFilter { mask: mask.clone() }),
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
+            let legacy = hnsw
+                .search(
+                    query_key.clone(),
+                    k,
+                    params,
+                    store.as_ref(),
+                    Arc::new(LegacyPreFilter { mask }),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            assert_eq!(batch, legacy);
             batch[lance_core::ROW_ID]
                 .as_primitive::<arrow_array::types::UInt64Type>()
                 .values()
@@ -3055,27 +3404,37 @@ mod tests {
         let query = fsl.value(0);
 
         let search_row_ids = |allowed: Vec<u64>| {
-            let filter = Arc::new(MaskPreFilter {
-                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                    allowed,
-                ))),
-            });
+            let mask = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                allowed,
+            )));
+            let params = HnswQueryParams {
+                ef: TOTAL,
+                lower_bound: Some(0.0),
+                upper_bound: Some(1.0),
+                dist_q_c: 0.0,
+                use_acorn: false,
+            };
             let batch = hnsw
                 .search(
                     query.clone(),
                     10,
-                    HnswQueryParams {
-                        ef: TOTAL,
-                        lower_bound: Some(0.0),
-                        upper_bound: Some(1.0),
-                        dist_q_c: 0.0,
-                        use_acorn: false,
-                    },
+                    params,
                     store.as_ref(),
-                    filter,
+                    Arc::new(MaskPreFilter { mask: mask.clone() }),
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
+            let legacy = hnsw
+                .search(
+                    query.clone(),
+                    10,
+                    params,
+                    store.as_ref(),
+                    Arc::new(LegacyPreFilter { mask }),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            assert_eq!(batch, legacy);
             batch[lance_core::ROW_ID]
                 .as_primitive::<arrow_array::types::UInt64Type>()
                 .values()
