@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{borrow::Cow, mem::size_of, ops::Bound, sync::Arc};
+use std::{
+    borrow::Cow,
+    hash::{DefaultHasher, Hash, Hasher},
+    mem::size_of,
+    ops::Bound,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use datafusion_common::ScalarValue;
 use lance_core::{
@@ -18,7 +27,45 @@ pub(super) const MIN_MATCHED_PAGES: usize = 128;
 const MAX_LITERAL_BYTES: usize = 4 * 1024;
 /// Keep an individual result from displacing a large share of the page cache.
 const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
+/// Keep 512 bytes of recent filter fingerprints per resident BTree state.
+const RECENT_FILTER_SLOTS: usize = 64;
 
+/// Shared by warm opens of the same immutable BTree state.
+#[derive(Debug)]
+pub(super) struct ResultCacheState {
+    pub(super) identity: Arc<()>,
+    recent_filters: [AtomicU64; RECENT_FILTER_SLOTS],
+}
+
+impl Default for ResultCacheState {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(()),
+            recent_filters: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl DeepSizeOf for ResultCacheState {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.identity.deep_size_of_children(context)
+    }
+}
+
+impl ResultCacheState {
+    /// Preserve page-cache capacity by admitting only recently repeated filters.
+    /// This is an admission hint: collisions can affect insertion, never reuse.
+    pub(super) fn should_admit(&self, key: &QueryResultKey<'_>) -> bool {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let slot = (fingerprint as usize) % RECENT_FILTER_SLOTS;
+        let marker = fingerprint | 1; // Zero denotes a slot that has never been written.
+        self.recent_filters[slot].swap(marker, Ordering::Relaxed) == marker
+    }
+}
+
+#[derive(Clone, Copy, Hash)]
 pub(super) struct QueryResultKey<'a> {
     // The index namespace isolates segments. A resident state shares this
     // token across opens, while another physical load gets a new token.
@@ -27,11 +74,13 @@ pub(super) struct QueryResultKey<'a> {
     predicate: Predicate<'a>,
 }
 
+#[derive(Clone, Copy, Hash)]
 enum Predicate<'a> {
     Equals(Literal<'a>),
     Range(Bound<Literal<'a>>, Bound<Literal<'a>>),
 }
 
+#[derive(Clone, Copy, Hash)]
 enum Literal<'a> {
     Int32(i32),
     Int64(i64),
