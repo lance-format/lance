@@ -45,7 +45,7 @@ use crate::vector::graph::{
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
-use crate::vector::{ApproxMode, Query, VECTOR_RESULT_SCHEMA};
+use crate::vector::{ApproxMode, Query, RqGraphScoring, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
@@ -350,7 +350,7 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
-        let dist_calc = storage.graph_dist_calculator(query, params.dist_q_c);
+        let dist_calc = params.dist_calculator(storage, query);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
@@ -543,7 +543,7 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
-        let dist_calc = storage.graph_dist_calculator(query, params.dist_q_c);
+        let dist_calc = params.dist_calculator(storage, query);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
@@ -645,7 +645,7 @@ impl HNSW {
         // every set bit gets exactly one distance on both branches below
         let comparisons = prefilter_bitset.count_ones();
 
-        let dist_calc = storage.graph_dist_calculator(query, params.dist_q_c);
+        let dist_calc = params.dist_calculator(storage, query);
         let in_range = range_filter(params, &dist_calc);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
 
@@ -914,6 +914,7 @@ impl HnswBuilder {
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn: false,
+                rq_graph_scoring: Default::default(),
             },
             dist_calc,
             None,
@@ -1494,6 +1495,7 @@ pub struct HnswQueryParams {
     pub upper_bound: Option<f32>,
     pub dist_q_c: f32,
     pub use_acorn: bool,
+    pub rq_graph_scoring: RqGraphScoring,
 }
 
 impl From<&Query> for HnswQueryParams {
@@ -1511,6 +1513,26 @@ impl HnswQueryParams {
             upper_bound: query.upper_bound,
             dist_q_c,
             use_acorn: query.approx_mode == ApproxMode::Fast,
+            rq_graph_scoring: query.rq_graph_scoring,
+        }
+    }
+
+    /// Whether the search walks with [`VectorStore::graph_dist_calculator`]
+    /// and lets [`VectorStore::rerank`] replace its scores.
+    fn reranks(&self) -> bool {
+        self.rq_graph_scoring == RqGraphScoring::OneBitRerank
+    }
+
+    /// The calculator that scores the nodes a search visits.
+    pub(crate) fn dist_calculator<'a, S: VectorStore>(
+        &self,
+        storage: &'a S,
+        query: ArrayRef,
+    ) -> S::DistanceCalculator<'a> {
+        if self.reranks() {
+            storage.graph_dist_calculator(query, self.dist_q_c)
+        } else {
+            storage.dist_calculator(query, self.dist_q_c)
         }
     }
 }
@@ -1733,8 +1755,8 @@ impl IvfSubIndex for HNSW {
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
         let rerank_query = query.clone();
-        // Every path keeps `ef` candidates for `VectorStore::rerank`.
-        let (top_k, k) = (k, params.ef);
+        // A reranking search keeps `ef` candidates on every path for `VectorStore::rerank`.
+        let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
         let (mut results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
@@ -1776,7 +1798,7 @@ impl IvfSubIndex for HNSW {
         metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
-        if storage.rerank(rerank_query, params.dist_q_c, &mut results) {
+        if params.reranks() && storage.rerank(rerank_query, params.dist_q_c, &mut results) {
             // The search applied the bounds to the scores rerank replaced.
             let lower = params.lower_bound.unwrap_or(f32::MIN);
             let upper = params.upper_bound.unwrap_or(f32::MAX);
@@ -2060,6 +2082,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
@@ -2122,6 +2145,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
@@ -2166,6 +2190,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 &store,
                 Arc::new(NoFilter),
@@ -2445,6 +2470,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 &store,
@@ -2569,6 +2595,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = fsl.value(0);
 
@@ -2661,6 +2688,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
 
         let calls = AtomicUsize::new(0);
@@ -2773,6 +2801,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = fsl.value(0);
         let truth: std::collections::HashSet<u32> =
@@ -2968,6 +2997,7 @@ mod tests {
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn,
+                rq_graph_scoring: Default::default(),
             };
             let batch = hnsw
                 .search(
@@ -3005,6 +3035,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 store.as_ref(),
@@ -3070,6 +3101,7 @@ mod tests {
                         upper_bound: Some(1.0),
                         dist_q_c: 0.0,
                         use_acorn: false,
+                        rq_graph_scoring: Default::default(),
                     },
                     store.as_ref(),
                     filter,
@@ -3125,6 +3157,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn,
+                    rq_graph_scoring: Default::default(),
                 },
                 &counting,
                 prefilter,
@@ -3216,6 +3249,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: true,
+            rq_graph_scoring: Default::default(),
         };
         let query_key = fsl.value(0);
 
@@ -3386,6 +3420,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let entry_point = builder.inner.entry_point as usize;
         let query_indices = [0, 1, TOTAL / 3, TOTAL - 1]
@@ -3481,6 +3516,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
 
@@ -3612,6 +3648,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (results, _) = loaded
             .search_basic(query, 10, &params, None, store.as_ref())
@@ -3709,6 +3746,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = fsl.value(7);
         let (a, _) = builder
@@ -3828,6 +3866,7 @@ mod tests {
             query_parallelism: 0,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -3964,6 +4003,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 &counting,
@@ -3994,6 +4034,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
 
         let mut visited_generator = VisitedGenerator::new(storage.len());
