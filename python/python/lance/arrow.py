@@ -580,9 +580,13 @@ def cast(
                 "Only support casting fixed size list to fixed size list "
                 f"with the same size, got: {arr.type} to {target_type}"
             )
-        values = cast(arr.values, list_type.value_type)
+        # ``arr.values`` ignores the array's offset and length, so slice it.
+        list_size = list_type.list_size
+        values = arr.values.slice(arr.offset * list_size, len(arr) * list_size)
+        values = cast(values, list_type.value_type)
+        mask = arr.is_null() if arr.null_count > 0 else None
         return pa.FixedSizeListArray.from_arrays(
-            values=values, list_size=list_type.list_size
+            values=values, list_size=list_size, mask=mask
         )
 
     # Fallback to normal cast.

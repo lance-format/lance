@@ -174,6 +174,21 @@ def test_bf16_fixed_size_list_cast():
         assert casted == fsl
 
 
+def test_fixed_size_list_cast_sliced_with_nulls():
+    values = pa.array(np.arange(20, dtype=np.float32))
+    fsl = pa.FixedSizeListArray.from_arrays(
+        values, 2, mask=pa.array([False, False, False, False, True] + [False] * 5)
+    )
+    sliced = fsl.slice(4, 3)
+    for target in [pa.float64(), pa.float16(), lance.arrow.BFloat16Type()]:
+        casted = lance.arrow.cast(sliced, pa.list_(target, 2))
+        assert len(casted) == 3
+        assert casted.is_null().to_pylist() == [True, False, False]
+        back = lance.arrow.cast(casted, sliced.type)
+        assert back.is_null().to_pylist() == [True, False, False]
+        assert back.values.slice(2, 4).to_pylist() == [10.0, 11.0, 12.0, 13.0]
+
+
 def test_bf16_roundtrip(tmp_path: Path):
     import numpy as np
     from ml_dtypes import bfloat16
