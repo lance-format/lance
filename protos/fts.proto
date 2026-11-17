@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.pb;
+
+// Semantic version of the global FTS statistics wire contract.
+enum FtsGlobalStatisticsSchemaVersion {
+  FTS_GLOBAL_STATISTICS_SCHEMA_VERSION_UNSPECIFIED = 0;
+  FTS_GLOBAL_STATISTICS_SCHEMA_VERSION_V1 = 1;
+}
+
+// Unit represented by one document in the FTS index.
+enum FtsDocumentGranularity {
+  FTS_DOCUMENT_GRANULARITY_UNSPECIFIED = 0;
+  FTS_DOCUMENT_GRANULARITY_ROW = 1;
+  FTS_DOCUMENT_GRANULARITY_LIST_ELEMENT = 2;
+}
+
+// Unit used for corpus counts and per-term document frequencies.
+enum FtsCorpusCountUnit {
+  FTS_CORPUS_COUNT_UNIT_UNSPECIFIED = 0;
+  /* Count indexed documents at the corpus's document_granularity, which may
+   * represent rows or individual list elements. This is the only V1 unit.
+   */
+  FTS_CORPUS_COUNT_UNIT_DOCUMENT = 1;
+}
+
+// Scoring operation represented by one prepared query leaf.
+enum FtsQueryLeafKind {
+  FTS_QUERY_LEAF_KIND_UNSPECIFIED = 0;
+  FTS_QUERY_LEAF_KIND_MATCH = 1;
+  FTS_QUERY_LEAF_KIND_PHRASE = 2;
+}
+
+/* Query-bound corpus statistics used to calculate comparable BM25 scores
+ * across independently searched subsets of one logical FTS index.
+ *
+ * The layout separates the shared prepared vocabulary from corpus-specific
+ * statistics so cross-column queries can be supported without restructuring
+ * the payload. V1 still represents exactly one BM25 corpus, uses DOCUMENT
+ * counts, and supports only MATCH and PHRASE leaves. Every leaf must resolve
+ * to that corpus's index, column, document granularity, and segment set.
+ * A producer must reject queries outside these V1 restrictions.
+ *
+ * This is an opaque payload for a trusted planning flow. V1 does not carry the
+ * source query or its preparation parameters, so a consumer cannot
+ * independently prove query identity. The planner must attach the payload only
+ * to the same query used to produce it.
+ *
+ * A consumer must reject an unsupported schema_version, any violation of the
+ * V1 restrictions (including UNSPECIFIED or unknown enum values), a missing
+ * required optional scalar, an out-of-range reference, an invalid segment
+ * UUID, non-canonical ordering, duplicate entries, or metadata that does not
+ * match the dataset snapshot and logical FTS index it will execute. These
+ * checks let V1 consumers reject future query kinds and count units instead
+ * of silently scoring with unsupported statistics.
+ */
+message FtsGlobalStatisticsProto {
+  // V1 consumers must reject UNSPECIFIED and unknown values.
+  FtsGlobalStatisticsSchemaVersion schema_version = 1;
+  /* Dataset snapshot from which the committed FTS segments were resolved.
+   * Version zero is invalid.
+   */
+  uint64 dataset_version = 2;
+  /* Unique prepared terms referenced by query_leaves, sorted lexicographically
+   * by their UTF-8 bytes. Per-corpus document frequencies reference this list.
+   */
+  repeated string terms = 3;
+  // V1: exactly one corpus, referenced by every query leaf.
+  repeated FtsCorpusStatisticsProto corpora = 4;
+  /* Canonical prepared vocabulary for every scoring leaf in the query.
+   * Entries are ordered by leaf_ordinal.
+   */
+  repeated FtsPreparedQueryLeafProto query_leaves = 5;
+}
+
+// Statistics of one logical FTS index on one column over its committed segments.
+message FtsCorpusStatisticsProto {
+  // Logical FTS index shared by every UUID in segment_uuids.
+  string index_name = 1;
+  // Canonical indexed field path used by the query.
+  string column = 2;
+  // Document unit shared by every segment in segment_uuids.
+  FtsDocumentGranularity document_granularity = 3;
+  // V1: DOCUMENT only. Consumers must reject UNSPECIFIED and unknown values.
+  FtsCorpusCountUnit count_unit = 4;
+  /* Exact committed segment set whose corpus statistics were aggregated.
+   * Each entry is a 16-byte UUID in RFC 4122 network byte order. Entries are
+   * unique and sorted lexicographically by their raw bytes.
+   */
+  repeated bytes segment_uuids = 5;
+  /* Number of indexed documents across segment_uuids. Presence is required in
+   * V1; zero is valid for an empty corpus.
+   */
+  optional uint64 num_docs = 6;
+  /* Sum of indexed document lengths across segment_uuids. Presence is required
+   * in V1; zero is valid for an empty-token corpus.
+   */
+  optional uint64 total_tokens = 7;
+  /* Unique term statistics, sorted by term_index. Covers every term referenced
+   * by a query leaf bound to this corpus.
+   */
+  repeated FtsCorpusTermStatisticsProto terms = 8;
+}
+
+// Corpus-specific statistics for one term in the shared prepared vocabulary.
+message FtsCorpusTermStatisticsProto {
+  /* Zero-based index into FtsGlobalStatisticsProto.terms. Presence is required
+   * in V1.
+   */
+  optional uint32 term_index = 1;
+  /* Number of indexed documents containing term. Presence is required in V1;
+   * zero is valid when an exact query term is absent from the corpus.
+   */
+  optional uint64 document_frequency = 2;
+}
+
+// Canonical prepared vocabulary for one Match or Phrase leaf.
+message FtsPreparedQueryLeafProto {
+  /* Zero-based leaf identity in this canonical depth-first traversal:
+   * Match/Phrase emits one leaf; Boost visits positive then negative;
+   * MultiMatch visits match queries in input order; Boolean visits should,
+   * must, then must_not, preserving input order within each group. Presence is
+   * required in V1.
+   */
+  optional uint32 leaf_ordinal = 1;
+  /* V1: MATCH or PHRASE only; must match the source query leaf. Consumers must
+   * reject UNSPECIFIED and unknown values.
+   */
+  FtsQueryLeafKind kind = 2;
+  /* Zero-based indices into FtsGlobalStatisticsProto.corpora.
+   * V1: exactly [0], binding this leaf to the single DOCUMENT-counted corpus.
+   */
+  repeated uint32 corpus_indices = 3;
+  /* Final tokens selected against the complete segment set. Entries are unique
+   * by (query_position, term_index), ordered first by query_position and then
+   * by term_index. query_position is interpreted according to kind.
+   */
+  repeated FtsPreparedTokenProto tokens = 4;
+  /* Whether at least one final token remains for every original Match term
+   * group or Phrase token position. Presence is required in V1. Consumers use
+   * false to preserve empty results for AND and Phrase leaves after capped
+   * fuzzy expansion.
+   */
+  optional bool has_all_query_positions = 5;
+}
+
+// One final token and the query group or position to which it belongs.
+message FtsPreparedTokenProto {
+  /* Zero-based index into FtsGlobalStatisticsProto.terms. Presence is required
+   * in V1.
+   */
+  optional uint32 term_index = 1;
+  /* Stable grouping value for the prepared source token. For MATCH it is the
+   * logical term group used by AND/OR scoring. For PHRASE it is the tokenizer
+   * position, including offsets left by removed tokens. Fuzzy alternatives for
+   * the same source token share this value. Presence is required in V1.
+   */
+  optional uint32 query_position = 2;
+}

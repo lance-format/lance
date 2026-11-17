@@ -637,6 +637,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
 | ALP             | ❓                    | ❌                       | ✅ (2.3)                   |
+| Pcodec          | ❓                    | ❌                       | ✅ (2.3)                   |
 | General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
@@ -869,6 +870,39 @@ cheap byte-position entropy pre-gate (threshold 4.6 bits per byte position) to r
 the candidate scan. A page that cannot be encoded (no encodable values, packed size at or above the raw size, or
 any chunk exceeding the mini-block byte budget) falls back to the flat encoding, so ALP never enlarges data.
 
+### Pcodec
+
+Pcodec (pco) is a lossless compressor for numerical sequences. It is used in the mini-block context of the
+unstable Lance 2.3 format for float16, float32 and float64 values and for fixed-size lists of them, such as
+vectors sampled over time. It is not transparent, so it cannot be used in the full zip context.
+
+The `Pcodec` message wraps the uncompressed layout of the values: a `Flat` leaf of 16 (float16), 32 (float32) or
+64 (float64) bits without buffer compression, optionally inside one or more `FixedSizeList` layers without item
+validity. Let `d` be the product of the list dimensions, or 1 for a bare `Flat` leaf. Each chunk has a single
+buffer. For a chunk of `n` values (`n * d` items), the writer:
+
+1. Transposes the items to item-major order: item `j` of value `i` moves to position `j * n + i`. Each list
+   position then forms one contiguous sequence of `n` numbers, which compresses far better than the interleaved
+   row-major order.
+2. Compresses the `n * d` numbers as one pco standalone file (standalone version 3, format version 4.1, as
+   written by pco 1.0), following the [pco format specification](https://github.com/pcodec/pcodec/blob/v1.0.4/docs/format.md).
+   The file records its own number type, mode, delta encoding and bins, so the chunk is self-describing.
+
+The reader decompresses the buffer into exactly `n * d` numbers, fails if the file holds any other count, and
+reverses the transpose. Decoding is bit-exact, including NaN payloads and signed zeros.
+
+The writer sizes chunks by uncompressed bytes rather than the usual compressed mini-block budget: each chunk
+holds the largest power of two number of values whose uncompressed size is at most 32KiB, capped at the
+maximum number of mini-block values, and never fewer than two values: only the final chunk of a page may
+hold a single value. pco stores bins and delta state per chunk, so it needs a few hundred
+numbers per list position to amortize that metadata. A random read of one value decodes one chunk.
+
+Pcodec is selected only when a field requests it with `lance-encoding:compression=pcodec`. Such a field is not
+dictionary encoded, since pcodec stores repeated values cheaply. Values wider than the mini-block threshold and
+mostly-null pages also use the dense mini-block layout, because full zip compresses each value on its own and
+cannot exploit similarity between rows; a request that also sets `lance-encoding:structural-encoding=fullzip`
+is rejected. Pages of fixed-size lists with null items are stored without pcodec.
+
 ### General
 
 General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
@@ -915,6 +949,8 @@ The `lance-encoding:compression` setting enables general-purpose compression alg
 - **`zstd`**: High compression ratios with configurable levels (0-22). Better compression than LZ4 but slower.
 - **`none`**: No general compression applied (default).
 - **`fsst`**: Fast Static Symbol Table compression for string data.
+- **`pcodec`**: Pcodec for float16/float32/float64 values and fixed-size lists of them (unstable 2.3 format only). See
+  the Pcodec section above. It accepts `lance-encoding:compression-level` from 0 to 12 (default 8).
 
 General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
 data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values

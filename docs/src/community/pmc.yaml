@@ -12,6 +12,10 @@
 # `handle` must match the member's GitHub login exactly (case-insensitive when
 # matched). `ecosystem_roles` is free-form markdown and may be empty.
 members:
+  - name: Wyatt Alt
+    handle: wkalt
+    affiliation: LanceDB
+    ecosystem_roles: ""
   - name: Yang Cen
     handle: BubbleCal
     affiliation: LanceDB
@@ -28,6 +32,10 @@ members:
     handle: SaintBacchus
     affiliation: Alibaba
     ecosystem_roles: Apache Doris Committer
+  - name: Yang Jie
+    handle: LuciferYang
+    affiliation: Baidu Inc.
+    ecosystem_roles: Apache Spark PMC Member, Apache Uniffle PMC Member
   - name: Will Jones
     handle: wjones127
     affiliation: LanceDB
@@ -40,6 +48,10 @@ members:
     handle: dennyglee
     affiliation: Databricks
     ecosystem_roles: Unity Catalog Maintainer, Delta Lake Maintainer, Apache Spark Contributor, MLflow Contributor
+  - name: Nathan Ma
+    handle: majin1102
+    affiliation: ByteDance
+    ecosystem_roles: Apache Amoro (incubating) PPMC Member
   - name: Rob Meng
     handle: chebbyChefNEQ
     affiliation: Jump Trading
@@ -56,6 +68,10 @@ members:
     handle: calvinqi
     affiliation: Harvey.ai
     ecosystem_roles: ""
+  - name: Lu Qiu
+    handle: LuQQiu
+    affiliation: LanceDB
+    ecosystem_roles: Alluxio PMC Member
   - name: Prashanth Rao
     handle: prrao87
     affiliation: LanceDB
@@ -88,3 +104,7 @@ members:
     handle: jackye1995
     affiliation: LanceDB
     ecosystem_roles: Apache Iceberg PMC Member, Apache Polaris (incubating) PPMC Member, Apache Incubation Program Committer
+  - name: Zhang Yue
+    handle: zhangyue19921010
+    affiliation: ByteDance
+    ecosystem_roles: Apache Hudi PMC, Apache Druid Committer, Kafka Contributor

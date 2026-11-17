@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 use crate::Dataset;
 use crate::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter,
-    segment_has_vector_details,
+    DatasetIndexExt, loading::DatasetIndexInternalExt, prefilter::DatasetPreFilter,
+    segment::segment_has_vector_details,
 };
 
 /// Scoring and output remain bounded even when the staged partition spills.

@@ -30,6 +30,16 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `LargeBinary` | Large binary data (64-bit offsets) | Large blobs |
 | `FixedSizeBinary(n)` | Fixed-length binary data | UUIDs, hashes |
 
+String and binary columns can opt in to general compression with the field metadata
+`lance-encoding:compression` (`zstd`, `lz4`, `fsst` or `none`) and `lance-encoding:compression-level`.
+Values of 32 KiB or more are compressed one value at a time (the full-zip layout) so that a random read
+decodes only the values it needs. In the stable 2.1 and 2.2 formats that per-value path honors only
+`zstd`: an `lz4` request on such a column falls back to the default `zstd`, because released readers
+cannot decode nullable `lz4` full-zip pages, and the writer logs a warning. Lance 2.3 honors the
+requested scheme. `compression-level` applies on the per-value path only together with an explicit
+`zstd`; on large text and JSON values level 1 compresses as well as the default level 3 and roughly
+twice as fast.
+
 ### Blob Type for Large Binary Objects
 
 Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Blob columns support planned full-payload reads as well as lazy file-like access for streaming, seeking, and partial reads.
@@ -38,10 +48,10 @@ For new datasets, use blob v2 (`lance.blob.v2`) via `blob_field` and `blob_array
 
 Blob versioning follows dataset file format rules:
 
-- `data_storage_version` is the Lance file format version of a dataset.
-- A dataset's `data_storage_version` is fixed once created.
-- For `data_storage_version >= 2.2`, legacy blob metadata (`lance-encoding:blob`) is rejected on write.
-- Legacy metadata-based blob write remains available for `0.1`, `2.0`, and `2.1`.
+- `data_storage_version` is the default Lance file format version of a dataset.
+- Within the `2.x` family, append, update, merge-insert, and compaction can select another exact `2.x` version without rewriting existing files or changing the dataset default. File format `0.1` cannot be mixed with `2.x`.
+- For target file versions `>= 2.2`, dataset writers use Blob v2 and also convert legacy blob-marked (`lance-encoding:blob`) binary inputs to Blob v2 on write.
+- Legacy metadata-based blob encoding remains available when writing file format `0.1`, `2.0`, or `2.1`.
 
 ```python
 import lance
@@ -246,12 +256,11 @@ print(results.to_pandas())
 For production workloads with large datasets, create a vector index for much faster search:
 
 ```python
-# Create an IVF-PQ index for fast approximate nearest neighbor search
+# Create an IVF_RQ index for fast approximate nearest neighbor search
 ds.create_index(
     "vector",
-    index_type="IVF_PQ",
+    index_type="IVF_RQ",
     num_partitions=256,  # Number of IVF partitions
-    num_sub_vectors=16,  # Number of PQ sub-vectors
 )
 
 # Search with the index (automatically used)
@@ -350,6 +359,68 @@ table = pa.Table.from_pydict({
 ds = lance.write_dataset(table, "./with_maps.lance", data_storage_version="2.2")
 ```
 
+### Standard Variant arrays (Rust)
+
+Current-format dataset writers accept the canonical `arrow.parquet.variant`
+extension type, including arrays already shredded by Arrow's
+`parquet-variant-compute` kernels. Lance preserves the extension metadata and
+stores the struct's children as columns. Nested `BinaryView` and `Utf8View`
+arrays are stored and returned as `Binary` and `Utf8` arrays.
+
+For example, using a version of `parquet-variant-compute` compatible with Lance's
+Arrow dependencies:
+
+```rust
+use std::sync::Arc;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
+use parquet_variant_compute::{json_to_variant, shred_variant, unshred_variant, VariantArray};
+
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"id":42,"extra":"retained in residual data"}"#,
+        r#"{"id":"a different type"}"#,
+    ]));
+    let variant = json_to_variant(&json)?;
+    let target = DataType::Struct(vec![Field::new("id", DataType::Int64, true)].into());
+    let shredded = shred_variant(&variant, &target)?;
+    let schema = Arc::new(Schema::new(vec![shredded.field("event")]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(shredded.into_inner())])?;
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    ).await?;
+
+    let batch = dataset.scan().try_into_batch().await?;
+    let stored = VariantArray::try_new(batch["event"].as_ref())?;
+    let reconstructed = unshred_variant(&stored)?;
+    assert_eq!(reconstructed.len(), 2);
+    Ok(())
+}
+```
+
+The physical layout for this example is:
+
+```text
+event (arrow.parquet.variant)
+|-- metadata: binary
+|-- value: binary (residual data)
+`-- typed_value: struct
+    `-- id: struct
+        |-- value: binary (values that do not fit int64)
+        `-- typed_value: int64
+```
+
+A projection such as `event.typed_value.id.typed_value` reads the typed child
+column, but it does not include values left in the residual data. Use the Arrow
+Variant kernels on the full Variant array when reconstruction or path extraction
+needs those values. Keep the same physical shredding schema across batches and
+appends. This interoperability does not automatically select fields to shred,
+rewrite existing data, or add Variant-aware SQL functions. Existing
+[JSON columns](json.md) continue to use their separate JSONB representation.
+
 ## Data Type Mapping for Integrations
 
 When integrating Lance with other systems (like Apache Flink, Spark, or Presto), the following type mappings apply:
@@ -411,10 +482,10 @@ This maps to Lance's `FixedSizeList(Float32, 384)` type, which is optimized for:
 4. **Create indices for large datasets**: For datasets with more than ~10,000 vectors, create an ANN index for fast search:
 
     ```python
-    # IVF_PQ is recommended for most use cases
-    ds.create_index("vector", index_type="IVF_PQ", num_partitions=256, num_sub_vectors=16)
+    # IVF_RQ is recommended for most use cases
+    ds.create_index("vector", index_type="IVF_RQ", num_partitions=256)
     
-    # IVF_HNSW_SQ offers better recall at the cost of more memory
+    # IVF_HNSW_SQ offers graph-based search with different latency and recall tradeoffs
     ds.create_index("vector", index_type="IVF_HNSW_SQ", num_partitions=256)
     ```
 

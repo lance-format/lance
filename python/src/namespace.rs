@@ -1623,8 +1623,22 @@ fn namespace_error_from_py(method_name: &'static str, e: PyErr) -> lance_core::E
         if is_namespace_error
             && let Ok(code) = value.getattr("code").and_then(|code| code.extract::<u32>())
         {
-            return lance_namespace::error::NamespaceError::from_code(code, value.to_string())
+            let message = value.to_string();
+            if code == lance_namespace::error::ErrorCode::Throttling.as_u32() {
+                // PyO3's Duration conversion reads the timedelta components
+                // and rejects negative delays; an absent or None attribute
+                // maps to None.
+                let retry_after = value
+                    .getattr("retry_after")
+                    .ok()
+                    .and_then(|attr| attr.extract::<std::time::Duration>().ok());
+                return lance_namespace::error::NamespaceError::Throttling {
+                    message,
+                    retry_after,
+                }
                 .into();
+            }
+            return lance_namespace::error::NamespaceError::from_code(code, message).into();
         }
         lance_core::Error::io(format!("Python error in {}: {}", method_name, e))
     })

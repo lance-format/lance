@@ -22,6 +22,28 @@ The chosen type is recorded in the index details as `target_data_type`. It is
 carried the type, and for one whose type a later rewrite of the details could
 not recover.
 
+### Target Version
+
+Every index has a version that is stored in the `IndexMetadata`. A JSON-wrapped
+target has no `IndexMetadata` entry of its own to record a version in, and
+most target types do not otherwise self-describe their version inside their
+own files (MinHash LSH, which stamps `minhash_lsh_index_version` into its
+own file metadata, is one exception). So the target's own version has to be
+recorded somewhere in `JsonIndexDetails` itself.  The field
+`target_index_version`, holds the version the target was actually built with
+-- the same number that would sit in `IndexMetadata::index_version` for a
+standalone instance of that type.
+
+If `target_index_version` is absent on a JSON index then we assume that
+index was built before this field existed.  Readers should use version 1
+for a label list index and version 0 for all other indexes.
+
+`target_index_version` does not affect the wrapper's `IndexMetadata::index_version`
+itself, which tracks the JSON wrapper's own on-disk format and is unrelated
+to the target's version; nor does it change how an old reader decides whether
+it can safely skip a JSON index whose target it does not understand. That
+decision is based on the target plugin's own declared maximum version.
+
 ## Index Details
 
 ```protobuf
@@ -42,7 +64,8 @@ example [BTree](btree.md) or [Bitmap](bitmap.md).
 Reader navigation therefore has two steps. Decode `JsonIndexDetails` to recover
 `path` and `target_details`, select the target implementation from the
 `type_url` of `target_details`, then navigate the target index exactly as a
-standalone index of that type, using `target_details` as its details.
+standalone index of that type, using `target_details` as its details and
+`target_index_version` as its version.
 
 ## Accelerated Queries
 
