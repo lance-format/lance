@@ -251,6 +251,7 @@ fn test_select_by_path() {
         (r#"$.neg_min % $.two63"#, vec![r#"0"#]),
         (r#"$.two63 - $.neg"#, vec![r#"9223372036854775809"#]),
         (r#"$.neg * $.two63"#, vec![r#"-9223372036854775808"#]),
+        (r#"-$.two63"#, vec![r#"-9223372036854775808"#]),
     ];
 
     let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
@@ -282,7 +283,7 @@ fn test_select_by_filter_wildcard_compare() {
             r#"$.items[*]?(@.x[*] == 1)"#,
             vec![r#"{"x":[1,null]}"#, r#"{"x":[null,1]}"#],
         ),
-        // Single-element arrays differing only in element order must agree.
+        // Items whose arrays differ only in element order must agree.
         (
             r#"{"items":[{"x":[1,null]}]}"#,
             r#"$.items[*]?(@.x[*] == 1)"#,

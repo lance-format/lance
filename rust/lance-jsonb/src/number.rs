@@ -362,19 +362,8 @@ impl Number {
     /// This method returns an error if the negation would overflow.
     pub(crate) fn neg(&self) -> Result<Self> {
         match self {
-            Self::Int64(v) => v
-                .checked_neg()
-                .map(Number::Int64)
-                .ok_or(Error::Message("Int64 overflow".to_string())),
-            Self::UInt64(v) => {
-                if let Ok(v) = i64::try_from(*v) {
-                    v.checked_neg()
-                        .map(Number::Int64)
-                        .ok_or(Error::Message("Int64 overflow".to_string()))
-                } else {
-                    Err(Error::Message("Int64 overflow".to_string()))
-                }
-            }
+            Self::Int64(v) => exact_i128(-i128::from(*v)),
+            Self::UInt64(v) => exact_i128(-i128::from(*v)),
             Self::Float64(v) => Ok(Self::Float64(*v * -1.0)),
             Self::Decimal64(v) => {
                 let neg_dec = Decimal64 {
@@ -1751,6 +1740,23 @@ mod tests {
             Number::Int64(-10).add(Number::UInt64(9223372036854775809)),
             Ok(Number::Int64(9223372036854775799))
         ));
+    }
+
+    #[test]
+    fn test_neg_integer_bounds() {
+        assert!(matches!(
+            Number::UInt64(9223372036854775808).neg(),
+            Ok(Number::Int64(i64::MIN))
+        ));
+        assert!(matches!(
+            Number::Int64(i64::MIN).neg(),
+            Ok(Number::UInt64(9223372036854775808))
+        ));
+        let err = Number::UInt64(9223372036854775809).neg().unwrap_err();
+        assert!(
+            matches!(&err, Error::Message(m) if m == "Int64 overflow"),
+            "{err:?}"
+        );
     }
 
     #[test]
