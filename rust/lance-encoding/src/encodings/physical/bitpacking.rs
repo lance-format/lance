@@ -228,7 +228,7 @@ impl InlineBitpacking {
     }
 
     // Validate before any alignment repair allocates, including on admitted paths.
-    fn validate_chunk<T: ArrowNativeType + BitPackingUninit + Pod>(
+    pub(crate) fn validate_chunk<T: ArrowNativeType + BitPackingUninit + Pod>(
         data: &[u8],
         num_values: u64,
     ) -> Result<usize> {
@@ -669,6 +669,20 @@ impl MiniBlockDecompressor for InlineBitpacking {
 }
 
 impl BlockDecompressor for InlineBitpacking {
+    fn plan_levels<'a>(
+        &self,
+        data: &'a LanceBuffer,
+        num_values: u64,
+    ) -> Result<crate::compression::levels::LevelDecodePlan<'a>> {
+        if self.uncompressed_bit_width != 16 {
+            return Err(Error::invalid_input(format!(
+                "Inline bitpacking structural levels require 16-bit values, got {}",
+                self.uncompressed_bit_width
+            )));
+        }
+        crate::compression::levels::LevelDecodePlan::inline_bitpacked(data, num_values)
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Inline bitpacking")?;
         if num_values == 0 {

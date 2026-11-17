@@ -15,7 +15,9 @@ mod rle;
 use rle::RleLevelPlan;
 
 #[cfg(feature = "bitpacking")]
-use crate::encodings::physical::bitpacking::{ELEMS_PER_CHUNK, out_of_line_payload_byte_lengths};
+use crate::encodings::physical::bitpacking::{
+    ELEMS_PER_CHUNK, InlineBitpacking, out_of_line_payload_byte_lengths,
+};
 #[cfg(feature = "bitpacking")]
 use lance_bitpacking::BitPacking;
 
@@ -25,6 +27,7 @@ enum Layout {
     Rle(RleLevelPlan),
     #[cfg(feature = "bitpacking")]
     Bitpacked {
+        payload_offset: usize,
         width: usize,
         chunk_bytes: usize,
         has_raw_tail: bool,
@@ -38,8 +41,9 @@ enum Layout {
 /// output keeps its reservation; alignment/tail scratch returns to the same
 /// workspace before the method returns. Metadata and allocator overhead are
 /// excluded. Planning never decompresses or allocates payload buffers.
-/// Flat-child RLE validates all run lengths before admission and expands directly
-/// into output, including when its frame is unaligned. Compressed RLE children
+/// Inline bitpacking retains its padded-tail semantics, including when a raw
+/// tail would occupy the same number of bytes. Flat-child RLE validates all run
+/// lengths before admission and expands directly into output, including when its frame is unaligned. Compressed RLE children
 /// remain unsupported; they must not use an unaccounted ordinary decoder.
 ///
 /// ```
@@ -154,9 +158,49 @@ impl<'a> LevelDecodePlan<'a> {
             output_bytes,
             workspace_bytes,
             layout: Layout::Bitpacked {
+                payload_offset: 0,
                 width: width as usize,
                 chunk_bytes,
                 has_raw_tail,
+                alignment_bytes,
+                tail_bytes,
+            },
+        })
+    }
+
+    #[cfg(feature = "bitpacking")]
+    pub(crate) fn inline_bitpacked(data: &'a LanceBuffer, num_values: u64) -> Result<Self> {
+        if num_values == 0 {
+            return Self::flat(data, 0);
+        }
+        // Inline blocks always pad to 1024 values, even when their encoded size
+        // equals a possible raw tail. Do not apply out-of-line tail inference.
+        let width = InlineBitpacking::validate_chunk::<u16>(data, num_values)?;
+        let output_bytes = Self::output_layout(num_values)?;
+        let chunk_bytes = width * 128;
+        let alignment_bytes = if data.as_ptr().addr().is_multiple_of(2) {
+            0
+        } else {
+            chunk_bytes
+        };
+        let tail_bytes = if num_values < ELEMS_PER_CHUNK {
+            2048
+        } else {
+            0
+        };
+        let workspace_bytes = output_bytes
+            .checked_add(alignment_bytes)
+            .and_then(|bytes| bytes.checked_add(tail_bytes))
+            .ok_or_else(|| Error::invalid_input("structural level workspace overflows"))?;
+        Ok(Self {
+            data,
+            output_bytes,
+            workspace_bytes,
+            layout: Layout::Bitpacked {
+                payload_offset: 2,
+                width,
+                chunk_bytes,
+                has_raw_tail: false,
                 alignment_bytes,
                 tail_bytes,
             },
@@ -187,12 +231,14 @@ impl<'a> LevelDecodePlan<'a> {
             }
             #[cfg(feature = "bitpacking")]
             Layout::Bitpacked {
+                payload_offset,
                 width,
                 chunk_bytes,
                 has_raw_tail,
                 alignment_bytes,
                 tail_bytes,
             } => {
+                let data = &self.data[payload_offset..];
                 let mut alignment = if alignment_bytes > 0 {
                     Some(allocate(workspace, alignment_bytes)?)
                 } else {
@@ -208,7 +254,7 @@ impl<'a> LevelDecodePlan<'a> {
                 for (i, destination) in full.iter_mut().enumerate() {
                     unpack(
                         width,
-                        &self.data[i * chunk_bytes..(i + 1) * chunk_bytes],
+                        &data[i * chunk_bytes..(i + 1) * chunk_bytes],
                         destination,
                         alignment.as_mut(),
                     );
@@ -216,11 +262,11 @@ impl<'a> LevelDecodePlan<'a> {
                 let start = full.len() * chunk_bytes;
                 if !remaining.is_empty() {
                     if has_raw_tail {
-                        bytemuck::cast_slice_mut(remaining).copy_from_slice(&self.data[start..]);
+                        bytemuck::cast_slice_mut(remaining).copy_from_slice(&data[start..]);
                     } else {
                         let scratch = tail.as_mut().expect("packed tail scratch was preflighted");
                         let decoded: &mut [u16] = bytemuck::cast_slice_mut(scratch.as_mut());
-                        unpack(width, &self.data[start..], decoded, alignment.as_mut());
+                        unpack(width, &data[start..], decoded, alignment.as_mut());
                         remaining.copy_from_slice(&decoded[..remaining.len()]);
                     }
                 }

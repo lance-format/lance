@@ -215,16 +215,83 @@ mod bitpacked {
         );
     }
 
-    #[test]
-    fn unsupported_codec_does_not_use_ordinary_decode() {
+    #[rstest]
+    #[case::empty(0, 0)]
+    #[case::zero_width(0, 65)]
+    #[case::single(1, 1)]
+    #[case::equal_raw_and_padded_size(1, 64)]
+    #[case::partial(7, 513)]
+    #[case::full_zero(0, 1024)]
+    #[case::full_one_bit(1, 1024)]
+    #[case::full_width(16, 1024)]
+    fn inline_levels_preserve_values_and_owner(
+        #[case] width: usize,
+        #[case] count: usize,
+        #[values(false, true)] unaligned: bool,
+    ) {
+        let mask = ((1_u32 << width) - 1) as u16;
+        let values = (0..count)
+            .map(|i| (i as u16).wrapping_mul(37) & mask)
+            .collect::<Vec<_>>();
+        // Construct the stored layout independently, including the ambiguous
+        // 64 one-bit values whose packed length equals 64 raw u16 values.
+        let mut input = Vec::new();
+        if count > 0 {
+            let mut padded = [0_u16; 1024];
+            padded[..count].copy_from_slice(&values);
+            input.resize(1 + width * 64, 0_u16);
+            input[0] = width as u16;
+            // SAFETY: 1024 values fit the requested width and output holds
+            // exactly 1024 * width / 16 packed words after the header.
+            unsafe { u16::unchecked_pack(width, &padded, &mut input[1..]) };
+        }
+        let scratch = if count > 0 && count < 1024 { 2048 } else { 0 }
+            + if unaligned && count > 0 {
+                width * 128
+            } else {
+                0
+            };
+        check(
+            &InlineBitpacking::new(16),
+            bytemuck::cast_slice(&input),
+            &values,
+            unaligned,
+            scratch,
+        );
+    }
+
+    #[rstest]
+    #[case::missing_header(vec![], 1, "header")]
+    #[case::odd_header(vec![1], 1, "header")]
+    #[case::invalid_width(vec![17, 0], 1, "width")]
+    #[case::truncated_payload(vec![1, 0], 1, "payload")]
+    #[case::extra_payload(vec![0, 0, 0, 0], 1, "payload")]
+    #[case::excess_count(vec![0, 0], 1025, "at most")]
+    fn malformed_inline_levels_rejected_before_admission(
+        #[case] bytes: Vec<u8>,
+        #[case] count: u64,
+        #[case] message: &str,
+    ) {
+        let input = LanceBuffer::from(bytes);
         let error = InlineBitpacking::new(16)
+            .plan_levels(&input, count)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[test]
+    fn inline_level_width_and_empty_payload_are_checked() {
+        let error = InlineBitpacking::new(32)
             .plan_levels(&LanceBuffer::empty(), 0)
             .unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("no admitted structural-level decoder")
-        );
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("require 16-bit"));
+        let input = LanceBuffer::from(vec![0_u8, 0]);
+        let error = InlineBitpacking::new(16)
+            .plan_levels(&input, 0)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("expected 0"));
     }
 }

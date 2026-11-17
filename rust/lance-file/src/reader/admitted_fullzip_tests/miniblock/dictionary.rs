@@ -15,32 +15,6 @@ async fn actual_dictionary_layout_and_admission_boundaries(
     #[values(false, true)] nested: bool,
     #[values(false, true)] default_compression: bool,
 ) {
-    let values = (0..1024)
-        .map(|i| {
-            if i % 17 == 3 {
-                None
-            } else {
-                Some(format!(
-                    "dictionary-value-{:03}-{}",
-                    i % 31,
-                    "value".repeat(i % 31 + 1)
-                ))
-            }
-        })
-        .collect::<Vec<_>>();
-    let leaf = Arc::new(LargeStringArray::from(values)) as ArrayRef;
-    let expected: ArrayRef = if nested {
-        Arc::new(ListArray::new(
-            Arc::new(Field::new("item", DataType::LargeUtf8, true)),
-            OffsetBuffer::new((0..=512).map(|i| i * 2).collect::<Vec<i32>>().into()),
-            leaf,
-            Some(NullBuffer::from(
-                (0..512).map(|i| i % 19 != 3).collect::<Vec<_>>(),
-            )),
-        ))
-    } else {
-        leaf
-    };
     let mut metadata = HashMap::from([
         (
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -57,6 +31,32 @@ async fn actual_dictionary_layout_and_admission_boundaries(
             "none".to_string(),
         );
     }
+    let values = (0..1024)
+        .map(|i| {
+            if i % 17 == 3 {
+                None
+            } else {
+                Some(format!(
+                    "dictionary-value-{:03}-{}",
+                    i % 31,
+                    "value".repeat(i % 31 + 1)
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+    let leaf = Arc::new(LargeStringArray::from(values)) as ArrayRef;
+    let expected: ArrayRef = if nested {
+        Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::LargeUtf8, true).with_metadata(metadata.clone())),
+            OffsetBuffer::new((0..=512).map(|i| i * 2).collect::<Vec<i32>>().into()),
+            leaf,
+            Some(NullBuffer::from(
+                (0..512).map(|i| i % 19 != 3).collect::<Vec<_>>(),
+            )),
+        ))
+    } else {
+        leaf
+    };
     let schema = Arc::new(Schema::new(vec![
         Field::new("payload", expected.data_type().clone(), true).with_metadata(metadata),
     ]));
@@ -95,6 +95,18 @@ async fn actual_dictionary_layout_and_admission_boundaries(
             assert!(
                 matches!(dictionary, Some(Compression::Variable(_))),
                 "explicit raw dictionary required: {dictionary:?}"
+            );
+        }
+        if !nested {
+            assert!(
+                matches!(
+                    layout
+                        .def_compression
+                        .as_ref()
+                        .and_then(|d| d.compression.as_ref()),
+                    Some(Compression::InlineBitpacking(_))
+                ),
+                "flat fixture must exercise inline structural levels"
             );
         }
         assert!(layout.num_dictionary_items > 1);
