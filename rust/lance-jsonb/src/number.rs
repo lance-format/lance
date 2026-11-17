@@ -397,10 +397,7 @@ impl Number {
     /// This method returns an error if the sum would overflow.
     pub(crate) fn add(&self, other: Self) -> Result<Self> {
         match (self, other) {
-            (Self::Int64(a), Self::Int64(b)) => a
-                .checked_add(b)
-                .map(Number::Int64)
-                .ok_or(Error::Message("Int64 overflow".to_string())),
+            (Self::Int64(a), Self::Int64(b)) => exact_i128(i128::from(*a) + i128::from(b)),
             (Self::UInt64(a), Self::UInt64(b)) => a
                 .checked_add(b)
                 .map(Number::UInt64)
@@ -443,10 +440,7 @@ impl Number {
     /// This method returns an error if the difference would overflow.
     pub(crate) fn sub(&self, other: Self) -> Result<Self> {
         match (self, other) {
-            (Self::Int64(a), Self::Int64(b)) => a
-                .checked_sub(b)
-                .map(Number::Int64)
-                .ok_or(Error::Message("Int64 overflow".to_string())),
+            (Self::Int64(a), Self::Int64(b)) => exact_i128(i128::from(*a) - i128::from(b)),
             // Both u64 and i64 fit i128: compute the exact difference and
             // re-fit it, instead of narrowing operands through `as i64`
             // casts that wrap for u64 values above i64::MAX.
@@ -1745,7 +1739,31 @@ mod tests {
             Number::Int64(-5).mul(Number::Int64(3)),
             Ok(Number::Int64(-15))
         ));
-        assert!(Number::Int64(i64::MIN).mul(Number::Int64(2)).is_err());
+        let err = Number::Int64(i64::MIN).mul(Number::Int64(2)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Message(m) if m == "Int64 overflow"),
+            "{err:?}"
+        );
+        let err = Number::Int64(i64::MIN)
+            .mul(Number::Int64(i64::MIN))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Message(m) if m == "UInt64 overflow"),
+            "{err:?}"
+        );
+        // A positive i64 result above i64::MAX fits u64.
+        assert!(matches!(
+            Number::Int64(1).sub(Number::Int64(i64::MIN)),
+            Ok(Number::UInt64(9223372036854775809))
+        ));
+        assert!(matches!(
+            Number::Int64(i64::MAX).add(Number::Int64(1)),
+            Ok(Number::UInt64(9223372036854775808))
+        ));
+        assert!(matches!(
+            Number::Int64(-2).add(Number::Int64(3)),
+            Ok(Number::Int64(1))
+        ));
         assert!(matches!(
             Number::Int64(i64::MIN).rem(Number::Int64(-1)),
             Ok(Number::Int64(0))
