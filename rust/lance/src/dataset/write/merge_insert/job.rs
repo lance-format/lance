@@ -511,8 +511,32 @@ impl MergeInsertJob {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(materialization_metrics);
         }
+        // DataFusion 56 registers the join's spillable consumer before polling
+        // its inputs. Finish the target sort before constructing that join too:
+        // otherwise its idle consumer reduces the sort's fair share and can
+        // reject a single wide row even when the row fits the configured pool.
+        let sorted_target = analysis::execute(
+            "indexed_target_sort",
+            Arc::new(SortExec::new(target_ordering, target)),
+            execution_options.clone(),
+            session_ctx,
+        )?;
+        let (sorted_target, materialization_metrics) = materialize_stream(
+            sorted_target,
+            session_ctx.runtime_env(),
+            execution_options.mem_pool_size() as usize / 8,
+            "materializing sorted merge insert target",
+        )
+        .await?;
+        if let Some(scope) = analysis::scope(session_ctx) {
+            scope
+                .materializations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(materialization_metrics);
+        }
         let source_input = Arc::new(OneShotExec::new(sorted_source));
-        let target = Arc::new(SortExec::new(target_ordering, target));
+        let target = Arc::new(OneShotExec::new(sorted_target));
         let joined: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
             source_input,
             target,
