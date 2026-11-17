@@ -10,7 +10,11 @@ use lance::index::optimize::{
     commit_optimize_indices, plan_optimize_indices,
 };
 use lance_index::optimize::OptimizeOptions;
+use pyo3::exceptions::PyTypeError;
+use pyo3::types::PyString;
 use serde::{Serialize, de::DeserializeOwned};
+
+use crate::indices::parse_index_segment_ids;
 
 use super::optimize::unwrap_dataset;
 use super::*;
@@ -43,6 +47,41 @@ pub(crate) fn optimize_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<O
     }
     if let Some(max_rows_to_consolidate) = kwargs.get_item("max_rows_to_consolidate")? {
         options.max_rows_to_consolidate = max_rows_to_consolidate.extract()?;
+    }
+    if let Some(segments) = kwargs.get_item("segments_to_consolidate")?
+        && !segments.is_none()
+    {
+        let not_iterable = || {
+            PyTypeError::new_err(
+                "segments_to_consolidate must be an iterable of str or uuid.UUID, \
+                 not a single value",
+            )
+        };
+        // A single string iterates as characters, so refuse it here rather
+        // than report the first one as an invalid uuid.
+        if segments.is_instance_of::<PyString>() {
+            return Err(not_iterable());
+        }
+        let ids = segments
+            .try_iter()
+            .map_err(|_| not_iterable())?
+            .map(|item| {
+                let item = item?;
+                // The scan APIs take str or uuid.UUID; refuse anything else
+                // rather than stringify it into an invalid uuid.
+                if !item.is_instance_of::<PyString>()
+                    && !item.is_instance(&item.py().import("uuid")?.getattr("UUID")?)?
+                {
+                    return Err(PyTypeError::new_err(format!(
+                        "segments_to_consolidate must be an iterable of str or uuid.UUID. \
+                         Got {} instead.",
+                        item.get_type().name()?
+                    )));
+                }
+                Ok(item.str()?.to_string())
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        options.segments_to_consolidate = parse_index_segment_ids(Some(ids))?;
     }
     Ok(options)
 }
@@ -286,8 +325,9 @@ impl PyOptimizeIndices {
     /// ``options`` are the keyword options of
     /// :py:meth:`lance.dataset.DatasetOptimizer.optimize_indices` the plan was
     /// made with, for the ones that decide how the results are checked: a
-    /// consolidation (``max_rows_to_consolidate``) is checked against the
-    /// segments the dataset has now, so pass those options here as well.
+    /// consolidation (``max_rows_to_consolidate`` or
+    /// ``segments_to_consolidate``) is checked against the segments the
+    /// dataset has now, so pass those options here as well.
     /// Omitted, the commit uses the defaults, as it always has.
     #[staticmethod]
     #[pyo3(signature = (dataset, results, options = None))]

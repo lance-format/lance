@@ -322,12 +322,24 @@ class DatasetOptimizer:
             Cannot be combined with `retrain`, `num_indices_to_merge` or
             `max_rows_per_segment`; `max_rows_per_task` may bound the
             re-encoding tasks, each of which must fit its fragments.
+        segments_to_consolidate: Iterable[str | uuid.UUID], default None
+            Consolidate these physical segments of one vector index, which
+            `index_names` must name exactly, with distinct ids. The output
+            reuses the newest selected segment's model, or is retrained as a
+            whole when the selected segments disagree; selected rows are
+            re-encoded, dropping deleted ones, and selected segments the
+            dataset no longer has are skipped. This is the only option that
+            takes `max_rows_per_segment`, packing the output into several
+            segments and splitting a selected segment larger than the limit.
+            Cannot be combined with `max_rows_to_consolidate`, `retrain` or
+            `num_indices_to_merge`.
 
         See :py:class:`lance.optimize.OptimizeIndices` to run the same
         optimization as a plan whose tasks execute on several workers. Options
-        that decide commit-time checks, such as `max_rows_to_consolidate`, also
-        belong to :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses
-        the defaults when they are omitted.
+        that decide commit-time checks, such as `max_rows_to_consolidate` and
+        `segments_to_consolidate`, also belong to
+        :py:meth:`lance.optimize.OptimizeIndices.commit`, which uses the
+        defaults when they are omitted.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

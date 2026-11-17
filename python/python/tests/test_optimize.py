@@ -6,6 +6,7 @@ import pickle
 import random
 import re
 import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -1608,3 +1609,176 @@ def test_optimize_indices_consolidate(tmp_path: Path, distributed: bool):
         columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
     )
     assert nearest["id"].to_pylist() == [175]
+
+
+def _vector_table(start: int, rows: int) -> pa.Table:
+    vectors = np.random.default_rng(start).random((rows, 8), dtype=np.float32)
+    return vec_to_table(vectors).append_column(
+        "id", pa.array(range(start, start + rows))
+    )
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_optimize_indices_consolidate_selected(tmp_path: Path, distributed: bool):
+    """A segment selection merges the chosen segments only, in one process or
+    as a plan committed with the same options."""
+
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(_vector_table(0, 100), uri)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    for start in (100, 150):
+        dataset = lance.write_dataset(_vector_table(start, 50), uri, mode="append")
+        dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    (index,) = dataset.describe_indices()
+    old = index.segments
+    assert [sorted(segment.fragment_ids) for segment in old] == [[0], [1], [2]]
+
+    # Both spellings of a segment id select it; the 100-row segment stays.
+    options = {
+        "index_names": ["vector_idx"],
+        "segments_to_consolidate": [old[1].uuid, uuid.UUID(old[2].uuid)],
+    }
+    if distributed:
+        plan = OptimizeIndices.plan(dataset, options)
+        assert len(plan.merges) == 1
+        results = [task.execute(dataset) for task in plan.tasks]
+        merged = plan.merges[0].execute(dataset, results)
+        OptimizeIndices.commit(dataset, [merged], options)
+    else:
+        dataset.optimize.optimize_indices(**options)
+
+    (index,) = dataset.describe_indices()
+    assert {tuple(segment.fragment_ids) for segment in index.segments} == {(0,), (1, 2)}
+    assert any(segment.uuid == old[0].uuid for segment in index.segments)
+    vector = dataset.to_table(columns=["vector"], filter="id = 175")["vector"][0]
+    nearest = dataset.to_table(
+        columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
+    )
+    assert nearest["id"].to_pylist() == [175]
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_optimize_indices_split_selected_segment(tmp_path: Path, distributed: bool):
+    """A segment selection with max_rows_per_segment splits a segment larger
+    than the limit into several."""
+
+    # One fragment per 50 rows, so one segment covers two fragments.
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(_vector_table(0, 100), uri, max_rows_per_file=50)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    (index,) = dataset.describe_indices()
+    (old,) = index.segments
+    assert sorted(old.fragment_ids) == [0, 1]
+
+    options = {
+        "index_names": ["vector_idx"],
+        # Any iterable, not only a list.
+        "segments_to_consolidate": (old.uuid,),
+        "max_rows_per_segment": 50,
+    }
+    if distributed:
+        plan = OptimizeIndices.plan(dataset, options)
+        assert len(plan.merges) == 2
+        results = [task.execute(dataset) for task in plan.tasks]
+        merged = [merge.execute(dataset, results) for merge in plan.merges]
+        OptimizeIndices.commit(dataset, merged, options)
+    else:
+        dataset.optimize.optimize_indices(**options)
+
+    (index,) = dataset.describe_indices()
+    assert [sorted(segment.fragment_ids) for segment in index.segments] == [[0], [1]]
+    vector = dataset.to_table(columns=["vector"], filter="id = 25")["vector"][0]
+    nearest = dataset.to_table(
+        columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
+    )
+    assert nearest["id"].to_pylist() == [25]
+
+
+def test_optimize_indices_consolidate_selected_invalid(tmp_path: Path):
+    """A selection needs distinct segments of exactly one index, no row budget
+    and no other way to pick the work."""
+
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(_vector_table(0, 100), uri)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    (segment,) = dataset.describe_indices()[0].segments
+
+    for options, error in [
+        # Core reports empty, repeated and unnamed selections in one sentence;
+        # each condition is matched by the part of it that only it triggers.
+        (
+            {"index_names": ["vector_idx"], "segments_to_consolidate": []},
+            "a segment selection needs",
+        ),
+        (
+            {
+                "index_names": ["vector_idx"],
+                "segments_to_consolidate": [segment.uuid] * 2,
+            },
+            "needs distinct segments",
+        ),
+        # No index name to consolidate.
+        ({"segments_to_consolidate": [segment.uuid]}, "exactly one index name"),
+        (
+            {
+                "index_names": ["vector_idx", "other"],
+                "segments_to_consolidate": [segment.uuid],
+            },
+            "exactly one index name",
+        ),
+        (
+            {
+                "index_names": ["vector_idx"],
+                "segments_to_consolidate": [segment.uuid],
+                "max_rows_to_consolidate": 100,
+            },
+            "takes no row budget",
+        ),
+        (
+            {
+                "index_names": ["vector_idx"],
+                "segments_to_consolidate": [segment.uuid],
+                "num_indices_to_merge": 1,
+            },
+            "requires positive row limits",
+        ),
+        (
+            {
+                "index_names": ["vector_idx"],
+                "segments_to_consolidate": [segment.uuid],
+                "retrain": True,
+            },
+            "requires positive row limits",
+        ),
+    ]:
+        # The in-process path reports core input errors as OSError.
+        with pytest.raises(OSError, match=error):
+            dataset.optimize.optimize_indices(**options)
+
+    # A segment id that is not a uuid fails before the options reach the core.
+    with pytest.raises(ValueError, match="invalid index segment uuid"):
+        dataset.optimize.optimize_indices(
+            index_names=["vector_idx"], segments_to_consolidate=["not-a-uuid"]
+        )
+    # The plan path classifies the same input errors as ValueError.
+    with pytest.raises(ValueError, match="exactly one index name"):
+        OptimizeIndices.plan(dataset, {"segments_to_consolidate": [segment.uuid]})
+
+    # A lone id iterates as characters, so both spellings are refused, as is
+    # an item that is neither spelling.
+    for lone in (segment.uuid, uuid.UUID(segment.uuid), [1]):
+        with pytest.raises(TypeError, match="iterable of str or uuid.UUID"):
+            dataset.optimize.optimize_indices(
+                index_names=["vector_idx"], segments_to_consolidate=lone
+            )
+
+    # None, the documented default, selects nothing.
+    dataset.optimize.optimize_indices(
+        index_names=["vector_idx"], segments_to_consolidate=None
+    )
