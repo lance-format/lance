@@ -239,38 +239,44 @@ impl IoQueueState {
     }
 
     fn can_deliver_without_warning(&self, task: &IoTask) -> bool {
+        self.can_admit(task.priority, task.num_bytes(), task.bypass_backpressure)
+    }
+
+    fn can_admit(&self, priority: u128, num_bytes: u64, bypass: bool) -> bool {
         if self.iops_avail == 0 {
             false
         } else if self.no_backpressure
-            || task.bypass_backpressure
-            || task.priority <= self.priorities_in_flight.min_in_flight()
+            || bypass
+            || priority <= self.priorities_in_flight.min_in_flight()
             // Chunks from an admitted logical request must keep moving.  A
             // higher-priority request may be scheduled later and remain
             // unconsumed while the caller awaits this request.
-            || self.priorities_in_flight.contains(task.priority)
+            || self.priorities_in_flight.contains(priority)
         {
             true
         } else {
-            task.num_bytes() as i64 <= self.bytes_avail
+            num_bytes as i64 <= self.bytes_avail
+        }
+    }
+
+    fn admit(&mut self, priority: u128, num_bytes: u64, bypass: bool) {
+        self.priorities_in_flight.push(priority);
+        self.iops_avail -= 1;
+        if !self.no_backpressure && !bypass {
+            self.bytes_avail -= num_bytes as i64;
+            if self.bytes_avail < 0 {
+                log::debug!(
+                    "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
+                    -self.bytes_avail
+                );
+            }
         }
     }
 
     fn next_task(&mut self) -> Option<IoTask> {
         let task = self.pending_requests.peek()?;
         if self.can_deliver(task) {
-            let skip_bytes_accounting = self.no_backpressure || task.bypass_backpressure;
-            self.priorities_in_flight.push(task.priority);
-            self.iops_avail -= 1;
-            if !skip_bytes_accounting {
-                self.bytes_avail -= task.num_bytes() as i64;
-                if self.bytes_avail < 0 {
-                    // This can happen when we admit special priority requests
-                    log::debug!(
-                        "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
-                        -self.bytes_avail
-                    );
-                }
-            }
+            self.admit(task.priority, task.num_bytes(), task.bypass_backpressure);
             Some(self.pending_requests.pop().unwrap())
         } else {
             None

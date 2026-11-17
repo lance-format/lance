@@ -37,7 +37,7 @@ impl EncodingsIo for LanceEncodingsIo {
         priority: u64,
         output: lance_core::utils::allocation::ReservedBuffer,
     ) -> BoxFuture<'static, lance_core::Result<lance_core::utils::allocation::ReservedBuffer>> {
-        self.scheduler.submit_single_into(range, priority, output)
+        self.scheduler.read_single_into(range, priority, output)
     }
 
     fn io_buffer_size(&self) -> Option<u64> {

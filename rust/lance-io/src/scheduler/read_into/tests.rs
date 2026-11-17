@@ -10,6 +10,27 @@ use lance_core::{
 use rstest::rstest;
 use tokio::sync::Semaphore;
 
+#[derive(Clone, Copy, Debug)]
+enum ReadMode {
+    Submitted,
+    Polled,
+}
+
+impl FileScheduler {
+    fn read_for_test(
+        &self,
+        mode: ReadMode,
+        range: Range<u64>,
+        priority: u64,
+        output: ReservedBuffer,
+    ) -> BoxFuture<'static, Result<ReservedBuffer>> {
+        match mode {
+            ReadMode::Submitted => self.submit_single_into(range, priority, output),
+            ReadMode::Polled => self.read_single_into(range, priority, output),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ControlledReader {
     path: Path,
@@ -114,25 +135,31 @@ fn setup(lite: bool, io_bytes: u64) -> (Arc<ScanScheduler>, FileScheduler, Arc<C
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn queued_owned_reads_preserve_priority_and_separate_delivery_credit(#[case] lite: bool) {
+async fn queued_owned_reads_preserve_priority_and_separate_delivery_credit(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let (scheduler, file, reader) = setup(lite, 8);
     let extra = IoStats::new();
     let file = file.with_io_stats(extra.recorder());
     let budget = AllocationBudget::new(24);
     let mut work = budget.try_reserve(24).unwrap();
     let first =
-        tokio::spawn(file.submit_single_into(0..8, 0, work.try_allocate(8).unwrap().unwrap()));
+        tokio::spawn(file.read_for_test(mode, 0..8, 0, work.try_allocate(8).unwrap().unwrap()));
     wait_until("first read blocked", || {
         reader.calls.lock().unwrap().len() == 1
     })
     .await;
-    let ordinary =
+    let mut ordinary =
         scheduler.submit_request(reader.clone(), vec![Range { start: 8, end: 16 }], 5, false);
+    assert!(futures::poll!(&mut ordinary).is_pending());
     let ordinary = tokio::spawn(ordinary);
-    let last =
-        tokio::spawn(file.submit_single_into(24..32, 20, work.try_allocate(8).unwrap().unwrap()));
-    let second =
-        tokio::spawn(file.submit_single_into(16..24, 10, work.try_allocate(8).unwrap().unwrap()));
+    let mut last = file.read_for_test(mode, 24..32, 20, work.try_allocate(8).unwrap().unwrap());
+    let mut second = file.read_for_test(mode, 16..24, 10, work.try_allocate(8).unwrap().unwrap());
+    assert!(futures::poll!(&mut last).is_pending());
+    assert!(futures::poll!(&mut second).is_pending());
+    let last = tokio::spawn(last);
+    let second = tokio::spawn(second);
     assert_eq!(*reader.calls.lock().unwrap(), [0]);
     assert_eq!(scheduler.reserved_bytes(), 8);
     assert_eq!(budget.reserved(), 24);
@@ -171,10 +198,14 @@ async fn queued_owned_reads_preserve_priority_and_separate_delivery_credit(#[cas
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn queued_and_running_cancellation_refund_without_blocking_a_peer(#[case] lite: bool) {
+async fn queued_and_running_cancellation_refund_without_blocking_a_peer(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let (scheduler, file, reader) = setup(lite, 8);
     let budget = AllocationBudget::new(24);
-    let first = tokio::spawn(file.submit_single_into(
+    let first = tokio::spawn(file.read_for_test(
+        mode,
         0..8,
         0,
         budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -183,11 +214,13 @@ async fn queued_and_running_cancellation_refund_without_blocking_a_peer(#[case] 
         reader.calls.lock().unwrap().len() == 1
     })
     .await;
-    let queued = file.submit_single_into(
+    let mut queued = file.read_for_test(
+        mode,
         16..24,
         10,
         budget.try_reserve(8).unwrap().allocate().unwrap(),
     );
+    assert!(futures::poll!(&mut queued).is_pending());
     assert_eq!(budget.reserved(), 16);
     drop(queued);
     assert_eq!(budget.reserved(), 8);
@@ -196,7 +229,8 @@ async fn queued_and_running_cancellation_refund_without_blocking_a_peer(#[case] 
     let bypass = file.with_bypass_backpressure();
     for _ in 0..3 {
         let output = bypass
-            .submit_single_into(
+            .read_for_test(
+                mode,
                 32..40,
                 30,
                 budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -216,7 +250,8 @@ async fn queued_and_running_cancellation_refund_without_blocking_a_peer(#[case] 
     .await;
     assert!(!reader.calls.lock().unwrap().contains(&16));
     let output = file
-        .submit_single_into(
+        .read_for_test(
+            mode,
             40..48,
             40,
             budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -232,13 +267,21 @@ async fn queued_and_running_cancellation_refund_without_blocking_a_peer(#[case] 
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn invalid_empty_and_failed_owned_reads_leave_no_credit(#[case] lite: bool) {
+async fn invalid_empty_and_failed_owned_reads_leave_no_credit(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let (scheduler, file, reader) = setup(lite, 8);
     let budget = AllocationBudget::new(8);
     let reversed = Range { start: 8, end: 7 };
     for range in [0..7, reversed] {
         let error = file
-            .submit_single_into(range, 0, budget.try_reserve(8).unwrap().allocate().unwrap())
+            .read_for_test(
+                mode,
+                range,
+                0,
+                budget.try_reserve(8).unwrap().allocate().unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
@@ -246,14 +289,20 @@ async fn invalid_empty_and_failed_owned_reads_leave_no_credit(#[case] lite: bool
         assert_eq!(budget.reserved(), 0);
     }
     let empty = file
-        .submit_single_into(7..7, 0, budget.try_reserve(0).unwrap().allocate().unwrap())
+        .read_for_test(
+            mode,
+            7..7,
+            0,
+            budget.try_reserve(0).unwrap().allocate().unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(empty.capacity(), 0);
     assert!(reader.calls.lock().unwrap().is_empty());
     assert_eq!(scheduler.stats().iops, 0);
     let error = file
-        .submit_single_into(
+        .read_for_test(
+            mode,
             128..136,
             0,
             budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -265,7 +314,8 @@ async fn invalid_empty_and_failed_owned_reads_leave_no_credit(#[case] lite: bool
     assert_eq!(budget.reserved(), 0);
     assert_eq!(scheduler.reserved_bytes(), 0);
     let error = file
-        .submit_single_into(
+        .read_for_test(
+            mode,
             96..104,
             0,
             budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -284,7 +334,10 @@ async fn invalid_empty_and_failed_owned_reads_leave_no_credit(#[case] lite: bool
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn scheduled_local_read_preserves_allocation_and_survives_handle_drop(#[case] lite: bool) {
+async fn scheduled_local_read_preserves_allocation_and_survives_handle_drop(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp.path(), b"abcdefgh").unwrap();
     let reader = crate::local::LocalObjectReader::open_local_path(temp.path(), 4096, Some(8))
@@ -301,7 +354,7 @@ async fn scheduled_local_read_preserves_allocation_and_survives_handle_drop(#[ca
     let budget = AllocationBudget::new(4);
     let output = budget.try_reserve(4).unwrap().allocate().unwrap();
     let pointer = output.as_ref().as_ptr() as usize;
-    let pending = file.submit_single_into(2..6, 0, output);
+    let pending = file.read_for_test(mode, 2..6, 0, output);
     drop(file);
     drop(scheduler);
     let output = pending.await.unwrap();
@@ -318,6 +371,7 @@ async fn scheduled_local_read_preserves_allocation_and_survives_handle_drop(#[ca
 #[tokio::test]
 async fn scheduled_reader_rejects_incomplete_ranges(
     #[values(false, true)] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
     #[case] cloud_stream: bool,
     #[case] expected_message: &str,
 ) {
@@ -345,13 +399,23 @@ async fn scheduled_reader_rejects_incomplete_ranges(
     };
     let budget = AllocationBudget::new(4);
     let output = file
-        .submit_single_into(1..5, 0, budget.try_reserve(4).unwrap().allocate().unwrap())
+        .read_for_test(
+            mode,
+            1..5,
+            0,
+            budget.try_reserve(4).unwrap().allocate().unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(output.as_ref(), b"bcde");
     drop(output);
     let error = file
-        .submit_single_into(6..10, 0, budget.try_reserve(4).unwrap().allocate().unwrap())
+        .read_for_test(
+            mode,
+            6..10,
+            0,
+            budget.try_reserve(4).unwrap().allocate().unwrap(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(error, Error::IO { .. }));
@@ -364,10 +428,14 @@ async fn scheduled_reader_rejects_incomplete_ranges(
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn cancellation_keeps_charge_until_detached_backend_stops(#[case] lite: bool) {
+async fn cancellation_keeps_charge_until_detached_backend_stops(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let (scheduler, file, reader) = setup(lite, 8);
     let budget = AllocationBudget::new(8);
-    let request = tokio::spawn(file.submit_single_into(
+    let request = tokio::spawn(file.read_for_test(
+        mode,
         64..72,
         0,
         budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -395,10 +463,14 @@ async fn cancellation_keeps_charge_until_detached_backend_stops(#[case] lite: bo
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn finite_peers_progress_with_slow_read_and_fixed_shared_budget(#[case] lite: bool) {
+async fn finite_peers_progress_with_slow_read_and_fixed_shared_budget(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let (scheduler, file, reader) = setup(lite, 16);
     let budget = AllocationBudget::new(16);
-    let slow = tokio::spawn(file.submit_single_into(
+    let slow = tokio::spawn(file.read_for_test(
+        mode,
         0..8,
         0,
         budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -409,7 +481,8 @@ async fn finite_peers_progress_with_slow_read_and_fixed_shared_budget(#[case] li
     .await;
     for _ in 0..3 {
         let output = file
-            .submit_single_into(
+            .read_for_test(
+                mode,
                 16..24,
                 1,
                 budget.try_reserve(8).unwrap().allocate().unwrap(),
@@ -431,11 +504,19 @@ async fn finite_peers_progress_with_slow_read_and_fixed_shared_budget(#[case] li
 #[case::standard(false)]
 #[case::lite(true)]
 #[tokio::test]
-async fn no_io_backpressure_still_retains_payload_charge(#[case] lite: bool) {
+async fn no_io_backpressure_still_retains_payload_charge(
+    #[case] lite: bool,
+    #[values(ReadMode::Submitted, ReadMode::Polled)] mode: ReadMode,
+) {
     let (scheduler, file, _) = setup(lite, 0);
     let budget = AllocationBudget::new(8);
     let output = file
-        .submit_single_into(8..16, 0, budget.try_reserve(8).unwrap().allocate().unwrap())
+        .read_for_test(
+            mode,
+            8..16,
+            0,
+            budget.try_reserve(8).unwrap().allocate().unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(scheduler.reserved_bytes(), 0);
@@ -471,4 +552,92 @@ async fn unpolled_drop_refunds_owned_read(#[case] lite: bool) {
         budget.reserved() == 0 && scheduler.reserved_bytes() == 0
     })
     .await;
+}
+
+#[tokio::test]
+async fn uncontended_polled_read_completes_without_scheduler_dispatch() {
+    let (scheduler, file, reader) = setup(false, 8);
+    let stats = IoStats::new();
+    let file = file.with_io_stats(stats.recorder());
+    let budget = AllocationBudget::new(8);
+    for _ in 0..3 {
+        let output = file
+            .read_single_into(8..16, 0, budget.try_reserve(8).unwrap().allocate().unwrap())
+            .now_or_never()
+            .expect("an immediately ready backend needs no scheduler task")
+            .unwrap();
+        assert_eq!(output.as_ref(), &[8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(scheduler.reserved_bytes(), 0);
+        assert_eq!(budget.reserved(), 8);
+        drop(output);
+    }
+    assert_eq!(*reader.calls.lock().unwrap(), [8, 8, 8]);
+    assert_eq!(stats.snapshot().iops, 3);
+    assert_eq!(stats.snapshot().bytes_read, 24);
+    let IoQueueType::Standard(queue) = &scheduler.io_queue else {
+        unreachable!()
+    };
+    let state = queue.state.lock().unwrap();
+    assert_eq!(state.iops_avail, state.io_capacity);
+    assert!(state.pending_requests.is_empty());
+    assert!(!state.priorities_in_flight.contains(0));
+}
+
+#[rstest]
+#[tokio::test]
+async fn unpolled_lazy_read_does_not_take_credit_or_start_io(#[values(false, true)] lite: bool) {
+    let (scheduler, file, reader) = setup(lite, 8);
+    let stats = IoStats::new();
+    let file = file.with_io_stats(stats.recorder());
+    let budget = AllocationBudget::new(16);
+    let pending =
+        file.read_single_into(0..8, 0, budget.try_reserve(8).unwrap().allocate().unwrap());
+    tokio::task::yield_now().await;
+    assert!(reader.calls.lock().unwrap().is_empty());
+    assert_eq!(scheduler.reserved_bytes(), 0);
+    assert_eq!(stats.snapshot().iops, 0);
+    assert_eq!(budget.reserved(), 8);
+    let peer = file
+        .read_single_into(8..16, 1, budget.try_reserve(8).unwrap().allocate().unwrap())
+        .await
+        .unwrap();
+    drop(peer);
+    drop(pending);
+    assert_eq!(*reader.calls.lock().unwrap(), [8]);
+    assert_eq!(budget.reserved(), 0);
+    assert_eq!(scheduler.reserved_bytes(), 0);
+    assert_eq!(stats.snapshot().iops, 1);
+}
+
+#[tokio::test]
+async fn direct_read_respects_iop_limit_and_cancel_wakes_same_priority_peer() {
+    let (scheduler, file, reader) = setup(false, 16);
+    let IoQueueType::Standard(queue) = &scheduler.io_queue else {
+        unreachable!()
+    };
+    {
+        let mut state = queue.state.lock().unwrap();
+        state.io_capacity = 1;
+        state.iops_avail = 1;
+    }
+    let budget = AllocationBudget::new(16);
+    let mut slow =
+        file.read_single_into(0..8, 0, budget.try_reserve(8).unwrap().allocate().unwrap());
+    assert!(futures::poll!(&mut slow).is_pending());
+    let mut peer =
+        file.read_single_into(8..16, 0, budget.try_reserve(8).unwrap().allocate().unwrap());
+    assert!(futures::poll!(&mut peer).is_pending());
+    assert_eq!(*reader.calls.lock().unwrap(), [0]);
+    assert_eq!(queue.state.lock().unwrap().pending_requests.len(), 1);
+    assert_eq!(scheduler.reserved_bytes(), 8);
+    drop(slow);
+    let output = peer.await.unwrap();
+    assert_eq!(output.as_ref(), &[8, 9, 10, 11, 12, 13, 14, 15]);
+    assert_eq!(scheduler.reserved_bytes(), 0);
+    assert_eq!(budget.reserved(), 8);
+    drop(output);
+    assert_eq!(budget.reserved(), 0);
+    let state = queue.state.lock().unwrap();
+    assert_eq!(state.iops_avail, 1);
+    assert!(!state.priorities_in_flight.contains(0));
 }

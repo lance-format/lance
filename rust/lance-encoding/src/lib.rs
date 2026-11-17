@@ -84,6 +84,8 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     /// workspace. Cancellation must keep it alive until underlying I/O stops using
     /// it. No new payload allocation, coalescing or splitting is implied by this API;
     /// opaque transport/cache allocations remain outside the caller's budget.
+    /// Implementations may defer scheduling until the future is polled. Callers
+    /// must drive each dependent read rather than relying on eager submission.
     ///
     /// Services must opt in explicitly. Falling back to `submit_single` would both
     /// allocate an unadmitted payload and lose exclusive ownership accounting.
