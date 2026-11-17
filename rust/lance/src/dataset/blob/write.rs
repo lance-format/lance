@@ -1439,7 +1439,7 @@ mod tests {
             .unwrap();
         let (field, array) = values.finish().unwrap().into_parts();
         let (array, _) = preprocessor
-            .rewrite_sidecars(array, &field, 1024, field.metadata())
+            .rewrite_sidecars(array, &field, 1024, &HashMap::from(field.metadata()))
             .await
             .unwrap();
         let array = array.as_struct();

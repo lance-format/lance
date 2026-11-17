@@ -274,11 +274,11 @@ mod tests {
         Python::initialize();
         let batch = record_batch!(("id", Int64, [1])).unwrap();
         let expected_schema = Arc::new(
-            batch.schema().as_ref().clone().with_metadata(
-                [("source_version".to_string(), "1".to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
+            batch
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata([("source_version".to_string(), "1".to_string())]),
         );
         let partition = Python::attach(|py| {
             let factory = PyCFunction::new_closure(py, None, None, move |args, _| {

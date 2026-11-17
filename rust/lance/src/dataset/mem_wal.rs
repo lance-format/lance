@@ -811,10 +811,10 @@ mod tests {
         // The `lance-schema:unenforced-primary-key` marker rides on field
         // metadata, so losing it here would silently drop the shard's PK.
         let marked = ArrowField::new("count", DataType::Int64, false)
-            .with_metadata([("k".to_string(), "v".to_string())].into());
+            .with_metadata([("k".to_string(), "v".to_string())]);
         let schema = ArrowSchema::new_with_metadata(
             vec![ArrowField::new("id", DataType::Int32, false), marked],
-            [("s".to_string(), "m".to_string())].into(),
+            [("s".to_string(), "m".to_string())],
         );
 
         let relaxed = relax_non_pk_nullability(&schema, &["id".to_string()]);

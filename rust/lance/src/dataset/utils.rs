@@ -417,13 +417,10 @@ mod tests {
         let fields = vec![
             Arc::new(ArrowField::new("name", DataType::Utf8View, true)),
             Arc::new(
-                ArrowField::new("document", DataType::Utf8, true).with_metadata(
-                    [(
-                        ARROW_EXT_NAME_KEY.to_string(),
-                        ARROW_JSON_EXT_NAME.to_string(),
-                    )]
-                    .into(),
-                ),
+                ArrowField::new("document", DataType::Utf8, true).with_metadata([(
+                    ARROW_EXT_NAME_KEY.to_string(),
+                    ARROW_JSON_EXT_NAME.to_string(),
+                )]),
             ),
         ];
         let values = StructArray::new(
@@ -438,7 +435,7 @@ mod tests {
             None,
         );
         let field = ArrowField::new("data", values.data_type().clone(), true)
-            .with_metadata([("custom".into(), "preserved".into())].into());
+            .with_metadata([("custom", "preserved")]);
         let schema = Arc::new(ArrowSchema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
         let adapter = SchemaAdapter::new(schema.clone());

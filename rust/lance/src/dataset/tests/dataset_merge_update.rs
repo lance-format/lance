@@ -903,7 +903,7 @@ async fn test_insert_balanced_subschemas() {
         field_a.clone(),
         field_b
             .clone()
-            .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+            .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())]),
     ]));
     let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
     let options = WriteParams {

@@ -84,7 +84,7 @@ pub fn bfloat16_array<'py>(
         EXPORT_METADATA
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
+            .collect::<arrow_schema::Metadata>(),
     );
     let schema = Schema::new(vec![field]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])

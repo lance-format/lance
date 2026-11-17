@@ -359,7 +359,7 @@ fn values(batch: &RecordBatch, name: &str) -> Vec<Option<i32>> {
 fn point_schema(packed: bool) -> Arc<ArrowSchema> {
     let mut point = ArrowField::new("point", DataType::Struct(point_children()), false);
     if packed {
-        point.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+        point.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]);
     }
     Arc::new(ArrowSchema::new(vec![point]))
 }
@@ -742,7 +742,7 @@ async fn test_stages_map_with_reordered_value_children() {
             DataType::Struct(entry_fields(value_children)),
             false,
         )
-        .with_metadata([("entry-semantic".to_string(), "kept".to_string())].into())
+        .with_metadata([("entry-semantic".to_string(), "kept".to_string())])
     };
     let map_batch = |value_children: &Fields,
                      a: [i32; 2],

@@ -1563,7 +1563,7 @@ async fn test_btree_merge_leaves_out_a_rewritten_packed_parent() {
 
     let children = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
     let mut packed = ArrowField::new("s", DataType::Struct(children.clone()), false);
-    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]);
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new("spare", DataType::Int32, false),

@@ -854,6 +854,36 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_openStream(
     ok_or_throw_without_return!(env, inner_open_stream(&mut env, j_scanner, stream_addr));
 }
 
+// The stable C stream ABI keeps release after the three producer callbacks.
+// Arrow 60 makes its fields private; this prefix lets us inspect only release,
+// even when Java's empty stream leaves the other fields uninitialized.
+#[repr(C)]
+struct ArrowArrayStreamPrefix {
+    _get_schema: Option<
+        unsafe extern "C" fn(*mut FFI_ArrowArrayStream, *mut FFI_ArrowSchema) -> std::ffi::c_int,
+    >,
+    _get_next: Option<
+        unsafe extern "C" fn(
+            *mut FFI_ArrowArrayStream,
+            *mut arrow::ffi::FFI_ArrowArray,
+        ) -> std::ffi::c_int,
+    >,
+    _get_last_error:
+        Option<unsafe extern "C" fn(*mut FFI_ArrowArrayStream) -> *const std::ffi::c_char>,
+    release: Option<unsafe extern "C" fn(*mut FFI_ArrowArrayStream)>,
+}
+
+// The pointer must be readable through release, which must be initialized.
+// It need not be aligned, and the other fields need not be initialized.
+unsafe fn stream_has_producer(stream: *const FFI_ArrowArrayStream) -> bool {
+    let prefix = stream.cast::<ArrowArrayStreamPrefix>();
+    unsafe {
+        std::ptr::addr_of!((*prefix).release)
+            .read_unaligned()
+            .is_some()
+    }
+}
+
 fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> Result<()> {
     if stream_addr == 0 {
         return Err(Error::input_error(
@@ -870,15 +900,8 @@ fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -
     //
     // The struct is allocated by Arrow Java inside an ArrowBuf and is not guaranteed to be aligned
     // (hence `write_unaligned` below), so we must not form a reference to it. We read only the
-    // `release` field through an unaligned read: `addr_of!` computes the field address without
-    // creating an intermediate, possibly-unaligned reference, and the field is an `Option<fn>`
-    // which is `Copy` with no destructor, so reading a copy of it leaves the caller's stream
-    // untouched.
-    let release_is_set = unsafe {
-        let stream_ptr = stream_addr as *const FFI_ArrowArrayStream;
-        let release = std::ptr::read_unaligned(std::ptr::addr_of!((*stream_ptr).release));
-        release.is_some()
-    };
+    // `release` field through an unaligned read, leaving the caller's stream untouched.
+    let release_is_set = unsafe { stream_has_producer(stream_addr as *const FFI_ArrowArrayStream) };
     if release_is_set {
         return Err(Error::input_error(
             "ArrowArrayStream is already populated; exporting into it would leak the existing \
@@ -998,5 +1021,47 @@ fn inner_get_stats<'local>(
     match stats {
         Some(stats) => (&stats).into_java(env),
         None => Ok(JObject::null()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::MaybeUninit;
+
+    #[test]
+    fn empty_stream_only_requires_release_to_be_initialized() {
+        let mut stream = MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+        let prefix = stream.as_mut_ptr().cast::<ArrowArrayStreamPrefix>();
+        unsafe {
+            std::ptr::addr_of_mut!((*prefix).release).write(None);
+            assert!(!stream_has_producer(stream.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn unaligned_stream_inspection_preserves_the_producer() {
+        let reader = arrow::array::RecordBatchIterator::new(
+            std::iter::empty::<
+                std::result::Result<arrow::array::RecordBatch, arrow::error::ArrowError>,
+            >(),
+            Arc::new(arrow_schema::Schema::empty()),
+        );
+        let stream = FFI_ArrowArrayStream::new(Box::new(reader));
+        let mut storage = [const { MaybeUninit::<FFI_ArrowArrayStream>::uninit() }; 2];
+        let ptr = unsafe {
+            storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(1)
+                .cast::<FFI_ArrowArrayStream>()
+        };
+        unsafe {
+            ptr.write_unaligned(stream);
+            assert!(stream_has_producer(ptr));
+            let stream = ptr.read_unaligned();
+            assert!(stream.release().is_some());
+            drop(stream);
+        }
     }
 }

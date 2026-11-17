@@ -721,10 +721,10 @@ fn fill(dt: &DataType, n: usize, seed: usize, null_b: bool) -> ArrayRef {
         )),
         DataType::List(item) => {
             let valid = (0..n).map(|i| (seed + i) % 5 != 4).collect::<Vec<_>>();
-            let offsets = arrow_buffer::OffsetBuffer::from_lengths(
+            let offsets = arrow_buffer::OffsetBuffer::<i32>::from_lengths(
                 (0..n).map(|i| if valid[i] { (seed + i) % 3 } else { 0 }),
             );
-            let len = *offsets.last().unwrap() as usize;
+            let len = *offsets.as_ref().last().unwrap() as usize;
             Arc::new(ListArray::new(
                 item.clone(),
                 offsets,

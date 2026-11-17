@@ -262,7 +262,7 @@ mod tests {
                     true,
                 ),
             ])
-            .with_metadata([("key".into(), "value".into())].into()),
+            .with_metadata([("key".to_string(), "value".to_string())]),
         );
 
         // Only needs to be one row

@@ -79,7 +79,7 @@ impl TableProvider for FtsTableProvider {
         scan.full_text_search(self.fts_query.clone())?;
 
         match projection {
-            Some(projection) if projection.is_empty() => {
+            Some([]) => {
                 scan.empty_project()?;
             }
             Some(projection) => {

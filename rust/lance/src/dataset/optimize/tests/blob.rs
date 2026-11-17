@@ -11,7 +11,7 @@ async fn test_compact_blob_columns() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("blob", DataType::LargeBinary, false)
-            .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+            .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())]),
     ]));
     let expected_payload: Vec<Vec<u8>> =
         vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9, 10], vec![11]];
@@ -63,7 +63,7 @@ async fn test_compact_blob_v1_preserves_null_empty_and_payload_order() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("blob", DataType::LargeBinary, true)
-            .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+            .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())]),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),

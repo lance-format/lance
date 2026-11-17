@@ -3501,7 +3501,7 @@ fn seed_bytes_f32(values: &[Option<f32>], rows_per_zone: u64) -> bytes::Bytes {
 /// version 0 buffers and corrupt inputs.
 fn transform_seed(
     bytes: &bytes::Bytes,
-    transform: impl FnOnce(&mut std::collections::HashMap<String, String>, RecordBatch) -> RecordBatch,
+    transform: impl FnOnce(&mut arrow_schema::Metadata, RecordBatch) -> RecordBatch,
 ) -> bytes::Bytes {
     use arrow_ipc::reader::FileReader as IpcReader;
     use arrow_ipc::writer::FileWriter as IpcWriter;

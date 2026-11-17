@@ -3830,9 +3830,10 @@ async fn test_blob_v2_external_ingest_inline_slice() {
     std::fs::write(&external_path, b"prefix-inline-suffix").unwrap();
     let external_uri = format!("file://{}", external_path.display());
 
-    let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
-        .into_iter()
-        .collect();
+    let metadata: arrow_schema::Metadata =
+        [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
+            .into_iter()
+            .collect();
     let blob_field = Field::new(
         "blob",
         DataType::Struct(

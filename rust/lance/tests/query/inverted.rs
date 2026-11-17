@@ -263,20 +263,14 @@ fn expected_bm25_score(
 async fn test_invalid_json_fts_query_returns_error(#[case] combined_fields: bool) {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
-        ArrowField::new("doc", DataType::Utf8, false).with_metadata(
-            [(
-                ARROW_EXT_NAME_KEY.to_string(),
-                ARROW_JSON_EXT_NAME.to_string(),
-            )]
-            .into(),
-        ),
-        ArrowField::new("other_doc", DataType::Utf8, false).with_metadata(
-            [(
-                ARROW_EXT_NAME_KEY.to_string(),
-                ARROW_JSON_EXT_NAME.to_string(),
-            )]
-            .into(),
-        ),
+        ArrowField::new("doc", DataType::Utf8, false).with_metadata([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        )]),
+        ArrowField::new("other_doc", DataType::Utf8, false).with_metadata([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        )]),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),

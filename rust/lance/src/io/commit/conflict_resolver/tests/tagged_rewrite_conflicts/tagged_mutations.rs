@@ -627,7 +627,7 @@ async fn tagged_table_withdraws_a_child_index_when_its_packed_parent_is_rewritte
 
     let children = Fields::from(vec![Field::new("x", DataType::Int32, false)]);
     let mut packed = Field::new("s", DataType::Struct(children.clone()), false);
-    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]);
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("i", DataType::Int32, false),
         Field::new("w", DataType::Int32, false),
@@ -756,7 +756,7 @@ async fn child_index_built_before_a_packed_parent_rewrite_lands_withdrawn() {
 
     let children = Fields::from(vec![Field::new("x", DataType::Int32, false)]);
     let mut packed = Field::new("s", DataType::Struct(children.clone()), false);
-    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]);
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("i", DataType::Int32, false),
         Field::new("w", DataType::Int32, false),

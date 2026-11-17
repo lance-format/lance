@@ -365,7 +365,7 @@ mod tests {
             .with_blob_handling(BlobHandling::default());
         let context = SessionContext::new();
         let plan = provider
-            .scan(&context.state(), projection.as_ref(), &[], None)
+            .scan(&context.state(), projection.as_deref(), &[], None)
             .await
             .unwrap();
         let expected_schema = match &projection {

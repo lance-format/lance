@@ -146,13 +146,10 @@ async fn test_merge_insert_requires_on_or_primary_key() {
 #[tokio::test]
 async fn test_merge_insert_defaults_to_unenforced_primary_key() {
     // Define a simple schema with an unenforced primary key on `id`.
-    let id_field = Field::new("id", DataType::Int32, false).with_metadata(
-        [(
-            "lance-schema:unenforced-primary-key".to_string(),
-            "true".to_string(),
-        )]
-        .into(),
-    );
+    let id_field = Field::new("id", DataType::Int32, false).with_metadata([(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    )]);
     let value_field = Field::new("value", DataType::Int32, false);
     let schema = Arc::new(Schema::new(vec![id_field, value_field]));
 

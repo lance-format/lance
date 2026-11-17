@@ -1651,7 +1651,7 @@ fn serialize_appender_batches(
     let mut metadata = schema.metadata().clone();
     // Only the writer sets these keys. Drop any the caller's schema carries.
     for reserved in RESERVED_ENTRY_KEYS {
-        metadata.remove(*reserved);
+        metadata.remove(reserved);
     }
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
     if let Some(generation) = generation {

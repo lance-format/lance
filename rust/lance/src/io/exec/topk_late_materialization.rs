@@ -834,7 +834,7 @@ mod tests {
         let fields = ["key", "wide", ROW_ID].map(|name| {
             let field = schema.field_with_name(name).unwrap().clone();
             if name == ROW_ID {
-                field.with_metadata([("k".into(), "v".into())].into())
+                field.with_metadata([("k".to_string(), "v".to_string())])
             } else {
                 field
             }

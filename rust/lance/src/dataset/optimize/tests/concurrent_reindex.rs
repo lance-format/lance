@@ -1032,7 +1032,7 @@ async fn test_index_on_a_packed_child_withdraws_a_rewritten_parent() {
 
     let children = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
     let mut packed = ArrowField::new("s", DataType::Struct(children.clone()), false);
-    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]);
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         ArrowField::new("spare", DataType::Int32, false),
@@ -1159,7 +1159,7 @@ fn packed_parent_field() -> (ArrowField, Fields) {
 
     let children = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
     let mut packed = ArrowField::new("s", DataType::Struct(children.clone()), false);
-    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())]);
     (packed, children)
 }
 
