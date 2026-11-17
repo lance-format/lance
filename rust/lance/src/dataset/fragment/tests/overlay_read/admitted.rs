@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use super::*;
 
 mod deletions;
+mod markers;
 mod row_ids;
 
 fn payload(prefix: &str, rows: usize, nested: bool, null_at: usize) -> ArrayRef {

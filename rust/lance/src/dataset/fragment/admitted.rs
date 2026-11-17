@@ -34,17 +34,20 @@ impl FragmentReader {
     /// Payloads use bounded input windows and selected charged storage.
     /// Other sparse codecs return `NotSupported` when selected.
     /// Stored layout determines decoder dispatch.
-    /// Deleted physical offsets are removed before base/overlay reads using the
-    /// reader's immutable deletion snapshot. A reduced selection's offsets share
+    /// By default, deleted physical offsets are removed before base/overlay
+    /// reads using the reader's immutable deletion snapshot. Reduced offsets share
     /// this workspace; output contains only surviving rows in input order. Empty
     /// results still charge their typed offset buffers. Deletion metadata itself
     /// is borrowed, not admitted here. This is not logical-offset remapping.
-    /// `_rowid` and `_rowaddr` use surviving physical offsets. Stable IDs use
+    /// With deletion markers enabled, physical rows and payload remain intact;
+    /// deleted rows have null identifiers. Their shared bitmap is admitted with
+    /// the output values. Markers require `_rowid` or `_rowaddr`.
+    /// `_rowid` and `_rowaddr` use selected physical offsets. Stable IDs use
     /// the reader's inline row-ID sequence snapshot; spilled ID columns are not
     /// supported. Shared sequence metadata is outside this payload budget, but
     /// generated values reserve credit alongside inputs and retain it through
     /// their final Arrow alias. Non-stable IDs and addresses share one buffer.
-    /// Struct ancestors, deletion markers, generated row-version columns,
+    /// Struct ancestors, generated row-version columns,
     /// missing-column synthesis and legacy readers are explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed
     /// selection's physical storage; metadata/transport/cache/allocator overhead
@@ -68,20 +71,27 @@ impl FragmentReader {
     ) -> Result<Option<RecordBatch>> {
         let mut read_selection =
             OverlayReadSelection::from_sorted_indices(indices, self.num_physical_rows as u64)?;
-        if self.with_row_created_at_version
-            || self.with_row_last_updated_at_version
-            || self.make_deletions_null
-        {
+        if self.with_row_created_at_version || self.with_row_last_updated_at_version {
             return Err(Error::not_supported(
-                "admitted fragment take does not yet compose deletion markers or row-version columns",
+                "admitted fragment take does not yet compose row-version columns",
+            ));
+        }
+        if self.make_deletions_null && !self.with_row_id && !self.with_row_addr {
+            return Err(Error::invalid_input(
+                "deletion markers require with_row_id or with_row_address",
             ));
         }
         // Validate the original selection above: deletion pruning must not hide
         // duplicates, null indices or physical offsets outside this fragment.
-        let Some(live_indices) =
-            deletions::try_filter_in(indices, self.deletion_vec.as_deref(), &mut workspace)?
-        else {
-            return Ok(None);
+        let live_indices = if self.make_deletions_null {
+            indices.clone()
+        } else {
+            let Some(live_indices) =
+                deletions::try_filter_in(indices, self.deletion_vec.as_deref(), &mut workspace)?
+            else {
+                return Ok(None);
+            };
+            live_indices
         };
         if live_indices.len() != indices.len() {
             read_selection = OverlayReadSelection::from_sorted_indices(
@@ -92,7 +102,7 @@ impl FragmentReader {
         let indices = live_indices;
         let schema = Arc::new(self.output_schema.clone());
         let Some(row_ids) =
-            row_ids::PreparedRowIds::try_prepare(self, indices.len(), &mut workspace).await?
+            row_ids::PreparedRowIds::try_prepare(self, &indices, &mut workspace).await?
         else {
             return Ok(None);
         };

@@ -183,7 +183,7 @@ async fn deletion_snapshot_and_ignore_deletions_keep_physical_row_identity() {
 }
 
 #[tokio::test]
-async fn deletion_pruning_does_not_hide_invalid_selection_or_marker_mode() {
+async fn deletion_pruning_does_not_hide_invalid_selection_or_invalid_markers() {
     let dataset = write_payload_dataset(LanceFileVersion::V2_3, false, false).await;
     let mut reader = open(&dataset, 0, dataset.schema(), false).await;
     // Include the invalid offset in the set so pruning before validation would
@@ -211,7 +211,7 @@ async fn deletion_pruning_does_not_hide_invalid_selection_or_marker_mode() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("deletion markers"));
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("markers require"));
     assert_eq!(budget.reserved(), 0);
 }
