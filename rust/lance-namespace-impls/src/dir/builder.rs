@@ -239,8 +239,9 @@ impl DirectoryNamespaceBuilder {
     ///
     /// Returns an error if:
     /// - The `root` property is missing
-    /// - A typed property (e.g. `manifest_enabled`, `commit_retries`) is present
-    ///   but its value cannot be parsed as the expected type
+    /// - One of the boolean or integer directory properties (e.g.
+    ///   `manifest_enabled`, `commit_retries`) is present but its value cannot
+    ///   be parsed as the expected type
     ///
     /// # Examples
     ///
@@ -376,7 +377,7 @@ impl DirectoryNamespaceBuilder {
                 lance_core::Error::from(NamespaceError::InvalidInput {
                     message: format!(
                         "Invalid value '{value}' for property '{key}', expected a boolean \
-                         (true/false/1/0/on/off/yes/no, case-insensitive)"
+                         (true/false/1/0/on/off/yes/no/y/n, case-insensitive)"
                     ),
                 })
             }),

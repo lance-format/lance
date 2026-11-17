@@ -666,12 +666,7 @@ impl LanceNamespace for DirectoryNamespace {
                 None,
             )
             .await
-            .map_err(|e| {
-                Error::io_source(box_error(std::io::Error::other(format!(
-                    "Failed to add columns: {}",
-                    e
-                ))))
-            })?;
+            .map_err(|e| Self::map_mutation_error(e, "add_columns", &table_uri))?;
 
         let version = dataset.version().version as i64;
         Ok(AlterTableAddColumnsResponse::new(version))

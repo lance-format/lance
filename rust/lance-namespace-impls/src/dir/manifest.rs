@@ -1043,7 +1043,10 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
         // Checked before the message text below: "Column x already exists in the
         // dataset" is a bad request, not a concurrent create.
         LanceError::InvalidInput { .. } => NamespaceError::InvalidInput {
-            message: format!("{}: {}", operation, e),
+            message: match object_id {
+                Some(id) => format!("{} on '{}': {}", operation, id, e),
+                None => format!("{}: {}", operation, e),
+            },
         }
         .into(),
         // Other errors: check message for semantic conflicts (matched/duplicate from WhenMatched::Fail)
@@ -7610,16 +7613,21 @@ mod tests {
 
     /// Adding a column the table already has is a bad request, not a concurrent create.
     #[rstest]
-    #[case::with_optimization(true)]
-    #[case::without_optimization(false)]
+    #[case::with_optimization(true, true)]
+    #[case::without_optimization(false, true)]
+    #[case::directory_only(false, false)]
     #[tokio::test]
-    async fn test_alter_table_add_columns_existing_column(#[case] inline_optimization: bool) {
+    async fn test_alter_table_add_columns_existing_column(
+        #[case] inline_optimization: bool,
+        #[case] manifest_enabled: bool,
+    ) {
         use lance_namespace::error::{ErrorCode, NamespaceError};
         use lance_namespace::models::{AddColumnsEntry, AlterTableAddColumnsRequest};
 
         let temp_dir = TempStdDir::default();
         let dir_namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
             .inline_optimization_enabled(inline_optimization)
+            .manifest_enabled(manifest_enabled)
             .build()
             .await
             .unwrap();

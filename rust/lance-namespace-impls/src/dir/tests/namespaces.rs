@@ -319,14 +319,17 @@ fn test_from_properties_rejects_unparsable_typed_values(#[case] key: &str, #[cas
 
     let err = DirectoryNamespaceBuilder::from_properties(properties, None)
         .expect_err("present-but-unparsable typed property should be rejected");
+    let code = match &err {
+        Error::Namespace { source, .. } => {
+            source.downcast_ref::<NamespaceError>().map(|e| e.code())
+        }
+        _ => None,
+    };
+    assert_eq!(code, Some(ErrorCode::InvalidInput), "{err}");
     let message = err.to_string();
     assert!(
-        message.contains(key),
-        "error should name the property: {message}"
-    );
-    assert!(
-        message.contains(value),
-        "error should name the offending value: {message}"
+        message.contains(&format!("'{key}'")) && message.contains(&format!("'{value}'")),
+        "error should name the property and the offending value: {message}"
     );
 }
 
