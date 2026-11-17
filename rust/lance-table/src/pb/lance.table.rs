@@ -1179,10 +1179,9 @@ pub struct IndexMetadata {
     pub dataset_version: u64,
     /// A bitmap of the included fragment ids.
     ///
-    /// Stores committed dataset fragment IDs (before FRI remapping), not local
-    /// fragment IDs stored inside index files. When `local_fragment_aliases` is
-    /// used, a commit or rebase updates this bitmap and the aliases together
-    /// without rewriting the index files.
+    /// Stores committed dataset fragment IDs, not local IDs stored inside index
+    /// files. When `local_fragment_aliases` is used, a commit or rebase updates
+    /// this bitmap and the aliases together without rewriting the index files.
     ///
     /// This may by used to determine how much of the dataset is covered by the
     /// index. This information can be retrieved from the dataset by looking at
@@ -1276,8 +1275,8 @@ pub struct IndexMetadata {
     /// are not translated.
     ///
     /// Keys and values must be less than 2^32 - 1. u32::MAX (2^32 - 1) is
-    /// reserved for RowAddress::TOMBSTONE_FRAG. Two referenced IDs must not
-    /// resolve to the same final fragment ID.
+    /// reserved for RowAddress::TOMBSTONE_FRAG. Two referenced fragment IDs must
+    /// not resolve to the same final fragment ID.
     ///
     /// Requires flag 1 << 20 (FLAG_LOCAL_FRAGMENT_ALIASES) in both reader and
     /// writer feature flags while nonempty. Both bits are cleared when no

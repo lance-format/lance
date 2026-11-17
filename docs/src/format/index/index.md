@@ -273,7 +273,7 @@ A segment whose files store stable row IDs must not carry local fragment
 aliases. A commit retry can reassign row IDs as well as fragment IDs, and the
 map cannot translate row IDs.
 
-`fragment_bitmap` must hold committed fragment IDs, before FRI remapping.
+`fragment_bitmap` must hold committed dataset fragment IDs, not local IDs.
 When a commit or rebase changes the committed ID of a fragment referenced
 through `local_fragment_aliases`, it must update `fragment_bitmap` and the
 aliases together. The index files do not need to be rewritten. For example,
