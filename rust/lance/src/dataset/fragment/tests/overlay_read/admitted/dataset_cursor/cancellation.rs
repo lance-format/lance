@@ -97,8 +97,11 @@ impl ObjectStore for GatedStore {
     }
 }
 
+#[rstest]
 #[tokio::test]
-async fn dataset_cursor_cancels_real_fragment_open_without_skipping_output() {
+async fn dataset_cursor_cancels_real_fragment_open_without_skipping_output(
+    #[values(false, true)] wait_for_admission: bool,
+) {
     let dataset = write_payload_dataset(LanceFileVersion::V2_3, false, false).await;
     let gate = Arc::new(ReadGate {
         armed: AtomicBool::new(true),
@@ -119,7 +122,13 @@ async fn dataset_cursor_cancels_real_fragment_open_without_skipping_output() {
         )
         .unwrap();
     let position = scan.position();
-    let mut next = Box::pin(scan.try_next());
+    let mut next = Box::pin(async {
+        if wait_for_admission {
+            scan.next_when_available().await
+        } else {
+            scan.try_next().await
+        }
+    });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::select! {
             result = &mut next => panic!("gated read must remain pending: {result:?}"),

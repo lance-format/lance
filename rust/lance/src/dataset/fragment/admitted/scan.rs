@@ -119,6 +119,17 @@ impl AdmittedFragmentScan<'_> {
 
     /// Attempt the next complete prefix, without waiting for credit or reading ahead.
     pub async fn try_next(&mut self) -> Result<AdmittedFragmentScanOutcome> {
+        Ok(self
+            .try_next_admitted()
+            .await?
+            .unwrap_or(AdmittedFragmentScanOutcome::NeedsCapacity))
+    }
+
+    // None is exclusively a failed pool admission. An admitted minimal prefix
+    // that cannot fit returns Some(NeedsCapacity), which must not wait for credit.
+    pub(crate) async fn try_next_admitted(
+        &mut self,
+    ) -> Result<Option<AdmittedFragmentScanOutcome>> {
         let reader = self.reader;
         self.try_next_with(|indices, workspace| async move {
             reader.try_take_admitted_fullzip(&indices, workspace).await
@@ -131,13 +142,13 @@ impl AdmittedFragmentScan<'_> {
     pub(in crate::dataset::fragment) async fn try_next_with<Run, Done>(
         &mut self,
         mut take: Run,
-    ) -> Result<AdmittedFragmentScanOutcome>
+    ) -> Result<Option<AdmittedFragmentScanOutcome>>
     where
         Run: FnMut(UInt32Array, Reservation) -> Done,
         Done: Future<Output = Result<Option<RecordBatch>>>,
     {
         if self.cursor == self.end {
-            return Ok(AdmittedFragmentScanOutcome::Finished);
+            return Ok(Some(AdmittedFragmentScanOutcome::Finished));
         }
         let mut count = self
             .max_rows
@@ -145,7 +156,7 @@ impl AdmittedFragmentScan<'_> {
             .min((self.workspace_bytes / size_of::<u32>()).max(1) as u64);
         loop {
             let Some(mut workspace) = self.budget.try_reserve(self.workspace_bytes) else {
-                return Ok(AdmittedFragmentScanOutcome::NeedsCapacity);
+                return Ok(None);
             };
             let bytes = usize::try_from(count)
                 .ok()
@@ -177,10 +188,10 @@ impl AdmittedFragmentScan<'_> {
                 // No await follows the commit. Empty filtered output is still a
                 // fully consumed physical prefix, not EOF or a retry.
                 self.cursor = rows.end;
-                return Ok(AdmittedFragmentScanOutcome::Batch { rows, batch });
+                return Ok(Some(AdmittedFragmentScanOutcome::Batch { rows, batch }));
             }
             if count == 1 {
-                return Ok(AdmittedFragmentScanOutcome::NeedsCapacity);
+                return Ok(Some(AdmittedFragmentScanOutcome::NeedsCapacity));
             }
             count /= 2;
         }

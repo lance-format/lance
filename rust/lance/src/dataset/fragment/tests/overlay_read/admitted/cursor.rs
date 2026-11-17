@@ -229,6 +229,24 @@ async fn cursor_refusal_and_cancel_do_not_consume_rows_or_hold_credit() {
     assert_eq!(scan.position(), 1);
     assert_eq!(budget.reserved(), 0);
 
+    // A competing operation can acquire credit between prefix retries. This
+    // must remain an admission refusal, not a conclusion that one row cannot fit.
+    let mut competing = None;
+    let attempt = scan
+        .try_next_with(|indices, workspace| {
+            drop((indices, workspace));
+            competing = budget.try_reserve(64);
+            assert!(competing.is_some());
+            std::future::ready(Ok(None))
+        })
+        .await
+        .unwrap();
+    assert!(attempt.is_none());
+    assert_eq!(scan.position(), 1);
+    assert_eq!(budget.reserved(), 64);
+    drop(competing);
+    assert_eq!(budget.reserved(), 0);
+
     let Outcome::Batch { rows, batch } = scan.try_next().await.unwrap() else {
         panic!("retry must return the unconsumed range");
     };
@@ -294,7 +312,7 @@ async fn cursor_validates_ranges_and_preserves_final_u32_offset() {
         })
         .await
         .unwrap();
-    assert!(matches!(result, Outcome::Batch { .. }));
+    assert!(matches!(result, Some(Outcome::Batch { .. })));
     assert_eq!(final_row.position(), u64::from(u32::MAX) + 1);
     assert!(matches!(
         final_row.try_next().await.unwrap(),

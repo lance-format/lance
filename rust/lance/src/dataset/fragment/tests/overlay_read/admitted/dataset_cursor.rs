@@ -8,6 +8,7 @@ use crate::dataset::{
 };
 
 mod cancellation;
+mod waiting;
 
 #[rstest]
 #[tokio::test]

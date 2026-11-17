@@ -184,9 +184,56 @@ impl AdmittedDatasetScan {
 
     /// Attempt a complete prefix without waiting for credit or prefetching fragments.
     pub async fn try_next(&mut self) -> Result<AdmittedDatasetScanOutcome> {
+        Ok(self
+            .try_next_admitted()
+            .await?
+            .unwrap_or(AdmittedDatasetScanOutcome::NeedsCapacity))
+    }
+
+    /// Wait for shared admission, then return a complete prefix or workspace refusal.
+    ///
+    /// Unlike [`Self::try_next`], temporary pool contention waits for released
+    /// credit in the outer async caller, without holding an attempted payload or
+    /// parking a CPU worker. A minimal prefix that cannot fit an admitted workspace
+    /// still returns `NeedsCapacity` immediately: waiting cannot make it fit.
+    /// A workspace exceeding the pool limit returns an error instead of waiting.
+    ///
+    /// Drop previously returned output before awaiting this method, or arrange an
+    /// independent consumer to drain it. Waiting while retaining the only data
+    /// that can release this pool would deadlock. Competing scans share capacity,
+    /// but admission order and fairness are not guaranteed. Cancellation consumes
+    /// no uncommitted rows; any already-dispatched work owns credit until it ends.
+    /// Exhausted snapshots return `Finished` even when the pool is occupied.
+    ///
+    /// ```
+    /// use lance::{Result, dataset::{AdmittedDatasetScan, AdmittedDatasetScanOutcome}};
+    /// async fn drain(scan: &mut AdmittedDatasetScan) -> Result<bool> {
+    ///     loop {
+    ///         match scan.next_when_available().await? {
+    ///             AdmittedDatasetScanOutcome::Batch { batch, .. } => drop(batch),
+    ///             // Incomplete: replan the workspace; do not retry by waiting.
+    ///             AdmittedDatasetScanOutcome::NeedsCapacity => return Ok(false),
+    ///             AdmittedDatasetScanOutcome::Finished => return Ok(true),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn next_when_available(&mut self) -> Result<AdmittedDatasetScanOutcome> {
+        loop {
+            if let Some(outcome) = self.try_next_admitted().await? {
+                return Ok(outcome);
+            }
+            // The failed admission retains no operation payload. Subscribe/check
+            // through the pool primitive so a concurrent refund cannot be lost.
+            self.budget.wait_for_capacity(self.workspace_bytes).await?;
+        }
+    }
+
+    // None distinguishes pool contention from an admitted decode refusal.
+    async fn try_next_admitted(&mut self) -> Result<Option<AdmittedDatasetScanOutcome>> {
         loop {
             let Some(position) = self.position() else {
-                return Ok(AdmittedDatasetScanOutcome::Finished);
+                return Ok(Some(AdmittedDatasetScanOutcome::Finished));
             };
             if self.active.is_none() {
                 let fragment = FileFragment::new(
@@ -215,8 +262,11 @@ impl AdmittedDatasetScan {
                 self.workspace_bytes,
                 self.budget.clone(),
             )?;
-            let result = scan.try_next().await?;
+            let result = scan.try_next_admitted().await?;
             drop(scan);
+            let Some(result) = result else {
+                return Ok(None);
+            };
             match result {
                 AdmittedFragmentScanOutcome::Batch { rows, batch } => {
                     self.row_offset = rows.end;
@@ -227,14 +277,14 @@ impl AdmittedDatasetScan {
                         self.fragment_index += 1;
                         self.row_offset = 0;
                     }
-                    return Ok(AdmittedDatasetScanOutcome::Batch {
+                    return Ok(Some(AdmittedDatasetScanOutcome::Batch {
                         fragment_id: position.fragment_id,
                         rows,
                         batch,
-                    });
+                    }));
                 }
                 AdmittedFragmentScanOutcome::NeedsCapacity => {
-                    return Ok(AdmittedDatasetScanOutcome::NeedsCapacity);
+                    return Ok(Some(AdmittedDatasetScanOutcome::NeedsCapacity));
                 }
                 AdmittedFragmentScanOutcome::Finished => {
                     return Err(Error::internal(
