@@ -589,7 +589,6 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
-    mark_supported(&mut supported, RESERVED_LOCAL_FRAGMENT_ALIASES, false);
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
@@ -611,50 +610,6 @@ pub fn can_read_dataset(reader_flags: u64) -> bool {
 
 pub fn can_write_dataset(writer_flags: u64) -> bool {
     writer_flags & !supported_flags() == 0
-}
-
-thread_local! {
-    static DELETION_FILE_PATHS_DISABLED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Guard returned by [`disable_deletion_file_paths_for_test`].
-#[doc(hidden)]
-pub struct DeletionFilePathsDisabledGuard {
-    previous: bool,
-}
-
-impl Drop for DeletionFilePathsDisabledGuard {
-    fn drop(&mut self) {
-        DELETION_FILE_PATHS_DISABLED_FOR_TEST.with(|flag| flag.set(self.previous));
-    }
-}
-
-/// Disable explicit deletion file paths on the current thread for testing.
-#[doc(hidden)]
-pub fn disable_deletion_file_paths_for_test() -> DeletionFilePathsDisabledGuard {
-    let previous = DELETION_FILE_PATHS_DISABLED_FOR_TEST.with(|flag| flag.replace(true));
-    DeletionFilePathsDisabledGuard { previous }
-}
-
-/// Whether this build supports reading and writing `DeletionFile.path`.
-pub fn deletion_file_paths_enabled() -> bool {
-    !DELETION_FILE_PATHS_DISABLED_FOR_TEST.with(std::cell::Cell::get)
-        && can_write_dataset(FLAG_DELETION_FILE_PATHS)
-}
-
-/// Refuse to write an explicit deletion file path when explicit deletion paths
-/// are not enabled.
-pub fn ensure_deletion_file_paths_enabled() -> Result<()> {
-    ensure_deletion_file_paths_enabled_when(deletion_file_paths_enabled())
-}
-
-pub fn ensure_deletion_file_paths_enabled_when(enabled: bool) -> Result<()> {
-    if enabled {
-        return Ok(());
-    }
-    Err(Error::not_supported_source(
-        "Explicit deletion file paths are not enabled in this build of Lance".into(),
-    ))
 }
 
 /// Refuse reads from manifests whose required reader features this build does
@@ -1690,9 +1645,9 @@ mod tests {
 
     #[test]
     fn test_deletion_file_paths_flag() {
-        assert_eq!(RESERVED_LOCAL_FRAGMENT_ALIASES, 1 << 20);
-        assert!(!can_read_dataset(RESERVED_LOCAL_FRAGMENT_ALIASES));
-        assert!(!can_write_dataset(RESERVED_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
         assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
         assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
         assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));

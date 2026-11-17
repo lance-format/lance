@@ -517,7 +517,7 @@ impl DeletionFileType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, DeepSizeOf)]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -538,6 +538,38 @@ pub struct DeletionFile {
         with = "inline_deletion_bytes"
     )]
     pub inline: Option<Bytes>,
+}
+
+impl<'de> Deserialize<'de> for DeletionFile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct DeletionFileHelper {
+            read_version: u64,
+            id: u64,
+            file_type: DeletionFileType,
+            num_deleted_rows: Option<usize>,
+            base_id: Option<u32>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default, with = "inline_deletion_bytes")]
+            inline: Option<Bytes>,
+        }
+
+        let helper = DeletionFileHelper::deserialize(deserializer)?;
+        let deletion_file = Self {
+            read_version: helper.read_version,
+            id: helper.id,
+            file_type: helper.file_type,
+            num_deleted_rows: helper.num_deleted_rows,
+            base_id: helper.base_id,
+            path: helper.path,
+            inline: helper.inline,
+        };
+        deletion_file
+            .check_location()
+            .map_err(serde::de::Error::custom)?;
+        Ok(deletion_file)
+    }
 }
 
 /// `Option<Bytes>` as serde sees a byte sequence, without the `serde` feature of `bytes`.
@@ -565,12 +597,6 @@ impl DeletionFile {
     /// Whether the deletion vector lives in the manifest, so no file exists for it.
     pub fn is_inline(&self) -> bool {
         self.inline.is_some()
-    }
-
-    /// Whether the file's path is derived from the id of the fragment that
-    /// owns it rather than stored explicitly or inline.
-    pub fn uses_derived_path(&self) -> bool {
-        self.path.is_none() && !self.is_inline()
     }
 
     pub fn validate_location(&self) -> Result<()> {
@@ -1684,6 +1710,21 @@ mod tests {
             } else {
                 assert!(err.to_string().contains(path), "{path}: {err}");
             }
+
+            let json = serde_json::json!({
+                "read_version": 1,
+                "id": 2,
+                "file_type": "bitmap",
+                "num_deleted_rows": 1,
+                "base_id": null,
+                "path": path,
+            });
+            let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
+            if path.is_empty() {
+                assert!(err.to_string().contains("empty"), "{err}");
+            } else {
+                assert!(err.to_string().contains(path), "{path}: {err}");
+            }
         }
 
         let proto = pb::DeletionFile {
@@ -1697,6 +1738,18 @@ mod tests {
         };
         let err = DeletionFile::try_from(proto).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("both path and inline"), "{err}");
+
+        let json = serde_json::json!({
+            "read_version": 1,
+            "id": 2,
+            "file_type": "bitmap",
+            "num_deleted_rows": 1,
+            "base_id": null,
+            "path": "_deletions/file.bin",
+            "inline": [1, 2, 3],
+        });
+        let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
         assert!(err.to_string().contains("both path and inline"), "{err}");
     }
 

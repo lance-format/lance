@@ -12,8 +12,8 @@ use lance_core::{Error, Result};
 
 /// Set (replace) a fragment's deletion file.
 ///
-/// This is reference-stable rather than a delta: the fragment id is committed
-/// and physical row offsets never move, so the post-image is unambiguous.
+/// Physical row offsets within a fragment never move, so the post-image is
+/// unambiguous.
 ///
 /// A fragment's deletions only grow. Indices built while rows were deleted
 /// never saw them, so bringing rows back would leave those indices silently
@@ -27,14 +27,14 @@ use lance_core::{Error, Result};
 /// the same fragment always conflict.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct SetDeletionFile {
-    /// The fragment, by committed id.
+    /// The target fragment, either committed or minted earlier in this
+    /// operation.
     ///
-    /// Unlike its sibling fragment actions this takes no [`Ref`](super::Ref).
-    /// A deletion file's path is `{fragment_id}-{read_version}-{id}.{suffix}`
-    /// (see [`deletion_file_path`](crate::io::deletion::deletion_file_path)),
-    /// so the writer has to know the committed fragment id before it can write
-    /// the file at all, and a minted id does not exist until apply.
-    pub fragment: u64,
+    /// When [`Ref::Local`], `deletion_file` must store its vector inline or at
+    /// an explicit [`DeletionFile::path`](crate::format::DeletionFile::path),
+    /// because a minted fragment's id is assigned at apply and can change on
+    /// rebase.
+    pub fragment: Ref,
     /// The new deletion file.
     pub deletion_file: DeletionFile,
     /// See [`AddFragment::data_change`](super::AddFragment::data_change).
@@ -46,19 +46,28 @@ pub struct SetDeletionFile {
 
 impl SetDeletionFile {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        self.deletion_file.validate_location()?;
+        let fragment_id = state.resolve_fragment(self.fragment)?;
+        if self.fragment.local().is_some()
+            && self.deletion_file.path.is_none()
+            && !self.deletion_file.is_inline()
+        {
+            return Err(Error::invalid_input(format!(
+                "SetDeletionFile for local fragment {fragment_id} cannot use a derived path; \
+                 a deletion file on a minted fragment must set an explicit path or inline vector"
+            )));
+        }
         if let Some(base_id) = self.deletion_file.base_id {
             return Err(Error::invalid_input(format!(
-                "SetDeletionFile for fragment {} carries deletion_file.base_id {base_id}; \
+                "SetDeletionFile for fragment {fragment_id} carries deletion_file.base_id {base_id}; \
                  deletion_file.base_id must be unset, since the action's base names where the \
-                 file lives",
-                self.fragment
+                 file lives"
             )));
         }
         let deletion_file = DeletionFile {
             base_id: self.base.map(|base| state.resolve_base(base)).transpose()?,
             ..self.deletion_file.clone()
         };
-        let fragment_id = state.resolve_fragment(Ref::Committed(self.fragment))?;
         let fragment = state.fragment_mut(fragment_id, "SetDeletionFile")?;
         let deleted_before = fragment
             .deletion_file
@@ -84,14 +93,16 @@ impl SetDeletionFile {
     /// The fragment's deletions, which is a distinct coordinate from the data of
     /// any field in it: deleting rows and re-encoding a column commute.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::FragmentDeletions(self.fragment));
+        if let Some(fragment) = self.fragment.committed() {
+            footprint.write(Coordinate::FragmentDeletions(fragment));
+        }
     }
 }
 
 impl From<&SetDeletionFile> for pb_actions::SetDeletionFile {
     fn from(value: &SetDeletionFile) -> Self {
         Self {
-            fragment: value.fragment,
+            fragment: Some(value.fragment.into()),
             deletion_file: Some(pb::DeletionFile::from(&value.deletion_file)),
             data_unchanged: !value.data_change,
             base: value.base.map(Into::into),
@@ -104,7 +115,7 @@ impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
 
     fn try_from(message: pb_actions::SetDeletionFile) -> Result<Self> {
         Ok(Self {
-            fragment: message.fragment,
+            fragment: required(message.fragment, "SetDeletionFile.fragment")?.try_into()?,
             deletion_file: DeletionFile::try_from(required(
                 message.deletion_file,
                 "SetDeletionFile.deletion_file",
@@ -118,16 +129,18 @@ impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::{FLAG_DELETION_FILE_PATHS, FLAG_INLINE_DELETIONS};
     use crate::format::DeletionFileType;
     use crate::transaction::action::test_support::{
         apply, backed_manifest, manifest_with_base, mint_base,
     };
-    use crate::transaction::action::{Action, Ref};
+    use crate::transaction::action::{Action, AddFragment, Ref};
+    use bytes::Bytes;
     use rstest::rstest;
 
     fn set_deletion_file(file: DeletionFile) -> Action {
         Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
+            fragment: Ref::Committed(0),
             deletion_file: file,
             data_change: true,
             base: None,
@@ -157,7 +170,7 @@ mod tests {
     #[test]
     fn test_set_deletion_file_requires_a_file_on_the_wire() {
         let message = pb_actions::SetDeletionFile {
-            fragment: 0,
+            fragment: Some(Ref::Committed(0).into()),
             deletion_file: None,
             data_unchanged: false,
             base: None,
@@ -167,6 +180,23 @@ mod tests {
 
         assert!(
             error.to_string().contains("SetDeletionFile.deletion_file"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_set_deletion_file_requires_a_fragment_on_the_wire() {
+        let message = pb_actions::SetDeletionFile {
+            fragment: None,
+            deletion_file: Some(pb::DeletionFile::from(&deletion_file(None))),
+            data_unchanged: false,
+            base: None,
+        };
+
+        let error = SetDeletionFile::try_from(message).unwrap_err();
+
+        assert!(
+            error.to_string().contains("SetDeletionFile.fragment"),
             "unexpected error: {error}"
         );
     }
@@ -212,7 +242,7 @@ mod tests {
         let error = apply(
             &backed_manifest(),
             vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 7,
+                fragment: Ref::Committed(7),
                 deletion_file: deletion_file(None),
                 data_change: true,
                 base: None,
@@ -230,7 +260,68 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(2),
             base_id,
+            path: None,
             inline: None,
+        }
+    }
+
+    #[rstest]
+    #[case::explicit_path(
+        DeletionFile {
+            file_type: DeletionFileType::Bitmap,
+            path: Some("_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            ..deletion_file(None)
+        },
+        Ok(FLAG_DELETION_FILE_PATHS),
+    )]
+    #[case::inline_vector(
+        DeletionFile {
+            file_type: DeletionFileType::Bitmap,
+            inline: Some(Bytes::from_static(&[1, 2, 3])),
+            ..deletion_file(None)
+        },
+        Ok(FLAG_INLINE_DELETIONS),
+    )]
+    #[case::derived_path(deletion_file(None), Err("derived path"))]
+    fn test_set_deletion_file_local_fragment_requires_explicit_path_or_inline(
+        #[case] file: DeletionFile,
+        #[case] expected: std::result::Result<u64, &str>,
+    ) {
+        let actions = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 10,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::SetDeletionFile(SetDeletionFile {
+                fragment: Ref::Local(0),
+                deletion_file: file.clone(),
+                data_change: true,
+                base: None,
+            }),
+        ];
+
+        let result = apply(&backed_manifest(), actions);
+
+        match expected {
+            Ok(flag) => {
+                let next = result.unwrap();
+                assert_eq!(next.fragments[1].id, 1);
+                assert_eq!(next.fragments[1].deletion_file.as_ref(), Some(&file));
+                assert_ne!(next.reader_feature_flags & flag, 0);
+                assert_ne!(next.writer_feature_flags & flag, 0);
+            }
+            Err(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(
+                    error.to_string().contains(message),
+                    "unexpected error: {error}"
+                );
+            }
         }
     }
 
@@ -269,7 +360,7 @@ mod tests {
             actions.push(mint_base());
         }
         actions.push(Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
+            fragment: Ref::Committed(0),
             deletion_file: file,
             data_change: true,
             base,
