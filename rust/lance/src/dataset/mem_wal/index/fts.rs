@@ -55,15 +55,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use crossbeam_skiplist::SkipMap;
-use fst::{Map, Streamer};
+use fst::automaton::{Automaton, Levenshtein, Str};
+use fst::{IntoStreamer, Map, Streamer};
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::scalar::IndexStore as _;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
-use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
+use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens, collect_query_tokens};
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_table::format::IndexMetadata;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, TokenStream};
@@ -695,6 +696,38 @@ pub fn levenshtein_distance(a: &str, b: &str) -> u32 {
     prev_row[n]
 }
 
+/// Longest ASCII term, in bytes, that fuzzy expansion builds a Levenshtein
+/// automaton for. The work per automaton state grows with the term length,
+/// and with two edits `fst` already gives up at about 50 bytes for most terms,
+/// so a longer term scans the dictionary.
+const FUZZY_AUTOMATON_MAX_TERM_BYTES: usize = 64;
+
+/// Prefixed partition terms per automaton state that fuzzy expansion may
+/// build. Building a state costs about as much as an edit distance or two, so
+/// with more than a few hundred such terms, a build that reaches this limit
+/// and falls back costs at most about as much as the edit distances the
+/// fallback then computes.
+const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
+
+/// Most automaton states fuzzy expansion builds, `fst`'s default limit for
+/// `Levenshtein::new`.
+const FUZZY_AUTOMATON_MAX_STATES: usize = 10_000;
+
+/// The Levenshtein automaton that expands `term` over partitions holding
+/// `prefixed_terms` terms with the required prefix, or `None` to check those
+/// terms one by one instead. `fst`'s automaton can miss matches for a non-ASCII
+/// term (lance-index keeps its own Unicode automaton for those), and building
+/// one for a long term or for few terms with the prefix can cost far more
+/// than the scan it replaces.
+fn fuzzy_automaton(term: &str, max_distance: u32, prefixed_terms: usize) -> Option<Levenshtein> {
+    let state_limit =
+        (prefixed_terms / FUZZY_AUTOMATON_TERMS_PER_STATE).min(FUZZY_AUTOMATON_MAX_STATES);
+    if !term.is_ascii() || term.len() > FUZZY_AUTOMATON_MAX_TERM_BYTES || state_limit == 0 {
+        return None;
+    }
+    Levenshtein::new_with_limit(term, max_distance, state_limit).ok()
+}
+
 fn char_prefix(term: &str, prefix_length: u32) -> &str {
     if prefix_length == 0 {
         return "";
@@ -705,15 +738,27 @@ fn char_prefix(term: &str, prefix_length: u32) -> &str {
         .unwrap_or(term)
 }
 
+// Counts dictionary terms whose edit distance `expand_fuzzy_term` computed for
+// a partition, so tests can tell an automaton search from a dictionary scan.
+#[cfg(test)]
+thread_local! {
+    static FUZZY_DISTANCES_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_fuzzy_distance_computed() {
+    FUZZY_DISTANCES_COMPUTED.with(|count| count.set(count.get() + 1));
+}
+
 fn query_tokens_to_vec(tokens: &Tokens) -> Vec<String> {
     (0..tokens.len())
         .map(|idx| tokens.get_token(idx).to_string())
         .collect()
 }
 
-fn has_grouped_positions(tokens: &Tokens) -> bool {
+fn has_grouped_terms(tokens: &Tokens) -> bool {
     let mut seen = HashSet::new();
-    (0..tokens.len()).any(|idx| !seen.insert(tokens.position(idx)))
+    (0..tokens.len()).any(|idx| !seen.insert(tokens.term_group(idx)))
 }
 
 struct QueryPositionGroup {
@@ -721,11 +766,15 @@ struct QueryPositionGroup {
     tokens: Vec<String>,
 }
 
-fn query_position_groups(tokens: &Tokens) -> Vec<QueryPositionGroup> {
+fn query_position_groups(tokens: &Tokens, is_phrase_query: bool) -> Vec<QueryPositionGroup> {
     let mut groups = Vec::with_capacity(tokens.len());
     let mut current_position = None;
     for idx in 0..tokens.len() {
-        let position = tokens.position(idx);
+        let position = if is_phrase_query {
+            tokens.position(idx)
+        } else {
+            tokens.term_group(idx)
+        };
         if current_position != Some(position) {
             current_position = Some(position);
             groups.push(QueryPositionGroup {
@@ -1124,8 +1173,8 @@ impl<'a> PooledTokenizer<'a> {
         }
     }
 
-    fn get_mut(&mut self) -> &mut dyn LanceTokenizer {
-        self.inner.as_mut().expect("tokenizer in scope").as_mut()
+    fn get_mut(&mut self) -> &mut Box<dyn LanceTokenizer> {
+        self.inner.as_mut().expect("tokenizer in scope")
     }
 }
 
@@ -2292,7 +2341,7 @@ impl FtsMemIndex {
         include_tail: bool,
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
-        if operator == Operator::And && has_grouped_positions(query_tokens) {
+        if operator == Operator::And && has_grouped_terms(query_tokens) {
             return self.search_grouped_and(st, query_tokens, limit, include_tail, tail_skip);
         }
         let tokens = query_tokens_to_vec(query_tokens);
@@ -2377,9 +2426,9 @@ impl FtsMemIndex {
         operator: Operator,
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
-        if operator == Operator::And && has_grouped_positions(query_tokens) {
+        if operator == Operator::And && has_grouped_terms(query_tokens) {
             let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
-            for group in query_position_groups(query_tokens) {
+            for group in query_position_groups(query_tokens, false) {
                 let group_results =
                     self.search_match_strings_with_scorer(st, &group.tokens, Operator::Or, scorer);
                 let group_map = group_results
@@ -2440,7 +2489,7 @@ impl FtsMemIndex {
         results
     }
 
-    /// Conjunction over the query's position groups; see [`Self::search_groups_and`].
+    /// Conjunction over the query's logical term groups; see [`Self::search_groups_and`].
     fn search_grouped_and(
         &self,
         st: &IndexState,
@@ -2451,7 +2500,7 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         self.search_groups_and(
             st,
-            query_position_groups(query_tokens)
+            query_position_groups(query_tokens, false)
                 .into_iter()
                 .map(|group| group.tokens)
                 .collect(),
@@ -2526,7 +2575,7 @@ impl FtsMemIndex {
         if query_tokens.is_empty() {
             return Vec::new();
         }
-        let groups = query_position_groups(query_tokens);
+        let groups = query_position_groups(query_tokens, true);
         if groups.is_empty() {
             return Vec::new();
         }
@@ -2596,7 +2645,7 @@ impl FtsMemIndex {
         if query_tokens.is_empty() || scorer.num_docs() == 0 {
             return Vec::new();
         }
-        let groups = query_position_groups(query_tokens);
+        let groups = query_position_groups(query_tokens, true);
         if groups.is_empty() {
             return Vec::new();
         }
@@ -2742,14 +2791,49 @@ impl FtsMemIndex {
                 matches.insert(key.to_string(), dist);
             }
         }
+        // A partition's dictionary is an FST, so a Levenshtein automaton
+        // yields only the terms within `max_distance`, as the committed index
+        // does. Without one, every partition term with the prefix is checked.
+        let prefixed_terms = st
+            .partitions
+            .iter()
+            .map(|p| p.count_terms_with_prefix(prefix))
+            .sum();
+        let automaton = fuzzy_automaton(term, max_distance, prefixed_terms);
         for p in st.partitions.iter() {
-            for key in p.collect_terms() {
-                if !key.starts_with(prefix) {
-                    continue;
+            match &automaton {
+                Some(automaton) => {
+                    let mut stream = p
+                        .term_fst
+                        .search(automaton.intersection(Str::new(prefix).starts_with()))
+                        .into_stream();
+                    // Matches stream in term order, and only the
+                    // `max_expansions` smallest are kept overall.
+                    let mut kept = 0;
+                    while kept < max_expansions
+                        && let Some((key, _)) = stream.next()
+                    {
+                        let key = std::str::from_utf8(key).expect("FTS terms are UTF-8");
+                        #[cfg(test)]
+                        count_fuzzy_distance_computed();
+                        matches.insert(key.to_string(), levenshtein_distance(term, key));
+                        kept += 1;
+                    }
                 }
-                let dist = levenshtein_distance(term, key.as_ref());
-                if dist <= max_distance {
-                    matches.insert(key.to_string(), dist);
+                None => {
+                    let mut stream = p
+                        .term_fst
+                        .search(Str::new(prefix).starts_with())
+                        .into_stream();
+                    while let Some((key, _)) = stream.next() {
+                        let key = std::str::from_utf8(key).expect("FTS terms are UTF-8");
+                        #[cfg(test)]
+                        count_fuzzy_distance_computed();
+                        let dist = levenshtein_distance(term, key);
+                        if dist <= max_distance {
+                            matches.insert(key.to_string(), dist);
+                        }
+                    }
                 }
             }
         }
@@ -2920,15 +3004,8 @@ impl FtsMemIndex {
     }
 
     fn analyze_for_search(&self, text: &str) -> Tokens {
-        let mut tok = PooledTokenizer::new(&self.tokenizer_pool);
-        let mut stream = tok.get_mut().token_stream_for_search(text);
-        let mut tokens = Vec::new();
-        let mut positions = Vec::new();
-        while let Some(t) = stream.next() {
-            tokens.push(t.text.clone());
-            positions.push(t.position as u32);
-        }
-        Tokens::with_positions(tokens, positions, DocType::Text)
+        let mut tokenizer = PooledTokenizer::new(&self.tokenizer_pool);
+        collect_query_tokens(text, tokenizer.get_mut())
     }
 
     // ------------------------------------------------------------------
@@ -3210,8 +3287,10 @@ fn index_text_with_predicate(
     term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
     mut retain_term: impl FnMut(&str) -> bool,
 ) -> Result<(u32, bool)> {
+    let discount_overlaps = tokenizer.discount_overlaps();
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut num_tokens = 0u32;
+    let mut last_position = None;
     let mut retained_term = false;
     while let Some(token) = stream.next() {
         let position = u32::try_from(token.position).map_err(|_| {
@@ -3232,11 +3311,14 @@ fn index_text_with_predicate(
                 );
             }
         }
-        num_tokens = num_tokens.checked_add(1).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "token count overflow for document_position={document_position}"
-            ))
-        })?;
+        if !discount_overlaps || last_position != Some(token.position) {
+            num_tokens = num_tokens.checked_add(1).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "document length overflow for document_position={document_position}"
+                ))
+            })?;
+        }
+        last_position = Some(token.position);
     }
     Ok((num_tokens, retained_term))
 }
@@ -3447,6 +3529,8 @@ fn phrase_search_tail(
             None => return Vec::new(),
         }
     }
+    // Constant per token; resolved once instead of once per matched document.
+    let query_weights: Vec<f32> = tokens.iter().map(|tok| scorer.query_weight(tok)).collect();
     // Drive the intersection from the rarest token to bound work.
     let smallest_idx = (0..per_token_chunks.len())
         .min_by_key(|&i| {
@@ -3495,10 +3579,10 @@ fn phrase_search_tail(
                 continue;
             }
             let dl = lookup_dl(snap, document_position).unwrap_or(1);
-            let score: f32 = tokens
+            let score: f32 = query_weights
                 .iter()
-                .enumerate()
-                .map(|(ti, tok)| scorer.query_weight(tok) * scorer.doc_weight(frequencies[ti], dl))
+                .zip(&frequencies)
+                .map(|(&qw, &f)| qw * scorer.doc_weight(f, dl))
                 .sum();
             if let Some(document) = lookup_document(snap, document_position) {
                 results.push(FtsEntry {
@@ -4465,7 +4549,7 @@ impl Partition {
     }
 
     /// All terms, indexed by term id (recovered from the FST). Used by the
-    /// flush, merge, and fuzzy-expansion paths; not on the hot search path.
+    /// flush and merge paths; not on the hot search path.
     fn collect_terms(&self) -> Vec<Arc<str>> {
         let mut out: Vec<Arc<str>> = vec![Arc::from(""); self.term_fst.len()];
         let mut stream = self.term_fst.stream();
@@ -4473,6 +4557,29 @@ impl Partition {
             out[id as usize] = Arc::from(std::str::from_utf8(key).expect("utf8 term"));
         }
         out
+    }
+
+    /// Number of terms that start with `prefix`. Term ids are dense and follow
+    /// term order, so this is the difference between the ids of the first
+    /// terms at or after `prefix` and after every term with it, found without
+    /// walking the terms in between.
+    fn count_terms_with_prefix(&self, prefix: &str) -> usize {
+        if prefix.is_empty() {
+            return self.term_fst.len();
+        }
+        let first_id_at_or_after = |key: &[u8]| {
+            self.term_fst
+                .range()
+                .ge(key)
+                .into_stream()
+                .next()
+                .map_or(self.term_fst.len(), |(_, id)| id as usize)
+        };
+        // A UTF-8 term never contains the byte 0xFF, so every term with the
+        // prefix sorts before the prefix followed by 0xFF.
+        let mut end = prefix.as_bytes().to_vec();
+        end.push(0xFF);
+        first_id_at_or_after(&end) - first_id_at_or_after(prefix.as_bytes())
     }
 
     /// Exact upper bound on a term's BM25 contribution to any doc: the max over
@@ -4846,9 +4953,14 @@ impl Partition {
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
         let mut term_ids: Vec<u32> = Vec::with_capacity(tokens.len());
+        // Constant per token; resolved once instead of once per matched document.
+        let mut query_weights: Vec<f32> = Vec::with_capacity(tokens.len());
         for token in tokens {
             match self.term_id(token) {
-                Some(id) => term_ids.push(id),
+                Some(id) => {
+                    term_ids.push(id);
+                    query_weights.push(scorer.query_weight(token));
+                }
                 // A phrase needs every token present in this partition.
                 None => return Vec::new(),
             }
@@ -4882,10 +4994,10 @@ impl Partition {
             }
             if present && phrase_matches(&all_positions, query_groups, slop) {
                 let dl = self.docs.num_tokens(doc);
-                let score: f32 = tokens
+                let score: f32 = query_weights
                     .iter()
                     .zip(&freqs)
-                    .map(|(t, &f)| scorer.query_weight(t) * scorer.doc_weight(f, dl))
+                    .map(|(&qw, &f)| qw * scorer.doc_weight(f, dl))
                     .sum();
                 let key = doc_set_key(&self.docs, doc);
                 results.push(FtsEntry {
@@ -5404,10 +5516,10 @@ impl FtsMemIndexPlugin {
         schema: &LanceSchema,
         index_meta: &IndexMetadata,
     ) -> Result<ResolvedIndex> {
-        let [field_id] = index_meta.fields.as_slice() else {
+        let [field_id] = index_meta.keyed_fields() else {
             return Err(Error::invalid_input(format!(
                 "index '{name}' covers {} columns, but this kind covers exactly one",
-                index_meta.fields.len()
+                index_meta.keyed_fields().len()
             )));
         };
 
@@ -5920,6 +6032,131 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[rstest]
+    #[case::bigrams((2, 2), "abcd", &[0, 5], &[0, 1, 2, 3, 5, 6])]
+    #[case::mixed_lengths((1, 3), "abcd", &[0], &[0, 1, 2, 3, 5, 6])]
+    #[case::missing_gram((2, 2), "abcde", &[], &[0, 1, 2, 3, 5, 6])]
+    #[case::repeated_gram((2, 2), "abab", &[6], &[0, 1, 5, 6])]
+    fn test_ngram_match_groups_preserve_phrase_behavior(
+        #[case] ngram_lengths: (u32, u32),
+        #[case] query: &str,
+        #[case] expected_and: &[u64],
+        #[case] expected_or: &[u64],
+        #[values(false, true)] with_position: bool,
+    ) {
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default()
+                .base_tokenizer("ngram".into())
+                .ngram_min_length(ngram_lengths.0)
+                .ngram_max_length(ngram_lengths.1)
+                .with_position(with_position),
+        );
+        let batch = arrow_array::record_batch!((
+            "description",
+            Utf8,
+            vec![
+                Some("abcd"),
+                Some("ab"),
+                Some("bc"),
+                Some("cd"),
+                Some("zz"),
+                Some("ab bc cd"),
+                Some("abab"),
+                None,
+                Some("")
+            ]
+        ))
+        .unwrap();
+        let batch_size = batch.num_rows() as u64;
+
+        // Exercise the tail, frozen partitions, and a partition with a new tail.
+        for copy in 0..2 {
+            index.insert(&batch, copy * batch_size).unwrap();
+            for is_flushed in [false, true] {
+                if is_flushed {
+                    index.flush();
+                }
+                let state = index.state.load_full();
+                let tokens = index.analyze_for_search(query);
+                let terms = query_tokens_to_vec(&tokens);
+                let scorer = build_scorer(&state, &state.tail.snapshot(), &terms, true);
+                for (operator, expected) in
+                    [(Operator::And, expected_and), (Operator::Or, expected_or)]
+                {
+                    let expected = (0..=copy)
+                        .flat_map(|copy| expected.iter().map(move |row| row + copy * batch_size))
+                        .collect::<Vec<_>>();
+                    let query = FtsQueryExpr::match_query_with_operator(query, operator);
+                    for entries in [
+                        index.search_query(&query),
+                        index.search_with_options(&query, SearchOptions::new().with_limit(20)),
+                        index.search_match_with_scorer(&state, &tokens, operator, &scorer),
+                    ] {
+                        assert_eq!(
+                            rows(entries),
+                            expected,
+                            "{operator:?}, copy={copy}, is_flushed={is_flushed}"
+                        );
+                    }
+                }
+
+                // Ngram phrase offsets remain zero, preserving their existing
+                // same-position alternatives independently of Match coverage.
+                let expected_phrase = (0..=copy)
+                    .flat_map(|copy| expected_or.iter().map(move |row| row + copy * batch_size))
+                    .collect::<Vec<_>>();
+                for entries in [
+                    index.search_phrase(query, 0),
+                    index.search_query(&FtsQueryExpr::phrase(query)),
+                    index.search_phrase_with_scorer(&state, &tokens, 0, &scorer),
+                ] {
+                    assert_eq!(
+                        rows(entries),
+                        expected_phrase,
+                        "phrase, copy={copy}, is_flushed={is_flushed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::full(false)]
+    #[case::query_filtered(true)]
+    fn test_code_document_lengths_and_frequencies(#[case] is_filtered: bool) {
+        let mut tokenizer = InvertedIndexParams::code()
+            .split_identifiers(true)
+            .build()
+            .unwrap();
+        let mut terms = FxHashMap::default();
+        let allowed = FxHashSet::from_iter(["get".to_string()]);
+        for (row, text, expected) in [
+            (0, "getUserName", 3),
+            (1, "get_user_name", 3),
+            (2, "get user name", 3),
+            (3, "user name get", 3),
+            (4, "getUserName getUserName", 6),
+            (5, "otherIdentifier", 2),
+        ] {
+            let length = if is_filtered {
+                index_text_filtered(text, row, tokenizer.as_mut(), &mut terms, &allowed)
+                    .unwrap()
+                    .0
+            } else {
+                index_text(text, row, tokenizer.as_mut(), &mut terms).unwrap()
+            };
+            assert_eq!(length, expected, "{text}");
+        }
+        assert_eq!(terms["get"].frequencies, vec![1, 1, 1, 1, 2]);
+        if !is_filtered {
+            assert_eq!(terms["getusername"].frequencies, vec![1, 2]);
+            assert_eq!(terms["getusername"].pos_data, vec![0, 0, 3]);
+            assert_eq!(terms["get_user_name"].frequencies, vec![1]);
+        }
     }
 
     #[test]
@@ -6723,6 +6960,185 @@ mod tests {
 
         let matches = index.expand_fuzzy("a", 10, 3);
         assert!(matches.len() <= 3);
+    }
+
+    #[rstest]
+    #[case::two_edits("bravo", 2, 10_000, true)]
+    #[case::small_dictionary("bravo", 2, 100, false)]
+    #[case::no_partitions("bravo", 2, 0, false)]
+    #[case::non_ascii("café", 1, usize::MAX, false)]
+    #[case::longest_term(
+        "bravobravobravobravobravobravobravobravobravobravobravobravobrav",
+        1,
+        usize::MAX,
+        true
+    )]
+    #[case::too_long(
+        "bravobravobravobravobravobravobravobravobravobravobravobravobravo",
+        1,
+        usize::MAX,
+        false
+    )]
+    #[case::too_many_states("bravobravobravob", 3, usize::MAX, false)]
+    fn test_fuzzy_automaton_bounds(
+        #[case] term: &str,
+        #[case] max_distance: u32,
+        #[case] prefixed_terms: usize,
+        #[case] builds: bool,
+    ) {
+        assert_eq!(
+            fuzzy_automaton(term, max_distance, prefixed_terms).is_some(),
+            builds
+        );
+    }
+
+    #[rstest]
+    #[case::empty("", 7)]
+    #[case::shared("bra", 3)]
+    #[case::whole_term("brave", 2)]
+    #[case::longer_than_a_term("bravest", 0)]
+    #[case::before_all("a", 0)]
+    #[case::between_terms("zz", 0)]
+    #[case::shared_with_non_ascii_term("caf", 2)]
+    #[case::non_ascii("ü", 1)]
+    #[case::after_all("ž", 0)]
+    fn test_count_terms_with_prefix(#[case] prefix: &str, #[case] expected: usize) {
+        let terms = [
+            "banana", "brava", "brave", "bravery", "cafe", "café", "über",
+        ];
+        let mut docs = DocSet::default();
+        docs.append(0, terms.len() as u32);
+        let entries = terms
+            .iter()
+            .map(|term| (Arc::from(*term), vec![(0, 1, vec![0])]))
+            .collect();
+        let partition = build_partition(entries, docs);
+        assert_eq!(partition.count_terms_with_prefix(prefix), expected);
+    }
+
+    /// Partitions expand an ASCII term with a Levenshtein automaton over their
+    /// term FST; the result must equal a scan of every dictionary term,
+    /// including non-ASCII terms, prefix lengths, and a `max_expansions` cap.
+    #[rstest]
+    #[case::one_edit("cafe", 1, 0, 50, 2_000, true)]
+    #[case::two_edits("bravo", 2, 0, 50, 2_000, true)]
+    #[case::prefix("bravo", 2, 1, 50, 2_000, true)]
+    #[case::capped("cafe", 2, 0, 3, 2_000, true)]
+    #[case::non_ascii_query("café", 1, 0, 50, 2_000, false)]
+    // Too few terms to pay for building the automaton.
+    #[case::small_dictionary("bravo", 2, 0, 50, 0, false)]
+    // Plenty of terms, but few of them with the prefix.
+    #[case::few_prefixed_terms("cafe", 2, 1, 50, 2_000, false)]
+    fn test_expand_fuzzy_matches_dictionary_scan(
+        #[case] term: &str,
+        #[case] max_distance: u32,
+        #[case] prefix_length: u32,
+        #[case] max_expansions: usize,
+        #[case] fillers_per_partition: usize,
+        #[case] uses_automaton: bool,
+    ) {
+        let schema = create_test_schema();
+        let params = InvertedIndexParams::default()
+            .ascii_folding(false)
+            .stem(false)
+            .remove_stop_words(false);
+        let mut index = FtsMemIndex::with_params(1, "description".to_string(), params)
+            .with_freeze_threshold_rows(1);
+        let rows = [
+            "cafe café cave care face cafes bravo brave bravos grave crave",
+            "cafe cake safe caff brava bravi bravo drove über uber naïve naive banana cucumber",
+            "zebra cafeteria calf cage bravado bravery bravobravobravo",
+        ];
+        let batch = |text: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec![text])),
+                ],
+            )
+            .unwrap()
+        };
+        // Far from every query term, these only grow the dictionary, and the
+        // set of terms starting with "b".
+        let fillers: Vec<String> = (0..fillers_per_partition)
+            .map(|i| format!("b{i:05}"))
+            .collect();
+        let fillers = fillers.join(" ");
+        // The first two rows freeze into separate partitions, the third stays
+        // in the tail.
+        index
+            .insert(&batch(&format!("{} {fillers}", rows[0])), 0)
+            .unwrap();
+        index
+            .insert(&batch(&format!("{} {fillers}", rows[1])), 1)
+            .unwrap();
+        index.freeze_threshold_rows = usize::MAX;
+        index.insert(&batch(rows[2]), 2).unwrap();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 2);
+
+        let prefix = char_prefix(term, prefix_length);
+        let mut dictionary: BTreeMap<String, u32> = BTreeMap::new();
+        let tail_terms = st.tail.terms.iter().map(|entry| entry.key().to_string());
+        let partition_terms = st
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.collect_terms())
+            .map(|key| key.to_string());
+        for key in tail_terms.chain(partition_terms) {
+            let distance = levenshtein_distance(term, &key);
+            if key.starts_with(prefix) && distance <= max_distance {
+                dictionary.insert(key, distance);
+            }
+        }
+        let expected: Vec<(String, u32)> = dictionary.into_iter().take(max_expansions).collect();
+        assert!(!expected.is_empty());
+
+        FUZZY_DISTANCES_COMPUTED.with(|count| count.set(0));
+        let expanded =
+            index.expand_fuzzy_term(&st, term, max_distance, prefix_length, max_expansions, true);
+        assert_eq!(expanded, expected);
+
+        // The automaton reaches only the matching partition terms; the
+        // fallback scans every partition term with the prefix.
+        let partition_matches: usize = st
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .collect_terms()
+                    .iter()
+                    .filter(|key| {
+                        key.starts_with(prefix) && levenshtein_distance(term, key) <= max_distance
+                    })
+                    .count()
+                    .min(max_expansions)
+            })
+            .sum();
+        let partition_terms: usize = st
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .collect_terms()
+                    .iter()
+                    .filter(|key| key.starts_with(prefix))
+                    .count()
+            })
+            .sum();
+        // Otherwise the count cannot tell the two paths apart.
+        assert_ne!(partition_matches, partition_terms);
+        let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
+        assert_eq!(
+            fuzzy_automaton(term, max_distance, partition_terms).is_some(),
+            uses_automaton
+        );
+        if uses_automaton {
+            assert_eq!(computed, partition_matches);
+        } else {
+            assert_eq!(computed, partition_terms);
+        }
     }
 
     #[test]
@@ -7704,6 +8120,59 @@ mod tests {
         );
         // A phrase not present anywhere returns nothing.
         assert!(index.search_phrase("world hello", 0).is_empty());
+    }
+
+    /// Phrase scores are exact BM25 sums on both the partition and the tail
+    /// path. Row 1 has different frequencies for the two tokens, so pairing a
+    /// token's weight with the other token's frequency changes its score.
+    #[rstest]
+    #[case::partition(3, 1)]
+    #[case::tail(usize::MAX, 0)]
+    fn test_phrase_exact_bm25_scores(
+        #[case] freeze_threshold_rows: usize,
+        #[case] partitions: usize,
+    ) {
+        let schema = create_test_schema();
+        let index =
+            position_index(1, "description").with_freeze_threshold_rows(freeze_threshold_rows);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    "alpha beta",
+                    "beta alpha beta gamma delta epsilon omega",
+                    "alpha beta alpha beta",
+                    "alpha gamma delta alpha",
+                    "sigma tau omega",
+                ])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), partitions);
+
+        let entries = index.search_phrase("alpha beta", 0);
+        assert_eq!(rows(entries.clone()), vec![0, 1, 2]);
+
+        // Corpus stats the query scorer sees: 5 docs, 20 tokens total;
+        // "alpha" occurs in 4 docs, "beta" in 3.
+        let scorer = MemBM25Scorer::new(
+            20,
+            5,
+            HashMap::from([("alpha".to_string(), 4), ("beta".to_string(), 3)]),
+        );
+        // Bit-exact: query_weight(token) * doc_weight(freq, doc_length),
+        // summed over the tokens.
+        let expected = |fa: u32, fb: u32, dl: u32| {
+            scorer.query_weight("alpha") * scorer.doc_weight(fa, dl)
+                + scorer.query_weight("beta") * scorer.doc_weight(fb, dl)
+        };
+        let by_row: HashMap<u64, f32> = entries.iter().map(|e| (e.row_position, e.score)).collect();
+        assert_eq!(by_row[&0], expected(1, 1, 2));
+        assert_eq!(by_row[&1], expected(1, 2, 7));
+        assert_eq!(by_row[&2], expected(2, 2, 4));
     }
 
     #[test]

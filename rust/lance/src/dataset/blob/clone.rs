@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::{UInt8Type, UInt32Type};
 use arrow_array::{
     Array, ArrayRef, GenericListArray, RecordBatch, StringArray, StructArray, UInt8Array,
     UInt32Array,
@@ -20,10 +21,10 @@ use lance_table::format::{Fragment, Manifest};
 use object_store::path::Path;
 use uuid::Uuid;
 
-use super::locate::{BlobV2DescriptorColumns, join_base_and_relative_path};
+use super::BlobV2BatchRewritePlan;
+use super::locate::join_base_and_relative_path;
 use super::managed::{field_contains_blob, managed_references};
-use crate::dataset::Dataset;
-use crate::dataset::optimize::BlobV2BatchRewritePlan;
+use crate::dataset::{BLOBS_DIR, Dataset};
 
 type BlobCopies = HashMap<(Option<u32>, String), String>;
 
@@ -38,32 +39,31 @@ fn replace_array(copies: &BlobCopies, field: &Field, array: ArrayRef) -> Result<
                 Error::internal(format!("Prepared Managed rewrite is missing {name}"))
             })
         };
-        let columns = BlobV2DescriptorColumns {
-            descriptions: values,
-            kinds: column("kind")?.as_primitive(),
-            positions: column("position")?.as_primitive(),
-            sizes: column("blob_size")?.as_primitive(),
-            blob_ids: column("blob_id")?.as_primitive(),
-            blob_uris: column("uri")?.as_string(),
-        };
-        let mut ids = columns.blob_ids.iter().collect::<Vec<_>>();
-        let mut kinds = columns.kinds.values().to_vec();
+        let kinds = column("kind")?.as_primitive::<UInt8Type>();
+        let blob_ids = column("blob_id")?.as_primitive::<UInt32Type>();
+        let blob_uris = column("uri")?.as_string::<i32>();
+        let mut ids = blob_ids.iter().collect::<Vec<_>>();
+        let mut new_kinds = kinds.values().to_vec();
         let mut uris = Vec::with_capacity(values.len());
         for (row, id) in ids.iter_mut().enumerate() {
-            let uri = columns.blob_uris.value(row);
-            if !columns.is_null_blob(row)
-                && matches!(
-                    BlobKind::try_from(columns.kinds.value(row))?,
-                    BlobKind::Managed | BlobKind::ManagedWithBase
-                )
-                && let Some(replacement) =
-                    copies.get(&(columns.managed_base_id(row), uri.to_string()))
+            let uri = blob_uris.value(row);
+            let managed_base_id = if values.is_null(row) || kinds.is_null(row) {
+                None
+            } else {
+                match BlobKind::try_from(kinds.value(row))? {
+                    BlobKind::Managed => Some(None),
+                    BlobKind::ManagedWithBase => Some(Some(blob_ids.value(row))),
+                    _ => None,
+                }
+            };
+            if let Some(base_id) = managed_base_id
+                && let Some(replacement) = copies.get(&(base_id, uri.to_string()))
             {
                 *id = None;
-                kinds[row] = BlobKind::Managed as u8;
+                new_kinds[row] = BlobKind::Managed as u8;
                 uris.push(Some(replacement.as_str()));
             } else {
-                uris.push(columns.blob_uris.is_valid(row).then_some(uri));
+                uris.push(blob_uris.is_valid(row).then_some(uri));
             }
         }
         let arrays = values
@@ -73,8 +73,8 @@ fn replace_array(copies: &BlobCopies, field: &Field, array: ArrayRef) -> Result<
             .map(|(field, array)| -> ArrayRef {
                 match field.name().as_str() {
                     "kind" => Arc::new(UInt8Array::new(
-                        kinds.clone().into(),
-                        columns.kinds.nulls().cloned(),
+                        new_kinds.clone().into(),
+                        kinds.nulls().cloned(),
                     )),
                     "blob_id" => Arc::new(UInt32Array::from(ids.clone())),
                     "uri" => Arc::new(StringArray::from(uris.clone())),
@@ -237,7 +237,7 @@ pub async fn copy_blob_columns(
         let target_uri = if id.is_none() {
             uri.clone()
         } else {
-            format!("_blobs/{}.blob", Uuid::new_v4())
+            format!("{BLOBS_DIR}/{}.blob", Uuid::new_v4())
         };
         let target_path = join_base_and_relative_path(&target.base, &target_uri)?;
         source

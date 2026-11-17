@@ -85,6 +85,8 @@ impl BasicTrainer for ExampleIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ExampleIndexPlugin {
+    // Deliberately does not implement `can_remap`: this plugin predates the
+    // metadata capability and must keep compiling through its default.
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -241,6 +243,84 @@ async fn external_address_index_keeps_rewritten_rows_visible(#[case] compact: bo
     indexed_scan.filter("value = 3").unwrap();
     let actual = indexed_scan.try_into_batch().await.unwrap();
     assert_eq!(actual, expected, "rewritten rows must remain visible");
+}
+
+/// The example plugin predates `ScalarIndexPlugin::can_remap`, so the metadata
+/// capability defaults to `true` and compaction keeps the existing
+/// load-and-check path. The loaded index still reports
+/// `ScalarIndex::can_remap == false`; that must keep it on the safe fallback
+/// path instead of attempting a remap it does not support.
+#[tokio::test]
+async fn legacy_external_plugin_can_remap_false_stays_on_fallback() {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [1, 2, 3, 4]),
+        ("other", Int64, [10, 20, 30, 40])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Scalar,
+            Some("example_index".to_string()),
+            &ScalarIndexParams::new("example".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let before = dataset.load_indices().await.unwrap();
+    let opened = dataset
+        .open_scalar_index("value", &before[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    #[allow(deprecated)]
+    let can_remap = opened.can_remap();
+    assert!(!can_remap);
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), before.len());
+    // `created_at` is re-encoded at a different subsecond precision on
+    // Windows, so compare the stable fields that identify an untouched index.
+    assert_eq!(after[0].uuid, before[0].uuid);
+    assert_eq!(after[0].fragment_bitmap, before[0].fragment_bitmap);
+    assert_eq!(after[0].index_details, before[0].index_details);
+    assert_eq!(after[0].index_version, before[0].index_version);
+
+    let mut full_scan = dataset.scan();
+    full_scan
+        .filter("value = 3")
+        .unwrap()
+        .use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 1);
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter("value = 3").unwrap();
+    let actual = indexed_scan.try_into_batch().await.unwrap();
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]

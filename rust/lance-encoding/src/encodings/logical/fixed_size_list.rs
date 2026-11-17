@@ -18,7 +18,7 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, ScheduledScanLine, SchedulerContext,
+        DecodedArray, DrainLimit, FilterExpression, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
         StructuralSchedulingJob,
     },
@@ -226,6 +226,57 @@ impl StructuralFixedSizeListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let dimension = match &self.data_type {
+            DataType::FixedSizeList(_, dimension) => *dimension as u64,
+            _ => {
+                return Err(Error::internal(
+                    "FixedSizeListDecoder has non-FSL data type".to_string(),
+                ));
+            }
+        };
+        if dimension == 0 {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: None,
+            });
+        }
+
+        let child_rows = num_rows.checked_mul(dimension).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Planning {} FixedSizeList rows with dimension {} overflows child row count",
+                num_rows, dimension
+            ))
+        })?;
+        let child_limit = self.child.max_rows_to_drain(child_rows, byte_budget)?;
+        let safe_rows = child_limit.rows / dimension;
+        let dictionary_rows = child_limit
+            .dictionary_rows
+            .map(|dictionary_rows| dictionary_rows / dimension);
+        if safe_rows == 0 {
+            return Ok(DrainLimit {
+                rows: 0,
+                bytes: 0,
+                dictionary_rows,
+            });
+        }
+
+        let planned_child_rows = safe_rows * dimension;
+        let bytes = if planned_child_rows == child_limit.rows {
+            child_limit.bytes
+        } else {
+            self.child
+                .max_rows_to_drain(planned_child_rows, byte_budget)?
+                .bytes
+        };
+        Ok(DrainLimit {
+            rows: safe_rows,
+            bytes,
+            dictionary_rows,
+        })
+    }
+
     fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
@@ -244,7 +295,6 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
         Ok(Box::new(StructuralFixedSizeListDecodeTask::new(
             child_task,
             self.data_type.clone(),
-            num_rows,
         )))
     }
 
@@ -257,19 +307,13 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
 struct StructuralFixedSizeListDecodeTask {
     child_task: Box<dyn StructuralDecodeArrayTask>,
     data_type: DataType,
-    num_rows: u64,
 }
 
 impl StructuralFixedSizeListDecodeTask {
-    fn new(
-        child_task: Box<dyn StructuralDecodeArrayTask>,
-        data_type: DataType,
-        num_rows: u64,
-    ) -> Self {
+    fn new(child_task: Box<dyn StructuralDecodeArrayTask>, data_type: DataType) -> Self {
         Self {
             child_task,
             data_type,
-            num_rows,
         }
     }
 }
@@ -283,11 +327,21 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
         } = self.child_task.decode()?;
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
-                let num_rows = self.num_rows as usize;
-                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize)?;
+                let dimension = usize::try_from(*dimension).map_err(|_| {
+                    Error::invalid_input("Fixed-size-list dimension must be positive")
+                })?;
+                if dimension == 0 || !array.len().is_multiple_of(dimension) {
+                    return Err(Error::invalid_input(
+                        "Fixed-size-list child count is not a whole number of slots",
+                    ));
+                }
+                // A surrounding variable list can contain a different number
+                // of FSL values than the top-level rows requested by the scan.
+                let num_rows = array.len() / dimension;
+                let validity = repdef.unravel_fsl_validity(num_rows, dimension)?;
                 let fsl_array = arrow_array::FixedSizeListArray::try_new(
                     child_field.clone(),
-                    *dimension,
+                    dimension as i32,
                     array,
                     validity,
                 )?;
@@ -549,7 +603,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, FixedSizeListArray,
+        Array, ArrayRef, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
     };
@@ -734,9 +788,10 @@ mod tests {
         #[values(TestEncoding::StructuralU32, TestEncoding::StructuralSparse)]
         encoding: TestEncoding,
         #[values(4096, 1024 * 1024)] page_size: u64,
-        #[values(false, true)] use_slicing: bool,
-        #[values(1, 5, 10)] ingest_batch_count: u32,
+        // Slicing a single ingest batch is a no-op, so that pair is omitted.
+        #[values((false, 1), (false, 5), (false, 10), (true, 5), (true, 10))] ingest: (bool, u32),
     ) {
+        let (use_slicing, ingest_batch_count) = ingest;
         let data_type = make_fsl_struct_type(struct_fields, dimension);
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -761,6 +816,37 @@ mod tests {
         let arrow_field = Field::new("test", data_type, true);
         let err = lance_core::datatypes::Field::try_from(&arrow_field).unwrap_err();
         assert!(err.to_string().contains("Unsupported data type"));
+    }
+
+    /// Only fixed-size lists that carry string values are refused. Null lists and
+    /// lists of null items still round-trip.
+    #[rstest]
+    #[case::null_lists(true)]
+    #[case::null_items(false)]
+    #[tokio::test]
+    async fn test_null_fsl_of_strings_round_trip(#[case] null_lists: bool) {
+        let num_lists = 300;
+        let (items, nulls): (ArrayRef, _) = if null_lists {
+            let items = (0..num_lists * 2).map(|i| format!("s{i}"));
+            (
+                Arc::new(arrow_array::StringArray::from_iter_values(items)),
+                Some(arrow_buffer::NullBuffer::new_null(num_lists)),
+            )
+        } else {
+            (
+                arrow_array::new_null_array(&DataType::Utf8, num_lists * 2),
+                None,
+            )
+        };
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            items,
+            nulls,
+        );
+        let test_cases = TestCases::default()
+            .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32]);
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
     }
 
     #[test]

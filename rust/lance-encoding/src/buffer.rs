@@ -97,7 +97,8 @@ impl LanceBuffer {
             Self(Buffer::from_vec(buf))
         } else {
             // The original buffer is aligned, can zero-copy
-            // SAFETY: the alignment is correct we can make this conversion
+            // SAFETY: the pointer is valid for `bytes.len()` bytes, and `bytes` moves into the
+            // owner, which keeps them alive and unchanged for as long as the buffer exists.
             unsafe {
                 Self(Buffer::from_custom_allocation(
                     NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
@@ -136,7 +137,8 @@ impl LanceBuffer {
         let slice = arc.as_ref();
         let data = NonNull::new(slice.as_ptr() as _).unwrap_or(NonNull::dangling());
         let len = std::mem::size_of_val(slice);
-        // SAFETY: the ptr will be valid for len items if the Arc<[T]> is valid
+        // SAFETY: the pointer is valid for `len` bytes, and the `Arc<[T]>` moves into the owner,
+        // which keeps them alive and unchanged for as long as the buffer exists.
         let buffer = unsafe { Buffer::from_custom_allocation(data, len, Arc::new(arc)) };
         Self(buffer)
     }
@@ -234,8 +236,32 @@ impl LanceBuffer {
                 Err(Error::invalid_input_source(format!("LanceBuffer::zip_into_one only supports full-byte buffers currently and received a buffer with {} bits per value", bits_per_value).into()))
             }
         }).collect::<Result<Vec<_>>>()?;
-        let total_bytes_per_value = bytes_per_value.iter().sum::<u64>();
-        let total_bytes = (total_bytes_per_value * num_values) as usize;
+        // The copy loop below reads `num_values` values from every buffer through raw pointers.
+        for (index, ((buffer, _), bytes_per_value)) in
+            buffers.iter().zip(&bytes_per_value).enumerate()
+        {
+            if bytes_per_value
+                .checked_mul(num_values)
+                .is_none_or(|needed| needed > buffer.len() as u64)
+            {
+                return Err(Error::invalid_input(format!(
+                    "LanceBuffer::zip_into_one buffer {index} has {} bytes, too few for \
+                     {num_values} values of {bytes_per_value} bytes",
+                    buffer.len()
+                )));
+            }
+        }
+        let total_bytes = bytes_per_value
+            .iter()
+            .try_fold(0_u64, |row_bytes, bytes| row_bytes.checked_add(*bytes))
+            .and_then(|row_bytes| row_bytes.checked_mul(num_values))
+            .and_then(|total_bytes| usize::try_from(total_bytes).ok())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "LanceBuffer::zip_into_one cannot allocate {num_values} rows of {} buffers",
+                    buffers.len()
+                ))
+            })?;
 
         let mut zipped = vec![0_u8; total_bytes];
         let mut buffer_ptrs = buffers
@@ -245,6 +271,9 @@ impl LanceBuffer {
             .collect::<Vec<_>>();
 
         let mut zipped_ptr = zipped.as_mut_ptr();
+        // SAFETY: `zipped` is a fresh allocation of exactly `num_values` rows, each holding one
+        // value of every buffer, which is what the loop writes, and every source holds at least
+        // the `num_values` values the loop reads from it (checked above).
         unsafe {
             let end = zipped_ptr.add(total_bytes);
             while zipped_ptr < end {
@@ -380,6 +409,7 @@ impl IntoIterator for LanceBuffer {
 #[cfg(test)]
 mod tests {
     use arrow_buffer::Buffer;
+    use lance_core::Error;
 
     use super::LanceBuffer;
 
@@ -449,6 +479,22 @@ mod tests {
         let expected = LanceBuffer::from(expected);
 
         assert_eq!(expected, zipped);
+    }
+
+    #[test]
+    fn test_zip_rejects_short_buffer() {
+        let buf1 = LanceBuffer::from(vec![1_u8, 2, 3]);
+        let buf2 = LanceBuffer::reinterpret_vec(vec![1_u16, 2]);
+
+        let error = LanceBuffer::zip_into_one(vec![(buf1, 8), (buf2, 16)], 3).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("buffer 1 has 4 bytes, too few for 3 values of 2 bytes"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]

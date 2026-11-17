@@ -22,9 +22,9 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result as OSResult, UploadPart,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+    UploadPart,
 };
 
 use crate::object_store::WrappingObjectStore;
@@ -112,6 +112,12 @@ impl IOTracker {
     #[cfg(feature = "metrics")]
     pub(crate) fn set_metrics_base(&mut self, base: &str) {
         self.metrics_base = Some(base.into());
+    }
+
+    /// The `base` this store's metrics are labelled with, if it is metered.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metrics_base(&self) -> Option<&str> {
+        self.metrics_base.as_deref()
     }
 
     /// Begin an operation that talks to storage without going through the
@@ -431,10 +437,6 @@ impl ObjectStore for IoTrackingStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
         let is_head = options.head;
-        let range = match &options.range {
-            Some(GetRange::Bounded(range)) => Some(range.clone()),
-            _ => None, // TODO: fill in other options.
-        };
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
             let num_bytes = if is_head {
@@ -446,7 +448,7 @@ impl ObjectStore for IoTrackingStore {
                 if is_head { "head" } else { "get_opts" },
                 location.to_owned(),
                 num_bytes,
-                range,
+                (!is_head).then(|| result.range.clone()),
             );
         }
         result

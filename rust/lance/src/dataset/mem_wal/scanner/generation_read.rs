@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::context::ExecutionProps;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
@@ -397,8 +398,13 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
     let df_schema = DFSchema::try_from(schema.as_ref().clone())
         .map_err(|e| Error::internal(format!("build a filter schema for `{expr}`: {e}")))?;
     let props = ExecutionProps::new();
-    let physical = create_physical_expr(expr, &df_schema, &props)
-        .map_err(|e| Error::internal(format!("plan filter `{expr}`: {e}")))?;
+    let physical = create_physical_expr(
+        expr,
+        &df_schema,
+        &props,
+        &PhysicalPlanningContext::default(),
+    )
+    .map_err(|e| Error::internal(format!("plan filter `{expr}`: {e}")))?;
     Ok(Arc::new(
         FilterExec::try_new(physical, plan).map_err(|e| Error::internal(format!("filter: {e}")))?,
     ))

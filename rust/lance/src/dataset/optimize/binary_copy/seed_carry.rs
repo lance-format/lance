@@ -50,7 +50,7 @@ pub fn output_rows_per_zone(index_rows_per_zone: Option<u64>) -> u64 {
 /// index, by field id.
 pub async fn index_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>> {
     use crate::index::scalar::fetch_index_details;
-    use crate::index::{index_is_usable, load_all_indices};
+    use crate::index::{loading::load_all_indices, segment::index_is_usable};
     use lance_index::pbold::ZoneMapIndexDetails;
 
     let mut rows_per_zone = HashMap::new();

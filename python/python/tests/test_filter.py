@@ -410,6 +410,51 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
     assert result["id"].to_pylist() == [1]
 
 
+@pytest.mark.parametrize(
+    "column",
+    [
+        # Polars writes list columns as large_list.
+        pytest.param(
+            pa.array([["a"], ["b"]], pa.large_list(pa.large_string())), id="large_list"
+        ),
+        # pandas writes timedelta columns as duration.
+        pytest.param(
+            pa.array([timedelta(seconds=1)] * 2, pa.duration("us")), id="duration"
+        ),
+        pytest.param(pa.array([Decimal(1)] * 2, pa.decimal256(40, 0)), id="decimal256"),
+        pytest.param(pa.array([1, 2], pa.time64("us")), id="time64_us"),
+        pytest.param(pa.array([[1], [2]], pa.list_(pa.uint8())), id="list_of_uint8"),
+        pytest.param(
+            pa.array([{"x": 1}] * 2, pa.struct([("x", pa.uint32())])),
+            id="struct_of_uint32",
+        ),
+        pytest.param(
+            pa.array([[("k", 1)]] * 2, pa.map_(pa.large_string(), pa.int64())),
+            id="map_with_large_string_key",
+        ),
+        # Polars writes categorical columns as dictionary<uint32, large_string>.
+        pytest.param(
+            pa.array(
+                [{"c": "a"}, {"c": "b"}],
+                pa.struct([("c", pa.dictionary(pa.uint32(), pa.large_string()))]),
+            ),
+            id="struct_of_categorical",
+        ),
+    ],
+)
+def test_filter_on_column_beside_unsupported_substrait_type(tmp_path, column):
+    """Filtering should work beside a column whose type cannot round-trip
+    through substrait."""
+    table = pa.table({"id": [1, 2], "other": column})
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    assert ds.to_table(filter=pc.field("id") == 1)["id"].to_pylist() == [1]
+    fragment = ds.get_fragments()[1]
+    assert fragment.to_table(filter=pc.field("id") == 2)["id"].to_pylist() == [2]
+    ds.update({"id": "id + 10"}, where=pc.field("id") == 2)
+    ds.delete(pc.field("id") == 1)
+    assert ds.to_table()["id"].to_pylist() == [12]
+
+
 @pytest.mark.skip(
     reason="requires a release build; see "
     "https://github.com/lance-format/lance/pull/4190"
