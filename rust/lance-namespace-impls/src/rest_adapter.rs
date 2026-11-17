@@ -74,7 +74,7 @@ impl RestAdapter {
     }
 
     /// Set the largest request body the server accepts, in bytes (512 MiB by
-    /// default). Larger requests are rejected with 413 before the backend runs.
+    /// default). Larger requests are rejected before the backend runs.
     pub fn with_max_request_body_size(mut self, max_request_body_size: usize) -> Self {
         self.max_request_body_size = max_request_body_size;
         self
@@ -2370,6 +2370,7 @@ mod tests {
                 recorder.received("create_table").is_null(),
                 "rejected upload must not reach the backend"
             );
+            server_handle.shutdown();
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
