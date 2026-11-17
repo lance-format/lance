@@ -1302,6 +1302,52 @@ def test_torch_cosine_ivf_pq_recall(tmp_path):
     )
 
 
+def test_torch_dot_ivf_pq_recall(tmp_path):
+    """Accelerated dot IVF_PQ must be as accurate as the CPU build.
+
+    The index only uses residuals for l2 and cosine and trains the PQ codebook
+    with l2, but the torch path used to encode residuals of the IVF centroids
+    with a dot-trained codebook.
+    """
+    torch = pytest.importorskip("torch")
+
+    rng = np.random.default_rng(42)
+    num_rows, dim = 4096, 32
+    centers = rng.standard_normal((32, dim), dtype=np.float32)
+    mat = centers[rng.integers(0, 32, num_rows)]
+    mat += 0.5 * rng.standard_normal((num_rows, dim), dtype=np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(np.arange(num_rows)))
+
+    queries = mat[rng.choice(num_rows, 100, replace=False)]
+    k = 10
+
+    def recall(accelerator, uri):
+        ds = lance.write_dataset(tbl, uri)
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            metric="dot",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator=accelerator,
+        )
+        hits = 0
+        for q in queries:
+            gt = np.argsort(-(mat @ q))[:k]
+            res = ds.to_table(
+                columns=["id"],
+                nearest={"column": "vector", "q": q, "k": k, "nprobes": 4},
+            )
+            hits += len(set(gt.tolist()) & set(res["id"].to_pylist()))
+        return hits / (len(queries) * k)
+
+    cpu_recall = recall(None, tmp_path / "cpu")
+    torch_recall = recall(torch.device("cpu"), tmp_path / "torch")
+    assert torch_recall >= cpu_recall - 0.1, (
+        f"torch recall {torch_recall} vs cpu recall {cpu_recall}"
+    )
+
+
 def test_index_with_pq_codebook(tmp_path):
     dim = 16
     rng = np.random.default_rng(42)
