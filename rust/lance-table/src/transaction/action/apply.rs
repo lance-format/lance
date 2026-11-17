@@ -23,7 +23,7 @@
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
-use super::{CompositeOperation, FieldId, FieldRef, Ref};
+use super::{CompositeOperation, FieldId, FieldRef, Ref, UserStep};
 use crate::feature_flags::{
     FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, inherit_sticky_feature_flags,
     managed_blobs_enabled, validate_auto_cleanup_config,
@@ -33,7 +33,7 @@ use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
 };
 use crate::rowids::read_row_ids;
-use crate::rowids::version::{SpilledRowLineage, build_version_meta};
+use crate::rowids::version::{LoadedRowLineage, SpilledRowLineage, build_version_meta};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::FragReuseActionInputs;
 use crate::system_index::is_system_index;
@@ -41,11 +41,14 @@ use crate::system_index::mem_wal::{
     CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
 };
 use crate::transaction::manifest_build::{apply_range_segments, check_blob_nesting};
+use crate::transaction::row_version::advance_row_id_counter;
 use crate::transaction::validate::schema_fragments_valid;
 use crate::transaction::{FragReuseUpdate, LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
+use lance_file::version::ConcreteFileVersion;
 use roaring::RoaringTreemap;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -78,27 +81,7 @@ impl Transaction {
         read_version_state: Option<ReadVersionState<'_>>,
         frag_reuse: &FragReuseUpdate,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-        // No `migration_next_row_id` escape, unlike the legacy guard in
-        // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
-        // activates the flag with an `Operation::Merge`, so an action set
-        // never carries that watermark.
-        if config.use_stable_row_ids && !current_manifest.uses_stable_row_ids() {
-            return Err(Error::not_supported_source(
-                "This dataset was not created with the stable row ids feature.  Please run \
-                 `migrate_to_stable_row_ids` before attempting to use stable row ids"
-                    .into(),
-            ));
-        }
-
-        // Snapshot taken before the actions rewrite the list, so coverage can
-        // be compared against what each logical index looked like going in --
-        // the same point the legacy path snapshots at, before its operation
-        // arm runs. Only tables with a MemWAL index maintain coverage, so
-        // every other commit pays nothing.
-        let mem_wal_segments_before = current_indices
-            .iter()
-            .any(|index| index.name == MEM_WAL_INDEX_NAME)
-            .then(|| Self::logical_index_segments(&current_indices));
+        reject_unsupported_build_config(config, current_manifest)?;
 
         // Committed ids are checked against the version the writer read, not
         // the one applied onto: an id minted in between belongs to whichever
@@ -119,23 +102,23 @@ impl Transaction {
         };
 
         let mut state = ApplyState::new(
-            current_manifest,
+            Arc::new(current_manifest.clone()),
             current_indices,
             config,
             self.read_version,
             ReadMarks::of(read_manifest),
-        );
+        )?;
         if let FragReuseUpdate::Actions(inputs) = frag_reuse {
             state.frag_reuse_inputs = inputs.clone();
         }
-        for action in composite_operation.iter_actions() {
-            action.apply(&mut state)?;
+        for step in &composite_operation.steps {
+            state.apply_step(step)?;
         }
 
-        state.into_manifest(
-            self,
-            transaction_file_path,
-            mem_wal_segments_before.as_ref(),
+        state.finish(
+            self.tag.as_deref(),
+            Some(transaction_file_path),
+            config,
             read_version_state,
         )
     }
@@ -143,6 +126,7 @@ impl Transaction {
 
 /// The id high-water marks of the version the operation read. A committed id
 /// above them names something the writer cannot have seen.
+#[derive(Clone)]
 struct ReadMarks {
     fragment: Option<u64>,
     field: i32,
@@ -169,31 +153,192 @@ fn max_base_id(manifest: &Manifest) -> u32 {
     manifest.base_paths.keys().max().copied().unwrap_or(0)
 }
 
+/// The manifest's fragments in strictly increasing id order, which is what
+/// lookups by id binary search.
+///
+/// Manifests written by Lance 0.10 and earlier are not in id order, so those
+/// get a sorted copy. Manifests from 0.16 and earlier can repeat an id, and an
+/// id above `u32::MAX` cannot be recorded in the manifest high-water mark.
+fn base_fragments_by_id(manifest: &Manifest) -> Result<Arc<Vec<Fragment>>> {
+    let base = if manifest
+        .fragments
+        .windows(2)
+        .all(|pair| pair[0].id < pair[1].id)
+    {
+        Arc::clone(&manifest.fragments)
+    } else {
+        let mut sorted = manifest.fragments.as_ref().clone();
+        sorted.sort_by_key(|fragment| fragment.id);
+        if let Some(repeated) = sorted.windows(2).find(|pair| pair[0].id == pair[1].id) {
+            return Err(Error::invalid_input(format!(
+                "version {} lists fragment id {} more than once, so its fragments cannot be \
+                 looked up by id to apply actions",
+                manifest.version, repeated[0].id
+            )));
+        }
+        Arc::new(sorted)
+    };
+    if let Some(last) = base.last()
+        && last.id > MAX_FRAGMENT_ID
+    {
+        return Err(Error::invalid_input(format!(
+            "version {} contains fragment id {}, above the maximum fragment id {MAX_FRAGMENT_ID}",
+            manifest.version, last.id
+        )));
+    }
+    Ok(base)
+}
+
+fn schema_field_ids(schema: &Schema) -> HashSet<i32> {
+    schema.fields_pre_order().map(|field| field.id).collect()
+}
+
+fn reject_unsupported_build_config(
+    config: &ManifestBuildConfig,
+    current_manifest: &Manifest,
+) -> Result<()> {
+    if config.clustering_definitions.is_some() {
+        return Err(Error::invalid_input(
+            "a complete clustering definitions list can only be committed with UpdateConfig",
+        ));
+    }
+    // No `migration_next_row_id` escape, unlike the legacy guard in
+    // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
+    // activates the flag with an `Operation::Merge`, so an action set
+    // never carries that watermark.
+    if config.use_stable_row_ids && !current_manifest.uses_stable_row_ids() {
+        return Err(Error::not_supported_source(
+            "This dataset was not created with the stable row ids feature.  Please run \
+             `migrate_to_stable_row_ids` before attempting to use stable row ids"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn merge_loaded_row_lineage(
+    existing: &LoadedRowLineage,
+    incoming: &LoadedRowLineage,
+    fragment_id: u64,
+) -> Result<(LoadedRowLineage, bool)> {
+    fn merge_field<T: PartialEq>(
+        existing: &Option<Arc<T>>,
+        incoming: &Option<Arc<T>>,
+        fragment_id: u64,
+        field_name: &str,
+    ) -> Result<(Option<Arc<T>>, bool)> {
+        match (existing, incoming) {
+            (Some(a), Some(b)) => {
+                if !Arc::ptr_eq(a, b) && a != b {
+                    return Err(Error::invalid_input(format!(
+                        "spilled {field_name} lineage for fragment {fragment_id} conflicts with \
+                         lineage already loaded for that fragment"
+                    )));
+                }
+                Ok((Some(Arc::clone(a)), false))
+            }
+            (Some(a), None) => Ok((Some(Arc::clone(a)), false)),
+            (None, Some(b)) => Ok((Some(Arc::clone(b)), true)),
+            (None, None) => Ok((None, false)),
+        }
+    }
+
+    let (row_ids, added_ids) =
+        merge_field(&existing.row_ids, &incoming.row_ids, fragment_id, "row id")?;
+    let (created_at, added_created) = merge_field(
+        &existing.created_at,
+        &incoming.created_at,
+        fragment_id,
+        "created_at",
+    )?;
+    let (last_updated_at, added_updated) = merge_field(
+        &existing.last_updated_at,
+        &incoming.last_updated_at,
+        fragment_id,
+        "last_updated_at",
+    )?;
+    Ok((
+        LoadedRowLineage {
+            row_ids,
+            created_at,
+            last_updated_at,
+        },
+        added_ids || added_created || added_updated,
+    ))
+}
+
 /// The state of the version being committed on top of, plus the id
 /// allocations made so far.
-pub(super) struct ApplyState<'a> {
+///
+/// The state owns everything it works on, so it can outlive one build. A
+/// writer that stages its steps one at a time keeps one state between steps.
+/// It applies and validates each step on a clone and keeps the clone only when
+/// both succeed. [`Self::build_manifest`] reads the table the steps produce so
+/// far without consuming the kept state.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance_core::Result;
+/// # use lance_table::format::{IndexMetadata, Manifest, ManifestBuildConfig};
+/// # use lance_table::transaction::action::{ApplyState, UserStep};
+/// # fn example(
+/// #     base: Arc<Manifest>,
+/// #     indices: Vec<IndexMetadata>,
+/// #     config: &ManifestBuildConfig,
+/// #     steps: &[UserStep],
+/// # ) -> Result<()> {
+/// let mut state = ApplyState::at_read_version(base, indices, config)?;
+/// for step in steps {
+///     state = state.apply_step_checked(step, config)?;
+/// }
+/// let (manifest, indices) = state.build_manifest(config)?;
+/// # let _ = (manifest, indices);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct ApplyState {
     /// The version being committed on top of: the read version on a first
     /// attempt, the latest committed version on a retry.
-    current_manifest: &'a Manifest,
+    current_manifest: Arc<Manifest>,
     read_marks: ReadMarks,
-    /// How the manifest this delta produces is to be assembled.
-    build_config: &'a ManifestBuildConfig,
+    /// Row lineage the caller read ahead of time for fragments whose lineage
+    /// lives in a data file, which applying cannot read itself.
+    spilled_row_lineage: Arc<SpilledRowLineage>,
+    /// What each logical index looked like before any action ran, which MemWAL
+    /// coverage is compared against. Only a table with a MemWAL index
+    /// maintains coverage, so every other state holds nothing.
+    mem_wal_segments_before: Option<Arc<LogicalIndexSegments>>,
     schema: Schema,
-    fragments: Vec<Fragment>,
+    /// Copy-on-write fragment working set over the manifest's base fragments,
+    /// with lazy masking of fields dropped by [`DropField`](super::DropField).
+    fragments: WorkingFragments,
+    added_fragment_order: Arc<Vec<AddedFragment>>,
+    /// Running tally of fresh row ids the added fragments consume, removed
+    /// ones included. Exact while no added fragment supplies inline row ids.
+    fresh_row_ids_added: u64,
+    /// An added fragment supplied inline row ids or could not be counted, so
+    /// row id counter validation must number copies of the added fragments.
+    row_ids_need_dry_run: bool,
+    /// An added fragment carried row id metadata on a table without a stable
+    /// row id counter, so feature-flag validation must inspect all fragments.
+    added_row_ids_without_counter: bool,
+    /// Changes accumulated across unvalidated [`Self::apply_step`] calls.
+    unvalidated: UnvalidatedScope,
     /// Base paths minted by this operation. Kept apart from the manifest's own
     /// base paths, which the manifest assembly inherits from the version being
     /// committed on top of.
-    new_bases: Vec<BasePath>,
-    existing_base_paths: HashMap<u32, BasePath>,
+    new_bases: Arc<Vec<BasePath>>,
+    existing_base_paths: Arc<HashMap<u32, BasePath>>,
     /// The index segments, as the actions have left them so far. Index
     /// actions edit this list; the assembly then prunes whatever the data
     /// actions invalidated.
-    indices: Vec<IndexMetadata>,
+    indices: Arc<Vec<IndexMetadata>>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
     /// to be written back over the assembled manifest.
-    config: HashMap<String, String>,
-    table_metadata: HashMap<String, String>,
+    config: Arc<HashMap<String, String>>,
+    table_metadata: Arc<HashMap<String, String>>,
 
     /// The highest id handed out so far in each space, by the version being
     /// committed on top of or by this operation. Kept as marks rather than
@@ -205,17 +350,17 @@ pub(super) struct ApplyState<'a> {
     base_high_water: u32,
 
     /// Local token -> the id minted for it, one map per id space.
-    fragment_tokens: HashMap<u32, u64>,
-    field_tokens: HashMap<u32, i32>,
-    base_tokens: HashMap<u32, u32>,
+    fragment_tokens: Arc<HashMap<u32, u64>>,
+    field_tokens: Arc<HashMap<u32, i32>>,
+    base_tokens: Arc<HashMap<u32, u32>>,
 
     /// Ids of the fragments this operation added, whether minted from the
     /// counter or claimed out of a reservation.
-    new_fragments: HashSet<u64>,
+    new_fragments: Arc<HashSet<u64>>,
     /// The new fragments an [`AddFragment`](super::AddFragment) added with
     /// `data_change = false`: rows moved from elsewhere in the table, whose
     /// values no action in the operation may change.
-    rearranged_fragments: HashSet<u64>,
+    rearranged_fragments: Arc<HashSet<u64>>,
 
     /// How many fragment ids this operation reserved for a later writer. Like
     /// [`Self::reserved_row_ids`], taken off the counter after this
@@ -229,12 +374,12 @@ pub(super) struct ApplyState<'a> {
 
     /// Names of the logical indices this operation added a segment to or
     /// adjusted, whose segment sets are validated once the operation has run.
-    touched_index_names: BTreeSet<String>,
+    touched_index_names: Arc<BTreeSet<String>>,
 
     /// Every field a [`TombstoneFieldData`](super::TombstoneFieldData) freed,
     /// by fragment and field, so a re-encode can be checked to re-bind what it
     /// tombstoned.
-    tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
+    tombstoned_fields: Arc<HashMap<(u64, i32), TombstonedField>>,
 
     /// Committed fragments whose values a data-changing action changed in
     /// place, which on a stable row id table leaves their row versions stale,
@@ -242,17 +387,17 @@ pub(super) struct ApplyState<'a> {
     /// [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)
     /// restamped, wholly or in part. Every value-changed fragment has to be
     /// restamped.
-    value_changed_fragments: BTreeSet<u64>,
-    restamped_fragments: BTreeSet<u64>,
+    value_changed_fragments: Arc<BTreeSet<u64>>,
+    restamped_fragments: Arc<BTreeSet<u64>>,
 
     /// Fragments a [`RemoveFragment`](super::RemoveFragment) removed: a
     /// fragment reuse transition may only consume a fragment a compaction
     /// removed as it was committed.
-    removed_fragments: HashMap<u64, RemovedFragment>,
+    removed_fragments: Arc<HashMap<u64, RemovedFragment>>,
     /// Committed fields whose values a data-changing tombstone replaced, by
     /// fragment. On a tagged fragment reuse history the coverage of segments
     /// translating into the fragment is withdrawn along the lineage.
-    rebound_fields: Vec<(u64, Vec<u32>)>,
+    rebound_fields: Arc<Vec<(u64, Vec<u32>)>>,
     /// What the operation asks of the fragment reuse history, settled once
     /// the whole operation has run.
     frag_reuse: frag_reuse_history::FragReuseChanges,
@@ -263,6 +408,208 @@ pub(super) struct ApplyState<'a> {
     /// manifest's version: on a retry the set is replayed onto something newer,
     /// and what an action saw is still the version it read.
     read_version: u64,
+}
+
+/// Copy-on-write fragment set over the version applied onto, with lazy masking
+/// of fields dropped by [`DropField`](super::DropField).
+#[derive(Clone)]
+struct WorkingFragments {
+    base: Arc<Vec<Fragment>>,
+    patched: BTreeMap<u64, Option<Arc<Fragment>>>,
+    dropped_fields: Arc<BTreeSet<i32>>,
+}
+
+impl WorkingFragments {
+    fn from_manifest(manifest: &Manifest) -> Result<Self> {
+        Ok(Self {
+            base: base_fragments_by_id(manifest)?,
+            patched: BTreeMap::new(),
+            dropped_fields: Default::default(),
+        })
+    }
+
+    fn max_base_id(&self) -> Option<u64> {
+        self.base.last().map(|fragment| fragment.id)
+    }
+
+    fn base_fragment(&self, fragment_id: u64) -> Option<&Fragment> {
+        self.base
+            .binary_search_by_key(&fragment_id, |fragment| fragment.id)
+            .ok()
+            .map(|position| &self.base[position])
+    }
+
+    fn contains(&self, fragment_id: u64) -> bool {
+        match self.patched.get(&fragment_id) {
+            Some(patch) => patch.is_some(),
+            None => self.base_fragment(fragment_id).is_some(),
+        }
+    }
+
+    /// Skips lazy [`DropField`](super::DropField) masking on unpatched base
+    /// fragments. Use this only where field lists do not matter, or for
+    /// fragments known to live in `patched` that already carry earlier drop
+    /// masks. Cloning and reinserting an unpatched base fragment would lose
+    /// its lazy drop mask.
+    fn get_unmasked(&self, fragment_id: u64) -> Option<&Fragment> {
+        match self.patched.get(&fragment_id) {
+            Some(patch) => patch.as_deref(),
+            None => self.base_fragment(fragment_id),
+        }
+    }
+
+    fn fragment(&self, fragment_id: u64, schema: &Schema) -> Result<Option<Cow<'_, Fragment>>> {
+        match self.patched.get(&fragment_id) {
+            Some(patch) => Ok(patch.as_deref().map(Cow::Borrowed)),
+            None => {
+                let Some(base) = self.base_fragment(fragment_id) else {
+                    return Ok(None);
+                };
+                if self.dropped_fields.is_empty() || !self.fragment_carries_dropped_field(base) {
+                    Ok(Some(Cow::Borrowed(base)))
+                } else {
+                    let live = schema_field_ids(schema);
+                    Ok(Some(Cow::Owned(
+                        self.with_dropped_fields_tombstoned(base, &live)?,
+                    )))
+                }
+            }
+        }
+    }
+
+    fn get_mut(
+        &mut self,
+        fragment_id: u64,
+        schema: &Schema,
+        action: &str,
+    ) -> Result<&mut Fragment> {
+        let missing = || {
+            Error::invalid_input(format!(
+                "{action} targets fragment {fragment_id}, which does not exist"
+            ))
+        };
+        if !self.patched.contains_key(&fragment_id) {
+            let base = self.base_fragment(fragment_id).ok_or_else(missing)?;
+            let masked = if self.dropped_fields.is_empty() {
+                base.clone()
+            } else {
+                let live = schema_field_ids(schema);
+                self.with_dropped_fields_tombstoned(base, &live)?
+            };
+            self.patched.insert(fragment_id, Some(Arc::new(masked)));
+        }
+        self.patched
+            .get_mut(&fragment_id)
+            .and_then(Option::as_mut)
+            .map(Arc::make_mut)
+            .ok_or_else(missing)
+    }
+
+    fn insert(&mut self, fragment: Fragment) {
+        self.patched.insert(fragment.id, Some(Arc::new(fragment)));
+    }
+
+    fn remove(&mut self, fragment_id: u64) {
+        self.patched.insert(fragment_id, None);
+    }
+
+    fn live_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        let unpatched_base = self
+            .base
+            .iter()
+            .map(|fragment| fragment.id)
+            .filter(|id| !self.patched.contains_key(id));
+        let patched = self
+            .patched
+            .iter()
+            .filter_map(|(id, patch)| patch.as_ref().map(|_| *id));
+        unpatched_base.chain(patched)
+    }
+
+    fn tombstone_dropped_field(&mut self, field_id: i32, schema: &Schema) -> Result<()> {
+        Arc::make_mut(&mut self.dropped_fields).insert(field_id);
+        if self.patched.is_empty() {
+            return Ok(());
+        }
+        let single = BTreeSet::from([field_id]);
+        let live = schema_field_ids(schema);
+        for patched in self.patched.values_mut().flatten() {
+            tombstone_fields_in_fragment(Arc::make_mut(patched), &single, &live)?;
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.base = Arc::default();
+        self.patched.clear();
+        self.dropped_fields = Arc::default();
+    }
+
+    fn build_fragments(&self, schema: &Schema) -> Result<Vec<Fragment>> {
+        let live = if self.dropped_fields.is_empty() {
+            HashSet::new()
+        } else {
+            schema_field_ids(schema)
+        };
+        let mut fragments = Vec::with_capacity(self.base.len() + self.patched.len());
+        let mut patches = self.patched.iter().peekable();
+        for base in self.base.iter() {
+            while let Some((_, patch)) = patches.next_if(|(id, _)| **id < base.id) {
+                fragments.extend(patch.as_deref().cloned());
+            }
+            match patches.next_if(|(id, _)| **id == base.id) {
+                Some((_, patch)) => fragments.extend(patch.as_deref().cloned()),
+                None => fragments.push(self.with_dropped_fields_tombstoned(base, &live)?),
+            }
+        }
+        fragments.extend(patches.filter_map(|(_, patch)| patch.as_deref().cloned()));
+        Ok(fragments)
+    }
+
+    fn fragment_carries_dropped_field(&self, fragment: &Fragment) -> bool {
+        fragment.files.iter().any(|file| {
+            file.fields
+                .iter()
+                .any(|field_id| self.dropped_fields.contains(field_id))
+        }) || fragment.overlays.iter().any(|overlay| {
+            overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| self.dropped_fields.contains(field_id))
+        })
+    }
+
+    fn with_dropped_fields_tombstoned(
+        &self,
+        base: &Fragment,
+        live_schema_fields: &HashSet<i32>,
+    ) -> Result<Fragment> {
+        let mut fragment = base.clone();
+        if !self.dropped_fields.is_empty() {
+            tombstone_fields_in_fragment(&mut fragment, &self.dropped_fields, live_schema_fields)?;
+        }
+        Ok(fragment)
+    }
+}
+
+/// Pending changes made by [`ApplyState::apply_step`] since the state was
+/// created or last validated by [`ApplyState::validate_step_invariants`].
+#[derive(Clone, Default)]
+struct UnvalidatedScope {
+    dirty_fragments: Vec<u64>,
+    changed_schema: bool,
+    changed_config: bool,
+}
+
+/// One fragment this operation added, in the order it was added.
+///
+/// A removed fragment keeps its slot because an intermediate manifest build may
+/// already have exposed the row ids of fragments added after it.
+#[derive(Clone)]
+enum AddedFragment {
+    Present(u64),
+    Removed { fresh_row_ids: u64 },
 }
 
 /// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
@@ -282,57 +629,264 @@ struct RemovedFragment {
     modified: bool,
 }
 
-impl<'a> ApplyState<'a> {
-    fn new(
-        manifest: &'a Manifest,
+impl ApplyState {
+    /// Start a state on `base`, the version the transaction read. The read
+    /// marks come from that same manifest.
+    ///
+    /// Actions read the spilled row lineage of `config`. The rest of a build
+    /// config is read when a manifest is assembled.
+    pub fn at_read_version(
+        base: Arc<Manifest>,
         indices: Vec<IndexMetadata>,
-        build_config: &'a ManifestBuildConfig,
+        config: &ManifestBuildConfig,
+    ) -> Result<Self> {
+        reject_unsupported_build_config(config, &base)?;
+        let read_version = base.version;
+        let read_marks = ReadMarks::of(&base);
+        Self::new(base, indices, config, read_version, read_marks)
+    }
+
+    fn new(
+        manifest: Arc<Manifest>,
+        indices: Vec<IndexMetadata>,
+        build_config: &ManifestBuildConfig,
         read_version: u64,
         read_marks: ReadMarks,
-    ) -> Self {
-        Self {
-            current_manifest: manifest,
+    ) -> Result<Self> {
+        let fragments = WorkingFragments::from_manifest(&manifest)?;
+        let fragment_high_water = match (manifest.max_fragment_id(), fragments.max_base_id()) {
+            (Some(mark), Some(base_max)) => Some(mark.max(base_max)),
+            (mark, base_max) => mark.or(base_max),
+        };
+        Ok(Self {
             read_version,
             read_marks,
-            build_config,
+            spilled_row_lineage: Arc::clone(&build_config.spilled_row_lineage),
+            mem_wal_segments_before: indices
+                .iter()
+                .any(|index| index.name == MEM_WAL_INDEX_NAME)
+                .then(|| Arc::new(Transaction::logical_index_segments(&indices))),
             schema: manifest.schema.clone(),
-            fragments: manifest.fragments.as_ref().clone(),
-            indices,
-            new_bases: Vec::new(),
-            existing_base_paths: manifest.base_paths.clone(),
-            config: manifest.config.clone(),
-            table_metadata: manifest.table_metadata.clone(),
-            fragment_high_water: manifest.max_fragment_id(),
+            fragments,
+            added_fragment_order: Default::default(),
+            fresh_row_ids_added: 0,
+            row_ids_need_dry_run: false,
+            added_row_ids_without_counter: false,
+            unvalidated: UnvalidatedScope::default(),
+            indices: Arc::new(indices),
+            new_bases: Default::default(),
+            existing_base_paths: Arc::new(manifest.base_paths.clone()),
+            config: Arc::new(manifest.config.clone()),
+            table_metadata: Arc::new(manifest.table_metadata.clone()),
+            fragment_high_water,
             field_high_water: manifest.max_field_id(),
-            base_high_water: max_base_id(manifest),
-            fragment_tokens: HashMap::new(),
-            field_tokens: HashMap::new(),
-            base_tokens: HashMap::new(),
-            new_fragments: HashSet::new(),
-            rearranged_fragments: HashSet::new(),
+            base_high_water: max_base_id(&manifest),
+            fragment_tokens: Default::default(),
+            field_tokens: Default::default(),
+            base_tokens: Default::default(),
+            new_fragments: Default::default(),
+            rearranged_fragments: Default::default(),
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
-            touched_index_names: BTreeSet::new(),
-            tombstoned_fields: HashMap::new(),
-            value_changed_fragments: BTreeSet::new(),
-            restamped_fragments: BTreeSet::new(),
-            removed_fragments: HashMap::new(),
-            rebound_fields: Vec::new(),
+            touched_index_names: Default::default(),
+            tombstoned_fields: Default::default(),
+            value_changed_fragments: Default::default(),
+            restamped_fragments: Default::default(),
+            removed_fragments: Default::default(),
+            rebound_fields: Default::default(),
             frag_reuse: Default::default(),
             frag_reuse_inputs: Default::default(),
+            current_manifest: manifest,
+        })
+    }
+
+    /// Apply one step's actions in order.
+    ///
+    /// A step that fails leaves the state partly changed, and changes applied
+    /// here remain in the pending validation scope until
+    /// [`Self::validate_step_invariants`] succeeds. Apply to a clone or use
+    /// [`Self::apply_step_checked`] when the previous state must survive a
+    /// rejected step.
+    pub fn apply_step(&mut self, step: &UserStep) -> Result<()> {
+        for action in &step.actions {
+            action.apply(self)?;
         }
+        Ok(())
+    }
+
+    /// Merge spilled row lineage loaded for fragments a later step touches.
+    ///
+    /// Missing sequence slots on an existing fragment entry are filled in, and
+    /// conflicting sequences for the same fragment id are rejected.
+    pub fn extend_spilled_row_lineage(&mut self, loaded: &SpilledRowLineage) -> Result<()> {
+        if loaded.is_empty() {
+            return Ok(());
+        }
+        if self.spilled_row_lineage.is_empty() {
+            self.spilled_row_lineage = Arc::new(loaded.clone());
+            return Ok(());
+        }
+        let mut updates = Vec::new();
+        for (&fragment_id, incoming) in loaded {
+            match self.spilled_row_lineage.get(&fragment_id) {
+                Some(existing) => {
+                    let (merged, added) =
+                        merge_loaded_row_lineage(existing, incoming, fragment_id)?;
+                    if added {
+                        updates.push((fragment_id, merged));
+                    }
+                }
+                None => updates.push((fragment_id, incoming.clone())),
+            }
+        }
+        if !updates.is_empty() {
+            let map = Arc::make_mut(&mut self.spilled_row_lineage);
+            for (fragment_id, merged) in updates {
+                map.insert(fragment_id, merged);
+            }
+        }
+        Ok(())
+    }
+
+    /// Spilled row lineage entry loaded for `fragment_id`, if any.
+    ///
+    /// An entry may carry only a subset of sequences, so callers that load
+    /// individual sequences should inspect the fields they require.
+    pub fn spilled_row_lineage_for(&self, fragment_id: u64) -> Option<&LoadedRowLineage> {
+        self.spilled_row_lineage.get(&fragment_id)
+    }
+
+    /// Whether `fragment_id` has an entry in the loaded spilled row lineage
+    /// map.
+    ///
+    /// A `true` return only means an entry exists and does not guarantee every
+    /// sequence on [`LoadedRowLineage`] is populated. Callers that load partial
+    /// entries should inspect [`Self::spilled_row_lineage_for`] for the fields
+    /// they need before skipping a load.
+    pub fn has_spilled_row_lineage(&self, fragment_id: u64) -> bool {
+        self.spilled_row_lineage.contains_key(&fragment_id)
+    }
+
+    /// Clone this state, merge any spilled row lineage from `config`, apply
+    /// `step`, and validate all pending invariants before returning the new
+    /// state. Leaves `self` unchanged on failure.
+    pub fn apply_step_checked(
+        &self,
+        step: &UserStep,
+        config: &ManifestBuildConfig,
+    ) -> Result<Self> {
+        let mut next = self.clone();
+        if !config.spilled_row_lineage.is_empty()
+            && !Arc::ptr_eq(&next.spilled_row_lineage, &config.spilled_row_lineage)
+        {
+            if next.spilled_row_lineage.is_empty() {
+                next.spilled_row_lineage = Arc::clone(&config.spilled_row_lineage);
+            } else {
+                next.extend_spilled_row_lineage(&config.spilled_row_lineage)?;
+            }
+        }
+        next.apply_step(step)?;
+        next.validate_step_invariants(config)?;
+        Ok(next)
+    }
+
+    /// Build the manifest and index list that the steps applied so far produce
+    /// on the read version.
+    ///
+    /// Finishing stamps row ids and takes reservations once per operation, so
+    /// a clone is finished and the kept state accepts more steps. The manifest
+    /// names no transaction file because an uncommitted snapshot is not a
+    /// published commit.
+    pub fn build_manifest(
+        &self,
+        config: &ManifestBuildConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        self.clone().into_manifest(config)
+    }
+
+    /// Consume this state and assemble the uncommitted manifest and index list
+    /// for the read version without cloning the state.
+    pub fn into_manifest(
+        self,
+        config: &ManifestBuildConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        reject_unsupported_build_config(config, &self.current_manifest)?;
+        debug_assert_eq!(self.current_manifest.version, self.read_version);
+        self.finish(None, None, config, None)
+    }
+
+    /// Validate all changes accumulated since creation or the last successful
+    /// validation against [`Self::build_manifest`] invariants.
+    ///
+    /// Steps touching only fragments, index segments, or id reservations are
+    /// validated against the pending dirty fragments without assembling a full
+    /// manifest. Unvalidated schema, config, fragment reuse history, MemWAL,
+    /// legacy unpromoted blob, or uncounted row-id changes fall back to
+    /// [`Self::build_manifest`], as does any state the incremental check
+    /// refuses so the returned error matches commit-time validation. Clears
+    /// the pending validation scope only on success.
+    pub fn validate_step_invariants(&mut self, config: &ManifestBuildConfig) -> Result<()> {
+        reject_unsupported_build_config(config, &self.current_manifest)?;
+        let dirty_fragments = self.unvalidated_dirty_fragments()?;
+        if self.needs_manifest_build_for_validation(&dirty_fragments)
+            || self.check_step_incrementally(dirty_fragments).is_err()
+        {
+            self.build_manifest(config)?;
+        }
+        self.unvalidated = UnvalidatedScope::default();
+        Ok(())
+    }
+
+    fn unvalidated_dirty_fragments(&self) -> Result<Vec<Fragment>> {
+        let mut ids = self.unvalidated.dirty_fragments.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut fragments = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(fragment) = self.live_fragment(id)? {
+                fragments.push(fragment.into_owned());
+            }
+        }
+        Ok(fragments)
+    }
+
+    fn needs_manifest_build_for_validation(&self, dirty_fragments: &[Fragment]) -> bool {
+        let may_promote_a_blob = !dirty_fragments.is_empty()
+            && self
+                .schema
+                .fields_pre_order()
+                .any(|field| field.is_blob() && !field.is_blob_v2());
+        let rewrote_the_mem_wal_entry = self.mem_wal_segments_before.is_some()
+            && self.touched_index_names.contains(MEM_WAL_INDEX_NAME);
+        self.unvalidated.changed_schema
+            || self.unvalidated.changed_config
+            || self.has_frag_reuse_history_work()
+            || rewrote_the_mem_wal_entry
+            || may_promote_a_blob
+            || self.added_row_ids_without_counter
+    }
+
+    fn check_step_incrementally(&self, mut dirty_fragments: Vec<Fragment>) -> Result<()> {
+        self.check_spilled_lineage_is_bound()?;
+        self.check_reencodes_are_rebound()?;
+        self.check_value_changes_are_restamped()?;
+        self.check_row_id_counter()?;
+        self.fragment_high_water_after_reservation()?;
+        validate_index_segment_sets(&self.indices, &self.touched_index_names)?;
+        Transaction::normalize_fragments(&mut dirty_fragments)?;
+        schema_fragments_valid(Some(&self.current_manifest), &self.schema, &dirty_fragments)
     }
 
     /// Assemble the next manifest from the state the actions left behind.
-    fn into_manifest(
+    fn finish(
         mut self,
-        transaction: &Transaction,
-        transaction_file_path: &str,
-        mem_wal_segments_before: Option<&LogicalIndexSegments>,
+        tag: Option<&str>,
+        transaction_file_path: Option<&str>,
+        config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-        let current_manifest = self.current_manifest;
-        let config = self.build_config;
+        let current_manifest = Arc::clone(&self.current_manifest);
+        let current_manifest = current_manifest.as_ref();
         let new_version = current_manifest.version + 1;
 
         self.check_spilled_lineage_is_bound()?;
@@ -346,17 +900,18 @@ impl<'a> ApplyState<'a> {
         self.assign_row_ids_to_new_fragments(&mut next_row_id, new_version)?;
         self.take_row_id_reservation(&mut next_row_id)?;
         self.take_fragment_id_reservation()?;
+        let mut fragments = self.build_fragments()?;
 
-        let ApplyState {
+        let Self {
             schema,
-            mut fragments,
-            mut indices,
+            indices,
             touched_index_names,
             new_bases,
             fragment_high_water,
             field_high_water,
             config: dataset_config,
             table_metadata,
+            mem_wal_segments_before,
             ..
         } = self;
 
@@ -368,6 +923,7 @@ impl<'a> ApplyState<'a> {
             check_schema(&schema)?;
         }
 
+        let mut indices = Arc::unwrap_or_clone(indices);
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
         validate_index_segment_sets(&indices, &touched_index_names)?;
 
@@ -378,7 +934,7 @@ impl<'a> ApplyState<'a> {
         // indices this commit publishes rather than what any one action
         // intended. Same position as on the legacy path: after the index list
         // has been pruned, before the manifest is assembled.
-        if let Some(segments_before) = mem_wal_segments_before {
+        if let Some(segments_before) = mem_wal_segments_before.as_deref() {
             Transaction::apply_mem_wal_index_coverage(
                 &mut indices,
                 segments_before,
@@ -387,7 +943,8 @@ impl<'a> ApplyState<'a> {
             )?;
         }
 
-        let mut manifest = transaction.assemble_manifest(
+        let mut manifest = Transaction::assemble_manifest(
+            tag,
             Some(current_manifest),
             schema,
             fragments,
@@ -413,12 +970,12 @@ impl<'a> ApplyState<'a> {
             frag_reuse_history::set_feature_flags(&mut manifest, &indices);
         }
 
-        for base in new_bases {
+        for base in Arc::unwrap_or_clone(new_bases) {
             manifest.base_paths.insert(base.id, base);
         }
 
-        manifest.config = dataset_config;
-        manifest.table_metadata = table_metadata;
+        manifest.config = Arc::unwrap_or_clone(dataset_config);
+        manifest.table_metadata = Arc::unwrap_or_clone(table_metadata);
         // Only a change is validated: settings inherited as they were, even
         // invalid ones, must not block an unrelated commit.
         if auto_cleanup_settings(&current_manifest.config)
@@ -454,7 +1011,7 @@ impl<'a> ApplyState<'a> {
             *current = (*current).max(field_high_water);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file = transaction_file_path.map(str::to_owned);
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }
@@ -496,8 +1053,8 @@ impl<'a> ApplyState<'a> {
                 segment.uuid
             )));
         }
-        self.touched_index_names.insert(segment.name.clone());
-        self.indices.push(segment);
+        Arc::make_mut(&mut self.touched_index_names).insert(segment.name.clone());
+        Arc::make_mut(&mut self.indices).push(segment);
         Ok(())
     }
 
@@ -510,14 +1067,14 @@ impl<'a> ApplyState<'a> {
                 "index segment {uuid} is not part of the dataset, so it cannot be removed"
             )));
         };
-        self.indices.remove(position);
+        Arc::make_mut(&mut self.indices).remove(position);
         Ok(())
     }
 
     /// Remove every segment of the index `name`.
     pub(super) fn drop_index(&mut self, name: &str) -> Result<()> {
         let before = self.indices.len();
-        self.indices.retain(|index| index.name != name);
+        Arc::make_mut(&mut self.indices).retain(|index| index.name != name);
         if self.indices.len() == before {
             return Err(Error::invalid_input(format!(
                 "DropIndex names index '{name}', which has no segment in the dataset"
@@ -534,7 +1091,11 @@ impl<'a> ApplyState<'a> {
         compacted_sstables: Vec<CompactedSsTable>,
     ) -> Result<()> {
         let new_version = self.new_version();
-        update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
+        update_mem_wal_index_compacted_sstables(
+            Arc::make_mut(&mut self.indices).as_mut_slice(),
+            new_version,
+            compacted_sstables,
+        )
     }
 
     /// Where the segment `uuid` lives, checking on the way that it really
@@ -564,14 +1125,14 @@ impl<'a> ApplyState<'a> {
                 "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
             )));
         };
-        self.touched_index_names.insert(name.to_string());
-        Ok(&mut self.indices[position])
+        Arc::make_mut(&mut self.touched_index_names).insert(name.to_string());
+        Ok(&mut Arc::make_mut(&mut self.indices)[position])
     }
 
-    /// Row lineage the caller read ahead of time for fragments whose lineage
-    /// lives in a data file, which applying cannot read itself.
-    pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
-        &self.build_config.spilled_row_lineage
+    /// A shared handle, because callers hold the lineage across a mutable
+    /// borrow of a fragment.
+    pub(super) fn spilled_row_lineage(&self) -> Arc<SpilledRowLineage> {
+        Arc::clone(&self.spilled_row_lineage)
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -579,6 +1140,7 @@ impl<'a> ApplyState<'a> {
     }
 
     pub(super) fn schema_mut(&mut self) -> &mut Schema {
+        self.unvalidated.changed_schema = true;
         &mut self.schema
     }
 
@@ -627,78 +1189,166 @@ impl<'a> ApplyState<'a> {
     }
 
     pub(super) fn config_mut(&mut self) -> &mut HashMap<String, String> {
-        &mut self.config
+        self.unvalidated.changed_config = true;
+        Arc::make_mut(&mut self.config)
     }
 
     pub(super) fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
-        &mut self.table_metadata
+        Arc::make_mut(&mut self.table_metadata)
     }
 
-    pub(super) fn fragments_mut(&mut self) -> &mut [Fragment] {
-        &mut self.fragments
-    }
-
-    pub(super) fn fragment_mut(&mut self, fragment_id: u64, action: &str) -> Result<&mut Fragment> {
+    pub(super) fn tombstone_dropped_field(&mut self, field_id: i32) -> Result<()> {
         self.fragments
-            .iter_mut()
-            .find(|fragment| fragment.id == fragment_id)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "{action} targets fragment {fragment_id}, which does not exist"
-                ))
+            .tombstone_dropped_field(field_id, &self.schema)
+    }
+
+    pub(super) fn base_fragment(&self, fragment_id: u64) -> Option<&Fragment> {
+        self.fragments.base_fragment(fragment_id)
+    }
+
+    pub(super) fn has_live_fragment(&self, fragment_id: u64) -> bool {
+        self.fragments.contains(fragment_id)
+    }
+
+    pub(super) fn live_fragment(&self, fragment_id: u64) -> Result<Option<Cow<'_, Fragment>>> {
+        self.fragments.fragment(fragment_id, &self.schema)
+    }
+
+    pub(super) fn live_fragment_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.fragments.live_ids()
+    }
+
+    fn added_fragments(&self) -> impl Iterator<Item = &Fragment> {
+        self.added_fragment_order
+            .iter()
+            .filter_map(|slot| match slot {
+                AddedFragment::Present(id) => self.fragments.patched.get(id)?.as_deref(),
+                AddedFragment::Removed { .. } => None,
             })
     }
 
+    fn build_fragments(&self) -> Result<Vec<Fragment>> {
+        self.fragments.build_fragments(&self.schema)
+    }
+
+    pub(super) fn fragment_mut(&mut self, fragment_id: u64, action: &str) -> Result<&mut Fragment> {
+        let fragment = self.fragments.get_mut(fragment_id, &self.schema, action)?;
+        self.unvalidated.dirty_fragments.push(fragment_id);
+        Ok(fragment)
+    }
+
     pub(super) fn push_fragment(&mut self, fragment: Fragment) {
-        self.fragments.push(fragment);
+        if self.uses_stable_row_ids() {
+            let supplies_row_ids = matches!(fragment.row_id_meta, Some(RowIdMeta::Inline(_)));
+            let tally = fresh_row_id_count(&fragment)
+                .ok()
+                .and_then(|fresh| self.fresh_row_ids_added.checked_add(fresh));
+            match tally {
+                Some(tally) => {
+                    self.fresh_row_ids_added = tally;
+                    self.row_ids_need_dry_run |= supplies_row_ids;
+                }
+                None => self.row_ids_need_dry_run = true,
+            }
+        } else if fragment.row_id_meta.is_some() {
+            self.added_row_ids_without_counter = true;
+        }
+        self.unvalidated.dirty_fragments.push(fragment.id);
+        Arc::make_mut(&mut self.added_fragment_order).push(AddedFragment::Present(fragment.id));
+        self.fragments.insert(fragment);
     }
 
     /// Drop a fragment and forget everything recorded about it. `false` if no
     /// such fragment was present.
-    pub(super) fn remove_fragment(&mut self, fragment_id: u64, data_change: bool) -> bool {
-        let Some(position) = self
-            .fragments
-            .iter()
-            .position(|fragment| fragment.id == fragment_id)
-        else {
-            return false;
+    pub(super) fn remove_fragment(&mut self, fragment_id: u64, data_change: bool) -> Result<bool> {
+        let Some(fragment) = self.fragments.fragment(fragment_id, &self.schema)? else {
+            return Ok(false);
         };
-        let removed = self.fragments.remove(position);
+        let burned_row_ids =
+            if self.new_fragments.contains(&fragment_id) && self.uses_stable_row_ids() {
+                fresh_row_id_count(&fragment)?
+            } else {
+                0
+            };
         let modified = self
-            .current_manifest
             .fragments
-            .iter()
-            .find(|fragment| fragment.id == fragment_id)
-            .is_some_and(|committed| *committed != removed);
-        self.removed_fragments.insert(
+            .base_fragment(fragment_id)
+            .is_some_and(|committed| {
+                !std::ptr::eq(committed, fragment.as_ref()) && *committed != *fragment
+            });
+        self.fragments.remove(fragment_id);
+        Arc::make_mut(&mut self.removed_fragments).insert(
             fragment_id,
             RemovedFragment {
                 data_change,
                 modified,
             },
         );
-        self.new_fragments.remove(&fragment_id);
-        self.rearranged_fragments.remove(&fragment_id);
-        self.tombstoned_fields
+        if Arc::make_mut(&mut self.new_fragments).remove(&fragment_id)
+            && let Some(slot_pos) = self
+                .added_fragment_order
+                .iter()
+                .rposition(|slot| matches!(slot, AddedFragment::Present(id) if *id == fragment_id))
+        {
+            if burned_row_ids > 0 {
+                Arc::make_mut(&mut self.added_fragment_order)[slot_pos] = AddedFragment::Removed {
+                    fresh_row_ids: burned_row_ids,
+                };
+            } else {
+                Arc::make_mut(&mut self.added_fragment_order).remove(slot_pos);
+            }
+        }
+        Arc::make_mut(&mut self.rearranged_fragments).remove(&fragment_id);
+        Arc::make_mut(&mut self.tombstoned_fields)
             .retain(|(fragment, _), _| *fragment != fragment_id);
-        self.value_changed_fragments.remove(&fragment_id);
-        self.restamped_fragments.remove(&fragment_id);
-        true
+        Arc::make_mut(&mut self.value_changed_fragments).remove(&fragment_id);
+        Arc::make_mut(&mut self.restamped_fragments).remove(&fragment_id);
+        Ok(true)
     }
 
     /// Empty the table: no schema, no fragments, no indices. The id counters
     /// keep going, so a field or fragment added afterwards never reuses an id an
     /// old file might still name.
-    pub(super) fn reset(&mut self) {
+    pub(super) fn reset(&mut self) -> Result<()> {
+        let mut burned = Vec::new();
+        let mut burned_total: Option<u64> = Some(0);
+        if self.uses_stable_row_ids() {
+            for slot in self.added_fragment_order.iter() {
+                let fresh_row_ids = match slot {
+                    AddedFragment::Removed { fresh_row_ids } => *fresh_row_ids,
+                    AddedFragment::Present(id) => match self.fragments.get_unmasked(*id) {
+                        Some(fragment) => fresh_row_id_count(fragment)?,
+                        None => 0,
+                    },
+                };
+                if fresh_row_ids > 0 {
+                    burned_total = burned_total.and_then(|sum| sum.checked_add(fresh_row_ids));
+                    burned.push(AddedFragment::Removed { fresh_row_ids });
+                }
+            }
+        }
+        match burned_total {
+            Some(total) => {
+                self.fresh_row_ids_added = total;
+                self.row_ids_need_dry_run = false;
+            }
+            None => self.row_ids_need_dry_run = true,
+        }
         self.schema.fields.clear();
         self.schema.metadata.clear();
+        self.added_row_ids_without_counter = false;
+        self.unvalidated.changed_schema = true;
         self.fragments.clear();
-        self.indices.clear();
-        self.new_fragments.clear();
-        self.rearranged_fragments.clear();
-        self.tombstoned_fields.clear();
-        self.value_changed_fragments.clear();
-        self.restamped_fragments.clear();
+        self.added_fragment_order = Arc::new(burned);
+        Arc::make_mut(&mut self.indices).clear();
+        self.frag_reuse = Default::default();
+        Arc::make_mut(&mut self.rebound_fields).clear();
+        Arc::make_mut(&mut self.new_fragments).clear();
+        Arc::make_mut(&mut self.rearranged_fragments).clear();
+        Arc::make_mut(&mut self.tombstoned_fields).clear();
+        Arc::make_mut(&mut self.value_changed_fragments).clear();
+        Arc::make_mut(&mut self.restamped_fragments).clear();
+        Ok(())
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
@@ -710,7 +1360,7 @@ impl<'a> ApplyState<'a> {
     }
 
     pub(super) fn push_base(&mut self, base: BasePath) {
-        self.new_bases.push(base);
+        Arc::make_mut(&mut self.new_bases).push(base);
     }
 
     /// The id to add a new fragment at: minted off the counter for a local
@@ -734,8 +1384,8 @@ impl<'a> ApplyState<'a> {
                 .ok_or_else(|| exhausted_err("fragment id", MAX_FRAGMENT_ID))?,
         };
         self.fragment_high_water = Some(id);
-        self.fragment_tokens.insert(token, id);
-        self.new_fragments.insert(id);
+        Arc::make_mut(&mut self.fragment_tokens).insert(token, id);
+        Arc::make_mut(&mut self.new_fragments).insert(id);
         Ok(id)
     }
 
@@ -758,7 +1408,7 @@ impl<'a> ApplyState<'a> {
                 display_mark(self.read_marks.fragment)
             )));
         }
-        if self.fragments.iter().any(|fragment| fragment.id == id) {
+        if self.has_live_fragment(id) {
             return Err(Error::invalid_input(format!(
                 "AddFragment adds a fragment at id {id}, which already exists"
             )));
@@ -780,7 +1430,7 @@ impl<'a> ApplyState<'a> {
                 index.name, index.uuid
             )));
         }
-        self.new_fragments.insert(id);
+        Arc::make_mut(&mut self.new_fragments).insert(id);
         Ok(id)
     }
 
@@ -823,7 +1473,7 @@ impl<'a> ApplyState<'a> {
             .checked_add(1)
             .ok_or_else(|| exhausted_err("field id", i32::MAX))?;
         self.field_high_water = id;
-        self.field_tokens.insert(token, id);
+        Arc::make_mut(&mut self.field_tokens).insert(token, id);
         Ok(id)
     }
 
@@ -836,7 +1486,7 @@ impl<'a> ApplyState<'a> {
             .checked_add(1)
             .ok_or_else(|| exhausted_err("base id", u32::MAX))?;
         self.base_high_water = id;
-        self.base_tokens.insert(token, id);
+        Arc::make_mut(&mut self.base_tokens).insert(token, id);
         Ok(id)
     }
 
@@ -923,7 +1573,7 @@ impl<'a> ApplyState<'a> {
     }
 
     pub(super) fn note_rearranged(&mut self, fragment_id: u64) {
-        self.rearranged_fragments.insert(fragment_id);
+        Arc::make_mut(&mut self.rearranged_fragments).insert(fragment_id);
     }
 
     /// Whether `fragment_id` is one this operation added with
@@ -960,7 +1610,7 @@ impl<'a> ApplyState<'a> {
     /// Record that a [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)
     /// restamped some or all of this fragment's rows.
     pub(super) fn note_restamp(&mut self, fragment_id: u64) {
-        self.restamped_fragments.insert(fragment_id);
+        Arc::make_mut(&mut self.restamped_fragments).insert(fragment_id);
     }
 
     /// Record that these fields' data in this fragment no longer matches what
@@ -975,7 +1625,7 @@ impl<'a> ApplyState<'a> {
         fields: impl IntoIterator<Item = i32>,
     ) -> Result<()> {
         let fields: Vec<i32> = fields.into_iter().collect();
-        self.rebound_fields.push((
+        Arc::make_mut(&mut self.rebound_fields).push((
             fragment_id,
             fields
                 .iter()
@@ -983,7 +1633,7 @@ impl<'a> ApplyState<'a> {
                 .collect(),
         ));
         prune_rebound_fields_from_indices(
-            &mut self.indices,
+            Arc::make_mut(&mut self.indices).as_mut_slice(),
             fragment_id,
             &fields,
             &self.current_manifest.schema,
@@ -995,14 +1645,14 @@ impl<'a> ApplyState<'a> {
     /// fragment. A fragment this operation adds is stamped whole at assembly.
     pub(super) fn note_value_change(&mut self, fragment_id: u64) {
         if !self.is_new_fragment(fragment_id) {
-            self.value_changed_fragments.insert(fragment_id);
+            Arc::make_mut(&mut self.value_changed_fragments).insert(fragment_id);
         }
     }
 
     /// Record that a [`TombstoneFieldData`](super::TombstoneFieldData) freed
     /// `field_id` in `fragment_id`.
     pub(super) fn note_tombstone(&mut self, fragment_id: u64, field_id: i32, data_change: bool) {
-        self.tombstoned_fields.insert(
+        Arc::make_mut(&mut self.tombstoned_fields).insert(
             (fragment_id, field_id),
             TombstonedField {
                 data_change,
@@ -1022,7 +1672,9 @@ impl<'a> ApplyState<'a> {
         field_id: i32,
         data_change: bool,
     ) -> Result<()> {
-        let Some(tombstoned) = self.tombstoned_fields.get_mut(&(fragment_id, field_id)) else {
+        let Some(tombstoned) =
+            Arc::make_mut(&mut self.tombstoned_fields).get_mut(&(fragment_id, field_id))
+        else {
             return Ok(());
         };
         if tombstoned.data_change != data_change {
@@ -1102,10 +1754,7 @@ impl<'a> ApplyState<'a> {
     /// [`AddDataFile`](super::AddDataFile) carrying it follows the
     /// [`AddFragment`](super::AddFragment) that declares it.
     fn check_spilled_lineage_is_bound(&self) -> Result<()> {
-        for fragment in &self.fragments {
-            if !self.new_fragments.contains(&fragment.id) {
-                continue;
-            }
+        for fragment in self.added_fragments() {
             for field_id in fragment.spilled_row_lineage_field_ids() {
                 let carriers = fragment
                     .files
@@ -1141,19 +1790,8 @@ impl<'a> ApplyState<'a> {
         let Some(next_row_id) = next_row_id.as_mut() else {
             return Ok(());
         };
-        self.validate_supplied_row_ids()?;
-        let minted_ids = std::mem::take(&mut self.new_fragments);
-        // The manifest assembly sorts fragments by id, so partitioning them here
-        // does not disturb the final order.
-        let (mut minted, existing): (Vec<Fragment>, Vec<Fragment>) = self
-            .fragments
-            .drain(..)
-            .partition(|fragment| minted_ids.contains(&fragment.id));
-
-        Transaction::assign_row_ids(next_row_id, minted.as_mut_slice())?;
-        for fragment in minted.iter_mut() {
-            // An action may carry its own sequences (a squashed operation
-            // does); only stamp the ones it left for apply to fill.
+        let mut updated = self.added_fragments_numbered(next_row_id)?;
+        for fragment in updated.iter_mut() {
             let version_meta = build_version_meta(fragment, new_version);
             if fragment.last_updated_at_version_meta.is_none() {
                 fragment.last_updated_at_version_meta = version_meta.clone();
@@ -1162,11 +1800,30 @@ impl<'a> ApplyState<'a> {
                 fragment.created_at_version_meta = version_meta;
             }
         }
-
-        self.fragments = existing;
-        self.fragments.extend(minted);
-        self.new_fragments = minted_ids;
+        for fragment in updated {
+            self.fragments.insert(fragment);
+        }
         Ok(())
+    }
+
+    fn added_fragments_numbered(&self, next_row_id: &mut u64) -> Result<Vec<Fragment>> {
+        self.validate_supplied_row_ids()?;
+        let mut numbered = Vec::new();
+        for slot in self.added_fragment_order.iter() {
+            match slot {
+                AddedFragment::Removed { fresh_row_ids } => {
+                    *next_row_id = advance_row_id_counter(*next_row_id, *fresh_row_ids)?;
+                }
+                AddedFragment::Present(id) => {
+                    let Some(mut fragment) = self.fragments.get_unmasked(*id).cloned() else {
+                        continue;
+                    };
+                    Transaction::assign_row_ids(next_row_id, std::slice::from_mut(&mut fragment))?;
+                    numbered.push(fragment);
+                }
+            }
+        }
+        Ok(numbered)
     }
 
     /// Reject row ids a new fragment arrived with that no commit reserved.
@@ -1189,10 +1846,7 @@ impl<'a> ApplyState<'a> {
     fn validate_supplied_row_ids(&self) -> Result<()> {
         let reserved_below = self.read_marks.next_row_id.unwrap_or(0);
         let mut supplied: Vec<(u64, RoaringTreemap)> = Vec::new();
-        for fragment in &self.fragments {
-            if !self.new_fragments.contains(&fragment.id) {
-                continue;
-            }
+        for fragment in self.added_fragments() {
             // A spilled sequence lives in a file, which this synchronous path
             // has no way to read; it goes unchecked.
             let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
@@ -1243,8 +1897,13 @@ impl<'a> ApplyState<'a> {
     /// own fragments have been numbered, so the reserved range is always the
     /// top `count` ids of the committed high-water mark.
     fn take_fragment_id_reservation(&mut self) -> Result<()> {
+        self.fragment_high_water = self.fragment_high_water_after_reservation()?;
+        Ok(())
+    }
+
+    fn fragment_high_water_after_reservation(&self) -> Result<Option<u64>> {
         if self.reserved_fragment_ids == 0 {
-            return Ok(());
+            return Ok(self.fragment_high_water);
         }
         let high_water = match self.fragment_high_water {
             None => Some(self.reserved_fragment_ids - 1),
@@ -1252,8 +1911,7 @@ impl<'a> ApplyState<'a> {
         }
         .and_then(|high_water| u32::try_from(high_water).ok())
         .ok_or_else(|| exhausted_err("fragment id", MAX_FRAGMENT_ID))?;
-        self.fragment_high_water = Some(u64::from(high_water));
-        Ok(())
+        Ok(Some(u64::from(high_water)))
     }
 
     /// Take this operation's row id reservation off the counter, after its own
@@ -1277,6 +1935,20 @@ impl<'a> ApplyState<'a> {
             ))
         })?;
         Ok(())
+    }
+
+    fn check_row_id_counter(&self) -> Result<()> {
+        let mut next_row_id = self
+            .uses_stable_row_ids()
+            .then_some(self.current_manifest.next_row_id);
+        if let Some(next_row_id) = next_row_id.as_mut() {
+            if self.row_ids_need_dry_run {
+                self.added_fragments_numbered(next_row_id)?;
+            } else {
+                *next_row_id = advance_row_id_counter(*next_row_id, self.fresh_row_ids_added)?;
+            }
+        }
+        self.take_row_id_reservation(&mut next_row_id)
     }
 }
 
@@ -1341,6 +2013,76 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 /// coverage -- has no fragment to prune, so a rewrite under it is refused
 /// rather than left to serve stale rows. System indices carry no bitmap by
 /// design and are keyed on no column, so a rewrite never affects them.
+fn tombstone_fields_in_fragment(
+    fragment: &mut Fragment,
+    dropped_fields: &BTreeSet<i32>,
+    live_schema_fields: &HashSet<i32>,
+) -> Result<()> {
+    for file in fragment.files.iter_mut() {
+        if !file
+            .fields
+            .iter()
+            .any(|field_id| dropped_fields.contains(field_id))
+        {
+            continue;
+        }
+        // A V1 reader locates pages by position in the file's field list, so
+        // the list stays whole until no field in it remains in the schema.
+        if file.file_version()? == ConcreteFileVersion::V1 {
+            if !file
+                .fields
+                .iter()
+                .any(|field_id| live_schema_fields.contains(field_id))
+            {
+                file.fields = vec![TOMBSTONED_FIELD; file.fields.len()].into();
+            }
+            continue;
+        }
+        file.fields = file
+            .fields
+            .iter()
+            .map(|id| {
+                if dropped_fields.contains(id) {
+                    TOMBSTONED_FIELD
+                } else {
+                    *id
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    let overlaid: Vec<u32> = dropped_fields
+        .iter()
+        .filter_map(|id| u32::try_from(*id).ok())
+        .collect();
+    if !fragment.overlays.is_empty() && !overlaid.is_empty() {
+        crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+    }
+    Ok(())
+}
+
+fn fresh_row_id_count(fragment: &Fragment) -> Result<u64> {
+    let physical_rows = fragment.physical_rows.ok_or_else(|| {
+        Error::internal(format!(
+            "fragment {} does not record its physical rows, so its row ids cannot be counted",
+            fragment.id
+        ))
+    })? as u64;
+    match &fragment.row_id_meta {
+        None => Ok(physical_rows),
+        Some(RowIdMeta::Column) => Ok(0),
+        Some(RowIdMeta::Inline(row_ids)) => {
+            let supplied = read_row_ids(row_ids)?.len() as u64;
+            physical_rows.checked_sub(supplied).ok_or_else(|| {
+                Error::internal(format!(
+                    "fragment {} carries {supplied} row ids for {physical_rows} physical rows",
+                    fragment.id
+                ))
+            })
+        }
+    }
+}
+
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
     fragment_id: u64,
@@ -1546,8 +2288,10 @@ mod tests {
         FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA,
         MANAGED_BLOBS_META_KEY,
     };
-    use crate::format::DataFile;
-    use crate::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
+    use crate::format::{DataFile, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID};
+    use crate::rowids::version::{
+        LoadedRowLineage, RowDatasetVersionMeta, RowDatasetVersionSequence,
+    };
     use crate::rowids::write_row_ids;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
@@ -1555,14 +2299,15 @@ mod tests {
     };
     use crate::transaction::action::test_support::{
         added_field, any_deletion_file, apply, apply_after_reading, apply_with_indices,
-        backed_manifest, last_updated_versions, manifest_with_base, mint_base, one_column_file,
-        refresh, refresh_rows, replace_field_data,
+        backed_manifest, frag_reuse, last_updated_versions, manifest_with_base, mint_base,
+        one_column_file, refresh, refresh_rows, replace_field_data,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
         AddIndexSegmentParts, AdjustIndexCoverage, AdjustIndexCoverageParts, AlterField,
-        CompositeOperation, ConfigUpdate, DropField, DropIndex, RemoveFragment, RemoveIndexSegment,
-        ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+        AssertCellsUnchanged, CompositeOperation, ConfigUpdate, DropField, DropIndex,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -2908,5 +3653,1423 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains(FRAG_REUSE_INDEX_NAME), "{error}");
+    }
+
+    fn whole_fragment(token: u32) -> Vec<Action> {
+        vec![
+            mint_fragment(token),
+            write_data(Ref::Local(token), FieldRef::Committed(0)),
+        ]
+    }
+
+    fn inline_row_ids(fragment: &Fragment) -> Vec<u64> {
+        let Some(RowIdMeta::Inline(row_ids)) = &fragment.row_id_meta else {
+            panic!("fragment {} has no inline row ids", fragment.id);
+        };
+        read_row_ids(row_ids).unwrap().iter().collect()
+    }
+
+    fn build_without_transaction_file(
+        base: &Manifest,
+        indices: &[IndexMetadata],
+        steps: &[UserStep],
+        config: &ManifestBuildConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        Transaction::new(
+            base.version,
+            Operation::CompositeOperation(CompositeOperation::new(steps.to_vec())),
+            None,
+        )
+        .build_manifest(Some(base), indices.to_vec(), "tx.txn", config)
+        .map(|(mut manifest, indices)| {
+            manifest.transaction_file = None;
+            (manifest, indices)
+        })
+    }
+
+    #[rstest]
+    #[case::two_separate_appends(vec![whole_fragment(0), whole_fragment(1)])]
+    #[case::three_separate_appends(vec![whole_fragment(0), whole_fragment(1), whole_fragment(2)])]
+    #[case::file_in_a_later_step(vec![
+        vec![mint_fragment(0)],
+        vec![write_data(Ref::Local(0), FieldRef::Committed(0))],
+    ])]
+    #[case::add_base_then_fragment_in_later_step(vec![
+        vec![Action::AddBase(AddBase::new(
+            0,
+            BasePath::new(0, "s3://bucket/ext".into(), Some("ext".into()), false),
+        ))],
+        vec![
+            mint_fragment(0),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    one_column_file("data/ext.lance"),
+                    vec![FieldRef::Committed(0)],
+                    Some(Ref::Local(0)),
+                    true,
+                )
+                .unwrap(),
+            ),
+        ],
+    ])]
+    #[case::reservations_before_a_fragment(vec![
+        vec![
+            Action::ReserveFragmentIds(ReserveFragmentIds::new(5)),
+            Action::ReserveRowIds(ReserveRowIds::new(7)),
+        ],
+        whole_fragment(0),
+    ])]
+    #[case::staged_fragment_removed_later(vec![
+        whole_fragment(0),
+        whole_fragment(1),
+        vec![Action::RemoveFragment(RemoveFragment::new(Ref::Local(0)))],
+    ])]
+    fn test_a_snapshot_after_each_step_matches_one_build_of_the_steps_so_far(
+        #[case] steps: Vec<Vec<Action>>,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(2, stable_row_ids);
+        let indices = vec![sample_index_metadata("idx")];
+        let config = default_build_config();
+        let reserves_row_ids = steps
+            .iter()
+            .flatten()
+            .any(|action| matches!(action, Action::ReserveRowIds(_)));
+        let steps: Vec<UserStep> = steps
+            .into_iter()
+            .map(|actions| UserStep::new("step", actions))
+            .collect();
+        let outcome = |built: Result<(Manifest, Vec<IndexMetadata>)>| {
+            built.map_err(|error| error.to_string())
+        };
+
+        let mut working =
+            ApplyState::at_read_version(Arc::new(base.clone()), indices.clone(), &config).unwrap();
+        let mut last_snapshot = None;
+        for applied in 1..=steps.len() {
+            let mut next = working.clone();
+            next.apply_step(&steps[applied - 1]).unwrap();
+            let validation = next
+                .validate_step_invariants(&config)
+                .map_err(|error| error.to_string());
+            working = next;
+            let snapshot = outcome(working.build_manifest(&config));
+            assert_eq!(
+                validation.err(),
+                snapshot.as_ref().err().cloned(),
+                "after step {applied}"
+            );
+            assert_eq!(
+                snapshot,
+                outcome(build_without_transaction_file(
+                    &base,
+                    &indices,
+                    &steps[..applied],
+                    &config,
+                )),
+                "after step {applied}"
+            );
+            if let Ok((manifest, _)) = &snapshot {
+                assert_eq!(manifest.transaction_file, None, "after step {applied}");
+            }
+            last_snapshot = Some(snapshot);
+        }
+        let last_snapshot = last_snapshot.unwrap();
+        assert_eq!(
+            last_snapshot.is_ok(),
+            stable_row_ids || !reserves_row_ids,
+            "{last_snapshot:?}"
+        );
+        if stable_row_ids {
+            let (manifest, _) = last_snapshot.unwrap();
+            assert!(manifest.next_row_id > base.next_row_id);
+        }
+    }
+
+    #[test]
+    fn test_add_base_followed_by_add_fragment_in_later_step_binds_base_id() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(1, true);
+        let config = default_build_config();
+        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+
+        state
+            .apply_step(&UserStep::new(
+                "add_base",
+                vec![Action::AddBase(AddBase::new(
+                    0,
+                    BasePath::new(0, "s3://bucket/ext".into(), Some("ext".into()), false),
+                ))],
+            ))
+            .unwrap();
+        let (intermediate, _) = state.build_manifest(&config).unwrap();
+        assert_eq!(intermediate.base_paths[&1].path, "s3://bucket/ext");
+
+        state
+            .apply_step(&UserStep::new(
+                "append_on_base",
+                vec![
+                    mint_fragment(0),
+                    Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Local(0),
+                            one_column_file("data/ext.lance"),
+                            vec![FieldRef::Committed(0)],
+                            Some(Ref::Local(0)),
+                            true,
+                        )
+                        .unwrap(),
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        let (manifest, _) = state.build_manifest(&config).unwrap();
+        assert_eq!(manifest.base_paths[&1].path, "s3://bucket/ext");
+        let added = manifest.fragments.iter().find(|f| f.id == 1).unwrap();
+        assert_eq!(added.files[0].base_id, Some(1));
+    }
+
+    #[test]
+    fn test_stable_row_ids_stay_fixed_across_fragment_removal_and_reset() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(1, true);
+        let config = default_build_config();
+        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+
+        state
+            .apply_step(&UserStep::new("append_a", whole_fragment(0)))
+            .unwrap();
+        state
+            .apply_step(&UserStep::new("append_b", whole_fragment(1)))
+            .unwrap();
+        let (before_remove, _) = state.build_manifest(&config).unwrap();
+        let frag_b_before = before_remove.fragments.iter().find(|f| f.id == 2).unwrap();
+        assert_eq!(
+            inline_row_ids(frag_b_before),
+            (1010..1020).collect::<Vec<_>>()
+        );
+        assert_eq!(before_remove.next_row_id, 1020);
+
+        state
+            .apply_step(&UserStep::new(
+                "remove_a",
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Local(0)))],
+            ))
+            .unwrap();
+        let (after_remove, _) = state.build_manifest(&config).unwrap();
+        let frag_b_after = after_remove.fragments.iter().find(|f| f.id == 2).unwrap();
+        assert_eq!(
+            inline_row_ids(frag_b_after),
+            (1010..1020).collect::<Vec<_>>()
+        );
+        assert_eq!(after_remove.next_row_id, 1020);
+
+        state
+            .apply_step(&UserStep::new(
+                "reset_and_rebuild",
+                vec![
+                    Action::ResetTable(ResetTable),
+                    mint_field(0, "fresh", None),
+                    mint_fragment(2),
+                    write_data(Ref::Local(2), FieldRef::Local(0)),
+                ],
+            ))
+            .unwrap();
+        let (after_reset, _) = state.build_manifest(&config).unwrap();
+        assert_eq!(after_reset.fragments.len(), 1);
+        assert_eq!(after_reset.fragments[0].id, 3);
+        assert_eq!(
+            inline_row_ids(&after_reset.fragments[0]),
+            (1020..1030).collect::<Vec<_>>()
+        );
+        assert_eq!(after_reset.next_row_id, 1030);
+    }
+
+    #[test]
+    fn test_repeated_manifest_builds_do_not_consume_reservations_or_double_apply_updates() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(2, true);
+        let shard = Uuid::from_u128(19);
+        let indices = vec![
+            IndexMetadata {
+                fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+                ..sample_index_metadata("idx")
+            },
+            new_mem_wal_index_meta(
+                base.version,
+                MemWalIndexDetails {
+                    compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                    index_catchup: vec![IndexCatchupProgress::new(
+                        "idx".to_string(),
+                        vec![CompactedSsTable::new(shard, 5)],
+                    )],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ];
+        let config = default_build_config();
+        let step_one = UserStep::new(
+            "step_one",
+            vec![
+                mint_fragment(0),
+                write_data(Ref::Local(0), FieldRef::Committed(0)),
+                Action::ReserveFragmentIds(ReserveFragmentIds::new(3)),
+                Action::ReserveRowIds(ReserveRowIds::new(5)),
+                tombstone_field_zero(true),
+                reencode_field_zero(true),
+                refresh(&[0]),
+            ],
+        );
+        let step_two = UserStep::new("step_two", whole_fragment(1));
+
+        let mut state =
+            ApplyState::at_read_version(Arc::new(base.clone()), indices.clone(), &config).unwrap();
+        state.apply_step(&step_one).unwrap();
+
+        let first_build = state.build_manifest(&config).unwrap();
+        let second_build = state.build_manifest(&config).unwrap();
+        assert_eq!(first_build.0, second_build.0);
+        assert_eq!(first_build.1[0], second_build.1[0]);
+        assert_eq!(
+            load_mem_wal_index_details(first_build.1[1].clone()).unwrap(),
+            load_mem_wal_index_details(second_build.1[1].clone()).unwrap()
+        );
+        assert!(
+            load_mem_wal_index_details(first_build.1[1].clone())
+                .unwrap()
+                .index_catchup
+                .is_empty()
+        );
+        assert_eq!(first_build.0.max_fragment_id, Some(5));
+        assert_eq!(first_build.0.next_row_id, base.next_row_id + 15);
+        assert_eq!(first_build.0.transaction_file, None);
+
+        state.apply_step(&step_two).unwrap();
+        let final_build = state.into_manifest(&config).unwrap();
+        let expected =
+            build_without_transaction_file(&base, &indices, &[step_one, step_two], &config)
+                .unwrap();
+        assert_eq!(final_build.0, expected.0);
+        assert_eq!(final_build.1[0], expected.1[0]);
+        assert_eq!(
+            load_mem_wal_index_details(final_build.1[1].clone()).unwrap(),
+            load_mem_wal_index_details(expected.1[1].clone()).unwrap()
+        );
+        assert_eq!(final_build.0.max_fragment_id, Some(6));
+        assert_eq!(final_build.0.next_row_id, base.next_row_id + 25);
+    }
+
+    #[test]
+    fn test_rebase_renumbers_local_fragments_and_checks_read_marks() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let read_manifest = table(2, true);
+        let config = default_build_config();
+        let step_one = UserStep::new("append_a", whole_fragment(0));
+        let step_two = UserStep::new("append_b", whole_fragment(1));
+
+        let mut staged =
+            ApplyState::at_read_version(Arc::new(read_manifest.clone()), Vec::new(), &config)
+                .unwrap();
+        staged.apply_step(&step_one).unwrap();
+        staged.apply_step(&step_two).unwrap();
+        let (staged_manifest, _) = staged.build_manifest(&config).unwrap();
+        let staged_ids: Vec<u64> = staged_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(staged_ids, vec![0, 1, 2, 3]);
+
+        let (current_manifest, current_indices) = Transaction::new(
+            read_manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "concurrent_append",
+                whole_fragment(0),
+            )])),
+            None,
+        )
+        .build_manifest(Some(&read_manifest), Vec::new(), "concurrent.txn", &config)
+        .unwrap();
+        assert_eq!(current_manifest.max_fragment_id(), Some(2));
+        assert_eq!(current_manifest.next_row_id, 1010);
+
+        let (rebased, _) = Transaction::new(
+            read_manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![step_one, step_two])),
+            None,
+        )
+        .build_manifest_with_read_version(
+            Some(&current_manifest),
+            current_indices.clone(),
+            "rebased.txn",
+            &config,
+            Some(ReadVersionState {
+                manifest: &read_manifest,
+                indices: &[],
+            }),
+        )
+        .unwrap();
+        let rebased_ids: Vec<u64> = rebased.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(rebased_ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            inline_row_ids(rebased.fragments.iter().find(|f| f.id == 3).unwrap()),
+            (1010..1020).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            inline_row_ids(rebased.fragments.iter().find(|f| f.id == 4).unwrap()),
+            (1020..1030).collect::<Vec<_>>()
+        );
+        assert_eq!(rebased.next_row_id, 1030);
+
+        let illegal = Transaction::new(
+            read_manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "touch_concurrent",
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    2,
+                )))],
+            )])),
+            None,
+        )
+        .build_manifest_with_read_version(
+            Some(&current_manifest),
+            current_indices,
+            "illegal.txn",
+            &config,
+            Some(ReadVersionState {
+                manifest: &read_manifest,
+                indices: &[],
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            illegal
+                .to_string()
+                .contains("high-water mark for fragment ids is 1"),
+            "{illegal}"
+        );
+    }
+
+    #[test]
+    fn test_index_coverage_across_multi_step_additions_rewrites_and_removals() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(2, true);
+        let config = default_build_config();
+        let seg_uuid = Uuid::from_u128(42);
+        let initial_index = IndexMetadata {
+            uuid: seg_uuid,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            ..sample_index_metadata("idx")
+        };
+
+        let steps = vec![
+            UserStep::new("append_frag_2", whole_fragment(0)),
+            UserStep::new(
+                "cover_frag_2",
+                vec![Action::AdjustIndexCoverage(
+                    AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                        uuid: seg_uuid,
+                        name: "idx".into(),
+                        add_fragments: vec![Ref::Local(0)],
+                        remove_fragments: Vec::new(),
+                        fields: vec![FieldRef::Committed(0)],
+                        covering_fields: Vec::new(),
+                    })
+                    .unwrap(),
+                )],
+            ),
+            UserStep::new(
+                "rewrite_frag_0",
+                vec![
+                    tombstone_field_zero(true),
+                    reencode_field_zero(true),
+                    refresh(&[0]),
+                ],
+            ),
+            UserStep::new(
+                "remove_frag_1",
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    1,
+                )))],
+            ),
+        ];
+
+        let mut state = ApplyState::at_read_version(
+            Arc::new(base.clone()),
+            vec![initial_index.clone()],
+            &config,
+        )
+        .unwrap();
+        for step in &steps {
+            state.apply_step(step).unwrap();
+        }
+        let (manifest, indices) = state.build_manifest(&config).unwrap();
+        assert_eq!(
+            manifest.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        let live_bitmap: RoaringBitmap = manifest.fragments.iter().map(|f| f.id as u32).collect();
+        assert_eq!(
+            indices[0].effective_fragment_bitmap(&live_bitmap),
+            Some(RoaringBitmap::from_iter([2u32]))
+        );
+        assert_eq!(
+            (manifest, indices),
+            build_without_transaction_file(&base, &[initial_index], &steps, &config).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_rewriting_a_newly_added_field_prunes_an_index_built_in_an_earlier_step() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(1, true);
+        let config = default_build_config();
+        let seg_uuid = Uuid::from_u128(77);
+        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+
+        state
+            .apply_step(&UserStep::new(
+                "add_field_and_index",
+                vec![
+                    mint_field(0, "added", None),
+                    write_data(Ref::Committed(0), FieldRef::Local(0)),
+                    refresh(&[0]),
+                    Action::AddIndexSegment(
+                        AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                            uuid: seg_uuid,
+                            name: "added_idx".into(),
+                            fields: vec![FieldRef::Local(0)],
+                            covering_fields: Vec::new(),
+                            index_details: None,
+                            index_version: 1,
+                            covered_fragments: Some(vec![Ref::Committed(0)]),
+                            files: Vec::new(),
+                            base: None,
+                            created_at: None,
+                            dataset_version: None,
+                            data_change: false,
+                        })
+                        .unwrap(),
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        state
+            .apply_step(&UserStep::new(
+                "rewrite_added_field",
+                vec![
+                    Action::TombstoneFieldData(TombstoneFieldData::new(
+                        Ref::Committed(0),
+                        vec![FieldRef::Local(0)],
+                    )),
+                    write_data(Ref::Committed(0), FieldRef::Local(0)),
+                    refresh(&[0]),
+                ],
+            ))
+            .unwrap();
+
+        let (_, indices) = state.build_manifest(&config).unwrap();
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_failed_step_on_a_clone_leaves_the_kept_state_unchanged() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = table(2, true);
+        let config = default_build_config();
+        let mut working =
+            ApplyState::at_read_version(Arc::new(base.clone()), Vec::new(), &config).unwrap();
+        let first = UserStep::new("step", whole_fragment(0));
+        working = working.apply_step_checked(&first, &config).unwrap();
+        let before = working.build_manifest(&config).unwrap();
+
+        let error = working
+            .apply_step_checked(
+                &UserStep::new("step", vec![mint_fragment(1), mint_fragment(0)]),
+                &config,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("local fragment token 0 is minted more than once in this operation"),
+            "{error}"
+        );
+        assert_eq!(working.build_manifest(&config).unwrap(), before);
+
+        let error = working
+            .apply_step_checked(&UserStep::new("step", vec![mint_fragment(1)]), &config)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("non-nullable field"), "{error}");
+        assert_eq!(working.build_manifest(&config).unwrap(), before);
+        working.validate_step_invariants(&config).unwrap();
+
+        let second = UserStep::new("step", whole_fragment(1));
+        working = working.apply_step_checked(&second, &config).unwrap();
+        let (manifest, indices) = working.build_manifest(&config).unwrap();
+        let fragment_ids: Vec<u64> = manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids, vec![0, 1, 2, 3]);
+        assert_eq!(
+            (manifest, indices),
+            build_without_transaction_file(&base, &[], &[first, second], &config).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_a_step_patches_only_the_fragments_it_touches_and_shares_the_rest() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let base = Arc::new(table(4, false));
+        let config = default_build_config();
+        let working = ApplyState::at_read_version(base.clone(), Vec::new(), &config).unwrap();
+        assert!(Arc::ptr_eq(&working.fragments.base, &base.fragments));
+
+        let mut stepped = working.clone();
+        let mut actions = whole_fragment(0);
+        actions.push(remove_fragment_zero());
+        stepped.apply_step(&UserStep::new("step", actions)).unwrap();
+
+        assert!(working.fragments.patched.is_empty());
+        assert!(Arc::ptr_eq(&stepped.fragments.base, &base.fragments));
+        let patched_ids: Vec<u64> = stepped.fragments.patched.keys().copied().collect();
+        assert_eq!(patched_ids, vec![0, 4]);
+        assert!(stepped.fragments.patched[&0].is_none());
+
+        let mut mutated_clone = stepped.clone();
+        assert!(Arc::ptr_eq(
+            stepped.fragments.patched[&4].as_ref().unwrap(),
+            mutated_clone.fragments.patched[&4].as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &stepped.fragment_tokens,
+            &mutated_clone.fragment_tokens
+        ));
+        assert!(Arc::ptr_eq(
+            &stepped.new_fragments,
+            &mutated_clone.new_fragments
+        ));
+        assert!(Arc::ptr_eq(&stepped.indices, &mutated_clone.indices));
+        assert!(Arc::ptr_eq(&stepped.config, &mutated_clone.config));
+        assert!(Arc::ptr_eq(&working.config, &stepped.config));
+
+        mutated_clone
+            .apply_step(&UserStep::new(
+                "mutate_clone",
+                vec![
+                    config_update(),
+                    Action::SetDeletionFile(
+                        SetDeletionFile::try_new_unchecked(1, any_deletion_file(), None, true)
+                            .unwrap(),
+                    ),
+                ],
+            ))
+            .unwrap();
+        assert!(!stepped.fragments.patched.contains_key(&1));
+        assert!(stepped.config.is_empty());
+
+        let (manifest, _) = stepped.build_manifest(&config).unwrap();
+        let fragment_ids: Vec<u64> = manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_lazy_drop_field_masks_v2_and_preserves_v1_files_without_corrupting_base() {
+        use crate::transaction::test_support::overlay_with_field;
+
+        let mut manifest = backed_manifest();
+        let mut keep_field = added_field("keep");
+        keep_field.id = 1;
+        manifest.schema.fields.push(keep_field);
+
+        let mut v2_frag = manifest.fragments[0].clone();
+        v2_frag.id = 0;
+        v2_frag.files = vec![DataFile::new(
+            "data/0.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+        v2_frag.overlays = vec![
+            overlay_with_field(0, manifest.version),
+            overlay_with_field(1, manifest.version),
+        ];
+
+        let mut v1_frag = manifest.fragments[0].clone();
+        v1_frag.id = 1;
+        v1_frag.files = vec![DataFile::new_legacy_from_fields(
+            "data/1.lance",
+            vec![0, 1],
+            None,
+        )];
+        manifest.fragments = Arc::new(vec![v2_frag, v1_frag]);
+        manifest.max_fragment_id = Some(1);
+
+        let base = Arc::new(manifest);
+        let config = default_build_config();
+        let mut state = ApplyState::at_read_version(base.clone(), Vec::new(), &config).unwrap();
+
+        state
+            .apply_step(&UserStep::new(
+                "drop_0",
+                vec![Action::DropField(DropField::new(FieldRef::Committed(0)))],
+            ))
+            .unwrap();
+
+        assert!(state.fragments.patched.is_empty());
+        assert_eq!(base.fragments[0].files[0].fields.as_ref(), &[0, 1]);
+        assert_eq!(base.fragments[1].files[0].fields.as_ref(), &[0, 1]);
+
+        assert_eq!(
+            state.live_fragment(0).unwrap().unwrap().files[0]
+                .fields
+                .as_ref(),
+            &[TOMBSTONED_FIELD, 1]
+        );
+        assert_eq!(
+            state.live_fragment(1).unwrap().unwrap().files[0]
+                .fields
+                .as_ref(),
+            &[0, 1]
+        );
+
+        let (after_one_drop, _) = state.build_manifest(&config).unwrap();
+        assert_eq!(
+            after_one_drop.fragments[0].files[0].fields.as_ref(),
+            &[TOMBSTONED_FIELD, 1]
+        );
+        assert_eq!(after_one_drop.fragments[0].overlays.len(), 1);
+        assert_eq!(
+            after_one_drop.fragments[0].overlays[0]
+                .data_file
+                .fields
+                .as_ref(),
+            &[1]
+        );
+        assert_eq!(base.fragments[0].overlays.len(), 2);
+        assert_eq!(
+            after_one_drop.fragments[1].files[0].fields.as_ref(),
+            &[0, 1]
+        );
+
+        state
+            .apply_step(&UserStep::new(
+                "drop_1",
+                vec![Action::DropField(DropField::new(FieldRef::Committed(1)))],
+            ))
+            .unwrap();
+        let (after_both_drops, _) = state.build_manifest(&config).unwrap();
+        assert!(after_both_drops.fragments[0].files.is_empty());
+        assert!(after_both_drops.fragments[1].files.is_empty());
+        assert_eq!(base.fragments[0].files[0].fields.as_ref(), &[0, 1]);
+        assert_eq!(base.fragments[1].files[0].fields.as_ref(), &[0, 1]);
+    }
+
+    #[test]
+    fn test_a_base_out_of_id_order_is_looked_up_by_id_and_built_sorted() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let mut base = table(2, false);
+        let mut fragments = base.fragments.as_ref().clone();
+        fragments.reverse();
+        base.fragments = Arc::new(fragments);
+
+        let next = apply_steps(
+            &base,
+            vec![
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    1,
+                )))],
+                whole_fragment(0),
+            ],
+        )
+        .unwrap();
+        let fragment_ids: Vec<u64> = next.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids, vec![0, 2]);
+        assert_eq!(next.fragments[0], base.fragments[1]);
+
+        ApplyState::at_read_version(Arc::new(base), Vec::new(), &default_build_config()).unwrap();
+    }
+
+    #[test]
+    fn test_base_manifests_with_duplicate_or_out_of_range_fragment_ids_are_rejected() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let mut duplicate = table(1, false);
+        let repeated = duplicate.fragments[0].clone();
+        duplicate.fragments = Arc::new(vec![repeated.clone(), repeated]);
+        for err in [
+            apply_steps(&duplicate, vec![whole_fragment(0)]).unwrap_err(),
+            ApplyState::at_read_version(Arc::new(duplicate), Vec::new(), &default_build_config())
+                .err()
+                .unwrap(),
+        ] {
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+            assert!(
+                err.to_string()
+                    .contains("lists fragment id 0 more than once"),
+                "{err}"
+            );
+        }
+
+        let mut out_of_range = table(1, false);
+        let mut bad_frag = out_of_range.fragments[0].clone();
+        bad_frag.id = MAX_FRAGMENT_ID + 1;
+        out_of_range.fragments = Arc::new(vec![bad_frag]);
+        for err in [
+            apply_steps(&out_of_range, vec![whole_fragment(0)]).unwrap_err(),
+            ApplyState::at_read_version(
+                Arc::new(out_of_range),
+                Vec::new(),
+                &default_build_config(),
+            )
+            .err()
+            .unwrap(),
+        ] {
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+            assert!(
+                err.to_string().contains("above the maximum fragment id"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_row_ids_follow_the_order_fragments_were_added() {
+        use crate::transaction::action::test_support::frag_reuse::table;
+
+        let mut base = table(1, true);
+        base.max_fragment_id = Some(2);
+        let claim_reserved = Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            id: Ref::Committed(1),
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        }));
+
+        let next = apply_steps(
+            &base,
+            vec![vec![
+                mint_fragment(0),
+                write_data(Ref::Local(0), FieldRef::Committed(0)),
+                claim_reserved,
+                write_data(Ref::Committed(1), FieldRef::Committed(0)),
+            ]],
+        )
+        .unwrap();
+
+        let frag_3 = next.fragments.iter().find(|f| f.id == 3).unwrap();
+        let frag_1 = next.fragments.iter().find(|f| f.id == 1).unwrap();
+        assert_eq!(inline_row_ids(frag_3), (1000..1010).collect::<Vec<_>>());
+        assert_eq!(inline_row_ids(frag_1), (1010..1020).collect::<Vec<_>>());
+        assert_eq!(next.next_row_id, 1020);
+    }
+
+    fn strict_field() -> Action {
+        Action::AddField(AddField::new(
+            0,
+            lance_core::datatypes::Field::try_from(ArrowField::new(
+                "strict",
+                DataType::Int32,
+                false,
+            ))
+            .unwrap(),
+        ))
+    }
+
+    fn whole_fragment_with_row_ids() -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                id: Ref::Local(0),
+                physical_rows: 10,
+                row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&(100..110).into()).into())),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            })),
+            write_data(Ref::Local(0), FieldRef::Committed(0)),
+        ]
+    }
+
+    #[rstest]
+    #[case::whole_fragment(frag_reuse::table(2, true), whole_fragment(0), None)]
+    #[case::removed_fragment(frag_reuse::table(2, true), vec![remove_fragment_zero()], None)]
+    #[case::renamed_field(frag_reuse::table(2, true), vec![rename_field_zero()], None)]
+    #[case::config(frag_reuse::table(2, true), vec![config_update()], None)]
+    #[case::deletion_on_a_fragment_missing_a_required_field(
+        sample_manifest(),
+        vec![Action::SetDeletionFile(
+            SetDeletionFile::try_new_unchecked(0, any_deletion_file(), None, true).unwrap(),
+        )],
+        None
+    )]
+    #[case::fragment_without_its_data(
+        frag_reuse::table(2, true),
+        vec![mint_fragment(0)],
+        Some("non-nullable field")
+    )]
+    #[case::data_change_without_a_refresh(
+        frag_reuse::table(2, true),
+        replace_field_data(0, 0, true),
+        Some("RefreshRowVersionMetadata")
+    )]
+    #[case::reencode_without_its_rebind(
+        frag_reuse::table(2, true),
+        replace_field_data(0, 0, false).into_iter().take(1).collect(),
+        Some("without a data file")
+    )]
+    #[case::fragment_reservation_past_the_counter(
+        frag_reuse::table(2, true),
+        vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(u32::MAX))],
+        Some("fragment id counter is exhausted")
+    )]
+    #[case::row_id_mint_past_the_counter(
+        row_id_counter_at_max(),
+        vec![mint_fragment(0)],
+        Some("row id counter is exhausted")
+    )]
+    #[case::row_id_reservation_without_a_counter(
+        frag_reuse::table(2, false),
+        vec![Action::ReserveRowIds(ReserveRowIds::new(7))],
+        Some("ReserveRowIds needs a row id counter")
+    )]
+    #[case::supplied_row_ids_without_a_counter(
+        frag_reuse::table(2, false),
+        whole_fragment_with_row_ids(),
+        Some("All fragments must have row ids")
+    )]
+    #[case::required_field_no_fragment_stores(
+        frag_reuse::table(2, true),
+        vec![strict_field()],
+        Some("non-nullable field")
+    )]
+    fn test_step_validation_gives_the_verdict_of_a_snapshot_build(
+        #[case] base: Manifest,
+        #[case] step: Vec<Action>,
+        #[case] rejected_with: Option<&str>,
+    ) {
+        let config = default_build_config();
+        let mut stepped = ApplyState::at_read_version(
+            Arc::new(base),
+            vec![sample_index_metadata("idx")],
+            &config,
+        )
+        .unwrap();
+        stepped.apply_step(&UserStep::new("step", step)).unwrap();
+
+        let validation = stepped
+            .validate_step_invariants(&config)
+            .map_err(|error| error.to_string());
+        let snapshot = stepped
+            .build_manifest(&config)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        assert_eq!(validation, snapshot);
+        match rejected_with {
+            None => validation.unwrap(),
+            Some(expected) => {
+                let error = validation.unwrap_err();
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+    }
+
+    fn table_with_a_legacy_blob_field() -> Manifest {
+        let mut manifest = frag_reuse::table(2, true);
+        manifest.schema.fields[0]
+            .metadata
+            .insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+        manifest
+    }
+
+    fn mem_wal_index() -> IndexMetadata {
+        new_mem_wal_index_meta(1, MemWalIndexDetails::default()).unwrap()
+    }
+
+    fn mem_wal_segment() -> Vec<Action> {
+        vec![Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::from_u128(11),
+                name: MEM_WAL_INDEX_NAME.into(),
+                fields: Vec::new(),
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: None,
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: true,
+            })
+            .unwrap(),
+        )]
+    }
+
+    #[rstest]
+    #[case::whole_fragment(frag_reuse::table(2, true), Vec::new(), whole_fragment(0), false)]
+    #[case::removed_fragment(
+        frag_reuse::table(2, true),
+        Vec::new(),
+        vec![remove_fragment_zero()],
+        false
+    )]
+    #[case::fragment_reservation(
+        frag_reuse::table(2, true),
+        Vec::new(),
+        vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(5))],
+        false
+    )]
+    #[case::renamed_field(frag_reuse::table(2, true), Vec::new(), vec![rename_field_zero()], true)]
+    #[case::added_field(
+        frag_reuse::table(2, true),
+        Vec::new(),
+        vec![mint_field(0, "added", None)],
+        true
+    )]
+    #[case::config(frag_reuse::table(2, true), Vec::new(), vec![config_update()], true)]
+    #[case::reset(
+        frag_reuse::table(2, true),
+        Vec::new(),
+        vec![Action::ResetTable(ResetTable)],
+        true
+    )]
+    #[case::compaction_with_a_transition(
+        frag_reuse::table(2, true),
+        Vec::new(),
+        frag_reuse::compaction(
+            &[0, 1],
+            0,
+            true,
+            Some(frag_reuse::ordered(frag_reuse::survivors(&[0, 1], &[])))
+        ),
+        true
+    )]
+    #[case::fragment_on_a_legacy_blob_schema(
+        table_with_a_legacy_blob_field(),
+        Vec::new(),
+        whole_fragment(0),
+        true
+    )]
+    #[case::supplied_row_ids_without_a_counter(
+        frag_reuse::table(2, false),
+        Vec::new(),
+        whole_fragment_with_row_ids(),
+        true
+    )]
+    #[case::mem_wal_segment(
+        frag_reuse::table(2, true),
+        vec![mem_wal_index()],
+        mem_wal_segment(),
+        true
+    )]
+    fn test_only_a_step_its_fragments_cannot_judge_asks_for_a_snapshot_build(
+        #[case] base: Manifest,
+        #[case] indices: Vec<IndexMetadata>,
+        #[case] step: Vec<Action>,
+        #[case] needs_build: bool,
+    ) {
+        let config = default_build_config();
+        let mut stepped = ApplyState::at_read_version(Arc::new(base), indices, &config).unwrap();
+        stepped.apply_step(&UserStep::new("step", step)).unwrap();
+
+        let dirty = stepped.unvalidated_dirty_fragments().unwrap();
+        assert_eq!(
+            stepped.needs_manifest_build_for_validation(&dirty),
+            needs_build
+        );
+        if !needs_build {
+            stepped.check_step_incrementally(dirty).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_unvalidated_scope_accumulates_across_unchecked_steps_and_clears_on_validation() {
+        let config = default_build_config();
+        let mut working =
+            ApplyState::at_read_version(Arc::new(frag_reuse::table(4, false)), Vec::new(), &config)
+                .unwrap();
+        let dirty_ids = |state: &ApplyState| -> Vec<u64> {
+            state
+                .unvalidated_dirty_fragments()
+                .unwrap()
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect()
+        };
+
+        working
+            .apply_step(&UserStep::new("step", whole_fragment(0)))
+            .unwrap();
+        assert_eq!(dirty_ids(&working), vec![4]);
+        assert!(!working.unvalidated.changed_schema);
+        assert!(!working.unvalidated.changed_config);
+
+        working
+            .apply_step(&UserStep::new("step", vec![rename_field_zero()]))
+            .unwrap();
+        assert_eq!(dirty_ids(&working), vec![4]);
+        assert!(working.unvalidated.changed_schema);
+        assert!(!working.unvalidated.changed_config);
+
+        working.validate_step_invariants(&config).unwrap();
+        assert!(working.unvalidated.dirty_fragments.is_empty());
+        assert!(!working.unvalidated.changed_schema);
+        assert!(!working.unvalidated.changed_config);
+
+        working
+            .apply_step(&UserStep::new("step", vec![config_update()]))
+            .unwrap();
+        assert!(!working.unvalidated.changed_schema);
+        assert!(working.unvalidated.changed_config);
+        working.validate_step_invariants(&config).unwrap();
+        assert!(!working.unvalidated.changed_config);
+
+        let assertion = AssertCellsUnchanged::try_new(
+            vec![FieldRef::Committed(0)],
+            vec![RowSelection {
+                fragment_id: 1,
+                rows: SelectedRows::Full,
+            }],
+        )
+        .unwrap();
+        working
+            .apply_step(&UserStep::new(
+                "step",
+                vec![Action::AssertCellsUnchanged(assertion)],
+            ))
+            .unwrap();
+        assert!(working.unvalidated.dirty_fragments.is_empty());
+        assert!(!working.fragments.patched.contains_key(&1));
+    }
+
+    #[rstest]
+    #[case::unchecked_schema_violation(vec![strict_field()], "non-nullable field")]
+    #[case::unchecked_fragment_violation(vec![mint_fragment(0)], "non-nullable field")]
+    #[case::unchecked_config_violation(
+        vec![Action::ConfigUpdate(ConfigUpdate::default().with_config(UpdateMap {
+            update_entries: vec![("lance.auto_cleanup.policy_interval", "1d").into()],
+            replace: false,
+        }))],
+        "policy_interval"
+    )]
+    fn test_checked_step_after_unchecked_violation_rejects_pending_scope(
+        #[case] bad_unchecked: Vec<Action>,
+        #[case] expected_error: &str,
+    ) {
+        let config = default_build_config();
+        let mut working =
+            ApplyState::at_read_version(Arc::new(frag_reuse::table(2, true)), Vec::new(), &config)
+                .unwrap();
+        working
+            .apply_step(&UserStep::new("unchecked", bad_unchecked))
+            .unwrap();
+
+        let direct_err = working.validate_step_invariants(&config).unwrap_err();
+        assert!(
+            direct_err.to_string().contains(expected_error),
+            "{direct_err}"
+        );
+
+        let valid_follow_up = vec![
+            mint_fragment(1),
+            write_data(Ref::Local(1), FieldRef::Committed(0)),
+        ];
+        let checked_err = working
+            .apply_step_checked(&UserStep::new("valid_follow_up", valid_follow_up), &config)
+            .err()
+            .unwrap();
+        assert!(
+            checked_err.to_string().contains(expected_error),
+            "{checked_err}"
+        );
+    }
+
+    #[test]
+    fn test_later_steps_accept_newly_loaded_spilled_row_lineage() {
+        let mut base = frag_reuse::table(1, true);
+        let mut fragment = base.fragments[0].clone();
+        fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
+        fragment.files.push(DataFile::new(
+            "data/0-lineage.lance",
+            vec![ROW_LAST_UPDATED_AT_VERSION_FIELD_ID],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
+        base.fragments = Arc::new(vec![fragment]);
+
+        let empty_config = default_build_config();
+        let state =
+            ApplyState::at_read_version(Arc::new(base.clone()), Vec::new(), &empty_config).unwrap();
+        assert!(!state.has_spilled_row_lineage(0));
+
+        let after_append = state
+            .apply_step_checked(&UserStep::new("append", whole_fragment(0)), &empty_config)
+            .unwrap();
+        assert!(!after_append.has_spilled_row_lineage(0));
+
+        let missing_err = after_append
+            .apply_step_checked(
+                &UserStep::new(
+                    "rewrite_without_lineage",
+                    vec![
+                        tombstone_field_zero(true),
+                        reencode_field_zero(true),
+                        refresh_rows(0, &[1]),
+                    ],
+                ),
+                &empty_config,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            missing_err
+                .to_string()
+                .contains("not loaded ahead of the commit"),
+            "{missing_err}"
+        );
+
+        let loaded = LoadedRowLineage {
+            last_updated_at: Some(Arc::new(RowDatasetVersionSequence::from_versions(&[2; 10]))),
+            ..Default::default()
+        };
+        let mut config_with_lineage = default_build_config();
+        config_with_lineage.spilled_row_lineage = Arc::new(SpilledRowLineage::from([(0, loaded)]));
+
+        let rejected = after_append
+            .apply_step_checked(
+                &UserStep::new("bad_step_with_lineage", vec![mint_fragment(0)]),
+                &config_with_lineage,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            rejected
+                .to_string()
+                .contains("local fragment token 0 is minted more than once"),
+            "{rejected}"
+        );
+        assert!(!after_append.has_spilled_row_lineage(0));
+
+        let rewrite_step = UserStep::new(
+            "rewrite_with_lineage",
+            vec![
+                tombstone_field_zero(true),
+                reencode_field_zero(true),
+                refresh_rows(0, &[1, 3]),
+            ],
+        );
+        let after_rewrite = after_append
+            .apply_step_checked(&rewrite_step, &config_with_lineage)
+            .unwrap();
+        assert!(after_rewrite.has_spilled_row_lineage(0));
+
+        let (manifest, _) = after_rewrite.build_manifest(&empty_config).unwrap();
+        let new_version = base.version + 1;
+        assert_eq!(
+            last_updated_versions(&manifest.fragments[0]),
+            vec![2, new_version, 2, new_version, 2, 2, 2, 2, 2, 2]
+        );
+
+        let second_rewrite = UserStep::new(
+            "second_rewrite_resupplying_base_lineage",
+            vec![
+                tombstone_field_zero(true),
+                reencode_field_zero(true),
+                refresh_rows(0, &[5]),
+            ],
+        );
+        let after_second_rewrite = after_rewrite
+            .apply_step_checked(&second_rewrite, &config_with_lineage)
+            .unwrap();
+        let (manifest_two, _) = after_second_rewrite.build_manifest(&empty_config).unwrap();
+        assert_eq!(
+            last_updated_versions(&manifest_two.fragments[0]),
+            vec![2, new_version, 2, new_version, 2, new_version, 2, 2, 2, 2]
+        );
+
+        let mut partial_row_ids_only = after_second_rewrite.clone();
+        partial_row_ids_only
+            .extend_spilled_row_lineage(&SpilledRowLineage::from([(
+                0,
+                LoadedRowLineage {
+                    row_ids: Some(Arc::new((0..10).into())),
+                    ..Default::default()
+                },
+            )]))
+            .unwrap();
+        let merged = partial_row_ids_only.spilled_row_lineage_for(0).unwrap();
+        assert!(merged.last_updated_at.is_some());
+        assert!(merged.row_ids.is_some());
+        assert!(merged.created_at.is_none());
+
+        let mut conflicting_config = default_build_config();
+        conflicting_config.spilled_row_lineage = Arc::new(SpilledRowLineage::from([(
+            0,
+            LoadedRowLineage {
+                last_updated_at: Some(Arc::new(RowDatasetVersionSequence::from_versions(&[9; 10]))),
+                ..Default::default()
+            },
+        )]));
+        let conflict_err = after_second_rewrite
+            .apply_step_checked(
+                &UserStep::new("append_more", whole_fragment(1)),
+                &conflicting_config,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            conflict_err
+                .to_string()
+                .contains("conflicts with lineage already loaded"),
+            "{conflict_err}"
+        );
+    }
+
+    #[test]
+    fn test_validation_handles_build_config_changes_and_cross_step_row_id_mismatch() {
+        let mut empty_base = frag_reuse::table(1, false);
+        empty_base.fragments = Arc::new(Vec::new());
+        empty_base.max_fragment_id = None;
+
+        let config_flags_on = default_build_config();
+        let mut config_flags_off = default_build_config();
+        config_flags_off.auto_set_feature_flags = false;
+
+        let state = ApplyState::at_read_version(Arc::new(empty_base), Vec::new(), &config_flags_on)
+            .unwrap();
+        let step_one = state
+            .apply_step_checked(
+                &UserStep::new("with_row_ids", whole_fragment_with_row_ids()),
+                &config_flags_on,
+            )
+            .unwrap();
+        let mismatch_err = step_one
+            .apply_step_checked(
+                &UserStep::new("without_row_ids", whole_fragment(1)),
+                &config_flags_on,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            mismatch_err
+                .to_string()
+                .contains("All fragments must have row ids"),
+            "{mismatch_err}"
+        );
+
+        let non_empty_base = frag_reuse::table(2, false);
+        let state =
+            ApplyState::at_read_version(Arc::new(non_empty_base), Vec::new(), &config_flags_off)
+                .unwrap();
+        let mut stepped = state
+            .apply_step_checked(
+                &UserStep::new("deferred_flag_check", whole_fragment_with_row_ids()),
+                &config_flags_off,
+            )
+            .unwrap();
+        let toggled_err = stepped
+            .validate_step_invariants(&config_flags_on)
+            .unwrap_err();
+        assert!(
+            toggled_err
+                .to_string()
+                .contains("All fragments must have row ids"),
+            "{toggled_err}"
+        );
+
+        let mut clustering_config = default_build_config();
+        clustering_config.clustering_definitions = Some(Vec::new());
+        let clustering_err = stepped
+            .validate_step_invariants(&clustering_config)
+            .unwrap_err();
+        assert!(
+            clustering_err
+                .to_string()
+                .contains("clustering definitions list can only be committed with UpdateConfig"),
+            "{clustering_err}"
+        );
+    }
+
+    #[test]
+    fn test_reset_recomputes_row_id_tally_and_preserves_overflow_check() {
+        let mut base = frag_reuse::table(2, true);
+        base.next_row_id = 1_000;
+        let config = default_build_config();
+
+        let mut state = ApplyState::at_read_version(Arc::new(base), Vec::new(), &config).unwrap();
+        state
+            .apply_step(&UserStep::new(
+                "carried_row_ids",
+                vec![
+                    Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                        id: Ref::Local(0),
+                        physical_rows: 10,
+                        row_id_meta: Some(RowIdMeta::Inline(
+                            write_row_ids(&(100..104).into()).into(),
+                        )),
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change: true,
+                    })),
+                    write_data(Ref::Local(0), FieldRef::Committed(0)),
+                ],
+            ))
+            .unwrap();
+        assert!(state.row_ids_need_dry_run);
+
+        state
+            .apply_step(&UserStep::new(
+                "reset",
+                vec![Action::ResetTable(ResetTable)],
+            ))
+            .unwrap();
+        assert!(!state.row_ids_need_dry_run);
+        assert_eq!(state.fresh_row_ids_added, 6);
+
+        let mut overflow_base = frag_reuse::table(1, true);
+        overflow_base.next_row_id = 0;
+        let mut overflow_state =
+            ApplyState::at_read_version(Arc::new(overflow_base), Vec::new(), &config).unwrap();
+        let huge_frag = |token| {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+                id: Ref::Local(token),
+                physical_rows: u64::MAX,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }))
+        };
+        overflow_state
+            .apply_step(&UserStep::new(
+                "overflow_then_reset",
+                vec![huge_frag(0), huge_frag(1), Action::ResetTable(ResetTable)],
+            ))
+            .unwrap();
+        assert!(overflow_state.row_ids_need_dry_run);
+        let err = overflow_state
+            .validate_step_invariants(&config)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("row id counter is exhausted"),
+            "{err}"
+        );
     }
 }

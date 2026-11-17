@@ -122,7 +122,7 @@ impl RefreshRowVersionMetadata {
                         new_version,
                         // The version scans read for a row with no sequence.
                         1,
-                        spilled,
+                        &spilled,
                     )?;
                 }
             }
