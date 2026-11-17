@@ -2849,6 +2849,7 @@ mod composite {
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream;
     use lance_core::datatypes::Field as LanceField;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
@@ -3505,7 +3506,8 @@ mod composite {
             ],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+        let test_uri = TempStrDir::default();
+        let dataset = InsertBuilder::new(test_uri.as_str())
             .with_params(&WriteParams {
                 data_storage_version: Some(LanceFileVersion::Legacy),
                 enable_stable_row_ids: true,
@@ -3540,13 +3542,17 @@ mod composite {
             .to_vec();
         assert_eq!(row_ids, vec![0, 1, 2, 3]);
 
-        let dataset = commit(
+        let committed = commit(
             dataset,
             vec![Action::DropField(DropField {
                 field: FieldRef::Committed(0),
             })],
         )
         .await;
+        // Reopen with a fresh session so the page table is loaded from the
+        // committed file, not from the cache the pre-commit read populated.
+        let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+        assert_eq!(dataset.version().version, committed.version().version);
 
         assert_eq!(dataset.schema().fields.len(), 1);
         assert!(dataset.schema().field("b").is_some());
