@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
+
 use itertools::{EitherOrBoth, Itertools};
 use lance_core::deepsize::DeepSizeOf;
 
@@ -319,6 +321,62 @@ impl std::ops::BitAnd for NullableRowAddrMask {
     }
 }
 
+impl std::ops::BitAnd<&Self> for NullableRowAddrMask {
+    type Output = Self;
+
+    fn bitand(self, rhs: &Self) -> Self::Output {
+        // Null handling:
+        // * null and true -> null
+        // * null and null -> null
+        // * null and false -> false
+        match (self, rhs) {
+            (Self::AllowList(mut a), Self::AllowList(b)) => {
+                a &= b;
+                Self::AllowList(a)
+            }
+            (Self::AllowList(mut allow), Self::BlockList(block)) => {
+                let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    (allow.nulls.clone() & &block.nulls) // null and null -> null
+                        | (allow.nulls - &block.selected) // null and true -> null
+                        | (block.nulls.clone() & &allow.selected) // true and null -> null
+                };
+                allow.selected -= &block.selected;
+                Self::AllowList(NullableRowAddrSet {
+                    selected: allow.selected,
+                    nulls,
+                })
+            }
+            (Self::BlockList(block), Self::AllowList(allow)) => {
+                let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    (allow.nulls.clone() & &block.nulls) // null and null -> null
+                        | (allow.nulls.clone() - &block.selected) // null and true -> null
+                        | (block.nulls & &allow.selected) // true and null -> null
+                };
+                let selected = allow.selected.clone() - &block.selected;
+                Self::AllowList(NullableRowAddrSet { selected, nulls })
+            }
+            (Self::BlockList(mut a), Self::BlockList(b)) => {
+                let nulls = if a.nulls.is_empty() && b.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    (a.nulls.clone() & &b.nulls) // null and null -> null
+                        | (a.nulls - &b.selected) // null and true -> null
+                        | (b.nulls.clone() - &a.selected) // true and null -> null
+                };
+                a.selected |= &b.selected;
+                Self::BlockList(NullableRowAddrSet {
+                    selected: a.selected,
+                    nulls,
+                })
+            }
+        }
+    }
+}
+
 impl std::ops::BitOr for NullableRowAddrMask {
     type Output = Self;
 
@@ -368,6 +426,120 @@ impl std::ops::BitOr for NullableRowAddrMask {
                 };
                 let selected = (a_false & b_false) | &nulls;
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
+            }
+        }
+    }
+}
+
+impl std::ops::BitOr<&Self> for NullableRowAddrMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: &Self) -> Self::Output {
+        // Null handling:
+        // * null or true -> true
+        // * null or null -> null
+        // * null or false -> null
+        match (self, rhs) {
+            (Self::AllowList(mut a), Self::AllowList(b)) => {
+                let nulls = if a.nulls.is_empty() && b.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    // null or null -> null (excluding rows that are true in either)
+                    let a_true = if a.nulls.is_empty() {
+                        Cow::Borrowed(&a.selected)
+                    } else {
+                        Cow::Owned(a.selected.clone() - &a.nulls)
+                    };
+                    let b_true = if b.nulls.is_empty() {
+                        Cow::Borrowed(&b.selected)
+                    } else {
+                        Cow::Owned(b.selected.clone() - &b.nulls)
+                    };
+                    let mut result_nulls = a.nulls | &b.nulls;
+                    result_nulls -= a_true.as_ref();
+                    result_nulls -= b_true.as_ref();
+                    result_nulls
+                };
+                a.selected |= &b.selected;
+                // Preserve invariant: NULL rows may only appear in `nulls` in inputs,
+                // so fold resulting `nulls` into `selected` as owned BitOr does.
+                if !nulls.is_empty() {
+                    a.selected |= &nulls;
+                }
+                Self::AllowList(NullableRowAddrSet {
+                    selected: a.selected,
+                    nulls,
+                })
+            }
+            (Self::AllowList(mut allow), Self::BlockList(block)) => {
+                if !allow.nulls.is_empty() {
+                    allow.selected -= &allow.nulls;
+                }
+                let mut block_false = block.selected.clone();
+                if !block.nulls.is_empty() {
+                    block_false -= &block.nulls;
+                }
+                let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    (allow.nulls & &block_false) | (block.nulls.clone() - &allow.selected)
+                };
+                block_false -= &allow.selected;
+                if !nulls.is_empty() {
+                    block_false |= &nulls;
+                }
+                Self::BlockList(NullableRowAddrSet {
+                    selected: block_false,
+                    nulls,
+                })
+            }
+            (Self::BlockList(mut block), Self::AllowList(allow)) => {
+                if !block.nulls.is_empty() {
+                    block.selected -= &block.nulls;
+                }
+                let allow_true = if allow.nulls.is_empty() {
+                    Cow::Borrowed(&allow.selected)
+                } else {
+                    Cow::Owned(allow.selected.clone() - &allow.nulls)
+                };
+                let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    (allow.nulls.clone() & &block.selected) | (block.nulls - allow_true.as_ref())
+                };
+                block.selected -= allow_true.as_ref();
+                if !nulls.is_empty() {
+                    block.selected |= &nulls;
+                }
+                Self::BlockList(NullableRowAddrSet {
+                    selected: block.selected,
+                    nulls,
+                })
+            }
+            (Self::BlockList(mut a), Self::BlockList(b)) => {
+                if !a.nulls.is_empty() {
+                    a.selected -= &a.nulls;
+                }
+                let b_false = if b.nulls.is_empty() {
+                    Cow::Borrowed(&b.selected)
+                } else {
+                    Cow::Owned(b.selected.clone() - &b.nulls)
+                };
+                let nulls = if a.nulls.is_empty() && b.nulls.is_empty() {
+                    RowAddrTreeMap::new() // Fast path
+                } else {
+                    (a.nulls.clone() & b_false.as_ref())
+                        | (b.nulls.clone() & &a.selected)
+                        | (a.nulls & &b.nulls)
+                };
+                a.selected &= b_false.as_ref();
+                if !nulls.is_empty() {
+                    a.selected |= &nulls;
+                }
+                Self::BlockList(NullableRowAddrSet {
+                    selected: a.selected,
+                    nulls,
+                })
             }
         }
     }
@@ -1000,5 +1172,89 @@ mod tests {
         let result = block1 | block2;
         // OR of BlockLists: BlockList([1,2] & [2,3]) = BlockList([2])
         assert_mask_selects(&result, &[1, 3, 4], &[2]);
+    }
+
+    #[test]
+    fn test_borrowed_rhs_ops_match_owned_all_variants() {
+        // Include rows where NULL appears in `selected` and where NULL appears ONLY in `nulls`.
+        let cases = [
+            allow(&[1, 2, 3], &[]),
+            allow(&[1, 2, 3], &[2]),
+            allow(&[1, 3], &[2, 4]),
+            allow(&[], &[5]),
+            allow(&[], &[]),
+            block(&[1, 2, 3], &[]),
+            block(&[1, 2, 3], &[2]),
+            block(&[1, 3], &[2, 4]),
+            block(&[], &[5]),
+            block(&[], &[]),
+        ];
+
+        for lhs in &cases {
+            for rhs in &cases {
+                let owned_and = lhs.clone() & rhs.clone();
+                let borrowed_and = lhs.clone() & rhs;
+                assert_eq!(
+                    borrowed_and, owned_and,
+                    "AND mismatch for {lhs:?} & {rhs:?}"
+                );
+                assert_eq!(
+                    !borrowed_and.clone(),
+                    !owned_and.clone(),
+                    "NOT(AND) mismatch for {lhs:?} & {rhs:?}"
+                );
+
+                let owned_or = lhs.clone() | rhs.clone();
+                let borrowed_or = lhs.clone() | rhs;
+                assert_eq!(borrowed_or, owned_or, "OR mismatch for {lhs:?} | {rhs:?}");
+                assert_eq!(
+                    !borrowed_or.clone(),
+                    !owned_or.clone(),
+                    "NOT(OR) mismatch for {lhs:?} | {rhs:?}"
+                );
+
+                // Specifically verify `selected` includes `nulls` after BitOr (preserving
+                // the invariant when NULL was only in `nulls`).
+                let (borrowed_sel, borrowed_nulls) = match &borrowed_or {
+                    NullableRowAddrMask::AllowList(s) | NullableRowAddrMask::BlockList(s) => {
+                        (s.selected_rows(), s.null_rows())
+                    }
+                };
+                assert!(
+                    (borrowed_nulls.clone() - borrowed_sel).is_empty(),
+                    "BitOr must keep nulls inside selected: {borrowed_or:?}"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn borrowed_rhs_matches_owned_kleene_across_fragments(
+            lhs_is_block in any::<bool>(),
+            rhs_is_block in any::<bool>(),
+            selected_left in prop::collection::btree_set(0_u64..24, 0..24),
+            selected_right in prop::collection::btree_set(0_u64..24, 0..24),
+            nulls_left in prop::collection::btree_set(0_u64..24, 0..24),
+            nulls_right in prop::collection::btree_set(0_u64..24, 0..24),
+        ) {
+            let address = |id: &u64| ((*id / 8) << 32) | (*id % 8);
+            let make_mask = |is_block: bool, selected: &BTreeSet<u64>, nulls: &BTreeSet<u64>| {
+                let set = NullableRowAddrSet::new(
+                    selected.iter().map(address).collect(),
+                    nulls.iter().map(address).collect(),
+                );
+                if is_block {
+                    NullableRowAddrMask::BlockList(set)
+                } else {
+                    NullableRowAddrMask::AllowList(set)
+                }
+            };
+            let lhs = make_mask(lhs_is_block, &selected_left, &nulls_left);
+            let rhs = make_mask(rhs_is_block, &selected_right, &nulls_right);
+
+            prop_assert_eq!(lhs.clone() & &rhs, lhs.clone() & rhs.clone());
+            prop_assert_eq!(lhs.clone() | &rhs, lhs | rhs);
+        }
     }
 }
