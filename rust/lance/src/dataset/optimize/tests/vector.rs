@@ -1615,7 +1615,8 @@ async fn test_ivf_hnsw_sq_defer_compaction_merge_only() {
 }
 
 /// Deletions spread through every partition drop rows from the storage as it
-/// loads, so the HNSW graph must be realigned with the shifted positions.
+/// loads, so the HNSW graph must be realigned with the shifted positions and
+/// stay connected.
 #[rstest]
 #[case::sq(VectorIndexParams::with_ivf_hnsw_sq_params(
     DistanceType::L2,
@@ -1637,13 +1638,17 @@ async fn test_ivf_hnsw_sq_defer_compaction_merge_only() {
 async fn test_ivf_hnsw_defer_compaction_with_deletions(
     #[case] params: VectorIndexParams,
     #[values(false, true)] prewarm: bool,
+    // Deleting 95% of rows removes most transit nodes, which strands survivors
+    // unless the realigned graph is repaired.
+    #[values(("id % 3 = 0", 8), ("id % 20 != 0", 5))] deletion: (&str, usize),
 ) {
+    let (delete_predicate, min_overlap) = deletion;
     // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
     Box::pin(check_vector_defer_compaction(
         params,
-        Some("id % 3 = 0"),
+        Some(delete_predicate),
         10,
-        8,
+        min_overlap,
         prewarm,
     ))
     .await;

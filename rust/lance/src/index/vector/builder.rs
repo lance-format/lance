@@ -247,13 +247,16 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
             .collect(),
         None => remapped_ids,
     };
-    let num_deleted = new_ids.len() - num_kept as usize;
+    // A graph covering only a prefix of its storage keeps fewer nodes than the
+    // storage survivors and falls back to a rebuild for full coverage.
+    let num_kept = new_ids.iter().flatten().count();
+    let num_deleted = new_ids.len() - num_kept;
     // Repairing or rebuilding the graph scores rows pairwise, staged from the centroid.
     let staged = || match index.ivf_model().centroid(partition_id) {
         Some(centroid) => storage.clone().with_centroid(centroid.as_ref()),
         None => Ok(storage.clone()),
     };
-    if num_kept as usize == storage.len() {
+    if num_kept == storage.len() {
         let repaired = if num_deleted == 0 {
             remap_graph_batch(&graph, &new_ids)
         } else {

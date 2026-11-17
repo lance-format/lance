@@ -28,7 +28,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::remap::remap_graph_batch;
+use super::remap::remap_graph_repair;
 use super::{
     HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
 };
@@ -1723,8 +1723,14 @@ impl IvfSubIndex for HNSW {
         }))
     }
 
-    fn remap_positions(data: RecordBatch, new_ids: &[Option<u32>]) -> Result<RecordBatch> {
-        remap_graph_batch(&data, new_ids)
+    /// Dropping the removed nodes alone can strand survivors whose every path
+    /// from the entry point ran through them, so damaged nodes are reconnected.
+    fn remap_positions(
+        data: RecordBatch,
+        new_ids: &[Option<u32>],
+        storage: &impl VectorStore,
+    ) -> Result<RecordBatch> {
+        remap_graph_repair(&data, new_ids, storage)
     }
 
     #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]

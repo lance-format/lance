@@ -602,7 +602,8 @@ fn level_from_rows<S: VectorStore>(
 /// parallel insert.
 ///
 /// `storage` is the remapped partition, in the new local-id order `new_ids`
-/// assigns. With no deletions the input batch is returned unchanged.
+/// assigns; rows past the last kept node are ones the graph never reached.
+/// With no deletions the input batch is returned unchanged.
 pub fn remap_graph_repair<S: VectorStore + Sync>(
     graph: &RecordBatch,
     new_ids: &[Option<u32>],
@@ -613,7 +614,9 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
         return Ok(graph.clone());
     }
     let kept = new_ids.iter().filter(|id| id.is_some()).count();
-    if storage.len() != kept {
+    // Storage may hold rows past the graph's last node, which the graph never
+    // reached; it only has to hold every node the graph keeps.
+    if storage.len() < kept {
         return Err(Error::invalid_input(format!(
             "remapped storage has {} rows but the graph kept {kept} nodes",
             storage.len()
