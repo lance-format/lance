@@ -142,13 +142,12 @@ mod common {
         lance_arrow::json::parse_json_path(path).map_err(|e| execution_error(e.to_string()))
     }
 
-    /// The parse of the JSONPath string the previous row used.
+    /// Caches the parse of the previous row's JSONPath string.
     ///
     /// A scalar path argument reaches the row loops as a 1-element array that
-    /// [`get_string_value_at`] broadcasts to every row, and a path column often
-    /// repeats one string, so a row whose path equals the previous row's reuses
-    /// that parse. Parsing stays lazy, so an invalid path still errors only at
-    /// the first row that uses it.
+    /// [`get_string_value_at`] broadcasts to every row, so a row whose path
+    /// equals the previous row's reuses that parse. Parsing stays lazy, so an
+    /// invalid path still errors only at the first row that uses it.
     #[derive(Default)]
     pub struct PathCache<'a> {
         last: Option<(&'a str, JsonPath<'a>)>,
@@ -165,7 +164,7 @@ mod common {
     }
 
     // Test-only count of parse_json_path invocations, used to assert that a
-    // repeated path is parsed once per batch instead of once per row.
+    // repeated path is parsed once per run of equal paths instead of once per row.
     // Thread-local so parallel test threads do not pollute each other's
     // counts (the row loops are synchronous, so one test stays on one thread).
     #[cfg(test)]
