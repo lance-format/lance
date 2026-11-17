@@ -81,7 +81,6 @@
 //! the successful tasks can be committed. You can also commit in batches if
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::index::DatasetIndexRemapperOptions;
@@ -103,6 +102,7 @@ mod repack;
 
 pub use commit::commit_compaction;
 use execution::refuse_stale_output_clustering;
+#[cfg(test)]
 use execution::rewrite_files;
 pub use execution::{CompactionMetrics, CompactionTask, RepackedFiles, RewriteResult};
 use planning::validate_fragment_groups_preserve_index_boundaries;
@@ -239,21 +239,11 @@ async fn compact_planned(
     let snapshot = &dataset.clone();
 
     // One stage for all tasks: they run side by side, so their peaks could not
-    // be told apart anyway. The tasks dispatch on their kind here instead of
-    // through `CompactionTask::execute`, which observes each task as an
-    // operation of its own for distributed execution.
+    // be told apart anyway. The internal executor preserves each task's read
+    // version without observing it as a separate distributed operation.
     let rewrite_stage = stages.start("rewrite_files");
     let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.compaction_tasks())
-        .map(|task| async move {
-            match &task.task.kind {
-                CompactionTaskKind::RewriteFragments => {
-                    rewrite_files(Cow::Borrowed(snapshot), task.task.clone(), &task.options).await
-                }
-                CompactionTaskKind::RepackColumns { files } => {
-                    repack::execute_repack(snapshot, &task.task, files, &task.options).await
-                }
-            }
-        })
+        .map(|task| async move { task.execute_inner(snapshot).await })
         .buffer_unordered(concurrency)
         .try_collect()
         .await?;

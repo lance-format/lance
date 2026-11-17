@@ -340,6 +340,20 @@ impl CompactionTask {
     /// compaction was planned).
     pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
         let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+        let stage_name = match &self.task.kind {
+            CompactionTaskKind::RewriteFragments => "rewrite_files",
+            CompactionTaskKind::RepackColumns { .. } => "repack_files",
+        };
+        let stage = scope.stages().start(stage_name);
+        let result = self.execute_inner(dataset).await?;
+        stage.complete();
+        scope.finish();
+        Ok(result)
+    }
+
+    // Both whole-plan and standalone execution must read the planned snapshot
+    // so conflict checking includes every write committed since planning.
+    pub(super) async fn execute_inner(&self, dataset: &Dataset) -> Result<RewriteResult> {
         let dataset = if dataset.manifest.version == self.read_version {
             Cow::Borrowed(dataset)
         } else {
@@ -347,19 +361,10 @@ impl CompactionTask {
         };
         match &self.task.kind {
             CompactionTaskKind::RewriteFragments => {
-                let rewrite_stage = scope.stages().start("rewrite_files");
-                let result = rewrite_files(dataset, self.task.clone(), &self.options).await?;
-                rewrite_stage.complete();
-                scope.finish();
-                Ok(result)
+                rewrite_files(dataset, self.task.clone(), &self.options).await
             }
             CompactionTaskKind::RepackColumns { files } => {
-                let repack_stage = scope.stages().start("repack_files");
-                let result =
-                    repack::execute_repack(&dataset, &self.task, files, &self.options).await?;
-                repack_stage.complete();
-                scope.finish();
-                Ok(result)
+                repack::execute_repack(&dataset, &self.task, files, &self.options).await
             }
         }
     }
