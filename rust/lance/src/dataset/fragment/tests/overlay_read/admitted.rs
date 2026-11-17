@@ -15,6 +15,7 @@ use super::*;
 mod deletions;
 mod markers;
 mod row_ids;
+mod row_versions;
 
 fn payload(prefix: &str, rows: usize, nested: bool, null_at: usize) -> ArrayRef {
     let values = (0..rows)
@@ -322,7 +323,7 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
     assert_eq!(budget.reserved(), 0);
     // Row-version readers require stable IDs before reaching the admitted API.
     let version_dataset = write_payload_dataset(LanceFileVersion::V2_3, false, true).await;
-    let version_reader = version_dataset
+    let mut version_reader = version_dataset
         .get_fragment(0)
         .unwrap()
         .open(
@@ -334,6 +335,10 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
         )
         .await
         .unwrap();
+    let mut fragment = version_reader.fragment.as_ref().clone();
+    fragment.metadata.created_at_version_meta =
+        Some(lance_table::rowids::version::RowDatasetVersionMeta::Column);
+    version_reader.fragment = Arc::new(fragment);
     let error = version_reader
         .try_take_admitted_fullzip(
             &UInt32Array::from(vec![0]),
@@ -342,7 +347,7 @@ async fn admitted_fragment_rejects_invalid_or_unsupported_requests_without_fallb
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSupported { .. }));
-    assert!(error.to_string().contains("row-version columns"));
+    assert!(error.to_string().contains("spilled version columns"));
     assert_eq!(budget.reserved(), 0);
 }
 

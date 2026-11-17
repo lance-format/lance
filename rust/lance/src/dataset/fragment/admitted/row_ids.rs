@@ -179,7 +179,7 @@ impl PreparedRowIds {
     }
 }
 
-fn row_array(
+pub(super) fn row_array(
     credit: &mut Reservation,
     count: usize,
     mut values: impl Iterator<Item = u64>,

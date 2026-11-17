@@ -10,6 +10,7 @@ use super::*;
 
 mod deletions;
 mod row_ids;
+mod row_versions;
 
 impl FragmentReader {
     /// Take sorted unique physical offsets within one already-admitted workspace.
@@ -47,8 +48,12 @@ impl FragmentReader {
     /// supported. Shared sequence metadata is outside this payload budget, but
     /// generated values reserve credit alongside inputs and retain it through
     /// their final Arrow alias. Non-stable IDs and addresses share one buffer.
-    /// Struct ancestors, generated row-version columns,
-    /// missing-column synthesis and legacy readers are explicitly unsupported.
+    /// Row-version outputs use inline reader snapshots (or version 1 when absent),
+    /// with credit reserved before payload reads. Deletion markers do not null
+    /// version values. Shared inline metadata is outside this payload budget;
+    /// spilled version columns are unsupported even if already cached by open.
+    /// Struct ancestors, missing-column synthesis and legacy readers are
+    /// explicitly unsupported.
     /// No query/scanner default is changed. The caller accounts for the borrowed
     /// selection's physical storage; metadata/transport/cache/allocator overhead
     /// remain outside this payload bound. Performance is not qualified.
@@ -71,11 +76,6 @@ impl FragmentReader {
     ) -> Result<Option<RecordBatch>> {
         let mut read_selection =
             OverlayReadSelection::from_sorted_indices(indices, self.num_physical_rows as u64)?;
-        if self.with_row_created_at_version || self.with_row_last_updated_at_version {
-            return Err(Error::not_supported(
-                "admitted fragment take does not yet compose row-version columns",
-            ));
-        }
         if self.make_deletions_null && !self.with_row_id && !self.with_row_addr {
             return Err(Error::invalid_input(
                 "deletion markers require with_row_id or with_row_address",
@@ -101,6 +101,11 @@ impl FragmentReader {
         }
         let indices = live_indices;
         let schema = Arc::new(self.output_schema.clone());
+        let Some(row_versions) =
+            row_versions::PreparedRowVersions::try_prepare(self, indices.len(), &mut workspace)?
+        else {
+            return Ok(None);
+        };
         let Some(row_ids) =
             row_ids::PreparedRowIds::try_prepare(self, &indices, &mut workspace).await?
         else {
@@ -111,6 +116,7 @@ impl FragmentReader {
         let mut file_columns = Vec::new();
         let mut covered = vec![false; schema.fields().len()];
         row_ids.mark_columns(&mut covered);
+        row_versions.mark_columns(&mut covered);
         for reader in &self.readers {
             if reader.projection().fields.is_empty() {
                 continue;
@@ -130,7 +136,7 @@ impl FragmentReader {
         }
         if covered.is_empty() || covered.iter().any(|covered| !covered) {
             return Err(Error::not_supported(
-                "admitted fragment take requires stored payload or generated IDs for every output field",
+                "admitted fragment take requires stored payload or generated columns for every output field",
             ));
         }
         let selection = OverlayBatchSelection::Indices(indices.clone());
@@ -184,6 +190,7 @@ impl FragmentReader {
                 }
             }
             row_ids.fill_columns(&indices, &mut columns)?;
+            row_versions.fill_columns(&indices, &mut columns)?;
             let columns = columns
                 .into_iter()
                 .map(|column| {
