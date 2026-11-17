@@ -153,6 +153,10 @@ reqwest = { workspace = true, features = ["rustls"] }
 name = "arrow_ordering"
 test = false
 
+[[test]]
+name = "memory_components"
+required-features = ["metrics"]
+
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]

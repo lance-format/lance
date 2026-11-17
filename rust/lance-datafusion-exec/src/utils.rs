@@ -243,6 +243,9 @@ pub const PARTITIONS_RANKED_METRIC: &str = "partitions_ranked";
 pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
 pub const INDEX_CACHE_HITS_METRIC: &str = "index_cache_hits";
 pub const INDEX_CACHE_MISSES_METRIC: &str = "index_cache_misses";
+/// Recorded by no operator: the summary of an execution reports it, see
+/// [`crate::exec::ExecutionSummaryCounts::peak_reserved_bytes`].
+pub const PEAK_RESERVED_BYTES_METRIC: &str = "peak_reserved_bytes";
 pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
 pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
 pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";

@@ -409,6 +409,40 @@ async fn row_addr_mask_plain_scan_rejected_on_legacy() {
 }
 
 #[rstest]
+#[case::row_addresses(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn row_addr_mask_empty_range(#[case] stable_row_ids: bool) {
+    let dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_ram_dataset_with_params(
+            FragmentCount::from(2),
+            FragmentRowCount::from(2),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let empty = RowAddrTreeMap::from(0..0);
+    let mut scan = dataset.scan();
+    scan.with_row_id_prefilter(RowAddrMask::from_allowed(empty.clone()));
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut scan = dataset.scan();
+    scan.with_row_id_prefilter(RowAddrMask::from_block(empty));
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["i"].as_primitive::<Int32Type>().values(),
+        &[0, 1, 2, 3]
+    );
+}
+
+#[rstest]
 #[case::without_stable_row_ids(false)]
 #[case::with_stable_row_ids(true)]
 #[tokio::test]
@@ -1937,6 +1971,57 @@ async fn test_limit_with_ordering_not_pushed_down() {
     assert_eq!(unsorted_values[0], 50);
     assert_eq!(unsorted_values[1], 20);
     assert_eq!(unsorted_values[2], 80);
+}
+
+#[rstest]
+#[case::plain(None, false, None)]
+#[case::filtered(Some("id > 2"), false, None)]
+#[case::full_text(None, true, None)]
+#[case::full_text_candidates(None, true, Some(4))]
+#[tokio::test]
+async fn test_zero_limit_with_ordering(
+    #[case] filter: Option<&str>,
+    #[case] has_full_text_query: bool,
+    #[case] candidate_limit: Option<i64>,
+    #[values(None, Some(0), Some(2))] offset: Option<i64>,
+    #[values(false, true)] is_sort_column_projected: bool,
+) {
+    let dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("text", array::cycle_utf8_literals(&["needle"]))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+        .await
+        .unwrap();
+
+    let columns = if is_sort_column_projected {
+        vec!["id", "text"]
+    } else {
+        vec!["text"]
+    };
+    let mut scanner = dataset.scan();
+    scanner.project(&columns).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+        .unwrap();
+    if let Some(filter) = filter {
+        scanner.filter(filter).unwrap();
+    }
+    if has_full_text_query {
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap();
+    }
+    let expected_schema = scanner.schema().await.unwrap();
+    scanner.limit(Some(0), offset).unwrap();
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), expected_schema);
 }
 
 #[tokio::test]

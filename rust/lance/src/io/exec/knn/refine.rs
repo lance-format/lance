@@ -134,10 +134,10 @@ impl BatchRefineExec {
         let mut heaps = (0..self.query_count)
             .map(|_| BinaryHeap::<BatchKnnCandidate>::new())
             .collect::<Vec<_>>();
-        let projection = ProjectionRequest::from_columns(
+        let projection = ProjectionRequest::try_from_columns(
             [self.query.column.as_str(), ROW_ID],
             self.dataset.schema(),
-        );
+        )?;
         let mut peak_bytes = 0;
         while let Some(batch) = input.next().await {
             let batch = batch?;

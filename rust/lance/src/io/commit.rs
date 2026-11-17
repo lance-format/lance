@@ -34,7 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
-use lance_table::feature_flags::ensure_can_write_manifest;
+use lance_table::feature_flags::{CoveringContract, ensure_can_write_manifest};
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
     WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
@@ -489,10 +489,11 @@ async fn do_commit_new_dataset(
             let reader = source_store.open(&source_manifest_location.path).await?;
             let section: pb::IndexSection =
                 lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            let contract = CoveringContract::of(&source_manifest);
             section
                 .indices
                 .into_iter()
-                .map(IndexMetadata::try_from)
+                .map(|proto| IndexMetadata::from_manifest_proto(proto, contract))
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![]
@@ -1747,6 +1748,11 @@ async fn record_successful_commit(
             store_identity: &dataset.object_store.store_prefix,
             e_tag: location.e_tag.as_deref(),
         };
+        let contract = CoveringContract::of(manifest);
+        let indices = indices
+            .into_iter()
+            .map(|index| index.into_stored_shape(contract))
+            .collect::<Vec<_>>();
         dataset
             .index_cache
             .insert_with_key(&key, Arc::new(indices))
@@ -1905,6 +1911,11 @@ pub(crate) async fn commit_transaction(
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
             rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            // A retry's window starts after its previous attempt, so it would
+            // miss the moves recorded there; not tracking only costs coverage.
+            if checked_since == read_version && missing.is_empty() {
+                rebase.track_moved_files();
+            }
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.
             if identity_fence.is_some() && !missing.is_empty() {
@@ -2867,6 +2878,56 @@ mod tests {
         // Rename is default for memory
         let handler = Arc::new(RenameCommitHandler);
         test_commit_handler(handler, true).await;
+    }
+
+    /// The rename handler's staging object is not the object readers resolve:
+    /// a store without atomic rename publishes by copy, so the staging ETag
+    /// need not describe the final path. The location returned by a successful
+    /// commit must describe the published object, or writer and reader disagree
+    /// on the manifest generation token.
+    #[tokio::test]
+    async fn test_rename_commit_handler_reports_published_e_tag() {
+        let temp_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int64,
+            false,
+        )]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema),
+            temp_dir.as_str(),
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let published = dataset.manifest_location();
+        let resolved = dataset
+            .commit_handler
+            .resolve_version_location(
+                &dataset.base,
+                dataset.manifest.version,
+                &dataset.object_store.inner,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            published.e_tag.is_some(),
+            "the local store reports a generation token for the published manifest"
+        );
+        assert_eq!(
+            published.e_tag, resolved.e_tag,
+            "the commit must report the published object's generation token"
+        );
     }
 
     #[tokio::test]

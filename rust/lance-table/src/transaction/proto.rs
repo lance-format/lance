@@ -190,11 +190,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -376,15 +376,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 }
             }
-            // `data_change` is not acted on yet: every replacement is still
-            // applied as a data change.
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements, .. },
+                pb::transaction::DataReplacement {
+                    replacements,
+                    data_change,
+                },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
+                data_change: data_change.unwrap_or(true),
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
                 pb::transaction::UpdateMemWalState {
@@ -595,11 +597,14 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                new_indices: new_indices
+                    .iter()
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .iter()
-                    .map(pb::IndexMetadata::from)
-                    .collect(),
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
             }),
             Operation::Merge {
                 fragments,
@@ -697,15 +702,18 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata: Default::default(),
                 field_metadata: Default::default(),
             }),
-            Operation::DataReplacement { replacements } => {
-                pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
-                    replacements: replacements
-                        .iter()
-                        .map(pb::transaction::DataReplacementGroup::from)
-                        .collect(),
-                    data_change: None,
-                })
-            }
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
+                replacements: replacements
+                    .iter()
+                    .map(pb::transaction::DataReplacementGroup::from)
+                    .collect(),
+                // Written only when false, so a transaction file from a data
+                // changing replacement stays byte-identical to an older writer's.
+                data_change: (!data_change).then_some(false),
+            }),
             Operation::DataOverlay { groups } => {
                 pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
                     groups: groups
@@ -848,8 +856,131 @@ impl TryFrom<&Transaction> for crate::format::Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::CoveringContract;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::test_support::sample_index_metadata;
+
+    #[rstest::rstest]
+    #[case::suffix(CoveringContract::Suffix, vec![7, 11], vec![11], vec![7])]
+    #[case::keys_only(CoveringContract::Independent, vec![7], vec![11], vec![7])]
+    #[case::carries_its_key(CoveringContract::Independent, vec![7], vec![7, 11], vec![7])]
+    #[case::tail_shaped(CoveringContract::Independent, vec![7, 11], vec![11], vec![7, 11])]
+    fn test_create_index_entries_roundtrip_in_the_suffix_layout(
+        #[case] contract: CoveringContract,
+        #[case] stored_fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] keys: Vec<i32>,
+    ) {
+        let mut stored = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        stored.fields = stored_fields;
+        stored.covering_fields = covering_fields.clone();
+        let entry = IndexMetadata::from_manifest_proto(stored, contract).unwrap();
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![entry],
+            },
+            None,
+        );
+
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        let Some(pb::transaction::Operation::CreateIndex(written)) = &message.operation else {
+            panic!("expected CreateIndex, got {:?}", message.operation);
+        };
+        let suffix_layout = [keys.as_slice(), &covering_fields].concat();
+        for entry in written.new_indices.iter().chain(&written.removed_indices) {
+            assert_eq!(entry.fields, suffix_layout);
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Suffix).unwrap();
+        }
+
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = Transaction::try_from(message).unwrap().operation
+        else {
+            panic!("expected CreateIndex");
+        };
+        for entry in new_indices.iter().chain(&removed_indices) {
+            assert_eq!(entry.keyed_fields(), keys);
+            assert_eq!(entry.covering_fields, covering_fields);
+        }
+    }
+
+    /// Appending the carried fields to an entry with no keys would write one
+    /// that reads back keyed on its carried field.
+    #[test]
+    fn test_create_index_entry_without_keys_is_not_encoded() {
+        let entry = IndexMetadata {
+            fields: vec![],
+            covering_fields: vec![11],
+            ..sample_index_metadata("covered")
+        };
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let error = pb::Transaction::try_from(&transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("at least one field must remain indexed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A transaction file holds only the suffix layout, so decoding one refuses
+    /// an entry that only a manifest under the independent contract may store.
+    #[rstest::rstest]
+    #[case::keys_only(vec![7], vec![11], "covering fields [11] but [11] are not among its fields [7]")]
+    #[case::no_key(vec![11], vec![11], "covering fields [11] but its fields are [11]; at least one field must remain indexed")]
+    #[case::carried_field_not_last(vec![7, 11], vec![7], "covering fields [7] which are not the trailing entries of [7, 11]")]
+    fn test_create_index_entry_outside_the_suffix_layout_is_refused(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_error: &str,
+    ) {
+        let mut entry = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        entry.fields = fields.clone();
+        entry.covering_fields = covering_fields;
+        let manifest_entry =
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Independent)
+                .unwrap();
+        assert_eq!(manifest_entry.keyed_fields(), fields);
+
+        for create_index in [
+            pb::transaction::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![],
+            },
+            pb::transaction::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![entry],
+            },
+        ] {
+            let error = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::CreateIndex(create_index)),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "expected InvalidInput, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error}"
+            );
+        }
+    }
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -922,6 +1053,46 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    /// `data_change` survives the round trip, and a transaction written
+    /// before the field existed reads back as a data change.
+    #[rstest::rstest]
+    #[case::moved(false)]
+    #[case::changed(true)]
+    fn test_data_replacement_data_change_roundtrips(#[case] data_change: bool) {
+        let transaction = Transaction::new(
+            1,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("new.lance", vec![3], None),
+                )],
+                data_change,
+            },
+            None,
+        );
+        let mut message = pb::Transaction::try_from(&transaction).unwrap();
+        let decoded = Transaction::try_from(message.clone()).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            Operation::DataReplacement { data_change: d, .. } if d == data_change
+        ));
+
+        if let Some(pb::transaction::Operation::DataReplacement(replacement)) =
+            message.operation.as_mut()
+        {
+            assert_eq!(replacement.data_change, (!data_change).then_some(false));
+            replacement.data_change = None;
+        }
+        let legacy = Transaction::try_from(message).unwrap();
+        assert!(matches!(
+            legacy.operation,
+            Operation::DataReplacement {
+                data_change: true,
+                ..
+            }
+        ));
     }
 
     #[test]

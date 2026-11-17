@@ -829,6 +829,7 @@ async fn rebuild_scalar_segment(
             Some(fragment_ids),
             &update_criteria.data_criteria,
             &index_store,
+            &NoopIndexBuildProgress,
         )
         .await;
     }
@@ -905,6 +906,16 @@ pub fn select_segments_to_merge<'a>(
         }
     }
     selected
+}
+
+/// Whether a scalar index can merge multiple segments without rescanning their data.
+fn has_segment_merge_primitive(index_type: IndexType) -> bool {
+    match index_type {
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram => true,
+        #[cfg(feature = "geo")]
+        IndexType::RTree => true,
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1070,12 +1081,6 @@ async fn merge_scalar_indices<'a>(
     rebuild_frags |= &effective_old_frags;
     let new_uuid = Uuid::new_v4();
 
-    // Scalar Index that expos an N:1 segment-merge primitive reachable without
-    // rescanning the dataset
-    let has_segment_merge_primitive = matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram
-    );
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
@@ -1102,6 +1107,39 @@ async fn merge_scalar_indices<'a>(
             .iter()
             .any(|segment| segment.index_version < ZoneMapIndexVersion::CURRENT as i32);
 
+    // Two or more bloom filter segments merge by their zones unless only a
+    // rebuild catches the index up (a pending compaction remap, since the
+    // merge keeps the oldest source version, or a segment without null rows)
+    // or the merge would refuse them (a tagged history, other parameters).
+    let is_bloomfilter_mergeable = if index_type == IndexType::BloomFilter
+        && selected_old_indices.len() >= 2
+        && !is_remappable
+        && tagged_coverage.is_none()
+        && selected_old_indices
+            .iter()
+            .all(|segment| segment.fragment_bitmap.is_some())
+        && !frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
+            fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
+        }) {
+        let reference = selected_old_indices[0];
+        crate::index::scalar::bloomfilter::segments_merge_by_zones(
+            dataset.as_ref(),
+            reference,
+            &selected_old_indices,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "Rebuilding index '{}' instead of merging its bloom filter segments, \
+                 whose metadata cannot be read: {error}",
+                reference.name
+            );
+            false
+        })
+    } else {
+        false
+    };
+
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
     //   - `effective_old_frags`: the selected segments' coverage intersected
@@ -1109,8 +1147,9 @@ async fn merge_scalar_indices<'a>(
     //   - `update_criteria` only requires the newly appended data. Indexes that
     //     need old data must rebuild over `frag_bitmap` so the scanned rows
     //     exactly match the segment coverage being committed.
-    //   - `has_segment_merge_primitive` (Indices supports N:1 segments merge) OR
-    //     `selected_old_indices.len() == 1` (any scalar type can `update` one).
+    //   - `has_segment_merge_primitive` or `is_bloomfilter_mergeable` (an N:1
+    //     segment merge applies) OR `selected_old_indices.len() == 1` (any
+    //     scalar type can `update` one).
     // Otherwise (e.g. ≥2 selected segments of a type without an N:1 merge
     // primitive) the index is rebuilt from scratch over `frag_bitmap`.
     let can_merge_segments = !effective_old_frags.is_empty()
@@ -1118,7 +1157,9 @@ async fn merge_scalar_indices<'a>(
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
         && !zonemap_requires_rebuild
-        && (has_segment_merge_primitive || selected_old_indices.len() == 1);
+        && (has_segment_merge_primitive(index_type)
+            || is_bloomfilter_mergeable
+            || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
     // produced:
@@ -1217,6 +1258,22 @@ async fn merge_scalar_indices<'a>(
             };
 
             match index_type {
+                IndexType::BloomFilter if is_bloomfilter_mergeable => {
+                    let fragment_filters = crate::index::scalar::bloomfilter::effective_coverage(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                    )?;
+                    crate::index::scalar::bloomfilter::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &fragment_filters,
+                        None,
+                    )
+                    .await?
+                }
                 IndexType::BTree => {
                     let (_, old_data_filters) = build_per_segment_filters(
                         dataset.as_ref(),
@@ -1268,6 +1325,27 @@ async fn merge_scalar_indices<'a>(
                     let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                #[cfg(feature = "geo")]
+                IndexType::RTree => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        address_domain,
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    crate::index::scalar::rtree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
@@ -2320,7 +2398,8 @@ mod tests {
     use lance_index::{
         IndexType,
         scalar::{
-            BuiltinIndexType, InvertedIndexParams, ScalarIndexParams, SearchResult, TextQuery,
+            BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+            SearchResult, TextQuery,
         },
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
@@ -6287,6 +6366,77 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::addresses(false)]
+    #[case::stable_ids(true)]
+    #[tokio::test]
+    async fn test_optimize_fts_consolidates_single_row_appends(#[case] stable_ids: bool) {
+        let batch = |id| {
+            arrow_array::record_batch!(("id", Int32, [id]), ("body", Utf8, ["common text"]))
+                .unwrap()
+        };
+        let initial = batch(0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: stable_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["body"],
+                IndexType::Inverted,
+                Some("body_idx".to_owned()),
+                &InvertedIndexParams::default().num_workers(1),
+                false,
+            )
+            .await
+            .unwrap();
+        for step in 1..6 {
+            let batch = batch(step);
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+            if step == 3 {
+                dataset.delete("id = 1").await.unwrap();
+            }
+            dataset
+                .optimize_indices(&OptimizeOptions::default().num_indices_to_merge(Some(1)))
+                .await
+                .unwrap();
+            let metadata = dataset
+                .load_index_by_name("body_idx")
+                .await
+                .unwrap()
+                .unwrap();
+            let index = dataset
+                .open_scalar_index_for_maintenance("body", &metadata.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert_eq!(
+                index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .partition_count(),
+                1
+            );
+            let mut scan = dataset.scan();
+            scan.full_text_search(FullTextSearchQuery::new("common".to_owned()))
+                .unwrap();
+            let expected = if step < 3 { step + 1 } else { step };
+            assert_eq!(scan.count_rows().await.unwrap(), expected as u64);
+        }
+    }
+
     /// Same multi-segment gap for FTS, which takes the separate Inverted dispatch
     /// path. One Inverted segment per fragment; an update to the older segment's
     /// fragment must not leave its old-token postings searchable.
@@ -7342,5 +7492,85 @@ mod tests {
                 "bitmap merge returned stale rows for cat = {cat}"
             );
         }
+    }
+
+    /// A column repack writes an indexed column's seed into the new file it
+    /// moves the column to, which need not be the fragment's first file; the
+    /// harvest has to find it there.
+    #[tokio::test]
+    async fn test_harvest_seeds_from_repacked_file() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values(0..20)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for (name, expr) in [("c", "a + 1"), ("d", "a + 2")] {
+            dataset
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        name.into(),
+                        expr.into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["c"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        // [a, b] stays first; c and d move into one new file after it.
+        let options = CompactionOptions {
+            max_data_files_per_fragment: Some(2),
+            scope: crate::dataset::optimize::CompactionScope::RepackColumns,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments: Vec<Fragment> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        let c_id = dataset.schema().field("c").unwrap().id;
+        assert!(
+            !fragments[0].files[0].fields.contains(&c_id),
+            "the indexed column is not in the first file: {:?}",
+            fragments[0].files
+        );
+        let index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.fields == [c_id])
+            .unwrap()
+            .clone();
+        let seeds = try_harvest_seeds(&dataset, &fragments, &index)
+            .await
+            .unwrap();
+        assert!(seeds.is_some(), "the seed in the repacked file is found");
     }
 }

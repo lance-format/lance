@@ -77,9 +77,10 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        ApproxMode, DISTANCE_TYPE_KEY, PartitionSearchControl, PartitionSearchResult,
-        PreparedPartitionSearchHandle, Query, VECTOR_RESULT_SCHEMA, ivf::storage::IVF_METADATA_KEY,
-        quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
+        ApproxMode, DISTANCE_TYPE_KEY, PartitionRowDistances, PartitionSearchControl,
+        PartitionSearchResult, PreparedPartitionRows, PreparedPartitionSearchHandle, Query,
+        VECTOR_RESULT_SCHEMA, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
+        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
@@ -90,7 +91,7 @@ use lance_io::{
     ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
 };
 use lance_linalg::distance::DistanceType;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -132,7 +133,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// both to avoid using wrong row offsets during reconstruction.
     pub(crate) aux_ivf: IvfModel,
     pub(crate) distance_type: DistanceType,
-    pub(crate) sub_index_metadata: Vec<String>,
+    pub(crate) sub_index_metadata: Arc<[String]>,
     /// Parsed quantizer metadata — stored directly to avoid JSON re-parsing on
     /// every warm-path reconstruction.
     pub(crate) metadata: <Q::Storage as QuantizerStorage>::Metadata,
@@ -216,6 +217,89 @@ pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
 /// (far below [`GLOBAL_TOPK_CHUNK_BYTES`]) still leave the resident-partition bound
 /// expressible as a partition count: at most the prepare window plus two chunks.
 pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
+
+/// Fewest prepared-partition bytes one concurrent scoring task of a single
+/// query is given when a global-top-k chunk is split across CPU tasks.
+///
+/// A chunk is scored on one CPU thread unless it holds at least twice this
+/// many bytes, so small partitions keep the single-dispatch latency (#6475),
+/// while a query over large partitions, which otherwise ran on one core
+/// however idle the pool was, spreads its chunk over up to the compute CPUs.
+/// Each task costs a dispatch (~100µs); 1 MiB of PQ8 codes scores in several
+/// times that. Override with the `LANCE_IVF_SCORING_TASK_BYTES` environment
+/// variable.
+pub(crate) const DEFAULT_SCORING_TASK_BYTES: usize = 1024 * 1024;
+
+pub(crate) static SCORING_TASK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let task_bytes = std::env::var("LANCE_IVF_SCORING_TASK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_SCORING_TASK_BYTES")
+        })
+        .unwrap_or(DEFAULT_SCORING_TASK_BYTES);
+    assert!(
+        task_bytes > 0,
+        "LANCE_IVF_SCORING_TASK_BYTES must be greater than 0, got {task_bytes}"
+    );
+    task_bytes
+});
+
+/// Chunks scored by more than one task, for tests to observe the split.
+#[cfg(test)]
+pub(crate) static PARALLEL_SCORING_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Split `0..bytes.len()` into at most `max_tasks` contiguous ranges of
+/// roughly equal bytes, each holding at least `min_task_bytes` where the
+/// total allows; a total below `2 * min_task_bytes` is one range.
+fn balanced_byte_ranges(
+    bytes: &[usize],
+    min_task_bytes: usize,
+    max_tasks: usize,
+) -> Vec<Range<usize>> {
+    let total: usize = bytes.iter().sum();
+    let task_count = (total / min_task_bytes.max(1))
+        .clamp(1, max_tasks.max(1))
+        .min(bytes.len().max(1));
+    let target = total.div_ceil(task_count);
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    let mut sum = 0;
+    for (index, &size) in bytes.iter().enumerate() {
+        sum += size;
+        // Close the range before the next partition overshoots the target, so
+        // a partition below the target still gets a task of its own.
+        let next = bytes.get(index + 1).copied();
+        if ranges.len() + 1 < task_count && next.is_some_and(|next| sum + next > target) {
+            ranges.push(start..index + 1);
+            start = index + 1;
+            sum = 0;
+        }
+    }
+    if start < bytes.len() {
+        ranges.push(start..bytes.len());
+    }
+    ranges
+}
+
+/// Merges per-task top-k heaps into the `capacity` best entries, into the
+/// first heap.
+fn merge_topk_heaps(
+    heaps: Vec<BinaryHeap<OrderedNode<u64>>>,
+    capacity: usize,
+) -> BinaryHeap<OrderedNode<u64>> {
+    let mut heaps = heaps.into_iter();
+    let mut merged = heaps.next().unwrap_or_default();
+    for node in heaps.flatten() {
+        if merged.len() < capacity {
+            merged.push(node);
+        } else if merged.peek().is_some_and(|worst| worst.dist > node.dist) {
+            merged.pop();
+            merged.push(node);
+        }
+    }
+    merged
+}
 
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
@@ -808,6 +892,85 @@ fn rabit_search_cache_cell(cache: Option<Arc<RabitSearchCache>>) -> RabitSearchC
     Arc::new(Mutex::new(Some(cache)))
 }
 
+/// A partition loaded for [`VectorIndex::prepare_partition_rows`], held in
+/// [`PreparedPartitionRows::handle`].
+struct PartitionRowsScan<S: IvfSubIndex, Q: Quantization> {
+    partition_id: usize,
+    part_entry: Arc<PartitionEntry<S, Q>>,
+    pre_filter: Arc<dyn PreFilter>,
+    partition_centroid: Option<ArrayRef>,
+    /// Each query, preprocessed for the partition, with its original key. The
+    /// key's RQ raw-query context is built when scoring, on the CPU pool.
+    queries: Vec<(Query, ArrayRef)>,
+    /// Counts the scan among the partitions pinned by in-flight searches.
+    _in_flight: PreparedPartitionGuard,
+}
+
+/// A partition's vectors grouped by row, for scoring every row.
+struct PartitionRows {
+    /// Rows with a selected vector, strictly ascending.
+    row_ids: Arc<[u64]>,
+    /// Offsets of the selected vectors, grouped by row in `row_ids` order.
+    offsets: Vec<u32>,
+    /// `group_ends[r]` is the end in `offsets` of row `row_ids[r]`'s vectors.
+    group_ends: Vec<u32>,
+}
+
+impl PartitionRows {
+    fn new<'a>(row_ids: impl Iterator<Item = &'a u64>, mask: Option<&RowAddrMask>) -> Self {
+        let mut vectors = row_ids
+            .enumerate()
+            .filter(|(_, row_id)| mask.is_none_or(|mask| mask.selected(**row_id)))
+            .map(|(offset, &row_id)| (row_id, offset as u32))
+            .collect::<Vec<_>>();
+        // Partitions usually hold their rows in ascending order already.
+        if !vectors.is_sorted() {
+            vectors.sort_unstable();
+        }
+        let mut row_ids = Vec::with_capacity(vectors.len());
+        let mut offsets = Vec::with_capacity(vectors.len());
+        let mut group_ends = Vec::with_capacity(vectors.len());
+        for (row_id, offset) in vectors {
+            if row_ids.last() != Some(&row_id) {
+                if !offsets.is_empty() {
+                    group_ends.push(offsets.len() as u32);
+                }
+                row_ids.push(row_id);
+            }
+            offsets.push(offset);
+        }
+        if !offsets.is_empty() {
+            group_ends.push(offsets.len() as u32);
+        }
+        Self {
+            row_ids: row_ids.into(),
+            offsets,
+            group_ends,
+        }
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// The smallest `distance(offset)` over each row's vectors, in `row_ids` order.
+    fn min_per_row(&self, distance: impl Fn(u32) -> f32) -> Vec<f32> {
+        let mut start = 0;
+        self.group_ends
+            .iter()
+            .map(|&end| {
+                let end = end as usize;
+                let closest = self.offsets[start..end]
+                    .iter()
+                    .map(|&offset| distance(offset))
+                    .fold(f32::INFINITY, f32::min);
+                start = end;
+                closest
+            })
+            .collect()
+    }
+}
+
 fn rotated_partition_centroid_slice(
     cache: Option<&RabitSearchCache>,
     partition_id: usize,
@@ -978,7 +1141,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 ivf,
                 aux_ivf,
                 distance_type,
-                sub_index_metadata: header.sub_index_metadata,
+                sub_index_metadata: header.sub_index_metadata.into(),
                 metadata,
                 sub_index_type,
                 quantization_type,
@@ -1049,7 +1212,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             index_file_path: self.index_file_path.clone(),
             uuid: self.uuid.to_string(),
             distance_type: self.distance_type.to_string(),
-            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_metadata: self.sub_index_metadata.to_vec(),
             sub_index_type: self.sub_index_type.to_string(),
             quantization_type: self.quantization_type.to_string(),
             quantizer_metadata_json,
@@ -1392,7 +1555,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// every column. Built once here because it is fallible and only depends on
     /// the file schema.
     read_projection: Option<ReaderProjection>,
-    sub_index_metadata: Vec<String>,
+    sub_index_metadata: Arc<[String]>,
     storage: IvfQuantizationStorage<Q>,
 
     distance_type: DistanceType,
@@ -1951,7 +2114,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             reader: index_reader,
             read_projection,
             storage,
-            sub_index_metadata,
+            sub_index_metadata: sub_index_metadata.into(),
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
             raw_cache,
@@ -1974,7 +2137,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: IvfModel,
         reader: FileReader,
         storage: IvfQuantizationStorage<Q>,
-        sub_index_metadata: Vec<String>,
+        sub_index_metadata: Arc<[String]>,
         distance_type: DistanceType,
         index_cache: LanceCache,
         raw_cache: WeakLanceCache,
@@ -2877,6 +3040,123 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         local_metrics.dump_into(metrics);
 
         Ok(batch)
+    }
+
+    async fn prepare_partition_rows(
+        &self,
+        partition_id: usize,
+        queries: &[Query],
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PreparedPartitionRows> {
+        let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+        let part_entry = self.load_query_partition(partition_id, metrics).await?;
+        {
+            let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+            pre_filter.wait_for_ready().await?;
+        }
+        let pre_filter =
+            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
+                .await?;
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let queries = queries
+            .iter()
+            .map(|query| {
+                let prepared = Self::preprocess_partition_query(
+                    self.use_query_residual,
+                    self.use_residual_scratch,
+                    partition_id,
+                    partition_centroid.as_ref(),
+                    query,
+                )?;
+                Ok((prepared, query.key.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PreparedPartitionRows {
+            size_bytes: part_entry.size_bytes(),
+            handle: Box::new(PartitionRowsScan::<S, Q> {
+                partition_id,
+                part_entry,
+                pre_filter,
+                partition_centroid,
+                queries,
+                _in_flight: self.prepared_partitions.track(),
+            }),
+        })
+    }
+
+    fn score_prepared_partition_rows(
+        &self,
+        prepared: PreparedPartitionRows,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PartitionRowDistances> {
+        let PartitionRowsScan {
+            partition_id,
+            part_entry,
+            pre_filter,
+            partition_centroid,
+            queries,
+            _in_flight,
+        } = *prepared
+            .handle
+            .downcast::<PartitionRowsScan<S, Q>>()
+            .map_err(|_| Error::internal("failed to downcast prepared partition rows"))?;
+        if queries.is_empty() || pre_filter.selects_nothing() {
+            return Ok(PartitionRowDistances {
+                row_ids: Arc::from([]),
+                distances: vec![Vec::new(); queries.len()],
+            });
+        }
+        let _search_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        let storage = &part_entry.storage;
+        let mask = (!pre_filter.is_empty()).then(|| pre_filter.mask());
+        let rows = PartitionRows::new(storage.row_ids(), mask.as_deref());
+        metrics.record_comparisons(rows.num_vectors() * queries.len());
+        let rotated_partition_centroid =
+            rotated_partition_centroid_slice(self.rq_search_cache.as_deref(), partition_id);
+        let distances = self.scratch_pool.with_scratch(|scratch| {
+            queries
+                .into_iter()
+                .map(|(query, original_key)| {
+                    let raw_query_context = self.prepare_rq_raw_query_context(&original_key)?;
+                    let residual = Self::query_context_for_scratch(
+                        self.use_query_residual,
+                        self.use_residual_scratch,
+                        partition_id,
+                        partition_centroid.as_ref(),
+                        rotated_partition_centroid,
+                        raw_query_context.as_deref(),
+                    )?;
+                    let dist_calc = storage.dist_calculator_with_scratch(
+                        query.key,
+                        query.dist_q_c,
+                        residual,
+                        &mut scratch.query_f32,
+                        DistanceCalculatorOptions {
+                            approx_mode: query.approx_mode,
+                        },
+                    );
+                    // Score as a FLAT sub-index search does: every row in one
+                    // batch when nothing is filtered, else row by row.
+                    Ok(if mask.is_some() {
+                        rows.min_per_row(|offset| dist_calc.distance(offset))
+                    } else {
+                        dist_calc.distance_all_with_scratch(
+                            storage.len(),
+                            &mut scratch.distances,
+                            &mut scratch.u16,
+                            &mut scratch.u8,
+                            &mut scratch.u32,
+                        );
+                        rows.min_per_row(|offset| scratch.distances[offset as usize])
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        Ok(PartitionRowDistances {
+            row_ids: rows.row_ids,
+            distances,
+        })
     }
 
     async fn search_in_partition_with_candidates(

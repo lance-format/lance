@@ -467,10 +467,11 @@ async fn test_external_reference_preserves_registered_matches_and_input_errors()
 }
 
 #[rstest]
-#[case::unknown_size(0)]
-#[case::known_size(3)]
+#[case::unknown_size(0, false)]
+#[case::known_size(3, false)]
+#[case::prefetched_unknown_size(0, true)]
 #[tokio::test]
-async fn test_unregistered_external_blob_policy(#[case] size: u64) {
+async fn test_unregistered_external_blob_policy(#[case] size: u64, #[case] prefetch: bool) {
     let fixture = create_multi_base_blob_v2_fixture(vec![1], None, false).await;
     let provider = Arc::new(BlobProvider::default());
     let registry = Arc::new(ObjectStoreRegistry::default());
@@ -493,18 +494,32 @@ async fn test_unregistered_external_blob_policy(#[case] size: u64) {
         "s3://unregistered-bucket/secret",
         "invalid://[bad",
     ] {
-        let err = locator
-            .locate(
-                &StoredBlob::External {
-                    base_id: 0,
-                    uri,
-                    position: 0,
+        let err = if prefetch {
+            locator
+                .prefetch_external_sizes(&super::descriptor(
+                    Some(BlobKind::External),
+                    0,
                     size,
-                },
-                0,
-            )
-            .await
-            .unwrap_err();
+                    0,
+                    uri,
+                    true,
+                ))
+                .await
+                .unwrap_err()
+        } else {
+            locator
+                .locate(
+                    &StoredBlob::External {
+                        base_id: 0,
+                        uri,
+                        position: 0,
+                        size,
+                    },
+                    0,
+                )
+                .await
+                .unwrap_err()
+        };
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains("base_id=0"), "{err}");
         assert!(err.to_string().contains("registered storage base"), "{err}");
@@ -624,6 +639,7 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
 async fn test_external_bypasses_cache_and_managed_keeps_cache(
     #[case] is_registered: bool,
     #[case] exact_binding: bool,
+    #[values(false, true)] prefetch: bool,
 ) {
     let fixture = create_multi_base_blob_v2_fixture(vec![1], None, false).await;
     let base =
@@ -709,8 +725,16 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         base_id: if is_registered { 2 } else { 0 },
         uri: external_uri,
         position: 0,
-        size: 3,
+        size: if prefetch { 0 } else { 3 },
     };
+    let descriptions = super::descriptor(
+        Some(BlobKind::External),
+        0,
+        0,
+        if is_registered { 2 } else { 0 },
+        external_uri,
+        true,
+    );
     let managed = StoredBlob::Managed {
         base_id: Some(2),
         uri: "payload",
@@ -727,20 +751,34 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
     );
     assert_eq!(provider.tracker.incremental_stats().read_iops, 0);
 
+    if prefetch {
+        locator
+            .prefetch_external_sizes(&descriptions)
+            .await
+            .unwrap();
+    }
     let external_file = locator.locate(&external, 0).await.unwrap();
     assert!(!Arc::ptr_eq(&managed_file.source, &external_file.source));
     observer.incremental_stats();
     assert_eq!(external_file.read().await.unwrap().as_ref(), b"old");
     assert!(observer.incremental_stats().read_iops > 0);
     assert!(provider.tracker.incremental_stats().read_iops > 0);
+    let next_payload: &[u8] = if prefetch { b"new-size" } else { b"new" };
     provider
         .origin
-        .put(&payload_path, b"new".as_slice().into())
+        .put(&payload_path, next_payload.into())
         .await
         .unwrap();
     let mut next_locator = BlobLocator::new(&dataset, field_id);
+    if prefetch {
+        next_locator
+            .prefetch_external_sizes(&descriptions)
+            .await
+            .unwrap();
+    }
     let external_file = next_locator.locate(&external, 0).await.unwrap();
-    assert_eq!(external_file.read().await.unwrap().as_ref(), b"new");
+    assert_eq!(external_file.size(), next_payload.len() as u64);
+    assert_eq!(external_file.read().await.unwrap().as_ref(), next_payload);
     assert!(provider.tracker.incremental_stats().read_iops > 0);
     assert_eq!(
         next_locator
@@ -789,7 +827,6 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
             }
             entries.push(BlobEntry {
                 selection_index,
-                row_address: 0,
                 file,
                 requested_range: None,
             });
@@ -811,7 +848,6 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         let blobs = execute_blob_entries_with_execution(
             vec![BlobEntry {
                 selection_index: 0,
-                row_address: 0,
                 file: managed_file,
                 requested_range: None,
             }],

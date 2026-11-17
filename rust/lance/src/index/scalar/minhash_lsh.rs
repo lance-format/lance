@@ -56,7 +56,8 @@ pub(in crate::index) async fn merge_segments(
         )));
     }
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    // MinHash LSH only reads its current format, which stores row addresses.
+    // Every segment here stores row addresses so the filters are built
+    // in the address domain.
     let (fragment_bitmap, filters) =
         build_per_segment_filters(dataset, &segment_refs, staged, true).await?;
 
@@ -125,7 +126,9 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::index_files_to_table;
     use lance_index::scalar::lance_format::LanceIndexStore;
-    use lance_index::scalar::minhash_lsh::{BANDS_FILENAME, MinHashQuery, SIGNATURES_FILENAME};
+    use lance_index::scalar::minhash_lsh::{
+        BANDS_FILENAME, MINHASH_LSH_INDEX_VERSION, MinHashQuery, SIGNATURES_FILENAME,
+    };
     use lance_index::scalar::{BuiltinIndexType, IndexStore, ScalarIndexParams};
     use uuid::Uuid;
 
@@ -497,22 +500,24 @@ mod tests {
         );
     }
 
-    /// MinHash LSH is experimental and has no compatibility path (see
-    /// AGENTS.md): `rebuild_from` always writes the current
-    /// (row-address-domain) layout, so merging a segment persisted before
-    /// that move would carry its stored row ids into a file the next load
-    /// unconditionally reads as row addresses, corrupting every one of them
-    /// on a stable-row-id dataset. Build one by hand -- the only way a real
-    /// segment this old would still exist -- and check the merge is refused
-    /// instead.
+    /// A merge always writes the current (row-address-domain) layout and
+    /// copies each source's stored identifiers as-is. A segment persisted
+    /// before that move stores row ids: on a stable-row-id dataset they differ
+    /// from addresses, so merging it must be refused rather than corrupt every
+    /// id; without stable row ids they coincide, so the merge succeeds and
+    /// upgrades the segment to the current version. Build such a segment by
+    /// hand -- the only way a real segment this old would still exist.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_merge_rejects_legacy_row_id_domain_segment() {
+    async fn test_merge_legacy_row_id_domain_segment(
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch(0..6))], schema()),
             "memory://",
             Some(WriteParams {
                 max_rows_per_file: 2,
-                enable_stable_row_ids: true,
+                enable_stable_row_ids,
                 ..Default::default()
             }),
         )
@@ -527,8 +532,8 @@ mod tests {
 
         // Rewrite the freshly trained segment's files as a pre-migration
         // (row-id domain) layout: rename `_rowaddr` to `_rowid`, convert each
-        // stored address into the dataset's logical row id, and stamp file
-        // version 0.
+        // stored address into the dataset's row id (with stable row ids, its
+        // logical id; otherwise the address itself), and stamp file version 0.
         let source = LanceIndexStore::from_dataset_for_existing(&dataset, &segment)
             .await
             .unwrap();
@@ -554,7 +559,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let schema = Arc::new(Schema::new(fields));
             let mut columns = batch.columns().to_vec();
-            if name == SIGNATURES_FILENAME {
+            if name == SIGNATURES_FILENAME && enable_stable_row_ids {
                 let ids = batch[lance_core::ROW_ADDR].as_primitive::<UInt64Type>();
                 columns[0] = Arc::new(UInt64Array::from_iter_values(
                     ids.values()
@@ -590,16 +595,23 @@ mod tests {
         let before = search_ids(&dataset, 2, 6).await;
         assert!(before.contains(&2), "before merge: {before:?}");
 
-        // But merging it must be refused outright, not silently corrupt it.
         let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        let err = dataset
-            .merge_existing_index_segments(segments)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-        assert!(err.to_string().contains("cannot be merged"), "{err}");
+        let merged = dataset.merge_existing_index_segments(segments).await;
+        if enable_stable_row_ids {
+            // Merging must be refused outright, not silently corrupt the ids.
+            let err = merged.unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("cannot be merged"), "{err}");
+        } else {
+            let merged = merged.unwrap();
+            assert_eq!(merged.index_version, MINHASH_LSH_INDEX_VERSION as i32);
+            dataset
+                .commit_existing_index_segments(INDEX_NAME, "text", vec![merged])
+                .await
+                .unwrap();
+        }
 
-        // The dataset is untouched: the legacy segment still answers correctly.
+        // Either way the index still answers correctly.
         assert_eq!(search_ids(&dataset, 2, 6).await, before);
     }
 }

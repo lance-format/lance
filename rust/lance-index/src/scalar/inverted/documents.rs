@@ -27,7 +27,7 @@ use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
 use crate::FtsPrewarmDocumentStatus;
-use crate::scalar::{IndexReader, IndexStore, RowIdRemapper};
+use crate::scalar::{IndexReader, IndexStore, OldIndexDataFilter, RowIdRemapper};
 
 use super::index::{
     DocSet, NUM_TOKEN_COL, count_row_id_runs, dequantize_doc_length, doc_index_storage_column,
@@ -1605,6 +1605,22 @@ impl PartitionDocuments {
 
     pub(crate) fn len(&self) -> usize {
         self.num_docs
+    }
+
+    /// Raw partition files are reusable only if maintenance needs neither
+    /// address translation nor removal of any persisted document.
+    pub(crate) async fn can_copy_unchanged(
+        &self,
+        filter: Option<&OldIndexDataFilter>,
+    ) -> Result<bool> {
+        if self.remapper.is_some() || self.batch_remapper.is_some() {
+            return Ok(false);
+        }
+        let Some(filter) = filter else {
+            return Ok(true);
+        };
+        let row_ids = self.row_ids_column().await?;
+        Ok(filter.filter_row_ids(&row_ids).true_count() == self.num_docs)
     }
 
     pub(crate) fn coordinate_rank(&self) -> usize {

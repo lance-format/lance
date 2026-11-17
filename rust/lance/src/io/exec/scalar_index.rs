@@ -998,13 +998,20 @@ impl ExecutionPlan for MapIndexExec {
         // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
+        let mut metrics = IndexMetrics::new(&self.metrics, partition);
+        if let Some(scope) = context
+            .session_config()
+            .get_extension::<crate::dataset::write::merge_insert::analysis::AnalysisScope>(
+        ) {
+            metrics = metrics.with_segment_tracking(scope.segments.clone());
+        }
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
             partition,
             self.dataset.clone(),
             self.lookups.clone(),
-            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            Arc::new(metrics),
             self.metrics.clone(),
             candidate_reservation,
         );
@@ -1017,6 +1024,10 @@ impl ExecutionPlan for MapIndexExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -1240,8 +1251,11 @@ async fn row_ids_for_mask(
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                capacity -= block_list.len().expect("unknown block list len") as usize;
+                let capacity: usize = sequences.iter().map(|seq| seq.len() as usize).sum();
+                // The block list comes from the whole index, so it can name more
+                // rows than `fragments` holds when the scan covers a subset.
+                let capacity = capacity
+                    .saturating_sub(block_list.len().expect("unknown block list len") as usize);
                 let mut row_ids = Vec::with_capacity(capacity);
                 for sequence in sequences {
                     row_ids.extend(
