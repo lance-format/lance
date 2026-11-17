@@ -491,8 +491,11 @@ impl Number {
                 .ok_or(Error::Message("UInt64 overflow".to_string())),
             (Self::Int64(a), Self::UInt64(b)) => {
                 if *a < 0 {
-                    a.checked_mul(b as i64)
-                        .map(Number::Int64)
+                    // Multiply in i128 instead of narrowing a u64 above
+                    // i64::MAX through a wrapping `as i64` cast.
+                    i128::from(*a)
+                        .checked_mul(i128::from(b))
+                        .and_then(fit_i128)
                         .ok_or(Error::Message("Int64 overflow".to_string()))
                 } else {
                     (*a as u64)
@@ -503,9 +506,9 @@ impl Number {
             }
             (Self::UInt64(a), Self::Int64(b)) => {
                 if b < 0 {
-                    (*a as i64)
-                        .checked_mul(b)
-                        .map(Number::Int64)
+                    i128::from(*a)
+                        .checked_mul(i128::from(b))
+                        .and_then(fit_i128)
                         .ok_or(Error::Message("Int64 overflow".to_string()))
                 } else {
                     a.checked_mul(b as u64)
@@ -1749,6 +1752,25 @@ mod tests {
                 .unwrap(),
             Number::UInt64(9223372036854775799)
         );
+    }
+
+    #[test]
+    fn test_mul_mixed_int64_uint64() {
+        // A u64 operand above i64::MAX must not be narrowed through `as i64`.
+        assert_eq!(
+            Number::Int64(-1)
+                .mul(Number::UInt64(9223372036854775808))
+                .unwrap(),
+            Number::Int64(i64::MIN)
+        );
+        assert_eq!(
+            Number::UInt64(9223372036854775808)
+                .mul(Number::Int64(-1))
+                .unwrap(),
+            Number::Int64(i64::MIN)
+        );
+        assert!(Number::Int64(-1).mul(Number::UInt64(u64::MAX)).is_err());
+        assert!(Number::UInt64(u64::MAX).mul(Number::Int64(2)).is_err());
     }
 
     #[test]

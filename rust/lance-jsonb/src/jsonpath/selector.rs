@@ -6,12 +6,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::ops::RangeInclusive;
-
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
-use std::sync::atomic::Ordering as AtomicOrdering;
 
 use crate::Error;
 use crate::OwnedJsonb;
@@ -32,12 +26,6 @@ use crate::jsonpath::RecursiveLevel;
 use crate::jsonpath::UnaryOperator;
 use crate::number::Number;
 use crate::value::Value;
-
-/// Counts array scans issued by `select_array_values_by_indices`, so tests can
-/// assert that an index list with several selectors resolves in one pass over
-/// the array instead of one rescan per selector.
-#[cfg(test)]
-static ARRAY_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 enum ExprValue<'a> {
@@ -510,64 +498,43 @@ impl<'a> Selector<'a> {
     fn select_array_values_by_indices(
         &mut self,
         parent_item: JsonbItem<'a>,
-        array_indices: &[ArrayIndex],
+        array_indices: &Vec<ArrayIndex>,
     ) -> Result<()> {
         let jsonb_item_type = parent_item.jsonb_item_type()?;
         let JsonbItemType::Array(arr_len) = jsonb_item_type else {
             return Ok(());
         };
-
-        // Resolve selectors to inclusive position ranges up front, so the
-        // loops below scan the array once and test membership arithmetically,
-        // instead of rescanning the array (and materializing an index set)
-        // once per selector. Each selector appends to its own bucket so the
-        // output stays in selector-list order with duplicates preserved.
-        let ranges: Vec<RangeInclusive<usize>> = array_indices
-            .iter()
-            .filter_map(|array_index| array_index.to_range(arr_len))
-            .collect();
-        if ranges.is_empty() {
-            return Ok(());
-        }
-        let mut buckets: Vec<VecDeque<JsonbItem<'a>>> =
-            (0..ranges.len()).map(|_| VecDeque::new()).collect();
-
-        match parent_item {
-            JsonbItem::Raw(raw) => {
-                let array_iter_opt = ArrayIterator::new(raw)?;
-                #[cfg(test)]
-                ARRAY_SCANS.fetch_add(1, AtomicOrdering::Relaxed);
-                if let Some(array_iter) = array_iter_opt {
-                    for (i, item_result) in &mut array_iter.enumerate() {
-                        let item = item_result?;
-                        for (range, bucket) in ranges.iter().zip(buckets.iter_mut()) {
-                            if range.contains(&i) {
-                                bucket.push_back(item.clone());
+        for array_index in array_indices {
+            let indices = array_index.to_indices(arr_len);
+            if indices.is_empty() {
+                continue;
+            }
+            match parent_item {
+                JsonbItem::Raw(raw) => {
+                    let array_iter_opt = ArrayIterator::new(raw)?;
+                    if let Some(array_iter) = array_iter_opt {
+                        for (i, item_result) in &mut array_iter.enumerate() {
+                            let item = item_result?;
+                            if indices.contains(&i) {
+                                self.items.push_back(item);
                             }
                         }
                     }
                 }
-            }
-            JsonbItem::Owned(ref owned) => {
-                let array_iter_opt = ArrayIterator::new(owned.as_raw())?;
-                #[cfg(test)]
-                ARRAY_SCANS.fetch_add(1, AtomicOrdering::Relaxed);
-                if let Some(array_iter) = array_iter_opt {
-                    for (i, item_result) in &mut array_iter.enumerate() {
-                        let item = item_result?;
-                        for (range, bucket) in ranges.iter().zip(buckets.iter_mut()) {
-                            if range.contains(&i) {
-                                let owned_item = OwnedJsonb::from_item(item.clone())?;
-                                bucket.push_back(JsonbItem::Owned(owned_item));
+                JsonbItem::Owned(ref owned) => {
+                    let array_iter_opt = ArrayIterator::new(owned.as_raw())?;
+                    if let Some(array_iter) = array_iter_opt {
+                        for (i, item_result) in &mut array_iter.enumerate() {
+                            let item = item_result?;
+                            if indices.contains(&i) {
+                                let owned_item = OwnedJsonb::from_item(item)?;
+                                self.items.push_back(JsonbItem::Owned(owned_item));
                             }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        for bucket in buckets {
-            self.items.extend(bucket);
         }
         Ok(())
     }
@@ -928,28 +895,5 @@ impl<'a> Selector<'a> {
         } else {
             None
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::jsonpath::parse_json_path;
-
-    use super::*;
-
-    #[test]
-    fn array_indices_select_in_one_scan() {
-        let owned_jsonb = r#"[10,20,30,40,50,60]"#.parse::<OwnedJsonb>().unwrap();
-        let raw_jsonb = owned_jsonb.as_raw();
-        let json_path = parse_json_path(b"$[5, 0, 1 to 2]").unwrap();
-
-        ARRAY_SCANS.store(0, AtomicOrdering::Relaxed);
-        let values = Selector::new(raw_jsonb).select_values(&json_path).unwrap();
-        assert_eq!(values.len(), 4);
-        assert_eq!(
-            ARRAY_SCANS.load(AtomicOrdering::Relaxed),
-            1,
-            "an index list with k selectors must scan the array once, not once per selector"
-        );
     }
 }

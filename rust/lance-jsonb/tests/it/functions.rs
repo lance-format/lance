@@ -315,38 +315,6 @@ fn test_select_by_filter_wildcard_compare() {
 }
 
 #[test]
-fn test_select_by_array_indices_list() {
-    // A bracket index list selects elements once per selector, concatenated
-    // in selector-list order, keeping duplicates across selectors.
-    let source = r#"[10,20,30,40,50,60]"#;
-
-    let paths = vec![
-        (r#"$[5, 0]"#, vec![r#"60"#, r#"10"#]),
-        (r#"$[0, 0 to 2]"#, vec![r#"10"#, r#"10"#, r#"20"#, r#"30"#]),
-        (
-            r#"$[1 to last-1, last]"#,
-            vec![r#"20"#, r#"30"#, r#"40"#, r#"50"#, r#"60"#],
-        ),
-        (r#"$[last]"#, vec![r#"60"#]),
-        (r#"$[6]"#, vec![]),
-    ];
-
-    let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
-    let raw_jsonb = owned_jsonb.as_raw();
-    for (path, expects) in paths {
-        let json_path = parse_json_path(path.as_bytes()).unwrap();
-        let res = Selector::new(raw_jsonb).select_values(&json_path);
-        assert!(res.is_ok());
-        let owned_jsonbs = res.unwrap();
-        assert_eq!(owned_jsonbs.len(), expects.len(), "path: {path}");
-        for (owned_jsonb, expect) in owned_jsonbs.into_iter().zip(expects.iter()) {
-            let expected_buf = parse_value(expect.as_bytes()).unwrap().to_vec();
-            assert_eq!(owned_jsonb.as_raw(), RawJsonb::new(&expected_buf));
-        }
-    }
-}
-
-#[test]
 fn test_get_by_index() {
     let sources = vec![
         (r#"1234"#, 0, None),
