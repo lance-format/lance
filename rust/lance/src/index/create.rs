@@ -758,6 +758,7 @@ impl<'a> CreateIndexBuilder<'a> {
             return self.execute_multi_segment_fmindex(num_segments).await;
         }
 
+        let caller_named_index_dir = self.index_uuid.is_some();
         let (new_idx, observed) = self
             .execute_uncommitted_impl()
             .instrument(tracing::info_span!("execute_uncommitted"))
@@ -783,15 +784,22 @@ impl<'a> CreateIndexBuilder<'a> {
         .transaction_properties(self.transaction_properties.clone())
         .build();
 
-        // This call built the index directory above and a retry rebuilds it,
-        // so the commit path may reclaim it after a verified loss.
-        self.dataset
-            .apply_commit_reclaiming_minted_index_dirs(
-                transaction,
-                &Default::default(),
-                &Default::default(),
-            )
-            .await?;
+        // A directory named by the caller (`index_uuid`) is not ours to remove: it
+        // may hold files written outside this call. Only a UUID generated here is
+        // reclaimed after a verified loss, because a retry generates a new one.
+        if caller_named_index_dir {
+            self.dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await?;
+        } else {
+            self.dataset
+                .apply_commit_reclaiming_minted_index_dirs(
+                    transaction,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await?;
+        }
 
         // Rebasing may withdraw all query coverage while keeping the committed
         // segment's definition for rebuilding. Include that stored metadata.
@@ -1749,16 +1757,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case::drop_indexed("drop", "value", true)]
-    #[case::drop_unrelated("drop", "other", false)]
-    #[case::cast_indexed("cast", "value", true)]
-    #[case::cast_unrelated("cast", "other", false)]
-    #[case::rename_indexed("rename", "value", false)]
+    #[case::drop_indexed("drop", "value", true, false)]
+    #[case::drop_unrelated("drop", "other", false, false)]
+    #[case::cast_indexed("cast", "value", true, false)]
+    #[case::cast_unrelated("cast", "other", false, false)]
+    #[case::rename_indexed("rename", "value", false, false)]
+    #[case::drop_caller_named_uuid("drop", "value", true, true)]
     #[tokio::test]
     async fn test_create_index_after_concurrent_schema_change(
         #[case] change: &str,
         #[case] column: &str,
         #[case] expect_conflict: bool,
+        #[case] caller_index_uuid: bool,
     ) {
         let batch = arrow_array::record_batch!(
             ("id", Int32, [1, 2, 3]),
@@ -1801,11 +1811,15 @@ mod tests {
             .unwrap();
 
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let caller_uuid = caller_index_uuid.then(Uuid::new_v4);
         let dirs_before = index_dir_names(&writer).await;
-        let result = CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
-            .name("value_idx".to_string())
-            .execute()
-            .await;
+        let mut builder =
+            CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
+                .name("value_idx".to_string());
+        if let Some(uuid) = caller_uuid {
+            builder = builder.index_uuid(uuid);
+        }
+        let result = builder.execute().await;
         if expect_conflict {
             let error = result.unwrap_err();
             assert!(
@@ -1819,11 +1833,24 @@ mod tests {
                 )),
                 "{error}"
             );
-            assert_eq!(
-                index_dir_names(&writer).await,
-                dirs_before,
-                "the index directory of the preempted CreateIndex must be reclaimed"
-            );
+            // T10: a directory the caller named through `index_uuid` is not
+            // this call's to remove, even though the commit failed.
+            if let Some(uuid) = caller_uuid {
+                let mut expected_dirs = dirs_before.clone();
+                expected_dirs.insert(uuid.to_string());
+                assert_eq!(
+                    index_dir_names(&writer).await,
+                    expected_dirs,
+                    "the caller-named index directory must be kept after the preempted \
+                     CreateIndex"
+                );
+            } else {
+                assert_eq!(
+                    index_dir_names(&writer).await,
+                    dirs_before,
+                    "the index directory of the preempted CreateIndex must be reclaimed"
+                );
+            }
         } else {
             result.unwrap();
         }

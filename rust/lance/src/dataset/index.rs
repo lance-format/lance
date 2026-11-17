@@ -278,6 +278,12 @@ impl DatasetIndexRemapper {
 
 #[async_trait]
 impl IndexRemapper for DatasetIndexRemapper {
+    /// Both remap paths below draw a fresh UUID for the segment they produce,
+    /// and a kept index keeps its committed ID, which the candidate filter drops.
+    fn creates_fresh_index_ids(&self) -> bool {
+        true
+    }
+
     async fn remap_indices(
         &self,
         mapping: RowAddrRemap,
