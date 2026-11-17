@@ -9,7 +9,10 @@ use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use lance_core::{
     Error, Result,
-    utils::allocation::{Reservation, ReservedBuffer},
+    utils::{
+        allocation::{Reservation, ReservedBuffer},
+        tokio::spawn_cpu,
+    },
 };
 
 use super::{
@@ -19,13 +22,16 @@ use super::{
 use crate::{
     buffer::LanceBuffer,
     compression::DecompressionStrategy,
-    decoder::PageInfo,
+    decoder::{DecodedPage, PageInfo},
     encodings::logical::primitive::fullzip_decode::array_admitted::Shape,
     format::metadata::MiniBlockLayout,
     repdef::{RepDefUnraveler, max_visible_level},
 };
 
+mod dictionary;
 mod nested;
+
+use dictionary::Dictionary;
 
 use nested::RepetitionSummary;
 
@@ -41,6 +47,7 @@ pub(in super::super) struct MiniBlockArrayScheduler {
     rows: u64,
     items: u64,
     repetition: Option<Range<u64>>,
+    dictionary: Option<Dictionary>,
 }
 
 #[derive(Debug)]
@@ -60,9 +67,9 @@ impl MiniBlockArrayScheduler {
         layout: &MiniBlockLayout,
         codecs: &dyn DecompressionStrategy,
     ) -> Result<Self> {
-        if layout.dictionary.is_some() || layout.repetition_index_depth > 1 {
+        if layout.repetition_index_depth > 1 {
             return Err(Error::not_supported(
-                "admitted MiniBlock input does not yet support dictionaries or deeper repetition indexes",
+                "admitted MiniBlock input does not yet support deeper repetition indexes",
             ));
         }
         let nested = layout.repetition_index_depth == 1;
@@ -71,7 +78,8 @@ impl MiniBlockArrayScheduler {
                 "repetition index and level codec must appear together",
             ));
         }
-        if page.buffer_offsets_and_sizes.len() != 2 + usize::from(nested)
+        if page.buffer_offsets_and_sizes.len()
+            != 2 + usize::from(nested) + usize::from(layout.dictionary.is_some())
             || layout.num_buffers == 0
             || layout.value_compression.is_none()
             || (!nested && layout.num_items != page.num_rows)
@@ -90,6 +98,16 @@ impl MiniBlockArrayScheduler {
         });
         let metadata = ranges.next().ok_or_else(|| corrupt("missing metadata"))??;
         let data = ranges.next().ok_or_else(|| corrupt("missing data"))??;
+        let dictionary = layout
+            .dictionary
+            .as_ref()
+            .map(|encoding| {
+                let range = ranges
+                    .next()
+                    .ok_or_else(|| corrupt("missing dictionary buffer"))??;
+                Dictionary::try_new(encoding, range, layout.num_dictionary_items)
+            })
+            .transpose()?;
         let repetition = ranges.next().transpose()?;
         let width = if layout.has_large_chunk { 4 } else { 2 };
         if metadata.is_empty() || (metadata.end - metadata.start) % width != 0 {
@@ -125,6 +143,7 @@ impl MiniBlockArrayScheduler {
             rows: page.num_rows,
             items: layout.num_items,
             repetition,
+            dictionary,
         })
     }
 
@@ -307,7 +326,7 @@ impl MiniBlockArrayScheduler {
                 },
             ));
         }
-        Ok(Some(MiniBlockArrayInput {
+        let input = EncodedArrayInput {
             task: DecodeMiniBlockTask {
                 structural_projection: None,
                 dictionary_data: None,
@@ -323,20 +342,107 @@ impl MiniBlockArrayScheduler {
             data_type,
             count: rows.end - rows.start,
             repetition,
+        };
+        let Some(dictionary) = &self.dictionary else {
+            return Ok(Some(MiniBlockArrayInput::Encoded(input)));
+        };
+        let data_type = input.data_type.clone();
+        let count = input.count;
+        let meanings = input.task.def_meaning.clone();
+        let shape = Shape::from_layers(&data_type, &meanings, None)?;
+        let output_bits = match shape.leaf {
+            DataType::Binary | DataType::Utf8 => 32,
+            _ => 64, // Shape has already rejected every other leaf type.
+        };
+        // Move the existing credit across the CPU boundary; no second admission
+        // can wait while these inputs are retained. Cancellation keeps ownership
+        // with the real CPU job until it finishes.
+        let empty = work
+            .try_split(0)
+            .ok_or_else(|| Error::internal("zero-credit transfer failed"))?;
+        let mut owned = std::mem::replace(work, empty);
+        let (page, returned) = spawn_cpu(move || {
+            let page = input.decode_page(&mut owned);
+            Ok::<_, Error>((page, owned))
+        })
+        .await?;
+        *work = returned;
+        let Some(mut page) = page? else {
+            return Ok(None);
+        };
+        let crate::data::DataBlock::FixedWidth(indices) = &page.data else {
+            return Err(corrupt(
+                "dictionary chunk decoder must produce fixed-width indices",
+            ));
+        };
+        let Some(data) = dictionary
+            .expand(indices, output_bits, work, &mut read)
+            .await?
+        else {
+            return Ok(None);
+        };
+        page.data = data;
+        Ok(Some(MiniBlockArrayInput::Decoded {
+            page,
+            data_type,
+            count,
+            meanings,
         }))
     }
 }
 
+pub(in super::super) enum MiniBlockArrayInput {
+    Encoded(EncodedArrayInput),
+    Decoded {
+        page: DecodedPage,
+        data_type: DataType,
+        count: u64,
+        meanings: Arc<[crate::repdef::DefinitionInterpretation]>,
+    },
+}
+
+impl std::fmt::Debug for MiniBlockArrayInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Encoded(_) => "MiniBlockArrayInput::Encoded",
+            Self::Decoded { .. } => "MiniBlockArrayInput::Decoded",
+        })
+    }
+}
+
+impl MiniBlockArrayInput {
+    pub(in super::super) fn decode_in(self, work: &mut Reservation) -> Result<Option<ArrayRef>> {
+        let (page, data_type, count, meanings) = match self {
+            Self::Encoded(input) => {
+                let data_type = input.data_type.clone();
+                let count = input.count;
+                let meanings = input.task.def_meaning.clone();
+                let Some(page) = input.decode_page(work)? else {
+                    return Ok(None);
+                };
+                (page, data_type, count, meanings)
+            }
+            Self::Decoded {
+                page,
+                data_type,
+                count,
+                meanings,
+            } => (page, data_type, count, meanings),
+        };
+        Shape::from_layers(&data_type, &meanings, None)?.finish(page, count, work)
+    }
+}
+
 #[derive(Debug)]
-pub(in super::super) struct MiniBlockArrayInput {
+pub(in super::super) struct EncodedArrayInput {
     task: DecodeMiniBlockTask,
     data_type: DataType,
     count: u64,
     repetition: Vec<RepetitionSummary>,
 }
 
-impl MiniBlockArrayInput {
-    pub(in super::super) fn decode_in(self, work: &mut Reservation) -> Result<Option<ArrayRef>> {
+impl EncodedArrayInput {
+    fn decode_page(self, work: &mut Reservation) -> Result<Option<DecodedPage>> {
         if !self.repetition.is_empty() && self.repetition.len() != self.task.instructions.len() {
             return Err(corrupt("nested input summary count mismatch"));
         }
@@ -362,14 +468,10 @@ impl MiniBlockArrayInput {
         let validator: Option<&super::admitted::ValidateRepetition<'_>> =
             (!self.repetition.is_empty()).then_some(&validate);
         let page = super::admitted::decode(&self.task, work, validator)?;
-        let meanings = self.task.def_meaning.clone();
         // Shared raw output may still retain a chunk owner. Never refund input
         // credit to this workspace while an output alias can keep it alive.
         drop(self.task);
-        let Some(page) = page else {
-            return Ok(None);
-        };
-        Shape::from_layers(&self.data_type, &meanings, None)?.finish(page, self.count, work)
+        Ok(page)
     }
 }
 

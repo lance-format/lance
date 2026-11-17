@@ -8,6 +8,8 @@ use arrow_array::{BinaryArray, LargeStringArray, UInt32Array};
 use lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK;
 use std::sync::Mutex;
 
+mod dictionary;
+
 fn nested_values(deep: bool) -> ArrayRef {
     use arrow_array::builder::{LargeBinaryBuilder, LargeListBuilder, ListBuilder};
 

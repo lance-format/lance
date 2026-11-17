@@ -177,7 +177,7 @@ impl MiniBlockArrayScheduler {
     }
 }
 
-impl MiniBlockArrayInput {
+impl EncodedArrayInput {
     // Called while the existing admitted decoder owns its level scratch, before
     // selection or value preparation. A mismatch takes its ordinary cleanup path.
     pub(super) fn validate_repetition(
