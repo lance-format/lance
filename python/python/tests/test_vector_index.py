@@ -3799,6 +3799,7 @@ def test_nearest_preserves_existing_positional_arguments(dataset):
         "refine_q",
         "refine_metric",
         "warp_imputation_rank",
+        "rq_graph_scoring",
     ]
 
 
