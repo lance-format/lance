@@ -30,6 +30,9 @@ This is why the file structure below is described as a *container specification*
 
 See the [Encoding Strategy](encoding.md) page for how Lance's default encodings are built on top of this container.
 
+The [Variant contract](variant.md) defines how unstable 2.3 files map a logical
+Variant field to a file-local group of physical columns.
+
 ## File Structure
 
 A Lance file is a container for tabular data. The data is stored in "disk pages". Each disk page contains some rows
