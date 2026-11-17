@@ -11,7 +11,7 @@ use lance_encoding::{
 };
 use lance_file::reader::{FileReader, FileReaderOptions};
 
-pub(super) async fn verify_layout(dataset: &Dataset) -> Result<()> {
+pub async fn verify_layout(dataset: &Dataset) -> Result<()> {
     let leaf_id = dataset
         .schema()
         .field("frames")
