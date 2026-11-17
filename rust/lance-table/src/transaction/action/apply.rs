@@ -841,6 +841,7 @@ impl<'a> ApplyState<'a> {
             fragment_id,
             &fields,
             &self.current_manifest.schema,
+            &self.schema,
         )
     }
 
@@ -1176,9 +1177,11 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 ///
 /// Rebinding a field also invalidates an index on any field it contains or is
 /// nested in: a packed struct is stored under the parent's id while an index may
-/// be keyed on a child. Ancestry is read from `base_schema`, the schema of the
-/// version being committed on top of, because a field this operation drops or
-/// moves has already left the schema being built.
+/// be keyed on a child. A field counts if its ancestry relates it to the index
+/// in either `base_schema`, the schema of the version being committed on top
+/// of, or `working_schema`, the one being built: a field this operation drops
+/// or moves has already left the working schema, and a child it adds is not
+/// yet in the base one.
 ///
 /// A user index with no bitmap -- one built before indices recorded their
 /// coverage -- has no fragment to prune, so a rewrite under it is refused
@@ -1189,15 +1192,16 @@ fn prune_rebound_fields_from_indices(
     fragment_id: u64,
     fields: &[i32],
     base_schema: &Schema,
+    working_schema: &Schema,
 ) -> Result<()> {
     let Ok(fragment_id) = u32::try_from(fragment_id) else {
         return Ok(());
     };
     for index in indices.iter_mut() {
-        let affected_field = fields
-            .iter()
-            .copied()
-            .find(|field| field_affects_index(*field, &index.fields, base_schema));
+        let affected_field = fields.iter().copied().find(|field| {
+            field_affects_index(*field, &index.fields, base_schema)
+                || field_affects_index(*field, &index.fields, working_schema)
+        });
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
             if !is_system_index(index)
                 && let Some(field) = affected_field
