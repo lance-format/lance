@@ -1,12 +1,14 @@
 """Runs the quickstart snippets embedded in docs/src/quickstart/ end to end."""
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 from importlib.metadata import version
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 import tomllib
@@ -15,9 +17,10 @@ from packaging.utils import canonicalize_name
 from snippet_runner import run_sql
 
 QUICKSTART = Path(__file__).resolve().parent.parent / "quickstart"
+REPO_ROOT = QUICKSTART.parents[2]
 OUTPUTS = QUICKSTART / "outputs"
 RUNNER = Path(__file__).resolve().parent / "snippet_runner.py"
-INSTALL_SCRIPTS = ["lancedb-install.sh", "spark-install.sh"]
+INSTALL_SCRIPTS = ["lancedb-install.sh", "pylance-install.sh", "spark-install.sh"]
 
 
 def spark_env():
@@ -104,6 +107,21 @@ def test_lancedb_quickstart(tmp_path, update_outputs):
     check_outputs(snippet, tmp_path, update_outputs)
 
 
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "pylance_quickstart.py",
+        "versioning_quickstart.py",
+        "vector_search_quickstart.py",
+        "fts_quickstart.py",
+    ],
+)
+def test_pylance_quickstarts(script_name, tmp_path, update_outputs):
+    snippet = QUICKSTART / script_name
+    subprocess.run([sys.executable, RUNNER, snippet, tmp_path], check=True)
+    check_outputs(snippet, tmp_path, update_outputs)
+
+
 # Spark creates a Derby metastore in its working directory, so the Spark tests
 # run from tmp_path to keep it out of the checkout.
 def test_spark_quickstart_pyspark(tmp_path, update_outputs):
@@ -133,3 +151,103 @@ def test_spark_quickstart_sql(tmp_path, update_outputs):
         cwd=tmp_path,
     )
     check_outputs(snippet, tmp_path / "outputs", update_outputs)
+
+
+def test_java_maven_and_gradle_versions_match():
+    maven_root = ElementTree.fromstring(
+        (QUICKSTART / "java-maven-deps.xml").read_text(encoding="utf-8")
+    )
+    maven_coords = [
+        f"{dep.findtext('groupId')}:{dep.findtext('artifactId')}:{dep.findtext('version')}"
+        for dep in maven_root.findall("dependency")
+    ]
+    gradle_text = (QUICKSTART / "java-gradle-deps.kts").read_text(encoding="utf-8")
+    gradle_coords = re.findall(r'implementation\("([^"]+)"\)', gradle_text)
+    assert maven_coords == gradle_coords
+
+
+def test_rust_quickstart(tmp_path, update_outputs):
+    snippet = QUICKSTART / "rust_quickstart.rs"
+    shutil.rmtree("/tmp/lance-rust-quickstart.lance", ignore_errors=True)
+    project_dir = tmp_path / "project"
+    (project_dir / "src").mkdir(parents=True)
+    shutil.copyfile(QUICKSTART / "rust-cargo.toml", project_dir / "Cargo.toml")
+    shutil.copyfile(snippet, project_dir / "src" / "main.rs")
+
+    result = subprocess.run(
+        ["cargo", "run", "--quiet", "--manifest-path", str(project_dir / "Cargo.toml")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    recorded_dir = tmp_path / "outputs"
+    recorded_dir.mkdir()
+    (recorded_dir / f"{snippet.name}.run.txt").write_text(
+        result.stdout.strip("\n") + "\n", encoding="utf-8"
+    )
+    check_outputs(snippet, recorded_dir, update_outputs)
+
+
+def test_java_quickstart(tmp_path, update_outputs):
+    snippet = QUICKSTART / "Quickstart.java"
+    shutil.rmtree("/tmp/lance-java-quickstart.lance", ignore_errors=True)
+    project_dir = tmp_path / "project"
+    src_dir = project_dir / "src" / "main" / "java" / "example"
+    src_dir.mkdir(parents=True)
+    shutil.copyfile(snippet, src_dir / "Quickstart.java")
+    deps_xml = (QUICKSTART / "java-maven-deps.xml").read_text(encoding="utf-8")
+    (project_dir / "pom.xml").write_text(
+        '<project xmlns="http://maven.apache.org/POM/4.0.0"'
+        ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+        ' xsi:schemaLocation="http://maven.apache.org/POM/4.0.0'
+        ' http://maven.apache.org/xsd/maven-4.0.0.xsd">\n'
+        "  <modelVersion>4.0.0</modelVersion>\n"
+        "  <groupId>example</groupId>\n"
+        "  <artifactId>lance-java-quickstart</artifactId>\n"
+        "  <version>0.1.0</version>\n"
+        "  <properties>\n"
+        "    <maven.compiler.source>11</maven.compiler.source>\n"
+        "    <maven.compiler.target>11</maven.compiler.target>\n"
+        "    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>\n"
+        "  </properties>\n"
+        f"  {deps_xml}\n"
+        "</project>\n",
+        encoding="utf-8",
+    )
+    mvn = shutil.which("mvn") or str(REPO_ROOT / "java" / "mvnw")
+    cp_file = project_dir / "cp.txt"
+    subprocess.run(
+        [
+            mvn,
+            "-f",
+            str(project_dir / "pom.xml"),
+            "-q",
+            "compile",
+            "dependency:build-classpath",
+            f"-Dmdep.outputFile={cp_file}",
+        ],
+        check=True,
+    )
+    classpath = (
+        f"{project_dir / 'target' / 'classes'}"
+        f"{os.pathsep}"
+        f"{cp_file.read_text(encoding='utf-8').strip()}"
+    )
+    result = subprocess.run(
+        [
+            "java",
+            "--add-opens=java.base/java.nio=ALL-UNNAMED",
+            "-cp",
+            classpath,
+            "example.Quickstart",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    recorded_dir = tmp_path / "outputs"
+    recorded_dir.mkdir()
+    (recorded_dir / f"{snippet.name}.run.txt").write_text(
+        result.stdout.strip("\n") + "\n", encoding="utf-8"
+    )
+    check_outputs(snippet, recorded_dir, update_outputs)

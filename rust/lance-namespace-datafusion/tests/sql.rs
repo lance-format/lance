@@ -11,7 +11,7 @@ use datafusion::prelude::SessionContext;
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_namespace::LanceNamespace;
-use lance_namespace::models::CreateNamespaceRequest;
+use lance_namespace::models::{CreateNamespaceRequest, RegisterTableRequest};
 use lance_namespace_datafusion::{NamespaceLevel, SessionBuilder};
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tempfile::TempDir;
@@ -199,15 +199,37 @@ async fn setup_test_context() -> DFResult<Context> {
         .await
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-    root_dir_ns
-        .migrate()
-        .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-    extra_dir_ns
-        .migrate()
-        .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    // Directory migration preserves `$` in root table names, so register the
+    // intended namespace boundaries explicitly instead of inferring them from filenames.
+    for (namespace, id, location) in [
+        (
+            &root_dir_ns,
+            ["retail", "sales", "customers"],
+            "retail$sales$customers.lance",
+        ),
+        (
+            &root_dir_ns,
+            ["retail", "sales", "orders"],
+            "retail$sales$orders.lance",
+        ),
+        (
+            &root_dir_ns,
+            ["wholesale", "sales2", "orders2"],
+            "wholesale$sales2$orders2.lance",
+        ),
+        (
+            &extra_dir_ns,
+            ["crm", "dim", "customers_dim"],
+            "crm$dim$customers_dim.lance",
+        ),
+    ] {
+        let mut request = RegisterTableRequest::new(location.to_string());
+        request.id = Some(id.into_iter().map(str::to_string).collect());
+        namespace
+            .register_table(request)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    }
 
     let root_ns: Arc<dyn LanceNamespace> = Arc::new(root_dir_ns);
     let extra_ns: Arc<dyn LanceNamespace> = Arc::new(extra_dir_ns);

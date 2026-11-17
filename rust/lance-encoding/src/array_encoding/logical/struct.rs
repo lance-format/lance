@@ -10,8 +10,8 @@ use std::{
 use crate::{
     data::concat_decoded_arrays,
     decoder::{
-        DecodeArrayTask, DrainLimit, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
-        ScheduledScanLine, SchedulerContext,
+        ColumnContext, DecodeArrayTask, DrainLimit, FilterExpression, MessageType, NextDecodeTask,
+        PriorityRange, ScheduledScanLine, SchedulerContext, with_column_context,
     },
     decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
@@ -433,6 +433,7 @@ impl ChildState {
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         let mut safe_rows = 0;
         let mut bytes = 0u64;
+        let mut dictionary_rows: Option<u64> = None;
         let mut budget = byte_budget;
         let mut remaining = num_rows;
         for decoder in &self.scheduled {
@@ -443,6 +444,12 @@ impl ChildState {
             let page_limit = decoder.max_rows_to_drain(rows_in_page, budget)?;
             safe_rows += page_limit.rows;
             bytes = bytes.saturating_add(page_limit.bytes);
+            dictionary_rows = match (dictionary_rows, page_limit.dictionary_rows) {
+                (Some(current), Some(page)) => Some(current.min(page)),
+                (Some(current), None) => Some(current),
+                (None, Some(page)) => Some(page),
+                (None, None) => None,
+            };
             if page_limit.rows < rows_in_page {
                 break;
             }
@@ -452,6 +459,7 @@ impl ChildState {
         Ok(DrainLimit {
             rows: safe_rows,
             bytes,
+            dictionary_rows,
         })
     }
 }
@@ -483,6 +491,8 @@ pub struct SimpleStructDecoder {
     child_fields: Fields,
     data_type: DataType,
     num_rows: u64,
+    // Column context for top-level fields, if known.
+    column_contexts: Option<Arc<[ColumnContext]>>,
 }
 
 impl SimpleStructDecoder {
@@ -497,7 +507,14 @@ impl SimpleStructDecoder {
             child_fields,
             data_type,
             num_rows,
+            column_contexts: None,
         }
+    }
+
+    /// Attach top-level column context so decode errors name the failing column.
+    pub(crate) fn with_column_contexts(mut self, contexts: Vec<ColumnContext>) -> Self {
+        self.column_contexts = Some(contexts.into());
+        self
     }
 
     async fn do_wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
@@ -536,14 +553,6 @@ impl SimpleStructDecoder {
 }
 
 impl LogicalPageDecoder for SimpleStructDecoder {
-    fn max_dictionary_rows(&self) -> Option<u64> {
-        self.children
-            .iter()
-            .flat_map(|child| child.scheduled.iter())
-            .filter_map(|decoder| decoder.max_dictionary_rows())
-            .min()
-    }
-
     fn accept_child(&mut self, mut child: DecoderReady) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
@@ -576,6 +585,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             task: Box::new(SimpleStructDecodeTask {
                 children: child_tasks,
                 child_fields: self.child_fields.clone(),
+                column_contexts: self.column_contexts.clone(),
             }),
             num_rows,
         })
@@ -588,6 +598,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             DrainLimit {
                 rows: num_rows,
                 bytes: 0,
+                dictionary_rows: None,
             },
             |limit, child| {
                 child
@@ -595,6 +606,13 @@ impl LogicalPageDecoder for SimpleStructDecoder {
                     .map(|child_limit| DrainLimit {
                         rows: limit.rows.min(child_limit.rows),
                         bytes: limit.bytes.max(child_limit.bytes),
+                        dictionary_rows: match (limit.dictionary_rows, child_limit.dictionary_rows)
+                        {
+                            (Some(current), Some(child)) => Some(current.min(child)),
+                            (Some(current), None) => Some(current),
+                            (None, Some(child)) => Some(child),
+                            (None, None) => None,
+                        },
                     })
             },
         )
@@ -651,14 +669,24 @@ impl CompositeDecodeTask {
 struct SimpleStructDecodeTask {
     children: Vec<CompositeDecodeTask>,
     child_fields: Fields,
+    column_contexts: Option<Arc<[ColumnContext]>>,
 }
 
 impl DecodeArrayTask for SimpleStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+        let contexts = self.column_contexts;
         let child_arrays = self
             .children
             .into_iter()
-            .map(|child| child.decode())
+            .enumerate()
+            .map(|(index, child)| {
+                child.decode().map_err(|source| {
+                    match contexts.as_ref().and_then(|contexts| contexts.get(index)) {
+                        Some(context) => with_column_context(&context.name, context.id, source),
+                        None => source,
+                    }
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.

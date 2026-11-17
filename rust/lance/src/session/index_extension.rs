@@ -56,7 +56,7 @@ pub trait VectorIndexExtension: IndexExtension {
 mod test {
     use crate::{
         dataset::{builder::DatasetBuilder, scanner::test_dataset::TestVectorDataset},
-        index::{DatasetIndexInternalExt, PreFilter},
+        index::{PreFilter, loading::DatasetIndexInternalExt},
         session::Session,
     };
 
@@ -417,5 +417,124 @@ mod test {
 
         // should be able to downcast to the mock index
         let _downcasted = vector_index.as_any().downcast_ref::<MockIndex>().unwrap();
+    }
+
+    /// A commit opens extension segments through their extension. They name no
+    /// index type this build knows, which only another such segment matches.
+    #[tokio::test]
+    async fn test_vector_index_extension_segments_commit_by_their_contract() {
+        use crate::dataset::CommitBuilder;
+        use crate::dataset::transaction::{Operation, Transaction};
+
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let idx_ext = Arc::new(MockIndexExtension::new());
+        let mut session = Session::default();
+        session
+            .register_index_extension("TEST".into(), idx_ext.clone())
+            .unwrap();
+        let mut dataset = DatasetBuilder::from_uri(&test_ds.tmp_dir)
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("ext".to_string()),
+                &MockIndexParams,
+                false,
+            )
+            .await
+            .unwrap();
+        let first = dataset
+            .load_indices_by_name("ext")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        // A fragment of its own for each of the next two segments.
+        test_ds.append_data_with_range(400, 410).await.unwrap();
+        test_ds.append_data_with_range(410, 420).await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let mut fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        fragments.sort_unstable();
+        let flat_fragment = fragments.pop().unwrap();
+        let extension_fragment = fragments.pop().unwrap();
+
+        let commit = |dataset: &Dataset, segment: lance_table::format::IndexMetadata| {
+            let transaction = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![lance_table::format::IndexMetadata {
+                        name: "ext".to_string(),
+                        ..segment
+                    }],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            CommitBuilder::new(Arc::new(dataset.clone())).execute(transaction)
+        };
+
+        // A second extension segment, as a coordinator could commit it.
+        let uuid = Uuid::new_v4();
+        idx_ext
+            .create_index(&dataset, "vec", &uuid, &MockIndexParams)
+            .await
+            .unwrap();
+        let second = lance_table::format::IndexMetadata {
+            uuid,
+            files: None,
+            fragment_bitmap: Some([extension_fragment].into_iter().collect()),
+            ..first.clone()
+        };
+        let mut dataset = commit(&dataset, second).await.unwrap();
+        assert_eq!(dataset.load_indices_by_name("ext").await.unwrap().len(), 2);
+
+        // A built-in segment with the same metric still differs in index type.
+        let flat = dataset
+            .create_index_builder(
+                &["vec"],
+                IndexType::Vector,
+                &crate::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2),
+            )
+            .name("worker".to_string())
+            .fragments(vec![flat_fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let err = commit(&dataset, flat.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        // The mock's file says cosine, but the opened segment reports L2.
+        assert!(
+            err.to_string().contains("IVF_FLAT")
+                && err
+                    .to_string()
+                    .contains("metric L2, an index extension's type"),
+            "{err}"
+        );
+
+        // Only the extension opens its segments, so a session without it
+        // cannot commit to the index.
+        let without_extension = DatasetBuilder::from_uri(&test_ds.tmp_dir)
+            .load()
+            .await
+            .unwrap();
+        let err = commit(&without_extension, flat).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::IO { .. })
+                && err.to_string().contains(&first.uuid.to_string()),
+            "{err:?}"
+        );
     }
 }

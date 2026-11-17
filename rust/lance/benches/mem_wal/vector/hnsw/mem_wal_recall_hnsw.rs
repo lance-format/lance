@@ -27,7 +27,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::DatasetMemWalExt;
-use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
+use lance::dataset::mem_wal::MemTableScanner;
+use lance::dataset::mem_wal::write::ShardWriterConfig;
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};

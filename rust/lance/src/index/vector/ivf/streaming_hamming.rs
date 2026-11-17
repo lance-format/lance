@@ -435,33 +435,42 @@ pub(super) fn append_local_coreset(
     }
     let dimension = data.value_length() as usize;
     let local_k = local_k.max(1);
-    let sample_rate = data.len().div_ceil(local_k).max(1);
-    let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
-        None,
-        data,
-        KMeansStepOptions {
+    // Rows that fit the local budget are their own summaries: k-modes cannot do
+    // better, and its hierarchical form fails on a repeated row when asked for
+    // one cluster per row.
+    let (num_summaries, membership) = if data.len() <= local_k {
+        (data.len(), (0..data.len() as u32).map(Some).collect())
+    } else {
+        let sample_rate = data.len().div_ceil(local_k).max(1);
+        let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
+            None,
+            data,
+            KMeansStepOptions {
+                dimension,
+                metric_type: DistanceType::Hamming,
+                num_partitions: local_k,
+                sample_rate,
+                max_iters,
+                disable_hierarchical: false,
+                on_progress,
+            },
+        )?;
+        let centroids =
+            FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?;
+        let assignment_model = KMeans::with_centroids(
+            centroids.values().clone(),
             dimension,
-            metric_type: DistanceType::Hamming,
-            num_partitions: local_k,
-            sample_rate,
-            max_iters,
-            disable_hierarchical: false,
-            on_progress,
-        },
-    )?;
-    let centroids = FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?;
-    let assignment_model = KMeans::with_centroids(
-        centroids.values().clone(),
-        dimension,
-        DistanceType::Hamming,
-        f64::MAX,
-    );
-    let (membership, _) = assignment_model.compute_membership_and_distances(data)?;
+            DistanceType::Hamming,
+            f64::MAX,
+        );
+        let (membership, _) = assignment_model.compute_membership_and_distances(data)?;
+        (centroids.len(), membership)
+    };
     let values = data
         .values()
         .as_primitive::<arrow_array::types::UInt8Type>()
         .values();
-    let mut summaries = HammingAccumulator::try_new(centroids.len(), dimension)?;
+    let mut summaries = HammingAccumulator::try_new(num_summaries, dimension)?;
     for (row_index, member) in membership.into_iter().enumerate() {
         let Some(cluster_id) = member.map(|value| value as usize) else {
             continue;
@@ -470,7 +479,7 @@ pub(super) fn append_local_coreset(
         coreset.insert_representative(vector)?;
         summaries.add_vector(cluster_id, vector)?;
     }
-    for cluster_id in 0..centroids.len() {
+    for cluster_id in 0..num_summaries {
         coreset.push_compact(
             summaries.count(cluster_id),
             &summaries.ones,
@@ -1165,6 +1174,21 @@ mod tests {
         append_local_coreset(&mut coreset, &data, 0, 2, std::sync::Arc::new(|_, _| {})).unwrap();
 
         assert_eq!(coreset.counts, vec![2]);
+    }
+
+    #[test]
+    fn local_coreset_keeps_rows_that_fit_its_budget() {
+        // One cluster for each of 300 one-byte rows, which hold at most 256 values
+        let data = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values((0..300).map(|row| row as u8)),
+            1,
+        )
+        .unwrap();
+        let mut coreset = HammingCoreset::new(1, 300);
+
+        append_local_coreset(&mut coreset, &data, 300, 1, std::sync::Arc::new(|_, _| {})).unwrap();
+
+        assert_eq!(coreset.counts, vec![1; 300]);
     }
 
     #[test]

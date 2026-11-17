@@ -43,6 +43,11 @@ def stage_progress_values(events, stage):
     ]
 
 
+@pytest.fixture
+def enable_unstable_data_overlay_files(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
 @pytest.fixture(params=(True, False))
 def provide_pandas(request, monkeypatch):
     if not request.param:
@@ -123,8 +128,8 @@ def pytest_configure(config):
 def pytest_configure_node(node):
     """Resolve the compat version list once, on the xdist controller.
 
-    The compat tests are parametrized over the pylance releases published to
-    PyPI and fury.io, and collecting `python/tests` imports them whether or not
+    The compat tests are parametrized over the stable pylance releases published
+    to PyPI, and collecting `python/tests` imports them whether or not
     --run-compat was passed. Left to itself every worker queries for that list
     while collecting, so a request that times out or a release that lands
     mid-run gives one worker a different parameter set, and xdist aborts the

@@ -54,6 +54,10 @@ class IndexProgress:
 class FragmentWriteProgress(ABC):
     """Progress tracking for Writing a Dataset or Fragment.
 
+    An exception raised by a hook fails the write. The hooks run on the async
+    runtime of the write, so Lance calls that block on it, such as
+    ``lance.dataset()``, panic when made from a hook.
+
     Warns
     -----
     This tracking class is experimental and may change in the future.
@@ -74,7 +78,8 @@ class FragmentWriteProgress(ABC):
         ----------
         fragment : FragmentMetadata
             The fragment that is open to write to. The fragment id might not
-            yet be assigned at this point.
+            yet be assigned at this point, and its data files might not be
+            listed yet.
         kwargs: dict, optional
             Extra keyword arguments to pass to the implementation.
 
@@ -95,10 +100,14 @@ class FragmentWriteProgress(ABC):
     def complete(self, fragment: "FragmentMetadata", **kwargs) -> None:
         """Callback when a fragment is completely written.
 
+        Its data file is closed, but a later failure of the write can still
+        remove it, so this does not mean the fragment will be committed.
+
         Parameters
         ----------
         fragment : FragmentMetadata
-            The fragment that is open to write to.
+            The fragment that was written. The fragment id might not yet be
+            assigned at this point.
         kwargs: dict, optional
             Extra keyword arguments to pass to the implementation.
         """
@@ -128,7 +137,13 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
     This implementation writes a JSON file to track in-progress state
     to the filesystem for each fragment.
 
-
+    The files are named after the fragment id. ``write_dataset`` and
+    ``write_fragments`` report id 0 for every fragment, as does
+    ``LanceFragment.create`` without a ``fragment_id``, so those fragments share
+    one pair of files and ``fragment_0.json`` holds only the last fragment begun.
+    Writers sharing a directory and a fragment id also share the marker, which can
+    then disappear while one of them is still writing or after one has crashed, so
+    give such writers their own directories.
     """
 
     PROGRESS_EXT: str = ".in_progress"
@@ -183,4 +198,8 @@ class FileSystemFragmentWriteProgress(FragmentWriteProgress):
 
     def complete(self, fragment: "FragmentMetadata", **kwargs):
         """Called when a fragment is completed"""
-        self._fs.delete_file(self._in_progress_path(fragment))
+        try:
+            self._fs.delete_file(self._in_progress_path(fragment))
+        except FileNotFoundError:
+            # Another writer sharing this directory removed the marker first.
+            pass

@@ -4,11 +4,18 @@
 use std::sync::Arc;
 
 use jni::JNIEnv;
-use jni::objects::{JMap, JObject, JString, JValue};
-use jni::sys::jlong;
-use lance::session::{CacheSpec, Session as LanceSession};
-use lance_core::cache::{BackendConfig, build_from_config, build_from_uri};
+use jni::objects::{JByteArray, JMap, JObject, JString, JValue};
+use jni::sys::{jboolean, jbyteArray, jlong};
+use lance::cache_diagnostics_pb as pb;
+use lance::session::{
+    CacheSpec, Session as LanceSession, SessionCacheDiagnostics as NativeSessionCacheDiagnostics,
+};
+use lance_core::cache::{
+    BackendConfig, CacheActivity, CacheBackendDiagnostics, CacheBackendKind,
+    CacheByTypeDiagnostics, CacheDiagnostics, CacheSnapshotMode, build_from_config, build_from_uri,
+};
 use lance_io::object_store::ObjectStoreRegistry;
+use prost::Message;
 
 use crate::block_on;
 use crate::error::{Error, Result};
@@ -148,6 +155,185 @@ fn resolve_cache_spec(
     }
 }
 
+fn checked_jlong(value: u64, field: &str) -> Result<jlong> {
+    value.try_into().map_err(|_| {
+        Error::runtime_error(format!(
+            "cache diagnostics field {} value {} exceeds Java long range",
+            field, value
+        ))
+    })
+}
+
+fn checked_u64(value: u64, field: &str) -> Result<u64> {
+    checked_jlong(value, field).map(|_| value)
+}
+
+fn checked_optional(value: Option<u64>, field: &str) -> Result<Option<u64>> {
+    value.map(|value| checked_u64(value, field)).transpose()
+}
+
+fn activity_to_proto(activity: &CacheActivity) -> Result<pb::CacheActivityDiagnostics> {
+    Ok(pb::CacheActivityDiagnostics {
+        hits: checked_u64(activity.hits, "activity.hits")?,
+        misses: checked_u64(activity.misses, "activity.misses")?,
+        lookup_errors: checked_u64(activity.lookup_errors, "activity.lookup_errors")?,
+        type_mismatches: checked_u64(activity.type_mismatches, "activity.type_mismatches")?,
+        loads_started: checked_u64(activity.loads_started, "activity.loads_started")?,
+        loads_succeeded: checked_u64(activity.loads_succeeded, "activity.loads_succeeded")?,
+        loads_failed: checked_u64(activity.loads_failed, "activity.loads_failed")?,
+        loads_cancelled: checked_u64(activity.loads_cancelled, "activity.loads_cancelled")?,
+        loads_in_flight: checked_u64(activity.loads_in_flight, "activity.loads_in_flight")?,
+        load_success_duration_ns: checked_u64(
+            activity.load_success_duration_ns,
+            "activity.load_success_duration_ns",
+        )?,
+        load_error_duration_ns: checked_u64(
+            activity.load_error_duration_ns,
+            "activity.load_error_duration_ns",
+        )?,
+        load_cancelled_duration_ns: checked_u64(
+            activity.load_cancelled_duration_ns,
+            "activity.load_cancelled_duration_ns",
+        )?,
+        warm: Some(pb::CacheWarmActivityDiagnostics {
+            attempts: checked_u64(activity.warm.attempts, "activity.warm.attempts")?,
+            hits: checked_u64(activity.warm.hits, "activity.warm.hits")?,
+            loads_started: checked_u64(activity.warm.loads_started, "activity.warm.loads_started")?,
+            loads_succeeded: checked_u64(
+                activity.warm.loads_succeeded,
+                "activity.warm.loads_succeeded",
+            )?,
+            loads_failed: checked_u64(activity.warm.loads_failed, "activity.warm.loads_failed")?,
+            loads_cancelled: checked_u64(
+                activity.warm.loads_cancelled,
+                "activity.warm.loads_cancelled",
+            )?,
+            load_bytes: checked_u64(activity.warm.load_bytes, "activity.warm.load_bytes")?,
+            errors: checked_u64(activity.warm.errors, "activity.warm.errors")?,
+        }),
+    })
+}
+
+fn backend_to_proto(backend: &CacheBackendDiagnostics) -> Result<pb::CacheBackendDiagnostics> {
+    let kind = match backend.kind {
+        CacheBackendKind::Quick => pb::cache_backend_diagnostics::Kind::Quick,
+        CacheBackendKind::Moka => pb::cache_backend_diagnostics::Kind::Moka,
+        CacheBackendKind::Custom => pb::cache_backend_diagnostics::Kind::Custom,
+    };
+    Ok(pb::CacheBackendDiagnostics {
+        kind: kind as i32,
+        pool_id: checked_optional(backend.pool_id, "backend.pool_id")?,
+        capacity_bytes: checked_optional(backend.capacity_bytes, "backend.capacity_bytes")?,
+        enabled: backend.enabled,
+        size_bytes: checked_optional(backend.size_bytes, "backend.size_bytes")?,
+        num_entries: checked_optional(backend.num_entries, "backend.num_entries")?,
+        write_attempts: checked_optional(backend.write_attempts, "backend.write_attempts")?,
+        write_bytes: checked_optional(backend.write_bytes, "backend.write_bytes")?,
+        size_removals: checked_optional(backend.size_removals, "backend.size_removals")?,
+        size_removed_bytes: checked_optional(
+            backend.size_removed_bytes,
+            "backend.size_removed_bytes",
+        )?,
+        disabled_write_rejections: checked_optional(
+            backend.disabled_write_rejections,
+            "backend.disabled_write_rejections",
+        )?,
+        disabled_bypasses: checked_optional(
+            backend.disabled_bypasses,
+            "backend.disabled_bypasses",
+        )?,
+        lost_placeholder_rejections: checked_optional(
+            backend.lost_placeholder_rejections,
+            "backend.lost_placeholder_rejections",
+        )?,
+        weight_saturations: checked_optional(
+            backend.weight_saturations,
+            "backend.weight_saturations",
+        )?,
+        write_rejections_complete: backend.write_rejections_complete,
+        resident_evictions: checked_optional(
+            backend.resident_evictions,
+            "backend.resident_evictions",
+        )?,
+        admissions: checked_optional(backend.admissions, "backend.admissions")?,
+        coalesced_loads: checked_optional(backend.coalesced_loads, "backend.coalesced_loads")?,
+    })
+}
+
+fn diagnostics_to_proto(diagnostics: &CacheDiagnostics) -> Result<pb::CacheDiagnosticsSnapshot> {
+    Ok(pb::CacheDiagnosticsSnapshot {
+        activity: Some(activity_to_proto(&diagnostics.activity)?),
+        backend: Some(backend_to_proto(&diagnostics.backend)?),
+        utilization: diagnostics.utilization,
+        by_type: diagnostics
+            .by_type
+            .as_ref()
+            .map(by_type_to_proto)
+            .transpose()?,
+    })
+}
+
+fn by_type_to_proto(diagnostics: &CacheByTypeDiagnostics) -> Result<pb::CacheByTypeDiagnostics> {
+    let activity = diagnostics
+        .activity
+        .iter()
+        .map(|item| {
+            Ok(pb::CacheTypeActivityDiagnostics {
+                type_name: item.type_name.clone(),
+                activity: Some(activity_to_proto(&item.activity)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let occupancy = diagnostics
+        .occupancy
+        .as_ref()
+        .map(|occupancy| -> Result<pb::CacheOccupancyByTypeDiagnostics> {
+            let types = occupancy
+                .types
+                .iter()
+                .map(|item| {
+                    Ok(pb::CacheTypeOccupancyDiagnostics {
+                        type_name: item.type_name.clone(),
+                        size_bytes: checked_u64(item.size_bytes, "by_type.occupancy.size_bytes")?,
+                        num_entries: checked_u64(
+                            item.num_entries,
+                            "by_type.occupancy.num_entries",
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(pb::CacheOccupancyByTypeDiagnostics {
+                types,
+                untagged_size_bytes: checked_u64(
+                    occupancy.untagged_size_bytes,
+                    "by_type.occupancy.untagged_size_bytes",
+                )?,
+                untagged_num_entries: checked_u64(
+                    occupancy.untagged_num_entries,
+                    "by_type.occupancy.untagged_num_entries",
+                )?,
+            })
+        })
+        .transpose()?;
+    Ok(pb::CacheByTypeDiagnostics {
+        activity,
+        occupancy,
+        type_label_overflow_events: checked_u64(
+            diagnostics.type_label_overflow_events,
+            "by_type.type_label_overflow_events",
+        )?,
+    })
+}
+
+fn session_diagnostics_to_proto(
+    diagnostics: &NativeSessionCacheDiagnostics,
+) -> Result<pb::SessionCacheDiagnostics> {
+    Ok(pb::SessionCacheDiagnostics {
+        index: Some(diagnostics_to_proto(&diagnostics.index)?),
+        metadata: Some(diagnostics_to_proto(&diagnostics.metadata)?),
+    })
+}
+
 /// Returns the current size of the session in bytes.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Session_sizeBytesNative(
@@ -188,19 +374,95 @@ fn metadata_cache_stats_native<'local>(
 
     // Safety: We trust that the handle is valid and was created by createNative
     let session_arc = unsafe { &*(handle as *const Arc<LanceSession>) };
-    let stats = block_on(session_arc.metadata_cache_stats());
+    cache_stats_to_java(env, block_on(session_arc.metadata_cache_stats()))
+}
 
-    let stats_obj = env.new_object(
+fn cache_stats_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    stats: lance_core::cache::CacheStats,
+) -> Result<JObject<'local>> {
+    let hits = checked_jlong(stats.hits, "hits")?;
+    let misses = checked_jlong(stats.misses, "misses")?;
+    let num_entries = checked_jlong(stats.num_entries as u64, "num_entries")?;
+    let size_bytes = checked_jlong(stats.size_bytes as u64, "size_bytes")?;
+    Ok(env.new_object(
         "org/lance/CacheStats",
         "(JJJJ)V",
         &[
-            JValue::Long(stats.hits as jlong),
-            JValue::Long(stats.misses as jlong),
-            JValue::Long(stats.num_entries as jlong),
-            JValue::Long(stats.size_bytes as jlong),
+            JValue::Long(hits),
+            JValue::Long(misses),
+            JValue::Long(num_entries),
+            JValue::Long(size_bytes),
         ],
-    )?;
-    Ok(stats_obj)
+    )?)
+}
+
+/// Returns statistics for the session's index cache as an org.lance.CacheStats object.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Session_indexCacheStatsNative<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, index_cache_stats_native(&mut env, obj))
+}
+
+fn index_cache_stats_native<'local>(
+    env: &mut JNIEnv<'local>,
+    obj: JObject,
+) -> Result<JObject<'local>> {
+    let handle = get_session_handle(env, &obj)?;
+    if handle == 0 {
+        return Err(Error::input_error("Session is closed".to_string()));
+    }
+
+    // Safety: We trust that the handle is valid and was created by createNative
+    let session_arc = unsafe { &*(handle as *const Arc<LanceSession>) };
+    cache_stats_to_java(env, block_on(session_arc.index_cache_stats()))
+}
+
+/// Returns protobuf-encoded complete diagnostics for both session caches.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Session_cacheDiagnosticsNative(
+    mut env: JNIEnv,
+    obj: JObject,
+    refresh: jboolean,
+    by_type: jboolean,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        cache_diagnostics_native(&mut env, obj, refresh != 0, by_type != 0)
+            .map(JByteArray::into_raw),
+        JByteArray::default().into_raw()
+    )
+}
+
+fn cache_diagnostics_native<'local>(
+    env: &mut JNIEnv<'local>,
+    obj: JObject,
+    refresh: bool,
+    by_type: bool,
+) -> Result<JByteArray<'local>> {
+    let handle = get_session_handle(env, &obj)?;
+    if handle == 0 {
+        return Err(Error::input_error("Session is closed".to_string()));
+    }
+
+    // Safety: We trust that the handle is valid and was created by createNative
+    let session_arc = unsafe { &*(handle as *const Arc<LanceSession>) };
+    let diagnostics = if by_type {
+        let mode = if refresh {
+            CacheSnapshotMode::Refreshed
+        } else {
+            CacheSnapshotMode::Approximate
+        };
+        block_on(session_arc.cache_diagnostics_by_type(mode))
+    } else if refresh {
+        block_on(session_arc.cache_diagnostics_with_mode(CacheSnapshotMode::Refreshed))
+    } else {
+        session_arc.cache_diagnostics()
+    };
+    let bytes = session_diagnostics_to_proto(&diagnostics)?.encode_to_vec();
+    Ok(env.byte_array_from_slice(&bytes)?)
 }
 
 /// Releases the native session handle.
@@ -270,5 +532,53 @@ pub extern "system" fn Java_org_lance_Session_isSameAsNative(
         1 // true
     } else {
         0 // false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_proto_preserves_optional_fields() {
+        let session = LanceSession::with_cache_backends(
+            CacheSpec::Size(0),
+            CacheSpec::Size(2048),
+            Arc::new(ObjectStoreRegistry::default()),
+        );
+
+        let diagnostics = session_diagnostics_to_proto(&session.cache_diagnostics()).unwrap();
+        let index = diagnostics.index.unwrap();
+        assert_eq!(
+            index
+                .activity
+                .as_ref()
+                .unwrap()
+                .warm
+                .as_ref()
+                .unwrap()
+                .attempts,
+            0
+        );
+        let index_backend = index.backend.unwrap();
+        assert_eq!(index_backend.capacity_bytes, Some(0));
+        assert_eq!(index_backend.enabled, Some(false));
+        assert_eq!(index.utilization, None);
+
+        let metadata = diagnostics.metadata.unwrap();
+        assert_eq!(metadata.backend.unwrap().capacity_bytes, Some(2048));
+        assert_eq!(metadata.utilization, Some(0.0));
+
+        let by_type = block_on(session.cache_diagnostics_by_type(CacheSnapshotMode::Approximate));
+        let by_type = session_diagnostics_to_proto(&by_type).unwrap();
+        let index_by_type = by_type.index.unwrap().by_type.unwrap();
+        assert!(index_by_type.activity.is_empty());
+        assert!(index_by_type.occupancy.unwrap().types.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_reject_values_outside_java_long_range() {
+        assert!(checked_u64(i64::MAX as u64, "test").is_ok());
+        assert!(checked_u64(i64::MAX as u64 + 1, "test").is_err());
     }
 }
