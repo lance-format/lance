@@ -32,14 +32,16 @@ use arrow_array::types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Ty
 use arrow_array::{Array, FixedSizeListArray, PrimitiveArray, cast::AsArray};
 use arrow_schema::DataType;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceType, l2::L2, l2::l2_distance_batch_into};
-use lance_linalg::kernels::argmin_value_float;
+use lance_linalg::distance::DistanceType;
 use num_traits::Float;
 use rand::prelude::*;
 use rand::seq::index::sample;
 use rayon::prelude::*;
 
 use super::KMeans;
+use assign::{Assignment, NearestCentroid};
+
+mod assign;
 
 /// Count that every cluster starts with. It makes `S_j / N_j` return the
 /// initial centroid exactly while giving it almost no weight against the
@@ -224,7 +226,7 @@ struct Trainer<'a> {
 impl Trainer<'_> {
     fn train<T: ArrowPrimitiveType>(&self, data: &FixedSizeListArray) -> Result<KMeans>
     where
-        T::Native: Float + L2,
+        T::Native: NearestCentroid,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         let Self {
@@ -372,7 +374,7 @@ fn rows_per_task(batch_len: usize, k: usize, dimension: usize) -> usize {
 /// order; a large table would be costly to replicate per task, so its tasks
 /// only assign and the sums are taken in one pass afterwards. A vector whose
 /// distances to every centroid are NaN joins no cluster.
-fn assign_batch<N: Float + L2 + Sync>(
+fn assign_batch<N: NearestCentroid>(
     values: &[N],
     dimension: usize,
     centroids: &[N],
@@ -380,49 +382,49 @@ fn assign_batch<N: Float + L2 + Sync>(
     batch: &[usize],
 ) -> BatchStats {
     let rows_per_task = rows_per_task(batch.len(), k, dimension);
-    let vector = |row: usize| &values[row * dimension..(row + 1) * dimension];
-    let nearest = |row: usize, distances: &mut [f32]| {
-        l2_distance_batch_into(vector(row), centroids, dimension, distances);
-        argmin_value_float(distances.iter().copied())
+    let prepared = N::prepare_centroids(centroids, dimension);
+    let assign = |rows: &[usize]| {
+        let mut assignments = Vec::with_capacity(rows.len());
+        N::assign_rows(
+            values,
+            dimension,
+            centroids,
+            &prepared,
+            rows,
+            &mut assignments,
+        );
+        assignments
+    };
+    let accumulate = |stats: &mut BatchStats, rows: &[usize], assignments: &[Assignment]| {
+        for (&row, assignment) in rows.iter().zip(assignments) {
+            if let Some((cluster, distance)) = *assignment {
+                let vector = &values[row * dimension..(row + 1) * dimension];
+                stats.add(cluster as usize, vector, distance);
+            }
+        }
     };
 
+    let mut stats = BatchStats::zeros(k, dimension);
     if k * dimension * size_of::<f64>() <= TASK_SUMS_MAX_BYTES {
         let partials: Vec<BatchStats> = batch
             .par_chunks(rows_per_task)
             .map(|rows| {
-                let mut stats = BatchStats::zeros(k, dimension);
-                let mut distances = vec![0.0f32; k];
-                for &row in rows {
-                    if let Some((cluster, distance)) = nearest(row, &mut distances) {
-                        stats.add(cluster as usize, vector(row), distance);
-                    }
-                }
-                stats
+                let mut partial = BatchStats::zeros(k, dimension);
+                accumulate(&mut partial, rows, &assign(rows));
+                partial
             })
             .collect();
-        let mut stats = BatchStats::zeros(k, dimension);
         for partial in &partials {
             stats.merge(partial);
         }
-        stats
     } else {
-        let assignments: Vec<Vec<Option<(u32, f32)>>> = batch
+        let assignments: Vec<Assignment> = batch
             .par_chunks(rows_per_task)
-            .map(|rows| {
-                let mut distances = vec![0.0f32; k];
-                rows.iter()
-                    .map(|&row| nearest(row, &mut distances))
-                    .collect()
-            })
+            .flat_map_iter(assign)
             .collect();
-        let mut stats = BatchStats::zeros(k, dimension);
-        for (&row, assignment) in batch.iter().zip(assignments.iter().flatten()) {
-            if let Some((cluster, distance)) = *assignment {
-                stats.add(cluster as usize, vector(row), distance);
-            }
-        }
-        stats
+        accumulate(&mut stats, batch, &assignments);
     }
+    stats
 }
 
 fn to_f64<N: Float>(value: N) -> f64 {
