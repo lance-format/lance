@@ -702,6 +702,102 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
     )?)
 }
 
+/// Remap like [`remap_graph_batch`], falling back to [`remap_graph_repair`]
+/// only when dropping the removed nodes strands a survivor.
+///
+/// Search walks level 0 from the entry point, so a survivor whose every path
+/// from it crossed a removed node can never be returned again, however wide the
+/// search. Checking that is a linear walk over the remapped graph, while
+/// repair re-searches every damaged node, so graphs that stay connected keep
+/// the cheap remap.
+pub fn remap_graph_connected<S: VectorStore + Sync>(
+    graph: &RecordBatch,
+    new_ids: &[Option<u32>],
+    storage: &S,
+) -> Result<RecordBatch> {
+    let remapped = remap_graph_batch(graph, new_ids)?;
+    let (reached, total) = level0_reachability(&remapped)?;
+    if reached == total {
+        return Ok(remapped);
+    }
+    remap_graph_repair(graph, new_ids, storage)
+}
+
+/// The number of level-0 nodes of a serialized graph reachable from its entry
+/// point, and the number of level-0 nodes.
+fn level0_reachability(graph: &RecordBatch) -> Result<(usize, usize)> {
+    let metadata_json = graph
+        .schema_ref()
+        .metadata()
+        .get(HNSW_METADATA_KEY)
+        .ok_or_else(|| Error::index(format!("{HNSW_METADATA_KEY} not found in HNSW batch")))?;
+    let metadata: HnswMetadata = serde_json::from_str(metadata_json).map_err(|e| {
+        Error::index(format!(
+            "Failed to decode HNSW metadata: {e}, json: {metadata_json}"
+        ))
+    })?;
+    let (start, num_nodes) = match metadata.level_offsets.as_slice() {
+        [start, end, ..] => (*start, end.saturating_sub(*start)),
+        _ => (0, 0),
+    };
+    if num_nodes == 0 {
+        return Ok((0, 0));
+    }
+    let ids = graph
+        .column_by_name(VECTOR_ID_COL)
+        .and_then(|ids| ids.as_primitive_opt::<UInt32Type>())
+        .ok_or_else(|| Error::index(format!("HNSW batch needs a UInt32 {VECTOR_ID_COL} column")))?;
+    let neighbors = graph
+        .column_by_name(NEIGHBORS_COL)
+        .and_then(|neighbors| neighbors.as_list_opt::<i32>())
+        .ok_or_else(|| {
+            Error::index(format!(
+                "HNSW batch needs a List<UInt32> {NEIGHBORS_COL} column"
+            ))
+        })?;
+    let neighbor_values = neighbors
+        .values()
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| Error::index(format!("{NEIGHBORS_COL} must be List<UInt32>")))?
+        .values();
+    let offsets = neighbors.value_offsets();
+
+    let mut row_of = vec![usize::MAX; num_nodes];
+    for row in start..start + num_nodes {
+        let id = ids.value(row) as usize;
+        if id >= num_nodes {
+            return Err(Error::index(format!(
+                "HNSW level-0 node {id} is out of range for {num_nodes} nodes"
+            )));
+        }
+        row_of[id] = row;
+    }
+    let entry = metadata.entry_point as usize;
+    if entry >= num_nodes {
+        return Ok((0, num_nodes));
+    }
+    let mut reached = vec![false; num_nodes];
+    reached[entry] = true;
+    let mut num_reached = 1;
+    let mut stack = vec![entry];
+    while let Some(node) = stack.pop() {
+        let row = row_of[node];
+        if row == usize::MAX {
+            continue;
+        }
+        let edges = &neighbor_values[offsets[row] as usize..offsets[row + 1] as usize];
+        for &neighbor in edges {
+            let neighbor = neighbor as usize;
+            if neighbor < num_nodes && !reached[neighbor] {
+                reached[neighbor] = true;
+                num_reached += 1;
+                stack.push(neighbor);
+            }
+        }
+    }
+    Ok((num_reached, num_nodes))
+}
+
 /// Level 0 of a repaired graph, as the builder's stranded-node linker sees it.
 struct Level0Adj<'a> {
     edges: &'a mut [Vec<(u32, f32)>],
@@ -760,7 +856,9 @@ mod tests {
     use lance_testing::datagen::generate_random_array_with_seed;
     use rstest::rstest;
 
-    use super::{remap_graph_batch, remap_graph_repair};
+    use super::{
+        level0_reachability, remap_graph_batch, remap_graph_connected, remap_graph_repair,
+    };
     use crate::vector::DIST_COL;
     use crate::vector::flat::storage::FlatFloatStorage;
     use crate::vector::graph::NEIGHBORS_COL;
@@ -1035,6 +1133,34 @@ mod tests {
         assert!(err.to_string().contains(DIST_COL), "{err}");
     }
 
+    /// A graph that stays connected once removed nodes are dropped keeps the
+    /// cheap remap instead of being repaired.
+    #[test]
+    fn test_connected_remap_skips_repair_of_connected_graph() {
+        let (vectors, hnsw) = build(TOTAL);
+        let batch = hnsw.to_batch().unwrap();
+        let mut new_ids = Vec::with_capacity(TOTAL);
+        let mut kept_idx = Vec::new();
+        for old_id in 0..TOTAL {
+            if old_id % 10 == 0 {
+                new_ids.push(None);
+            } else {
+                new_ids.push(Some(kept_idx.len() as u32));
+                kept_idx.push(old_id as u32);
+            }
+        }
+        let kept = take(&vectors, &UInt32Array::from(kept_idx), None).unwrap();
+        let kept_store = FlatFloatStorage::new(kept.as_fixed_size_list().clone(), DistanceType::L2);
+
+        let dropped = remap_graph_batch(&batch, &new_ids).unwrap();
+        let (reached, total) = level0_reachability(&dropped).unwrap();
+        assert_eq!(reached, total, "a dense graph should survive 10% removals");
+        assert_eq!(
+            remap_graph_connected(&batch, &new_ids, &kept_store).unwrap(),
+            dropped
+        );
+    }
+
     /// Deleting from a graph of identical vectors drops the only inbound edge of
     /// many nodes. The repair links each of them back, and a wide search can
     /// return them.
@@ -1065,10 +1191,19 @@ mod tests {
         let kept = kept.as_fixed_size_list().clone();
         let kept_store = FlatFloatStorage::new(kept, DistanceType::L2);
 
+        let dropped = remap_graph_batch(&batch, &new_ids).unwrap();
+        let (reached, total) = level0_reachability(&dropped).unwrap();
+        assert!(reached < total, "dropping nodes should strand survivors");
+
         let repaired = remap_graph_repair(&batch, &new_ids, &kept_store).unwrap();
-        let (reached, total) = reachable_from_entry(&repaired);
+        let (reached, total) = level0_reachability(&repaired).unwrap();
         assert_eq!(reached, total, "repair left nodes stranded");
         assert_eq!(total, N - N / 100);
+        assert_eq!(
+            remap_graph_connected(&batch, &new_ids, &kept_store).unwrap(),
+            repaired,
+            "a stranded graph should be repaired"
+        );
 
         let params = HnswQueryParams {
             ef: 300,
@@ -1084,47 +1219,5 @@ mod tests {
             .0
             .len();
         assert_eq!(hits, 300);
-    }
-
-    fn reachable_from_entry(batch: &RecordBatch) -> (usize, usize) {
-        let meta = metadata(batch);
-        let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
-        let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
-        let level0 = meta.level_offsets[1];
-        let n = ids.values()[..level0].iter().copied().max().unwrap_or(0) as usize + 1;
-        let mut adj = vec![Vec::new(); n];
-        let mut present = vec![false; n];
-        for row in 0..level0 {
-            let id = ids.value(row) as usize;
-            present[id] = true;
-            adj[id] = neighbors
-                .value(row)
-                .as_primitive::<UInt32Type>()
-                .values()
-                .to_vec();
-        }
-        let mut reachable = vec![false; n];
-        let mut queue = std::collections::VecDeque::new();
-        let entry = meta.entry_point as usize;
-        if entry < n {
-            reachable[entry] = true;
-            queue.push_back(entry);
-        }
-        while let Some(current) = queue.pop_front() {
-            for &neighbor in &adj[current] {
-                let neighbor = neighbor as usize;
-                if neighbor < n && !reachable[neighbor] {
-                    reachable[neighbor] = true;
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-        let total = present.iter().filter(|on| **on).count();
-        let reached = present
-            .iter()
-            .zip(&reachable)
-            .filter(|(on, reached)| **on && **reached)
-            .count();
-        (reached, total)
     }
 }
