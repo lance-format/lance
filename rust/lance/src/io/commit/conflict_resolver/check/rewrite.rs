@@ -153,7 +153,7 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::DataReplacement { replacements } => {
+                Operation::DataReplacement { replacements, .. } => {
                     // These conflict if the rewrite touches any of the fragments being replaced.
                     for replacement in replacements {
                         for group in groups {

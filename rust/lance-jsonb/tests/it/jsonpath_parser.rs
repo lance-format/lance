@@ -6,7 +6,11 @@
 use std::io::Write;
 
 use goldenfile::Mint;
+use lance_jsonb::Error;
+use lance_jsonb::Number;
 use lance_jsonb::jsonpath::parse_json_path;
+use lance_jsonb::jsonpath::{Expr, Path, PathValue};
+use rstest::rstest;
 
 #[test]
 fn test_json_path() {
@@ -76,6 +80,50 @@ fn test_json_path() {
     }
 }
 
+#[rstest]
+#[case::decimal("0.9", Number::Float64(0.9))]
+#[case::large_decimal("1234.5", Number::Float64(1234.5))]
+#[case::negative_decimal("-0.5", Number::Float64(-0.5))]
+#[case::leading_dot(".9", Number::Float64(0.9))]
+#[case::negative_leading_dot("-.5", Number::Float64(-0.5))]
+#[case::trailing_dot("1.", Number::Float64(1.0))]
+#[case::exponent("9E-1", Number::Float64(0.9))]
+#[case::lowercase_exponent("9e-1", Number::Float64(0.9))]
+#[case::positive_exponent("1e+3", Number::Float64(1000.0))]
+#[case::decimal_exponent("1.25e2", Number::Float64(125.0))]
+#[case::negative_exponent("-9E-1", Number::Float64(-0.9))]
+#[case::zero("0", Number::UInt64(0))]
+#[case::positive_integer("42", Number::UInt64(42))]
+#[case::negative_integer("-42", Number::Int64(-42))]
+#[case::exact_unsigned("9007199254740993", Number::UInt64(9007199254740993))]
+#[case::exact_signed("-9007199254740993", Number::Int64(-9007199254740993))]
+#[case::max_unsigned("18446744073709551615", Number::UInt64(u64::MAX))]
+#[case::min_signed("-9223372036854775808", Number::Int64(i64::MIN))]
+#[case::unsigned_overflow("18446744073709551616", Number::Float64(18446744073709551616.0))]
+#[case::signed_overflow("-9223372036854775809", Number::Float64(-9223372036854775809.0))]
+fn test_json_path_number(#[case] literal: &str, #[case] expected: Number) {
+    let path = format!("$[*] ? (@.value == {literal})");
+    let json_path = parse_json_path(path.as_bytes()).unwrap();
+    let Path::FilterExpr(expr) = &json_path.paths[2] else {
+        panic!("expected a filter expression: {json_path:?}");
+    };
+    let Expr::BinaryOp { right, .. } = expr.as_ref() else {
+        panic!("expected a comparison: {expr:?}");
+    };
+    let Expr::Value(value) = right.as_ref() else {
+        panic!("expected a literal: {right:?}");
+    };
+    let PathValue::Number(actual) = value.as_ref() else {
+        panic!("expected a number: {value:?}");
+    };
+    // Number equality compares across variants; integer literals must keep their type.
+    assert_eq!(
+        std::mem::discriminant(actual),
+        std::mem::discriminant(&expected)
+    );
+    assert_eq!(actual, &expected);
+}
+
 #[test]
 fn test_json_path_error() {
     let cases = &[
@@ -92,10 +140,15 @@ fn test_json_path_error() {
         r#"$['1', ,'3']"#,
         r#"$['aaa'}'bbb']"#,
         r#"@ > 10"#,
+        r#"$[*] ? (@.value > 0.9.1)"#,
+        r#"$[*] ? (@.value > 9e)"#,
+        r#"$[*] ? (@.value > 9E-)"#,
+        r#"$[*] ? (@.value > 1.2e+)"#,
+        r#"$[*] ? (@.value > 0.9abc)"#,
     ];
 
     for case in cases {
         let res = parse_json_path(case.as_bytes());
-        assert!(res.is_err());
+        assert_eq!(res, Err(Error::InvalidJsonPath), "{case}");
     }
 }

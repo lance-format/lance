@@ -8,7 +8,9 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions, SourceBudgetMode};
+use lance::dataset::optimize::{
+    CompactionMode, CompactionOptions, CompactionScope, SourceBudgetMode,
+};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -301,6 +303,26 @@ pub fn build_compaction_options(
     Ok(compaction_options)
 }
 
+/// Apply the column repack options a Java `CompactionOptions` carries.
+pub fn apply_repack_options(
+    env: &mut JNIEnv,
+    options: &mut CompactionOptions,
+    max_data_files_per_fragment: &JObject, // Optional<Long>
+    scope: &JObject,                       // Optional<String>
+) -> Result<()> {
+    if let Some(max) = env.get_long_opt(max_data_files_per_fragment)? {
+        options.max_data_files_per_fragment = Some(usize::try_from(max).map_err(|_| {
+            Error::input_error(format!(
+                "max_data_files_per_fragment must be positive, got {max}"
+            ))
+        })?);
+    }
+    if let Some(scope) = env.get_string_opt(scope)? {
+        options.scope = CompactionScope::try_from(scope.as_str())?;
+    }
+    Ok(())
+}
+
 // Convert from Java Optional<Query> to Rust Option<Query>
 pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> {
     let query = env.get_optional(&query_obj, |env, java_obj| {
@@ -362,6 +384,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // Java does not expose `rq_graph_scoring` yet.
+            rq_graph_scoring: Default::default(),
         };
         query.validate_search_effort()?;
         Ok(query)

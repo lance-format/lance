@@ -54,19 +54,24 @@ use crate::cache_pb::BitmapIndexHeader;
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    progress::IndexBuildProgress,
+    progress::{IndexBuildProgress, stage_until_first_batch},
     scalar::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, QueryDomain, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
 use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
+/// The first column of [`BITMAP_LOOKUP_NAME`]: the key each bitmap is
+/// stored under. Its type is the type every key in the index is stored as,
+/// which is what [`BitmapIndex::load`] and
+/// [`BitmapIndexPlugin::recover_query_domain`] both read the value type from.
+const BITMAP_LOOKUP_KEYS_COLUMN: &str = "keys";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
 const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
@@ -345,7 +350,7 @@ impl BitmapIndexState {
     /// at least one batch so an empty index still records its value type.
     fn lookup_batches(&self, max_batch_bytes: usize) -> Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("keys", self.value_type.clone(), true),
+            Field::new(BITMAP_LOOKUP_KEYS_COLUMN, self.value_type.clone(), true),
             Field::new("offsets", DataType::UInt64, false),
         ]));
         let mut batches = Vec::new();
@@ -1560,7 +1565,7 @@ pub(crate) async fn new_bitmap_batch_writer(
     value_type: &DataType,
 ) -> Result<BitmapBatchWriter> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("keys", value_type.clone(), true),
+        Field::new(BITMAP_LOOKUP_KEYS_COLUMN, value_type.clone(), true),
         Field::new("bitmaps", DataType::Binary, true),
     ]));
     let index_file = index_store.new_index_file(file_name, schema).await?;
@@ -1980,6 +1985,7 @@ impl BitmapIndexPlugin {
     ) -> Result<IndexFile> {
         let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
         let file_name = bitmap_shard_file_name(partition_id);
+        let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
@@ -2654,7 +2660,13 @@ impl BasicTrainer for BitmapIndexPlugin {
                     .to_string(),
             ));
         } else {
-            Self::train_bitmap_index(data, index_store).await?
+            let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
+            progress
+                .stage_start("write_bitmap_index", None, "files")
+                .await?;
+            let file = Self::train_bitmap_index(data, index_store).await?;
+            progress.stage_complete("write_bitmap_index").await?;
+            file
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -2698,6 +2710,35 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             SargableQueryParser::new(index_name, self.name().to_string(), false)
                 .without_like_prefix(),
         ))
+    }
+
+    async fn recover_query_domain(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        index_store: Arc<dyn IndexStore>,
+    ) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
+        // The value type is in the lookup file's schema, so answering costs one
+        // file open and no row reads.
+        let lookup = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+        let schema = lookup.schema();
+        let Some(field) = schema.fields.first() else {
+            return Ok(None);
+        };
+        if field.name != BITMAP_LOOKUP_KEYS_COLUMN {
+            return Ok(None);
+        }
+        let Some(parser) = self.new_query_parser(index_name, index_details) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            parser,
+            QueryDomain {
+                data_type: field.data_type(),
+                identity: None,
+            },
+        )))
     }
 
     /// Load an index from storage
