@@ -137,11 +137,20 @@ mod bitpacked {
         output
     }
 
-    #[test]
-    fn two_streams_share_scratch_and_transfer_into_list_output() {
-        let rep_bytes = padded(&[1, 0, 1, 1, 1, 0], 1);
-        let def_bytes = padded(&[0, 1, 2, 3, 0, 0], 2);
-        let input_bytes = 128 + 1 + 256 + 1;
+    #[rstest]
+    fn two_streams_share_scratch_and_transfer_into_list_output(
+        #[values(false, true)] inline_rep: bool,
+        #[values(false, true)] inline_def: bool,
+    ) {
+        let mut rep_bytes = padded(&[1, 0, 1, 1, 1, 0], 1);
+        let mut def_bytes = padded(&[0, 1, 2, 3, 0, 0], 2);
+        if inline_rep {
+            rep_bytes.insert(0, 1);
+        }
+        if inline_def {
+            def_bytes.insert(0, 2);
+        }
+        let input_bytes = (rep_bytes.len() + def_bytes.len()) * 2 + 2;
         // During the second decode: 12 retained rep bytes + 12 def output +
         // 256 alignment bytes + 2048 full-tail scratch. First scratch is reused.
         let peak = 12 + 12 + 256 + 2048;
@@ -149,14 +158,22 @@ mod bitpacked {
         let mut work = budget.try_reserve(input_bytes + peak).unwrap();
         let rep = own(bytemuck::cast_slice(&rep_bytes), &mut work);
         let def = own(bytemuck::cast_slice(&def_bytes), &mut work);
-        let rep_codec = OutOfLineBitpacking::new(1, 16);
-        let def_codec = OutOfLineBitpacking::new(2, 16);
+        let rep_codec: Box<dyn BlockDecompressor> = if inline_rep {
+            Box::new(InlineBitpacking::new(16))
+        } else {
+            Box::new(OutOfLineBitpacking::new(1, 16))
+        };
+        let def_codec: Box<dyn BlockDecompressor> = if inline_def {
+            Box::new(InlineBitpacking::new(16))
+        } else {
+            Box::new(OutOfLineBitpacking::new(2, 16))
+        };
         let meaning = Arc::from([Meaning::NullableItem, Meaning::NullableAndEmptyableList]);
         let mut short = work.try_split(peak - 1).unwrap();
         assert!(
             RepDefUnraveler::try_from_encoded_in(
-                Some((&rep_codec, &rep)),
-                Some((&def_codec, &def)),
+                Some((rep_codec.as_ref(), &rep)),
+                Some((def_codec.as_ref(), &def)),
                 6,
                 Arc::clone(&meaning),
                 4,
@@ -170,8 +187,8 @@ mod bitpacked {
         drop(work);
         let mut work = budget.try_reserve(peak).unwrap();
         let source = RepDefUnraveler::try_from_encoded_in(
-            Some((&rep_codec, &rep)),
-            Some((&def_codec, &def)),
+            Some((rep_codec.as_ref(), &rep)),
+            Some((def_codec.as_ref(), &def)),
             6,
             meaning,
             4,
@@ -211,28 +228,53 @@ mod bitpacked {
         assert_eq!(budget.reserved(), 0);
     }
 
-    #[test]
-    fn unsupported_second_codec_preserves_admission() {
+    #[rstest]
+    fn invalid_second_codec_preserves_admission(#[values(false, true)] malformed_inline: bool) {
+        // A codec with no admitted implementation must never fall back to its
+        // ordinary allocating decoder, independent of which built-ins gain support.
+        #[derive(Debug)]
+        struct OrdinaryOnly;
+        impl BlockDecompressor for OrdinaryOnly {
+            fn decompress(
+                &self,
+                _data: Option<LanceBuffer>,
+                _num_values: u64,
+            ) -> lance_core::Result<crate::data::DataBlock> {
+                panic!("admitted composition must not invoke ordinary decode")
+            }
+        }
         let codec = OutOfLineBitpacking::new(0, 16);
-        let unsupported = InlineBitpacking::new(16);
+        let second: Box<dyn BlockDecompressor> = if malformed_inline {
+            Box::new(InlineBitpacking::new(16))
+        } else {
+            Box::new(OrdinaryOnly)
+        };
         let input = LanceBuffer::empty();
         let budget = AllocationBudget::new(1024);
         let mut work = budget.try_reserve(1024).unwrap();
         let error = RepDefUnraveler::try_from_encoded_in(
             Some((&codec, &input)),
-            Some((&unsupported, &input)),
+            Some((second.as_ref(), &input)),
             128,
             Arc::from([Meaning::NullableItem, Meaning::NullableList]),
             128,
             &mut work,
         )
         .unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("no admitted structural-level decoder")
-        );
+        if malformed_inline {
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("too small for 2-byte header"));
+        } else {
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("no admitted structural-level decoder")
+            );
+        }
         assert_eq!(work.len(), 1024);
+        assert_eq!(budget.reserved(), 1024);
+        drop(work);
+        assert_eq!(budget.reserved(), 0);
     }
 }
