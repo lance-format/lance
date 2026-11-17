@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "protos",
     "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
