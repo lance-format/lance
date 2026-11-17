@@ -15,7 +15,8 @@
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, QueryDomain, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest,
 };
 use crate::scalar::seed::IndexSeedWriter;
 use crate::scalar::{
@@ -73,6 +74,11 @@ fn without_fragments(
 pub const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
+/// The first column of [`ZONEMAP_FILENAME`]: each zone's minimum value. Its
+/// type is the type of the values the index was trained on, which is what
+/// [`ZoneMapIndex::load`] and [`ZoneMapIndexPlugin::recover_query_domain`] both
+/// read the value type from.
+const ZONEMAP_MIN_COLUMN: &str = "min";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 /// Index-file metadata recording that the index was configured without a
@@ -1829,7 +1835,7 @@ impl ZoneMapIndexBuilder {
 
         let mut fields = vec![
             // min and max can be null if the entire batch is null values
-            Field::new("min", self.items_type.clone(), true),
+            Field::new(ZONEMAP_MIN_COLUMN, self.items_type.clone(), true),
             Field::new("max", self.items_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
@@ -2231,6 +2237,37 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             parser
         };
         Some(Box::new(parser))
+    }
+
+    async fn recover_query_domain(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        index_store: Arc<dyn IndexStore>,
+    ) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
+        // The value type is in the zone statistics schema (`min` is typed by the
+        // values the index was trained on), so answering costs one file open and
+        // no row reads. `new_query_parser` still takes the null-tracking policy
+        // from the persisted details, so an inexact zone map keeps its recheck.
+        let index_file = index_store.open_index_file(ZONEMAP_FILENAME).await?;
+        let schema = index_file.schema();
+        let Some(field) = schema.fields.first() else {
+            return Ok(None);
+        };
+        if field.name != ZONEMAP_MIN_COLUMN {
+            return Ok(None);
+        }
+        let Some(parser) = self.new_query_parser(index_name, index_details) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            parser,
+            QueryDomain {
+                data_type: field.data_type(),
+                identity: None,
+            },
+        )))
     }
 
     async fn load_index(

@@ -3,6 +3,9 @@
 
 mod composition;
 
+#[path = "dataset_index_json_recovery.rs"]
+mod json_recovery;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -8778,18 +8781,28 @@ async fn json_filter_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool
     ids
 }
 
-/// A typed accessor may only use a JSON index whose recorded target type it
-/// produces. The index stores keys of that one type, while accessors coerce
-/// values (`json_get_int` rounds nonintegral numbers, `json_get_string` renders
-/// numbers as text), so a mismatched accessor would answer a different
-/// question. This fixture also checks that an inexact index still accelerates
-/// when the types match, and that the legacy recheck evaluates the original
-/// predicate instead of an accessor reconstructed from the index expression.
+/// A typed accessor may only use a JSON index whose target type it produces.
+/// The index stores keys of that one type, while accessors coerce values
+/// (`json_get_int` rounds nonintegral numbers, `json_get_string` renders numbers
+/// as text), so a mismatched accessor would answer a different question. This
+/// fixture also checks that an inexact index still accelerates when the types
+/// match, and that the legacy recheck evaluates the original predicate instead
+/// of an accessor reconstructed from the index expression.
+///
+/// `record_target_type = false` removes the type from the two BTree targets'
+/// details without touching their files, which is the state a writer that
+/// predates the field left behind. The whole matrix must behave identically:
+/// the planner recovers the type from the target's persisted metadata.
 #[rstest]
-#[case::legacy(LanceFileVersion::Legacy)]
-#[case::stable(LanceFileVersion::Stable)]
+#[case::legacy_recorded(LanceFileVersion::Legacy, true)]
+#[case::legacy_recovered(LanceFileVersion::Legacy, false)]
+#[case::stable_recorded(LanceFileVersion::Stable, true)]
+#[case::stable_recovered(LanceFileVersion::Stable, false)]
 #[tokio::test]
-async fn test_json_typed_index_routing_and_recheck(#[case] data_storage_version: LanceFileVersion) {
+async fn test_json_typed_index_routing_and_recheck(
+    #[case] data_storage_version: LanceFileVersion,
+    #[case] record_target_type: bool,
+) {
     let test_uri = TempStrDir::default();
     let mut metadata = HashMap::new();
     metadata.insert(
@@ -8881,6 +8894,12 @@ async fn test_json_typed_index_routing_and_recheck(#[case] data_storage_version:
             )
             .await
             .unwrap();
+    }
+
+    if !record_target_type {
+        for name in ["json_p_idx", "json_n_idx"] {
+            json_recovery::forget_json_index_target_type(&mut dataset, name).await;
+        }
     }
 
     for (filter, expected_ids, used_index, unused_indexes, legacy_recheck_accessor) in [
