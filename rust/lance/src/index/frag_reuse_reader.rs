@@ -645,7 +645,12 @@ pub mod tests {
             scan.with_fragments(source_fragments.clone());
             scan.try_into_batch().await.unwrap()
         };
-        let values = batch["i"].as_primitive::<Int32Type>();
+        // The detection fixtures name this column `id`.
+        let values = batch
+            .column_by_name("i")
+            .or_else(|| batch.column_by_name("id"))
+            .unwrap()
+            .as_primitive::<Int32Type>();
         let labels: Vec<_> = values.iter().map(|v| (v.unwrap() % 2) as u16).collect();
         let mut destinations = Vec::new();
         for label in 0..2 {

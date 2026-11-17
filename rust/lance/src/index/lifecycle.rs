@@ -8,6 +8,8 @@
 //! optimize entry. Low-level source freshness lives in `provenance`; opening
 //! and cache behavior lives in `loading`.
 
+use super::field_dependencies::{input_field_ids, input_field_ids_for};
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -96,7 +98,12 @@ pub(super) async fn build_index_metadata_from_segments(
             && scalar::SCALAR_INDEX_PLUGIN_REGISTRY
                 .get_plugin_by_details(segment.index_details())
                 .is_ok_and(|plugin| !plugin.supports_optimization());
-        if segment.keyed_field() != Some(field_id)
+        let input_fields = input_field_ids_for(
+            segment.fields(),
+            segment.covering_fields(),
+            Some(segment.index_details()),
+        )?;
+        if input_fields.as_ref() != [field_id]
             && !(is_multi_field_plugin && segment.fields().first() == Some(&field_id))
         {
             return Err(Error::invalid_input(format!(
@@ -108,7 +115,10 @@ pub(super) async fn build_index_metadata_from_segments(
                 field_id
             )));
         }
-        if is_multi_field_plugin {
+        if is_multi_field_plugin
+            || input_fields.len()
+                != IndexMetadata::keyed_fields_of(segment.fields(), segment.covering_fields()).len()
+        {
             let mut seen_fields = HashSet::with_capacity(segment.fields().len());
             for id in segment.fields() {
                 if dataset.schema().field_by_id(*id).is_none() {
@@ -565,13 +575,19 @@ impl DatasetIndexExt for Dataset {
                     log::warn!("The method describe_indices does not support indexes without index details.  Please retrain the index {}", idx.name);
                     return false;
                 }
-                // Only the keyed prefix. `index_matches_criteria` compares this
+                // Only query inputs. `index_matches_criteria` compares this
                 // slice against the single column named by `for_column`, so
                 // passing the carried columns too would push its length past one
                 // and silently drop every covered index from a filtered
                 // describe.
-                let fields = idx
-                    .keyed_fields()
+                let input_fields = match input_field_ids(idx) {
+                    Ok(fields) => fields,
+                    Err(error) => {
+                        log::warn!("Could not describe index {}: {error}", idx.name);
+                        return false;
+                    }
+                };
+                let fields = input_fields
                     .iter()
                     .filter_map(|id| self.schema().field_by_id(*id))
                     .collect::<Vec<_>>();
@@ -688,10 +704,8 @@ impl DatasetIndexExt for Dataset {
         })?;
         let expected_covering_fields = source_segments[0].covering_fields.clone();
         for segment in &source_segments {
-            // Same rule as `build_index_metadata_from_segments`: only the
-            // keyed-field count matters here, not the exact `fields` vector,
-            // so a covered segment is not rejected outright.
-            if segment.keyed_field() != Some(field_id) {
+            // Use the same query-input declaration as staged publication.
+            if input_field_ids(segment)?.as_ref() != [field_id] {
                 return Err(Error::invalid_input(format!(
                     "merge_existing_index_segments: segment {} was built for fields {:?} \
                      (carried {:?}), expected keyed field [{}]",
@@ -931,11 +945,15 @@ impl DatasetIndexExt for Dataset {
         }
 
         let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
-        if existing_named_indices.iter().any(|idx| {
-            // Field order is part of a plugin scope's identity. Covered
-            // single-column indices still compare only their keyed prefix.
-            idx.keyed_fields() != new_indices[0].keyed_fields()
-        }) {
+        let incoming_inputs = input_field_ids(&new_indices[0])?;
+        let existing_inputs = existing_named_indices
+            .iter()
+            .map(input_field_ids)
+            .collect::<Result<Vec<_>>>()?;
+        if existing_inputs
+            .iter()
+            .any(|fields| fields != &incoming_inputs)
+        {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
                 please specify a different name"

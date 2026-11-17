@@ -16,6 +16,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::scalar::BuiltinIndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
@@ -207,6 +208,162 @@ async fn test_scalar_index_info_includes_covered_index() {
     assert!(
         index_info.get_index("a").is_some(),
         "a covered index must still be eligible for filter pushdown on its keyed column"
+    );
+}
+
+async fn list_element_dependency_dataset(padding: bool) -> Dataset {
+    let element_type = DataType::Struct(
+        vec![
+            ArrowField::new("key", DataType::Int32, true),
+            ArrowField::new("other", DataType::Float32, true),
+        ]
+        .into(),
+    );
+    let mut data = gen_batch();
+    if padding {
+        data = data.col("padding", array::step::<Int32Type>());
+    }
+    let data = data
+        .col("id", array::step::<Int32Type>())
+        .col("objects", array::rand_list(&element_type, false))
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    Dataset::write(
+        data,
+        "memory://",
+        Some(crate::dataset::WriteParams {
+            max_rows_per_file: 6,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_list_element_dependency_fields_preserve_single_input() {
+    let mut dataset = list_element_dependency_dataset(false).await;
+    let params = ScalarIndexParams::new("listelement".to_string())
+        .with_params(&serde_json::json!({"keys": ["key"]}));
+    let root = dataset.schema().field("objects").unwrap();
+    let fields = vec![root.id, root.children[0].children[0].id];
+    let untrained = dataset
+        .create_index_builder(&["objects"], IndexType::Scalar, &params)
+        .train(false)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(untrained.fields, fields);
+    assert!(untrained.fragment_bitmap.unwrap().is_empty());
+    let mut builder = dataset
+        .create_index_builder(&["objects"], IndexType::Scalar, &params)
+        .name("objects_idx".to_string());
+    let staged = builder.execute_uncommitted().await.unwrap();
+    assert_eq!(staged.fields, fields);
+    dataset
+        .commit_existing_index_segments("objects_idx", "objects", vec![staged])
+        .await
+        .unwrap();
+
+    let index_info = dataset.scalar_index_info().await.unwrap();
+    assert!(index_info.get_index("objects").is_some());
+    let described = dataset
+        .describe_indices(Some(
+            lance_index::IndexCriteria::default().for_column("objects"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0].field_ids(), [fields[0] as u32]);
+    let metadata = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    let recovered = crate::index::scalar::load_scalar_segment_params(&dataset, &metadata[0])
+        .await
+        .unwrap();
+    assert!(recovered.index_type.eq_ignore_ascii_case("listelement"));
+
+    let filter = "any_element(objects, 'key >= 0')";
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("ListElement("), "{plan}");
+    scanner.fast_search();
+    let indexed = scanner.try_into_batch().await.unwrap();
+    let scanned = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let sorted_ids = |batch: &arrow_array::RecordBatch| {
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(sorted_ids(&indexed), sorted_ids(&scanned));
+
+    // The declaration must pass the input-arity guard before the missing-history check.
+    let error =
+        crate::dataset::optimize::remapping::remap_column_index(&mut dataset, &["objects"], None)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::NotSupported { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Fragment reuse index not found"),
+        "{error}"
+    );
+    dataset
+        .optimize_indices(&lance_index::optimize::OptimizeOptions::default())
+        .await
+        .unwrap();
+    let maintained = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    assert!(!maintained.is_empty());
+    assert!(maintained.iter().all(|segment| segment.fields == fields));
+    // Default naming and explicit replacement still recognize the one input.
+    let replaced = dataset
+        .create_index(&["objects"], IndexType::Scalar, None, &params, true)
+        .await
+        .unwrap();
+    assert_eq!(replaced.name, "objects_idx");
+    assert_eq!(replaced.fields, fields);
+}
+
+#[tokio::test]
+async fn test_initialize_list_element_uses_target_dependency_ids() {
+    let mut source = list_element_dependency_dataset(false).await;
+    let mut target = list_element_dependency_dataset(true).await;
+    let params = ScalarIndexParams::new("listelement".to_string())
+        .with_params(&serde_json::json!({"keys": ["key"]}));
+    source
+        .create_index(&["objects"], IndexType::Scalar, None, &params, false)
+        .await
+        .unwrap();
+    target
+        .initialize_index(&source, "objects_idx")
+        .await
+        .unwrap();
+    let root = target.schema().field("objects").unwrap();
+    let target_fields = vec![root.id, root.children[0].children[0].id];
+    let source_fields = source.load_indices_by_name("objects_idx").await.unwrap()[0]
+        .fields
+        .clone();
+    assert_ne!(source_fields, target_fields);
+    assert_eq!(
+        target.load_indices_by_name("objects_idx").await.unwrap()[0].fields,
+        target_fields,
+    );
+    assert!(
+        target
+            .scalar_index_info()
+            .await
+            .unwrap()
+            .get_index("objects")
+            .is_some()
     );
 }
 

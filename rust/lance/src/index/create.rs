@@ -9,6 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, IntoIndexSegment,
+        field_dependencies::{fields_with_dependencies, input_field_ids},
         frag_reuse::OpenPurpose,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
@@ -241,6 +242,10 @@ impl<'a> CreateIndexBuilder<'a> {
         // manifest carries: one this build cannot read still owns its name, and
         // handing that name out again commits two indices under it.
         let indices = load_all_indices(self.dataset).await?;
+        let input_fields = indices
+            .iter()
+            .map(|index| Ok((index.uuid, input_field_ids(index)?.into_owned())))
+            .collect::<Result<HashMap<_, _>>>()?;
         // These always store row ids, so refuse them before training.
         let index_kind = if self.index_type.is_vector() {
             Some("vector")
@@ -413,7 +418,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 // prefix; only that prefix decides whether this is "the same
                 // field", not the full `fields` vector including carried
                 // columns.
-                let different_field = idx.keyed_field() != Some(field.id);
+                let different_field = input_fields[&idx.uuid].as_slice() != [field.id];
                 idx.name == candidate
                     && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
@@ -429,7 +434,7 @@ impl<'a> CreateIndexBuilder<'a> {
         if existing_named_indices.iter().any(|idx| {
             // Same rule as above: the keyed prefix decides identity, not the
             // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
+            input_fields[&idx.uuid].as_slice() != [field.id]
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -721,7 +726,11 @@ impl<'a> CreateIndexBuilder<'a> {
         let index_metadata = IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
-            fields: vec![field.id],
+            fields: fields_with_dependencies(
+                self.dataset.schema(),
+                &[field.id],
+                &created_index.index_details,
+            )?,
             covering_fields: vec![],
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
@@ -845,6 +854,10 @@ impl<'a> CreateIndexBuilder<'a> {
         };
 
         let indices = load_all_indices(self.dataset).await?;
+        let input_fields = indices
+            .iter()
+            .map(|index| Ok((index.uuid, input_field_ids(index)?.into_owned())))
+            .collect::<Result<HashMap<_, _>>>()?;
         // Matches execute_uncommitted. Unobservable here, since the only caller
         // consumes the builder.
         let index_name = if let Some(name) = self.name.as_deref() {
@@ -857,7 +870,7 @@ impl<'a> CreateIndexBuilder<'a> {
             while indices.iter().any(|idx| {
                 // Same name-collision rule as `execute_uncommitted_impl`'s
                 // default-name loop above in this file.
-                let different_field = idx.keyed_field() != Some(field.id);
+                let different_field = input_fields[&idx.uuid].as_slice() != [field.id];
                 idx.name == candidate
                     && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
@@ -873,7 +886,7 @@ impl<'a> CreateIndexBuilder<'a> {
         if existing_named_indices.iter().any(|idx| {
             // Same rule as above: the keyed prefix decides identity, not the
             // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
+            input_fields[&idx.uuid].as_slice() != [field.id]
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
