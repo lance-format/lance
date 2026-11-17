@@ -196,6 +196,7 @@ async fn corrupt_unselected_index_is_rejected_before_data(
 
 #[rstest]
 #[case::row_boundary(0, 0, 0, "row boundaries")]
+#[case::out_of_domain_level(0, 0, 2, "row boundaries")]
 #[case::trailer(0, 2, 0, "row boundaries")]
 #[tokio::test]
 async fn selected_index_must_agree_with_actual_levels(

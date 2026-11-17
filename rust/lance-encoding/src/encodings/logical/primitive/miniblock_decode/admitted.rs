@@ -58,9 +58,14 @@ fn recycle(buffer: &mut Option<ReservedBuffer>, workspace: &mut Reservation) -> 
     Ok(())
 }
 
+// Borrow existing decoded levels before any selected/value output is prepared.
+// Input adapters can validate page indexes without decoding a second copy.
+pub(super) type ValidateRepetition<'a> = dyn Fn(usize, Option<&[u16]>) -> Result<()> + 'a;
+
 pub(super) fn decode(
     task: &DecodeMiniBlockTask,
     workspace: &mut Reservation,
+    validate: Option<&ValidateRepetition<'_>>,
 ) -> Result<Option<DecodedPage>> {
     if task.dictionary_data.is_some() || task.structural_projection.is_some() {
         return Err(Error::not_supported(
@@ -68,7 +73,7 @@ pub(super) fn decode(
         ));
     }
     let [(instruction, chunk)] = task.instructions.as_slice() else {
-        return multiple::decode(task, workspace);
+        return multiple::decode(task, workspace, validate);
     };
     RepDefUnraveler::validate_dense_levels(None, None, &task.def_meaning)?;
     let max_rep = task.def_meaning.iter().filter(|m| m.is_list()).count() as u16;
@@ -143,6 +148,9 @@ pub(super) fn decode(
         let def_values = def
             .as_ref()
             .map(|b| bytemuck::cast_slice::<u8, u16>(b.as_ref()));
+        if let Some(validate) = validate {
+            validate(0, rep_values)?;
+        }
         RepDefUnraveler::validate_dense_levels(rep_values, def_values, &task.def_meaning)?;
         let (items, levels) = selected_ranges(
             start..end,

@@ -656,3 +656,54 @@ fn inline_values_preserve_range_decode_and_complete_scratch(
 
 mod binary;
 mod multiple;
+
+#[rstest]
+#[case::single(0, false)]
+#[case::after_prior_selection(1, true)]
+fn index_validation_error_recycles_the_complete_attempt(
+    #[case] fail_at: usize,
+    #[case] multiple: bool,
+    #[values(Codec::Flat, Codec::Rle)] codec: Codec,
+) {
+    let expected = [1_u16, 0, 1, 1, 1, 0];
+    let Fixture {
+        mut task,
+        budget,
+        mut work,
+        physical,
+    } = fixture(
+        Some(&expected),
+        Some(&[0, 1, 2, 3, 0, 0]),
+        codec,
+        false,
+        1024,
+    );
+    if multiple {
+        multiple::select(&mut task, &[(0, 1), (3, 1)]);
+    }
+    let visited = std::cell::RefCell::new(Vec::new());
+    let validate = |index, levels: Option<&[u16]>| {
+        assert_eq!(levels.unwrap(), expected);
+        visited.borrow_mut().push(index);
+        if index == fail_at {
+            Err(Error::corrupt_file_named(
+                "page index",
+                "row boundary mismatch",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let Err(error) = decode(&task, &mut work, Some(&validate)) else {
+        panic!("index validation must reject the attempted output");
+    };
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("row boundary mismatch"));
+    assert_eq!(*visited.borrow(), (0..=fail_at).collect::<Vec<_>>());
+    assert_eq!(work.len(), 1024);
+    assert_eq!(budget.reserved(), physical + 1024);
+    // A rejection cannot poison the shared inputs or strand exclusive scratch.
+    let output = task.try_decode_in(&mut work).unwrap().unwrap();
+    drop((output, task, work));
+    assert_eq!(budget.reserved(), 0);
+}

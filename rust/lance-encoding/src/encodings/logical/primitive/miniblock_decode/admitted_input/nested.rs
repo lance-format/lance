@@ -178,72 +178,40 @@ impl MiniBlockArrayScheduler {
 }
 
 impl MiniBlockArrayInput {
-    // Check selected summaries against their actual levels before reconstruction.
-    // Index-only validation cannot establish that a claimed row boundary exists.
-    // Scratch is recycled into the original workspace; no extra admission occurs.
-    pub(super) fn validate_repetition(&self, work: &mut Reservation) -> Result<bool> {
-        let codec = self
-            .task
-            .rep_decompressor
-            .as_ref()
-            .ok_or_else(|| corrupt("nested input has no repetition codec"))?;
+    // Called while the existing admitted decoder owns its level scratch, before
+    // selection or value preparation. A mismatch takes its ordinary cleanup path.
+    pub(super) fn validate_repetition(
+        &self,
+        instruction: usize,
+        levels: Option<&[u16]>,
+    ) -> Result<()> {
+        let summary = self
+            .repetition
+            .get(instruction)
+            .ok_or_else(|| corrupt("nested input summary count mismatch"))?;
+        let values = levels.ok_or_else(|| corrupt("nested input has no repetition levels"))?;
         let max_rep = self.task.def_meaning.iter().filter(|m| m.is_list()).count() as u16;
-        if max_rep == 0 || self.repetition.len() != self.task.instructions.len() {
-            return Err(corrupt("nested input summary count or schema mismatch"));
+        if max_rep == 0
+            || values.is_empty()
+            || values.iter().any(|value| *value > max_rep)
+            || (values[0] != max_rep) != summary.has_preamble
+            || values.iter().filter(|value| **value == max_rep).count() as u64 != summary.starts
+        {
+            return Err(corrupt(
+                "repetition index disagrees with decoded row boundaries",
+            ));
         }
-        for (summary, (_, chunk)) in self.repetition.iter().zip(&self.task.instructions) {
-            let sections = DecodeMiniBlockTask::split_miniblock_chunk(
-                &chunk.data,
-                true,
-                self.task.def_decompressor.is_some(),
-                self.task.num_buffers,
-                self.task.has_large_chunk,
-            )?;
-            let count = DecodeMiniBlockTask::resolve_num_levels(
-                Some(codec.as_ref()),
-                sections.rep.as_ref(),
-                self.task.def_decompressor.as_deref(),
-                sections.def.as_ref(),
-                sections.num_levels,
-            )?;
-            let plan = codec.plan_levels(
-                sections
-                    .rep
-                    .as_ref()
-                    .ok_or_else(|| corrupt("missing repetition buffer"))?,
-                count,
-            )?;
-            let Some(levels) = plan.try_decode_in(work)? else {
-                return Ok(false);
-            };
-            let check = (|| {
-                let values: &[u16] = bytemuck::cast_slice(levels.as_ref());
-                if values.is_empty()
-                    || values.iter().any(|value| *value > max_rep)
-                    || (values[0] != max_rep) != summary.has_preamble
-                    || values.iter().filter(|value| **value == max_rep).count() as u64
-                        != summary.starts
-                {
-                    return Err(corrupt(
-                        "repetition index disagrees with decoded row boundaries",
-                    ));
-                }
-                if summary.partial != 0 {
-                    let tail = values
-                        .iter()
-                        .rposition(|value| *value == max_rep)
-                        .map_or(values.len(), |position| values.len() - position);
-                    if summary.partial != tail as u64 {
-                        return Err(corrupt(
-                            "repetition index disagrees with decoded trailer length",
-                        ));
-                    }
-                }
-                Ok(())
-            })();
-            levels.recycle(work)?;
-            check?;
+        if summary.partial != 0 {
+            let tail = values
+                .iter()
+                .rposition(|value| *value == max_rep)
+                .map_or(values.len(), |position| values.len() - position);
+            if summary.partial != tail as u64 {
+                return Err(corrupt(
+                    "repetition index disagrees with decoded trailer length",
+                ));
+            }
         }
-        Ok(true)
+        Ok(())
     }
 }

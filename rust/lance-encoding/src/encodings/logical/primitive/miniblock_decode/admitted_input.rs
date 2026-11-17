@@ -19,7 +19,7 @@ use super::{
 use crate::{
     buffer::LanceBuffer,
     compression::DecompressionStrategy,
-    decoder::{DecodePageTask, PageInfo},
+    decoder::PageInfo,
     encodings::logical::primitive::fullzip_decode::array_admitted::Shape,
     format::metadata::MiniBlockLayout,
     repdef::{RepDefUnraveler, max_visible_level},
@@ -337,8 +337,8 @@ pub(in super::super) struct MiniBlockArrayInput {
 
 impl MiniBlockArrayInput {
     pub(in super::super) fn decode_in(self, work: &mut Reservation) -> Result<Option<ArrayRef>> {
-        if !self.repetition.is_empty() && !self.validate_repetition(work)? {
-            return Ok(None);
+        if !self.repetition.is_empty() && self.repetition.len() != self.task.instructions.len() {
+            return Err(corrupt("nested input summary count mismatch"));
         }
         for (_, chunk) in &self.task.instructions {
             let sections = DecodeMiniBlockTask::split_miniblock_chunk(
@@ -358,7 +358,10 @@ impl MiniBlockArrayInput {
                 return Err(corrupt("chunk level header disagrees with flat item count"));
             }
         }
-        let page = self.task.try_decode_in(work)?;
+        let validate = |index, levels: Option<&[u16]>| self.validate_repetition(index, levels);
+        let validator: Option<&super::admitted::ValidateRepetition<'_>> =
+            (!self.repetition.is_empty()).then_some(&validate);
+        let page = super::admitted::decode(&self.task, work, validator)?;
         let meanings = self.task.def_meaning.clone();
         // Shared raw output may still retain a chunk owner. Never refund input
         // credit to this workspace while an output alias can keep it alive.

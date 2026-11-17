@@ -11,7 +11,7 @@ use lance_core::{
 };
 
 use super::super::{ChunkDrainInstructions, DecodeMiniBlockTask, LoadedChunk};
-use super::{copy_levels, decode_levels, recycle, selected_ranges};
+use super::{ValidateRepetition, copy_levels, decode_levels, recycle, selected_ranges};
 use crate::{
     compression::{
         MiniBlockDecodeBudget, MiniBlockOutputLayout, PreparedMiniBlockRange,
@@ -41,6 +41,8 @@ fn prepare<'a>(
     chunk: &LoadedChunk,
     layout: &MiniBlockOutputLayout,
     workspace: &mut Reservation,
+    instruction_index: usize,
+    validate: Option<&ValidateRepetition<'_>>,
 ) -> Result<Option<Prepared<'a>>> {
     let start = instruction
         .rows_to_skip
@@ -104,6 +106,9 @@ fn prepare<'a>(
         let def_values = def
             .as_ref()
             .map(|b| bytemuck::cast_slice::<u8, u16>(b.as_ref()));
+        if let Some(validate) = validate {
+            validate(instruction_index, rep_values)?;
+        }
         RepDefUnraveler::validate_dense_levels(rep_values, def_values, &task.def_meaning)?;
         let (range, levels) = selected_ranges(
             start..end,
@@ -180,6 +185,7 @@ fn combine_levels(
 pub(super) fn decode(
     task: &DecodeMiniBlockTask,
     workspace: &mut Reservation,
+    validate: Option<&ValidateRepetition<'_>>,
 ) -> Result<Option<DecodedPage>> {
     RepDefUnraveler::validate_dense_levels(None, None, &task.def_meaning)?;
     if task.max_visible_level != max_visible_level(&task.def_meaning) {
@@ -203,8 +209,17 @@ pub(super) fn decode(
         let mut rep_bytes = 0;
         let mut def_bytes = 0;
         let mut values = 0_u64;
-        for (instruction, chunk) in &task.instructions {
-            let Some(plan) = prepare(task, instruction, chunk, &layout, workspace)? else {
+        for (index, (instruction, chunk)) in task.instructions.iter().enumerate() {
+            let Some(plan) = prepare(
+                task,
+                instruction,
+                chunk,
+                &layout,
+                workspace,
+                index,
+                validate,
+            )?
+            else {
                 return Ok(None);
             };
             // Store the owned scratch before any fallible arithmetic so an error

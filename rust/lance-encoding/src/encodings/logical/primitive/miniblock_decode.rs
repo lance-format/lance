@@ -944,7 +944,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
         &self,
         workspace: &mut lance_core::utils::allocation::Reservation,
     ) -> Result<Option<DecodedPage>> {
-        admitted::decode(self, workspace)
+        admitted::decode(self, workspace, None)
     }
 
     fn decode(mut self: Box<Self>) -> Result<DecodedPage> {
