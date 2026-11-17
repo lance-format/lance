@@ -75,7 +75,7 @@ async fn batch_does_not_jump_queued_reads() {
     let mut work = budget.try_reserve(24).unwrap();
     let mut blocker = file.read_single_into(0..8, 0, work.try_allocate(8).unwrap().unwrap());
     assert!(futures::poll!(&mut blocker).is_pending());
-    let mut earlier = file.submit_single(8..16, 5);
+    let mut earlier = Box::pin(file.submit_single(8..16, 5));
     assert!(futures::poll!(&mut earlier).is_pending());
     let mut batch = file.read_many_into(allocations(&mut work, &[24, 32]), 10);
     assert!(futures::poll!(&mut batch).is_pending());
