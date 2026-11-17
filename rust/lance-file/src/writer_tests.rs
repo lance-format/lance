@@ -26,6 +26,7 @@ mod tests {
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
+    use futures::TryStreamExt;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
@@ -3165,5 +3166,93 @@ mod tests {
         )
         .await;
         assert_eq!(read.to_data(), array.to_data());
+    }
+    #[rstest]
+    #[case::mixed(false)]
+    #[case::all_null(true)]
+    #[tokio::test]
+    async fn test_write_fixed_size_list_masked_struct_nulls(
+        #[case] all_null: bool,
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(false, true)] sliced: bool,
+        #[values(false, true)] column_write: bool,
+    ) {
+        let valid = if all_null {
+            vec![false; 4]
+        } else {
+            vec![true, false, true, false]
+        };
+        let child_valid: Vec<bool> = valid.iter().flat_map(|valid| [*valid; 2]).collect();
+        let values = Int32Array::from(
+            child_valid
+                .iter()
+                .enumerate()
+                .map(|(i, valid)| valid.then_some(i as i32))
+                .collect::<Vec<_>>(),
+        );
+        let entries = Arc::new(StructArray::new(
+            vec![ArrowField::new("value", DataType::Int32, false)].into(),
+            vec![Arc::new(values)],
+            Some(NullBuffer::from(child_valid)),
+        ));
+        let lists = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", entries.data_type().clone(), false)),
+            2,
+            entries,
+            Some(NullBuffer::from(valid)),
+        )
+        .unwrap();
+        let lists = if sliced { lists.slice(1, 2) } else { lists };
+        let batch =
+            RecordBatch::try_from_iter(vec![("lists", Arc::new(lists) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(batch.schema().as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        if column_write {
+            writer
+                .write_column(0, batch["lists"].clone())
+                .await
+                .unwrap();
+        } else {
+            writer.write_batch(&batch).await.unwrap();
+        }
+        assert_eq!(
+            writer.finish().await.unwrap().num_rows,
+            batch.num_rows() as u64
+        );
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
     }
 }
