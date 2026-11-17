@@ -61,7 +61,7 @@ impl MiniBlockArrayScheduler {
             for (word, pair) in meta
                 .as_ref()
                 .chunks_exact(width as usize)
-                .zip(rep.as_ref().chunks_exact(16))
+                .zip(rep.as_ref().as_chunks::<16>().0)
             {
                 let mut word_bytes = [0; 4];
                 word_bytes[..word.len()].copy_from_slice(word);

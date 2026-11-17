@@ -98,7 +98,9 @@ async fn actual_nested_miniblock_scan_and_take(
             .await
             .unwrap();
         has_continuation |= index[0]
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .any(|pair| u64::from_le_bytes(pair[8..].try_into().unwrap()) > 0);
     }
     assert!(
