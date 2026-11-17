@@ -248,6 +248,9 @@ fn test_select_by_path() {
         (r#"$.big % -2"#, vec![r#"1"#]),
         (r#"$.neg5 % $.big"#, vec![r#"-5"#]),
         (r#"$.neg_min % $.big"#, vec![r#"-9223372036854775808"#]),
+        (r#"$.neg_min % $.two63"#, vec![r#"0"#]),
+        (r#"$.two63 - $.neg"#, vec![r#"9223372036854775809"#]),
+        (r#"$.neg * $.two63"#, vec![r#"-9223372036854775808"#]),
     ];
 
     let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
@@ -290,6 +293,8 @@ fn test_select_by_filter_wildcard_compare() {
             r#"$.items[*]?(@.x[*] == 1)"#,
             vec![r#"{"x":[null,1]}"#],
         ),
+        // A root predicate reports the same existential result.
+        (r#"{"x":[null,1]}"#, r#"$.x[*] == 1"#, vec![r#"true"#]),
         // No pair compares true: SQL-style unknown still filters the item
         // out, with or without an incomparable pair present.
         (

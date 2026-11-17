@@ -421,8 +421,8 @@ impl Number {
                     // The sum of a negative i64 and a u64 always fits i64 or
                     // u64; widening to i128 avoids the wrapping `as i64`
                     // narrowing for u64 values above i64::MAX.
-                    let sum = i128::from(*a) + i128::from(b);
-                    Ok(fit_i128(sum).expect("negative i64 + u64 fits i64 or u64"))
+                    fit_i128(i128::from(*a) + i128::from(b))
+                        .ok_or(Error::Message("UInt64 overflow".to_string()))
                 } else {
                     (*a as u64)
                         .checked_add(b)
@@ -432,8 +432,8 @@ impl Number {
             }
             (Self::UInt64(a), Self::Int64(b)) => {
                 if b < 0 {
-                    let sum = i128::from(*a) + i128::from(b);
-                    Ok(fit_i128(sum).expect("u64 + negative i64 fits i64 or u64"))
+                    fit_i128(i128::from(*a) + i128::from(b))
+                        .ok_or(Error::Message("UInt64 overflow".to_string()))
                 } else {
                     a.checked_add(b as u64)
                         .map(Number::UInt64)
@@ -461,12 +461,9 @@ impl Number {
             // Both u64 and i64 fit i128: compute the exact difference and
             // re-fit it, instead of narrowing operands through `as i64`
             // casts that wrap for u64 values above i64::MAX.
-            (Self::UInt64(a), Self::UInt64(b)) => fit_i128(i128::from(*a) - i128::from(b))
-                .ok_or(Error::Message("UInt64 overflow".to_string())),
-            (Self::Int64(a), Self::UInt64(b)) => fit_i128(i128::from(*a) - i128::from(b))
-                .ok_or(Error::Message("Int64 overflow".to_string())),
-            (Self::UInt64(a), Self::Int64(b)) => fit_i128(i128::from(*a) - i128::from(b))
-                .ok_or(Error::Message("Int64 overflow".to_string())),
+            (Self::UInt64(a), Self::UInt64(b)) => exact_i128(i128::from(*a) - i128::from(b)),
+            (Self::Int64(a), Self::UInt64(b)) => exact_i128(i128::from(*a) - i128::from(b)),
+            (Self::UInt64(a), Self::Int64(b)) => exact_i128(i128::from(*a) - i128::from(b)),
             (Self::Float64(a), Self::Float64(b)) => Ok(Self::Float64(a - b)),
             (a, b) => {
                 let a_float = a.as_f64();
@@ -563,15 +560,10 @@ impl Number {
                     return Err(Error::Message("Division by zero".to_string()));
                 }
                 if *a < 0 {
-                    if b > i64::MAX as u64 {
-                        // |a| < 2^63 <= b, so the truncated remainder is
-                        // exactly a; narrowing b through `as i64` would wrap.
-                        Ok(Self::Int64(*a))
-                    } else {
-                        a.checked_rem(b as i64)
-                            .map(Number::Int64)
-                            .ok_or(Error::Message("Int64 overflow".to_string()))
-                    }
+                    // The truncated remainder lies in [a, 0], so it fits i64;
+                    // narrowing b above i64::MAX through `as i64` would wrap.
+                    fit_i128(i128::from(*a) % i128::from(b))
+                        .ok_or(Error::Message("Int64 overflow".to_string()))
                 } else {
                     (*a as u64)
                         .checked_rem(b)
@@ -622,6 +614,14 @@ fn fit_i128(value: i128) -> Option<Number> {
         .map(Number::Int64)
         .or_else(|_| u64::try_from(value).map(Number::UInt64))
         .ok()
+}
+
+/// Like [`fit_i128`], but reports which end of the integer domain `value` overflowed.
+fn exact_i128(value: i128) -> Result<Number> {
+    fit_i128(value).ok_or_else(|| {
+        let domain = if value < 0 { "Int64" } else { "UInt64" };
+        Error::Message(format!("{domain} overflow"))
+    })
 }
 
 fn exact_float_to_int<T>(value: f64) -> Option<T>
@@ -1745,13 +1745,36 @@ mod tests {
             Number::UInt64(u64::MAX).add(Number::Int64(-1)).unwrap(),
             Number::UInt64(18446744073709551614)
         );
-        // Fits neither i64 nor narrowed i64 arithmetic, only u64.
-        assert_eq!(
-            Number::Int64(-10)
-                .add(Number::UInt64(9223372036854775809))
-                .unwrap(),
-            Number::UInt64(9223372036854775799)
+        // The narrowed operand wraps to a negative i64 and the sum overflows,
+        // while the exact sum fits i64.
+        assert!(matches!(
+            Number::Int64(-10).add(Number::UInt64(9223372036854775809)),
+            Ok(Number::Int64(9223372036854775799))
+        ));
+    }
+
+    #[test]
+    fn test_sub_mixed_int64_uint64() {
+        // Narrowing u64 operands above i64::MAX through `as i64` returned 0
+        // for both of these instead of failing.
+        let err = Number::Int64(-1).sub(Number::UInt64(u64::MAX)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Message(m) if m == "Int64 overflow"),
+            "{err:?}"
         );
+        let err = Number::UInt64(u64::MAX).sub(Number::Int64(-1)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Message(m) if m == "UInt64 overflow"),
+            "{err:?}"
+        );
+        assert!(matches!(
+            Number::UInt64(9223372036854775808).sub(Number::Int64(-1)),
+            Ok(Number::UInt64(9223372036854775809))
+        ));
+        assert!(matches!(
+            Number::UInt64(0).sub(Number::UInt64(9223372036854775808)),
+            Ok(Number::Int64(i64::MIN))
+        ));
     }
 
     #[test]
@@ -1793,5 +1816,10 @@ mod tests {
                 .unwrap(),
             Number::Int64(i64::MIN)
         );
+        // |i64::MIN| == 2^63, so this one divides exactly.
+        assert!(matches!(
+            Number::Int64(i64::MIN).rem(Number::UInt64(9223372036854775808)),
+            Ok(Number::Int64(0))
+        ));
     }
 }
