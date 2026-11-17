@@ -142,7 +142,7 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
+use crate::dataset::refs::{BranchContents, BranchIdentifier, BranchReservation, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
@@ -690,7 +690,8 @@ impl Dataset {
     /// - Create the branch dataset by shallow cloning.
     ///
     /// These two phases are not atomic. We consider `BranchContents` as the source of truth
-    /// for the branch.
+    /// for the branch. Callers that must check their own state between the phases can run
+    /// them separately with [`Self::reserve_branch`] and [`Self::complete_branch`].
     ///
     /// A concurrent creator that cannot reserve the name returns a conflict without
     /// writing to the branch dataset.
@@ -734,53 +735,177 @@ impl Dataset {
         )
         .await?;
         let result = async {
-            let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
-            let branch_location = self.branch_location().find_branch(Some(branch))?;
-            let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
-            if self.object_store.exists(&branch_file).await? {
-                return Err(Error::RefConflict {
-                    message: format!("branch {branch} already exists"),
-                });
-            }
-            let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
-            if has_any_entry(&self.object_store, &versions_path).await? {
-                return Err(Error::RefConflict {
-                    message: format!(
-                        "Cannot create branch {branch}: {versions_path} contains leftover version data. \
-                         Use force_delete_branch to clean up the unused branch before retrying"
-                    ),
-                });
-            }
-            let source_location = self
-                .branch_location()
-                .find_branch(source_branch.as_deref())?;
-            let clone_op = Operation::Clone {
-                is_shallow: true,
-                ref_name: source_branch.clone(),
-                ref_version: version_number,
-                ref_path: source_location.uri,
-                branch_name: Some(branch.to_string()),
-            };
-            let transaction = Transaction::new(version_number, clone_op, None);
-
-            // Claim the name before the clone can write into another creator's branch.
-            self.branches()
-                .create(branch, version_number, source_branch.as_deref())
-                .await?;
-
-            CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-                // Fall back to the dataset's own store params
-                .with_store_params(
-                    store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-                )
-                .with_object_store(Arc::new(self.object_store.as_ref().clone()))
-                .with_commit_handler(self.commit_handler.clone())
-                .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
-                .execute(transaction)
-                .await
+            let reservation = self.reserve_branch_unlocked(branch, version.into()).await?;
+            // Keep history exclusion across both phases, without acquiring it twice.
+            self.clone_reserved_branch(reservation, store_params).await
         }
         .await;
         guard.finish(result).await
+    }
+
+    /// Reserve a branch name at an exact source version without creating the branch dataset.
+    ///
+    /// This is the first phase of [`Self::create_branch`]. It applies the same name and
+    /// destination checks, resolves `version` to a fixed source branch and version, and
+    /// atomically creates the branch metadata (`BranchContents`). A concurrent reservation
+    /// of the same name returns a conflict.
+    ///
+    /// Until [`Self::complete_branch`] clones the source, the reserved branch is listed but
+    /// cannot be checked out. To abandon the reservation, delete the branch with
+    /// [`Self::delete_branch`].
+    ///
+    /// A pending reservation does not keep [`Self::cleanup_old_versions`] from removing its
+    /// source version: cleanup finds the versions a branch depends on through the branch's
+    /// manifests, and a reservation has none yet. If cleanup can run before the reservation
+    /// is completed, tag the source version until then, or completion can fail because the
+    /// source manifest was removed.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let reservation = dataset.reserve_branch("experiment", ("main", None)).await?;
+    /// // Check any state that must still hold before the branch is published.
+    /// let experiment = dataset.complete_branch(reservation, None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn reserve_branch(
+        &self,
+        branch: &str,
+        version: impl Into<refs::Ref>,
+    ) -> Result<BranchReservation> {
+        refs::check_new_branch(branch)?;
+        let guard = HistoryLock::acquire(
+            self.object_store.clone(),
+            &self.branch_location(),
+            "reserve branch",
+        )
+        .await?;
+        let result = self.reserve_branch_unlocked(branch, version.into()).await;
+        guard.finish(result).await
+    }
+
+    // The caller holds history exclusion while checking and reserving the source.
+    async fn reserve_branch_unlocked(
+        &self,
+        branch: &str,
+        version: refs::Ref,
+    ) -> Result<BranchReservation> {
+        let (source_branch, version_number) = self.resolve_reference(version).await?;
+        let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
+        if self.object_store.exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("branch {branch} already exists"),
+            });
+        }
+        let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
+        if has_any_entry(&self.object_store, &versions_path).await? {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Cannot create branch {branch}: {versions_path} contains leftover version data. \
+                     Use force_delete_branch to clean up the unused branch before retrying"
+                ),
+            });
+        }
+
+        // Claim the name before the clone can write into another creator's branch.
+        let contents = self
+            .branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+        Ok(BranchReservation {
+            branch: branch.to_string(),
+            source_branch,
+            source_version: version_number,
+            identifier: contents.identifier,
+        })
+    }
+
+    /// Clone the source version of a reservation from [`Self::reserve_branch`] into its
+    /// branch.
+    ///
+    /// This is the second phase of [`Self::create_branch`]. Because a reservation can be held
+    /// across other work, it first rereads the branch metadata and refuses to clone if the
+    /// reservation was deleted ([`Error::RefNotFound`]) or the name was deleted and reserved
+    /// again ([`Error::RefConflict`]). That check is not atomic with the clone commit.
+    ///
+    /// The clone commits through this dataset's object store and commit handler, so any
+    /// handle of the same dataset can complete the reservation. `store_params` defaults to
+    /// this dataset's store parameters. As with [`Self::create_branch`], a failed or
+    /// interrupted clone keeps the reservation because the clone may have succeeded. Use
+    /// [`Self::force_delete_branch`] to remove the failed creation before retrying.
+    pub async fn complete_branch(
+        &self,
+        reservation: BranchReservation,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let guard = HistoryLock::acquire(
+            self.object_store.clone(),
+            &self.branch_location(),
+            "complete branch",
+        )
+        .await?;
+        let result = async {
+            let branch = reservation.branch();
+            let contents = self
+                .branches()
+                .get(branch)
+                .await
+                .map_err(|error| match error {
+                    Error::RefNotFound { .. } => Error::RefNotFound {
+                        message: format!("branch {branch} was deleted after it was reserved"),
+                    },
+                    error => error,
+                })?;
+            if contents.identifier != reservation.identifier {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "branch {branch} was deleted and recreated after it was reserved"
+                    ),
+                });
+            }
+            self.clone_reserved_branch(reservation, store_params).await
+        }
+        .await;
+        guard.finish(result).await
+    }
+
+    // The caller keeps history exclusion until the clone commit settles.
+    async fn clone_reserved_branch(
+        &self,
+        reservation: BranchReservation,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let BranchReservation {
+            branch,
+            source_branch,
+            source_version,
+            ..
+        } = reservation;
+        let branch_location = self.branch_location().find_branch(Some(branch.as_str()))?;
+        let source_location = self
+            .branch_location()
+            .find_branch(source_branch.as_deref())?;
+        let clone_op = Operation::Clone {
+            is_shallow: true,
+            ref_name: source_branch,
+            ref_version: source_version,
+            ref_path: source_location.uri,
+            branch_name: Some(branch),
+        };
+        let transaction = Transaction::new(source_version, clone_op, None);
+
+        CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+            // Fall back to the dataset's own store params
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
+            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+            .with_commit_handler(self.commit_handler.clone())
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .execute(transaction)
+            .await
     }
 
     /// Deletes a branch and removes its directory when safe.

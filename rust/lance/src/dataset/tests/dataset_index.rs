@@ -3278,6 +3278,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, replacement_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -5223,10 +5224,90 @@ async fn test_fts_9058_deleted_candidates_stay_excluded(
         &[None],
     )
     .await;
-    // Deletions retain their established corpus-statistics semantics. The new
-    // restriction path must preserve live candidates and never revive postings.
+    // The shared-corpus plan also runs on tables with deletions; it must keep
+    // deleted rows out of the results.
     assert_restricted_match_membership(
         &format!("9058-deleted-{name}-stable-{stable_row_ids}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+/// Deletes one row from the indexed fragment and one from the residual tail.
+async fn restricted_match_dataset_with_deletions(stable_row_ids: bool) -> Dataset {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete("id = 1 OR id = 6").await.unwrap();
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    assert!(fragments[0].metadata().deletion_file.is_some());
+    assert!(fragments[2].metadata().deletion_file.is_some());
+    dataset
+}
+
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 5, 7])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
+#[case::filter(RestrictedMatchDomain::Filter("id != 3"), &[0, 2, 4, 5, 7])]
+#[tokio::test]
+async fn test_fts_9058_deletions_corpus_scores(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = restricted_match_dataset_with_deletions(stable_row_ids).await;
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        domain,
+        "alpha beta",
+        &[Some(1), None],
+    )
+    .await;
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.stage == "before_optimize")
+    {
+        assert_contains!(observation.plan.as_ref().unwrap(), "MatchCorpus");
+    }
+    // Indexed statistics are those stored at index time, so they still count
+    // deleted row 1, and the append optimize leaves them in place; the residual
+    // scan and the new segment are deletion-aware and omit row 6.
+    let corpus: Vec<_> = RESTRICTED_MATCH_CORPUS
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != 6)
+        .collect();
+    assert_restricted_match_oracle(
+        &format!("9058-deletions-scores-{domain:?}-stable-{stable_row_ids}.json"),
+        &corpus,
+        domain,
+        candidate_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::indexed_fragment("indexed-fragment", "id <= 2 OR id = 6", &[3, 4, 7])]
+#[case::residual_fragment("residual-fragment", "id >= 5 OR id = 1", &[0, 2, 3, 4])]
+#[tokio::test]
+async fn test_fts_9058_fully_deleted_fragment(
+    #[case] name: &str,
+    #[case] deletion: &str,
+    #[case] expected_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
+    dataset.delete(deletion).await.unwrap();
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Filter("id >= 0"),
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    assert_restricted_match_membership(
+        &format!("9058-fully-deleted-{name}-stable-{stable_row_ids}.json"),
         expected_ids,
         &observations,
     );
@@ -5620,6 +5701,63 @@ async fn test_fts_9058_phrase_corpus(
             assert_contains!(plan, "PhraseQuery:");
         }
     }
+}
+
+/// The phrase matches rows 0 and 1 in the indexed fragment and rows 5 and 8 in
+/// the unindexed tail; one of each is deleted.
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 2, 3, 4, 6, 7, 8, 9])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0])]
+#[case::residual_filter(RestrictedMatchDomain::Filter("id >= 5"), &[6, 7, 8, 9])]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 2]), &[0, 2, 3, 7, 8, 9])]
+#[tokio::test]
+async fn test_fts_9058_phrase_deletions_corpus_scores(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, stable_row_ids).await;
+    dataset.delete("id = 1 OR id = 5").await.unwrap();
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    assert!(fragments[0].metadata().deletion_file.is_some());
+    assert!(fragments[1].metadata().deletion_file.is_some());
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["before_optimize", "after_optimize"] {
+        if stage == "after_optimize" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, phrase_corpus_query())
+                    .await,
+            );
+        }
+    }
+    for observation in &observations[..2] {
+        let plan = observation.plan.as_ref().unwrap();
+        assert_contains!(plan, "MatchCorpus");
+        assert_contains!(plan, "PhraseQuery:");
+    }
+    // Indexed statistics are those stored at index time, so they still count
+    // deleted row 1, and the append optimize leaves them in place; the
+    // unindexed scan and the new segment are deletion-aware and omit row 5.
+    let corpus: Vec<_> = PHRASE_CORPUS
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != 5)
+        .collect();
+    assert_restricted_oracle(
+        &format!("9058-phrase-deletions-{domain:?}-stable-{stable_row_ids}.json"),
+        &corpus,
+        raw_phrase_oracle(&corpus, "alpha beta"),
+        domain,
+        candidate_ids,
+        &observations,
+    );
 }
 
 #[tokio::test]
@@ -8049,6 +8187,72 @@ async fn test_label_list_index_types(#[case] large_list: bool) {
     );
 }
 
+/// DataFusion types the literal list as Int64 and casts a narrower integer column to
+/// match, which must not stop the LabelList index from answering. Literals outside the
+/// item range must keep falling back to a scan instead of matching NULL items.
+#[tokio::test]
+async fn test_label_list_index_on_int32_items() {
+    let test_uri = TempStrDir::default();
+    let labels = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(3)]),
+        Some(vec![Some(2), Some(3)]),
+        None,
+        Some(vec![None, Some(1)]),
+    ]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(labels),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for (filter, expected_ids, uses_index) in [
+        ("array_has(labels, 2)", vec![0, 2], true),
+        ("array_has_any(labels, [1, 3])", vec![0, 1, 2, 4], true),
+        ("array_has_all(labels, [2, 3])", vec![2], true),
+        ("array_has(labels, 3000000000)", vec![], false),
+        ("array_has_any(labels, [3, 3000000000])", vec![1, 2], false),
+        ("array_has_all(labels, [1, 3000000000])", vec![], false),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "{filter}");
+
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert_eq!(
+            plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+            uses_index,
+            "{filter}: {plan}"
+        );
+    }
+}
+
 /// LabelList analogue: after prewarming, an `array_has_any` query against a
 /// `LabelList` index serves results without any further IO. Exercises the
 /// `LabelListIndexState` codec (which embeds the inner bitmap state and the
@@ -8495,6 +8699,66 @@ async fn test_json_btree_index_statistics() {
     assert_eq!(stats["num_unindexed_rows"], 0);
     assert_eq!(stats["indices"][0]["min"], "1000");
     assert_eq!(stats["indices"][0]["max"], "3000");
+}
+
+/// A JSON-wrapped ngram target always needs a recheck. On legacy (V1) datasets
+/// the legacy scanner rechecks by re-materializing the index expression via
+/// `JsonQuery::to_expr`, so a filtered contains-scan must plan instead of
+/// panicking, and the recheck must drop the ngram false positive.
+#[rstest]
+#[case::legacy(LanceFileVersion::Legacy)]
+#[case::stable(LanceFileVersion::Stable)]
+#[tokio::test]
+async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVersion) {
+    let test_uri = TempStrDir::default();
+    let batch = json_batch(vec![
+        r#"{"tag": "unique-bravo"}"#,
+        r#"{"tag": "alpha-charlie"}"#,
+        // Holds every trigram of "bravo" but not the word, so only the
+        // recheck removes it.
+        r#"{"tag": "brazil ravioli avocado"}"#,
+    ]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "ngram",
+        "path": "tag",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_ngram_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .filter("contains(json_get_string(json, 'tag'), 'bravo')")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+    assert!(
+        result["json"]
+            .as_string::<i32>()
+            .value(0)
+            .contains("unique-bravo")
+    );
 }
 
 #[rstest]
