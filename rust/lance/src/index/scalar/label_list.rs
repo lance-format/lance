@@ -15,6 +15,18 @@ use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
+fn ensure_label_list_details(segment: &IndexMetadata) -> Result<()> {
+    if let Some(details) = segment.index_details.as_ref()
+        && !details.type_url.ends_with("LabelListIndexDetails")
+    {
+        return Err(Error::invalid_input(format!(
+            "Segment '{}' is not a LabelList segment (details type_url = '{}')",
+            segment.uuid, details.type_url
+        )));
+    }
+    Ok(())
+}
+
 async fn validate_nullable_segment_for_merge(
     dataset: &Dataset,
     field_id: i32,
@@ -69,6 +81,30 @@ pub(in crate::index) async fn merge_segments(
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
 
+    for segment in &segments {
+        ensure_label_list_details(segment)?;
+    }
+
+    // A pre-migration segment stores row ids directly, which on a
+    // stable-row-id dataset are a different domain than the row addresses a
+    // modern segment stores; merging the two into one segment would silently
+    // combine incompatible values in the postings column. This path never
+    // rescans the dataset to repair that, so refuse rather than corrupt --
+    // the caller should fully rebuild the legacy segment first (e.g. via
+    // `create_index(..., replace: true)`).
+    if dataset.manifest.uses_stable_row_ids() {
+        for segment in &segments {
+            if !segment.results_are_row_addrs() {
+                return Err(Error::invalid_input(format!(
+                    "LabelList merge_segments: segment {} predates row-address-domain support \
+                     and cannot be merged on a dataset with stable row IDs; rebuild it first \
+                     (e.g. with create_index(..., replace: true))",
+                    segment.uuid,
+                )));
+            }
+        }
+    }
+
     let field_id = *segments[0].fields.first().ok_or_else(|| {
         Error::invalid_input(format!(
             "CreateIndex: segment {} is missing field ids",
@@ -96,13 +132,21 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let fragment_bitmap = effective_old_frags.clone();
-    let old_data_filter = if deleted_old_frags.is_empty() {
+    // A live fragment can have deleted rows even when no whole fragment was
+    // retired. Clean both value postings and list-null rows in that case too.
+    let has_partial_deletions = effective_old_frags.iter().any(|id| {
+        dataset
+            .find_fragment(u64::from(id))
+            .is_some_and(|fragment| fragment.deletion_file.is_some())
+    });
+    let old_data_filter = if deleted_old_frags.is_empty() && !has_partial_deletions {
         None
     } else {
         crate::index::append::build_old_data_filter(
             dataset,
             &effective_old_frags,
             &deleted_old_frags,
+            true,
         )
         .await?
     };
@@ -151,6 +195,8 @@ pub(in crate::index) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }

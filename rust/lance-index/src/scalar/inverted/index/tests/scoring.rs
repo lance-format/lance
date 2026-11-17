@@ -241,8 +241,10 @@ async fn load_global_scoring_test_index(
     }
 
     write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+    // Prewarming needs headroom beyond the final resident data for both partitions.
+    // Eviction is exercised explicitly with cache.clear().
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
-        QuickCacheBackend::with_capacity(4096),
+        QuickCacheBackend::with_capacity(64 * 1024),
     )));
     let index = InvertedIndex::load(store, None, cache.as_ref())
         .await
@@ -770,7 +772,6 @@ async fn search_test_impact_partition(
             Operator::Or,
             scorer.as_ref(),
             &NoOpMetricsCollector,
-            false,
         )
         .await
         .unwrap();
@@ -924,7 +925,6 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
                 Operator::And,
                 scorer.as_ref(),
                 &NoOpMetricsCollector,
-                false,
             )
             .await
             .unwrap();

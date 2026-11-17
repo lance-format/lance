@@ -177,6 +177,12 @@ fn operation_labels(base: &str, operation: &'static str) -> Vec<metrics::Label> 
     labels
 }
 
+/// The `base` (+ optional `dataset`) label set of a store, for metrics
+/// recorded next to its IO rather than by it.
+pub(crate) fn store_labels(base: &str) -> Vec<metrics::Label> {
+    base_labels(base_label_mode(), base)
+}
+
 /// Recommended histogram bucket boundaries for [`METRIC_DURATION`], in seconds.
 ///
 /// Object store requests can take anywhere from a few milliseconds to the
@@ -230,6 +236,16 @@ pub fn describe_metrics() {
         METRIC_IN_FLIGHT,
         metrics::Unit::Count,
         "Number of object store requests currently in flight, by operation and scheme."
+    );
+    metrics::describe_counter!(
+        crate::object_store::METRIC_SCAN_DECODE_TIME,
+        metrics::Unit::Nanoseconds,
+        "Wall time of scan decode tasks, summed over concurrent tasks. Scan metrics use the dataset's primary store labels."
+    );
+    metrics::describe_counter!(
+        crate::object_store::METRIC_SCAN_TASK_WAIT_TIME,
+        metrics::Unit::Nanoseconds,
+        "Time scan partitions spent waiting for scheduled I/O. Scan metrics use the dataset's primary store labels."
     );
 }
 
@@ -338,7 +354,14 @@ impl object_store::ObjectStore for MeteredObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn MultipartUpload>> {
-        let upload = self.target.put_multipart_opts(location, opts).await?;
+        // Creating the upload is a request of its own, and the only one in
+        // this store that went unrecorded: its parts, completion and abort
+        // are all metered already.
+        let _in_flight = InFlightGuard::new(&self.base, "create_multipart");
+        let start = Instant::now();
+        let result = self.target.put_multipart_opts(location, opts).await;
+        record_request(&self.base, "create_multipart", start, 0, &result);
+        let upload = result?;
         Ok(Box::new(MeteredMultipartUpload {
             target: upload,
             base: self.base.clone(),
@@ -625,9 +648,9 @@ impl ObjectStoreMetricsExt for Arc<dyn object_store::ObjectStore> {
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 mod http {
     use super::*;
+    use crate::object_store::throttle::Transport;
     use object_store::client::{
-        ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse,
-        HttpService, ReqwestConnector,
+        ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService,
     };
 
     /// An [`HttpConnector`] that records throttle and retryable responses
@@ -636,14 +659,19 @@ mod http {
     #[derive(Debug)]
     pub struct MeteringHttpConnector {
         base: String,
-        inner: ReqwestConnector,
+        inner: Transport,
     }
 
     impl MeteringHttpConnector {
         pub fn new(base: String) -> Self {
+            Self::with_transport(base, Transport::new(None))
+        }
+
+        /// Meter the clients `transport` opens, and not object_store's default ones.
+        pub(crate) fn with_transport(base: String, transport: Transport) -> Self {
             Self {
                 base,
-                inner: ReqwestConnector::default(),
+                inner: transport,
             }
         }
     }
@@ -1304,6 +1332,16 @@ mod tests {
             histogram_count(&recorded, METRIC_DURATION, &complete_labels),
             1
         );
+
+        // So is creating it, which is what a dashboard compares the
+        // completions against.
+        let create_labels = [("operation", "create_multipart"), ("base", "memory")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &create_labels), 1);
+        assert_eq!(
+            histogram_count(&recorded, METRIC_DURATION, &create_labels),
+            1
+        );
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &create_labels), 0);
     }
 
     #[test]

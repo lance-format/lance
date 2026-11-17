@@ -1367,6 +1367,227 @@ async fn test_inverted_phrase_query_with_positions() {
         .await;
 }
 
+#[rstest::rstest]
+#[case::utf8(false, false, DocumentGranularity::Row)]
+#[case::large_utf8(false, true, DocumentGranularity::Row)]
+#[case::list(true, false, DocumentGranularity::Row)]
+#[case::large_list(true, true, DocumentGranularity::Row)]
+#[case::list_element(true, false, DocumentGranularity::ListElement)]
+#[case::large_list_element(true, true, DocumentGranularity::ListElement)]
+#[tokio::test]
+async fn test_code_phrase_indexed_and_appended_rows(
+    #[case] is_list: bool,
+    #[case] is_large: bool,
+    #[case] granularity: DocumentGranularity,
+) {
+    let docs = [
+        Some("def getUserName(user_id): pass"),
+        Some("let x = get_user_name();"),
+        Some("class XMLHttpRequest {}"),
+        Some("parse_html2json(input)"),
+        Some("name user gap"),
+        None,
+        Some(""),
+        Some(""),
+    ];
+    let mut code: ArrayRef = if is_list {
+        let mut lists = docs
+            .iter()
+            .map(|doc| doc.map(|doc| vec![Some(doc), None, Some(doc)]))
+            .collect::<Vec<_>>();
+        lists[6] = Some(vec![]);
+        lists[7] = Some(vec![None]);
+        string_lists(&lists)
+    } else {
+        Arc::new(StringArray::from(docs.to_vec()))
+    };
+    if is_large {
+        let data_type = if is_list {
+            DataType::LargeList(Arc::new(ArrowField::new("item", DataType::LargeUtf8, true)))
+        } else {
+            DataType::LargeUtf8
+        };
+        code = arrow_cast::cast(&code, &data_type).unwrap();
+    }
+    let initial = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from((0..8).collect::<Vec<_>>())) as ArrayRef,
+        ),
+        ("code", code.clone()),
+    ])
+    .unwrap();
+    let mut ds = InsertBuilder::new("memory://")
+        .execute(vec![initial])
+        .await
+        .unwrap();
+    let params = InvertedIndexParams::code()
+        .split_identifiers(true)
+        .with_position(true)
+        .document_granularity(granularity);
+    ds.create_index(&["code"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from((8..16).collect::<Vec<_>>())) as ArrayRef,
+        ),
+        ("code", code),
+    ])
+    .unwrap();
+    ds.append(
+        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ds.fragments().len(), 2);
+
+    for optimize in [false, true] {
+        if optimize {
+            ds.optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for (query, expected) in [
+            ("userName", vec![0, 1, 8, 9]),
+            ("getUserName", vec![0, 1, 8, 9]),
+            ("get_user_name", vec![0, 1, 8, 9]),
+            ("HttpRequest", vec![2, 10]),
+            ("html2json", vec![3, 11]),
+            ("user name", vec![0, 1, 8, 9]),
+        ] {
+            let phrase = PhraseQuery::new(query.to_string())
+                .with_column(Some("code".to_string()))
+                .with_document_granularity(granularity);
+            let result = run_fts(
+                &ds,
+                FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase)),
+                None,
+            )
+            .await;
+            if granularity.is_list_element() {
+                let expected = expected
+                    .into_iter()
+                    .flat_map(|id| [(id, vec![0]), (id, vec![2])])
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    element_hits(&result),
+                    expected,
+                    "query={query}, optimize={optimize}"
+                );
+            } else {
+                assert_eq!(
+                    result["id"]
+                        .as_primitive::<arrow_array::types::Int32Type>()
+                        .values(),
+                    expected.as_slice(),
+                    "query={query}, optimize={optimize}"
+                );
+            }
+        }
+    }
+}
+
+#[rstest::rstest]
+#[case::positions(true)]
+#[case::no_positions(false)]
+#[tokio::test]
+async fn test_code_document_length_ranking(#[case] with_position: bool) {
+    let docs = [
+        "getUserName",
+        "get user name",
+        "get_user_name",
+        "user name get",
+        "fooBar baz",
+        "qux quux corge",
+        "alpha beta",
+        "gamma delta",
+    ];
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, (0..8).collect::<Vec<_>>()),
+        ("code", Utf8, docs.to_vec()),
+        ("context", Utf8, vec!["context"; 8])
+    )
+    .unwrap();
+    let mut ds = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        })
+        .execute(vec![batch.clone()])
+        .await
+        .unwrap();
+    assert_eq!(ds.fragments().len(), 2);
+    let params = InvertedIndexParams::code()
+        .split_identifiers(true)
+        .with_position(with_position);
+    for column in ["code", "context"] {
+        ds.create_index(&[column], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+    }
+
+    for stage in 0..3 {
+        if stage == 1 {
+            let appended = arrow_array::record_batch!(
+                ("id", Int32, (8..16).collect::<Vec<_>>()),
+                ("code", Utf8, docs.to_vec()),
+                ("context", Utf8, vec!["context"; 8])
+            )
+            .unwrap();
+            ds.append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        } else if stage == 2 {
+            ds.optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for (terms, exact, variant) in [("getUserName", 0, 2), ("get_user_name", 2, 0)] {
+            let mut queries = vec![combined_fields(terms, &["code", "context"])];
+            for operator in [Operator::Or, Operator::And] {
+                queries.push(FullTextSearchQuery::new_query(FtsQuery::Match(
+                    row_match_node("code", terms).with_operator(operator),
+                )));
+            }
+            if with_position {
+                queries.push(row_phrase("code", terms));
+            }
+            for query in queries {
+                let result = run_fts(&ds, query.clone(), None).await;
+                let scores = result["id"]
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(
+                        result["_score"]
+                            .as_primitive::<arrow_array::types::Float32Type>()
+                            .values()
+                            .iter()
+                            .copied(),
+                    )
+                    .collect::<std::collections::HashMap<_, _>>();
+                for offset in if stage == 0 { vec![0] } else { vec![0, 8] } {
+                    assert!(
+                        scores[&(exact + offset)] > scores[&(1 + offset)],
+                        "stage={stage}, query={query:?}"
+                    );
+                    assert!(
+                        (scores[&(variant + offset)] - scores[&(1 + offset)]).abs() < 1e-6,
+                        "stage={stage}, query={query:?}, scores={scores:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_segmented_inverted_match_query() {
     let test_dir = tempfile::tempdir().unwrap();

@@ -12,7 +12,6 @@ use futures::stream::FuturesOrdered;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
-use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
     ArrayFieldEncodingStrategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
     EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
@@ -244,10 +243,7 @@ impl Writer {
             buffer_sizes.push(buffer.len() as u64);
             Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -326,7 +322,13 @@ impl Writer {
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
         self.options.validate()?;
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
+            let cache_owners = schema
+                .fields
+                .iter()
+                .map(super::cache_owner_count)
+                .sum::<usize>()
+                .max(1);
+            data_cache_bytes / cache_owners as u64
         } else {
             8 * 1024 * 1024
         };
@@ -503,6 +505,12 @@ impl Writer {
         self.write_pages(encoding_tasks).await?;
 
         Ok(())
+    }
+
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.column_writers {
+            encoder.prepare_for_flush();
+        }
     }
 
     /// Write a single column, advancing only that column's row counter.
@@ -880,14 +888,7 @@ pub fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<B
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()

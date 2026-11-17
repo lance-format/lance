@@ -23,9 +23,11 @@ use super::MemTableDataTarget;
 use super::index::IndexStore;
 use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 use super::wal::WalFlushFailure;
-use super::write::{DurabilityResult, WalFlushResult};
+use super::wal::WalFlushResult;
+use super::write::DurabilityResult;
 use crate::Dataset;
 use crate::blob::{BlobIdAllocator, prepared_to_descriptor_blob_schema};
+use crate::dataset::write::dictionary_budget::{DictionaryReservation, DictionaryValueBudget};
 use batch_store::BatchStore;
 
 /// Default batch store capacity when not specified.
@@ -76,6 +78,9 @@ pub struct MemTable {
     /// Wrapped in Arc for sharing with scanners.
     batch_store: Arc<BatchStore>,
 
+    /// Encoded dictionary values admitted to this single-fragment generation.
+    dictionary_budget: Option<DictionaryValueBudget>,
+
     /// Unique URI for on-demand Dataset construction.
     dataset_uri: String,
 
@@ -90,7 +95,7 @@ pub struct MemTable {
     /// Reserved SSTable/data-file identity for this generation.
     target: Option<MemTableDataTarget>,
 
-    /// Shared across the per-put Blob preprocessors for this target.
+    /// Shared by the generation-scoped Blob preprocessor and replay recovery.
     blob_id_allocator: BlobIdAllocator,
 
     /// Primary key bloom filter for staleness detection.
@@ -149,8 +154,8 @@ const PK_BLOOM_FILTER_FPP: f64 = 0.00057;
 /// measurement, and a memory view need not carry it per memtable.
 ///
 /// Counted as index memory rather than row data: it is an auxiliary lookup
-/// structure, and a fixed term in the `max_memtable_size` seal trigger would
-/// make every memtable seal a constant early.
+/// structure, and a fixed term in the `max_memtable_size` freeze trigger would
+/// make every memtable freeze a constant early.
 pub fn pk_bloom_filter_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
@@ -267,6 +272,7 @@ impl MemTable {
             .unwrap_or(batch_capacity);
         let lance_schema = Schema::try_from(schema.as_ref())?;
         let scan_schema = Arc::new(prepared_to_descriptor_blob_schema(schema.as_ref())?);
+        let dictionary_budget = DictionaryValueBudget::try_new(&schema)?;
 
         // Initialize bloom filter for primary key staleness detection.
         let pk_bloom_filter =
@@ -300,6 +306,7 @@ impl MemTable {
             scan_schema,
             lance_schema,
             batch_store,
+            dictionary_budget,
             dataset_uri,
             cache_config,
             cached_dataset: RwLock::new(None),
@@ -429,7 +436,9 @@ impl MemTable {
 
     /// Insert a record batch into the MemTable.
     ///
-    /// O(1) append.
+    /// Narrow-key dictionaries must fit in one fragment across all admitted batches.
+    /// An overflowing batch is rejected before changing rows or indexes. Freeze this
+    /// MemTable and retry in a new one, or split a write that exceeds capacity alone.
     ///
     /// # Returns
     ///
@@ -451,6 +460,7 @@ impl MemTable {
         if num_rows == 0 {
             return Err(Error::invalid_input("Cannot insert empty batch"));
         }
+        let reservation = self.reserve_dictionary_values(std::slice::from_ref(&batch))?;
 
         // Row offset is the current row count (before adding this batch)
         let row_offset = self.batch_store.total_rows() as u64;
@@ -471,6 +481,9 @@ impl MemTable {
             self.batch_store.append(batch).map_err(|_| {
                 Error::invalid_input("MemTable batch store is full - should have been flushed")
             })?;
+        if let Some((budget, reservation)) = self.dictionary_budget.as_mut().zip(reservation) {
+            budget.commit(reservation);
+        }
 
         Ok(batch_position)
     }
@@ -478,6 +491,7 @@ impl MemTable {
     /// Insert a batch without updating indexes.
     ///
     /// Index updates are performed during WAL flush by `WalFlushHandler`.
+    /// Dictionary capacity is enforced as in [`Self::insert`].
     ///
     /// Returns `(batch_position, row_offset, estimated_size)` so the caller can queue the index update.
     ///
@@ -496,6 +510,7 @@ impl MemTable {
         if num_rows == 0 {
             return Err(Error::invalid_input("Cannot insert empty batch"));
         }
+        let reservation = self.reserve_dictionary_values(std::slice::from_ref(&batch))?;
 
         // Update bloom filter with primary keys
         self.update_bloom_filter(&batch)?;
@@ -507,6 +522,9 @@ impl MemTable {
             self.batch_store.append(batch).map_err(|_| {
                 Error::invalid_input("MemTable batch store is full - should have been flushed")
             })?;
+        if let Some((budget, reservation)) = self.dictionary_budget.as_mut().zip(reservation) {
+            budget.commit(reservation);
+        }
 
         Ok((batch_position, row_offset, estimated_size))
     }
@@ -515,6 +533,7 @@ impl MemTable {
     ///
     /// All batches are inserted atomically - readers see either none or all.
     /// Index updates are performed during WAL flush by `WalFlushHandler`.
+    /// Dictionary capacity is checked for the entire write as in [`Self::insert`].
     ///
     /// Returns `Vec<(batch_position, row_offset, estimated_size)>` for each batch.
     ///
@@ -542,6 +561,7 @@ impl MemTable {
                 return Err(Error::invalid_input(format!("Batch {} is empty", i)));
             }
         }
+        let reservation = self.reserve_dictionary_values(&batches)?;
 
         // Update bloom filter for all batches
         for batch in &batches {
@@ -554,8 +574,23 @@ impl MemTable {
         let results = self.batch_store.append_batches(batches).map_err(|_| {
             Error::invalid_input("MemTable batch store is full - should have been flushed")
         })?;
+        if let Some((budget, reservation)) = self.dictionary_budget.as_mut().zip(reservation) {
+            budget.commit(reservation);
+        }
 
         Ok(results)
+    }
+
+    /// Preflight dictionary capacity before preparing Blob sidecars or admitting rows.
+    /// The reservation must only be committed after the corresponding append succeeds.
+    pub(crate) fn reserve_dictionary_values(
+        &self,
+        batches: &[RecordBatch],
+    ) -> Result<Option<DictionaryReservation>> {
+        self.dictionary_budget
+            .as_ref()
+            .map(|budget| budget.reserve(batches))
+            .transpose()
     }
 
     /// Check if the MemTable should be flushed.
@@ -819,7 +854,7 @@ impl MemTable {
     }
 
     /// Whether every committed batch in this memtable is WAL-durable, given the
-    /// writer-global durability cursor. The L0 flush's precondition.
+    /// writer-global durability cursor. The SSTable flush's precondition.
     pub fn all_flushed_to_wal(&self, durable: usize) -> bool {
         self.batch_store.pending_wal_flush_count(durable) == 0
     }
@@ -985,7 +1020,7 @@ mod tests {
         assert_eq!(total_rows, 15);
     }
 
-    /// `all_flushed_to_wal(durable)` is the L0 flush's precondition (`flush.rs:171`):
+    /// `all_flushed_to_wal(durable)` is the SSTable flush's precondition (`flush.rs:171`):
     /// false while any committed batch is still un-appended, true once the
     /// durability watermark covers every one of them.
     #[tokio::test]

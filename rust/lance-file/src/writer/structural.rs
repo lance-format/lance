@@ -14,7 +14,6 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use lance_encoding::{
-    decoder::PageEncoding,
     encoder::{
         BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
         OutOfLineBuffers,
@@ -212,10 +211,7 @@ impl StructuralFileSink {
             buffer_sizes.push(buffer.len() as u64);
             self.write_aligned_buffer(&buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -413,7 +409,13 @@ impl EncodingPipeline {
 
     pub fn encoding_options(&self, schema: &Schema) -> EncodingOptions {
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
+            let cache_owners = schema
+                .fields
+                .iter()
+                .map(crate::reader::structural::physical_column_count)
+                .sum::<usize>()
+                .max(1);
+            data_cache_bytes / cache_owners as u64
         } else {
             8 * 1024 * 1024
         };
@@ -456,6 +458,12 @@ impl EncodingPipeline {
 
     pub fn is_initialized(&self) -> bool {
         self.schema.is_some()
+    }
+
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.field_encoders {
+            encoder.prepare_for_flush();
+        }
     }
 
     fn verify_field_nullability(array: &dyn Array, field: &Field) -> Result<()> {
@@ -863,14 +871,7 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
                     page_info.buffer_offsets_and_sizes.iter().copied().unzip();
                 Ok(pbfile::column_metadata::Page {
@@ -937,7 +938,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
 
-    use super::EncodingPipeline;
+    use super::{EncodingPipeline, FileWriterOptions};
 
     /// `analysis: struct<changed: bool>` where the child is declared
     /// non-nullable, built with a nullable child so the array can carry the
@@ -985,6 +986,31 @@ mod tests {
             error.to_string().contains("`changed`"),
             "should name the offending child: {error}"
         );
+    }
+
+    #[test]
+    fn explicit_cache_budget_is_aggregate_across_nested_physical_columns() {
+        let nested = DataType::Struct(Fields::from(vec![
+            ArrowField::new("changed", DataType::Boolean, true),
+            ArrowField::new("code", DataType::Int32, true),
+        ]));
+        let scores = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            4,
+        );
+        let schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("nested", nested, true),
+            ArrowField::new("scores", scores, true),
+        ]))
+        .unwrap();
+        let pipeline = EncodingPipeline::new(FileWriterOptions {
+            data_cache_bytes: Some(3 * 1024 * 1024),
+            ..Default::default()
+        });
+
+        let options = pipeline.encoding_options(&schema);
+
+        assert_eq!(options.cache_bytes_per_column, 1024 * 1024);
     }
 
     /// A dictionary key can point at a null value, which the physical

@@ -39,17 +39,17 @@ Lance is an open lakehouse format for multimodal AI. It contains a file format, 
 
 The key features of Lance include:
 
-* **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.
+- **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.
 
-* **Lightning-fast random access:** 100x faster than Parquet or Iceberg for random access without sacrificing scan performance.
+- **Lightning-fast random access:** 100x faster than Parquet or Iceberg for random access without sacrificing scan performance.
 
-* **Native multimodal data support:** Store images, videos, audio, text, and embeddings in a single unified format with efficient blob encoding and lazy loading.
+- **Native multimodal data support:** Store images, videos, audio, text, and embeddings in a single unified format with efficient blob encoding and lazy loading.
 
-* **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
+- **Data evolution:** Efficiently add columns with backfilled values without full table rewrites, perfect for ML feature engineering.
 
-* **Zero-copy versioning:** Automatic versioning with ACID transactions, time travel, tags, and branches—no extra infrastructure needed.
+- **Zero-copy versioning:** Automatic versioning with ACID transactions, time travel, tags, and branches—no extra infrastructure needed.
 
-* **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
+- **Rich ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Apache Spark, Ray, Trino, Apache Flink, and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino).
 
 For more details, see the full [Lance format specification](https://lance.org/format).
 
@@ -60,10 +60,10 @@ For more details, see the full [Lance format specification](https://lance.org/fo
 
 Lance releases frequently because the SDKs, integrations, and performance work are moving quickly. This does not mean the Lance file format changes incompatibly in every release. The Lance file format is identified by the `data_storage_version` stored in each dataset, and stable storage versions are a long-term compatibility contract.
 
-* Once a dataset is written with a stable `data_storage_version`, future Lance releases will continue to support reading that storage version.
-* SDK and API compatibility is separate from file format compatibility. SDK/API changes follow semantic versioning and are documented in the [migration guide](https://lance.org/guide/migration/).
-* Older Lance releases may not understand file format versions introduced later. If you run mixed Lance versions, pin `data_storage_version` for deterministic writes.
-* The `next` file format alias is unstable and should only be used for experimentation, never for production data.
+- Once a dataset is written with a stable `data_storage_version`, future Lance releases will continue to support reading that storage version.
+- SDK and API compatibility is separate from file format compatibility. SDK/API changes follow semantic versioning and are documented in the [migration guide](https://lance.org/guide/migration/).
+- Older Lance releases may not understand file format versions introduced later. If you run mixed Lance versions, pin `data_storage_version` for deterministic writes.
+- The `next` file format alias is unstable and should only be used for experimentation, never for production data.
 
 For production, write data with a stable `data_storage_version`. See the [format versioning guide](https://lance.org/format/file/versioning/) for the current compatibility matrix.
 
@@ -106,18 +106,21 @@ lance.write_dataset(parquet, "/tmp/test.lance")
 ```
 
 **Reading Lance data**
+
 ```python
 dataset = lance.dataset("/tmp/test.lance")
 assert isinstance(dataset, pa.dataset.Dataset)
 ```
 
 **Pandas**
+
 ```python
 df = dataset.to_table().to_pandas()
 df
 ```
 
 **DuckDB**
+
 ```python
 import duckdb
 
@@ -183,7 +186,7 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 ## Directory structure
 
 | Directory          | Description              |
-|--------------------|--------------------------|
+| ------------------ | ------------------------ |
 | [rust](./rust)     | Core Rust implementation |
 | [python](./python) | Python bindings (PyO3)   |
 | [java](./java)     | Java bindings (JNI)      |
@@ -227,6 +230,7 @@ graph LR
 ```
 
 Traditional lakehouse formats were designed for SQL analytics and struggle with AI/ML workloads that require:
+
 - **Vector search** for similarity and semantic retrieval
 - **Fast random access** for sampling and interactive exploration
 - **Multimodal data** storage (images, videos, audio alongside embeddings)
@@ -238,10 +242,31 @@ While existing formats (Parquet, Iceberg, Delta Lake) excel at SQL analytics, th
 A comparison of different formats across ML development stages:
 
 |                     | Lance | Parquet & ORC | JSON & XML | TFRecord | Database | Warehouse |
-|---------------------|-------|---------------|------------|----------|----------|-----------|
+| ------------------- | ----- | ------------- | ---------- | -------- | -------- | --------- |
 | Analytics           | Fast  | Fast          | Slow       | Slow     | Decent   | Fast      |
 | Feature Engineering | Fast  | Fast          | Decent     | Slow     | Decent   | Good      |
 | Training            | Fast  | Decent        | Slow       | Fast     | N/A      | N/A       |
 | Exploration         | Fast  | Slow          | Fast       | Slow     | Fast     | Decent    |
 | Infra Support       | Rich  | Rich          | Decent     | Limited  | Rich     | Rich      |
 
+## Supported Storage
+
+Lance reads and writes datasets stored on local disk or in object storage. The
+storage backend is selected automatically by the URI scheme of the dataset path.
+
+| Storage                                  | URI scheme           | Notes |
+| ---------------------------------------- | -------------------- | ----- |
+| Local filesystem                         | `file://`            | Default; also accepts plain paths. `file+uring://` (Linux only) uses `io_uring` for better local I/O performance. |
+| AWS S3                                   | `s3://`              | Supports S3 Express One Zone buckets. Use `s3+ddb://` to version datasets with DynamoDB-managed metadata. |
+| S3-compatible stores                     | `s3://`              | MinIO, Cloudflare R2, Wasabi, and other S3-compatible stores via the `endpoint` storage option. |
+| Microsoft Azure Blob Storage             | `az://`              | Also supports Azure Data Lake Storage Gen2 via `abfss://`. |
+| Google Cloud Storage                     | `gs://`              | |
+| Alibaba Cloud Object Storage Service     | `oss://`             | |
+| Tencent Cloud Object Storage             | `cos://`             | |
+| Volcengine Object Storage (TOS)          | `tos://`             | |
+| Hugging Face Hub                         | `hf://`              | |
+| GooseFS                                  | `goosefs://`         | |
+| In-memory                                | `memory://`          | Intended for testing only. |
+
+For credentials, authentication, and per-store configuration options, see the
+[object store configuration guide](./docs/src/guide/object_store.md).

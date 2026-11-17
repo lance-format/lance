@@ -71,10 +71,10 @@ def vec_to_table(
     vector: [[[1.7640524,0.4001572,0.978738,2.2408931,1.867558,-0.9772779,0.95008844,\
 -0.1513572,-0.10321885,0.41059852],[0.14404356,1.4542735,0.7610377,\
 0.121675014,0.44386324,0.33367434,1.4940791,-0.20515826,0.3130677,-0.85409576]]]
-    >>> vec_to_table(dd).to_pandas()
+    >>> vec_to_table(dd).to_pandas()  # doctest: +ELLIPSIS
             id                                             vector
-    0  vector0  [1.7640524, 0.4001572, 0.978738, 2.2408931, 1....
-    1  vector1  [0.14404356, 1.4542735, 0.7610377, 0.121675014...
+    0  vector0  [1.7640..., 0.4001..., 0.9787..., 2.2408...
+    1  vector1  [0.1440..., 1.4542..., 0.7610..., 0.1216...
 
     Parameters
     ----------
@@ -181,7 +181,11 @@ def train_pq_codebook_on_accelerator(
         kmeans_local = KMeans(
             256,
             max_iters=50,
-            metric=metric_type,
+            # For cosine the residuals are computed from normalized vectors, and
+            # the index treats the PQ codebook as an L2 codebook over them.
+            # Training it with cosine would normalize the codewords and drop
+            # the residual norms.
+            metric="l2" if metric_type == "cosine" else metric_type,
             device=accelerator,
             centroids=init_centroids_slice,
         )
@@ -540,7 +544,11 @@ def compute_partitions(
 
                 split_columns = []
                 if num_sub_vectors is not None:
-                    residual_vecs = vecs[mask_gpu] - kmeans.centroids[partitions]
+                    residual_vecs = vecs[mask_gpu]
+                    if kmeans.metric == "cosine":
+                        # Match the index build: normalize before the residual.
+                        residual_vecs = torch.nn.functional.normalize(residual_vecs)
+                    residual_vecs = residual_vecs - kmeans.centroids[partitions]
                     for i in range(num_sub_vectors):
                         subvector_tensor = residual_vecs[
                             :, i * subvector_size : (i + 1) * subvector_size
@@ -713,6 +721,9 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
                 partitions = partitions[mask_gpu].cpu()
                 vecs = vecs[mask_gpu]
+                if ivf_kmeans.metric == "cosine":
+                    # Match the index build: normalize before the residual.
+                    vecs = torch.nn.functional.normalize(vecs)
 
                 residual_vecs = vecs - ivf_kmeans.centroids[partitions]
                 # cast centroids to the same dtype as vecs

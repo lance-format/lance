@@ -74,17 +74,28 @@ impl TlsConfig {
         // `Identity::from_pem` produces a rustls identity, so the client must use rustls.
         // reqwest prefers native-tls whenever another crate in the build enables its
         // `default-tls` feature, and would then reject the identity.
-        let mut client_builder = reqwest::Client::builder()
-            .use_rustls_tls()
-            .danger_accept_invalid_hostnames(!self.assert_hostname);
+        let mut client_builder = reqwest::Client::builder().use_rustls_tls();
 
         if let Some(identity) = material.identity {
             client_builder = client_builder.identity(identity);
         }
 
-        if let Some(root_cert) = material.root_cert {
-            client_builder = client_builder.add_root_certificate(root_cert);
-        }
+        // reqwest only allows disabling hostname verification together with `tls_certs_only`,
+        // which trusts nothing but the supplied CA - the built-in roots are dropped.
+        client_builder = match (self.assert_hostname, material.root_cert) {
+            (true, Some(root_cert)) => client_builder.add_root_certificate(root_cert),
+            (true, None) => client_builder,
+            (false, Some(root_cert)) => client_builder
+                .tls_certs_only([root_cert])
+                .tls_danger_accept_invalid_hostnames(true),
+            (false, None) => {
+                return Err(tls_config_error(
+                    "Disabling hostname verification requires a CA certificate \
+                     ('ssl_ca_cert'): the system roots cannot be combined with it"
+                        .to_string(),
+                ));
+            }
+        };
 
         client_builder
             .build()
@@ -547,6 +558,37 @@ vlUSTstZkV9DqFsqGgtQZsdPpD/ndAKCeILH618omGtfieRWbNEfmLnD
             digest.is_none(),
             "material dropped at build time must be retried"
         );
+    }
+
+    /// reqwest 0.13 rejects a hostname opt-out unless the supplied CA is the only root.
+    #[test]
+    fn test_hostname_opt_out_keeps_ca_and_identity() {
+        let dir = tempdir().unwrap();
+        let mut tls = write_identity(dir.path(), CERT_A, KEY_A);
+        with_ca_cert(dir.path(), &mut tls, Some(CERT_B));
+        tls.assert_hostname = false;
+
+        let material = TlsMaterial::load(&tls).unwrap();
+        tls.build_client(material).unwrap();
+
+        let (_, digest) = tls.build_best_effort(TlsMaterial::load_best_effort(&tls));
+        assert!(
+            digest.is_some(),
+            "the CA and identity must not be dropped by a hostname opt-out"
+        );
+    }
+
+    #[test]
+    fn test_hostname_opt_out_requires_ca() {
+        let dir = tempdir().unwrap();
+        let mut tls = write_identity(dir.path(), CERT_A, KEY_A);
+        tls.assert_hostname = false;
+
+        let error = tls
+            .build_client(TlsMaterial::load(&tls).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ssl_ca_cert"), "{error}");
     }
 
     #[test]

@@ -129,16 +129,13 @@ impl LanceSchema {
 
     /// Create a Lance schema from a PyArrow schema.
     ///
-    /// This assigns field ids in depth-first order. Arrow field-ID metadata is
-    /// descriptive only and cannot select identities for a dataset. Be aware
-    /// this assignment may not match the correct schema for a particular table.
+    /// Fields keep the ID in their `lance:field_id` metadata; fields without one
+    /// get IDs in depth-first order above the largest. These IDs may not match
+    /// an existing table's.
     #[staticmethod]
     pub fn from_pyarrow(schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
-        let mut schema = Schema::try_from(&schema.0)
+        let schema = Schema::try_from(&schema.0)
             .map_err(|err| PyValueError::new_err(format!("Failed to convert schema: {}", err)))?;
-        schema
-            .try_reassign_field_ids(None)
-            .map_err(|err| PyValueError::new_err(format!("Failed to assign field ids: {err}")))?;
         Ok(Self(schema))
     }
 

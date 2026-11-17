@@ -12,12 +12,15 @@ use lance_table::feature_flags::{
     FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, frag_reuse_with_stable_row_ids_enabled,
 };
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
+use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
+use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use prost::Name;
 use prost_types::Any;
 
 use super::scalar::IndexDetails;
-use super::{index_is_usable, unsupported_index_version};
+use super::{segment::index_is_usable, segment::unsupported_index_version};
+
+pub mod history;
 
 fn details_type_name(details: &Any) -> &str {
     details
@@ -55,9 +58,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
         ));
     }
     if type_name.eq_ignore_ascii_case(&lance_index::pb::JsonIndexDetails::full_name()) {
-        return Some(
-            "a JSON index, which does not record the identifiers its target index stores".into(),
-        );
+        return Some("a JSON index, which does not apply the fragment reuse index".into());
     }
     if let Some(max_supported_version) = unsupported_index_version(index) {
         return Some(format!(
@@ -94,6 +95,14 @@ fn incompatible_indices(indices: &[IndexMetadata]) -> Vec<(&IndexMetadata, Strin
         .iter()
         .filter_map(|index| ordinary_index_incompatibility(index).map(|reason| (index, reason)))
         .collect()
+}
+
+fn list_incompatible(incompatible: &[(&IndexMetadata, String)]) -> String {
+    incompatible
+        .iter()
+        .map(|(index, reason)| format!("`{}` ({}): {reason}", index.name, index.uuid))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub fn apply_frag_reuse_with_stable_row_ids_flag(
@@ -159,16 +168,60 @@ fn validate_frag_reuse_with_stable_row_ids_when(
     if incompatible.is_empty() {
         return Ok(());
     }
-    let listed = incompatible
-        .iter()
-        .map(|(index, reason)| format!("`{}` ({}): {reason}", index.name, index.uuid))
-        .collect::<Vec<_>>()
-        .join("; ");
+    let listed = list_incompatible(&incompatible);
     Err(Error::invalid_input(format!(
         "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
          fragment reuse index, which is applied to every index as row-address moves, so each \
          index must be one this build of Lance can confirm stores row addresses and applies \
          the fragment reuse index. These indices cannot be confirmed: {listed}"
+    )))
+}
+
+pub fn ensure_frag_reuse_recording_allowed(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+) -> Result<()> {
+    ensure_frag_reuse_recording_allowed_when(
+        manifest,
+        indices,
+        frag_reuse_with_stable_row_ids_enabled(),
+    )
+}
+
+fn ensure_frag_reuse_recording_allowed_when(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+    is_supported: bool,
+) -> Result<()> {
+    if !is_supported {
+        return Err(Error::not_supported(
+            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
+             recording their row-address moves in a fragment reuse index is not supported by \
+             this build of Lance",
+        ));
+    }
+    // The tagged-history flag is sticky, so it can outlive a trim and a
+    // migration to stable row ids.
+    let frag_reuse_entry = indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
+    if uses_tagged_fri(manifest, frag_reuse_entry) {
+        return Err(Error::not_supported(
+            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
+             manifest requires a tagged fragment reuse history, which stable row IDs do not \
+             support",
+        ));
+    }
+    let incompatible = incompatible_indices(indices);
+    if incompatible.is_empty() {
+        return Ok(());
+    }
+    let listed = list_incompatible(&incompatible);
+    Err(Error::invalid_input(format!(
+        "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and the \
+         fragment reuse index that records the row-address moves is applied to every index, \
+         so each index must be one this build of Lance can confirm stores row addresses and \
+         applies the fragment reuse index. These indices cannot be confirmed: {listed}"
     )))
 }
 
@@ -266,7 +319,7 @@ mod tests {
     use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
     use lance_index::{IndexType, pb, pbold};
     use lance_linalg::distance::MetricType;
-    use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+    use lance_table::feature_flags::{FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS};
     use lance_table::format::DataStorageFormat;
     use lance_table::io::commit::write_manifest_file_to_path;
     use lance_table::system_index::frag_reuse::{
@@ -283,7 +336,10 @@ mod tests {
     use crate::dataset::{CommitBuilder, WriteParams};
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, load_all_indices};
+    use crate::index::{
+        DatasetIndexExt,
+        loading::{DatasetIndexInternalExt, load_all_indices},
+    };
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     fn index_with(name: &str, details: Option<Any>, index_version: i32) -> IndexMetadata {
@@ -299,6 +355,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -318,6 +376,7 @@ mod tests {
             path: "x".to_string(),
             target_details: target,
             target_data_type: pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
     }
 
@@ -336,14 +395,19 @@ mod tests {
     #[rstest]
     #[case::zone_map(details(&pbold::ZoneMapIndexDetails::default()), 0, true)]
     #[case::bloom_filter(details(&pb::BloomFilterIndexDetails::default()), 0, true)]
-    #[case::btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
+    #[case::btree(details(&pbold::BTreeIndexDetails::default()), 1, true)]
+    #[case::legacy_btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
     #[case::bitmap(details(&pbold::BitmapIndexDetails::default()), 0, false)]
     #[case::label_list(details(&pbold::LabelListIndexDetails::default()), 0, false)]
     #[case::ngram(details(&pbold::NGramIndexDetails::default()), 0, false)]
+    #[case::ngram_address_domain(details(&pbold::NGramIndexDetails::default()), 1, true)]
+    #[case::rtree(details(&pb::RTreeIndexDetails::default()), 0, false)]
+    #[case::rtree_address_domain(details(&pb::RTreeIndexDetails::default()), 1, true)]
     #[case::inverted(details(&pbold::InvertedIndexDetails::default()), 0, false)]
     #[case::vector(details(&pb::VectorIndexDetails::default()), 0, false)]
     #[case::fm(details(&pb::FmIndexDetails::default()), 0, false)]
     #[case::min_hash(details(&pb::MinHashLshIndexDetails::default()), 0, false)]
+    #[case::min_hash_address_domain(details(&pb::MinHashLshIndexDetails::default()), 1, false)]
     #[case::json(details(&pb::JsonIndexDetails::default()), 0, false)]
     #[case::json_over_zone_map(
         json_over(details(&pbold::ZoneMapIndexDetails::default())),
@@ -351,6 +415,11 @@ mod tests {
         false
     )]
     #[case::json_over_btree(json_over(details(&pbold::BTreeIndexDetails::default())), 0, false)]
+    #[case::json_over_address_domain_btree(
+        json_over(details(&pbold::BTreeIndexDetails::default())),
+        1,
+        false
+    )]
     #[case::undecodable_json(undecodable_json(), 0, false)]
     #[case::legacy_without_details(None, 0, false)]
     #[case::unknown_type(foreign("example.ForeignIndexDetails"), 0, false)]
@@ -479,6 +548,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_recording_policy() {
+        let zone_map = index_with(
+            "zone_map",
+            details(&pbold::ZoneMapIndexDetails::default()),
+            0,
+        );
+        let bitmap = index_with("bitmap", details(&pbold::BitmapIndexDetails::default()), 0);
+        let manifest = stable_row_id_manifest();
+        ensure_frag_reuse_recording_allowed_when(
+            &manifest,
+            &[frag_reuse_entry(0), zone_map.clone()],
+            true,
+        )
+        .unwrap();
+
+        // As a release build.
+        let error = ensure_frag_reuse_recording_allowed_when(&manifest, &[], false).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+
+        let mut flagged = manifest.clone();
+        flagged.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        flagged.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        for (manifest, indices) in [(&flagged, vec![]), (&manifest, vec![frag_reuse_entry(1)])] {
+            let error =
+                ensure_frag_reuse_recording_allowed_when(manifest, &indices, true).unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(error.to_string().contains("tagged"), "{error}");
+        }
+
+        let result = ensure_frag_reuse_recording_allowed_when(&manifest, &[zone_map, bitmap], true);
+        assert!(
+            !result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("`zone_map`")
+        );
+        assert_rejected(result, "`bitmap`");
+    }
+
     async fn stable_row_id_dataset(uri: &str) -> Dataset {
         gen_batch()
             .col("i", array::step::<Int32Type>())
@@ -597,6 +707,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!has_flag(&dataset));
+        let without_entry = dataset.version().version;
 
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
         commit_new_indices(&mut dataset, vec![frag_reuse])
@@ -623,8 +734,12 @@ mod tests {
         assert!(deep.manifest.uses_stable_row_ids());
         assert!(has_flag(&deep));
 
-        dataset.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap();
-        assert!(!has_flag(&dataset));
+        let error = dataset.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(has_flag(&dataset));
+        let mut restored = dataset.checkout_version(without_entry).await.unwrap();
+        restored.restore().await.unwrap();
+        assert!(!has_flag(&restored));
     }
 
     #[tokio::test]
@@ -668,8 +783,8 @@ mod tests {
         dataset
             .create_index_builder(
                 &["category"],
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -716,21 +831,39 @@ mod tests {
 
     /// Typed requests ignore the params' index type; generic ones resolve it.
     #[rstest]
-    #[case::typed_zone_map(IndexType::ZoneMap, ScalarIndexParams::default(), None)]
+    #[case::typed_zone_map("i", IndexType::ZoneMap, ScalarIndexParams::default(), None)]
     #[case::generic_zone_map(
+        "i",
         IndexType::Scalar,
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
         None
     )]
-    #[case::generic_default_btree(IndexType::Scalar, ScalarIndexParams::default(), Some("BTree"))]
+    // BTree always stores row addresses now, so it applies the fragment
+    // reuse index like ZoneMap/Bitmap and is no longer rejected here.
+    #[case::generic_default_btree("i", IndexType::Scalar, ScalarIndexParams::default(), None)]
     #[case::typed_btree_with_zone_map_params(
+        "i",
         IndexType::BTree,
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
-        Some("BTree")
+        None
     )]
-    #[case::typed_bitmap(IndexType::Bitmap, ScalarIndexParams::default(), Some("Bitmap"))]
+    // Bitmap also always stores row addresses now, so it is no longer rejected
+    // here either -- see the generic_default_btree case above.
+    #[case::typed_bitmap("i", IndexType::Bitmap, ScalarIndexParams::default(), None)]
+    // NGram also stores row addresses now; it needs a text column, hence the
+    // different column here.
+    #[case::typed_ngram("category", IndexType::NGram, ScalarIndexParams::default(), None)]
+    // MinHash LSH stores row addresses but does not apply the fragment reuse
+    // index when it is loaded.
+    #[case::typed_minhash_lsh(
+        "category",
+        IndexType::MinHashLsh,
+        ScalarIndexParams::default(),
+        Some("MinHashLsh")
+    )]
     #[tokio::test]
     async fn test_create_scalar_index_under_frag_reuse(
+        #[case] column: &str,
         #[case] index_type: IndexType,
         #[case] params: ScalarIndexParams,
         #[case] rejected_type: Option<&str>,
@@ -742,12 +875,15 @@ mod tests {
             .unwrap();
         let version = dataset.version().version;
 
-        let result = create_index(&mut dataset, "i", index_type, &params).await;
+        let result = create_index(&mut dataset, column, index_type, &params).await;
         match rejected_type {
             None => result.unwrap(),
             Some(type_name) => {
                 let message = result.as_ref().unwrap_err().to_string();
-                assert!(message.contains("Cannot create index `i_idx`"), "{message}");
+                assert!(
+                    message.contains(&format!("Cannot create index `{column}_idx`")),
+                    "{message}"
+                );
                 assert_rejected(result, type_name);
                 dataset.checkout_latest().await.unwrap();
                 assert_eq!(dataset.version().version, version);
@@ -831,8 +967,8 @@ mod tests {
         dataset
             .create_index_builder(
                 &["category"],
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -928,7 +1064,7 @@ mod tests {
         values
     }
 
-    /// The bitmap's stable row ids collide with compacted fragment 0's old
+    /// The Inverted index's stable row ids collide with compacted fragment 0's old
     /// addresses, so applying the fragment reuse index to it would lose rows.
     #[tokio::test]
     async fn test_incompatible_indices_are_hidden_from_readers() {
@@ -936,8 +1072,8 @@ mod tests {
         create_index(
             &mut dataset,
             "category",
-            IndexType::Bitmap,
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            IndexType::Inverted,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
         )
         .await
         .unwrap();
@@ -1132,11 +1268,11 @@ mod tests {
             create_index(
                 &mut dataset,
                 "category",
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .await,
-            "Cannot create index `category_idx`",
+            "Cannot create a full-text index on column `category`",
         );
         let bitmap = index_with(
             "category_idx",
@@ -1159,18 +1295,18 @@ mod tests {
 
     #[rstest]
     #[case::frag_reuse_index_first(true)]
-    #[case::bitmap_first(false)]
+    #[case::inverted_first(false)]
     #[tokio::test]
     async fn test_racing_index_creation_is_rejected_after_rebase(#[case] frag_reuse_first: bool) {
         let dir = TempStrDir::default();
         let mut dataset = stable_row_id_dataset(dir.as_str()).await;
         let mut other = Dataset::open(dir.as_str()).await.unwrap();
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
-        let bitmap = other
+        let inverted_index = other
             .create_index_builder(
                 &["category"],
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -1182,9 +1318,11 @@ mod tests {
             commit_new_indices(&mut dataset, vec![frag_reuse])
                 .await
                 .unwrap();
-            commit_new_indices(&mut other, vec![bitmap]).await
+            commit_new_indices(&mut other, vec![inverted_index]).await
         } else {
-            commit_new_indices(&mut other, vec![bitmap]).await.unwrap();
+            commit_new_indices(&mut other, vec![inverted_index])
+                .await
+                .unwrap();
             commit_new_indices(&mut dataset, vec![frag_reuse]).await
         };
         assert_rejected(result, "`category_idx`");

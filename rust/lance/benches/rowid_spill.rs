@@ -43,7 +43,11 @@
 //!    resolve an id -- the read cost the design adds. The `take` that follows
 //!    once the index and the fragment's sequence are cached is a control: it
 //!    should cost the same in both arms
-//! 5. compaction wall time and the bytes it wrote -- the write cost it adds
+//! 5. cold scans of both user columns, with and without row ids -- whether a
+//!    scan pays for lineage it does not need. Each sample starts with a fresh
+//!    default session, preserving normal caching within the query. The OS page
+//!    cache is not flushed, and dataset open is not timed
+//! 6. compaction wall time and the bytes it wrote -- the write cost it adds
 //!
 //! Timings are reported as the median and the minimum of their samples.
 //!
@@ -54,15 +58,15 @@
 //!
 //! ## Running
 //!
-//! Spilled row lineage is an unstable feature, so a release build -- which is
-//! what `cargo bench` produces -- has to opt in:
+//! Each spilled arm opts in through table configuration. No process-level
+//! environment opt-in is needed:
 //!
 //! ```bash
-//! LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE=1 cargo bench --bench rowid_spill
+//! cargo bench --profile release-with-debug --bench rowid_spill
 //! # A quick run. At this size the deleted table fits the default inline
 //! # budget, so the budget is set to zero to keep something spilling.
 //! BENCH_FRAGMENTS=2 BENCH_ROWS_PER_FRAGMENT=200000 BENCH_INLINE_MAX_BYTES=0 \
-//!   LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE=1 cargo bench --bench rowid_spill
+//!   cargo bench --profile release-with-debug --bench rowid_spill
 //! ```
 //!
 //! ## Configuration
@@ -108,7 +112,6 @@ use lance::dataset::{
 use lance::session::Session;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_io::object_store::ObjectStoreRegistry;
-use lance_table::feature_flags::ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV;
 use lance_table::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
 use lance_table::rowids::version::write_dataset_versions;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -259,6 +262,8 @@ struct ArmResult {
     commit: Vec<Duration>,
     load_sequence: Vec<Duration>,
     index_build: Vec<Duration>,
+    scan: Vec<Duration>,
+    scan_with_row_ids: Vec<Duration>,
     take: Vec<Duration>,
     spilled_fragments: SpilledFragments,
     total_fragments: usize,
@@ -709,6 +714,37 @@ async fn run_arm(dir: &str, config: Config, scenario: Scenario, spill: bool) -> 
         index_build.push(started.elapsed());
     }
 
+    // The same user columns and batches in both cases. Fresh default sessions
+    // start each query cold while preserving normal within-query cache reuse.
+    let mut scan = Vec::with_capacity(READ_SAMPLES);
+    let mut scan_with_row_ids = Vec::with_capacity(READ_SAMPLES);
+    for _ in 0..READ_SAMPLES {
+        for (with_row_ids, samples) in [(false, &mut scan), (true, &mut scan_with_row_ids)] {
+            let cold = lance::dataset::builder::DatasetBuilder::from_uri(&uri)
+                .with_session(Arc::new(Session::default()))
+                .load()
+                .await
+                .unwrap();
+            let mut scanner = cold.scan();
+            scanner.project(&["id", "value"]).unwrap();
+            if with_row_ids {
+                scanner.with_row_id();
+            }
+            let started = Instant::now();
+            let scanned = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_fold(0_u64, |count, batch| async move {
+                    Ok(count + batch.num_rows() as u64)
+                })
+                .await
+                .unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(scanned, rows);
+        }
+    }
+
     // The take itself, once everything it depends on is cached, which makes
     // this row a control. It needs a session that actually caches --
     // `open_cold` gives the caches zero capacity, so on that dataset
@@ -820,6 +856,8 @@ async fn run_arm(dir: &str, config: Config, scenario: Scenario, spill: bool) -> 
         commit,
         load_sequence,
         index_build,
+        scan,
+        scan_with_row_ids,
         take,
         spilled_fragments,
         total_fragments,
@@ -941,6 +979,26 @@ fn report(scenario: Scenario, config: Config, inline: &ArmResult, spilled: &ArmR
         &inline.index_build,
         &spilled.index_build,
     );
+    for (name, inline_samples, spilled_samples) in [
+        ("scan user columns (cold)", &inline.scan, &spilled.scan),
+        (
+            "scan with row ids (cold)",
+            &inline.scan_with_row_ids,
+            &spilled.scan_with_row_ids,
+        ),
+    ] {
+        timing(name, inline_samples, spilled_samples);
+        // Keep the samples alongside the summary so comparisons can inspect
+        // variance instead of relying on the median alone.
+        println!(
+            "{name} inline samples (ms): {:?}",
+            inline_samples.iter().copied().map(ms).collect::<Vec<_>>()
+        );
+        println!(
+            "{name} spilled samples (ms): {:?}",
+            spilled_samples.iter().copied().map(ms).collect::<Vec<_>>()
+        );
+    }
     timing("take by row id (control)", &inline.take, &spilled.take);
     row(
         "compaction",
@@ -1003,15 +1061,6 @@ fn scenarios_from_env() -> Vec<Scenario> {
 }
 
 fn bench_rowid_spill(_c: &mut Criterion) {
-    if std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_none()
-        && !cfg!(debug_assertions)
-    {
-        panic!(
-            "set {ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV}=1 to run this benchmark: spilled row lineage \
-             are an unstable feature and a release build refuses the dataset without it"
-        );
-    }
-
     let config = Config::from_env();
     let scenarios = scenarios_from_env();
     config.validate(&scenarios);
@@ -1020,10 +1069,9 @@ fn bench_rowid_spill(_c: &mut Criterion) {
     println!("=== Row lineage placement ===");
 
     for scenario in scenarios {
-        // A table that has not opted in reproduces the behavior on main, where
-        // a compacted fragment's sequences always stay inline however large
-        // they grow. Each arm's table is deleted before the next arm builds its
-        // own, so the two never take up disk at the same time.
+        // A table that has not opted in keeps its sequences inline however
+        // large they grow. Each arm's table is deleted before the next arm
+        // builds its own, so the two never take up disk at the same time.
         let run = |spill: bool| {
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_string_lossy().into_owned();

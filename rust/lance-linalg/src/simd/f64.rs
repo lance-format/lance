@@ -133,7 +133,10 @@ impl SIMD<f64, 4> for f64x4 {
     unsafe fn load_unaligned(ptr: *const f64) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_pd(ptr))
+            // Treat the register as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers this to an AVX move when AVX is
+            // enabled for the caller.
+            Self(ptr.cast::<__m256d>().read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -440,9 +443,8 @@ impl Mul for f64x4 {
 /// x86_64. Originally there was a sibling AVX-512 variant gated on
 /// `target_feature = "avx512f"`, but no project CI configuration enables
 /// `+avx512f` globally, so the variant was dead code. Removed in the
-/// runtime-SIMD-dispatch retrofit; per-tier dispatch happens in the kernel
-/// functions in `crate::distance::*` via `match *SIMD_SUPPORT` + per-tier
-/// `#[target_feature(enable = "...")]` inner functions.
+/// runtime-SIMD-dispatch retrofit; `crate::distance::*` now selects a
+/// per-tier `target_kernel!` candidate through a `Dispatch` list.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
@@ -565,7 +567,11 @@ impl SIMD<f64, 8> for f64x8 {
     unsafe fn load_unaligned(ptr: *const f64) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_pd(ptr), _mm256_loadu_pd(ptr.add(4)))
+            // Treat the registers as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers these to AVX moves when AVX is
+            // enabled for the caller.
+            let ptr = ptr.cast::<__m256d>();
+            Self(ptr.read_unaligned(), ptr.add(1).read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -900,6 +906,29 @@ mod tests {
     fn test_slice_conversion_rejects_short_input() {
         assert!(std::panic::catch_unwind(|| f64x4::from(&[0.0; 3][..])).is_err());
         assert!(std::panic::catch_unwind(|| f64x8::from(&[0.0; 7][..])).is_err());
+    }
+
+    #[test]
+    fn test_slice_conversion_uses_cpu_baseline() {
+        let values4 = [1.0_f64, 2.0, 3.0, 4.0];
+        let values8 = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let vectors = (
+            f64x4::from(&values4[..]),
+            f64x4::from(&values4),
+            f64x8::from(&values8[..]),
+            f64x8::from(&values8),
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            std::hint::black_box(vectors);
+            return;
+        }
+
+        assert_eq!(vectors.0.as_array(), values4);
+        assert_eq!(vectors.1.as_array(), values4);
+        assert_eq!(vectors.2.as_array(), values8);
+        assert_eq!(vectors.3.as_array(), values8);
     }
 
     #[test]

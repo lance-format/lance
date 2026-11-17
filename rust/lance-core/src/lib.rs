@@ -14,6 +14,7 @@ pub mod datatypes;
 pub mod deepsize;
 pub mod error;
 pub mod levenshtein;
+pub mod memory;
 pub mod traits;
 pub mod utils;
 

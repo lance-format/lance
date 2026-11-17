@@ -12,7 +12,7 @@ In this tutorial, you'll learn how to append new data to existing datasets while
 ## Install the Python SDK
 
 ```bash
-pip install pylance
+--8<-- "snippets/quickstart/pylance-install.sh"
 ```
 
 ## Set Up Your Environment
@@ -20,11 +20,15 @@ pip install pylance
 First, you should import the necessary libraries:
 
 ```python
-import shutil
-import lance
-import numpy as np
-import pandas as pd
-import pyarrow as pa
+--8<-- "snippets/quickstart/versioning_quickstart.py:imports"
+```
+
+## Create a Dataset
+
+Start with a fresh dataset, which becomes version 1:
+
+```python
+--8<-- "snippets/quickstart/versioning_quickstart.py:create"
 ```
 
 ## Append New Data to Your Dataset
@@ -32,11 +36,11 @@ import pyarrow as pa
 You can add new rows to your existing dataset, creating a new version while preserving the original data. Here is how to append rows:
 
 ```python
-df = pd.DataFrame({"a": [10]})
-tbl = pa.Table.from_pandas(df)
-dataset = lance.write_dataset(tbl, "/tmp/test.lance", mode="append")
+--8<-- "snippets/quickstart/versioning_quickstart.py:append"
+```
 
-dataset.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.append.txt"
 ```
 
 ## Overwrite Your Dataset
@@ -46,28 +50,36 @@ You can completely replace your dataset with new data, creating a new version wh
 Here is how to overwrite the data and create a new version:
 
 ```python
-df = pd.DataFrame({"a": [50, 100]})
-tbl = pa.Table.from_pandas(df)
-dataset = lance.write_dataset(tbl, "/tmp/test.lance", mode="overwrite")
+--8<-- "snippets/quickstart/versioning_quickstart.py:overwrite"
+```
 
-dataset.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.overwrite.txt"
 ```
 
 ## Access Previous Dataset Versions
 
 You can also check what versions are available and then access specific versions of your dataset.
 
-List all versions of a dataset with this request:
+List all versions of a dataset with `versions()` (each entry includes `version`, `timestamp`, and `metadata`):
 
 ```python
-dataset.versions()
+--8<-- "snippets/quickstart/versioning_quickstart.py:versions"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.versions.txt"
 ```
 
 If you only need version numbers, use the lightweight reference API. It lists manifest
 locations without reading and deserializing every manifest:
 
 ```python
-dataset.version_refs()
+--8<-- "snippets/quickstart/versioning_quickstart.py:version-refs"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.version-refs.txt"
 ```
 
 Use `dataset.latest_version` instead when only the latest version of the current branch
@@ -76,11 +88,11 @@ is needed.
 You can also access any available version:
 
 ```python
-# Version 1
-lance.dataset('/tmp/test.lance', version=1).to_table().to_pandas()
+--8<-- "snippets/quickstart/versioning_quickstart.py:checkout-versions"
+```
 
-# Version 2
-lance.dataset('/tmp/test.lance', version=2).to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.checkout-versions.txt"
 ```
 
 ## Tag Your Important Versions
@@ -88,15 +100,21 @@ lance.dataset('/tmp/test.lance', version=2).to_table().to_pandas()
 Create named tags for important versions, making it easier to reference them by meaningful names.
 
 ```python
-dataset.tags.create("stable", 2)
-dataset.tags.create("nightly", 3)
-dataset.tags.list()
+--8<-- "snippets/quickstart/versioning_quickstart.py:tags"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.tags.txt"
 ```
 
 Tags can be checked out like versions:
 
 ```python
-lance.dataset('/tmp/test.lance', version="stable").to_table().to_pandas()
+--8<-- "snippets/quickstart/versioning_quickstart.py:checkout-tag"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.checkout-tag.txt"
 ```
 
 For advanced tag operations (e.g., tagging versions on specific branches), see [Tags and Branches](../guide/tags_and_branches.md).
@@ -108,15 +126,14 @@ Branches manage parallel lines of dataset evolution. You can create branches fro
 `main` refers to the default branch in checkout and reference APIs, but it is reserved and cannot be used as the name of a new branch.
 
 ```python
-# Create branch from current latest version
-experiment_branch = ds.create_branch("experiment")
-
-# Write to the branch (affects only that branch's history)
-tbl = pa.Table.from_pandas(pd.DataFrame({"a": [42]}))
-lance.write_dataset(tbl, experiment_branch, mode="append")
+--8<-- "snippets/quickstart/versioning_quickstart.py:branches"
 ```
 
-For more details, see [Tags and Branches](../guide/tags_and_branches.md).
+```output
+--8<-- "snippets/quickstart/outputs/versioning_quickstart.py.branches.txt"
+```
+
+For more details, see [Tags and Branches](../guide/tags_and_branches.md). To preserve logical row identity across updates and compaction, see [Stable Row IDs and Lineage](../guide/row_ids.md).
 
 ## Next Steps
 

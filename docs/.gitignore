@@ -16,6 +16,8 @@ __pycache__/
 
 # uv
 uv.lock
+# CI installs the docs snippets' pinned versions from this lockfile.
+!snippets/uv.lock
 
 # IDE
 .vscode/

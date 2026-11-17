@@ -18,6 +18,11 @@ Lance projects follow two types of releases:
   The PMC is responsible for officially casting binding votes for the stable release. Once the vote has passed,
   a maintainer can continue and finish the stable release.
 
+  Before publishing Lance stable, its LanceDB RC pin PR must be ready to merge:
+  relevant CI and reviews must be complete, with no unresolved blocking findings.
+  Passing CI alone is insufficient. The actual downstream merge can follow the
+  mechanical dependency update and verification of the published stable packages.
+
 ## Release Versioning
 
 All Lance projects follow [semantic versioning](https://semver.org/) spec for release versioning:
@@ -42,3 +47,8 @@ handle any breaking changes introduced in the major version.
 
 Each project maintains its own detailed release process in a file named `release_process.md`.
 Changes to any project-specific release process are treated as normal code modifications and can be approved by a maintainer with write access.
+
+Project-specific instructions:
+
+- [Lance release process](https://github.com/lance-format/lance/blob/main/release_process.md)
+- [LanceDB release process](https://github.com/lancedb/lancedb/blob/main/release_process.md)

@@ -10,6 +10,7 @@ keywords = { workspace = true }
 categories = { workspace = true }
 
 [dependencies]
+argminmax = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 half = { workspace = true }
@@ -62,6 +63,10 @@ harness = false
 
 [[bench]]
 name = "batch_distance"
+harness = false
+
+[[bench]]
+name = "hamming"
 harness = false
 
 [lints]

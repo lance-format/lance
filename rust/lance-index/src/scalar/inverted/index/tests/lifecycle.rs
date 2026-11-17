@@ -3,6 +3,39 @@
 
 use super::*;
 
+use crate::Index;
+
+/// `calculate_included_frags` reports that coverage cannot be rebuilt from the
+/// index files rather than panicking (it was `unimplemented!()`): the posting
+/// lists store row ids, which do not identify a fragment once stable row ids
+/// are enabled. `migrate_indices` relies on this error to keep the
+/// authoritative fragment bitmap recorded in the index metadata.
+#[tokio::test]
+async fn test_calculate_included_frags_is_unsupported() -> Result<()> {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = write_single_partition_index(
+        store,
+        InvertedIndexParams::default(),
+        TokenSetFormat::default(),
+        "hello",
+        100,
+    )
+    .await?;
+
+    let err = index.calculate_included_frags().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("do not recalculate fragment coverage from their files"),
+        "inverted coverage recovery must be not_supported, got: {err}"
+    );
+    Ok(())
+}
+
 /// Build a multi-partition inverted index in `store` with `num_partitions`
 /// partitions, each carrying a handful of tokens/docs.
 async fn build_multi_partition_index(
@@ -197,7 +230,8 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
     let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(updated.format_version(), format_version);
     assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
-    assert_eq!(updated.partitions.len(), 2);
+    // Consolidating the two tiny partitions must preserve their V2 format.
+    assert_eq!(updated.partitions.len(), 1);
     for partition in &updated.partitions {
         assert_eq!(
             partition.inverted_list.posting_tail_codec(),
@@ -291,7 +325,7 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
         &[index],
         empty_doc_stream(),
         dest_store.as_ref(),
-        None,
+        &[None],
         crate::progress::noop_progress(),
     )
     .await?;
@@ -347,7 +381,7 @@ async fn test_merge_segments_preserves_format_version(
         &[index],
         empty_doc_stream(),
         dest_store.as_ref(),
-        None,
+        &[None],
         crate::progress::noop_progress(),
     )
     .await?;
@@ -408,7 +442,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
         &segments,
         empty_doc_stream(),
         dest_store.as_ref(),
-        None,
+        &vec![None; segments.len()],
         crate::progress::noop_progress(),
     )
     .await?;
@@ -471,7 +505,7 @@ async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()
             empty_doc_stream(),
             dest_store.as_ref(),
             &[first, second],
-            None,
+            &[None, None],
         )
         .await?;
 

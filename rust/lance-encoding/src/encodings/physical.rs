@@ -6,17 +6,22 @@ use lance_core::{Error, Result};
 
 use crate::data::FixedWidthDataBlock;
 
+pub mod alp;
+pub(crate) mod axis_delta;
 pub mod binary;
 #[cfg(feature = "bitpacking")]
 pub mod bitpacking;
 pub mod block;
 pub mod byte_stream_split;
 pub mod constant;
+pub(crate) mod cost;
 pub mod delta;
 pub mod dictionary;
 pub mod fsst;
 pub mod general;
 pub mod packed;
+#[cfg(feature = "pcodec")]
+pub mod pcodec;
 pub mod range;
 pub mod rle;
 pub(crate) mod sequence;

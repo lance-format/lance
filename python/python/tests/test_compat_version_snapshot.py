@@ -3,10 +3,14 @@
 
 """Coverage for the version snapshot the compat tests are parametrized over."""
 
+import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+from compat import compat_decorator
 
 TESTS_DIR = Path(__file__).resolve().parent
 
@@ -27,14 +31,7 @@ from compat import compat_decorator
 def _fetch_stable_versions():
     extra = ["8.0.0"] if os.environ.get("PYTEST_XDIST_WORKER") == "gw1" else []
     return sorted(Version(v) for v in ["6.0.0", "7.0.0", *extra])
-
-
-def _fetch_last_beta_release():
-    return "7.1.0b1"
-
-
 compat_decorator._fetch_stable_versions = _fetch_stable_versions
-compat_decorator._fetch_last_beta_release = _fetch_last_beta_release
 """
 
 # Not run with --run-compat: the generated cases stay collected but skipped, which
@@ -104,3 +101,50 @@ def test_workers_share_the_controller_version_snapshot(tmp_path):
     assert "Different tests were collected" not in output, output
     assert "8.0.0" not in output, output
     assert result.returncode == 0, output
+
+
+def test_stable_release_discovery_excludes_prereleases(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            releases = {
+                "14.0.0": [],
+                "15.0.0b8": [],
+                "15.0.0rc1": [],
+                "15.0.0.dev1": [],
+                "not-a-version": [],
+            }
+            return json.dumps({"releases": releases}).encode()
+
+    monkeypatch.setattr(
+        compat_decorator.urllib.request, "urlopen", lambda *args, **kwargs: Response()
+    )
+
+    assert [str(v) for v in compat_decorator._fetch_stable_versions()] == ["14.0.0"]
+
+
+def test_version_snapshot_rejects_prereleases():
+    compat_decorator.use_version_snapshot({"stable": ["14.0.0", "15.0.0b8"]})
+    try:
+        with pytest.raises(ValueError, match="only stable releases"):
+            compat_decorator.pylance_stable_versions()
+    finally:
+        compat_decorator.use_version_snapshot({"stable": []})
+
+
+def test_compat_versions_select_recent_stable_majors():
+    compat_decorator.use_version_snapshot(
+        {"stable": ["0.39.0", "12.0.0", "13.0.0", "14.0.0", "14.0.2"]}
+    )
+    assert compat_decorator.compat_versions() == ["14.0.2", "13.0.0", "12.0.0"]
+
+
+@pytest.mark.parametrize("version", ["15.0.0b8", "15.0.0-beta.8", "15.0.0rc1"])
+def test_compat_test_rejects_prerelease_minimum(version):
+    with pytest.raises(ValueError, match="only stable releases"):
+        compat_decorator.compat_test(min_version=version)

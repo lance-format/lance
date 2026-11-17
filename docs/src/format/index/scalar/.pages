@@ -4,6 +4,7 @@ nav:
   - Bitmap: bitmap.md
   - Label List: label_list.md
   - Zone Map: zonemap.md
+  - Zone Write Seeds: zone_write_seeds.md
   - Bloom Filter: bloom_filter.md
   - Full Text Search: fts.md
   - N-gram: ngram.md
@@ -11,3 +12,4 @@ nav:
   - FM-Index: fmindex.md
   - RTree: rtree.md
   - JSON: json.md
+  - List Element (experimental): list_element.md

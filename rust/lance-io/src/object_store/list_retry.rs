@@ -21,6 +21,8 @@ pub struct ListRetryStream {
     current_stream: BoxStream<'static, object_store::Result<ObjectMeta>>,
     prefix: Option<Path>,
     last_successful_key: Option<Path>,
+    is_lexically_ordered: bool,
+    is_done: bool,
     max_retries: usize,
     current_retries: usize,
     retry_sleep: Option<Pin<Box<Sleep>>>,
@@ -40,12 +42,24 @@ impl ListRetryStream {
             current_stream,
             prefix,
             last_successful_key: None,
+            is_lexically_ordered: false,
+            is_done: false,
             max_retries,
             current_retries: 0,
             retry_sleep: None,
             base_retry_delay: DEFAULT_BASE_RETRY_DELAY,
             max_retry_delay: DEFAULT_MAX_RETRY_DELAY,
         }
+    }
+
+    /// Allow retries after emitting entries when the store guarantees lexical listing order.
+    ///
+    /// Without this guarantee, a failed listing can only be retried before its
+    /// first entry: an offset would exclude unseen entries that sort before the
+    /// last emitted key.
+    pub fn with_lexical_ordering(mut self, is_lexically_ordered: bool) -> Self {
+        self.is_lexically_ordered = is_lexically_ordered;
+        self
     }
 
     #[cfg(test)]
@@ -56,18 +70,10 @@ impl ListRetryStream {
         base_retry_delay: Duration,
         max_retry_delay: Duration,
     ) -> Self {
-        let current_stream = object_store.list(prefix.as_ref());
-        Self {
-            object_store,
-            current_stream,
-            prefix,
-            last_successful_key: None,
-            max_retries,
-            current_retries: 0,
-            retry_sleep: None,
-            base_retry_delay,
-            max_retry_delay,
-        }
+        let mut stream = Self::new(object_store, prefix, max_retries);
+        stream.base_retry_delay = base_retry_delay;
+        stream.max_retry_delay = max_retry_delay;
+        stream
     }
 
     fn is_retryable(error: &object_store::Error) -> bool {
@@ -95,9 +101,9 @@ impl ListRetryStream {
     }
 
     fn recreate_stream(&mut self) {
-        self.current_stream = if let Some(offset) = self.last_successful_key.clone() {
+        self.current_stream = if let Some(offset) = self.last_successful_key.as_ref() {
             self.object_store
-                .list_with_offset(self.prefix.as_ref(), &offset)
+                .list_with_offset(self.prefix.as_ref(), offset)
         } else {
             self.object_store.list(self.prefix.as_ref())
         };
@@ -112,6 +118,9 @@ impl Stream for ListRetryStream {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.is_done {
+            return Poll::Ready(None);
+        }
         loop {
             if let Some(sleep) = this.retry_sleep.as_mut() {
                 match sleep.as_mut().poll(cx) {
@@ -133,6 +142,10 @@ impl Stream for ListRetryStream {
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(error))) if Self::is_retryable(&error) => {
+                    if !this.is_lexically_ordered && this.last_successful_key.is_some() {
+                        this.is_done = true;
+                        return Poll::Ready(Some(Err(error)));
+                    }
                     if this.current_retries < this.max_retries {
                         this.current_retries += 1;
                         this.retry_sleep = Some(Box::pin(tokio::time::sleep(this.retry_delay())));
@@ -165,11 +178,11 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use futures::stream;
+    use futures::{TryStreamExt, stream};
     use object_store::memory::InMemory;
     use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result as OSResult,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStoreExt,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
     };
 
     fn assert_send<T: Send>() {}
@@ -300,18 +313,15 @@ mod tests {
 
         fn list_with_offset(
             &self,
-            _prefix: Option<&Path>,
+            prefix: Option<&Path>,
             offset: &Path,
         ) -> BoxStream<'static, OSResult<ObjectMeta>> {
             self.offset_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_offset.lock().unwrap() = Some(offset.clone());
-            let results = self
-                .offset_streams
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default();
-            stream::iter(results).boxed()
+            match self.offset_streams.lock().unwrap().pop_front() {
+                Some(results) => stream::iter(results).boxed(),
+                None => self.inner.list_with_offset(prefix, offset),
+            }
         }
 
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
@@ -364,7 +374,8 @@ mod tests {
             1,
             Duration::from_millis(1),
             Duration::from_millis(1),
-        );
+        )
+        .with_lexical_ordering(true);
 
         let items = stream.collect::<Vec<_>>().await;
 
@@ -399,5 +410,82 @@ mod tests {
         ));
         assert_eq!(store.list_calls(), 1);
         assert_eq!(store.offset_calls(), 0);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::retry_before_first_item(false, false, 2, false)]
+    #[case::partial_unordered_listing(true, false, 1, true)]
+    #[case::exhausted_before_first_item(false, true, 2, true)]
+    async fn test_unordered_listing_failure(
+        #[case] is_partial: bool,
+        #[case] is_exhausted: bool,
+        #[case] expected_list_calls: usize,
+        #[case] expects_error: bool,
+    ) {
+        let first = if is_partial {
+            vec![
+                Ok(object_meta("prefix/b")),
+                Err(retryable_error()),
+                Ok(object_meta("prefix/a")),
+            ]
+        } else {
+            vec![Err(retryable_error())]
+        };
+        let second = if is_exhausted {
+            vec![Err(retryable_error())]
+        } else {
+            vec![Ok(object_meta("prefix/a"))]
+        };
+        let store = Arc::new(ScriptedListStore::new(vec![first, second], vec![]));
+        // If the stream incorrectly resumes after b, the dependency's lexical
+        // offset filter excludes the as-yet unseen a.
+        store
+            .inner
+            .put(&Path::from("prefix/a"), Bytes::new().into())
+            .await
+            .unwrap();
+        store
+            .inner
+            .put(&Path::from("prefix/b"), Bytes::new().into())
+            .await
+            .unwrap();
+        if is_partial {
+            let remaining = store
+                .inner
+                .list_with_offset(Some(&Path::from("prefix")), &Path::from("prefix/b"))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(remaining.is_empty(), "the offset hides the unseen a");
+        }
+        let stream = ListRetryStream::new_with_backoff(
+            store.clone(),
+            Some(Path::from("prefix")),
+            1,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+
+        let items = stream.collect::<Vec<_>>().await;
+        assert_eq!(store.list_calls(), expected_list_calls);
+        assert_eq!(store.offset_calls(), 0);
+        assert_eq!(items.len(), if is_partial { 2 } else { 1 });
+        if is_partial {
+            assert_eq!(items[0].as_ref().unwrap().location, Path::from("prefix/b"));
+        }
+        if expects_error {
+            let error = items.last().unwrap().as_ref().unwrap_err();
+            assert!(matches!(
+                error,
+                object_store::Error::Generic {
+                    store: "scripted",
+                    ..
+                }
+            ));
+            assert_eq!(error.to_string(), retryable_error().to_string());
+        } else {
+            assert_eq!(items[0].as_ref().unwrap().location, Path::from("prefix/a"));
+        }
     }
 }

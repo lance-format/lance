@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod aggregate;
-pub mod chunker;
+pub use lance_datafusion_exec::chunker;
 pub mod dataframe;
-#[cfg(any(test, feature = "datagen"))]
-pub mod datagen;
+#[cfg(feature = "datagen")]
+pub use lance_datafusion_exec::datagen;
 pub mod exec;
-pub mod expr;
+pub use lance_datafusion_exec::expr;
 pub mod logical_expr;
 pub mod planner;
 pub mod projection;
@@ -20,12 +20,14 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.datafusion.rs"));
+    include!("pb/lance.datafusion.rs");
 }
-mod signed_zero;
+mod numeric_coercion;
+#[doc(hidden)]
+pub mod signed_zero;
 pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]
 pub mod substrait;
 pub mod udf;
-pub mod utils;
+pub use lance_datafusion_exec::utils;

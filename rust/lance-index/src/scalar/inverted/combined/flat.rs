@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use arrow::array::{Float32Builder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch};
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::Time;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::metrics::Time;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{FutureExt, stream};
 use lance_core::error::DataFusionResult;
 use lance_core::utils::tokio::spawn_cpu;

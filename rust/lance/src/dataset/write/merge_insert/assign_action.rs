@@ -9,6 +9,8 @@ use datafusion::common::{
 };
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{Case, Expr, col};
+use lance_core::datatypes::Schema;
+use std::sync::Arc;
 
 // Note: right now, this is a fixed enum. In the future, this will need to be
 // dynamic to support multiple merge insert update clauses like:
@@ -72,11 +74,61 @@ fn qualify_unqualified_columns(expr: Expr, relation: &'static str) -> Result<Exp
     .map_err(crate::Error::from)
 }
 
+/// The `UpdateIf` condition, parsed against the dataset schema with the
+/// `source` / `target` qualifiers enabled.
+pub fn parse_update_condition(
+    params: &MergeInsertParams,
+    schema: &arrow_schema::Schema,
+) -> Result<Option<Expr>> {
+    match &params.when_matched {
+        WhenMatched::UpdateIf(condition_str) => {
+            let planner = lance_datafusion::planner::Planner::new(Arc::new(schema.clone()))
+                .with_enable_relations(true);
+            let condition = planner.parse_filter(condition_str).map_err(|e| {
+                crate::Error::invalid_input(format!("Failed to parse UpdateIf condition: {}", e))
+            })?;
+            Ok(Some(condition))
+        }
+        WhenMatched::UpdateIfExpr(condition) => Ok(Some(condition.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// The `DeleteIf` condition with its unqualified columns bound to `target`.
+pub fn parse_delete_condition(params: &MergeInsertParams) -> Result<Option<Expr>> {
+    match &params.delete_not_matched_by_source {
+        WhenNotMatchedBySource::DeleteIf(condition) => Ok(Some(qualify_unqualified_columns(
+            condition.clone(),
+            "target",
+        )?)),
+        _ => Ok(None),
+    }
+}
+
+/// Whether a merge condition reads a target column. An unqualified name
+/// counts: the join resolves it to the target when the source lacks it, and
+/// rejects it as ambiguous when both carry it, as the take does.
+pub fn condition_reads_target(condition: &Expr, dataset_schema: &Schema) -> bool {
+    condition.column_refs().into_iter().any(|column| {
+        column
+            .relation
+            .as_ref()
+            .is_none_or(|relation| relation.table() == "target")
+            && dataset_schema.field(&column.name).is_some()
+    })
+}
+
 /// Transforms merge insert parameters into a logical expression. The output
 /// is a single "action" column, that describes what to do with each row.
+///
+/// `update_condition` and `delete_condition` are the `UpdateIf` and `DeleteIf`
+/// conditions to fold into the action. `None` for a configured condition
+/// leaves every matched row an update, or every target-only row a delete,
+/// for `MergeConditionExec` to gate after the join.
 pub fn merge_insert_action(
     params: &MergeInsertParams,
-    schema: Option<&arrow_schema::Schema>,
+    update_condition: Option<Expr>,
+    delete_condition: Option<Expr>,
 ) -> Result<Expr> {
     // Use a sentinel column to detect whether the source side contributed a row to the
     // join output.  This is NULL-safe: the sentinel is `true` for every source row and
@@ -104,32 +156,12 @@ pub fn merge_insert_action(
         WhenMatched::UpdateAll => {
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
-        WhenMatched::UpdateIf(condition_str) => {
-            // Parse the condition with qualified column references enabled for fast path
-            if let Some(dataset_schema) = schema {
-                let planner = lance_datafusion::planner::Planner::new(std::sync::Arc::new(
-                    dataset_schema.clone(),
-                ))
-                .with_enable_relations(true);
-                let condition = planner.parse_filter(condition_str).map_err(|e| {
-                    crate::Error::invalid_input(format!(
-                        "Failed to parse UpdateIf condition: {}",
-                        e
-                    ))
-                })?;
-                cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
-            } else {
-                // Fallback - this shouldn't happen in the fast path
-                return Err(crate::Error::internal(
-                    "Schema required for UpdateIf parsing",
-                ));
-            }
-        }
-        WhenMatched::UpdateIfExpr(condition) => {
-            cases.push((
-                matched.and(condition.clone()),
-                Action::UpdateAll.as_literal_expr(),
-            ));
+        WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
+            let when = match update_condition {
+                Some(condition) => matched.and(condition),
+                None => matched,
+            };
+            cases.push((when, Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::DoNothing => {}
         WhenMatched::Fail => {
@@ -144,12 +176,12 @@ pub fn merge_insert_action(
         WhenNotMatchedBySource::Delete => {
             cases.push((target_only, Action::Delete.as_literal_expr()));
         }
-        WhenNotMatchedBySource::DeleteIf(condition) => {
-            let target_condition = qualify_unqualified_columns(condition.clone(), "target")?;
-            cases.push((
-                target_only.and(target_condition),
-                Action::Delete.as_literal_expr(),
-            ));
+        WhenNotMatchedBySource::DeleteIf(_) => {
+            let when = match delete_condition {
+                Some(condition) => target_only.and(condition),
+                None => target_only,
+            };
+            cases.push((when, Action::Delete.as_literal_expr()));
         }
         WhenNotMatchedBySource::Keep => {}
     }

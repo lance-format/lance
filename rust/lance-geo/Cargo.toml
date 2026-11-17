@@ -9,20 +9,50 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
-description = "Lance's geospatial extension providing geospatial UDFs."
+description = "Lance's geospatial extension."
 
 [dependencies]
-datafusion.workspace = true
-geoarrow-array = { workspace = true, optional = true }
-geoarrow-schema = { workspace = true, optional = true }
-geodatafusion = { workspace = true, optional = true }
-geo-traits = { workspace = true, optional = true }
-geo-types = { workspace = true, optional = true }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+async-trait.workspace = true
+datafusion-common.workspace = true
+datafusion-execution.workspace = true
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
+datafusion-physical-plan.workspace = true
+futures.workspace = true
+geoarrow-array.workspace = true
+geoarrow-schema.workspace = true
+geo-traits.workspace = true
+geo-types.workspace = true
+lance-arrow.workspace = true
 lance-core.workspace = true
+lance-datafusion-exec.workspace = true
+lance-index.workspace = true
+lance-index-core.workspace = true
+lance-io.workspace = true
+lance-select.workspace = true
+prost-types.workspace = true
+roaring.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
-[features]
-geo = ["dep:geoarrow-array", "dep:geoarrow-schema", "dep:geodatafusion", "dep:geo-traits", "dep:geo-types"]
+[dev-dependencies]
+bytes.workspace = true
+criterion.workspace = true
+lance-testing.workspace = true
+object_store.workspace = true
+rand.workspace = true
+rstest.workspace = true
+serial_test.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[[bench]]
+name = "geo"
+harness = false
 
 [lints]
 workspace = true

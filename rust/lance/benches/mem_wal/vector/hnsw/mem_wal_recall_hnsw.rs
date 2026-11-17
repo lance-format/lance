@@ -27,7 +27,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::DatasetMemWalExt;
-use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
+use lance::dataset::mem_wal::MemTableScanner;
+use lance::dataset::mem_wal::write::ShardWriterConfig;
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -274,7 +275,7 @@ fn make_batch(start_id: i64, vectors: &[f32], schema: Arc<ArrowSchema>) -> Recor
 }
 
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    DistanceType::Cosine.func()(a, b)
+    DistanceType::Cosine.try_func().unwrap()(a, b)
 }
 
 fn brute_force_top_k(corpus: &[f32], n: usize, query: &[f32], k: usize) -> Vec<(f32, i64)> {
@@ -439,12 +440,12 @@ async fn run_checkpoint(
     use std::io::Write;
     std::io::stdout().flush().ok();
 
-    // Flush mode: seal the active MemTable to a persistent on-disk generation
+    // Flush mode: freeze the active MemTable to a persistent on-disk generation
     // (single-partition IVF_HNSW_SQ at the base dataset's storage version) and
     // print its dataset path. Validates we can flush cp=100k/500k/1M.
     if let Some(dir) = &local_dir {
-        let seal_start = Instant::now();
-        writer.force_seal_active().await?;
+        let freeze_start = Instant::now();
+        writer.force_freeze_active().await?;
         let mut waited = 0u64;
         let gen_path = loop {
             if let Some(m) = writer.manifest().await?
@@ -473,7 +474,7 @@ async fn run_checkpoint(
             "SSTABLE_OK cp={} id_offset={} flush_s={:.2} path={}",
             cp,
             id_offset,
-            seal_start.elapsed().as_secs_f64(),
+            freeze_start.elapsed().as_secs_f64(),
             gen_path
         );
         std::io::stdout().flush().ok();

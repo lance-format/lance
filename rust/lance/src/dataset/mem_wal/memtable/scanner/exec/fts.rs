@@ -12,8 +12,11 @@ use arrow_array::{BooleanArray, Float32Array, RecordBatch, UInt32Array, UInt64Ar
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -28,12 +31,13 @@ use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
 use super::super::builder::FtsQuery;
 use super::{newest_pk_positions, scan_record_batch};
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsEntry, FtsMemQuery, MemMatches, SearchContext, SearchOptions, search_cross_column,
 };
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Score column name in output.
 pub const SCORE_COLUMN: &str = "_score";
@@ -683,6 +687,13 @@ impl ExecutionPlan for FtsIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        apply_expression_roots(&self.filter, f)
     }
 
     fn with_new_children(

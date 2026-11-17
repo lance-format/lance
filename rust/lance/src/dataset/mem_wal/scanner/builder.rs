@@ -33,6 +33,7 @@ use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
+use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -48,9 +49,8 @@ struct LsmVectorQuery {
     k: usize,
     /// IVF partition probe bounds for indexed arms.
     probe_bounds: ProbeBounds,
-    /// Re-rank base candidates with exact distances when set (refine factor is
-    /// treated as a boolean; the LSM merge needs exact base distances).
-    refine: bool,
+    /// Refine factor for the base and SSTable arms; `None` leaves them unrefined.
+    refine_factor: Option<u32>,
     /// Distance metric; `None` defaults to L2 (matching the unindexed memtable arm).
     metric_type: Option<DistanceType>,
 }
@@ -206,6 +206,8 @@ pub struct LsmScanner {
     /// In-memory memtables by shard (active + frozen-awaiting-flush), so
     /// the scanner path carries frozen-undrained generations too.
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// The MemWAL's `dir_id`, handed to the collector.
+    mem_wal_dir_id: String,
 
     // Query configuration
     projection: Option<Vec<String>>,
@@ -273,6 +275,7 @@ impl LsmScanner {
             schema: Arc::new(arrow_schema),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            mem_wal_dir_id: String::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -295,7 +298,7 @@ impl LsmScanner {
     /// SSTables) without including a base Lance table.
     ///
     /// This is useful when the caller owns the base read path separately and
-    /// only needs the WAL's contribution: active memtable ∪ L0 SSTables.
+    /// only needs the WAL's contribution: active memtable ∪ SSTables.
     /// Deduplication semantics are unchanged — newer generations
     /// still win on PK conflicts.
     ///
@@ -320,6 +323,7 @@ impl LsmScanner {
             schema,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            mem_wal_dir_id: String::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -354,7 +358,7 @@ impl LsmScanner {
         self
     }
 
-    /// Supply [`Self::schema`] with each field's id, so a sealed generation's
+    /// Supply [`Self::schema`] with each field's id, so a flushed generation's
     /// columns resolve to the table's by id rather than by name. A rename keeps
     /// the id and moves the name, so without this a renamed column reads as
     /// absent. Built with
@@ -376,6 +380,13 @@ impl LsmScanner {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Set the MemWAL `dir_id` the snapshots' SSTables live under. See
+    /// [`LsmDataSourceCollector::with_mem_wal_dir_id`].
+    pub fn with_mem_wal_dir_id(mut self, dir_id: impl Into<String>) -> Self {
+        self.mem_wal_dir_id = dir_id.into();
         self
     }
 
@@ -503,7 +514,7 @@ impl LsmScanner {
             key: key.slice(0, key.len()),
             k,
             probe_bounds: ProbeBounds::default(),
-            refine: false,
+            refine_factor: None,
             metric_type: None,
         });
         Ok(self)
@@ -541,12 +552,11 @@ impl LsmScanner {
         self
     }
 
-    /// Re-rank base-table candidates with exact distances so they are directly
-    /// comparable to the exact memtable distances in the cross-source merge.
-    /// The factor is treated as a boolean today. No-op unless `nearest` was set.
+    /// Re-rank base and SSTable candidates by exact distance over `refine_factor`
+    /// times as many. `0` clears it; no-op unless `nearest` was set.
     pub fn refine(mut self, refine_factor: u32) -> Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.refine = refine_factor > 0;
+            q.refine_factor = (refine_factor > 0).then_some(refine_factor);
         }
         self
     }
@@ -612,7 +622,7 @@ impl LsmScanner {
         if self.full_text_query.is_some() {
             return self.plan_fts().await;
         }
-        self.plan_scan().await
+        self.plan_scan(self.projection.as_deref()).await
     }
 
     /// Apply the builder's `limit`/`offset` on top of a search plan. The plain
@@ -646,7 +656,8 @@ impl LsmScanner {
             distance_type,
         )
         .with_identity_schema(Arc::clone(&self.identity_schema))
-        .with_filter(self.filter.clone());
+        .with_filter(self.filter.clone())
+        .with_refine_factor(nearest.refine_factor);
         if let BaseSource::Table(dataset) = &self.base {
             planner = planner.with_dataset(dataset.clone());
         }
@@ -673,7 +684,7 @@ impl LsmScanner {
                 per_source_k,
                 nearest.probe_bounds,
                 self.projection.as_deref(),
-                nearest.refine,
+                false,
                 overfetch_factor,
             )
             .await?;
@@ -737,7 +748,11 @@ impl LsmScanner {
     }
 
     /// Plain (filter / projection / limit) scan over base ∪ SSTables ∪ in-memory.
-    async fn plan_scan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    ///
+    /// `projection` is what the plan returns: the caller's projection, or an
+    /// empty one for `count_rows`. Validation and routing follow the caller's
+    /// projection either way.
+    async fn plan_scan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
         validate_projection_names(self.projection.as_deref(), &base_schema, &[])?;
@@ -773,9 +788,7 @@ impl LsmScanner {
             if let Some(warmer) = &self.warmer {
                 planner = planner.with_warmer(warmer.clone());
             }
-            let plan = planner
-                .plan_point_lookup(&keys, self.projection.as_deref())
-                .await?;
+            let plan = planner.plan_point_lookup(&keys, projection).await?;
             return Ok(match self.limit {
                 Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),
                 None => plan,
@@ -804,7 +817,7 @@ impl LsmScanner {
 
         planner
             .plan_scan(
-                self.projection.as_deref(),
+                projection,
                 self.filter.as_ref(),
                 self.limit,
                 self.offset,
@@ -828,8 +841,22 @@ impl LsmScanner {
     }
 
     /// Execute the scan and return a stream of record batches.
+    ///
+    /// Lance JSON columns are returned as Arrow JSON, as
+    /// [`crate::dataset::scanner::Scanner::try_into_stream`] does.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
+        let stream = self.execute_plan().await?;
+        Ok(SchemaAdapter::new(stream.schema()).to_logical_stream(stream))
+    }
+
+    /// Execute the scan without converting Lance JSON columns to Arrow JSON.
+    async fn execute_plan(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
+        Self::execute_created_plan(plan)
+    }
+
+    /// Run an already-built plan as a record batch stream.
+    fn execute_created_plan(plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchStream> {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         plan.execute(0, task_ctx)
@@ -856,13 +883,21 @@ impl LsmScanner {
 
     /// Count the number of rows that match the query.
     pub async fn count_rows(&self) -> Result<u64> {
-        let stream = self.try_into_stream().await?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
+        // Counting needs no JSON conversion, so skip decoding the values. A
+        // plain scan needs none of the projected columns either, so it reads
+        // only the key and filter columns instead of a possibly wide
+        // projection. Searches keep their own plan.
+        let plan = if self.nearest.is_some() || self.full_text_query.is_some() {
+            self.create_plan().await?
+        } else {
+            self.plan_scan(Some(&[])).await?
+        };
+        Self::execute_created_plan(plan)?
+            .try_fold(0u64, |count, batch| async move {
+                Ok(count + batch.num_rows() as u64)
+            })
             .await
-            .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))?;
-
-        Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
+            .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))
     }
 
     /// Test which `pks` have been (re)written in the WAL fresh tier — the active
@@ -943,7 +978,8 @@ impl LsmScanner {
                 path.clone(),
                 self.shard_snapshots.clone(),
             ),
-        };
+        }
+        .with_mem_wal_dir_id(self.mem_wal_dir_id.clone());
 
         for (shard_id, mems) in &self.in_memory_memtables {
             collector = collector.with_in_memory_memtables(*shard_id, mems.clone());
@@ -986,7 +1022,8 @@ mod tests {
     use arrow_schema::{Field, Fields};
     use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity, InvertedIndexParams};
 
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::index::IndexStore;
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
     #[test]
     fn test_lsm_scanner_builder() {
@@ -1037,7 +1074,8 @@ mod tests {
 
     #[test]
     fn test_in_memory_memtable_ref() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
         let batch_store = Arc::new(BatchStore::with_capacity(100));
         let index_store = Arc::new(IndexStore::new());
@@ -1068,7 +1106,8 @@ mod tests {
     /// An active/frozen memtable holding `ids` at `generation`, with a single
     /// batch and a maintained primary-key index on `id`.
     fn mk_pk_memtable(ids: &[i32], generation: u64) -> InMemoryMemTableRef {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         let store = BatchStore::with_capacity(8);
         let mut index = IndexStore::new();
         index.enable_pk_index(&[("id".to_string(), 0)]);
@@ -1198,6 +1237,141 @@ mod tests {
             err.to_string().contains("missing"),
             "unexpected missing-column point lookup error: {err}"
         );
+    }
+
+    /// `count_rows` needs only PK rows, never payload: counting a projection
+    /// that names a wide `vector` column must not decode that column's pages.
+    /// Asserted via the base store's IO stats — the bytes read while counting
+    /// must be a small fraction of the vector payload.
+    #[tokio::test]
+    async fn count_rows_skips_projected_payload_reads() {
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Int32Array, RecordBatchIterator};
+        use arrow_schema::{DataType, Field};
+
+        const ROWS: i32 = 512;
+        const DIM: i32 = 1024;
+        let vector_payload_bytes = ROWS as u64 * DIM as u64 * 4;
+
+        let schema = pk_schema_with(Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            false,
+        ));
+        let ids: Vec<i32> = (0..ROWS).collect();
+        let mut vb = FixedSizeListBuilder::with_capacity(
+            Float32Builder::with_capacity((ROWS * DIM) as usize),
+            DIM,
+            ROWS as usize,
+        );
+        for id in &ids {
+            for d in 0..DIM {
+                // Noisy values so page compression cannot shrink the payload
+                // enough to blur the read-bytes signal.
+                vb.values()
+                    .append_value((id * 7919 + d * 104729).rem_euclid(65521) as f32 / 65521.0);
+            }
+            vb.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let base = Arc::new(
+            Dataset::write(reader, &uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .project(&["vector"])
+            .unwrap();
+        let _ = base.object_store.io_stats_incremental(); // reset
+        let count = scanner.count_rows().await.unwrap();
+        let stats = base.object_store.io_stats_incremental();
+
+        assert_eq!(count, ROWS as u64, "count must match the base row count");
+        assert!(
+            stats.read_bytes * 8 < vector_payload_bytes,
+            "count_rows read {} bytes for a {} byte vector payload; \
+             counting must not decode the projected column",
+            stats.read_bytes,
+            vector_payload_bytes,
+        );
+    }
+
+    /// The count plans with an empty projection but still validates the
+    /// caller's; an unknown column must fail as the scan path does.
+    #[tokio::test]
+    async fn count_rows_rejects_unknown_projection_column() {
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .project(&["missing"])
+        .unwrap();
+
+        let Err(err) = scanner.count_rows().await else {
+            panic!("unknown projection column should fail counting");
+        };
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column count error: {err}"
+        );
+    }
+
+    /// The count must stay correct when the filter names a column outside the
+    /// count's (empty) projection: each source scan resolves filter columns
+    /// itself, so only the count, not the predicate, must survive the
+    /// projection override. `limit` continues to cap the counted rows.
+    #[tokio::test]
+    async fn count_rows_honors_filter_and_limit() {
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::{Int32Array, Int64Array, RecordBatchIterator};
+        use arrow_schema::{DataType, Field};
+
+        let schema = pk_schema_with(Field::new("value", DataType::Int64, true));
+        let ids: Vec<i32> = (0..10).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int64Array::from(vec![9i64, 8, 7, 6, 5, 4, 3, 2, 1, 0])),
+            ],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let base = Arc::new(
+            Dataset::write(reader, &uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let filtered = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .project(&["value"])
+            .unwrap()
+            .filter("value >= 3")
+            .unwrap();
+        assert_eq!(filtered.count_rows().await.unwrap(), 7);
+
+        let limited = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .project(&["value"])
+            .unwrap()
+            .filter("value >= 3")
+            .unwrap()
+            .limit(Some(5), None)
+            .unwrap();
+        assert_eq!(limited.count_rows().await.unwrap(), 5);
     }
 
     #[tokio::test]
@@ -1365,7 +1539,8 @@ mod tests {
     /// `vector_dim`) and surface the in-memory match.
     #[tokio::test]
     async fn nearest_dispatches_through_facade() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::{Dataset, WriteParams};
         use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
         use arrow_array::{Float32Array, Int32Array, RecordBatchIterator};
@@ -1878,7 +2053,8 @@ mod tests {
     /// FTS planner and surface a memtable-only match.
     #[tokio::test]
     async fn full_text_search_dispatches_through_facade() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::{Dataset, WriteParams};
         use crate::index::DatasetIndexExt;
         use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
@@ -1966,7 +2142,8 @@ mod tests {
     /// expands to the multi-match the cross-column planner decomposes.
     #[tokio::test]
     async fn full_text_search_spans_every_named_column() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use arrow_array::{Int32Array, StringArray};
         use arrow_schema::{DataType, Field, Schema};
 
@@ -2182,12 +2359,13 @@ mod tests {
 
     /// One active memtable with a maintained BTree on `id`, all rows visible.
     fn mk_indexed_memtable(schema: &SchemaRef, ids: &[i32], names: &[&str]) -> InMemoryMemTableRef {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use arrow_array::{Int32Array, StringArray};
 
         let store = BatchStore::with_capacity(8);
         let index = IndexStore::from_specs(
-            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+            &[crate::dataset::mem_wal::index::MemIndexSpec::btree(
                 "id_idx", 0, "id",
             )],
             &lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),

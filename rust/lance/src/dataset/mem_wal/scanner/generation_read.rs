@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Reading a sealed generation under the table's current schema.
+//! Reading a flushed generation under the table's current schema.
 //!
-//! A sealed generation is a Lance dataset of its own, written under whatever
+//! A flushed generation is a Lance dataset of its own, written under whatever
 //! the table's schema was at the time. The names it stores are therefore its
-//! own: a rename since the seal moved the table's name and left the file
+//! own: a rename since the freeze moved the table's name and left the file
 //! holding the old one, and only field ids relate the two. Every read path —
 //! scan, point lookup, vector search, full-text search — goes through
 //! [`GenerationRead`] so they resolve a generation the same way.
@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::context::ExecutionProps;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
@@ -30,7 +31,7 @@ use super::projection::{is_auto_managed, resolve_data_fields_or_drop};
 use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_id};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
-/// One sealed generation, read under the table's schema.
+/// One flushed generation, read under the table's schema.
 ///
 /// Answers what to project ([`Self::stored_projection`]), whether a predicate
 /// can be pushed down and under which names ([`Self::to_stored`]), and how to
@@ -397,8 +398,13 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
     let df_schema = DFSchema::try_from(schema.as_ref().clone())
         .map_err(|e| Error::internal(format!("build a filter schema for `{expr}`: {e}")))?;
     let props = ExecutionProps::new();
-    let physical = create_physical_expr(expr, &df_schema, &props)
-        .map_err(|e| Error::internal(format!("plan filter `{expr}`: {e}")))?;
+    let physical = create_physical_expr(
+        expr,
+        &df_schema,
+        &props,
+        &PhysicalPlanningContext::default(),
+    )
+    .map_err(|e| Error::internal(format!("plan filter `{expr}`: {e}")))?;
     Ok(Arc::new(
         FilterExec::try_new(physical, plan).map_err(|e| Error::internal(format!("filter: {e}")))?,
     ))
@@ -611,7 +617,7 @@ mod tests {
         )
     }
 
-    /// The generation was sealed as `value`; the table has since renamed it.
+    /// The generation was frozen as `value`; the table has since renamed it.
     fn renamed() -> GenerationRead {
         generation(
             schema(vec![
@@ -678,7 +684,7 @@ mod tests {
     #[test]
     fn a_field_id_taken_back_after_a_drop_is_read_as_the_column_that_took_it() {
         let read = generation(
-            // Sealed while id 1 was `retired`.
+            // Frozen while id 1 was `retired`.
             schema(vec![
                 with_id("id", DataType::Int64, 0),
                 with_id("retired", DataType::Int64, 1),
