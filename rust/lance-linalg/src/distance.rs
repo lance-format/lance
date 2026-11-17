@@ -694,7 +694,7 @@ mod tests {
     /// Cosine multivector distances equal the per-pair `cosine_distance` reference
     /// exactly, with query sub-vectors of different norms.
     #[rstest::rstest]
-    fn test_multivec_cosine_matches_pairwise(
+    fn test_multivec_distance_cosine_matches_pairwise(
         #[values(DataType::Float16, DataType::Float32, DataType::Float64)] dtype: DataType,
     ) {
         fn reference<T: Cosine>(query: &[T], rows: &[&[T]], dim: usize) -> Vec<f32> {
