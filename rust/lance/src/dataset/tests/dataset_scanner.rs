@@ -2352,3 +2352,59 @@ async fn test_lambda_filter_rejects_unsupported_forms(#[case] filter: &str, #[ca
         .unwrap_err();
     assert!(err.to_string().contains(reason), "{err}");
 }
+
+/// A fragment-scoped flat (unindexed) full-text search with a scoped BTree
+/// scalar-index prefilter combines through `PrefilterUnionExec`, whose output
+/// is row-id domain. The flat FTS node (`FlatMatchQueryExec`) must recognize
+/// that and skip re-converting it, or it misreads stable row ids as physical
+/// offsets and fails a live fragment.
+#[tokio::test]
+async fn test_stable_flat_fts_scoped_scalar_prefilter() {
+    let batch = record_batch!(
+        ("id", Int32, (0..9).collect::<Vec<_>>()),
+        ("text", Utf8, vec!["token"; 9])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = FullTextSearchQuery::new("token".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let mut baseline = dataset.scan();
+    baseline
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .use_scalar_index(false)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    baseline.full_text_search(query.clone()).unwrap();
+    assert_eq!(baseline.try_into_batch().await.unwrap().num_rows(), 3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .prefilter(true)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    scanner.full_text_search(query).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
+}

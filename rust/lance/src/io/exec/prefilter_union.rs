@@ -22,11 +22,14 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, utils::address::RowAddress};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrTreeMap, result::IndexExprResultWireFormat,
+    IndexExprResult, MaskDomain, RowAddrMask, RowAddrTreeMap, result::IndexExprResultWireFormat,
 };
 use roaring::RoaringBitmap;
 
-use super::utils::{FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter};
+use super::{
+    scalar_index::finalize_to_row_ids,
+    utils::{FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter},
+};
 use crate::{Dataset, index::prefilter::DatasetPreFilter};
 
 /// Bound an exact scalar mask to its current fragment membership and union it
@@ -51,11 +54,14 @@ pub struct PrefilterUnionExec {
 impl PrefilterUnionExec {
     /// Construct a scoped mask source, coalescing each input to one partition.
     ///
-    /// `scalar` must emit one exact [`IndexExprResult`] batch in `format`.
+    /// `scalar` must emit one exact [`IndexExprResult`] batch in `format` —
+    /// always row-address domain on the wire (a `ScalarIndexExec`'s output
+    /// contract), converted to row-id domain internally before combining, to
+    /// match `missing` and this node's own `_rowid`-domain output contract.
     /// `missing`, when present, emits `_rowid` values from the remaining evaluated
     /// fragments. `scope` bounds the scalar mask; `coverage` records every
-    /// evaluated fragment, including the missing branch. Both children must use
-    /// the dataset's `_rowid` domain and the same immutable dataset snapshot.
+    /// evaluated fragment, including the missing branch. Both children use
+    /// the same immutable dataset snapshot.
     /// Child order for codecs is scalar first, followed by the optional row-ID input.
     /// An empty `scope` removes all scalar matches: without `missing` the result
     /// is an exact empty mask; with `missing` its row-ID matches are retained.
@@ -151,6 +157,18 @@ impl PrefilterUnionExec {
             // Stable IDs must be selected by their current fragment membership.
             return DatasetPreFilter::do_create_deletion_mask_row_id(dataset, Some(scope)).await;
         }
+        Ok(Arc::new(RowAddrMask::from_allowed(
+            Self::fragment_address_range(&dataset, &scope)?,
+        )))
+    }
+
+    /// The physical row addresses of `scope`'s fragments, as a treemap —
+    /// the address-domain shape of a fragment restriction, usable to trim an
+    /// address-domain mask before a reverse (address -> id) conversion.
+    fn fragment_address_range(
+        dataset: &Dataset,
+        scope: &RoaringBitmap,
+    ) -> lance_core::Result<RowAddrTreeMap> {
         let mut addresses = RowAddrTreeMap::new();
         for fragment in dataset
             .manifest()
@@ -170,7 +188,7 @@ impl PrefilterUnionExec {
             )))?;
             addresses.insert_range(start..start + u64::from(rows));
         }
-        Ok(Arc::new(RowAddrMask::from_allowed(addresses)))
+        Ok(addresses)
     }
 }
 
@@ -249,6 +267,8 @@ impl ExecutionPlan for PrefilterUnionExec {
         let coverage = self.coverage.clone();
         let format = self.format;
         let metrics = self.metrics.clone();
+        let dataset = self.dataset.clone();
+        let scope = self.scope.clone();
         let future = async move {
             let scalar_future = async {
                 let batch = scalar.try_next().await?.ok_or_else(|| {
@@ -272,6 +292,22 @@ impl ExecutionPlan for PrefilterUnionExec {
                         "PrefilterUnionExec scalar child emitted more than one mask batch",
                     ));
                 }
+                // Restrict to this scope's physical addresses before the reverse
+                // (address -> id) conversion below, which is a per-fragment
+                // row-id-sequence load: a shared index segment can list matches
+                // outside `scope`, and converting those would do real I/O whose
+                // result the later `& selection` step discards anyway.
+                let scope_addresses = Self::fragment_address_range(&dataset, &scope)?;
+                let restricted = match result.upper {
+                    RowAddrMask::AllowList(set) => RowAddrMask::AllowList(set & scope_addresses),
+                    RowAddrMask::BlockList(set) => RowAddrMask::BlockList(set & scope_addresses),
+                };
+                // The scalar child (a `ScalarIndexExec`) is always row-address
+                // domain on the wire; this node's own output, and the `missing`
+                // branch below, are pinned to the dataset's row-id domain (see
+                // the struct doc), so convert once here before combining.
+                let result =
+                    finalize_to_row_ids(&dataset, IndexExprResult::exact(restricted)).await?;
                 Ok(result.upper)
             };
             let missing_future = async {
@@ -296,7 +332,13 @@ impl ExecutionPlan for PrefilterUnionExec {
                 // A complement needs the scope's allow-list to become a finite selection.
                 RowAddrMask::BlockList(_) => scalar & selection.as_ref().clone(),
             };
+            // The wire format carries no domain bit and this is serialized
+            // immediately below (the in-memory `IndexExprResult` and its
+            // domain tag never escape this function), but tag it accurately
+            // for any future in-memory use: `scalar`/`missing` were both
+            // brought into row-id domain above.
             IndexExprResult::exact(scalar | missing)
+                .with_domain(MaskDomain::RowId)
                 .serialize(&coverage, format)
                 .map_err(DataFusionError::from)
         };
@@ -503,5 +545,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A shared index segment can list matches outside the requested scope
+    /// (e.g. it covers more fragments than this node was asked to restrict
+    /// to). The reverse (address -> id) conversion must restrict to the
+    /// scope's physical addresses first, or it pays per-fragment row-id-
+    /// sequence/deletion-vector I/O for fragments the result discards anyway.
+    #[tokio::test]
+    async fn scoped_union_reads_only_scoped_deletions() {
+        use crate::dataset::ReadParams;
+        use crate::dataset::builder::DatasetBuilder;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::utils::tracking_store::IOTracker;
+        use lance_table::io::deletion::relative_deletion_file_path;
+
+        let tmp = TempStrDir::default();
+        let path = tmp.as_str();
+        let prefix = if path.starts_with('/') { "" } else { "/" };
+        let uri = format!("file-object-store://{prefix}{path}");
+        let batch = record_batch!(("id", Int64, (0..12).collect::<Vec<_>>())).unwrap();
+        let mut dataset = crate::Dataset::write(
+            arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (0, 5, 9)").await.unwrap();
+
+        let io = Arc::new(IOTracker::default());
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(&uri)
+                .with_read_params(ReadParams {
+                    store_options: Some(ObjectStoreParams {
+                        object_store_wrapper: Some(io.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .load()
+                .await
+                .unwrap(),
+        );
+        let fragment = &dataset.fragments()[1];
+        let allowed_deletion =
+            relative_deletion_file_path(fragment.id, fragment.deletion_file.as_ref().unwrap());
+
+        // The scalar mask models a shared index segment: it lists matches
+        // across every fragment, not just the ones in `scope` below.
+        let addresses = (0..3u32).flat_map(|fragment_id| {
+            (0..4u32).map(move |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+        });
+        let format = IndexExprResultWireFormat::TwoMask;
+        let scope: RoaringBitmap = [1].into_iter().collect();
+        let mask = IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            addresses,
+        )))
+        .serialize(&scope, format)
+        .unwrap();
+        let scalar =
+            MemorySourceConfig::try_new_exec(&[vec![mask]], format.schema().clone(), None).unwrap();
+        let union = Arc::new(PrefilterUnionExec::new(
+            dataset,
+            scalar,
+            None,
+            scope.clone(),
+            scope,
+            format,
+        ));
+
+        io.incremental_stats();
+        let batches = union
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let (result, _) = IndexExprResult::deserialize(&batches[0]).unwrap();
+        // Fragment 1 (rows 4..8, with id=5 deleted) is the only fragment in
+        // scope, so only its live stable ids survive.
+        assert_eq!(
+            result.upper,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([4, 6, 7]))
+        );
+
+        let reads = io.incremental_stats();
+        let deletion_reads = reads
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/_deletions/"))
+            .collect::<Vec<_>>();
+        assert!(!deletion_reads.is_empty());
+        assert!(
+            deletion_reads
+                .iter()
+                .all(|request| request.path.as_ref().ends_with(allowed_deletion.as_str())),
+            "scoped union read another fragment's deletion file: {deletion_reads:?}"
+        );
     }
 }
