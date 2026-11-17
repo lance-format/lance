@@ -40,7 +40,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use regex_syntax::hir::{Class, Hir, HirKind};
 use roaring::RoaringTreemap;
 
-use super::{NGRAM_N, NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
+use super::{NGRAM_N, NGRAM_TOKENIZER, ngram_to_token, token_to_ngram, tokenize_visitor};
 
 /// Maximum number of strings kept in an `exact` / `prefix` / `suffix` set before
 /// it is folded into the trigram condition and dropped.
@@ -108,6 +108,27 @@ impl TrigramQuery {
             1 => flat.pop().unwrap(),
             _ => Self::Or(flat),
         }
+    }
+}
+
+/// Spelled the way a plan shows it: `(rhi AND (hor OR nos))`.
+impl std::fmt::Display for TrigramQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (items, separator) = match self {
+            Self::All => return f.write_str("ALL"),
+            Self::None => return f.write_str("NONE"),
+            Self::Trigram(token) => return f.write_str(&token_to_ngram(*token, NGRAM_N)),
+            Self::And(items) => (items, " AND "),
+            Self::Or(items) => (items, " OR "),
+        };
+        f.write_str("(")?;
+        for (idx, item) in items.iter().enumerate() {
+            if idx > 0 {
+                f.write_str(separator)?;
+            }
+            item.fmt(f)?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -510,6 +531,8 @@ pub fn eval_trigram_query(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// A single trigram condition, hashed the same way the index hashes it.
@@ -651,6 +674,17 @@ mod tests {
             eval_trigram_query(&or_missing, &bitmaps),
             RoaringTreemap::from_iter([1u64, 2, 3])
         );
+    }
+
+    #[rstest]
+    #[case("foo", "foo")]
+    #[case(
+        "rhino.*(horn|nose)",
+        "(hin AND ino AND rhi AND ((hor AND orn) OR (nos AND ose)))"
+    )]
+    #[case("a.b", "ALL")]
+    fn test_display(#[case] pattern: &str, #[case] expected: &str) {
+        assert_eq!(q(pattern).to_string(), expected);
     }
 
     #[test]
