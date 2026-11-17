@@ -18,9 +18,9 @@
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeapMemory {
-    /// Bytes allocated by the process and not freed yet.
+    /// Bytes the allocator reports as in use, including freed blocks in glibc tcache.
     pub in_use_bytes: u64,
-    /// Bytes freed by the process but retained by the allocator.
+    /// Bytes the allocator reports as free and retains, excluding glibc tcache.
     pub free_bytes: u64,
 }
 
@@ -38,10 +38,11 @@ pub type HeapProvider = fn() -> Option<HeapMemory>;
 ///
 /// Returns `None` outside GNU/Linux and on glibc versions before 2.33, where
 /// `mallinfo2` is unavailable. The symbol is resolved at runtime so binaries
-/// built for older glibc versions retain their existing compatibility. Live
+/// built for older glibc versions retain their existing compatibility. In-use
 /// bytes include both arena allocations (`uordblks`) and mmap-backed
 /// allocations (`hblkhd`); free bytes are those retained in arenas
-/// (`fordblks`).
+/// (`fordblks`). Freed blocks in glibc's per-thread cache (tcache) can remain
+/// counted as in use, so free bytes do not cover all allocator retention.
 ///
 /// This function locks allocator arenas while glibc collects their statistics.
 /// Use it from metric collection, not a memory sampler or an operation's hot
@@ -125,6 +126,9 @@ mod glibc {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
     use super::*;
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -161,6 +165,23 @@ mod tests {
     #[test]
     fn test_glibc_lookup_reports_missing_symbols() {
         assert!(glibc::lookup(c"lance_missing_mallinfo2_symbol").is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn test_glibc_lookup_caches_missing_symbol() {
+        static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+
+        fn missing_symbol(symbol: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+            assert_eq!(symbol, c"mallinfo2");
+            LOOKUPS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+
+        let cache = AtomicPtr::new(std::ptr::null_mut());
+        assert_eq!(glibc::read_with_lookup(&cache, missing_symbol), None);
+        assert_eq!(glibc::read_with_lookup(&cache, missing_symbol), None);
+        assert_eq!(LOOKUPS.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

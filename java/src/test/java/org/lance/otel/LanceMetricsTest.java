@@ -191,10 +191,23 @@ public class LanceMetricsTest {
 
         LanceMetrics.setMemoryObservation(true);
         assertTrue(memoryGauge("lance_memory_rss_bytes") > 0);
+        Map<String, MetricData> exported =
+            reader.collectAllMetrics().stream()
+                .collect(Collectors.toMap(MetricData::getName, Function.identity()));
         if (hasMallinfo2()) {
+          Collection<DoublePointData> inUsePoints =
+              exported.get(MEMORY_HEAP_IN_USE).getDoubleGaugeData().getPoints();
+          Collection<DoublePointData> freePoints =
+              exported.get(MEMORY_HEAP_FREE).getDoubleGaugeData().getPoints();
+          assertEquals(1, inUsePoints.size());
+          assertTrue(inUsePoints.iterator().next().getValue() > 0);
+          assertEquals(1, freePoints.size());
+          assertTrue(freePoints.iterator().next().getValue() >= 0);
           assertTrue(memoryGauge(MEMORY_HEAP_IN_USE) > 0);
           assertTrue(memoryGauge(MEMORY_HEAP_FREE) >= 0);
         } else {
+          assertFalse(exported.containsKey(MEMORY_HEAP_IN_USE));
+          assertFalse(exported.containsKey(MEMORY_HEAP_FREE));
           assertTrue(
               LanceMetrics.snapshot().stream()
                   .noneMatch(

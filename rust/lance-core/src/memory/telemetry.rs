@@ -26,9 +26,9 @@ pub const METRIC_OPERATION_PEAK: &str = "lance_memory_operation_peak_bytes";
 pub const METRIC_IVF_PARTITION_BACKING: &str = "lance_ivf_partition_backing_bytes";
 /// Bytes that Lance components hold right now, labelled by `component`.
 pub const METRIC_COMPONENT: &str = "lance_memory_component_bytes";
-/// Bytes allocated by the process's allocator and not freed yet.
+/// Bytes the allocator reports as in use, including freed blocks in glibc tcache.
 pub const METRIC_HEAP_IN_USE: &str = "lance_memory_heap_in_use_bytes";
-/// Bytes freed by the process but retained by its allocator.
+/// Bytes the allocator reports as free and retains, excluding glibc tcache.
 pub const METRIC_HEAP_FREE: &str = "lance_memory_heap_free_bytes";
 
 const MIB: f64 = 1024.0 * 1024.0;
@@ -110,12 +110,12 @@ pub fn describe_metrics() {
         metrics::describe_gauge!(
             METRIC_HEAP_IN_USE,
             Bytes,
-            "Bytes allocated by the process's allocator and not freed yet."
+            "Bytes the allocator reports as in use, including freed blocks in glibc tcache."
         );
         metrics::describe_gauge!(
             METRIC_HEAP_FREE,
             Bytes,
-            "Bytes freed by the process but retained by its allocator."
+            "Bytes the allocator reports as free and retains, excluding glibc tcache."
         );
     }
 }

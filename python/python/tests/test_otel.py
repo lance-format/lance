@@ -104,6 +104,7 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
 
 
 _OBSERVED_BUILD = """
+import ctypes
 import sys
 
 import lance
@@ -124,6 +125,14 @@ for resource_metrics in reader.get_metrics_data().resource_metrics:
             points[metric.name] = list(metric.data.data_points)
 
 assert points["lance_memory_rss_bytes"][0].value > 0
+heap_in_use = points.get("lance_memory_heap_in_use_bytes", [])
+heap_free = points.get("lance_memory_heap_free_bytes", [])
+if hasattr(ctypes.CDLL(None), "mallinfo2"):
+    assert len(heap_in_use) == 1 and heap_in_use[0].value > 0, heap_in_use
+    assert len(heap_free) == 1 and heap_free[0].value >= 0, heap_free
+else:
+    assert not heap_in_use, heap_in_use
+    assert not heap_free, heap_free
 build = {"operation": "create_index", "index_type": "btree"}
 builds = [
     point.value
@@ -361,6 +370,7 @@ assert heap_refreshes == 4, (heap_refreshes, snapshots)
 
 
 def test_otel_collection_bounds_heap_refreshes():
+    pytest.importorskip("opentelemetry.sdk.metrics")
     result = subprocess.run(
         [sys.executable, "-c", _BOUNDED_HEAP_REFRESHES],
         capture_output=True,
