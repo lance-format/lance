@@ -237,7 +237,10 @@ impl DirectoryNamespaceBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `root` property is missing.
+    /// Returns an error if:
+    /// - The `root` property is missing
+    /// - A typed property (e.g. `manifest_enabled`, `commit_retries`) is present
+    ///   but its value cannot be parsed as the expected type
     ///
     /// # Examples
     ///
@@ -283,35 +286,30 @@ impl DirectoryNamespaceBuilder {
             Some(storage_options)
         };
 
+        // Typed properties must parse when present; absent keys keep their
+        // documented defaults. Rejecting present-but-unparsable values keeps
+        // a typo like "not-a-bool" from silently flipping a knob back to its default.
         // Extract manifest_enabled (default: true)
-        let manifest_enabled = properties
-            .get("manifest_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+        let manifest_enabled = Self::parse_bool_property(&properties, "manifest_enabled", true)?;
 
         // Extract dir_listing_enabled (default: true)
-        let dir_listing_enabled = properties
-            .get("dir_listing_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+        let dir_listing_enabled =
+            Self::parse_bool_property(&properties, "dir_listing_enabled", true)?;
 
         // Extract inline_optimization_enabled (default: false)
-        let inline_optimization_enabled = properties
-            .get("inline_optimization_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let inline_optimization_enabled =
+            Self::parse_bool_property(&properties, "inline_optimization_enabled", false)?;
 
         // Extract table_version_tracking_enabled (default: false)
-        let table_version_tracking_enabled = properties
-            .get("table_version_tracking_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let table_version_tracking_enabled =
+            Self::parse_bool_property(&properties, "table_version_tracking_enabled", false)?;
 
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
-        let dir_listing_to_manifest_migration_enabled = properties
-            .get("dir_listing_to_manifest_migration_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let dir_listing_to_manifest_migration_enabled = Self::parse_bool_property(
+            &properties,
+            "dir_listing_to_manifest_migration_enabled",
+            false,
+        )?;
 
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
         // The prefix is stripped to get short property names
@@ -324,26 +322,27 @@ impl DirectoryNamespaceBuilder {
             })
             .collect();
 
-        let commit_retries = properties
-            .get("commit_retries")
-            .and_then(|v| v.parse::<u32>().ok());
+        let commit_retries: Option<u32> = Self::parse_optional_property(
+            &properties,
+            "commit_retries",
+            "a non-negative integer number of retries",
+        )?;
 
         // Extract vend_input_storage_options (default: false)
-        let vend_input_storage_options = properties
-            .get("vend_input_storage_options")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let vend_input_storage_options =
+            Self::parse_bool_property(&properties, "vend_input_storage_options", false)?;
 
         // Extract vend_input_storage_options_refresh_interval_millis (optional)
-        let vend_input_storage_options_refresh_interval_millis = properties
-            .get("vend_input_storage_options_refresh_interval_millis")
-            .and_then(|v| v.parse::<u64>().ok());
+        let vend_input_storage_options_refresh_interval_millis: Option<u64> =
+            Self::parse_optional_property(
+                &properties,
+                "vend_input_storage_options_refresh_interval_millis",
+                "a non-negative integer number of milliseconds",
+            )?;
 
         // Extract ops_metrics_enabled (default: false)
-        let ops_metrics_enabled = properties
-            .get("ops_metrics_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let ops_metrics_enabled =
+            Self::parse_bool_property(&properties, "ops_metrics_enabled", false)?;
 
         Ok(Self {
             root: root.trim_end_matches('/').to_string(),
@@ -361,6 +360,53 @@ impl DirectoryNamespaceBuilder {
             vend_input_storage_options_refresh_interval_millis,
             ops_metrics_enabled,
         })
+    }
+
+    /// Parse a boolean property, falling back to `default` when the key is absent.
+    ///
+    /// A present value that [`str_to_bool`] cannot parse is rejected so typos
+    /// do not silently re-enable or disable a knob.
+    fn parse_bool_property(
+        properties: &HashMap<String, String>,
+        key: &str,
+        default: bool,
+    ) -> Result<bool> {
+        match properties.get(key) {
+            Some(value) => str_to_bool(value).ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid value '{value}' for property '{key}', expected a boolean \
+                         (true/false/1/0/on/off/yes/no, case-insensitive)"
+                    ),
+                })
+            }),
+            None => Ok(default),
+        }
+    }
+
+    /// Parse an optional typed property, returning `None` when the key is absent.
+    ///
+    /// A present value that cannot be parsed as `T` is rejected with the
+    /// expected format described by `expected`.
+    fn parse_optional_property<T>(
+        properties: &HashMap<String, String>,
+        key: &str,
+        expected: &str,
+    ) -> Result<Option<T>>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        match properties.get(key) {
+            Some(value) => value.parse::<T>().map(Some).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid value '{value}' for property '{key}', expected {expected}: {e}"
+                    ),
+                })
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Add a storage option.

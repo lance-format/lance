@@ -292,6 +292,44 @@ async fn test_from_properties_defaults() {
     assert!(!builder.inline_optimization_enabled);
 }
 
+/// Present-but-unparsable typed properties must be rejected instead of
+/// silently falling back to the knob's default value.
+#[rstest]
+#[case::manifest_enabled("manifest_enabled", "tru")]
+#[case::dir_listing_enabled("dir_listing_enabled", "tru")]
+#[case::inline_optimization_enabled("inline_optimization_enabled", "tru")]
+#[case::table_version_tracking_enabled("table_version_tracking_enabled", "tru")]
+#[case::dir_listing_to_manifest_migration_enabled(
+    "dir_listing_to_manifest_migration_enabled",
+    "tru"
+)]
+#[case::vend_input_storage_options("vend_input_storage_options", "tru")]
+#[case::ops_metrics_enabled("ops_metrics_enabled", "tru")]
+#[case::commit_retries("commit_retries", "ten")]
+#[case::vend_input_storage_options_refresh_interval_millis(
+    "vend_input_storage_options_refresh_interval_millis",
+    "1.5"
+)]
+fn test_from_properties_rejects_unparsable_typed_values(#[case] key: &str, #[case] value: &str) {
+    let temp_dir = TempStdDir::default();
+
+    let mut properties = HashMap::new();
+    properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+    properties.insert(key.to_string(), value.to_string());
+
+    let err = DirectoryNamespaceBuilder::from_properties(properties, None)
+        .expect_err("present-but-unparsable typed property should be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains(key),
+        "error should name the property: {message}"
+    );
+    assert!(
+        message.contains(value),
+        "error should name the offending value: {message}"
+    );
+}
+
 #[test]
 fn test_builder_disables_inline_optimization_by_default() {
     let builder = DirectoryNamespaceBuilder::new("memory://");
