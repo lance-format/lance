@@ -11,7 +11,7 @@
 //! being committed on top of carries, never from a copy the writer read, which
 //! is what makes a retry merge onto whatever a concurrent writer recorded.
 
-use super::ApplyState;
+use super::{ApplyState, RemovedFragment};
 use crate::feature_flags::{FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX};
 use crate::format::pb::fragment_reuse_index_details as pb_fri;
 use crate::format::{Fragment, IndexMetadata, Manifest};
@@ -323,8 +323,21 @@ impl ApplyState<'_> {
             }
             for &source in &transition.sources {
                 match self.removed_fragments.get(&source) {
-                    Some(false) => {}
-                    Some(true) => {
+                    // The source digest is taken from the committed fragment,
+                    // which a change earlier in the operation would make stale.
+                    Some(RemovedFragment { modified: true, .. }) => {
+                        return Err(Error::invalid_input(format!(
+                            "AppendFragReuseTransition consumes fragment {source}, which this \
+                             operation modified before removing it; record the move in a \
+                             separate operation"
+                        )));
+                    }
+                    Some(RemovedFragment {
+                        data_change: false, ..
+                    }) => {}
+                    Some(RemovedFragment {
+                        data_change: true, ..
+                    }) => {
                         return Err(Error::invalid_input(format!(
                             "AppendFragReuseTransition consumes fragment {source}, which this \
                              operation removes with data_change true; a transition records rows \

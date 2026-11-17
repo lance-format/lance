@@ -245,10 +245,10 @@ pub(super) struct ApplyState<'a> {
     value_changed_fragments: BTreeSet<u64>,
     restamped_fragments: BTreeSet<u64>,
 
-    /// Fragments a [`RemoveFragment`](super::RemoveFragment) removed, with its
-    /// `data_change`: a fragment reuse transition may only consume a fragment
-    /// a compaction removed.
-    removed_fragments: HashMap<u64, bool>,
+    /// Fragments a [`RemoveFragment`](super::RemoveFragment) removed: a
+    /// fragment reuse transition may only consume a fragment a compaction
+    /// removed as it was committed.
+    removed_fragments: HashMap<u64, RemovedFragment>,
     /// Committed fields whose values a data-changing tombstone replaced, by
     /// fragment. On a tagged fragment reuse history the coverage of segments
     /// translating into the fragment is withdrawn along the lineage.
@@ -271,6 +271,15 @@ struct TombstonedField {
     data_change: bool,
     /// Whether an [`AddDataFile`](super::AddDataFile) has bound it again.
     rebound: bool,
+}
+
+/// A fragment a [`RemoveFragment`](super::RemoveFragment) removed.
+#[derive(Debug, Clone, Copy)]
+struct RemovedFragment {
+    data_change: bool,
+    /// Whether an earlier action in the operation changed it from the
+    /// committed fragment.
+    modified: bool,
 }
 
 impl<'a> ApplyState<'a> {
@@ -647,12 +656,27 @@ impl<'a> ApplyState<'a> {
     /// Drop a fragment and forget everything recorded about it. `false` if no
     /// such fragment was present.
     pub(super) fn remove_fragment(&mut self, fragment_id: u64, data_change: bool) -> bool {
-        let before = self.fragments.len();
-        self.fragments.retain(|fragment| fragment.id != fragment_id);
-        if self.fragments.len() == before {
+        let Some(position) = self
+            .fragments
+            .iter()
+            .position(|fragment| fragment.id == fragment_id)
+        else {
             return false;
-        }
-        self.removed_fragments.insert(fragment_id, data_change);
+        };
+        let removed = self.fragments.remove(position);
+        let modified = self
+            .current_manifest
+            .fragments
+            .iter()
+            .find(|fragment| fragment.id == fragment_id)
+            .is_some_and(|committed| *committed != removed);
+        self.removed_fragments.insert(
+            fragment_id,
+            RemovedFragment {
+                data_change,
+                modified,
+            },
+        );
         self.new_fragments.remove(&fragment_id);
         self.rearranged_fragments.remove(&fragment_id);
         self.tombstoned_fields
