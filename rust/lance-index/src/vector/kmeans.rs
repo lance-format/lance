@@ -53,6 +53,8 @@ use {
 use crate::vector::utils::SimpleIndex;
 use lance_core::{Error, Result};
 
+pub mod emeans;
+
 /// KMean initialization method.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KMeanInit {
