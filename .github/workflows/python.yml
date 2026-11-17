@@ -122,7 +122,7 @@ jobs:
     if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 30
     name: pylance crate Rust tests
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-4x' || 'ubuntu-24.04' }}
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
@@ -154,7 +154,7 @@ jobs:
   linux-wheel:
     timeout-minutes: 45
     name: Python Linux x86_64 wheel
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-4x' || 'ubuntu-24.04' }}
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
@@ -215,7 +215,7 @@ jobs:
           - python-minor-version: "14"
             doctest: true
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-4x' || 'ubuntu-24.04' }}
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
@@ -249,7 +249,7 @@ jobs:
   compat:
     needs: linux-wheel
     timeout-minutes: 60
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-8x' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04-8x
     name: Compatibility Tests
     defaults:
       run:
@@ -269,10 +269,6 @@ jobs:
         with:
           name: linux-x86_64-wheel
           path: python/target/wheels
-      - name: Install protoc for the DataFusion Python source build
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
-        with:
-          tool: protoc
       - name: Install dependencies
         run: |
           pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
@@ -290,7 +286,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 45
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-arm64-4x' || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04-arm64-4x
     name: Python Linux 3.14 ARM
     defaults:
       run:
@@ -323,7 +319,7 @@ jobs:
     needs: [changes, linux-wheel]
     if: needs.changes.outputs.bindings == 'true'
     timeout-minutes: 45
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-4x' || 'ubuntu-24.04' }}
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash

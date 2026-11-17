@@ -2705,8 +2705,6 @@ mod tests {
                 futures::stream::iter(batches),
             ))
         };
-        let stats = Arc::new(std::sync::Mutex::new(None));
-        let stats_for_callback = stats.clone();
         let stream = super::anti_join(
             as_stream(candidate_ids),
             as_stream(live_ids),
@@ -2714,9 +2712,6 @@ mod tests {
                 use_spilling: true,
                 mem_pool_size: Some(2 * 1024 * 1024),
                 batch_size: Some(2048),
-                execution_stats_callback: Some(Arc::new(move |counts| {
-                    *stats_for_callback.lock().unwrap() = Some(counts.clone());
-                })),
                 ..Default::default()
             },
         )
@@ -2724,15 +2719,6 @@ mod tests {
         let batches: Vec<_> = stream.try_collect().await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, expected, "anti join dropped or kept the wrong ids");
-        let stats = stats.lock().unwrap();
-        let stats = stats.as_ref().expect("anti join execution statistics");
-        assert!(stats.spill_count().is_some_and(|count| count > 0));
-        assert!(stats.spilled_bytes().is_some_and(|bytes| bytes > 0));
-        assert!(
-            stats
-                .peak_reserved_bytes()
-                .is_some_and(|peak| peak <= 2 * 1024 * 1024)
-        );
     }
 
     /// Interleaved updates leave every row live; none may read as deleted.

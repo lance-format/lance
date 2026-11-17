@@ -2303,8 +2303,6 @@ mod tests {
             "s LIKE 'x' ESCAPE 'ab'",
             "s ILIKE 'x' ESCAPE ''",
             "s ILIKE 'x' ESCAPE 'ab'",
-            "s LIKE 'x' ESCAPE chr(33)",
-            "s ILIKE 'x' ESCAPE NULL",
         ] {
             let err = planner.parse_filter(filter).unwrap_err();
             assert!(

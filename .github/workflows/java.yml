@@ -48,7 +48,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   build-jni:
-    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-4x' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04-4x
     timeout-minutes: 60
     name: Build and Test lance-jni
     steps:

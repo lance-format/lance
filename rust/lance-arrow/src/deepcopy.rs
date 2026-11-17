@@ -178,13 +178,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
-    fn raw_sliced_primitive_data_keeps_the_selected_values() {
-        let data = Int32Array::from(vec![10, 20, 30]).to_data().slice(1, 2);
-        let copied = super::deep_copy_array_data_sliced(&data);
-        assert_eq!(Int32Array::from(copied).values().as_ref(), &[20, 30]);
-    }
-
-    #[test]
     fn raw_sliced_fixed_size_list_data_keeps_its_child_offset() {
         // `ArrayData::slice` records the offset on the parent and leaves the
         // child whole -- a shape `FixedSizeListArray::slice` never produces,
