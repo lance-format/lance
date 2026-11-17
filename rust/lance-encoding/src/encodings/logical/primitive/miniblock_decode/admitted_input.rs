@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Prepare selected flat MiniBlock chunks without an uncharged page index/cache.
+//! Prepare selected MiniBlock chunks without an uncharged page index/cache.
 
 use std::{future::Future, ops::Range, sync::Arc};
 
@@ -25,6 +25,10 @@ use crate::{
     repdef::{RepDefUnraveler, max_visible_level},
 };
 
+mod nested;
+
+use nested::RepetitionSummary;
+
 fn corrupt(message: &str) -> Error {
     Error::corrupt_file_named("MiniBlock input", message)
 }
@@ -35,6 +39,8 @@ pub(in super::super) struct MiniBlockArrayScheduler {
     metadata: Range<u64>,
     data: Range<u64>,
     rows: u64,
+    items: u64,
+    repetition: Option<Range<u64>>,
 }
 
 #[derive(Debug)]
@@ -43,6 +49,9 @@ struct Selection {
     bytes: Range<u64>,
     items: u64,
     rows: Range<u64>,
+    preamble: PreambleAction,
+    take_trailer: bool,
+    repetition: Option<RepetitionSummary>,
 }
 
 impl MiniBlockArrayScheduler {
@@ -51,22 +60,26 @@ impl MiniBlockArrayScheduler {
         layout: &MiniBlockLayout,
         codecs: &dyn DecompressionStrategy,
     ) -> Result<Self> {
-        if layout.dictionary.is_some()
-            || layout.rep_compression.is_some()
-            || layout.repetition_index_depth != 0
-        {
+        if layout.dictionary.is_some() || layout.repetition_index_depth > 1 {
             return Err(Error::not_supported(
-                "admitted MiniBlock input does not yet support dictionaries or repetition indexes",
+                "admitted MiniBlock input does not yet support dictionaries or deeper repetition indexes",
             ));
         }
-        if page.buffer_offsets_and_sizes.len() != 2
+        let nested = layout.repetition_index_depth == 1;
+        if nested != layout.rep_compression.is_some() {
+            return Err(corrupt(
+                "repetition index and level codec must appear together",
+            ));
+        }
+        if page.buffer_offsets_and_sizes.len() != 2 + usize::from(nested)
             || layout.num_buffers == 0
             || layout.value_compression.is_none()
-            || layout.num_items != page.num_rows
+            || (!nested && layout.num_items != page.num_rows)
             || page.num_rows == 0
+            || layout.num_items == 0
         {
             return Err(corrupt(
-                "flat page requires two buffers, a value codec and matching nonzero row/item counts",
+                "page requires metadata/data buffers, a value codec, nonzero row/item counts and an index buffer only for nested pages",
             ));
         }
         let mut ranges = page.buffer_offsets_and_sizes.iter().map(|(start, len)| {
@@ -77,10 +90,19 @@ impl MiniBlockArrayScheduler {
         });
         let metadata = ranges.next().ok_or_else(|| corrupt("missing metadata"))??;
         let data = ranges.next().ok_or_else(|| corrupt("missing data"))??;
+        let repetition = ranges.next().transpose()?;
         let width = if layout.has_large_chunk { 4 } else { 2 };
         if metadata.is_empty() || (metadata.end - metadata.start) % width != 0 {
             return Err(corrupt(
                 "metadata must contain complete nonempty chunk words",
+            ));
+        }
+        if repetition.as_ref().is_some_and(|range| {
+            ((metadata.end - metadata.start) / width).checked_mul(16)
+                != Some(range.end - range.start)
+        }) {
+            return Err(corrupt(
+                "repetition index must have two u64 words per chunk",
             ));
         }
         let decoder = MiniBlockScheduler::try_new(
@@ -91,7 +113,7 @@ impl MiniBlockArrayScheduler {
             codecs,
         )?;
         RepDefUnraveler::validate_dense_levels(None, None, &decoder.def_meaning)?;
-        if decoder.def_meaning.len() != 1 || decoder.def_meaning[0].is_list() {
+        if !nested && (decoder.def_meaning.len() != 1 || decoder.def_meaning[0].is_list()) {
             return Err(Error::not_supported(
                 "admitted flat MiniBlock input requires one non-list layer",
             ));
@@ -101,6 +123,8 @@ impl MiniBlockArrayScheduler {
             metadata,
             data,
             rows: page.num_rows,
+            items: layout.num_items,
+            repetition,
         })
     }
 
@@ -189,6 +213,9 @@ impl MiniBlockArrayScheduler {
                         bytes: byte..end_byte,
                         items,
                         rows: start - item..end - item,
+                        preamble: PreambleAction::Absent,
+                        take_trailer: false,
+                        repetition: None,
                     });
                 }
                 item = end_item;
@@ -225,7 +252,13 @@ impl MiniBlockArrayScheduler {
                 "MiniBlock input range must be nonempty and within page rows",
             ));
         }
-        let Some(selected) = self.selections(&rows, work, &mut read).await? else {
+        let selected = if let Some(repetition) = &self.repetition {
+            self.nested_selections(&rows, repetition, work, &mut read)
+                .await?
+        } else {
+            self.selections(&rows, work, &mut read).await?
+        };
+        let Some(selected) = selected else {
             return Ok(None);
         };
         let required = selected.iter().try_fold(0_usize, |sum, chunk| {
@@ -238,6 +271,7 @@ impl MiniBlockArrayScheduler {
             return Ok(None);
         }
         let mut instructions = Vec::with_capacity(selected.len());
+        let mut repetition = Vec::new();
         for chunk in selected {
             let len = usize::try_from(chunk.bytes.end - chunk.bytes.start)
                 .map_err(|_| corrupt("chunk length exceeds usize"))?;
@@ -249,18 +283,21 @@ impl MiniBlockArrayScheduler {
                 return Err(corrupt("chunk read length mismatch"));
             }
             let take = chunk.rows.end - chunk.rows.start;
+            if let Some(summary) = chunk.repetition {
+                repetition.push(summary);
+            }
             instructions.push((
                 ChunkDrainInstructions {
                     chunk_instructions: ChunkInstructions {
                         chunk_idx: chunk.index,
-                        preamble: PreambleAction::Absent,
+                        preamble: chunk.preamble,
                         rows_to_skip: chunk.rows.start,
                         rows_to_take: take,
-                        take_trailer: false,
+                        take_trailer: chunk.take_trailer,
                     },
                     rows_to_skip: 0,
                     rows_to_take: take,
-                    preamble_action: PreambleAction::Absent,
+                    preamble_action: chunk.preamble,
                 },
                 LoadedChunk {
                     data: LanceBuffer::from_bytes(output.freeze(), 1),
@@ -274,7 +311,7 @@ impl MiniBlockArrayScheduler {
             task: DecodeMiniBlockTask {
                 structural_projection: None,
                 dictionary_data: None,
-                rep_decompressor: None,
+                rep_decompressor: self.decoder.rep_decompressor.clone(),
                 def_decompressor: self.decoder.def_decompressor.clone(),
                 value_decompressor: self.decoder.value_decompressor.clone(),
                 def_meaning: self.decoder.def_meaning.clone(),
@@ -285,6 +322,7 @@ impl MiniBlockArrayScheduler {
             },
             data_type,
             count: rows.end - rows.start,
+            repetition,
         }))
     }
 }
@@ -294,14 +332,18 @@ pub(in super::super) struct MiniBlockArrayInput {
     task: DecodeMiniBlockTask,
     data_type: DataType,
     count: u64,
+    repetition: Vec<RepetitionSummary>,
 }
 
 impl MiniBlockArrayInput {
     pub(in super::super) fn decode_in(self, work: &mut Reservation) -> Result<Option<ArrayRef>> {
+        if !self.repetition.is_empty() && !self.validate_repetition(work)? {
+            return Ok(None);
+        }
         for (_, chunk) in &self.task.instructions {
             let sections = DecodeMiniBlockTask::split_miniblock_chunk(
                 &chunk.data,
-                false,
+                self.task.rep_decompressor.is_some(),
                 self.task.def_decompressor.is_some(),
                 self.task.num_buffers,
                 self.task.has_large_chunk,
@@ -309,7 +351,8 @@ impl MiniBlockArrayInput {
             // The count is meaningful only with structural buffers: the writer
             // emits zero when rep/def are absent. With flat definition levels,
             // chunk metadata independently proves the possibly wrapped u16 count.
-            if self.task.def_decompressor.is_some()
+            if self.task.rep_decompressor.is_none()
+                && self.task.def_decompressor.is_some()
                 && u64::from(sections.num_levels) != chunk.items_in_chunk % 65536
             {
                 return Err(corrupt("chunk level header disagrees with flat item count"));

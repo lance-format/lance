@@ -699,7 +699,7 @@ fn with_unsupported_page(reader: FileReader, column: usize, page: usize) -> File
                 PageEncoding::Structural(PageLayout {
                     layout: Some(Layout::MiniBlockLayout(
                         lance_encoding::format::metadata::MiniBlockLayout {
-                            repetition_index_depth: 1,
+                            repetition_index_depth: 2,
                             ..Default::default()
                         },
                     )),

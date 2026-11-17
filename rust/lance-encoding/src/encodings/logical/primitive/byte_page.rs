@@ -37,8 +37,11 @@ enum Scheduler {
 }
 
 /// Metadata-only dispatch for admitted byte/string pages.
-/// Flat MiniBlock byte/string pages use a bounded metadata window and only read
-/// selected chunks. Repetition indexes and page dictionaries are not yet supported.
+/// MiniBlock byte/string pages, including List/LargeList nesting, use bounded
+/// chunk-metadata and two-word repetition-index windows and read only selected chunks.
+/// Full index traversal validates the row/item/data domain; selected repetition
+/// summaries are checked against charged decoded levels before reconstruction.
+/// Page dictionaries and deeper repetition-index formats are not yet supported.
 /// Dense FullZip and Constant pages support List/LargeList nesting. Flat all-null
 /// pages require metadata-only validity. V2_3 List chains with null byte leaves
 /// support metadata or Flat/Bitpacked/Delta parent validity, nonempty positions,

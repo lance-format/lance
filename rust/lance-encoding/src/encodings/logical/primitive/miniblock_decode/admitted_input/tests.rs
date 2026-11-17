@@ -347,3 +347,5 @@ async fn original_workspace_covers_input_and_output_overlap(
     }
     assert_eq!(budget.reserved(), 0);
 }
+
+mod nested;
