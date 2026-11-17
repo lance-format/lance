@@ -438,7 +438,7 @@ fn snapshot_lance_metrics_native<'local>(env: &mut JNIEnv<'local>) -> Result<JOb
     let list = object_list(env)?;
     if let Some(registry) = REGISTRY.get() {
         lance_core::cache::refresh_metrics();
-        lance_core::memory::refresh_metrics();
+        lance_core::memory::refresh_metrics_with_heap(lance_core::memory::read_glibc_heap);
         for point in collect_points(registry) {
             env.with_local_frame(64, |env| {
                 let item = metric_point_to_java(env, point)?;
