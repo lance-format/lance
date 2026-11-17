@@ -240,6 +240,14 @@ async fn commit_rewrites(
     } else {
         None
     };
+    // Remapped segments are the only caller-named index IDs this commit can
+    // carry, so a call without a remapper has none and every directory it mints
+    // is its own, fragment reuse entries included. A remapper that draws a fresh
+    // ID per segment says so; anything else keeps its directories, because it may
+    // reuse them across calls or have written them earlier.
+    let reclaim_index_dirs = index_remapper
+        .as_ref()
+        .is_none_or(|remapper| remapper.creates_fresh_index_ids());
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
     // In distributed mode (e.g. Spark) the caller opens *two separate* Dataset
@@ -613,14 +621,21 @@ async fn commit_rewrites(
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
-    if let Err(e) = dataset
-        .apply_commit_reclaiming_minted_index_dirs(
-            transaction,
-            &Default::default(),
-            &Default::default(),
-        )
-        .await
-    {
+    let commit_result = if reclaim_index_dirs {
+        dataset
+            .apply_commit_reclaiming_minted_index_dirs(
+                transaction,
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+    } else {
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+    };
+
+    if let Err(e) = commit_result {
         // RewriteResult is serializable and may be retried after an earlier
         // ambiguous success. A conflict on this call therefore does not prove
         // that the rewritten files are unreferenced. Leave them for dataset GC.

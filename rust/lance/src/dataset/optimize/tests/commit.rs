@@ -1308,6 +1308,91 @@ async fn test_delete_conflict_reclaims_remapped_index_dir() {
     assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
 }
 
+/// A remapper whose answers are fixed by the caller, standing in for a
+/// caller-managed remapper that decides its own index ids.
+#[derive(Debug)]
+struct FixedAnswerRemapper {
+    answers: Vec<RemappedIndex>,
+}
+
+#[async_trait]
+impl IndexRemapper for FixedAnswerRemapper {
+    async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
+        Ok(self.answers.clone())
+    }
+}
+
+#[derive(Debug)]
+struct FixedAnswerRemapperOptions {
+    answers: Vec<RemappedIndex>,
+}
+
+#[async_trait]
+impl IndexRemapperOptions for FixedAnswerRemapperOptions {
+    async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+        Ok(Some(Box::new(FixedAnswerRemapper {
+            answers: self.answers.clone(),
+        })))
+    }
+}
+
+/// T11: a caller-supplied remapper owns the ids it reports, so its directory
+/// survives a commit verified not to have landed. A replay may reuse the very
+/// same id, and the directory may hold files written outside the compaction.
+#[tokio::test]
+async fn test_custom_remapper_index_dir_survives_preemption() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let handler = Arc::new(RaceBeforeRewrite::default());
+    let mut dataset = reclaim_fixture(uri, handler.clone()).await;
+    let original = stored_index(&dataset, "scalar").await;
+
+    let owned_uuid = Uuid::new_v4();
+    let owned_dir = std::path::Path::new(uri)
+        .join("_indices")
+        .join(owned_uuid.to_string());
+    std::fs::create_dir_all(&owned_dir).unwrap();
+    std::fs::write(owned_dir.join("payload"), b"owned by the caller's remapper").unwrap();
+
+    let remapper = Arc::new(FixedAnswerRemapperOptions {
+        answers: vec![RemappedIndex {
+            old_id: original.uuid,
+            new_id: owned_uuid,
+            index_details: original.index_details.as_ref().unwrap().as_ref().clone(),
+            index_version: original.index_version as u32,
+            files: original.files.clone(),
+        }],
+    });
+    let before = index_dir_names(&dataset).await;
+    assert!(before.contains(&owned_uuid.to_string()));
+
+    handler.arm(&dataset, vec![Race::Delete]);
+    let error = compact_files(&mut dataset, reclaim_options(), Some(remapper))
+        .await
+        .expect_err("the DELETE must preempt the rewrite commit");
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "expected a retryable conflict, got: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction Delete"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        index_dir_names(&dataset).await,
+        before,
+        "a directory behind a caller-supplied remapper's id must survive a failed commit"
+    );
+    assert!(
+        owned_dir.join("payload").exists(),
+        "the caller-owned file must not be removed"
+    );
+    assert_indexed_query_matches(uri, "i >= 20 AND i < 40").await;
+}
+
 /// The failure injected into the Rewrite commit for
 /// `test_rewrite_commit_failure_preserves_or_reclaims_index_dirs`.
 #[derive(Debug, Clone, Copy)]
