@@ -66,7 +66,7 @@ fn values(prefix: &str, rows: usize, nested: bool) -> ArrayRef {
     }
 }
 
-async fn assert_dictionary(dataset: &Dataset, file: &DataFile, field: i32, nested: bool) {
+async fn assert_dictionary(dataset: &Dataset, file: &DataFile, leaf_id: i32, nested: bool) {
     let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::new(1024));
     let source = scheduler
         .open_file(
@@ -84,8 +84,18 @@ async fn assert_dictionary(dataset: &Dataset, file: &DataFile, field: i32, neste
     )
     .await
     .unwrap();
-    let index = file.fields.iter().position(|id| *id == field).unwrap();
-    let column = file.column_indices[index] as usize;
+    let index = file
+        .fields
+        .iter()
+        .position(|id| *id == leaf_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "file {} has no physical leaf {leaf_id}: fields={:?}, columns={:?}",
+                file.path, file.fields, file.column_indices
+            )
+        });
+    let column = usize::try_from(file.column_indices[index])
+        .expect("the payload leaf must map to a physical column");
     let pages = &reader.metadata().column_infos[column].page_infos;
     assert!(!pages.is_empty());
     for page in pages.iter() {
@@ -94,15 +104,18 @@ async fn assert_dictionary(dataset: &Dataset, file: &DataFile, field: i32, neste
             PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
             PageEncoding::Legacy(_) => panic!("current writer fixture"),
         };
-        let Some(Layout::MiniBlockLayout(layout)) = layout.layout else {
-            panic!("stored MiniBlock required");
+        let Some(Layout::MiniBlockLayout(layout)) = &layout.layout else {
+            panic!("file {} requires stored MiniBlock: {layout:?}", file.path);
         };
         let Some(Compression::General(general)) = layout
             .dictionary
             .as_ref()
             .and_then(|d| d.compression.as_ref())
         else {
-            panic!("stored compressed dictionary required");
+            panic!(
+                "file {} requires stored compressed dictionary: {layout:?}",
+                file.path
+            );
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
@@ -144,9 +157,23 @@ async fn fixture(version: LanceFileVersion, nested: bool) -> (Dataset, Vec<Array
     .await
     .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
-    let field = dataset.schema().field("payload").unwrap().id;
-    let old_offsets = (0..ROWS as u32).step_by(2).collect::<Vec<_>>();
-    let new_offsets = (16..112).step_by(2).collect::<Vec<u32>>();
+    let payload_field = dataset.schema().field("payload").unwrap();
+    let field = payload_field.id;
+    // Structural files map physical leaves, not the logical List parent.
+    let leaf_id = if nested {
+        payload_field.children[0].id
+    } else {
+        field
+    };
+    // A dictionary hint does not bypass the writer's 100-value minimum.
+    // Each overlay has 116 rows, including nulls. Distinct and common holes
+    // retain old-only, new-only, overlapping and base-only selections.
+    let old_offsets = (0..ROWS as u32)
+        .filter(|row| row % 16 != 7 && row % 32 != 31)
+        .collect::<Vec<_>>();
+    let new_offsets = (0..ROWS as u32)
+        .filter(|row| row % 16 != 3 && row % 32 != 31)
+        .collect::<Vec<_>>();
     let old = values("old", old_offsets.len(), nested);
     let new = values("new", new_offsets.len(), nested);
     let mut expected = Vec::new();
@@ -176,6 +203,9 @@ async fn fixture(version: LanceFileVersion, nested: bool) -> (Dataset, Vec<Array
                 }
             })
             .collect::<Vec<_>>();
+        for source in 0..3 {
+            assert!(routing.iter().any(|(selected, _)| *selected == source));
+        }
         expected.push(
             arrow_select::interleave::interleave(
                 &[original.as_ref(), old.as_ref(), new.as_ref()],
@@ -186,10 +216,10 @@ async fn fixture(version: LanceFileVersion, nested: bool) -> (Dataset, Vec<Array
     }
     for fragment in dataset.iter_fragments() {
         for file in &fragment.files {
-            assert_dictionary(&dataset, file, field, nested).await;
+            assert_dictionary(&dataset, file, leaf_id, nested).await;
         }
         for overlay in &fragment.overlays {
-            assert_dictionary(&dataset, &overlay.data_file, field, nested).await;
+            assert_dictionary(&dataset, &overlay.data_file, leaf_id, nested).await;
         }
     }
     dataset
