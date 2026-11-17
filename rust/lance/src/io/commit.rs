@@ -5010,7 +5010,7 @@ mod tests {
         }
     }
 
-    /// T1: only directories this transaction minted are candidates. A remap
+    /// Only directories this transaction minted are candidates. A remap
     /// that keeps the original index and an index that replaces another one
     /// must not put either existing UUID in the set.
     #[test]
@@ -5064,7 +5064,7 @@ mod tests {
         assert!(minted_index_uuids(&Operation::Append { fragments: vec![] }).is_empty());
     }
 
-    /// T9: cleanup must re-read the latest manifest and keep a directory it
+    /// Cleanup must re-read the latest manifest and keep a directory it
     /// references, even when the caller claims the directory was minted by
     /// the failed call.
     #[tokio::test]
@@ -5118,7 +5118,7 @@ mod tests {
         );
     }
 
-    /// C1's `Foreign` branch: when another writer wins the target version,
+    /// When another writer wins the target version,
     /// the attempt is verified as not landed and the directory it minted is
     /// reclaimed.
     #[tokio::test]

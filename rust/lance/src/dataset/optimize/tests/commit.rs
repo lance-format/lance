@@ -1280,7 +1280,7 @@ async fn assert_indexed_query_matches(uri: &str, filter: &str) {
     assert!(indexed.num_rows() > 0, "the filter must match some rows");
 }
 
-/// T2 (#7207's original shape): a concurrent DELETE lands before the rewrite
+/// The shape reported in #7207: a concurrent DELETE lands before the rewrite
 /// publishes, the retry's conflict check rejects the rewrite, and the index
 /// directory the remap minted is reclaimed while the original index survives.
 #[tokio::test]
@@ -1344,7 +1344,7 @@ impl IndexRemapperOptions for FixedAnswerRemapperOptions {
     }
 }
 
-/// T11: a caller-supplied remapper owns the ids it reports, so its directory
+/// A caller-supplied remapper owns the ids it reports, so its directory
 /// survives a commit verified not to have landed. A replay may reuse the very
 /// same id, and the directory may hold files written outside the compaction.
 #[tokio::test]
@@ -1415,8 +1415,8 @@ enum RewriteFailure {
     LandedWithoutVerification,
     /// The manifest lands and a later version drops the index it published
     /// before the handler reports the error. The latest manifest therefore
-    /// does not reference the minted directory: only the write tracking of
-    /// C1 protects it.
+    /// does not reference the minted directory: only the unverified-write
+    /// flag protects it.
     LandedThenIndexDropped,
     /// As [`Self::LandedThenIndexDropped`], with verification unavailable.
     UnknownThenIndexDropped,
@@ -1502,7 +1502,7 @@ impl CommitHandler for LandDropThenFail {
     }
 }
 
-/// T3, T4, T5: whether the remapped index directory survives depends only on
+/// Whether the remapped index directory survives depends only on
 /// whether verification proved the commit did not land.
 #[rstest]
 #[case::verified_absent(RewriteFailure::VerifiedAbsent)]
@@ -1637,7 +1637,7 @@ async fn test_rewrite_commit_failure_preserves_or_reclaims_index_dirs(
     }
 }
 
-/// T6: between retries the directories must survive, because the retry reuses
+/// Between retries the directories must survive, because the retry reuses
 /// the same UUIDs. The second attempt succeeds after a non-conflicting append
 /// preempted the first.
 #[tokio::test]

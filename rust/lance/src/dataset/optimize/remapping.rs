@@ -79,12 +79,9 @@ pub trait IndexRemapper: Send + Sync {
     }
 
     /// Whether every ID in the [`RemappedIndex`]es this remapper reports is
-    /// generated inside the call that reports them.
-    ///
-    /// Compaction removes the directories behind those IDs once its commit is
-    /// verified not to have landed. That is only safe when a retry mints new
-    /// IDs, so the default keeps the directories: a remapper may reuse IDs
-    /// across calls, or point them at files it wrote earlier.
+    /// generated inside the call that reports them. When true, compaction
+    /// removes those index directories once its commit is verified not to
+    /// have landed, so return true only if a retry never reuses an ID.
     fn creates_fresh_index_ids(&self) -> bool {
         false
     }

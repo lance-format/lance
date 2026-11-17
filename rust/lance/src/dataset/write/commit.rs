@@ -1738,7 +1738,7 @@ mod tests {
         );
     }
 
-    /// T8: a caller that built an index segment and commits it itself owns
+    /// A caller that built an index segment and commits it itself owns
     /// the directory. A failed commit must leave it in place so the same
     /// segment can be committed again.
     #[tokio::test]
