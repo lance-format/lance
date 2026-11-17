@@ -439,12 +439,9 @@ fn prefilter_mask_future(
     };
     if let Some(shared_filter) = shared_filter {
         let shared_filter = match external_mask {
-            Some(mask) => async move {
-                Ok(Arc::new(
-                    mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
-                ))
+            Some(mask) => {
+                async move { Ok(Arc::new(mask.intersect_ref(&*shared_filter.await?))) }.boxed()
             }
-            .boxed(),
             None => shared_filter,
         };
         return Ok(Some(shared_filter));
@@ -455,7 +452,7 @@ fn prefilter_mask_future(
         }
         None => prefilter_loader,
     };
-    Ok(prefilter_loader.map(|loader| async move { loader.load().await }.in_current_span().boxed()))
+    Ok(prefilter_loader.map(|loader| loader.load().in_current_span().boxed()))
 }
 
 pub(crate) fn build_prefilter(

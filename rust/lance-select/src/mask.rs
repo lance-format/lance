@@ -463,12 +463,7 @@ impl std::ops::BitAnd for RowAddrMask {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
-            (Self::AllowList(allow), Self::BlockList(block))
-            | (Self::BlockList(block), Self::AllowList(allow)) => Self::AllowList(allow - block),
-            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
-        }
+        self.intersect(rhs)
     }
 }
 
@@ -606,6 +601,9 @@ impl RowAddrSelection {
             (_, Self::Full) => return None,
             (Cow::Borrowed(Self::Full) | Cow::Owned(Self::Full), Self::Partial(rhs)) => {
                 // This generally won't be hit.
+                if rhs.is_empty() {
+                    return Some(Self::Full);
+                }
                 let mut set = RoaringBitmap::full();
                 set -= rhs;
                 return Some(Self::Partial(set));
@@ -1660,9 +1658,7 @@ mod tests {
                 (2, partial(&[0])),
                 (3, RowAddrSelection::Partial(all_but_seven)),
                 (4, whole()),
-                // As in `SubAssign`: nothing was removed, yet the fragment is
-                // now spelled as every offset.
-                (7, RowAddrSelection::Partial(RoaringBitmap::full())),
+                (7, whole()),
                 (9, partial(&[3])),
             ]))
         );

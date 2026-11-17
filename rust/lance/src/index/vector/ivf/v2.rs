@@ -1052,7 +1052,7 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
 /// The quantizer a decoded state keeps for its partition storages: only the
 /// storages that retain one (PQ) get it built, so an RQ entry does not carry
 /// its rotation matrices for nothing.
-fn retained_quantizer<Q: Quantization>(
+fn build_retained_quantizer<Q: Quantization>(
     metadata: &<Q::Storage as QuantizerStorage>::Metadata,
     distance_type: DistanceType,
 ) -> Option<Quantizer> {
@@ -1157,7 +1157,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
             if !extra_bytes.is_empty() {
                 metadata.parse_buffer(extra_bytes)?;
             }
-            let quantizer = retained_quantizer::<Q>(&metadata, distance_type);
+            let quantizer = build_retained_quantizer::<Q>(&metadata, distance_type);
             Ok(IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
                 index_file_path: header.index_file_path,
                 uuid: header.uuid,
