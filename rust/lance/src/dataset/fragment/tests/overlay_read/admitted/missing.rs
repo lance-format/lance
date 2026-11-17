@@ -137,11 +137,11 @@ async fn missing_only_projection_charges_empty_offsets_and_final_alias(
     let projection = dataset.schema().project(&["late"]).unwrap();
     for fragment in 0..2 {
         let reader = open(&dataset, fragment, &projection, lite).await;
+        let budget = AllocationBudget::new(1024);
         for selected in [vec![0, 2, 5], vec![]] {
             let indices = UInt32Array::from(selected.clone());
             let offsets = (selected.len() + 1) * 8;
             let exact = offsets + selected.len().div_ceil(8);
-            let budget = AllocationBudget::new(1024);
             assert!(
                 reader
                     .try_take_admitted_fullzip(&indices, budget.try_reserve(exact - 1).unwrap())
