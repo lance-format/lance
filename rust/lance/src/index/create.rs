@@ -785,9 +785,7 @@ impl<'a> CreateIndexBuilder<'a> {
         .transaction_properties(self.transaction_properties.clone())
         .build();
 
-        // A directory named by the caller (`index_uuid`) is not ours to remove: it
-        // may hold files written outside this call. Only a UUID generated here is
-        // reclaimed after a verified loss, because a retry generates a new one.
+        // A caller-named directory may hold files written outside this call.
         if caller_named_index_dir {
             self.dataset
                 .apply_commit(transaction, &Default::default(), &Default::default())
@@ -1751,8 +1749,6 @@ mod tests {
                 )),
                 "{error}"
             );
-            // T10: a directory the caller named through `index_uuid` is not
-            // this call's to remove, even though the commit failed.
             if let Some(uuid) = caller_uuid {
                 let mut expected_dirs = dirs_before.clone();
                 expected_dirs.insert(uuid.to_string());

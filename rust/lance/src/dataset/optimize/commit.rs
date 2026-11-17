@@ -240,11 +240,8 @@ async fn commit_rewrites(
     } else {
         None
     };
-    // Remapped segments are the only caller-named index IDs this commit can
-    // carry, so a call without a remapper has none and every directory it mints
-    // is its own, fragment reuse entries included. A remapper that draws a fresh
-    // ID per segment says so; anything else keeps its directories, because it may
-    // reuse them across calls or have written them earlier.
+    // Remapped segments are the only index IDs a caller can supply here, so a
+    // call without a remapper mints every directory it commits.
     let reclaim_index_dirs = index_remapper
         .as_ref()
         .is_none_or(|remapper| remapper.creates_fresh_index_ids());
