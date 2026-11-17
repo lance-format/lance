@@ -403,11 +403,14 @@ impl DecodePageTask for ListStructureTask {
             .iter()
             .flat_map(|r| r.rep.iter().copied())
             .collect::<Vec<_>>();
-        let has_defs = self
-            .details
-            .def_meaning
-            .iter()
-            .any(|d| d.num_def_levels() > 0);
+        // Pages written before #9018 can have nullable layers but a NIL control word. Such a
+        // page stores no def levels, so read every item as valid, as the value path does.
+        let has_defs = !matches!(self.details.ctrl_word_parser, ControlWordParser::NIL)
+            && self
+                .details
+                .def_meaning
+                .iter()
+                .any(|d| d.num_def_levels() > 0);
         let def = has_defs.then(|| {
             rows.iter()
                 .flat_map(|r| {

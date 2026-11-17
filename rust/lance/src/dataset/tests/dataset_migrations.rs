@@ -20,7 +20,7 @@ use lance_table::rowids::read_row_ids;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
-use arrow_array::types::{Float32Type, Int64Type};
+use arrow_array::types::{Float32Type, Int64Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Int32Array, Int64Array, ListArray, RecordBatchIterator,
     StructArray, UInt32Array,
@@ -880,6 +880,30 @@ async fn test_v11_0_0_fullzip_padded_control_words(#[case] rows: Option<Vec<u64>
             );
         }
     }
+}
+
+/// `array_length` reads these pages through the list structure path, which skips the
+/// values.
+#[rstest]
+#[case::binary("binary")]
+#[case::vector("vector")]
+#[tokio::test]
+async fn test_v11_0_0_fullzip_padded_control_words_list_length(#[case] column: &str) {
+    let test_dir = copy_test_data_to_tmp("v11.0.0/fullzip_padded_control_words.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let expression = format!("array_length({column})");
+    let lengths = dataset
+        .scan()
+        .project_with_transform(&[("length", expression.as_str())])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let lengths = lengths["length"].as_primitive::<UInt64Type>();
+    let expected = (0..8)
+        .map(|row| (row >= 2).then_some(2))
+        .collect::<Vec<_>>();
+    assert_eq!(lengths.iter().collect::<Vec<_>>(), expected);
 }
 
 /// Lance 4.0.1 wrote a zero control-word byte before each value that a merge_insert
