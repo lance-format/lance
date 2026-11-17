@@ -31,6 +31,17 @@ impl LanceEncodingsIo {
 }
 
 impl EncodingsIo for LanceEncodingsIo {
+    fn submit_many_into(
+        &self,
+        requests: Vec<(
+            std::ops::Range<u64>,
+            lance_core::utils::allocation::ReservedBuffer,
+        )>,
+        priority: u64,
+    ) -> BoxFuture<'_, lance_core::Result<Vec<lance_core::utils::allocation::ReservedBuffer>>> {
+        self.scheduler.read_many_into(requests, priority)
+    }
+
     fn submit_single_into(
         &self,
         range: std::ops::Range<u64>,

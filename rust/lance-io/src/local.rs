@@ -414,6 +414,50 @@ impl Reader for LocalObjectReader {
         })
     }
 
+    fn get_ranges_into(
+        &self,
+        requests: Vec<(Range<usize>, ReservedBuffer)>,
+    ) -> BoxFuture<'_, Result<Vec<ReservedBuffer>>> {
+        let file = self.file.clone();
+        let io_tracker = self.io_tracker.clone();
+        let path = self.path.clone();
+        Box::pin(async move {
+            for (range, output) in &requests {
+                if range.end.checked_sub(range.start) != Some(output.capacity()) {
+                    return Err(Error::invalid_input(
+                        "read range does not match reserved payload",
+                    ));
+                }
+            }
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            // One blocking dispatch, still one positional read and metric per
+            // range. The closure owns every buffer even if its waiter is dropped.
+            Ok(join_local_io(tokio::task::spawn_blocking(move || {
+                let mut outputs = Vec::with_capacity(requests.len());
+                for (range, mut output) in requests {
+                    let metrics = io_tracker.begin_io("get");
+                    #[cfg(unix)]
+                    let result = file.read_exact_at(output.as_mut(), range.start as u64);
+                    #[cfg(windows)]
+                    let result = read_exact_at(file.clone(), output.as_mut(), range.start as u64);
+                    metrics.record(&result, range.len() as u64);
+                    result?;
+                    io_tracker.record_read(
+                        "get_range_into",
+                        path.clone(),
+                        range.len() as u64,
+                        Some(range.start as u64..range.end as u64),
+                    );
+                    outputs.push(output);
+                }
+                Ok(outputs)
+            }))
+            .await?)
+        })
+    }
+
     /// Reads the entire file.
     #[instrument(level = "debug", skip(self))]
     fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {

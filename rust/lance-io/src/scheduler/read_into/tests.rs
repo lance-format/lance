@@ -10,6 +10,8 @@ use lance_core::{
 use rstest::rstest;
 use tokio::sync::Semaphore;
 
+mod many;
+
 #[derive(Clone, Copy, Debug)]
 enum ReadMode {
     Submitted,
@@ -36,6 +38,7 @@ struct ControlledReader {
     path: Path,
     calls: Arc<Mutex<Vec<usize>>>,
     gate: Arc<Semaphore>,
+    batches: std::sync::atomic::AtomicUsize,
 }
 
 impl DeepSizeOf for ControlledReader {
@@ -45,6 +48,21 @@ impl DeepSizeOf for ControlledReader {
 }
 
 impl Reader for ControlledReader {
+    fn get_ranges_into(
+        &self,
+        requests: Vec<(Range<usize>, ReservedBuffer)>,
+    ) -> BoxFuture<'_, Result<Vec<ReservedBuffer>>> {
+        self.batches.fetch_add(1, Ordering::SeqCst);
+        async move {
+            let mut outputs = Vec::new();
+            for (range, output) in requests {
+                outputs.push(self.get_range_into(range, output).await?);
+            }
+            Ok(outputs)
+        }
+        .boxed()
+    }
+
     fn path(&self) -> &Path {
         &self.path
     }
@@ -126,6 +144,7 @@ fn setup(lite: bool, io_bytes: u64) -> (Arc<ScanScheduler>, FileScheduler, Arc<C
         path: Path::from("owned"),
         calls: Arc::new(Mutex::new(Vec::new())),
         gate: Arc::new(Semaphore::new(0)),
+        batches: std::sync::atomic::AtomicUsize::new(0),
     });
     let file = scheduler.open_reader(reader.clone());
     (scheduler, file, reader)

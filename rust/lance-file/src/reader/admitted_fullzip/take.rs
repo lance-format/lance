@@ -261,6 +261,14 @@ impl DecodeEngine {
             column.page_start = 0;
             column.decoder = None;
         }
+        if let Some(inputs) =
+            prepare_contiguous_batch(&mut columns, &schema, indices, workspace).await?
+        {
+            return Ok(Some(PreparedFullZipTake {
+                schema,
+                source: TakeSource::Stored(inputs.into_iter().map(|input| vec![input]).collect()),
+            }));
+        }
         let mut inputs = Vec::with_capacity(columns.len());
         for (column, field) in columns.iter_mut().zip(schema.fields()) {
             let mut chunks = Vec::new();
@@ -302,4 +310,49 @@ impl DecodeEngine {
             source: TakeSource::Stored(inputs),
         }))
     }
+}
+
+async fn prepare_contiguous_batch(
+    columns: &mut [FullZipColumn],
+    schema: &ArrowSchema,
+    indices: &[u32],
+    workspace: &mut Reservation,
+) -> Result<Option<Vec<AdmittedBytePageInput>>> {
+    let (Some(first), Some(last)) = (indices.first(), indices.last()) else {
+        return Ok(None);
+    };
+    if !(2..=16).contains(&columns.len())
+        || u64::from(*last) - u64::from(*first) + 1 != indices.len() as u64
+    {
+        return Ok(None);
+    }
+    let io = columns[0].io.clone();
+    let mut requests = Vec::with_capacity(columns.len());
+    let mut common_priority = None;
+    for (column, field) in columns.iter_mut().zip(schema.fields()) {
+        let page_end = column.select(u64::from(*first))?;
+        if u64::from(*last) >= page_end || !Arc::ptr_eq(&io, &column.io) {
+            return Ok(None);
+        }
+        let priority = column.column.page_infos[column.page_index].priority;
+        if common_priority.is_some_and(|previous| previous != priority) {
+            return Ok(None);
+        }
+        common_priority = Some(priority);
+        let decoder = column
+            .decoder
+            .as_ref()
+            .ok_or_else(|| Error::internal("missing FullZip batch decoder"))?;
+        requests.push((
+            decoder.clone(),
+            (u64::from(*first) - column.page_start)..(u64::from(*last) + 1 - column.page_start),
+            field.data_type().clone(),
+        ));
+    }
+    let priority =
+        common_priority.ok_or_else(|| Error::internal("missing FullZip batch priority"))?;
+    AdmittedBytePageScheduler::try_prepare_fullzip_batch_in(&requests, workspace, |requests| {
+        io.submit_many_into(requests, priority)
+    })
+    .await
 }

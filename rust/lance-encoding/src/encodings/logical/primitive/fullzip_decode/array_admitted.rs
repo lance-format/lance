@@ -3,6 +3,8 @@
 
 //! Keep structural reconstruction inside the read/decode admission envelope.
 
+pub mod batch;
+
 use std::{future::Future, ops::Range, sync::Arc};
 
 use arrow_array::{ArrayRef, LargeListArray, ListArray, make_array};

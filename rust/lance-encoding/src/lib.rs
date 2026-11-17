@@ -102,6 +102,25 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
         .boxed()
     }
 
+    /// Fill independent admitted allocations in order, with one common priority.
+    ///
+    /// Backends may batch dispatch while preserving individual scheduling credit
+    /// and the ownership contract of [`Self::submit_single_into`]. The default
+    /// drives each read sequentially. Request metadata is outside payload credit.
+    fn submit_many_into(
+        &self,
+        requests: Vec<(Range<u64>, lance_core::utils::allocation::ReservedBuffer)>,
+        priority: u64,
+    ) -> BoxFuture<'_, Result<Vec<lance_core::utils::allocation::ReservedBuffer>>> {
+        Box::pin(async move {
+            let mut outputs = Vec::with_capacity(requests.len());
+            for (range, output) in requests {
+                outputs.push(self.submit_single_into(range, priority, output).await?);
+            }
+            Ok(outputs)
+        })
+    }
+
     /// Returns a version of this I/O service that bypasses backpressure for all requests.
     ///
     /// This is intended for indirect I/O (e.g. fetching items after decoding offsets) where

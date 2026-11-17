@@ -193,6 +193,25 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
         })
     }
 
+    /// Fill independent caller-owned allocations in request order.
+    ///
+    /// This default preserves the single-read contract and performs reads
+    /// sequentially. A backend may combine dispatch, but must preserve every
+    /// allocation and retain all buffers until access stops on cancellation.
+    /// No coalescing, payload allocation or budget acquisition is permitted.
+    fn get_ranges_into(
+        &self,
+        requests: Vec<(Range<usize>, ReservedBuffer)>,
+    ) -> BoxFuture<'_, Result<Vec<ReservedBuffer>>> {
+        Box::pin(async move {
+            let mut outputs = Vec::with_capacity(requests.len());
+            for (range, output) in requests {
+                outputs.push(self.get_range_into(range, output).await?);
+            }
+            Ok(outputs)
+        })
+    }
+
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations

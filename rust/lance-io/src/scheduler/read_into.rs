@@ -129,6 +129,108 @@ fn validate_range(range: &Range<u64>, output: &ReservedBuffer) -> Result<()> {
 }
 
 impl FileScheduler {
+    /// Fill a small group of independent admitted ranges in request order.
+    ///
+    /// At most 16 nonempty ranges and 256 KiB may share one backend dispatch.
+    /// Every range first obtains its own normal scheduler credit without waiting
+    /// or jumping queued requests. If that is not possible, release all tentative
+    /// credits and use sequential [`Self::read_single_into`] calls. The lite
+    /// scheduler also uses that path. No ranges are coalesced or copied.
+    /// Cancellation and transport exclusions match the single-read contract.
+    ///
+    /// ```
+    /// # async fn example(file: &lance_io::scheduler::FileScheduler) -> lance_core::Result<()> {
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// let budget = AllocationBudget::new(8);
+    /// let mut work = budget.try_reserve(8).unwrap();
+    /// let requests = vec![(0..4, work.try_allocate(4)?.unwrap()),
+    ///                     (16..20, work.try_allocate(4)?.unwrap())];
+    /// let outputs = file.read_many_into(requests, 0).await?;
+    /// assert_eq!(outputs.len(), 2);
+    /// # Ok(()) }
+    /// ```
+    pub fn read_many_into(
+        &self,
+        requests: Vec<(Range<u64>, ReservedBuffer)>,
+        priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<ReservedBuffer>>> {
+        let file = self.clone();
+        async move {
+            for (range, output) in &requests {
+                validate_range(range, output)?;
+            }
+            let total = requests.iter().try_fold(0usize, |sum, (_, output)| {
+                sum.checked_add(output.capacity())
+            });
+            let mut credits = Vec::new();
+            if (2..=16).contains(&requests.len())
+                && total.is_some_and(|bytes| bytes <= 256 * 1024)
+                && requests.iter().all(|(range, _)| !range.is_empty())
+                && let IoQueueType::Standard(queue) = &file.root.io_queue
+            {
+                let full_priority = ((file.base_priority as u128) << 64) + priority as u128;
+                for (range, _) in &requests {
+                    let Some(credit) = DirectReadCredit::try_new(
+                        queue,
+                        full_priority,
+                        range.end - range.start,
+                        file.bypass_backpressure,
+                    ) else {
+                        break;
+                    };
+                    credits.push(credit);
+                }
+            }
+            if !requests.is_empty() && credits.len() == requests.len() {
+                let identities: Vec<_> = requests
+                    .iter()
+                    .map(|(_, buffer)| (buffer.as_ref().as_ptr() as usize, buffer.capacity()))
+                    .collect();
+                for (range, _) in &requests {
+                    file.record_owned_read(range);
+                }
+                IOPS_COUNTER.fetch_add(requests.len() as u64, Ordering::Release);
+                let outputs = file
+                    .reader
+                    .get_ranges_into(
+                        requests
+                            .into_iter()
+                            .map(|(range, buffer)| {
+                                (range.start as usize..range.end as usize, buffer)
+                            })
+                            .collect(),
+                    )
+                    .await;
+                BYTES_READ_COUNTER.fetch_add(
+                    identities.iter().map(|(_, len)| *len as u64).sum(),
+                    Ordering::Release,
+                );
+                let outputs = outputs?;
+                if outputs.len() != identities.len()
+                    || outputs
+                        .iter()
+                        .zip(identities)
+                        .any(|(buffer, (pointer, len))| {
+                            buffer.capacity() != len || buffer.as_ref().as_ptr() as usize != pointer
+                        })
+                {
+                    return Err(Error::invalid_input(
+                        "scheduled reads must return supplied allocations unchanged and in order",
+                    ));
+                }
+                return Ok(outputs);
+            }
+            // Never await more credit while retaining only part of a group.
+            drop(credits);
+            let mut outputs = Vec::with_capacity(requests.len());
+            for (range, output) in requests {
+                outputs.push(file.read_single_into(range, priority, output).await?);
+            }
+            Ok(outputs)
+        }
+        .boxed()
+    }
+
     /// Read into an admitted allocation when the returned future is polled.
     ///
     /// Uses the same priority, IOP limit and byte policy as

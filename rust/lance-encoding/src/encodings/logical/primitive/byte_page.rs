@@ -112,6 +112,62 @@ impl AdmittedBytePageScheduler {
         }
     }
 
+    /// Prepare two to sixteen independent small FullZip selections in two I/O
+    /// phases: index endpoints, then selected payloads. Requests share one file
+    /// and priority established by the caller; returned inputs retain order.
+    ///
+    /// `None` means this optimization does not apply, with all scratch returned
+    /// to the original workspace. The caller may then prepare ranges singly.
+    /// It is not EOF. Errors/cancellation discard the entire compound attempt.
+    /// No payload copy, read-ahead, new admission or persistent cache is added.
+    /// Output reconstruction still needs headroom in the same workspace.
+    /// Callbacks must return the supplied allocations unchanged and in order;
+    /// transport and bounded request metadata are outside payload accounting.
+    ///
+    /// ```
+    /// use std::{ops::Range, sync::Arc};
+    /// use arrow_schema::DataType;
+    /// use lance_core::{Result, utils::allocation::Reservation};
+    /// use lance_encoding::{EncodingsIo, encodings::logical::primitive::AdmittedBytePageScheduler};
+    /// async fn prepare(pages: &[(Arc<AdmittedBytePageScheduler>, Range<u64>, DataType)],
+    ///     io: &dyn EncodingsIo, work: &mut Reservation) -> Result<()> {
+    ///     let inputs = AdmittedBytePageScheduler::try_prepare_fullzip_batch_in(
+    ///         pages, work, |requests| io.submit_many_into(requests, 0)).await?;
+    ///     drop(inputs); // Or decode with this same workspace.
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn try_prepare_fullzip_batch_in<F, Fut>(
+        requests: &[(Arc<Self>, Range<u64>, DataType)],
+        workspace: &mut Reservation,
+        read: F,
+    ) -> Result<Option<Vec<AdmittedBytePageInput>>>
+    where
+        F: FnMut(Vec<(Range<u64>, ReservedBuffer)>) -> Fut,
+        Fut: Future<Output = Result<Vec<ReservedBuffer>>>,
+    {
+        if !(2..=16).contains(&requests.len()) {
+            return Ok(None);
+        }
+        let mut fullzip = Vec::with_capacity(requests.len());
+        for (page, rows, data_type) in requests {
+            let Scheduler::FullZip(scheduler) = &page.0 else {
+                return Ok(None);
+            };
+            fullzip.push((scheduler.clone(), rows.clone(), data_type.clone()));
+        }
+        Ok(
+            super::fullzip_decode::array_admitted::batch::prepare(fullzip, workspace, read)
+                .await?
+                .map(|inputs| {
+                    inputs
+                        .into_iter()
+                        .map(|input| AdmittedBytePageInput(Input::FullZip(input)))
+                        .collect()
+                }),
+        )
+    }
+
     /// Prepare one exact nonempty page-local range using caller-owned I/O buffers.
     /// `None` requires dropping/replanning the complete attempt. All input, output
     /// and assembly must use this same reservation; no additional credit is awaited.
