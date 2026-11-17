@@ -1450,7 +1450,11 @@ mod tests {
     #[tokio::test]
     async fn test_forced_sort_spill_is_collected() {
         let batch = record_batch!(("x", Int32, (0..128).rev().collect::<Vec<i32>>())).unwrap();
-        let batches: Vec<_> = (0..128).map(|_| Ok(batch.clone())).collect();
+        // DataFusion accounts shared buffers once, so use distinct allocations
+        // to force spilling within the same 64 KiB pool.
+        let batches: Vec<_> = (0..128)
+            .map(|_| Ok(lance_arrow::deepcopy::deep_copy_batch(&batch).unwrap()))
+            .collect();
         let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
             batch.schema(),
             stream::iter(batches),

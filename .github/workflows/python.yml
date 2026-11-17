@@ -269,6 +269,10 @@ jobs:
         with:
           name: linux-x86_64-wheel
           path: python/target/wheels
+      - name: Install protoc for the DataFusion Python source build
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install dependencies
         run: |
           pip install $(ls target/wheels/pylance-*.whl)[tests,ray]

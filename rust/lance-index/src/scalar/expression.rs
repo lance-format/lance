@@ -7157,14 +7157,14 @@ mod planner_tests {
         vec![key_planner("ab_idx", AB)],
         &[],
         "a IN (1, 2)",
-        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)",
+        "[a IN ([Int32(1), Int32(2)])]@ab_idx(Keys)",
         None
     )]
     #[case::three_value_in_list_reaches_planners(
         vec![key_planner("ab_idx", AB)],
         &[],
         "a IN (1, 2, 3)",
-        "[a = Int32(1) OR a = Int32(2) OR a = Int32(3)]@ab_idx(Keys)",
+        "[a IN ([Int32(1), Int32(2), Int32(3)])]@ab_idx(Keys)",
         None
     )]
     #[case::not_of_boolean_key_reaches_planners(
@@ -7178,7 +7178,7 @@ mod planner_tests {
         vec![key_planner("ab_idx", AB)],
         &["c"],
         "c IN (1, 2)",
-        "OR([c = 1]@c_idx(BTree),[c = 2]@c_idx(BTree))",
+        "[c IN [1,2]]@c_idx(BTree)",
         None
     )]
     fn routes_conjuncts_to_planners(

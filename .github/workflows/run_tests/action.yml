@@ -23,6 +23,10 @@ runs:
     - name: Setup MSVC for torch.compile
       if: runner.os == 'Windows'
       uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+    - name: Install protoc for the DataFusion Python source build
+      uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+      with:
+        tool: protoc
     - name: Install dependencies
       working-directory: python
       shell: bash

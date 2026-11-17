@@ -1108,13 +1108,13 @@ impl MetricsCollector for IndexMetrics {
 }
 
 /// Minimum estimated row width, matching DataFusion's default collect thresholds:
-/// 1 MiB / 128 Ki rows = 8 bytes per row. DataFusion uses the byte threshold instead
+/// 4 MiB / 128 Ki rows = 32 bytes per row. DataFusion uses the byte threshold instead
 /// of the row threshold whenever a byte estimate is available. This floor keeps
 /// narrow schemas from admitting more rows than the default row threshold allows.
 ///
 /// Custom threshold ratios can break that agreement. This is a planning estimate,
 /// not a bound on runtime memory, which also includes allocation and join overhead.
-const MIN_BYTES_PER_ROW: f64 = 8.0;
+const MIN_BYTES_PER_ROW: f64 = 32.0;
 
 /// Whether the columns a node emits include a materialized blob payload.
 ///
@@ -2111,7 +2111,7 @@ mod tests {
         let blobless = LanceSchema::default();
         let mut fields = vec![
             Arc::new(Field::new("a", DataType::UInt32, false)),
-            Arc::new(Field::new("b", DataType::Float64, false)),
+            Arc::new(Field::new("b", DataType::FixedSizeBinary(40), false)),
         ];
         assert_eq!(
             super::estimated_bytes_per_row(
@@ -2119,7 +2119,7 @@ mod tests {
                 &blobless,
                 &MeasuredWidths::default()
             ),
-            Some(12.0)
+            Some(44.0)
         );
 
         // Empty and null-only schemas have no value or validity buffers.
@@ -2136,7 +2136,7 @@ mod tests {
             None
         );
 
-        // A partly measurable schema is seeded rather than withdrawn: 12 bytes of
+        // A partly measurable schema is seeded rather than withdrawn: 44 bytes of
         // fixed width, plus 64 of string, 4 of offset and a validity bit.
         fields.push(Arc::new(Field::new("note", DataType::Utf8, true)));
         assert_eq!(
@@ -2145,7 +2145,7 @@ mod tests {
                 &blobless,
                 &MeasuredWidths::default()
             ),
-            Some(80.125)
+            Some(112.125)
         );
     }
 
@@ -2289,11 +2289,11 @@ mod tests {
         );
 
         let measured =
-            MeasuredWidths::from_iter([(Field::new("name", DataType::Utf8, false), 20.0)]);
+            MeasuredWidths::from_iter([(Field::new("name", DataType::Utf8, false), 40.0)]);
         assert_eq!(
             super::estimated_bytes_per_row(&schema, &blobless, &measured),
-            Some(24.0),
-            "4 bytes of int plus the 20 measured for the string"
+            Some(44.0),
+            "4 bytes of int plus the 40 measured for the string, above the planning floor"
         );
     }
 
@@ -2529,6 +2529,9 @@ mod tests {
             DataType::Struct(Fields::from(vec![
                 Field::new("x", DataType::Int64, false),
                 Field::new("y", DataType::Int64, false),
+                Field::new("z", DataType::Int64, false),
+                Field::new("w", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
             ])),
             false,
         );
@@ -2537,8 +2540,8 @@ mod tests {
 
         assert_eq!(
             super::estimated_bytes_per_row(&schema, &LanceSchema::default(), &measured),
-            Some(16.0),
-            "two int64s, not the 999 measured"
+            Some(40.0),
+            "five int64s, above the planning floor, not the 999 measured"
         );
     }
 }

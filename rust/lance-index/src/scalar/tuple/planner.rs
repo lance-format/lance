@@ -1214,7 +1214,7 @@ mod tests {
     #[case::in_zero_and_one(
         "x",
         "x IN (0.0, 1.0)",
-        planned("TupleQuery[x IN (-0, 0, 1)]", &[], &[])
+        planned("TupleQuery[x IN (0, 1, -0)]", &[], &[])
     )]
     #[case::zero_before_tenant(
         "x",

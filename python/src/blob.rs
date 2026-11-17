@@ -100,10 +100,17 @@ fn descriptor_field_to_pyarrow<'py>(
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
         Ok(data) => Ok(vec![validated_blob_payload(data, None)?]),
-        Err(_) => {
+        Err(error) => {
             let pyarrow = PyModule::import(payloads.py(), "pyarrow")?;
             let chunked_array_type = pyarrow.getattr("ChunkedArray")?;
             if !payloads.is_instance(&chunked_array_type)? {
+                if payloads.is_instance(&pyarrow.getattr("Array")?)?
+                    || payloads.hasattr("__arrow_c_array__")?
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "Packed blob payload array contains invalid Arrow data: {error}"
+                    )));
+                }
                 return Err(PyValueError::new_err(format!(
                     "payloads must be a pyarrow BinaryArray, LargeBinaryArray, or ChunkedArray, got {}",
                     payloads.get_type().name()?
@@ -120,7 +127,11 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
             let chunks = payloads.getattr("chunks")?;
             let mut arrays = Vec::with_capacity(chunks.len()?);
             for (chunk_index, chunk) in chunks.try_iter()?.enumerate() {
-                let data = ArrayData::from_pyarrow_bound(&chunk?)?;
+                let data = ArrayData::from_pyarrow_bound(&chunk?).map_err(|error| {
+                    PyValueError::new_err(format!(
+                        "Packed blob payload chunk {chunk_index} contains invalid Arrow data: {error}"
+                    ))
+                })?;
                 arrays.push(validated_blob_payload(data, Some(chunk_index))?);
             }
             Ok(arrays)
@@ -139,14 +150,10 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
         )));
     }
     if data.is_empty() {
-        // PyArrow may export an empty slice without the values preceding its
-        // nonzero first offset. Normalize it because an empty array never
-        // observes those buffers, and Arrow validation would reject the slice.
+        // Empty payloads do not need to retain their exported slice buffers.
         return Ok(make_array(ArrayData::new_empty(data.data_type())));
     }
-    data.validate_full().map_err(|error| {
-        PyValueError::new_err(format!("{context} contains invalid Arrow data: {error}"))
-    })?;
+    // Arrow 60's checked Python bridge validates the data before returning it.
     Ok(make_array(data))
 }
 

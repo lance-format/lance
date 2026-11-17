@@ -5773,18 +5773,20 @@ mod tests {
                     // Loading a vector here regresses a bug found during development where the input schema
                     // to the filter exec in statistics was incorrect.
                     .union_column("vector", OnMissing::Error)
-                    .unwrap(),
+                    .unwrap()
+                    .with_row_id()
+                    .with_row_addr(),
             );
         let plan = fixture.make_plan(options).await;
         let stats = StatisticsContext::new()
             .compute(&plan, &StatisticsArgs::new())
             .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
-        assert_eq!(stats.column_statistics.len(), 1);
-        // Only the vector is projected, so only the vector is billed: 16 bytes of
-        // values, its own validity bit and one per float, or 16.625 a row.
-        // `not_indexed` is read to evaluate the filter but never output.
-        assert_eq!(stats.total_byte_size, Precision::Inexact(4157));
+        assert_eq!(stats.column_statistics.len(), 3);
+        // The vector contributes 16.625 bytes and the two nullable identities
+        // another 16.25. This exceeds the 32-byte floor, keeping an incorrect
+        // filter-input schema observable. `not_indexed` is never output.
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8219));
     }
 
     #[test_log::test(tokio::test)]

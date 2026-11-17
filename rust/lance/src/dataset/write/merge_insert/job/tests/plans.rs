@@ -45,7 +45,8 @@ async fn test_plan_upsert() {
     // 1. FullSchemaMergeInsertExec at the top
     // 2. ProjectionExec that creates action based on _rowaddr nullness (sentinel is constant
     //    true so DataFusion folds `sentinel IS NOT NULL` away from the CASE expression)
-    // 3. HashJoin with projection that includes the sentinel column
+    // 3. HashJoin collecting the target under DataFusion 56's 4 MiB threshold,
+    //    with a projection that includes the sentinel column
     // 4. LanceScan that only reads the key column (projection pushdown working!)
     // 5. ProjectionExec on the source side that materializes the sentinel literal
     assert_plan_node_equals(
@@ -53,11 +54,10 @@ async fn test_plan_upsert() {
         "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
           row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec: partitioning=Hash([key@1], ...), input_partitions=1
+        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
     ).await.unwrap();
@@ -70,7 +70,7 @@ async fn test_plan_upsert() {
 ///
 /// The target here is one row past DataFusion's
 /// `hash_join_single_partition_threshold_rows`, and its estimated width puts it
-/// past the 1 MiB byte threshold too, so the target cannot be collected on
+/// past the 4 MiB byte threshold too, so the target cannot be collected on
 /// either count. That leaves the source: a materialized one reports exact
 /// statistics and fits under the threshold, so `JoinSelection` swaps it onto
 /// the build side and rewrites `Right` into `Left`. A one-shot stream reports
@@ -88,7 +88,7 @@ async fn test_plan_upsert() {
 ///
 /// Both expectations characterise DataFusion's choice rather than any Lance
 /// logic, and Lance sets no `hash_join_single_partition_threshold*` of its own,
-/// so this rides on DataFusion's defaults (1 MiB / 128 Ki rows). A DataFusion
+/// so this rides on DataFusion's defaults (4 MiB / 128 Ki rows). A DataFusion
 /// upgrade that changes them fails this test without anything in Lance
 /// regressing, which is the point: the plan shape is what merge_insert's memory
 /// use depends on, so a silent change to it should not go unnoticed.
@@ -501,10 +501,9 @@ async fn test_fast_path_update_only() {
         "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec...
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
     ).await.unwrap();
@@ -550,10 +549,9 @@ async fn test_fast_path_conditional_update() {
         "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec...
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
     ).await.unwrap();
@@ -608,10 +606,9 @@ async fn test_fast_path_find_or_create() {
         "MergeInsert: on=[key], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 ELSE 0 END as __action]
-      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec...
+      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
     )

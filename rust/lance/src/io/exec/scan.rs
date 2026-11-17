@@ -1057,10 +1057,11 @@ mod tests {
             .compute(&scan, &StatisticsArgs::new())
             .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
-        // Nullable int32 plus a four-float vector, including estimated validity.
+        // The nullable int32 and vector occupy 20.75 bytes per row, below the
+        // 32-byte planning floor required by DataFusion 56's collect thresholds.
         assert_eq!(
             stats.total_byte_size,
-            Precision::Inexact((expected_rows as f64 * 20.75).ceil() as usize)
+            Precision::Inexact(expected_rows * 32)
         );
 
         // The estimate is only worth anything if it matches what the scan emits.
@@ -1090,7 +1091,7 @@ mod tests {
             .compute(&scan, &StatisticsArgs::new())
             .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(TOTAL_ROWS));
-        assert_eq!(stats.total_byte_size, Precision::Inexact(8300));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(TOTAL_ROWS * 32));
         assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
     }
 
@@ -1298,11 +1299,11 @@ mod tests {
             "fixture no longer emits what it claims"
         );
         assert_eq!(stats.num_rows, Precision::Exact(emitted));
-        // 4 bytes of int32 and a validity bit, plus 8 of nullable row id and a bit
-        // of its own: 12.25 bytes per row.
+        // The int32 and nullable row id occupy 12.25 bytes, so the 32-byte
+        // planning floor controls this estimate.
         assert_eq!(
             stats.total_byte_size,
-            Precision::Inexact((expected_rows as f64 * 12.25).ceil() as usize)
+            Precision::Inexact(expected_rows * 32)
         );
     }
 

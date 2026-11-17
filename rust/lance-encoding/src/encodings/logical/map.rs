@@ -462,11 +462,7 @@ mod tests {
         let struct_array = StructArray::new(
             Fields::from(vec![
                 Field::new("id", DataType::Int32, false),
-                Field::new(
-                    "properties",
-                    make_map_type(DataType::Utf8, DataType::Utf8),
-                    true,
-                ),
+                Field::new("properties", map_array.data_type().clone(), true),
             ]),
             vec![id_array, map_array],
             None,
@@ -612,11 +608,7 @@ mod tests {
         let entries_struct = StructArray::new(
             Fields::from(vec![
                 Field::new("key", DataType::Utf8, false),
-                Field::new(
-                    "value",
-                    make_map_type(DataType::Utf8, DataType::Int32),
-                    true,
-                ),
+                Field::new("value", inner_maps.data_type().clone(), true),
             ]),
             vec![outer_keys, inner_maps],
             None,

@@ -2660,7 +2660,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(error, Error::Arrow { .. }),
+            matches!(error, Error::IO { .. }),
             "unexpected low-disk error: {error:?}"
         );
         assert!(error.to_string().contains("exceeded the allowable limit"));
