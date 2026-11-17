@@ -66,6 +66,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
+mod admitted;
+pub use admitted::{AdmittedDatasetScan, AdmittedDatasetScanOutcome, AdmittedScanPosition};
 pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;

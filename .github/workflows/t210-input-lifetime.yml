@@ -25,14 +25,15 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted fragment cursor composition
+      - name: Verify admitted dataset cursor composition
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          # Existing take/materializer implementations are unchanged. Exercise
-          # cursor commit/refusal and actual overlay/deletion/placeholder composition.
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::cursor:: -- --nocapture
+          # The proven fragment cursor and materializers are unchanged. Exercise
+          # lazy multi-fragment reads, shared output ownership and open cancellation.
+          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
           cargo test --profile ci --locked -p lance --doc try_scan_admitted_fullzip -- --nocapture
+          cargo test --profile ci --locked -p lance --doc set_workspace_bytes -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
