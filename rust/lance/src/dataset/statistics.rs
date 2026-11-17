@@ -304,16 +304,59 @@ impl<'a> DatasetStatistics<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_encoding::decoder::DecoderPlugins;
+    use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::version::LanceFileVersion;
+    use lance_table::format::DataFile;
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::transaction::Operation;
+    use crate::dataset::{WriteDestination, WriteParams};
 
     use super::*;
+
+    /// Read one physical Lance file directly and return the page-buffer bytes of
+    /// each field it stores. This deliberately bypasses the dataset statistics
+    /// path so tests can check what the production collector reports.
+    async fn raw_file_field_bytes(dataset: &Dataset, data_file: &DataFile) -> BTreeMap<i32, u64> {
+        let (store, path) = dataset.resolve_data_file_location(data_file).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            store.clone(),
+            SchedulerConfig::max_bandwidth(store.as_ref()),
+        );
+        let file_scheduler = scheduler
+            .open_file(&path, &data_file.file_size_bytes)
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stats = reader.file_statistics();
+        assert_eq!(
+            data_file.fields.len(),
+            stats.columns.len(),
+            "the fixture expects one physical column per stored field, got fields {:?}",
+            data_file.fields
+        );
+        data_file
+            .fields
+            .iter()
+            .zip(stats.columns.iter())
+            .map(|(field_id, column)| (*field_id, column.size_bytes))
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_calculate_data_stats_after_dropping_wide_dataset_columns() {
@@ -365,5 +408,132 @@ mod tests {
             stats.fields[0].bytes_on_disk > 0,
             "bytes_on_disk should include the remaining column after drop_columns"
         );
+    }
+
+    #[tokio::test]
+    async fn test_calculate_data_stats_counts_overlay_bytes() {
+        let batch =
+            record_batch!(("id", Int32, [0, 1, 2, 3]), ("val", Int32, [0, 10, 20, 30])).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2, "expected two fragments");
+        let dataset = Arc::new(dataset);
+        let before = dataset.calculate_data_stats().await.unwrap();
+
+        // The collector must count every fragment, including fragment 1, which
+        // the overlay below never touches.
+        let mut raw_base: BTreeMap<i32, u64> = BTreeMap::new();
+        for fragment in dataset.fragments().iter() {
+            for data_file in &fragment.files {
+                for (field_id, bytes) in raw_file_field_bytes(&dataset, data_file).await {
+                    *raw_base.entry(field_id).or_default() += bytes;
+                }
+            }
+        }
+        let before_id = field_bytes(&before, 0);
+        let before_val = field_bytes(&before, 1);
+        assert_eq!(
+            before_id, raw_base[&0],
+            "id bytes must cover both fragments"
+        );
+        assert_eq!(
+            before_val, raw_base[&1],
+            "val bytes must cover both fragments"
+        );
+        assert!(before_val > 0);
+
+        // Overlay new values for `val` (field 1) on rows 0 and 1 of fragment 0.
+        assert!(
+            dataset
+                .get_fragment(0)
+                .unwrap()
+                .metadata()
+                .overlays
+                .is_empty()
+        );
+        let mut overlay = dataset
+            .get_fragment(0)
+            .unwrap()
+            .write_overlay(&dataset.schema().project_by_ids(&[1], true))
+            .await
+            .unwrap();
+        let values = record_batch!(("_rowaddr", UInt64, [0, 1]), ("val", Int32, [5, 15])).unwrap();
+        overlay.write_batch(&values).await.unwrap();
+        let group = overlay.finish().await.unwrap().unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset.fragments().len(),
+            2,
+            "overlay must not add fragments"
+        );
+        let overlay_file = dataset.get_fragment(0).unwrap().metadata().overlays[0]
+            .data_file
+            .clone();
+        assert!(
+            dataset
+                .get_fragment(1)
+                .unwrap()
+                .metadata()
+                .overlays
+                .is_empty(),
+            "fragment 1 must stay untouched"
+        );
+        assert_eq!(
+            overlay_file.fields.as_ref(),
+            &[1],
+            "the overlay file should hold only `val` (field 1)"
+        );
+
+        // Measure the overlay column from its raw Lance file metadata. This is
+        // independent of `calculate_data_stats` and of the field aggregation it
+        // performs.
+        let dataset = Arc::new(dataset);
+        let overlay_fields = raw_file_field_bytes(&dataset, &overlay_file).await;
+        assert_eq!(overlay_fields.len(), 1);
+        let overlay_bytes = overlay_fields[&1];
+        assert!(overlay_bytes > 0, "the overlay column has no page bytes");
+
+        let after = dataset.calculate_data_stats().await.unwrap();
+        let after_id = field_bytes(&after, 0);
+        let after_val = field_bytes(&after, 1);
+        assert_eq!(after_id, before_id, "untouched id bytes must not change");
+        assert_eq!(
+            after_val - before_val,
+            overlay_bytes,
+            "val bytes must grow by exactly the overlay column's page-buffer bytes"
+        );
+        assert_eq!(after_val, raw_base[&1] + overlay_bytes);
+    }
+
+    fn field_bytes(stats: &DataStatistics, id: u32) -> u64 {
+        stats
+            .fields
+            .iter()
+            .find(|field| field.id == id)
+            .unwrap_or_else(|| panic!("field {id} missing from data statistics"))
+            .bytes_on_disk
     }
 }

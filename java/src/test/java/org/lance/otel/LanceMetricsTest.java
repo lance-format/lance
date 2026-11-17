@@ -15,6 +15,11 @@ package org.lance.otel;
 
 import org.lance.Dataset;
 import org.lance.TestUtils;
+import org.lance.index.IndexBuildProgress;
+import org.lance.index.IndexOptions;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
 
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -25,15 +30,20 @@ import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -77,8 +87,8 @@ public class LanceMetricsTest {
       assertEquals("histogram", catalog.get(DURATION).getKind());
       assertEquals("counter", catalog.get(RETRYABLE).getKind());
       assertEquals("gauge", catalog.get(IN_FLIGHT).getKind());
-      // Memory metrics are described whether or not LANCE_MEMORY_OBSERVE is set;
-      // they only carry values while it is.
+      // Memory metrics are described whether or not memory observation is on;
+      // they stay empty until it is first switched on.
       for (String gauge : MEMORY_GAUGES) {
         assertEquals("gauge", catalog.get(gauge).getKind(), gauge);
       }
@@ -160,6 +170,47 @@ public class LanceMetricsTest {
   }
 
   @Test
+  @EnabledOnOs(OS.LINUX)
+  void testSetMemoryObservationSwitchesAtRuntime(@TempDir Path tempDir) {
+    InMemoryMetricReader reader = InMemoryMetricReader.create();
+    SdkMeterProvider provider = SdkMeterProvider.builder().registerMetricReader(reader).build();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      assertTrue(LanceMetrics.instrument(provider));
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(
+              allocator, tempDir.resolve("memory_switch.lance").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 16)) {
+        long builds = observedPeaks(MEMORY_OPERATION_PEAK);
+        long stages = observedPeaks(MEMORY_STAGE_PEAK);
+
+        LanceMetrics.setMemoryObservation(true);
+        assertTrue(memoryGauge("lance_memory_rss_bytes") > 0);
+
+        // The build checks the switch before its first stage, so it reports in
+        // full although observation is switched off while it runs.
+        AtomicLong buildsAtSwitch = new AtomicLong(-1);
+        dataset.createIndex(btreeOptions(), switchingProgress(false, buildsAtSwitch));
+        assertEquals(builds, buildsAtSwitch.get());
+        assertEquals(builds + 1, observedPeaks(MEMORY_OPERATION_PEAK));
+        assertTrue(observedPeaks(MEMORY_STAGE_PEAK) > stages);
+        stages = observedPeaks(MEMORY_STAGE_PEAK);
+
+        // A build that starts while observation is off reports nothing, even if
+        // observation is switched on while it runs.
+        dataset.createIndex(btreeOptions());
+        dataset.createIndex(btreeOptions(), switchingProgress(true, new AtomicLong()));
+        assertEquals(builds + 1, observedPeaks(MEMORY_OPERATION_PEAK));
+        assertEquals(stages, observedPeaks(MEMORY_STAGE_PEAK));
+      }
+    } finally {
+      LanceMetrics.setMemoryObservation(false);
+      provider.close();
+    }
+  }
+
+  @Test
   void testSupportedMetricsSkipsUnknownKinds() {
     MetricDescription counter = new MetricDescription("counter", "counter", null, "counter");
     MetricDescription unknown = new MetricDescription("unknown", "summary", null, "unknown");
@@ -179,6 +230,51 @@ public class LanceMetricsTest {
         assertEquals(0, dataset.countRows());
       }
     }
+  }
+
+  private static IndexOptions btreeOptions() {
+    IndexParams params =
+        IndexParams.builder()
+            .setScalarIndexParams(ScalarIndexParams.create("btree", "{\"zone_size\": 2048}"))
+            .build();
+    return IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, params)
+        .replace(true)
+        .build();
+  }
+
+  /** Progress that switches memory observation as a stage starts. */
+  private static IndexBuildProgress switchingProgress(boolean enabled, AtomicLong buildsAtSwitch) {
+    return new IndexBuildProgress() {
+      @Override
+      public void stageStart(String stage, Optional<Long> total, String unit) {
+        buildsAtSwitch.set(observedPeaks(MEMORY_OPERATION_PEAK));
+        LanceMetrics.setMemoryObservation(enabled);
+      }
+
+      @Override
+      public void stageProgress(String stage, long completed) {}
+
+      @Override
+      public void stageComplete(String stage) {}
+    };
+  }
+
+  /** How many BTree builds, or stages of them, have reported a peak to {@code name}. */
+  private static long observedPeaks(String name) {
+    return LanceMetrics.snapshot().stream()
+        .filter(point -> name.equals(point.getName()))
+        .filter(point -> "create_index".equals(point.getAttributes().get("operation")))
+        .filter(point -> "btree".equals(point.getAttributes().get("index_type")))
+        .mapToLong(MetricPoint::getCount)
+        .sum();
+  }
+
+  private static double memoryGauge(String name) {
+    return LanceMetrics.snapshot().stream()
+        .filter(point -> name.equals(point.getName()))
+        .map(MetricPoint::getValue)
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("expected the gauge " + name));
   }
 
   private static Set<String> metricNames(InMemoryMetricReader reader) {

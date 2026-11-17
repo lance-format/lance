@@ -1251,8 +1251,11 @@ async fn row_ids_for_mask(
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                capacity -= block_list.len().expect("unknown block list len") as usize;
+                let capacity: usize = sequences.iter().map(|seq| seq.len() as usize).sum();
+                // The block list comes from the whole index, so it can name more
+                // rows than `fragments` holds when the scan covers a subset.
+                let capacity = capacity
+                    .saturating_sub(block_list.len().expect("unknown block list len") as usize);
                 let mut row_ids = Vec::with_capacity(capacity);
                 for sequence in sequences {
                     row_ids.extend(

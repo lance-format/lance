@@ -23,7 +23,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let read_fragments = is_create_index.then(|| dataset.fragments().clone());
+                let read_fragments = is_create_index.then(|| ReadFragments {
+                    fragments: dataset.fragments().clone(),
+                    moved_files: None,
+                });
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
@@ -149,7 +152,7 @@ impl<'a> TransactionRebase<'a> {
                     staged_replay: false,
                 })
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 let modified_fragment_ids =
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
@@ -249,7 +252,10 @@ impl<'a> TransactionRebase<'a> {
     /// removed fields when compared with the latest version.
     pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
         if matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
-            self.read_fragments = Some(dataset.fragments().clone());
+            self.read_fragments = Some(ReadFragments {
+                fragments: dataset.fragments().clone(),
+                moved_files: None,
+            });
             self.read_schema = Some(dataset.schema().clone());
         }
         self
@@ -322,6 +328,18 @@ impl<'a> TransactionRebase<'a> {
         }
         self.untagged_reuse = Some(Box::new(reuse));
         Ok(())
+    }
+
+    /// Record the files `data_change: false` replacements write in the
+    /// transactions checked next, so that the finish keeps an index's coverage
+    /// of values they only moved. Call it only when those transactions are
+    /// every version since the read version: the finish compares against the
+    /// read version's fragments, so a change the checks did not see could lie
+    /// under any moved file.
+    pub(crate) fn track_moved_files(&mut self) {
+        if let Some(read) = &mut self.read_fragments {
+            read.moved_files = Some(HashMap::new());
+        }
     }
 
     /// Handle gaps in the transaction history required to safely rebase.
