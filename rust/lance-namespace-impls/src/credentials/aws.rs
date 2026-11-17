@@ -336,11 +336,13 @@ impl AwsCredentialVendor {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        // STS accepts only ASCII `[\w+=,.@-]` in a role session name, so keep
-        // just those characters of the subject.
+        // Sanitize for role session name (ASCII alphanumeric, =, @, -, .): STS
+        // rejects non-ASCII characters.
         let sanitized: String = subject
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(*c))
+            .filter(|c| {
+                c.is_ascii_alphanumeric() || *c == '=' || *c == '@' || *c == '-' || *c == '.'
+            })
             .collect();
 
         Self::cap_session_name(&format!("lance-{}", sanitized))
@@ -843,7 +845,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::cjk_sub(r#"{"sub":"用戶名稱測試資料用戶名稱測試資料再加四字"}"#, "lance-")]
-    #[case::mixed_sub(r#"{"sub":"張三_zhang+san,1"}"#, "lance-_zhang+san,1")]
+    #[case::mixed_sub(r#"{"sub":"張三.zhang@example.com"}"#, "lance-.zhang@example.com")]
     #[case::long_email(
         r#"{"email":"a.very.long.mailbox.name.for.testing@example-subdomain.example.com"}"#,
         "lance-a.very.long.mailbox.name.for.testing@example-subdomain.exa"
@@ -860,7 +862,7 @@ mod tests {
             session_name.len() <= 64
                 && session_name
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c)),
+                    .all(|c| c.is_ascii_alphanumeric() || "=.@-".contains(c)),
             "STS rejects session name {session_name:?}"
         );
     }
