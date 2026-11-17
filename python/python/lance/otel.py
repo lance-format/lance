@@ -94,10 +94,15 @@ def instrument_lance_metrics(meter_provider: Optional["MeterProvider"] = None) -
     meter = provider.get_meter("lance")
 
     def scalar_callback(metric_name: str):
+        refresh_heap = metric_name in {
+            "lance_memory_heap_in_use_bytes",
+            "lance_memory_heap_free_bytes",
+        }
+
         def callback(_options):
             return [
                 Observation(point.value, point.attributes)
-                for point in snapshot_lance_metrics()
+                for point in snapshot_lance_metrics(refresh_heap=refresh_heap)
                 if point.name == metric_name and point.value is not None
             ]
 
@@ -106,7 +111,7 @@ def instrument_lance_metrics(meter_provider: Optional["MeterProvider"] = None) -
     def bucket_callback(metric_name: str):
         def callback(_options):
             observations = []
-            for point in snapshot_lance_metrics():
+            for point in snapshot_lance_metrics(refresh_heap=False):
                 if point.name != metric_name or point.buckets is None:
                     continue
                 for le, cumulative in point.buckets:
@@ -120,7 +125,7 @@ def instrument_lance_metrics(meter_provider: Optional["MeterProvider"] = None) -
     def field_callback(metric_name: str, field: str):
         def callback(_options):
             observations = []
-            for point in snapshot_lance_metrics():
+            for point in snapshot_lance_metrics(refresh_heap=False):
                 if point.name != metric_name:
                     continue
                 value = getattr(point, field)
@@ -186,6 +191,7 @@ def set_memory_observation(enabled: bool) -> None:
     with it, and a worker started with ``spawn`` or ``forkserver`` follows its
     own environment. On Linux, observation reads the process and cgroup memory,
     keeps the peak of every operation and stage, and emits the memory events.
+    On GNU/Linux with glibc 2.33 or newer it also reads heap memory.
     Events need no recorder; the gauges and histograms need the ``metrics``
     feature and a recorder, so call :func:`instrument_lance_metrics` before the
     operations to observe. The component gauge is independent of the platform,

@@ -16,8 +16,10 @@
 //!   feature, as the peak of every stage and of the whole build next to gauges
 //!   for the process and its cgroup.
 //!
-//! Readings come from `/proc` and cgroupfs, so observation is available on
-//! Linux only.
+//! Process and cgroup readings come from `/proc` and cgroupfs, so they are
+//! available on Linux only. The Python and Java bridges additionally pass
+//! [`read_glibc_heap`] to [`refresh_metrics_with_heap`] to report allocator
+//! statistics on GNU/Linux.
 //!
 //! On every platform, the same switch and feature also report how many bytes
 //! the I/O schedulers, the DataFusion memory pools that Lance builds from its
@@ -40,16 +42,18 @@
 mod cgroup;
 mod components;
 mod events;
+mod heap;
 mod observer;
 mod proc;
 mod report;
 mod telemetry;
 
 pub use components::{Component, register_component};
+pub use heap::{HeapMemory, HeapProvider, read_glibc_heap};
 pub use observer::{MemoryObserver, OBSERVE_ENV_VAR, StageWindow, set_observation};
 pub use report::OperationReport;
 pub use telemetry::{
-    METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_COMPONENT, METRIC_OPERATION_PEAK, METRIC_RSS,
-    METRIC_RSS_PEAK, METRIC_STAGE_PEAK, PEAK_BOUNDS, describe_metrics, histogram_bounds,
-    refresh_metrics,
+    METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_COMPONENT, METRIC_HEAP_FREE, METRIC_HEAP_IN_USE,
+    METRIC_OPERATION_PEAK, METRIC_RSS, METRIC_RSS_PEAK, METRIC_STAGE_PEAK, PEAK_BOUNDS,
+    describe_metrics, histogram_bounds, refresh_metrics, refresh_metrics_with_heap,
 };
