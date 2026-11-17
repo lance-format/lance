@@ -25,15 +25,13 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify admitted dataset cursor composition
+      - name: Verify dataset benchmark harness correctness
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          # The proven fragment cursor and materializers are unchanged. Exercise
-          # lazy multi-fragment reads, shared output ownership and open cancellation.
-          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
-          cargo test --profile ci --locked -p lance --doc try_scan_admitted_fullzip -- --nocapture
-          cargo test --profile ci --locked -p lance --doc set_workspace_bytes -- --nocapture
+          # No benchmark timing/RSS measurement runs in CI. Validate immutable
+          # fixtures and full output/order/hash equivalence of both real paths.
+          cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
