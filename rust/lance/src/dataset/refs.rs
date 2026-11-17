@@ -472,13 +472,13 @@ impl Branches<'_> {
         }
     }
 
-    // Only create branch metadata
+    // Only create branch metadata, returning the contents that were written
     pub(crate) async fn create(
         &self,
         branch_name: &str,
         version_number: u64,
         source_branch: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<BranchContents> {
         check_valid_branch(branch_name)?;
 
         let source_branch = source_branch.and_then(standardize_branch);
@@ -540,7 +540,8 @@ impl Branches<'_> {
             serde_json::to_vec_pretty(&branch_contents)?,
             format!("branch {} already exists", branch_name),
         )
-        .await
+        .await?;
+        Ok(branch_contents)
     }
 
     pub async fn replace_metadata(
@@ -1188,6 +1189,43 @@ pub struct BranchContents {
     /// Missing metadata is deserialized as an empty map.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+}
+
+/// A branch name reserved by [`Dataset::reserve_branch`](crate::Dataset::reserve_branch)
+/// whose branch dataset has not been cloned yet.
+///
+/// Pass it to [`Dataset::complete_branch`](crate::Dataset::complete_branch) to clone the
+/// reserved source version, or delete the branch to abandon the reservation.
+#[derive(Debug)]
+#[must_use = "a reserved branch keeps its name until it is completed or deleted"]
+pub struct BranchReservation {
+    pub(crate) branch: String,
+    pub(crate) source_branch: Option<String>,
+    pub(crate) source_version: u64,
+    pub(crate) identifier: BranchIdentifier,
+}
+
+impl BranchReservation {
+    /// Name of the reserved branch.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Branch that holds the source version. `None` and `Some("main")` both refer to
+    /// the default branch.
+    pub fn source_branch(&self) -> Option<&str> {
+        self.source_branch.as_deref()
+    }
+
+    /// Version the branch will be cloned from.
+    pub fn source_version(&self) -> u64 {
+        self.source_version
+    }
+
+    /// Identifier written to the branch metadata when the name was reserved.
+    pub fn identifier(&self) -> &BranchIdentifier {
+        &self.identifier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
