@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use lance_core::datatypes::{Field as LanceField, Schema};
 use lance_file::version::ConcreteFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_table::format::{DataFile, Fragment};
 
 use super::{CompactionMetrics, CompactionOptions, RepackedFiles, RewriteResult, TaskData};
@@ -256,6 +257,11 @@ pub(super) async fn execute_repack(
     let source = FileFragment::new(Arc::new(dataset.clone()), base);
     let schema = dataset.schema();
     let batch_size = options.batch_size.map(|size| size as u32);
+    // The writer options `rewrite_files` uses.
+    let file_writer_options = FileWriterOptions {
+        data_cache_bytes: options.data_cache_bytes,
+        ..Default::default()
+    };
 
     let mut written: Vec<DataFile> = Vec::with_capacity(files.len());
     for column_ids in files {
@@ -265,7 +271,16 @@ pub(super) async fn execute_repack(
             .filter(|field| column_ids.contains(&field.id))
             .map(|field| field.name.as_str())
             .collect();
-        match write_one_file(&source, schema, &names, batch_size, write_version).await {
+        let file = write_one_file(
+            &source,
+            schema,
+            &names,
+            batch_size,
+            write_version,
+            &file_writer_options,
+        )
+        .await;
+        match file {
             Ok(file) => written.push(file),
             Err(err) => {
                 discard(dataset, fragment.id, written).await;
@@ -316,6 +331,7 @@ async fn write_one_file(
     columns: &[&str],
     batch_size: Option<u32>,
     write_version: ConcreteFileVersion,
+    file_writer_options: &FileWriterOptions,
 ) -> Result<DataFile> {
     let write_schema = schema.project(columns)?;
     let mut updater = source
@@ -327,6 +343,7 @@ async fn write_one_file(
             write_version,
         )
         .await?;
+    updater.set_file_writer_options(file_writer_options.clone());
     let finished: Result<Fragment> = async {
         while let Some(batch) = updater.next().await?.cloned() {
             updater.update(batch).await?;
