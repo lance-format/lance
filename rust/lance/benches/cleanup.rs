@@ -25,6 +25,8 @@
 //! - `CLEANUP_BENCH_ORPHANS`: number of orphan files (default: 2000, minimum: 1).
 //! - `CLEANUP_BENCH_VERSIONS`: number of dataset versions (default: 200, minimum: 2).
 //! - `CLEANUP_BENCH_SAMPLE_SIZE`: criterion sample size (default: 10, minimum: 10).
+//! - `CLEANUP_BENCH_LIST_LATENCY_MICROS`: modeled round-trip latency charged to
+//!   every LIST during the timed cleanup (default: 0, i.e. a local store).
 //! - `CLEANUP_BENCH_SKIP_ORPHANS`: set to 1/true/yes to skip the orphan scenario.
 //! - `CLEANUP_BENCH_SKIP_VERSIONS`: set to 1/true/yes to skip the version scenario.
 //!
@@ -32,10 +34,22 @@
 //! back to a default or resizing the requested workload. Skip flags also accept
 //! 0/false/no to run the scenario; other values are rejected.
 //!
+//! ## Modeling object-store listing latency
+//!
+//! Cleanup issues one recursive LIST per managed subtree (`_versions`,
+//! `_transactions`, `data`, `_blobs`, `_indices`, `_deletions`, and `_fri` when
+//! it exists). On a remote object store each of those pays a round trip; on a
+//! local filesystem it does not. `CLEANUP_BENCH_LIST_LATENCY_MICROS` charges
+//! each LIST a fixed delay so the benchmark can show what overlapping the
+//! subtrees is worth once listing latency stops being free. It is applied only
+//! inside the timed region, so dataset setup is unaffected.
+//!
 //! Run with:
 //!
 //! ```bash
 //! cargo bench --bench cleanup
+//! # With a modeled 1 ms LIST round trip (roughly a same-region object store):
+//! CLEANUP_BENCH_LIST_LATENCY_MICROS=1000 cargo bench --bench cleanup
 //! ```
 
 #![allow(clippy::print_stderr)]
@@ -43,6 +57,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema};
@@ -89,16 +104,46 @@ struct DeleteCountSnapshot {
     delete_paths: u64,
 }
 
-/// A pass-through object store that counts how cleanup deletes files.
+/// Modeled LIST round-trip latency, in nanoseconds.
+///
+/// The benchmark flips this on only around the timed cleanup call so that
+/// dataset setup keeps running against an unthrottled store.
+#[derive(Debug, Default)]
+struct ListLatency {
+    nanos: AtomicU64,
+}
+
+impl ListLatency {
+    fn set(&self, latency: Duration) {
+        self.nanos.store(
+            latency.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn get(&self) -> Duration {
+        Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+}
+
+/// A pass-through object store that counts how cleanup deletes files and can
+/// charge a modeled latency to every LIST.
 ///
 /// Every delete eventually goes through `delete_stream` at this layer, so the
 /// counter sees one call per single-file delete and one call per bulk
 /// delete. The wrapper does not change which paths are deleted, so the same
 /// benchmark works for both implementations.
+///
+/// `list_latency` stands in for the round trip an object store spends on a
+/// LIST. Cleanup issues one LIST per managed subtree, so a serial merge pays
+/// it once per subtree while a concurrent merge overlaps them. Local
+/// filesystems have no such round trip, which is why the numbers without a
+/// modeled latency do not show the effect this change targets.
 #[derive(Debug)]
 struct CountingStore {
     inner: Arc<dyn OSObjectStore>,
     counters: Arc<DeleteCounters>,
+    list_latency: Arc<ListLatency>,
 }
 
 impl std::fmt::Display for CountingStore {
@@ -153,7 +198,18 @@ impl OSObjectStore for CountingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.inner.list(prefix)
+        // Read the latency when the LIST starts, not when the stream is
+        // created: cleanup builds its per-subtree streams up front, and only
+        // the timed call should see the modeled round trip.
+        let latency = Arc::clone(&self.list_latency);
+        let inner = Arc::clone(&self.inner);
+        let prefix = prefix.cloned();
+        futures::stream::once(async move {
+            tokio::time::sleep(latency.get()).await;
+            inner.list(prefix.as_ref())
+        })
+        .flatten()
+        .boxed()
     }
 
     fn list_with_offset(
@@ -180,6 +236,7 @@ impl OSObjectStore for CountingStore {
 #[derive(Debug, Clone)]
 struct CountingStoreWrapper {
     counters: Arc<DeleteCounters>,
+    list_latency: Arc<ListLatency>,
 }
 
 impl WrappingObjectStore for CountingStoreWrapper {
@@ -191,6 +248,7 @@ impl WrappingObjectStore for CountingStoreWrapper {
         Arc::new(CountingStore {
             inner: original,
             counters: Arc::clone(&self.counters),
+            list_latency: Arc::clone(&self.list_latency),
         })
     }
 
@@ -238,13 +296,19 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
 /// manifest, leaving cleanup nothing to delete besides manifests. The
 /// `file-object-store://` scheme keeps writes on the object-store path so that
 /// the delete counter observes cleanup's requests.
-async fn write_dataset(dir: &TempDir, counters: Arc<DeleteCounters>, versions: usize) -> Dataset {
+async fn write_dataset(
+    dir: &TempDir,
+    counters: Arc<DeleteCounters>,
+    list_latency: Arc<ListLatency>,
+    versions: usize,
+) -> Dataset {
     let uri = file_object_store_uri(&dir.path().join("db"));
     let write_params = || WriteParams {
         mode: WriteMode::Overwrite,
         store_params: Some(ObjectStoreParams {
             object_store_wrapper: Some(Arc::new(CountingStoreWrapper {
                 counters: Arc::clone(&counters),
+                list_latency: Arc::clone(&list_latency),
             })),
             ..Default::default()
         }),
@@ -263,17 +327,23 @@ async fn write_dataset(dir: &TempDir, counters: Arc<DeleteCounters>, versions: u
     dataset
 }
 
-async fn setup_versions(versions: usize) -> (TempDir, Dataset, Arc<DeleteCounters>) {
+async fn setup_versions(
+    versions: usize,
+    list_latency: Arc<ListLatency>,
+) -> (TempDir, Dataset, Arc<DeleteCounters>) {
     let dir = TempDir::new().unwrap();
     let counters = Arc::new(DeleteCounters::default());
-    let dataset = write_dataset(&dir, Arc::clone(&counters), versions).await;
+    let dataset = write_dataset(&dir, Arc::clone(&counters), list_latency, versions).await;
     (dir, dataset, counters)
 }
 
-async fn setup_orphans(orphans: usize) -> (TempDir, Dataset, Arc<DeleteCounters>) {
+async fn setup_orphans(
+    orphans: usize,
+    list_latency: Arc<ListLatency>,
+) -> (TempDir, Dataset, Arc<DeleteCounters>) {
     let dir = TempDir::new().unwrap();
     let counters = Arc::new(DeleteCounters::default());
-    let dataset = write_dataset(&dir, Arc::clone(&counters), 1).await;
+    let dataset = write_dataset(&dir, Arc::clone(&counters), list_latency, 1).await;
     let data_dir = dataset.data_dir();
     let store = dataset.object_store(None).await.unwrap();
 
@@ -320,6 +390,23 @@ fn env_usize(name: &str, default: usize, minimum: usize) -> usize {
         "{name} must be at least {minimum}, got {value}"
     );
     value
+}
+
+/// Modeled LIST round-trip latency, in microseconds.
+///
+/// A remote object store spends a real round trip on every LIST page; a local
+/// filesystem does not. Setting this charges each LIST a fixed delay so the
+/// benchmark can show what overlapping the managed subtrees is worth once
+/// listing latency stops being free.
+fn env_duration(name: &str) -> Duration {
+    let micros = match std::env::var(name) {
+        Ok(value) => value.parse::<u64>().unwrap_or_else(|_| {
+            panic!("{name} must be an integer number of microseconds, got {value:?}")
+        }),
+        Err(std::env::VarError::NotPresent) => return Duration::ZERO,
+        Err(error) => panic!("failed to read {name}: {error}"),
+    };
+    Duration::from_micros(micros)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -393,20 +480,27 @@ fn report_once(
 fn bench_cleanup(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
     let sample_size = env_usize("CLEANUP_BENCH_SAMPLE_SIZE", 10, 10);
+    let list_latency = env_duration("CLEANUP_BENCH_LIST_LATENCY_MICROS");
     let mut group = c.benchmark_group("cleanup");
     group.sample_size(sample_size);
 
     if !env_flag("CLEANUP_BENCH_SKIP_ORPHANS") {
         let orphans = env_usize("CLEANUP_BENCH_ORPHANS", 2000, 1);
         let reported = AtomicBool::new(false);
+        let latency = Arc::new(ListLatency::default());
+        let setup_latency = Arc::clone(&latency);
         group.bench_function(BenchmarkId::new("orphans", orphans), |b| {
             b.iter_batched(
-                || runtime.block_on(setup_orphans(orphans)),
+                || runtime.block_on(setup_orphans(orphans, Arc::clone(&setup_latency))),
                 |(dir, dataset, counters)| {
                     counters.reset();
+                    // Charge the modeled LIST round trip only to the timed
+                    // region; setup above stays unthrottled.
+                    latency.set(list_latency);
                     let stats = runtime
                         .block_on(dataset.cleanup(orphans_policy()).execute())
                         .unwrap();
+                    latency.set(Duration::ZERO);
                     let counts = counters.snapshot();
                     report_once(&reported, "orphans", orphans, &stats, counts);
                     // Return the fixture so Criterion drops it after the timed
@@ -422,14 +516,18 @@ fn bench_cleanup(c: &mut Criterion) {
     if !env_flag("CLEANUP_BENCH_SKIP_VERSIONS") {
         let versions = env_usize("CLEANUP_BENCH_VERSIONS", 200, 2);
         let reported = AtomicBool::new(false);
+        let latency = Arc::new(ListLatency::default());
+        let setup_latency = Arc::clone(&latency);
         group.bench_function(BenchmarkId::new("versions", versions), |b| {
             b.iter_batched(
-                || runtime.block_on(setup_versions(versions)),
+                || runtime.block_on(setup_versions(versions, Arc::clone(&setup_latency))),
                 |(dir, dataset, counters)| {
                     counters.reset();
+                    latency.set(list_latency);
                     let stats = runtime
                         .block_on(dataset.cleanup(versions_policy(&dataset)).execute())
                         .unwrap();
+                    latency.set(Duration::ZERO);
                     let counts = counters.snapshot();
                     report_once(&reported, "versions", versions, &stats, counts);
                     (dir, dataset, stats, counts)
