@@ -136,7 +136,7 @@ mod tests {
         survivors, table, transition,
     };
     use crate::transaction::action::test_support::{apply_with_indices, footprint};
-    use crate::transaction::action::{Action, RemoveFragment, SetDeletionFile};
+    use crate::transaction::action::{Action, AddOverlays, RemoveFragment, SetDeletionFile};
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
     use std::sync::Arc;
@@ -265,6 +265,34 @@ mod tests {
                 num_deleted_rows: 1,
             }]
         );
+    }
+
+    fn delete_one_row(fragment: u64) -> Action {
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment,
+            deletion_file: DeletionFile {
+                read_version: 1,
+                id: 1,
+                file_type: DeletionFileType::Array,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                inline: None,
+            },
+            data_change: true,
+            base: None,
+        })
+    }
+
+    fn overlay_one_row(fragment: u64) -> Action {
+        Action::AddOverlays(AddOverlays {
+            fragment: Ref::Committed(fragment),
+            overlays: vec![DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("o.lance", vec![0], None),
+                coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+                committed_version: 1,
+            }],
+            data_change: true,
+        })
     }
 
     fn reserved_destination(manifest: &mut Manifest) -> u64 {
@@ -401,6 +429,25 @@ mod tests {
         },
         "data overlay files"
     )]
+    // The deletion is honored: the destination and bitmap leave the row out.
+    #[case::source_given_a_deletion_earlier_in_the_operation(
+        |_: &mut Manifest, actions: &mut Vec<Action>| {
+            actions.insert(0, delete_one_row(0));
+            if let Action::AddFragment(add) = &mut actions[3] {
+                add.physical_rows = 2 * ROWS - 1;
+            }
+            if let Action::AppendFragReuseTransition(t) = &mut actions[5] {
+                t.mapping = ordered(survivors(&[0, 1], &[(0, 3)]));
+            }
+        },
+        "modified before removing it"
+    )]
+    #[case::source_given_an_overlay_earlier_in_the_operation(
+        |_: &mut Manifest, actions: &mut Vec<Action>| {
+            actions.insert(0, overlay_one_row(0));
+        },
+        "modified before removing it"
+    )]
     fn test_a_transition_apply_rejects(
         #[case] change: fn(&mut Manifest, &mut Vec<Action>),
         #[case] expected: &str,
@@ -427,6 +474,29 @@ mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    /// Changing a fragment the transition does not consume leaves the
+    /// transition as it would be alone.
+    #[rstest]
+    #[case::deletion(delete_one_row(2))]
+    #[case::overlay(overlay_one_row(2))]
+    fn test_a_transition_beside_a_change_to_another_fragment(#[case] change: Action) {
+        let mut actions = vec![change];
+        actions.extend(compaction(
+            &[0, 1],
+            0,
+            false,
+            Some(ordered(survivors(&[0, 1], &[]))),
+        ));
+
+        let (_, indices) = commit(&table(3, false), actions, Vec::new()).unwrap();
+
+        let (_, _, transitions) = read_history(&indices).unwrap();
+        assert_eq!(
+            transitions[0].sources,
+            vec![digest(0, ROWS), digest(1, ROWS)]
+        );
     }
 
     /// The history translates row addresses, so it cannot record moves on a
