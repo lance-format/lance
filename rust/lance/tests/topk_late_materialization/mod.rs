@@ -28,7 +28,7 @@ use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
 };
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
+use datafusion::physical_optimizer::sanity_checker::check_plan_tree_sanity;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -218,8 +218,7 @@ async fn sql_topk_keeps_its_ordering_for_the_parent() {
     let shown = displayable(rewritten.as_ref()).indent(true).to_string();
 
     assert_eq!(take_output_rows(&rewritten), [20], "{shown}");
-    SanityCheckPlan::new()
-        .optimize(rewritten, &ConfigOptions::default())
+    check_plan_tree_sanity(&rewritten, &ConfigOptions::default().optimizer)
         .unwrap_or_else(|e| panic!("{e}\n{shown}"));
     assert_eq!(actual, expected, "{shown}");
 }
@@ -354,7 +353,9 @@ async fn sql_limit_covering_the_table_is_left_alone() {
 }
 
 fn erase_metadata(schema: &Schema) -> Schema {
-    schema.clone().with_metadata(Default::default())
+    schema
+        .clone()
+        .with_metadata(arrow_schema::Metadata::default())
 }
 
 /// A node a `TableProvider` wraps around the Lance scan, which drops the
@@ -805,8 +806,7 @@ async fn sort_stays_above_a_take_that_extends_a_struct(#[case] field_name: &str)
         .optimize(make_plan(), &ConfigOptions::default())
         .unwrap();
     let shown = displayable(optimized.as_ref()).indent(true).to_string();
-    SanityCheckPlan::new()
-        .optimize(optimized.clone(), &ConfigOptions::default())
+    check_plan_tree_sanity(&optimized, &ConfigOptions::default().optimizer)
         .unwrap_or_else(|e| panic!("{e}\n{shown}"));
     assert_eq!(execute(optimized).await, expected, "{shown}");
 }
