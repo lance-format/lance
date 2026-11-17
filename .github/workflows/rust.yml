@@ -206,7 +206,7 @@ jobs:
     name: Arrow ordering compatibility
     needs: arrow-ordering-detect
     if: needs.arrow-ordering-detect.outputs.run == 'true'
-    runs-on: "ubuntu-24.04-8x"
+    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-8x' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -271,7 +271,7 @@ jobs:
           cargo test --profile ci --locked -p lance --test arrow_ordering
 
   linux-build:
-    runs-on: "ubuntu-24.04-8x"
+    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-8x' || 'ubuntu-24.04' }}
     timeout-minutes: 75
     env:
       # Need up-to-date compilers for kernels
@@ -330,7 +330,7 @@ jobs:
           files: target/nextest/ci/junit.xml
 
   linux-arm:
-    runs-on: ubuntu-24.04-arm64-8x
+    runs-on: ${{ github.repository == 'lance-format/lance' && 'ubuntu-24.04-arm64-8x' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

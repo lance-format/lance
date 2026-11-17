@@ -42,7 +42,7 @@ jobs:
       working-directory: python
       shell: bash
       run: |
-        pip3 install jupyter duckdb>=0.7
+        pip3 install jupyter pandas "duckdb>=0.7"
         pip3 install $(ls target/wheels/*.whl)
     - name: Run python tests
       shell: bash
