@@ -336,40 +336,19 @@ impl AwsCredentialVendor {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        // Sanitize for role session name (alphanumeric, =, @, -, .)
+        // STS accepts only ASCII `[\w+=,.@-]` in a role session name, so keep
+        // just those characters of the subject.
         let sanitized: String = subject
             .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '=' || *c == '@' || *c == '-' || *c == '.')
+            .filter(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(*c))
             .collect();
 
-        let session_name = format!("lance-{}", sanitized);
-
-        // Cap to 64 chars (AWS limit). Back the cut index down to the
-        // nearest char boundary: subjects may carry multi-byte UTF-8 (e.g.
-        // CJK 'sub' claims) and slicing at byte 64 panics mid-character.
-        if session_name.len() > 64 {
-            let mut end = 64;
-            while !session_name.is_char_boundary(end) {
-                end -= 1;
-            }
-            session_name[..end].to_string()
-        } else {
-            session_name
-        }
+        Self::cap_session_name(&format!("lance-{}", sanitized))
     }
 
-    /// Cap a session name to 64 characters (AWS limit).
+    /// Cap a session name to 64 bytes (AWS limit) without splitting a character.
     fn cap_session_name(name: &str) -> String {
-        // Same char-boundary walk-back as `derive_session_name_from_token`.
-        if name.len() > 64 {
-            let mut end = 64;
-            while !name.is_char_boundary(end) {
-                end -= 1;
-            }
-            name[..end].to_string()
-        } else {
-            name.to_string()
-        }
+        name[..name.floor_char_boundary(64)].to_string()
     }
 
     /// Extract credentials from an STS Credentials response.
@@ -862,31 +841,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_session_name_truncates_on_char_boundaries() {
-        // A JWT whose decoded 'sub' claim is 20 CJK chars (60 bytes) makes
-        // "lance-<sub>" 66 bytes with byte 64 landing mid-character, so a
-        // truncating byte slice at 64 panics. The header/signature segments
-        // are never parsed, so any non-empty fillers work.
-        let payload =
-            URL_SAFE_NO_PAD.encode(r#"{"sub":"用戶名稱測試資料用戶名稱測試資料再加四字"}"#);
-        let jwt = format!("header.{}.signature", payload);
-
+    #[rstest::rstest]
+    #[case::cjk_sub(r#"{"sub":"用戶名稱測試資料用戶名稱測試資料再加四字"}"#, "lance-")]
+    #[case::mixed_sub(r#"{"sub":"張三_zhang+san,1"}"#, "lance-_zhang+san,1")]
+    #[case::long_email(
+        r#"{"email":"a.very.long.mailbox.name.for.testing@example-subdomain.example.com"}"#,
+        "lance-a.very.long.mailbox.name.for.testing@example-subdomain.exa"
+    )]
+    fn test_session_name_from_token_is_valid_for_sts(
+        #[case] payload: &str,
+        #[case] expected: &str,
+    ) {
+        // The header and signature segments are never parsed.
+        let jwt = format!("header.{}.signature", URL_SAFE_NO_PAD.encode(payload));
         let session_name = AwsCredentialVendor::derive_session_name_from_token(&jwt);
+        assert_eq!(session_name, expected);
         assert!(
-            session_name.starts_with("lance-"),
-            "unexpected session name: {session_name}"
+            session_name.len() <= 64
+                && session_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c)),
+            "STS rejects session name {session_name:?}"
         );
-        assert!(
-            session_name.len() <= 64,
-            "session name exceeds 64 bytes: {session_name}"
-        );
+    }
 
-        // Operator-supplied role session names go through the same kind of
-        // 64-limit truncation and must not slice mid-character either.
-        let long_cjk_name = format!("{}a", "中".repeat(23)); // 70 bytes
-        let capped = AwsCredentialVendor::cap_session_name(&long_cjk_name);
-        assert!(capped.len() <= 64, "capped name exceeds 64 bytes: {capped}");
+    #[test]
+    fn test_cap_session_name_keeps_whole_characters() {
+        // Operator-configured names are not sanitized; byte 64 falls inside a
+        // three-byte character here.
+        let name = format!("{}a", "中".repeat(23));
+        assert_eq!(
+            AwsCredentialVendor::cap_session_name(&name),
+            "中".repeat(21)
+        );
     }
 
     // ============================================================================
