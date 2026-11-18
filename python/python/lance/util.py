@@ -58,7 +58,7 @@ def sanitize_ts(ts: ts_types) -> datetime:
         if ts is pd.NaT:
             raise ValueError("NaT is not a valid version timestamp")
         if isinstance(ts, pd.Timestamp):
-            return ts.to_pydatetime()
+            ts = ts.to_pydatetime()
     if isinstance(ts, datetime):
         return ts
     raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")

@@ -482,6 +482,25 @@ class LanceFileSession:
         """
         return self._session.read_range(path, offset, length)
 
+    def size(self, path: str) -> int:
+        """
+        Return the size in bytes of a file (relative to this session's base path).
+
+        Issues a single metadata request and reads no data. A missing object
+        raises ``OSError``, consistent with ``read_range``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path`.
+
+        Returns
+        -------
+        int
+            The object size in bytes.
+        """
+        return self._session.size(path)
+
     def delete_file(self, path: str) -> None:
         """
         Delete a file (relative to this session's base path).

@@ -33,7 +33,9 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::minhash_lsh::MinHashQuery;
-use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query};
+use lance_index::vector::{
+    ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query, RqGraphScoring,
+};
 use lance_linalg::distance::MetricType;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
@@ -939,6 +941,7 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         });
         self.quantized_refine_factor = None;
         self.nearest_refine = None;
@@ -1258,6 +1261,15 @@ impl Scanner {
     /// When a distance range is set, the selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
     ///
+    /// Completed partition results may be reused for identical queries in the
+    /// same snapshot, within the session index-cache budget. This memory-only
+    /// cache accepts fully indexed single-vector queries without filters,
+    /// fragment subsets, external masks, or stale vector overlays, and requires
+    /// a proven manifest identity. It stores row IDs and quantized distances;
+    /// exact refinement and projections still run independently. Immutable RQ
+    /// index data is cached separately and can remain reusable across queries
+    /// and snapshots even when completed results cannot be reused.
+    ///
     /// ```
     /// # use arrow_array::Float32Array;
     /// # use lance::{Dataset, Result};
@@ -1378,6 +1390,39 @@ impl Scanner {
             q.approx_mode = approx_mode;
         } else {
             log::warn!("approx_mode is not set because nearest has not been called yet");
+        }
+        self
+    }
+
+    /// Configure how an `IVF_HNSW_RQ` graph search scores the nodes it visits.
+    ///
+    /// [`RqGraphScoring::MultiBit`], the default, scores every visited node with
+    /// the full multi-bit RQ codes. [`RqGraphScoring::OneBitRerank`] walks the
+    /// graph with the 1-bit sign codes and rescores only the `ef` finalists,
+    /// trading some recall at a given `ef` for faster queries. Other index types
+    /// ignore this setting.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::vector::RqGraphScoring;
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0f32; 128]);
+    /// let results = dataset
+    ///     .scan()
+    ///     .nearest("vector", &query, 10)?
+    ///     .ef(64)
+    ///     .rq_graph_scoring(RqGraphScoring::OneBitRerank)
+    ///     .try_into_batch()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rq_graph_scoring(&mut self, rq_graph_scoring: RqGraphScoring) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.rq_graph_scoring = rq_graph_scoring;
+        } else {
+            log::warn!("rq_graph_scoring is not set because nearest has not been called yet");
         }
         self
     }

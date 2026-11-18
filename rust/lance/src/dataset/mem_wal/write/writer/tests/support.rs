@@ -10,11 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Wake, Waker};
 use std::time::Duration;
 
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use object_store::path::Path;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::super::{ShardWriter, WriterMode, in_memory_ref};
 use crate::dataset::mem_wal::memtable::flush::{MemTableFlusher, TriggerMemTableFlush};
+use crate::dataset::mem_wal::test_util::{FailControls, observable_store_params};
 use crate::dataset::mem_wal::wal::{WalFlushSource, WriterCursors};
 use crate::dataset::mem_wal::write::ShardWriterConfig;
 use crate::dataset::mem_wal::write::handlers::MemTableFlushHandler;
@@ -35,6 +38,46 @@ pub(super) async fn pending_pk_flush() -> (
     TempDir,
 ) {
     let (store, base_path, base_uri, temp) = create_local_store().await;
+    pending_pk_flush_with(store, base_path, base_uri, temp, None).await
+}
+
+/// [`pending_pk_flush`] with an observable store, so generation writes can be
+/// held at the storage boundary instead of being timed.
+#[cfg_attr(coverage, coverage(off))]
+pub(super) async fn pending_pk_flush_observable() -> (
+    ShardWriter,
+    MemTableFlushHandler,
+    TriggerMemTableFlush,
+    TempDir,
+    Arc<FailControls>,
+) {
+    let (_store, _base_path, base_uri, temp) = create_local_store().await;
+    let (params, controls) = observable_store_params();
+    let (store, base_path) = ObjectStore::from_uri_and_params(
+        Arc::new(ObjectStoreRegistry::default()),
+        &base_uri,
+        &params,
+    )
+    .await
+    .unwrap();
+    let (writer, handler, message, temp) =
+        pending_pk_flush_with(store, base_path, base_uri, temp, Some(params)).await;
+    (writer, handler, message, temp, controls)
+}
+
+#[cfg_attr(coverage, coverage(off))]
+async fn pending_pk_flush_with(
+    store: Arc<ObjectStore>,
+    base_path: Path,
+    base_uri: String,
+    temp: TempDir,
+    store_params: Option<ObjectStoreParams>,
+) -> (
+    ShardWriter,
+    MemTableFlushHandler,
+    TriggerMemTableFlush,
+    TempDir,
+) {
     let schema = create_pk_test_schema();
     let mut writer = ShardWriter::open(
         store.clone(),
@@ -43,6 +86,7 @@ pub(super) async fn pending_pk_flush() -> (
         ShardWriterConfig {
             shard_id: Uuid::new_v4(),
             max_wal_flush_interval: Some(Duration::from_secs(60)),
+            store_params: store_params.clone(),
             ..Default::default()
         },
         schema.clone(),
@@ -92,14 +136,17 @@ pub(super) async fn pending_pk_flush() -> (
     let handler = MemTableFlushHandler::new(
         state.clone(),
         writer_state.memory.clone(),
-        Arc::new(MemTableFlusher::new(
-            store,
-            base_path,
-            base_uri,
-            "",
-            writer.config.shard_id,
-            writer.manifest_store.clone(),
-        )),
+        Arc::new(
+            MemTableFlusher::new(
+                store,
+                base_path,
+                base_uri,
+                "",
+                writer.config.shard_id,
+                writer.manifest_store.clone(),
+            )
+            .with_storage_context(store_params, None),
+        ),
         writer.wal_flusher.clone(),
         writer.epoch,
         writer.stats.clone(),

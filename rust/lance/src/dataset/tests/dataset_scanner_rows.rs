@@ -1973,6 +1973,57 @@ async fn test_limit_with_ordering_not_pushed_down() {
     assert_eq!(unsorted_values[2], 80);
 }
 
+#[rstest]
+#[case::plain(None, false, None)]
+#[case::filtered(Some("id > 2"), false, None)]
+#[case::full_text(None, true, None)]
+#[case::full_text_candidates(None, true, Some(4))]
+#[tokio::test]
+async fn test_zero_limit_with_ordering(
+    #[case] filter: Option<&str>,
+    #[case] has_full_text_query: bool,
+    #[case] candidate_limit: Option<i64>,
+    #[values(None, Some(0), Some(2))] offset: Option<i64>,
+    #[values(false, true)] is_sort_column_projected: bool,
+) {
+    let dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("text", array::cycle_utf8_literals(&["needle"]))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+        .await
+        .unwrap();
+
+    let columns = if is_sort_column_projected {
+        vec!["id", "text"]
+    } else {
+        vec!["text"]
+    };
+    let mut scanner = dataset.scan();
+    scanner.project(&columns).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+        .unwrap();
+    if let Some(filter) = filter {
+        scanner.filter(filter).unwrap();
+    }
+    if has_full_text_query {
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap();
+    }
+    let expected_schema = scanner.schema().await.unwrap();
+    scanner.limit(Some(0), offset).unwrap();
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), expected_schema);
+}
+
 #[tokio::test]
 async fn test_scan_with_version_columns() {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};

@@ -23,6 +23,7 @@ mod pk;
 mod pk_block_filter;
 mod reconcile;
 mod schema_relabel;
+mod sstable_lookup;
 
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
@@ -36,3 +37,4 @@ pub use pk::{
 pub use pk_block_filter::PkBlockFilterExec;
 pub(crate) use reconcile::ReconcileExec;
 pub use schema_relabel::SchemaRelabelExec;
+pub(super) use sstable_lookup::SsTablePointLookupExec;
