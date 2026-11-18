@@ -20,9 +20,10 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarIndexPlanner,
+    IndexInformationProvider, MultiQueryParser, ScalarIndexPlanner, ScalarQueryParser,
 };
-use lance_index::scalar::registry::ScalarIndexPlugin;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::{QueryDomain, ScalarIndexPlugin};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -52,6 +53,7 @@ use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::api::DatasetIndexExt;
 use crate::index::frag_reuse::{self, load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::frag_reuse_with_stable_row_ids::warn_about_indices_hidden_by_frag_reuse;
@@ -628,6 +630,194 @@ pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
         })
 }
 
+/// A resolved single-key index: the column it answers for, and its parser
+/// together with that column's Arrow type.
+type IndexedFieldParser = (String, (DataType, Box<dyn ScalarQueryParser>));
+
+/// One single-key index segment awaiting a routing decision shared with the
+/// other segments registered under the same name.
+struct PendingQueryParser<'a> {
+    field_path: String,
+    column_type: DataType,
+    index: &'a IndexMetadata,
+    index_details: IndexDetails,
+    parser: Option<Box<dyn ScalarQueryParser>>,
+    /// The domain the details declare, which is free to read. `None` leaves it
+    /// to [`ScalarIndexPlugin::recover_query_domain`] or to the scan.
+    domain: Option<QueryDomain>,
+}
+
+/// Union one segment's coverage into its `(column, index_name)` entry. If any
+/// contributing segment has no bitmap, the entry becomes `None` so callers know
+/// coverage is partial/unknown.
+fn union_fragment_bitmap(
+    fragment_bitmaps: &mut HashMap<(String, String), Option<RoaringBitmap>>,
+    field_path: &str,
+    index: &IndexMetadata,
+) {
+    fragment_bitmaps
+        .entry((field_path.to_string(), index.name.clone()))
+        .and_modify(|entry| {
+            if let (Some(acc), Some(seg)) = (entry.as_mut(), index.fragment_bitmap.as_ref()) {
+                *acc |= seg;
+            } else {
+                *entry = None;
+            }
+        })
+        .or_insert_with(|| index.fragment_bitmap.clone());
+}
+
+/// Resolve the single-key query parsers of one planning call, per index name.
+///
+/// Planning decides what to route per column, but a [`ScalarIndexSearch`]
+/// records only an index name, and execution opens every segment registered
+/// under that name -- across columns -- and asks each one. So a name may only
+/// be planned when all of its segments establish the same [`QueryDomain`]: the
+/// same value type alone is not enough, because a JSON index's keys of one
+/// type can have been extracted from different paths or keyed by targets whose
+/// queries mean different things. Routing on type alone would hand a query
+/// planned from one segment to a segment that holds other values, which loses
+/// or invents rows.
+///
+/// A name whose details state no domain asks its plugin to recover one from
+/// persisted index metadata. That is the only path that reads anything; a name
+/// whose segments all answered from their details never touches the store.
+///
+/// [`ScalarIndexSearch`]: lance_index::scalar::expression::ScalarIndexSearch
+async fn resolve_query_parsers(
+    dataset: &Dataset,
+    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    mut pending: Vec<PendingQueryParser<'_>>,
+    indexed_fields: &mut Vec<IndexedFieldParser>,
+    fragment_bitmaps: &mut HashMap<(String, String), Option<RoaringBitmap>>,
+) -> Result<()> {
+    // Group by name in first-seen order. The final loop below walks `pending` in
+    // metadata order, so grouping decides recovery order, not parser order.
+    let mut group_ids: HashMap<&str, usize> = HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (position, pending) in pending.iter().enumerate() {
+        let group_id = *group_ids
+            .entry(pending.index.name.as_str())
+            .or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+        groups[group_id].push(position);
+    }
+
+    let mut routed = vec![false; pending.len()];
+    for members in &groups {
+        recover_missing_parsers(dataset, plugin_for, &mut pending, members).await;
+
+        // A name that states no domain anywhere keeps the per-segment decisions
+        // this function has always made; every plugin that never declares a
+        // domain takes this path. Once one segment states a domain, the others
+        // must prove they share it before any of them may answer.
+        let domain = members
+            .iter()
+            .find_map(|&position| pending[position].domain.as_ref());
+        let unanimous = match domain {
+            None => true,
+            Some(domain) => members.iter().all(|&position| {
+                let segment = &pending[position];
+                segment.parser.is_some() && segment.domain.as_ref() == Some(domain)
+            }),
+        };
+        if !unanimous {
+            let declared: Vec<Option<&DataType>> = members
+                .iter()
+                .map(|&position| pending[position].domain.as_ref().map(|d| &d.data_type))
+                .collect();
+            log::debug!(
+                "Not routing queries to index '{}': its segments do not establish one query \
+                 domain (value types {:?}). Queries on its columns will fall back to a full \
+                 scan.",
+                pending[members[0]].index.name,
+                declared,
+            );
+            continue;
+        }
+        for &position in members {
+            routed[position] = true;
+        }
+    }
+
+    for (position, pending) in pending.into_iter().enumerate() {
+        if !routed[position] {
+            continue;
+        }
+        // A name that states no domain may still have a segment whose plugin
+        // declined to parse; that segment contributes no coverage, as before.
+        let Some(parser) = pending.parser else {
+            continue;
+        };
+        union_fragment_bitmap(fragment_bitmaps, &pending.field_path, pending.index);
+        indexed_fields.push((pending.field_path, (pending.column_type, parser)));
+    }
+    Ok(())
+}
+
+/// Ask the plugin of every segment that answered no parser to recover one from
+/// persisted index metadata.
+async fn recover_missing_parsers(
+    dataset: &Dataset,
+    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    pending: &mut [PendingQueryParser<'_>],
+    members: &[usize],
+) {
+    for &position in members {
+        if pending[position].parser.is_some() {
+            continue;
+        }
+        let recovered = recover_one_query_parser(dataset, plugin_for, &pending[position]).await;
+        match recovered {
+            Ok(Some((parser, domain))) => {
+                let segment = &mut pending[position];
+                segment.parser = Some(parser);
+                segment.domain = Some(domain);
+            }
+            // The details and the persisted files both leave the domain
+            // unstated, which is the pre-recovery outcome: scan.
+            Ok(None) => {
+                let segment = &pending[position];
+                log::debug!(
+                    "No persisted value domain for index '{}' on column '{}'; queries on \
+                     this column will fall back to a full scan.",
+                    segment.index.name,
+                    segment.field_path,
+                );
+            }
+            Err(error) => {
+                let segment = &pending[position];
+                log::warn!(
+                    "Could not read the persisted value domain of index '{}' on column \
+                     '{}': {}. Queries on this column will fall back to a full scan.",
+                    segment.index.name,
+                    segment.field_path,
+                    error,
+                );
+            }
+        }
+    }
+}
+
+async fn recover_one_query_parser(
+    dataset: &Dataset,
+    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    segment: &PendingQueryParser<'_>,
+) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
+    let plugin = plugin_for(&segment.index_details)?;
+    let store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, segment.index).await?);
+    plugin
+        .recover_query_domain(
+            segment.index.name.clone(),
+            &segment.index_details.0,
+            u32::try_from(segment.index.index_version).unwrap_or(0),
+            store,
+        )
+        .await
+}
+
 impl Dataset {
     #[instrument(level = "trace", skip_all)]
     pub(crate) async fn scalar_index_info_ignoring(
@@ -684,6 +874,10 @@ impl Dataset {
         // entry has a bitmap; if any are missing, we leave the entry absent
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
+        // Single-key parsers are resolved after this loop, together with the
+        // other segments registered under the same name, because a search opens
+        // every segment of the name a parser reports and asks all of them.
+        let mut pending_parsers = Vec::new();
         for index in indices.iter().filter(|idx| {
             if ignored_index_names.contains(&idx.name) {
                 return false;
@@ -791,34 +985,31 @@ impl Dataset {
                     };
                     planners.insert(index.name.clone(), planner);
                 }
+                union_fragment_bitmap(&mut fragment_bitmaps, &field_path, index);
             } else {
-                let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
-                let Some(query_parser) = query_parser else {
-                    continue;
-                };
-                indexed_fields.push((
-                    field_path.clone(),
-                    (keys[0].data_type().clone(), query_parser),
-                ));
+                let parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
+                let domain = plugin.recorded_query_domain(
+                    &index_details.0,
+                    u32::try_from(index.index_version).unwrap_or(0),
+                );
+                pending_parsers.push(PendingQueryParser {
+                    field_path,
+                    column_type: keys[0].data_type().clone(),
+                    index,
+                    index_details,
+                    parser,
+                    domain,
+                });
             }
-
-            // Union the per-segment fragment bitmap into this
-            // (column, index_name) entry. If any segment is missing a
-            // bitmap, downgrade the entry to None so callers know
-            // coverage is partial/unknown.
-            let key = (field_path, index.name.clone());
-            fragment_bitmaps
-                .entry(key)
-                .and_modify(|entry| {
-                    if let (Some(acc), Some(seg)) = (entry.as_mut(), index.fragment_bitmap.as_ref())
-                    {
-                        *acc |= seg;
-                    } else {
-                        *entry = None;
-                    }
-                })
-                .or_insert_with(|| index.fragment_bitmap.clone());
         }
+        resolve_query_parsers(
+            self,
+            &plugin_for,
+            pending_parsers,
+            &mut indexed_fields,
+            &mut fragment_bitmaps,
+        )
+        .await?;
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
         for indexed_field in indexed_fields {
             // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called

@@ -862,6 +862,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let entry = OrderedNode::new(0, distances[0].into());
         let mut visited_generator = VisitedGenerator::new(graph.len());
@@ -909,6 +910,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let entry = OrderedNode::new(0, 0.0.into());
 

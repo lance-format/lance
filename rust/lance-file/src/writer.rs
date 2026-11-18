@@ -41,8 +41,9 @@ pub struct FileWriteSummary {
 pub struct FileWriterOptions {
     /// How many bytes to use for buffering column data.
     ///
-    /// The budget is divided evenly across columns. The default is 8 MiB per
-    /// column.
+    /// This is an aggregate budget divided evenly across the cache-owning field
+    /// encoders, including encoders nested inside structs, lists, and maps.
+    /// The default is 8 MiB per cache owner.
     pub data_cache_bytes: Option<u64>,
     /// A best-effort maximum encoded page size.
     pub max_page_bytes: Option<u64>,
