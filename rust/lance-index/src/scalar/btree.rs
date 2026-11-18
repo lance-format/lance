@@ -85,11 +85,11 @@ use lance_datafusion_exec::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
+use lance_io::object_store::Error as ObjectStoreError;
 use lance_io::scheduler::SchedulerConfig;
 use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use log::{debug, warn};
-use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -4504,13 +4504,13 @@ mod tests {
     use futures::stream;
     use lance_core::cache::LanceCache;
     use lance_core::deepsize::DeepSizeOf;
+    use lance_core::storage::path::Path;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion_exec::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use lance_select::{RowAddrTreeMap, RowSetOps};
-    use object_store::path::Path;
 
     use crate::Index;
     use crate::metrics::LocalMetricsCollector;
@@ -5364,9 +5364,9 @@ mod tests {
     #[tokio::test]
     async fn test_range_query_coalesces_page_reads() {
         let tmpdir = TempObjDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let test_store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5396,7 +5396,7 @@ mod tests {
             .unwrap();
 
         // Ignore the I/O that loading the index itself did.
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
 
         let query = SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
@@ -5416,7 +5416,7 @@ mod tests {
         );
         // The pages are consecutive, so they should coalesce into a handful of
         // requests rather than one per page.
-        let read_iops = object_store.io_stats_snapshot().read_iops;
+        let read_iops = storage.io_stats_snapshot().read_iops;
         assert!(
             read_iops < parts_loaded / 4,
             "expected {parts_loaded} pages to coalesce, but took {read_iops} reads"
@@ -5426,9 +5426,9 @@ mod tests {
     #[tokio::test]
     async fn test_wide_range_query_prefetches_in_bounded_chunks() {
         let tmpdir = TempObjDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let test_store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5460,7 +5460,7 @@ mod tests {
             .unwrap();
 
         // Ignore the I/O that loading the index itself did.
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
 
         let query = SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
@@ -5499,7 +5499,7 @@ mod tests {
         // per chunk: a single request for the whole range would mean the
         // missing set was handed to the reader all at once, unbounded,
         // instead of PAGE_PREFETCH_CHUNK_SIZE pages at a time.
-        let read_iops = object_store.io_stats_snapshot().read_iops;
+        let read_iops = storage.io_stats_snapshot().read_iops;
         assert!(
             read_iops >= expected_chunks,
             "expected at least one request per prefetch chunk ({expected_chunks} chunks), but \
@@ -5521,9 +5521,9 @@ mod tests {
         // own and a wide search costs *more* I/O than reading pages one at a
         // time would.
         let tmpdir = TempObjDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let test_store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -5552,7 +5552,7 @@ mod tests {
             .unwrap();
 
         // Ignore the I/O that loading the index itself did.
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
 
         let query = SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
@@ -5588,7 +5588,7 @@ mod tests {
             "prefetched pages must be searched directly, not re-read one at a time \
              because the cache couldn't retain them"
         );
-        let read_iops = object_store.io_stats_snapshot().read_iops;
+        let read_iops = storage.io_stats_snapshot().read_iops;
         assert!(
             read_iops < parts_loaded / 4,
             "expected {parts_loaded} pages to still coalesce per chunk even with no index \
@@ -9110,10 +9110,10 @@ mod tests {
     async fn test_whole_index_reads_are_sequential() {
         let page_size = 64u64;
         let num_pages = 50u64;
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -9126,11 +9126,11 @@ mod tests {
 
         // Baseline: the per-page path costs at least one request per page.
         let reader = store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         for page_idx in 0..num_pages {
             reader.read_record_batch(page_idx, page_size).await.unwrap();
         }
-        let per_page_iops = object_store.io_stats_incremental().read_iops;
+        let per_page_iops = storage.io_stats_incremental().read_iops;
         assert!(
             per_page_iops >= num_pages,
             "expected >= {} requests for per-page reads, got {}",
@@ -9140,9 +9140,9 @@ mod tests {
 
         let budget = num_pages / 4;
 
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         index.prewarm().await.unwrap();
-        let prewarm_iops = object_store.io_stats_incremental().read_iops;
+        let prewarm_iops = storage.io_stats_incremental().read_iops;
         assert!(
             prewarm_iops < budget,
             "prewarm issued {} requests for {} pages (per-page path: {})",
@@ -9162,10 +9162,10 @@ mod tests {
             );
         }
 
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         let frags = index.calculate_included_frags().await.unwrap();
         assert_eq!(frags.len(), 1);
-        let frags_iops = object_store.io_stats_incremental().read_iops;
+        let frags_iops = storage.io_stats_incremental().read_iops;
         assert!(
             frags_iops < budget,
             "calculate_included_frags issued {} requests for {} pages",
@@ -9173,7 +9173,7 @@ mod tests {
             num_pages
         );
 
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         let batches: Vec<RecordBatch> = index
             .data_stream()
             .await
@@ -9181,7 +9181,7 @@ mod tests {
             .try_collect()
             .await
             .unwrap();
-        let data_stream_iops = object_store.io_stats_incremental().read_iops;
+        let data_stream_iops = storage.io_stats_incremental().read_iops;
         assert_eq!(batches.len() as u64, num_pages);
         assert!(
             data_stream_iops < budget,

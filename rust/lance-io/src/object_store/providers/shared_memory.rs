@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
 };
 
+use crate::object_store::path::Path;
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, providers::memory::MemoryStoreProvider,
+    ObjectStoreParams, ObjectStoreProvider, providers::memory::MemoryStoreProvider,
 };
+use ::object_store::memory::InMemory;
 use lance_core::error::Result;
-use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
 /// Process-global pool of in-memory backends keyed by URL authority.
@@ -39,7 +41,7 @@ fn shared_backend_for(url: &Url) -> Arc<InMemory> {
 /// fence simulations). Choose distinct authorities for isolation
 /// (`shared-memory://test-a` vs `shared-memory://test-b`).
 ///
-/// Unlike `memory://` — which mints a fresh `InMemory` per `new_store` call — this
+/// Unlike `memory://` — which mints a fresh `InMemory` per `new_backend` call — this
 /// provider is opt-in precisely so existing tests relying on per-call isolation are
 /// unaffected.
 #[derive(Default, Debug)]
@@ -49,11 +51,16 @@ pub struct SharedMemoryStoreProvider {
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for SharedMemoryStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let mut store = self.inner.new_store(base_path.clone(), params).await?;
-        store.inner = shared_backend_for(&base_path);
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
+        let mut store = self.inner.new_backend(base_path.clone(), params).await?;
+        store.backend =
+            crate::object_store::backend::native::from_object_store(shared_backend_for(&base_path));
         store.scheme = String::from("shared-memory");
-        store.store_prefix = self.calculate_object_store_prefix(&base_path, None)?;
+
         Ok(store)
     }
 
@@ -62,7 +69,7 @@ impl ObjectStoreProvider for SharedMemoryStoreProvider {
         Ok(Path::from(url.path().trim_start_matches('/')))
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
@@ -74,9 +81,10 @@ impl ObjectStoreProvider for SharedMemoryStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store::ObjectStore;
     use crate::object_store::ObjectStoreRegistry;
+    use crate::object_store::PutPayload;
     use bytes::Bytes;
-    use object_store::{ObjectStoreExt as _, PutPayload};
 
     async fn store_for(uri: &str) -> (Arc<ObjectStore>, Path) {
         let registry = Arc::new(ObjectStoreRegistry::default());
@@ -138,10 +146,10 @@ mod tests {
     fn calculate_prefix_is_per_authority() {
         let provider = SharedMemoryStoreProvider::default();
         let a = provider
-            .calculate_object_store_prefix(&Url::parse("shared-memory://x/p").unwrap(), None)
+            .calculate_storage_prefix(&Url::parse("shared-memory://x/p").unwrap(), None)
             .unwrap();
         let b = provider
-            .calculate_object_store_prefix(&Url::parse("shared-memory://y/p").unwrap(), None)
+            .calculate_storage_prefix(&Url::parse("shared-memory://y/p").unwrap(), None)
             .unwrap();
         assert_ne!(a, b);
         assert_eq!(a, "shared-memory$x");

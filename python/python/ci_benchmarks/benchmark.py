@@ -130,7 +130,7 @@ class IOMemoryBenchmark:
         target = prepare()
 
         # Reset IO stats before the measured run. Stats are tracked on the
-        # ObjectStore, which is shared by every handle from the same session,
+        # Storage, which is shared by every handle from the same session,
         # so resetting/reading through `dataset` also captures work that `func`
         # performs through a handle returned by `setup`.
         dataset.io_stats_incremental()

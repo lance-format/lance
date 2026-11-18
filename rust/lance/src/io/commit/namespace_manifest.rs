@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
+use lance_core::storage::path::Path;
+use lance_io::object_store::ObjectStore;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
 };
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use object_store::ObjectStore as OSObjectStore;
-use object_store::path::Path;
 
 use lance_namespace::error::NamespaceError;
 
@@ -137,7 +137,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         staging_path: &Path,
         size: u64,
         e_tag: Option<String>,
-        _object_store: &dyn OSObjectStore,
+        _storage: &ObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
         // create_table_version reads staging manifest and writes to final location

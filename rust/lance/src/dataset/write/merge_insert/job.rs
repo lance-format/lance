@@ -1663,7 +1663,7 @@ impl MergeInsertJob {
             let (mut new_fragments, _) = write_fragments_internal(
                 self.params.write_version(&self.dataset),
                 Some(&self.dataset),
-                self.dataset.object_store.clone(),
+                self.dataset.storage.clone(),
                 &self.dataset.base,
                 self.dataset.schema().clone(),
                 stream,
@@ -1724,7 +1724,7 @@ impl MergeInsertJob {
                 Ok(removed_row_addrs) => removed_row_addrs,
                 Err(e) => {
                     cleanup_data_fragments(
-                        &self.dataset.object_store,
+                        &self.dataset.storage,
                         &self.dataset.base,
                         cleanup_bases.as_deref(),
                         &new_fragments,
@@ -1739,7 +1739,7 @@ impl MergeInsertJob {
                 Ok(v) => v,
                 Err(e) => {
                     cleanup_data_fragments(
-                        &self.dataset.object_store,
+                        &self.dataset.storage,
                         &self.dataset.base,
                         cleanup_bases.as_deref(),
                         &new_fragments,
@@ -1826,7 +1826,7 @@ impl MergeInsertJob {
                     }
                 }
             })
-            .buffer_unordered(dataset.object_store.io_parallelism());
+            .buffer_unordered(dataset.storage.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -2069,7 +2069,7 @@ impl MergeInsertJob {
                 .ok()
                 .flatten();
             cleanup_data_fragments(
-                &self.dataset.object_store,
+                &self.dataset.storage,
                 &self.dataset.base,
                 target_bases_info.as_deref(),
                 &written_fragments,
@@ -2079,7 +2079,7 @@ impl MergeInsertJob {
         // Merge insert writes deletion files with `write_deletion_file`, which
         // always places them under the dataset root.
         for path in written_deletion_files {
-            if let Err(e) = self.dataset.object_store.delete(&path).await {
+            if let Err(e) = self.dataset.storage.delete(&path).await {
                 log::warn!(
                     "Failed to clean up orphaned deletion file '{}': {}",
                     path,
@@ -2149,7 +2149,7 @@ impl RetryExecutor for MergeInsertJobWithProvider {
                             .ok()
                             .flatten();
                     cleanup_data_fragments(
-                        &cleanup_dataset.object_store,
+                        &cleanup_dataset.storage,
                         &cleanup_dataset.base,
                         target_bases_info.as_deref(),
                         &new_fragments,

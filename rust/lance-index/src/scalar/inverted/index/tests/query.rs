@@ -4,30 +4,21 @@
 use super::*;
 use crate::scalar::inverted::InvertedIndexPlugin;
 use crate::scalar::registry::ScalarIndexPlugin;
-use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_io::object_store::WrappingObjectStore;
-use object_store::list::PaginatedListStore;
+use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 #[derive(Debug, Default)]
 struct RequestWrapper {
-    policy: Arc<std::sync::Mutex<ProxyObjectStorePolicy>>,
+    policy: Arc<std::sync::Mutex<ProxyBackendPolicy>>,
 }
 
 impl WrappingObjectStore for RequestWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
-    }
-
-    fn wrap_paginated(
-        &self,
-        _store_prefix: &str,
-        _original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>> {
-        None
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        Arc::new(ProxyBackend::new(original, self.policy.clone()))
     }
 }
 
@@ -46,10 +37,10 @@ impl BatchRowIdRemapper for OffsetBatchRemapper {
 
 #[tokio::test]
 async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_resources() {
-    let object_store = ObjectStore::memory();
+    let storage = ObjectStore::memory();
     let metadata_cache = Arc::new(LanceCache::with_capacity(1 << 20));
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(object_store.clone()),
+        Arc::new(storage.clone()),
         "index".into(),
         metadata_cache.clone(),
     ));
@@ -97,7 +88,7 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
             }
         }),
     );
-    let mut wrapped = object_store;
+    let mut wrapped = storage;
     wrapped.apply_wrapper(&wrapper);
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(wrapped),
@@ -142,11 +133,11 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
 
 #[tokio::test]
 async fn test_request_wrappers_preserve_prewarmed_index_state() {
-    let object_store = ObjectStore::memory();
-    let directory = object_store::path::Path::from("index");
+    let storage = ObjectStore::memory();
+    let directory = lance_core::storage::path::Path::from("index");
     let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(object_store.clone()),
+        Arc::new(storage.clone()),
         directory.clone(),
         metadata_cache.clone(),
     ));
@@ -157,7 +148,7 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
     let terms = vec!["alpha".to_owned(), "beta".to_owned()];
     let mut first = None;
     for request in 0..3 {
-        let mut wrapped = object_store.clone();
+        let mut wrapped = storage.clone();
         let wrapper = RequestWrapper::default();
         let requests = Arc::new(AtomicU32::new(0));
         let counted_requests = requests.clone();
@@ -238,10 +229,10 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
 
 #[tokio::test]
 async fn test_deferred_posting_reader_retries_current_credentials_and_validates_metadata() {
-    let object_store = ObjectStore::memory();
+    let storage = ObjectStore::memory();
     let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
     let store = Arc::new(LanceIndexStore::new(
-        Arc::new(object_store.clone()),
+        Arc::new(storage.clone()),
         "index".into(),
         metadata_cache.clone(),
     ));
@@ -263,7 +254,7 @@ async fn test_deferred_posting_reader_retries_current_credentials_and_validates_
             }
         }),
     );
-    let mut wrapped = object_store;
+    let mut wrapped = storage;
     wrapped.apply_wrapper(&wrapper);
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(wrapped),

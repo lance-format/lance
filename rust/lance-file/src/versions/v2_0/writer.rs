@@ -10,6 +10,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::storage::path::Path;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::encoder::{
@@ -20,7 +21,6 @@ use lance_encoding::repdef::RepDefBuilder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
 use log::{debug, warn};
-use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
 use tokio::io::AsyncWrite;
@@ -59,7 +59,7 @@ const DEFAULT_SPILL_BUFFER_LIMIT: usize = 256 * 1024;
 /// order.
 struct PageMetadataSpill {
     writer: Box<dyn ObjectWriter>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     path: Path,
     /// Current write position in the spill file.
     position: u64,
@@ -74,12 +74,12 @@ struct PageMetadataSpill {
 }
 
 impl PageMetadataSpill {
-    async fn new(object_store: Arc<ObjectStore>, path: Path, num_columns: usize) -> Result<Self> {
-        let writer = object_store.create(&path).await?;
+    async fn new(storage: Arc<ObjectStore>, path: Path, num_columns: usize) -> Result<Self> {
+        let writer = storage.create(&path).await?;
         let per_column_limit = (DEFAULT_SPILL_BUFFER_LIMIT / num_columns.max(1)).max(64);
         Ok(Self {
             writer,
-            object_store,
+            storage,
             path,
             position: 0,
             column_buffers: vec![Vec::new(); num_columns],
@@ -222,8 +222,8 @@ impl Writer {
     /// The sidecar file is created lazily on the first page write. The caller
     /// is responsible for cleaning up `path` (e.g. by placing it in a temp
     /// directory that is removed via RAII).
-    pub fn with_page_metadata_spill(mut self, object_store: Arc<ObjectStore>, path: Path) -> Self {
-        self.page_spill = Some(PageSpillState::Pending(object_store, path));
+    pub fn with_page_metadata_spill(mut self, storage: Arc<ObjectStore>, path: Path) -> Self {
+        self.page_spill = Some(PageSpillState::Pending(storage, path));
         self
     }
 
@@ -606,7 +606,7 @@ impl Writer {
         let (spill_chunks, spill_reader) =
             if let Some(PageSpillState::Active(mut spill)) = spill_state {
                 spill.shutdown_writer().await?;
-                let reader = spill.object_store.open(&spill.path).await?;
+                let reader = spill.storage.open(&spill.path).await?;
                 let chunks = std::mem::take(&mut spill.column_chunks);
                 (chunks, Some(reader))
             } else {

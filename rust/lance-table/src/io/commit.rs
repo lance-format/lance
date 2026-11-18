@@ -38,10 +38,8 @@ use futures::{
     stream::BoxStream,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_io::object_store::{Error as ObjectStoreError, path::Path};
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
-use object_store::ObjectStoreExt as OSObjectStoreExt;
-use object_store::PutOptions;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::{debug, info};
 use url::Url;
 
@@ -50,7 +48,7 @@ pub mod dynamodb;
 pub mod external_manifest;
 
 use lance_core::{Error, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::traits::{WriteExt, Writer};
 
 use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
@@ -172,8 +170,8 @@ impl ManifestNamingScheme {
 ///
 /// However, it should not be run while other concurrent operations are happening.
 /// And it should also run until completion before resuming other operations.
-pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Path) -> Result<()> {
-    object_store
+pub async fn migrate_scheme_to_v2(storage: &ObjectStore, dataset_base: &Path) -> Result<()> {
+    storage
         .list_objects(Some(&dataset_base.clone().join(VERSIONS_DIR)))
         .try_filter(|res| {
             let res = if let Some(filename) = res.location.filename() {
@@ -183,11 +181,11 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
             };
             future::ready(res)
         })
-        .try_for_each_concurrent(object_store.io_parallelism(), |meta| async move {
+        .try_for_each_concurrent(storage.io_parallelism(), |meta| async move {
             let filename = meta.location.filename().unwrap();
             let version = ManifestNamingScheme::V1.parse_version(filename).unwrap();
             let path = ManifestNamingScheme::V2.manifest_path(dataset_base, version);
-            object_store.rename(&meta.location, &path).await?;
+            storage.rename(&meta.location, &path).await?;
             Ok(())
         })
         .await?;
@@ -199,7 +197,7 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 ///
 /// Returns the size of the written manifest.
 pub type ManifestWriter = for<'a> fn(
-    object_store: &'a ObjectStore,
+    storage: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
@@ -210,14 +208,14 @@ pub type ManifestWriter = for<'a> fn(
 /// Rationale: keep a crate-local writer implementation so call sites can pass this function
 /// directly without non-primitive casts or lifetime coercions.
 pub fn write_manifest_file_to_path<'a>(
-    object_store: &'a ObjectStore,
+    storage: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
     transaction: Option<Transaction>,
 ) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async move {
-        let mut object_writer = ObjectWriter::new(object_store, path).await?;
+        let mut object_writer = ObjectWriter::new(storage, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices, transaction).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
@@ -279,10 +277,10 @@ pub struct ManifestLocation {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
+impl TryFrom<lance_io::object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
-    fn try_from(meta: object_store::ObjectMeta) -> Result<Self> {
+    fn try_from(meta: lance_io::object_store::ObjectMeta) -> Result<Self> {
         let filename = meta.location.filename().ok_or_else(|| {
             Error::internal("ObjectMeta location does not have a filename".to_string())
         })?;
@@ -312,21 +310,18 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
 ///   listing on these stores is O(n) in the number of versions.
 /// - Lexicographically ordered stores (e.g. S3 Standard, GCS): the listing
 ///   already resolves the latest version in roughly one request.
-async fn current_manifest_path(
-    object_store: &ObjectStore,
-    base: &Path,
-) -> Result<ManifestLocation> {
-    if object_store.has_direct_local_paths() {
+async fn current_manifest_path(storage: &ObjectStore, base: &Path) -> Result<ManifestLocation> {
+    if storage.has_direct_local_paths() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
-    } else if uses_version_hint(object_store)
-        && let Some(location) = read_version_hint_and_probe(object_store, base).await
+    } else if uses_version_hint(storage)
+        && let Some(location) = read_version_hint_and_probe(storage, base).await
     {
         return Ok(location);
     }
 
-    resolve_version_from_listing(object_store, base).await
+    resolve_version_from_listing(storage, base).await
 }
 
 /// JSON body of the version hint file: `{"version":N}`.
@@ -360,8 +355,8 @@ fn version_hint_globally_enabled() -> bool {
 /// read) it only on stores where listing is not lexicographically ordered —
 /// S3 Express and the local filesystem. Can be force-disabled with the
 /// `LANCE_USE_VERSION_HINT=0` environment variable.
-pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
-    version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
+pub fn uses_version_hint(storage: &ObjectStore) -> bool {
+    version_hint_globally_enabled() && !storage.list_is_lexically_ordered()
 }
 
 /// Path to the JSON version hint file for a dataset.
@@ -378,14 +373,14 @@ fn version_hint_path(base: &Path) -> Path {
 /// do not benefit from a hint (see [`uses_version_hint`]).
 /// Local write failures on Windows are logged at debug level, since readers
 /// holding the hint open can prevent replacement.
-pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
-    if is_detached_version(version) || !uses_version_hint(object_store) {
+pub async fn write_version_hint(storage: &ObjectStore, base: &Path, version: u64) {
+    if is_detached_version(version) || !uses_version_hint(storage) {
         return;
     }
     let hint_path = version_hint_path(base);
     let content = serde_json::to_vec(&VersionHint { version }).expect("serialize version hint");
-    if let Err(e) = object_store.put(&hint_path, content.as_slice()).await {
-        if cfg!(windows) && object_store.is_local() {
+    if let Err(e) = storage.put(&hint_path, content.as_slice()).await {
+        if cfg!(windows) && storage.is_local() {
             debug!("Failed to write version hint file for version {version}: {e}");
         } else {
             tracing::warn!("Failed to write version hint file for version {version}: {e}");
@@ -395,8 +390,8 @@ pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version
 
 /// Read the latest version from the hint file, or `None` if it does not exist
 /// or cannot be parsed.
-async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
-    read_version_hint(object_store, base).await.ok().flatten()
+async fn read_version_from_hint(storage: &ObjectStore, base: &Path) -> Option<u64> {
+    read_version_hint(storage, base).await.ok().flatten()
 }
 
 /// Read the version hint for retention planning, distinguishing absence from
@@ -406,14 +401,14 @@ async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Opti
 /// # use lance_core::Result;
 /// # use lance_io::object_store::ObjectStore;
 /// # use lance_table::io::commit::read_version_hint;
-/// # use object_store::path::Path;
+/// # use lance_core::storage::path::Path;
 /// # async fn example(store: &ObjectStore, base: &Path) -> Result<()> {
 /// let version = read_version_hint(store, base).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn read_version_hint(object_store: &ObjectStore, base: &Path) -> Result<Option<u64>> {
-    let result = match object_store.read_object(&version_hint_path(base)).await {
+pub async fn read_version_hint(storage: &ObjectStore, base: &Path) -> Result<Option<u64>> {
+    let result = match storage.read_object(&version_hint_path(base)).await {
         Ok(result) => result,
         Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -433,11 +428,11 @@ pub async fn read_version_hint(object_store: &ObjectStore, base: &Path) -> Resul
 /// Returns `None` if the hint file is missing, the hinted version no longer
 /// exists, or any error occurred — callers should fall back to listing.
 async fn read_version_hint_and_probe(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base: &Path,
 ) -> Option<ManifestLocation> {
-    let hint_version = read_version_from_hint(object_store, base).await?;
-    let (version, scheme, mut probed) = probe_versions_upward(object_store, base, hint_version)
+    let hint_version = read_version_from_hint(storage, base).await?;
+    let (version, scheme, mut probed) = probe_versions_upward(storage, base, hint_version)
         .await
         .ok()
         .flatten()?;
@@ -476,26 +471,26 @@ const MAX_HINT_PROBE_GAP: u64 = 1000;
 ///   be incomplete; callers should fall back to a full listing rather than
 ///   trust a possibly-stale result.
 async fn probe_versions_upward(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base: &Path,
     from_version: u64,
 ) -> Result<
     Option<(
         u64,
         ManifestNamingScheme,
-        Vec<(u64, object_store::ObjectMeta)>,
+        Vec<(u64, lance_io::object_store::ObjectMeta)>,
     )>,
 > {
     // Newer datasets use V2; fall back to V1 if the V2 path is not found.
     let mut scheme = ManifestNamingScheme::V2;
-    let meta = match object_store
+    let meta = match storage
         .stat(&scheme.manifest_path(base, from_version))
         .await
     {
         Ok(meta) => meta,
         Err(ObjectStoreError::NotFound { .. }) => {
             scheme = ManifestNamingScheme::V1;
-            match object_store
+            match storage
                 .stat(&scheme.manifest_path(base, from_version))
                 .await
             {
@@ -511,7 +506,7 @@ async fn probe_versions_upward(
     let mut version = from_version;
     loop {
         let next = version + 1;
-        match object_store.stat(&scheme.manifest_path(base, next)).await {
+        match storage.stat(&scheme.manifest_path(base, next)).await {
             Ok(meta) => {
                 probed.push((next, meta));
                 version = next;
@@ -533,11 +528,11 @@ async fn probe_versions_upward(
 /// usable — callers should fall back to a full listing. `Some(vec![])` is the
 /// fast path where the hint confirms there are no new versions.
 async fn list_manifests_since_version_with_hint(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base: &Path,
     since_version: u64,
 ) -> Option<Vec<ManifestLocation>> {
-    let hint_version = read_version_from_hint(object_store, base).await?;
+    let hint_version = read_version_from_hint(storage, base).await?;
 
     // A reader that is very far behind is cheaper to serve with one paginated
     // listing than with thousands of HEADs.
@@ -553,7 +548,7 @@ async fn list_manifests_since_version_with_hint(
         since_version + 1
     };
 
-    let (scheme, probed) = match probe_versions_upward(object_store, base, probe_from).await {
+    let (scheme, probed) = match probe_versions_upward(storage, base, probe_from).await {
         Ok(Some((_true_latest, scheme, probed))) => (scheme, probed),
         // Nothing at `probe_from`. If we were probing from the hint, the hint
         // is stale — bail to a full listing. If we were probing from
@@ -586,7 +581,7 @@ async fn list_manifests_since_version_with_hint(
         let gap_locations: Vec<ManifestLocation> =
             futures::stream::iter((since_version + 1)..hint_version)
                 .map(|version| async move {
-                    object_store
+                    storage
                         .stat(&scheme.manifest_path(base, version))
                         .await
                         .map(|meta| ManifestLocation {
@@ -599,7 +594,7 @@ async fn list_manifests_since_version_with_hint(
                             last_modified: None,
                         })
                 })
-                .buffer_unordered(object_store.io_parallelism())
+                .buffer_unordered(storage.io_parallelism())
                 .try_collect()
                 .await
                 .ok()?;
@@ -612,10 +607,10 @@ async fn list_manifests_since_version_with_hint(
 
 /// Resolve the latest manifest by listing the versions directory.
 async fn resolve_version_from_listing(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    let manifest_files = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
+    let manifest_files = storage.list(Some(base.clone().join(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
         let filename = res.location.filename().unwrap();
@@ -632,7 +627,7 @@ async fn resolve_version_from_listing(
     });
 
     let first = valid_manifests.next().await.transpose()?;
-    match (first, object_store.list_is_lexically_ordered) {
+    match (first, storage.list_is_lexically_ordered()) {
         // If the first valid manifest we see is V2, we can assume that we are using
         // V2 naming scheme for all manifests.
         //
@@ -765,9 +760,9 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
 
 fn list_manifests<'a>(
     base_path: &Path,
-    object_store: &'a dyn OSObjectStore,
+    storage: &'a ObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
-    object_store
+    storage
         .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
         .filter_map(|obj_meta| {
             futures::future::ready(
@@ -781,7 +776,7 @@ fn list_manifests<'a>(
 
 /// Convert object metadata to ManifestLocation for detached manifests.
 fn detached_manifest_location_from_meta(
-    meta: object_store::ObjectMeta,
+    meta: lance_io::object_store::ObjectMeta,
 ) -> Option<ManifestLocation> {
     let filename = meta.location.filename()?;
     let version = ManifestNamingScheme::parse_detached_version(filename)?;
@@ -799,15 +794,14 @@ fn detached_manifest_location_from_meta(
 /// List all detached manifest files in the versions directory.
 pub fn list_detached_manifests<'a>(
     base_path: &Path,
-    object_store: &'a dyn OSObjectStore,
+    storage: &'a ObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
     let versions_dir = base_path.clone().join(VERSIONS_DIR);
     // Detached names sort after every attached manifest and temporary file, so
     // stores that support a start offset skip those on the server.
     let offset = versions_dir.clone().join(DETACHED_VERSION_PREFIX);
-    object_store
+    storage
         .list_with_offset(Some(&versions_dir), &offset)
-        .map_err(Error::from)
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -829,10 +823,10 @@ const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 /// Object-store listing of `_versions/`; the `CommitHandler` defaults.
 pub(crate) fn default_list_manifest_locations<'a>(
     base_path: &Path,
-    object_store: &'a ObjectStore,
+    storage: &'a ObjectStore,
     sorted_descending: bool,
 ) -> BoxStream<'a, Result<ManifestLocation>> {
-    let underlying_stream = list_manifests(base_path, &object_store.inner);
+    let underlying_stream = list_manifests(base_path, storage);
 
     if !sorted_descending {
         return underlying_stream.boxed();
@@ -848,7 +842,7 @@ pub(crate) fn default_list_manifest_locations<'a>(
 
     // If the object store supports lexicographically ordered lists and
     // the naming scheme is V2, we can use an optimized list operation.
-    if object_store.list_is_lexically_ordered {
+    if storage.list_is_lexically_ordered() {
         // We don't know the naming scheme until we see the first manifest.
         let mut peekable = underlying_stream.peekable();
 
@@ -883,31 +877,34 @@ pub(crate) fn default_list_manifest_locations<'a>(
 
 pub(crate) fn default_list_manifest_locations_since<'a>(
     base_path: &Path,
-    object_store: &'a ObjectStore,
+    storage: &'a ObjectStore,
     since_version: u64,
 ) -> BoxStream<'a, Result<ManifestLocation>> {
-    if !uses_version_hint(object_store) {
-        return default_list_manifest_locations(base_path, object_store, true)
+    if !uses_version_hint(storage) {
+        return default_list_manifest_locations(base_path, storage, true)
             .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
             .boxed();
     }
 
     let base_path = base_path.clone();
     futures::stream::once(async move {
-        let locations =
-            match list_manifests_since_version_with_hint(object_store, &base_path, since_version)
-                .await
-            {
-                Some(locations) => locations,
-                None => {
-                    let mut locations = list_manifests(&base_path, &object_store.inner)
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    locations.retain(|loc| loc.version > since_version);
-                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
-                    locations
-                }
-            };
+        let locations = match list_manifests_since_version_with_hint(
+            storage,
+            &base_path,
+            since_version,
+        )
+        .await
+        {
+            Some(locations) => locations,
+            None => {
+                let mut locations = list_manifests(&base_path, storage)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                locations.retain(|loc| loc.version > since_version);
+                locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+                locations
+            }
+        };
         Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
     })
     .try_flatten()
@@ -949,18 +946,18 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
     ) -> Result<ManifestLocation> {
-        Ok(current_manifest_path(object_store, base_path).await?)
+        Ok(current_manifest_path(storage, base_path).await?)
     }
 
     async fn resolve_version_location(
         &self,
         base_path: &Path,
         version: u64,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
     ) -> Result<ManifestLocation> {
-        default_resolve_version(base_path, version, object_store).await
+        default_resolve_version(base_path, version, storage).await
     }
 
     /// Check whether an attached manifest version exists without loading it.
@@ -972,11 +969,11 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         version: u64,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> Result<bool> {
         let path = naming_scheme.manifest_path(base_path, version);
-        match object_store.head(&path).await {
+        match storage.stat(&path).await {
             Ok(_) => Ok(true),
             Err(ObjectStoreError::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
@@ -994,10 +991,10 @@ pub trait CommitHandler: Debug + Send + Sync {
         base_path: &Path,
         version: u64,
         path: &Path,
-        object_store: &dyn OSObjectStore,
+        storage: &ObjectStore,
     ) -> Result<bool> {
         match self
-            .resolve_version_location(base_path, version, object_store)
+            .resolve_version_location(base_path, version, storage)
             .await
         {
             Ok(location) => Ok(location.path == *path),
@@ -1012,9 +1009,9 @@ pub trait CommitHandler: Debug + Send + Sync {
     fn list_detached_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a ObjectStore,
+        storage: &'a ObjectStore,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        list_detached_manifests(base_path, &object_store.inner).boxed()
+        list_detached_manifests(base_path, storage).boxed()
     }
 
     /// If `sorted_descending` is `true`, the stream will yield manifests in descending
@@ -1026,10 +1023,10 @@ pub trait CommitHandler: Debug + Send + Sync {
     fn list_manifest_locations<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a ObjectStore,
+        storage: &'a ObjectStore,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        default_list_manifest_locations(base_path, object_store, sorted_descending)
+        default_list_manifest_locations(base_path, storage, sorted_descending)
     }
 
     /// List manifest locations with version `> since_version`, in descending
@@ -1042,10 +1039,10 @@ pub trait CommitHandler: Debug + Send + Sync {
     fn list_manifest_locations_since<'a>(
         &self,
         base_path: &Path,
-        object_store: &'a ObjectStore,
+        storage: &'a ObjectStore,
         since_version: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        default_list_manifest_locations_since(base_path, object_store, since_version)
+        default_list_manifest_locations_since(base_path, storage, since_version)
     }
 
     /// Commit a manifest.
@@ -1057,7 +1054,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1073,7 +1070,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn resolve_latest_identity(
         &self,
         _base_path: &Path,
-        _object_store: &ObjectStore,
+        _storage: &ObjectStore,
     ) -> Result<Option<PredecessorIdentity>> {
         Ok(None)
     }
@@ -1083,7 +1080,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn resolve_identity(
         &self,
         _base_path: &Path,
-        _object_store: &ObjectStore,
+        _storage: &ObjectStore,
         _version: u64,
     ) -> Result<Option<PredecessorIdentity>> {
         Ok(None)
@@ -1098,7 +1095,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         _manifest: &mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _base_path: &Path,
-        _object_store: &ObjectStore,
+        _storage: &ObjectStore,
         _manifest_writer: ManifestWriter,
         _naming_scheme: ManifestNamingScheme,
         _transaction: Option<Transaction>,
@@ -1129,7 +1126,7 @@ pub trait CommitHandler: Debug + Send + Sync {
 async fn default_resolve_version(
     base_path: &Path,
     version: u64,
-    object_store: &dyn OSObjectStore,
+    storage: &ObjectStore,
 ) -> Result<ManifestLocation> {
     if is_detached_version(version) {
         return Ok(ManifestLocation {
@@ -1149,7 +1146,7 @@ async fn default_resolve_version(
     // try V2, fallback to V1.
     let scheme = ManifestNamingScheme::V2;
     let path = scheme.manifest_path(base_path, version);
-    match object_store.head(&path).await {
+    match storage.stat(&path).await {
         Ok(meta) => Ok(ManifestLocation {
             version,
             path,
@@ -1314,7 +1311,6 @@ pub async fn commit_handler_from_url(
 
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
-                options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
                 accessor,
@@ -1402,7 +1398,7 @@ impl CommitHandler for UnsafeCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1417,10 +1413,9 @@ impl CommitHandler for UnsafeCommitHandler {
         }
 
         let version_path = naming_scheme.manifest_path(base_path, manifest.version);
-        let res =
-            manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
+        let res = manifest_writer(storage, manifest, indices, &version_path, transaction).await?;
 
-        write_version_hint(object_store, base_path, manifest.version).await;
+        write_version_hint(storage, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1535,7 +1530,7 @@ where
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1548,7 +1543,7 @@ where
         let lease = LeaseGuard::new(self.lock(manifest.version).await?);
 
         // Head the location and make sure it's not already committed
-        match object_store.stat(&path).await {
+        match storage.stat(&path).await {
             Ok(_) => {
                 // The path already exists, so it's already committed
                 // Release the lock
@@ -1565,14 +1560,14 @@ where
                 return Err(CommitError::OtherError(e.into()));
             }
         }
-        let res = manifest_writer(object_store, manifest, indices, &path, transaction).await;
+        let res = manifest_writer(storage, manifest, indices, &path, transaction).await;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
 
         let res = res?;
 
-        write_version_hint(object_store, base_path, manifest.version).await;
+        write_version_hint(storage, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1604,7 +1599,7 @@ where
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1614,7 +1609,7 @@ where
                 manifest,
                 indices,
                 base_path,
-                object_store,
+                storage,
                 manifest_writer,
                 naming_scheme,
                 transaction,
@@ -1643,7 +1638,7 @@ impl CommitHandler for RenameCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1654,12 +1649,12 @@ impl CommitHandler for RenameCommitHandler {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let tmp_path = make_staging_manifest_path(&path)?;
 
-        let res = manifest_writer(object_store, manifest, indices, &tmp_path, transaction).await?;
+        let res = manifest_writer(storage, manifest, indices, &tmp_path, transaction).await?;
 
-        match object_store.rename_if_not_exists(&tmp_path, &path).await {
+        match storage.rename_if_not_exists(&tmp_path, &path).await {
             Ok(_) => {
                 // Successfully committed
-                write_version_hint(object_store, base_path, manifest.version).await;
+                write_version_hint(storage, base_path, manifest.version).await;
                 Ok(ManifestLocation {
                     version: manifest.version,
                     path,
@@ -1673,7 +1668,7 @@ impl CommitHandler for RenameCommitHandler {
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 // Another transaction has already been committed
                 // Attempt to clean up temporary object, but ignore errors if we can't
-                let _ = object_store.delete(&tmp_path).await;
+                let _ = storage.delete(&tmp_path).await;
 
                 return Err(CommitError::CommitConflict);
             }
@@ -1708,7 +1703,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
@@ -1727,15 +1722,8 @@ impl CommitHandler for ConditionalPutCommitHandler {
         .await?;
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
         let size = dummy_data.len() as u64;
-        let res = object_store
-            .put_payload_opts(
-                &path,
-                dummy_data.into(),
-                PutOptions {
-                    mode: object_store::PutMode::Create,
-                    ..Default::default()
-                },
-            )
+        let res = storage
+            .put_if_absent(&path, dummy_data.into())
             .await
             .map_err(|err| match err {
                 ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
@@ -1744,7 +1732,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 _ => CommitError::OtherError(err.into()),
             })?;
 
-        write_version_hint(object_store, base_path, manifest.version).await;
+        write_version_hint(storage, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1784,7 +1772,7 @@ impl CommitHandler for TencentCosCommitHandler {
         _manifest: &mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _base_path: &Path,
-        _object_store: &ObjectStore,
+        _storage: &ObjectStore,
         _manifest_writer: ManifestWriter,
         _naming_scheme: ManifestNamingScheme,
         _transaction: Option<Transaction>,
@@ -1839,38 +1827,53 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::utils::testing::{
-        CountingObjectStore, ProxyObjectStore, ProxyObjectStorePolicy,
+    use lance_io::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
     };
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    };
+    use lance_io::utils::testing::{CountingBackend, ProxyBackend, ProxyBackendPolicy};
     use tracing::instrument::WithSubscriber;
     use tracing_mock::{expect, subscriber};
 
     use super::*;
 
     #[derive(Debug)]
-    struct FailingManifestListStore {
-        inner: Arc<dyn OSObjectStore>,
-        first_path: Path,
+    enum ManifestFailure {
+        Listing(Path),
+        ReadBody(Path),
     }
 
-    impl std::fmt::Display for FailingManifestListStore {
+    #[derive(Debug)]
+    struct FailingManifestBackend {
+        inner: Arc<dyn lance_io::object_store::StorageBackend>,
+        failure: ManifestFailure,
+    }
+
+    impl std::fmt::Display for FailingManifestBackend {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "FailingManifestListStore")
+            write!(f, "FailingManifestBackend")
         }
     }
 
     #[async_trait]
-    impl OSObjectStore for FailingManifestListStore {
+    impl lance_io::object_store::StorageBackend for FailingManifestBackend {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: lance_io::object_store::PaginatedListOptions,
+        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             path: &Path,
             data: PutPayload,
             opts: PutOptions,
-        ) -> object_store::Result<PutResult> {
+        ) -> lance_io::object_store::Result<PutResult> {
             self.inner.put_opts(path, data, opts).await
         }
 
@@ -1878,34 +1881,57 @@ mod tests {
             &self,
             path: &Path,
             opts: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+        {
             self.inner.put_multipart_opts(path, opts).await
         }
 
-        async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
-            self.inner.get_opts(path, opts).await
+        async fn get_opts(
+            &self,
+            path: &Path,
+            opts: GetOptions,
+        ) -> lance_io::object_store::Result<GetResult> {
+            let mut result = self.inner.get_opts(path, opts).await?;
+            if let ManifestFailure::ReadBody(failed_path) = &self.failure
+                && path == failed_path
+            {
+                let path = path.to_string();
+                result.payload = lance_io::object_store::GetResultPayload::Stream(
+                    futures::stream::once(async move {
+                        Err(ObjectStoreError::NotFound {
+                            path,
+                            source: "body disappeared".into(),
+                        })
+                    })
+                    .boxed(),
+                );
+            }
+            Ok(result)
         }
 
         async fn get_ranges(
             &self,
             path: &Path,
             ranges: &[Range<u64>],
-        ) -> object_store::Result<Vec<Bytes>> {
+        ) -> lance_io::object_store::Result<Vec<Bytes>> {
             self.inner.get_ranges(path, ranges).await
         }
 
         fn delete_stream(
             &self,
-            paths: BoxStream<'static, object_store::Result<Path>>,
-        ) -> BoxStream<'static, object_store::Result<Path>> {
+            paths: BoxStream<'static, lance_io::object_store::Result<Path>>,
+        ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
             self.inner.delete_stream(paths)
         }
 
         fn list(
             &self,
             prefix: Option<&Path>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            let first_path = self.first_path.clone();
+        ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
+            let ManifestFailure::Listing(first_path) = &self.failure else {
+                return self.inner.list(prefix);
+            };
+            let first_path = first_path.clone();
             self.inner
                 .list(prefix)
                 .filter(move |item| {
@@ -1924,7 +1950,7 @@ mod tests {
         async fn list_with_delimiter(
             &self,
             prefix: Option<&Path>,
-        ) -> object_store::Result<ListResult> {
+        ) -> lance_io::object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -1933,8 +1959,32 @@ mod tests {
             from: &Path,
             to: &Path,
             opts: CopyOptions,
-        ) -> object_store::Result<()> {
+        ) -> lance_io::object_store::Result<()> {
             self.inner.copy_opts(from, to, opts).await
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> futures::stream::BoxStream<
+            'static,
+            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+        > {
+            let offset = offset.clone();
+            futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+                self.list(prefix),
+                move |meta| std::future::ready(meta.location > offset),
+            ))
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: lance_io::object_store::RenameOptions,
+        ) -> lance_io::object_store::Result<()> {
+            self.inner.rename_opts(from, to, opts).await
         }
     }
 
@@ -1985,7 +2035,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_manifest_naming_migration() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base = Path::from("base");
         let versions_dir = base.clone().join(VERSIONS_DIR);
 
@@ -1996,18 +2046,18 @@ mod tests {
             ManifestNamingScheme::V2.manifest_path(&base, 1),
         ];
         for path in original_files {
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
         }
 
-        migrate_scheme_to_v2(&object_store, &base).await.unwrap();
+        migrate_scheme_to_v2(&storage, &base).await.unwrap();
 
         let expected_files = vec![
             ManifestNamingScheme::V2.manifest_path(&base, 1),
             ManifestNamingScheme::V2.manifest_path(&base, 0),
             versions_dir.clone().join("irrelevant"),
         ];
-        let actual_files = object_store
-            .list_objects(Some(&versions_dir))
+        let actual_files = storage
+            .list(Some(versions_dir.clone()))
             .map_ok(|res| res.location)
             .try_collect::<Vec<_>>()
             .await
@@ -2023,13 +2073,13 @@ mod tests {
         naming_scheme: ManifestNamingScheme,
     ) {
         let tempdir;
-        let (object_store, base) = if lexical_list_store {
+        let (storage, base) = if lexical_list_store {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
             tempdir = TempObjDir::default();
             let path = tempdir.clone().join("base");
             let store = Box::new(ObjectStore::local());
-            assert!(!store.list_is_lexically_ordered);
+            assert!(!store.list_is_lexically_ordered());
             (store, path)
         };
 
@@ -2037,12 +2087,12 @@ mod tests {
         let mut expected_paths = Vec::new();
         for i in (0..12).rev() {
             let path = naming_scheme.manifest_path(&base, i);
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
             expected_paths.push(path);
         }
 
         let actual_versions = ConditionalPutCommitHandler
-            .list_manifest_locations(&base, &object_store, true)
+            .list_manifest_locations(&base, &storage, true)
             .map_ok(|location| location.path)
             .try_collect::<Vec<_>>()
             .await
@@ -2056,15 +2106,15 @@ mod tests {
         // The listing already sees ObjectMeta, so the manifest write time is free.
         // Dropping it forces callers that only need a version's age to read the whole
         // manifest, which is the cost `expire_versions` exists to avoid.
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base = Path::from("base");
         for version in 0..3 {
             let path = ManifestNamingScheme::V2.manifest_path(&base, version);
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
         }
 
         let locations = ConditionalPutCommitHandler
-            .list_manifest_locations(&base, &object_store, true)
+            .list_manifest_locations(&base, &storage, true)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -2080,6 +2130,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_current_manifest_path_respects_local_wrapper() {
+        use lance_io::object_store::{StorageBackend, WrappingObjectStore};
+
+        #[derive(Debug)]
+        struct Replacement(Arc<dyn StorageBackend>);
+        impl WrappingObjectStore for Replacement {
+            fn wrap(&self, _: &str, _: Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend> {
+                self.0.clone()
+            }
+        }
+
+        let directory = TempObjDir::default();
+        let base = directory.clone().join("dataset");
+        let mut local = ObjectStore::local();
+        let naming_scheme = ManifestNamingScheme::V2;
+        local
+            .put(&naming_scheme.manifest_path(&base, 9), b"disk")
+            .await
+            .unwrap();
+        let replacement = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        replacement
+            .put(
+                &naming_scheme.manifest_path(&base, 3),
+                bytes::Bytes::from_static(b"backend").into(),
+            )
+            .await
+            .unwrap();
+        local.apply_wrapper(&Replacement(replacement));
+
+        assert_eq!(
+            current_manifest_path(&local, &base).await.unwrap().version,
+            3
+        );
+        assert_eq!(
+            current_manifest_path(&ObjectStore::local(), &base)
+                .await
+                .unwrap()
+                .version,
+            9
+        );
+    }
+
+    #[tokio::test]
     #[rstest::rstest]
     async fn test_current_manifest_path(
         #[values(true, false)] lexical_list_store: bool,
@@ -2088,18 +2183,16 @@ mod tests {
     ) {
         // Use memory store for both cases to avoid local FS special codepath.
         // Modify list_is_lexically_ordered to simulate different object stores.
-        let mut object_store = ObjectStore::memory();
-        object_store.list_is_lexically_ordered = lexical_list_store;
-        let object_store = Box::new(object_store);
+        let storage = memory_store(lexical_list_store);
         let base = Path::from("base");
 
         // Write 12 manifest files in non-sequential order
         for version in [5, 2, 11, 0, 8, 3, 10, 1, 7, 4, 9, 6] {
             let path = naming_scheme.manifest_path(&base, version);
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
         }
 
-        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        let location = current_manifest_path(&storage, &base).await.unwrap();
 
         assert_eq!(location.version, 11);
         assert_eq!(location.naming_scheme, naming_scheme);
@@ -2108,10 +2201,80 @@ mod tests {
 
     /// A memory store that reports `list_is_lexically_ordered == false`, like
     /// S3 Express, so the version-hint paths are exercised.
+    fn memory_store(lexical: bool) -> Box<ObjectStore> {
+        let mut config = lance_io::object_store::BackendConfig::new(
+            lance_io::object_store::backend::native::from_object_store(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+            "memory",
+        );
+        config.list_is_lexically_ordered = lexical;
+        config.is_remote = false;
+        Box::new(
+            lance_io::utils::testing::TestObjectStoreProvider(config)
+                .build(url::Url::parse("memory:///").unwrap(), &Default::default()),
+        )
+    }
+
     fn non_lexical_memory_store() -> Box<ObjectStore> {
-        let mut object_store = ObjectStore::memory();
-        object_store.list_is_lexically_ordered = false;
-        Box::new(object_store)
+        memory_store(false)
+    }
+
+    #[rstest::rstest]
+    #[case::missing(false)]
+    #[case::request_failure(true)]
+    #[tokio::test]
+    async fn test_version_hint_read_does_not_retry(#[case] fail_request: bool) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
+        let count = requests.clone();
+        policy.lock().unwrap().set_before_policy(
+            "count",
+            Arc::new(move |op, _| {
+                if op == "get_opts" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if fail_request {
+                        return Err(Error::io("injected request failure"));
+                    }
+                }
+                Ok(())
+            }),
+        );
+        let mut store = ObjectStore::memory();
+        store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
+        ));
+        let result = read_version_hint(&store, &Path::from("dataset")).await;
+        if fail_request {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("injected request failure"));
+        } else {
+            assert_eq!(result.unwrap(), None);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_version_hint_body_not_found_is_an_error() {
+        let base = Path::from("dataset");
+        let path = version_hint_path(&base);
+        let mut store = ObjectStore::memory();
+        store
+            .put_payload(&path, Bytes::from_static(br#"{"version":1}"#).into())
+            .await
+            .unwrap();
+        store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| {
+                Arc::new(FailingManifestBackend {
+                    inner: backend,
+                    failure: ManifestFailure::ReadBody(path.clone()),
+                })
+            },
+        ));
+        let error = read_version_hint(&store, &base).await.unwrap_err();
+        assert!(matches!(error, Error::NotFound { .. }), "{error:?}");
+        assert!(error.to_string().contains(path.as_ref()));
     }
 
     #[tokio::test]
@@ -2123,36 +2286,25 @@ mod tests {
         write_version_hint(&lexical, &base, 42).await;
         assert_eq!(read_version_from_hint(&lexical, &base).await, None);
 
-        let object_store = non_lexical_memory_store();
-        write_version_hint(&object_store, &base, 42).await;
-        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(42));
+        let storage = non_lexical_memory_store();
+        write_version_hint(&storage, &base, 42).await;
+        assert_eq!(read_version_from_hint(&storage, &base).await, Some(42));
 
         // A later commit overwrites the hint.
-        write_version_hint(&object_store, &base, 100).await;
-        assert_eq!(
-            read_version_from_hint(&object_store, &base).await,
-            Some(100)
-        );
+        write_version_hint(&storage, &base, 100).await;
+        assert_eq!(read_version_from_hint(&storage, &base).await, Some(100));
 
         // Detached versions are never written to the hint.
-        write_version_hint(
-            &object_store,
-            &base,
-            crate::format::DETACHED_VERSION_MASK | 7,
-        )
-        .await;
-        assert_eq!(
-            read_version_from_hint(&object_store, &base).await,
-            Some(100)
-        );
+        write_version_hint(&storage, &base, crate::format::DETACHED_VERSION_MASK | 7).await;
+        assert_eq!(read_version_from_hint(&storage, &base).await, Some(100));
 
         // A corrupt / non-JSON hint file is treated as missing.
         let hint_path = version_hint_path(&base);
-        object_store
+        storage
             .put(&hint_path, b"not json".as_slice())
             .await
             .unwrap();
-        assert_eq!(read_version_from_hint(&object_store, &base).await, None);
+        assert_eq!(read_version_from_hint(&storage, &base).await, None);
     }
 
     #[tokio::test]
@@ -2166,31 +2318,30 @@ mod tests {
     ) {
         let tempdir = TempObjDir::default();
         let base = tempdir.clone();
-        let mut object_store = ObjectStore::local();
+        let mut storage = ObjectStore::local();
 
         for version in 1..=3 {
-            object_store
+            storage
                 .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
                 .await
                 .unwrap();
         }
-        write_version_hint(&object_store, &base, hint_version).await;
+        write_version_hint(&storage, &base, hint_version).await;
 
         let listing_count = Arc::new(AtomicUsize::new(0));
-        object_store.inner = Arc::new(CountingObjectStore::new(
-            object_store.inner.clone(),
-            listing_count.clone(),
+        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| Arc::new(CountingBackend::new(backend, listing_count.clone())),
         ));
 
         // Every commit checks for newer versions, even when already up to date.
-        let versions = default_list_manifest_locations_since(&base, &object_store, 3)
+        let versions = default_list_manifest_locations_since(&base, &storage, 3)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
         assert!(versions.is_empty());
 
         assert_eq!(
-            default_list_manifest_locations_since(&base, &object_store, 1)
+            default_list_manifest_locations_since(&base, &storage, 1)
                 .map_ok(|location| location.version)
                 .try_collect::<Vec<_>>()
                 .await
@@ -2199,7 +2350,7 @@ mod tests {
         );
         assert_eq!(listing_count.load(Ordering::SeqCst), 0);
         assert_eq!(
-            read_version_from_hint(&object_store, &base).await,
+            read_version_from_hint(&storage, &base).await,
             Some(hint_version)
         );
     }
@@ -2211,15 +2362,15 @@ mod tests {
     async fn test_version_hint_write_failure_logging(#[case] is_local: bool) {
         let tempdir = TempObjDir::default();
         let base = tempdir.clone();
-        let object_store = if is_local {
+        let storage = if is_local {
             // Replacing a directory fails on every platform, exercising the
             // same best-effort error boundary as an open hint on Windows.
             std::fs::create_dir_all(lance_io::local::to_local_path(&version_hint_path(&base)))
                 .unwrap();
             ObjectStore::local()
         } else {
-            let mut object_store = *non_lexical_memory_store();
-            let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+            let mut storage = *non_lexical_memory_store();
+            let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
             policy.lock().unwrap().set_before_policy(
                 "fail_hint_write",
                 Arc::new(|method, _| {
@@ -2229,9 +2380,10 @@ mod tests {
                     Ok(())
                 }),
             );
-            object_store.inner =
-                Arc::new(ProxyObjectStore::new(object_store.inner.clone(), policy));
-            object_store
+            storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+                |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
+            ));
+            storage
         };
         let level = if cfg!(windows) && is_local {
             tracing::Level::DEBUG
@@ -2243,11 +2395,11 @@ mod tests {
             .event(expect::event().at_level(level))
             .only()
             .run_with_handle();
-        write_version_hint(&object_store, &base, 2)
+        write_version_hint(&storage, &base, 2)
             .with_subscriber(subscriber)
             .await;
         handle.assert_finished();
-        assert_eq!(read_version_from_hint(&object_store, &base).await, None);
+        assert_eq!(read_version_from_hint(&storage, &base).await, None);
     }
 
     #[cfg(windows)]
@@ -2255,9 +2407,9 @@ mod tests {
     async fn test_version_hint_held_open_on_windows() {
         let tempdir = TempObjDir::default();
         let base = tempdir.clone();
-        let object_store = ObjectStore::local();
+        let storage = ObjectStore::local();
         for version in 1..=2 {
-            object_store
+            storage
                 .put(
                     &ManifestNamingScheme::V2.manifest_path(&base, version),
                     b"".as_slice(),
@@ -2265,7 +2417,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        write_version_hint(&object_store, &base, 1).await;
+        write_version_hint(&storage, &base, 1).await;
 
         // Match Python's read-only open: allow reads, but prevent replacement.
         const FILE_SHARE_READ: u32 = 1;
@@ -2279,12 +2431,12 @@ mod tests {
             .event(expect::event().at_level(tracing::Level::DEBUG))
             .only()
             .run_with_handle();
-        write_version_hint(&object_store, &base, 2)
+        write_version_hint(&storage, &base, 2)
             .with_subscriber(subscriber)
             .await;
         handle.assert_finished();
-        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(1));
-        let versions = default_list_manifest_locations_since(&base, &object_store, 1)
+        assert_eq!(read_version_from_hint(&storage, &base).await, Some(1));
+        let versions = default_list_manifest_locations_since(&base, &storage, 1)
             .map_ok(|location| location.version)
             .try_collect::<Vec<_>>()
             .await
@@ -2292,8 +2444,8 @@ mod tests {
         assert_eq!(versions, vec![2]);
 
         drop(reader);
-        write_version_hint(&object_store, &base, 2).await;
-        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(2));
+        write_version_hint(&storage, &base, 2).await;
+        assert_eq!(read_version_from_hint(&storage, &base).await, Some(2));
     }
 
     #[tokio::test]
@@ -2302,55 +2454,43 @@ mod tests {
         #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
         naming_scheme: ManifestNamingScheme,
     ) {
-        let object_store = non_lexical_memory_store();
+        let storage = non_lexical_memory_store();
         let base = Path::from("base");
 
         // No hint file yet.
-        assert!(
-            read_version_hint_and_probe(&object_store, &base)
-                .await
-                .is_none()
-        );
+        assert!(read_version_hint_and_probe(&storage, &base).await.is_none());
 
         for version in 1..=5 {
-            object_store
+            storage
                 .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
                 .await
                 .unwrap();
         }
 
         // Stale hint: should probe forward and find version 5.
-        write_version_hint(&object_store, &base, 3).await;
-        let location = read_version_hint_and_probe(&object_store, &base)
-            .await
-            .unwrap();
+        write_version_hint(&storage, &base, 3).await;
+        let location = read_version_hint_and_probe(&storage, &base).await.unwrap();
         assert_eq!(location.version, 5);
         assert_eq!(location.naming_scheme, naming_scheme);
 
         // Up-to-date hint: returns version 5 directly.
-        write_version_hint(&object_store, &base, 5).await;
-        let location = read_version_hint_and_probe(&object_store, &base)
-            .await
-            .unwrap();
+        write_version_hint(&storage, &base, 5).await;
+        let location = read_version_hint_and_probe(&storage, &base).await.unwrap();
         assert_eq!(location.version, 5);
 
         // Hint points past the latest version: not usable.
-        write_version_hint(&object_store, &base, 10).await;
-        assert!(
-            read_version_hint_and_probe(&object_store, &base)
-                .await
-                .is_none()
-        );
+        write_version_hint(&storage, &base, 10).await;
+        assert!(read_version_hint_and_probe(&storage, &base).await.is_none());
     }
 
     #[tokio::test]
     async fn test_list_manifests_since_version_with_hint() {
-        let object_store = non_lexical_memory_store();
+        let storage = non_lexical_memory_store();
         let base = Path::from("base");
         let scheme = ManifestNamingScheme::V2;
 
         for version in 1..=10 {
-            object_store
+            storage
                 .put(&scheme.manifest_path(&base, version), b"".as_slice())
                 .await
                 .unwrap();
@@ -2358,21 +2498,21 @@ mod tests {
 
         // No hint yet -> not usable, caller must fall back.
         assert!(
-            list_manifests_since_version_with_hint(&object_store, &base, 7)
+            list_manifests_since_version_with_hint(&storage, &base, 7)
                 .await
                 .is_none()
         );
 
         // Hint exactly at the read version -> fast path, nothing new.
-        write_version_hint(&object_store, &base, 10).await;
+        write_version_hint(&storage, &base, 10).await;
         assert!(matches!(
-            list_manifests_since_version_with_hint(&object_store, &base, 10).await,
+            list_manifests_since_version_with_hint(&storage, &base, 10).await,
             Some(v) if v.is_empty()
         ));
 
         // Hint ahead of the read version, with a gap to fill (8, 9) plus probing
         // from the hint (10). Results are descending by version.
-        let locations = list_manifests_since_version_with_hint(&object_store, &base, 7)
+        let locations = list_manifests_since_version_with_hint(&storage, &base, 7)
             .await
             .unwrap();
         assert_eq!(
@@ -2381,8 +2521,8 @@ mod tests {
         );
 
         // Slightly stale hint (points at 8) still probes up to the true latest.
-        write_version_hint(&object_store, &base, 8).await;
-        let locations = list_manifests_since_version_with_hint(&object_store, &base, 7)
+        write_version_hint(&storage, &base, 8).await;
+        let locations = list_manifests_since_version_with_hint(&storage, &base, 7)
             .await
             .unwrap();
         assert_eq!(
@@ -2391,9 +2531,9 @@ mod tests {
         );
 
         // Hint points past the latest -> not usable, caller falls back.
-        write_version_hint(&object_store, &base, 20).await;
+        write_version_hint(&storage, &base, 20).await;
         assert!(
-            list_manifests_since_version_with_hint(&object_store, &base, 7)
+            list_manifests_since_version_with_hint(&storage, &base, 7)
                 .await
                 .is_none()
         );
@@ -2402,52 +2542,56 @@ mod tests {
     #[tokio::test]
     async fn test_current_manifest_path_with_hint_non_lexical() {
         // Simulate S3 Express (non-lexically ordered list) with many versions.
-        let object_store = non_lexical_memory_store();
+        let storage = non_lexical_memory_store();
         let base = Path::from("base");
         let naming_scheme = ManifestNamingScheme::V2;
 
         for version in 1..=100 {
-            object_store
+            storage
                 .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
                 .await
                 .unwrap();
         }
 
         // Slightly stale hint: probing from 98 still resolves the true latest.
-        write_version_hint(&object_store, &base, 98).await;
-        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        write_version_hint(&storage, &base, 98).await;
+        let location = current_manifest_path(&storage, &base).await.unwrap();
         assert_eq!(location.version, 100);
     }
 
     #[tokio::test]
     async fn test_current_manifest_path_with_stale_hint_falls_back_to_listing() {
-        let object_store = non_lexical_memory_store();
+        let storage = non_lexical_memory_store();
         let base = Path::from("base");
         let naming_scheme = ManifestNamingScheme::V2;
 
         // Only version 5 exists, but the hint claims version 10.
-        object_store
+        storage
             .put(&naming_scheme.manifest_path(&base, 5), b"".as_slice())
             .await
             .unwrap();
-        write_version_hint(&object_store, &base, 10).await;
+        write_version_hint(&storage, &base, 10).await;
 
         // The stale hint is ignored; listing finds version 5.
-        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        let location = current_manifest_path(&storage, &base).await.unwrap();
         assert_eq!(location.version, 5);
 
         // A newer manifest can be missed if an unordered list fails after an
         // older entry. The fallback must report the failure, not version 5.
-        object_store
+        storage
             .put(&naming_scheme.manifest_path(&base, 11), b"".as_slice())
             .await
             .unwrap();
-        write_version_hint(&object_store, &base, 20).await;
-        let mut failing_store = (*object_store).clone();
-        failing_store.inner = Arc::new(FailingManifestListStore {
-            inner: failing_store.inner.clone(),
-            first_path: naming_scheme.manifest_path(&base, 5),
-        });
+        write_version_hint(&storage, &base, 20).await;
+        let mut failing_store = (*storage).clone();
+        failing_store.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| {
+                Arc::new(FailingManifestBackend {
+                    inner: backend,
+                    failure: ManifestFailure::Listing(naming_scheme.manifest_path(&base, 5)),
+                })
+            },
+        ));
         let error = current_manifest_path(&failing_store, &base)
             .await
             .unwrap_err();
@@ -2493,7 +2637,7 @@ mod tests {
         use crate::format::DETACHED_VERSION_MASK;
         use futures::TryStreamExt;
 
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base = Path::from("base");
         let versions_dir = base.clone().join(VERSIONS_DIR);
 
@@ -2502,12 +2646,12 @@ mod tests {
         for version in [1, 2, 3] {
             for scheme in [ManifestNamingScheme::V1, ManifestNamingScheme::V2] {
                 let path = scheme.manifest_path(&base, version);
-                object_store.put(&path, b"".as_slice()).await.unwrap();
+                storage.put(&path, b"".as_slice()).await.unwrap();
             }
         }
         for name in [".tmp_1.manifest_abc", VERSION_HINT_FILE] {
             let path = versions_dir.clone().join(name);
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
         }
 
         // Create some detached manifests
@@ -2518,15 +2662,14 @@ mod tests {
         ];
         for version in &detached_versions {
             let path = versions_dir.clone().join(format!("d{}.manifest", version));
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
         }
 
         // List detached manifests
-        let detached_locations: Vec<ManifestLocation> =
-            list_detached_manifests(&base, &object_store.inner)
-                .try_collect()
-                .await
-                .unwrap();
+        let detached_locations: Vec<ManifestLocation> = list_detached_manifests(&base, &storage)
+            .try_collect()
+            .await
+            .unwrap();
 
         assert_eq!(detached_locations.len(), 3);
         for loc in &detached_locations {
@@ -2645,7 +2788,7 @@ mod tests {
     /// A manifest writer that succeeds immediately, so the commit reaches the
     /// explicit lease release.
     fn succeeding_manifest_writer<'a>(
-        _object_store: &'a ObjectStore,
+        _storage: &'a ObjectStore,
         _manifest: &'a mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _path: &'a Path,
@@ -2701,7 +2844,7 @@ mod tests {
 
     /// A manifest writer that never completes, simulating a hung object store.
     fn hanging_manifest_writer<'a>(
-        _object_store: &'a ObjectStore,
+        _storage: &'a ObjectStore,
         _manifest: &'a mut Manifest,
         _indices: Option<Vec<IndexMetadata>>,
         _path: &'a Path,
@@ -2725,7 +2868,7 @@ mod tests {
             released: released.clone(),
         };
 
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("test");
         let mut manifest = test_manifest();
 
@@ -2735,7 +2878,7 @@ mod tests {
             &mut manifest,
             None,
             &base_path,
-            &object_store,
+            &storage,
             hanging_manifest_writer,
             ManifestNamingScheme::V2,
             None,
@@ -2771,7 +2914,7 @@ mod tests {
             released: released.clone(),
         };
 
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("test");
         let mut manifest = test_manifest();
 
@@ -2781,7 +2924,7 @@ mod tests {
             &mut manifest,
             None,
             &base_path,
-            &object_store,
+            &storage,
             succeeding_manifest_writer,
             ManifestNamingScheme::V2,
             None,
@@ -2823,13 +2966,12 @@ mod tests {
         #[case] leftover_staging: bool,
         #[case] expected_entries_listed: usize,
     ) {
-        let mut object_store = ObjectStore::memory();
-        object_store.list_is_lexically_ordered = true;
+        let mut storage = ObjectStore::memory();
 
         let base = Path::from("base");
         for version in 0..10u64 {
             let path = ManifestNamingScheme::V2.manifest_path(&base, version);
-            object_store.put(&path, b"".as_slice()).await.unwrap();
+            storage.put(&path, b"".as_slice()).await.unwrap();
         }
         if leftover_staging {
             // A staging manifest orphaned by an interrupted commit of version 10.
@@ -2837,19 +2979,16 @@ mod tests {
             // of the answer, and `detect_scheme` drops it for the `-{uuid}` suffix.
             let final_path = ManifestNamingScheme::V2.manifest_path(&base, 10);
             let staging_path = make_staging_manifest_path(&final_path).unwrap();
-            object_store
-                .put(&staging_path, b"".as_slice())
-                .await
-                .unwrap();
+            storage.put(&staging_path, b"".as_slice()).await.unwrap();
         }
 
         let entries_listed = Arc::new(AtomicUsize::new(0));
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
         policy.lock().unwrap().set_obj_meta_policy(
             "count_listed_entries",
             Arc::new({
                 let entries_listed = entries_listed.clone();
-                move |op: &str, meta: object_store::ObjectMeta| {
+                move |op: &str, meta: lance_io::object_store::ObjectMeta| {
                     if op == "list" {
                         entries_listed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2857,9 +2996,11 @@ mod tests {
                 }
             }),
         );
-        object_store.inner = Arc::new(ProxyObjectStore::new(object_store.inner.clone(), policy));
+        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
+        ));
 
-        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        let location = current_manifest_path(&storage, &base).await.unwrap();
         assert_eq!(location.version, 9);
         assert_eq!(
             entries_listed.load(Ordering::Relaxed),

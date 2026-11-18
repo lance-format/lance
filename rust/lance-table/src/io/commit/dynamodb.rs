@@ -18,7 +18,7 @@ use aws_sdk_dynamodb::operation::{
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, DeleteRequest, KeyType, WriteRequest,
 };
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
 use tracing::warn;

@@ -750,11 +750,9 @@ mod test {
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::WrappingObjectStore;
-    use object_store::list::PaginatedListStore;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-        Result as ObjectStoreResult, path::Path,
+    use lance_io::object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult, path::Path,
     };
     use pretty_assertions::assert_eq;
     use tokio::sync::{Semaphore, mpsc};
@@ -797,26 +795,21 @@ mod test {
     }
 
     impl WrappingObjectStore for BlockingDataFileStoreWrapper {
-        fn wrap(&self, _prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        fn wrap(
+            &self,
+            _prefix: &str,
+            target: Arc<dyn lance_io::object_store::StorageBackend>,
+        ) -> Arc<dyn lance_io::object_store::StorageBackend> {
             Arc::new(BlockingDataFileStore {
                 target,
                 reads: self.reads.clone(),
             })
         }
-
-        // Only data file reads are blocked, so a listing can keep the pushdown.
-        fn wrap_paginated(
-            &self,
-            _store_prefix: &str,
-            original: Arc<dyn PaginatedListStore>,
-        ) -> Option<Arc<dyn PaginatedListStore>> {
-            Some(original)
-        }
     }
 
     #[derive(Debug)]
     struct BlockingDataFileStore {
-        target: Arc<dyn ObjectStore>,
+        target: Arc<dyn lance_io::object_store::StorageBackend>,
         reads: Arc<BlockingDataFileReads>,
     }
 
@@ -827,7 +820,33 @@ mod test {
     }
 
     #[async_trait]
-    impl ObjectStore for BlockingDataFileStore {
+    impl lance_io::object_store::StorageBackend for BlockingDataFileStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: lance_io::object_store::PaginatedListOptions,
+        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
+        async fn get_ranges(
+            &self,
+            path: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+            object_store::coalesce_ranges(
+                ranges,
+                |range| {
+                    (self as &dyn lance_io::object_store::StorageBackend).get_range(path, range)
+                },
+                object_store::OBJECT_STORE_COALESCE_DEFAULT,
+            )
+            .await
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -841,7 +860,7 @@ mod test {
             &self,
             location: &Path,
             options: PutMultipartOptions,
-        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        ) -> ObjectStoreResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
             self.target.put_multipart_opts(location, options).await
         }
 
@@ -893,6 +912,21 @@ mod test {
         ) -> ObjectStoreResult<()> {
             self.target.rename_opts(from, to, options).await
         }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> futures::stream::BoxStream<
+            'static,
+            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+        > {
+            let offset = offset.clone();
+            futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+                self.list(prefix),
+                move |meta| std::future::ready(meta.location > offset),
+            ))
+        }
     }
 
     #[derive(Debug)]
@@ -935,7 +969,7 @@ mod test {
             started_tx,
             completed_tx,
         });
-        let dataset = Arc::new(dataset.with_object_store_wrappers([Arc::new(
+        let dataset = Arc::new(dataset.with_backend_wrappers([Arc::new(
             BlockingDataFileStoreWrapper {
                 reads: reads.clone(),
             },

@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray};
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 
 use super::file::{BlobFile, BlobSource, BlobSourceKey, shared_blob_source};
 use crate::dataset::Dataset;
@@ -481,12 +481,12 @@ impl<'a> BlobLocator<'a> {
 
     async fn store(&mut self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
         let Some(base_id) = base_id else {
-            return Ok(self.dataset.object_store.clone());
+            return Ok(self.dataset.storage.clone());
         };
         if let Some(store) = self.stores.get(&base_id) {
             return Ok(store.clone());
         }
-        let store = self.dataset.object_store(Some(base_id)).await?;
+        let store = self.dataset.storage(Some(base_id)).await?;
         self.stores.insert(base_id, store.clone());
         Ok(store)
     }

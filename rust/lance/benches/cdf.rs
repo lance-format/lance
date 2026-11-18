@@ -139,11 +139,7 @@ async fn scan(dataset: &Dataset, query: Query, path: ScanPath) -> usize {
     // Dev-dependencies enable lance-io's `test-util`, which keeps a record of every
     // I/O request until drained. Left to grow, that log slows each later scan, so
     // sequential Criterion runs would misattribute the drift to whichever path ran last.
-    dataset
-        .object_store(None)
-        .await
-        .unwrap()
-        .io_stats_incremental();
+    dataset.storage(None).await.unwrap().io_stats_incremental();
     rows
 }
 

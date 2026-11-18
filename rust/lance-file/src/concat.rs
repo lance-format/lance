@@ -83,7 +83,7 @@ impl EncodedFileInput {
     }
 
     /// The path used to read this input.
-    pub fn path(&self) -> &object_store::path::Path {
+    pub fn path(&self) -> &lance_core::storage::path::Path {
         self.scheduler.reader().path()
     }
 
@@ -382,7 +382,7 @@ fn validate_blob_field(
     array: &ArrayRef,
     selected: &[bool],
     blob_ids: Option<&Range<u32>>,
-    path: &object_store::path::Path,
+    path: &lance_core::storage::path::Path,
 ) -> Result<()> {
     if field.is_blob() {
         let descriptors = array.as_struct();
@@ -1162,7 +1162,7 @@ where
 /// # use lance_core::Result;
 /// # use lance_file::concat::{concat_files, EncodedFileInput, FileConcatOptions, FileConcatResult, FileConcatTarget};
 /// # use lance_io::object_store::ObjectStore;
-/// # use object_store::path::Path;
+/// # use lance_core::storage::path::Path;
 /// # async fn stitch(
 /// #     target: &FileConcatTarget,
 /// #     inputs: &[EncodedFileInput],
@@ -1311,7 +1311,7 @@ mod tests {
 
     async fn write_file(
         store: &Arc<ObjectStore>,
-        path: &object_store::path::Path,
+        path: &lance_core::storage::path::Path,
         version: ConcreteFileVersion,
         values: &[i32],
     ) -> Arc<Schema> {
@@ -1331,7 +1331,7 @@ mod tests {
 
     async fn input(
         store: Arc<ObjectStore>,
-        path: &object_store::path::Path,
+        path: &lance_core::storage::path::Path,
         expected_num_rows: u64,
     ) -> EncodedFileInput {
         let scheduler = ScanScheduler::new(store, SchedulerConfig::default_for_testing());

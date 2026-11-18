@@ -20,7 +20,7 @@ async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
     let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
-    let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+    let io_tracker = dataset.storage.as_ref().io_tracker().clone();
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
     dataset
@@ -44,7 +44,7 @@ async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
         .unwrap()
         .join(index_meta.uuid.to_string())
         .join(BITMAP_LOOKUP_NAME);
-    let meta = dataset.object_store.stat(&lookup_path).await.unwrap();
+    let meta = dataset.storage.stat(&lookup_path).await.unwrap();
     assert!(
         meta.size >= 1_000_000,
         "bitmap index should be large enough to fail without metadata path, size={} bytes",
@@ -903,7 +903,7 @@ async fn test_scalar_index_create_does_not_list_files() {
     let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
         .await
         .unwrap();
-    let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+    let io_tracker = dataset.storage.as_ref().io_tracker().clone();
 
     io_tracker.incremental_stats();
     dataset
@@ -960,7 +960,7 @@ async fn test_vector_index_create_does_not_list_files() {
     let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
         .await
         .unwrap();
-    let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+    let io_tracker = dataset.storage.as_ref().io_tracker().clone();
 
     io_tracker.incremental_stats();
     dataset
@@ -1165,7 +1165,7 @@ async fn test_btree_index_iops() {
         .unwrap();
 
     // Reset IO stats before query
-    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let _ = dataset.storage.as_ref().io_stats_incremental();
 
     // Query using the BTree index
     let results = dataset
@@ -1178,7 +1178,7 @@ async fn test_btree_index_iops() {
     assert!(results.num_rows() > 0);
 
     // Verify IOPs - should be minimal (no HEAD requests)
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     // We expect reads for: index metadata + index pages + data files
     // The key assertion is that we don't have extra HEAD requests
     assert_io_lt!(
@@ -1232,7 +1232,7 @@ async fn test_bitmap_index_iops() {
         .unwrap();
 
     // Reset IO stats before query
-    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let _ = dataset.storage.as_ref().io_stats_incremental();
 
     // Query using the Bitmap index
     let results = dataset
@@ -1245,7 +1245,7 @@ async fn test_bitmap_index_iops() {
     assert!(results.num_rows() > 0);
 
     // Verify IOPs
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(
         stats,
         read_iops,
@@ -1304,7 +1304,7 @@ async fn test_inverted_index_iops() {
         .unwrap();
 
     // Reset IO stats before query
-    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let _ = dataset.storage.as_ref().io_stats_incremental();
 
     // Query using the Inverted index (full-text search)
     let results = dataset
@@ -1321,7 +1321,7 @@ async fn test_inverted_index_iops() {
     // query opens the docs file on demand — a couple more IOPs than the
     // eager path, but constant and only on the first query (prewarm or a
     // warm cache serve it with zero IO).
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(
         stats,
         read_iops,
@@ -1395,7 +1395,7 @@ async fn test_ivf_pq_index_iops() {
     let _ = dataset.scan().try_into_batch().await.unwrap();
 
     // Reset IO stats before query
-    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let _ = dataset.storage.as_ref().io_stats_incremental();
 
     // Query using the IVF_PQ index (KNN search)
     let query_vector: Vec<f32> = (0..dimension).map(|i| i as f32 / 1000.0).collect();
@@ -1411,7 +1411,7 @@ async fn test_ivf_pq_index_iops() {
     assert!(results.num_rows() > 0);
 
     // Verify IOPs
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_lt!(
         stats,
         read_iops,

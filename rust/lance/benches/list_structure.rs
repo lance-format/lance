@@ -350,7 +350,7 @@ async fn main() -> Result<()> {
     match Args::parse().command {
         Command::Inspect { uri } => {
             let dataset = Dataset::open(&uri).await?;
-            let store = dataset.object_store(None).await?;
+            let store = dataset.storage(None).await?;
             let scheduler =
                 ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
             let mut files = Vec::new();
@@ -447,7 +447,7 @@ async fn main() -> Result<()> {
                 );
             }
             let dataset = Arc::new(Dataset::open(&uri).await?);
-            let store = dataset.object_store(None).await?;
+            let store = dataset.storage(None).await?;
             let peak_after_open = peak_rss_bytes()?;
             for iteration in 0..iterations {
                 store.io_stats_incremental();

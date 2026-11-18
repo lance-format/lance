@@ -256,14 +256,14 @@ impl ReadBlobsBuilder {
                 })
             })?;
         let physical_buffer_size = self.options.io_buffer_size_bytes.unwrap_or_else(|| {
-            SchedulerConfig::max_bandwidth(self.dataset.object_store.as_ref()).io_buffer_size_bytes
+            SchedulerConfig::max_bandwidth(self.dataset.storage.as_ref()).io_buffer_size_bytes
         });
         let batches = plan_blob_read_batches(partitioned.reads, physical_buffer_size)?;
         let execution = Arc::new(ReadBlobsExecution::new(self.options.io_buffer_size_bytes));
         let non_null_blobs = execute_blob_read_batches_stream(
             batches,
             execution,
-            self.dataset.object_store.io_parallelism(),
+            self.dataset.storage.io_parallelism(),
         )
         .map_ok(|blob| {
             let selection_index = blob.selection_index;
@@ -401,8 +401,7 @@ impl ReadBlobRangesBuilder {
             },
         )?;
         let physical_buffer_size = self.inner.options.io_buffer_size_bytes.unwrap_or_else(|| {
-            SchedulerConfig::max_bandwidth(self.inner.dataset.object_store.as_ref())
-                .io_buffer_size_bytes
+            SchedulerConfig::max_bandwidth(self.inner.dataset.storage.as_ref()).io_buffer_size_bytes
         });
         let batches = plan_blob_read_batches(partitioned.reads, physical_buffer_size)?;
         let execution = Arc::new(ReadBlobsExecution::new(
@@ -411,7 +410,7 @@ impl ReadBlobRangesBuilder {
         let non_null_ranges = execute_blob_read_batches_stream(
             batches,
             execution,
-            self.inner.dataset.object_store.io_parallelism(),
+            self.inner.dataset.storage.io_parallelism(),
         )
         .map(|result| {
             result.and_then(|blob| {
@@ -477,15 +476,13 @@ impl ReadBlobsExecution {
     fn scheduler_for(&self, source: &BlobSource) -> Arc<ScanScheduler> {
         let mut schedulers = self.schedulers.lock().unwrap();
         schedulers
-            .entry(Arc::as_ptr(&source.object_store) as usize)
+            .entry(Arc::as_ptr(&source.storage) as usize)
             .or_insert_with(|| {
                 let config = self
                     .io_buffer_size_bytes
                     .map(SchedulerConfig::new)
-                    .unwrap_or_else(|| {
-                        SchedulerConfig::max_bandwidth(source.object_store.as_ref())
-                    });
-                ScanScheduler::new(source.object_store.clone(), config)
+                    .unwrap_or_else(|| SchedulerConfig::max_bandwidth(source.storage.as_ref()));
+                ScanScheduler::new(source.storage.clone(), config)
             })
             .clone()
     }
@@ -718,7 +715,7 @@ async fn execute_blob_read_plan(
         let scheduler = execution.scheduler_for(&task.source);
         // The plan already bounds physical reads; probing the backing object's
         // size would add a metadata request without validating the blob slice.
-        let reader = task.source.object_store.open(&task.source.path).await?;
+        let reader = task.source.storage.open(&task.source.path).await?;
         let file_scheduler = scheduler.open_reader(reader.into());
         let priority = first_range.start;
         let physical_range_count = physical_ranges.len();
@@ -1087,11 +1084,11 @@ mod tests {
         BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY,
     };
     use lance_core::datatypes::BlobKind;
+    use lance_core::storage::path::Path;
     use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_table::format::BasePath;
-    use object_store::path::Path;
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::{
@@ -1146,7 +1143,7 @@ mod tests {
 
         for compacted in [false, true] {
             if compacted {
-                let payload_store = dataset.object_store(base_id).await.unwrap();
+                let payload_store = dataset.storage(base_id).await.unwrap();
                 let _ = payload_store.io_stats_incremental();
                 compact_files(&mut dataset, Default::default(), None)
                     .await
@@ -1178,7 +1175,7 @@ mod tests {
             // Descriptor lookup is warm, but payload reads are submitted through
             // the real dataset planner. Duplicate and overlapping selections
             // must share the same physical range in this single read plan.
-            let payload_store = dataset.object_store(base_id).await.unwrap();
+            let payload_store = dataset.storage(base_id).await.unwrap();
             let _ = payload_store.io_stats_incremental();
             let results = dataset
                 .read_blob_ranges("blob")
@@ -1217,7 +1214,7 @@ mod tests {
     async fn test_blob_execution_isolates_store_instances_with_the_same_prefix() {
         let (cached, _) = recording_range_store(Bytes::from_static(b"cached"));
         let (fresh, _) = recording_range_store(Bytes::from_static(b"origin"));
-        assert_eq!(cached.store_prefix, fresh.store_prefix);
+        assert_eq!(cached.store_prefix(), fresh.store_prefix());
         let path = Path::from("blobs/shared.bin");
         let mut sources = HashMap::new();
         let cached_source =
@@ -1779,7 +1776,7 @@ mod tests {
         for blob in &blobs {
             assert_eq!(blob.as_ref().unwrap().kind(), kind);
         }
-        let _ = dataset.object_store.io_stats_incremental();
+        let _ = dataset.storage.io_stats_incremental();
         let results = dataset
             .read_blob_ranges("blob")
             .unwrap()
@@ -1787,7 +1784,7 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = dataset.storage.io_stats_incremental();
 
         assert_eq!(results.len(), indices.len());
         for ((result, row), blob) in results.iter().zip(indices).zip(blobs) {

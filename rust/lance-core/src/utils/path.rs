@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use object_store::path::Path;
+use crate::storage::path::Path;
 
 pub trait LancePathExt {
     fn child_path(&self, path: &Path) -> Path;

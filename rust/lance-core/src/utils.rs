@@ -19,6 +19,5 @@ pub mod path;
 pub mod row_addr_remap;
 pub mod stable_partition;
 pub mod tempfile;
-pub mod testing;
 pub mod tokio;
 pub mod tracing;

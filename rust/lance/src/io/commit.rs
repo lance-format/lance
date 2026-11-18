@@ -74,10 +74,10 @@ use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use log;
-use object_store::path::Path;
 use prost::Message;
 
 #[cfg(test)]
@@ -158,7 +158,7 @@ pub(crate) fn maybe_timeout<T>(
 
 /// Read the raw protobuf transaction from a transaction file.
 async fn read_transaction_file_pb(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<pb::Transaction> {
@@ -166,7 +166,7 @@ async fn read_transaction_file_pb(
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
-    let result = object_store.read_object(&path).await?;
+    let result = storage.read_object(&path).await?;
     let data = result.bytes().await?;
     Ok(pb::Transaction::decode(data)?)
 }
@@ -174,11 +174,11 @@ async fn read_transaction_file_pb(
 /// Read the transaction data from a transaction file.
 #[cfg(test)]
 pub(crate) async fn read_transaction_file(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    read_transaction_file_pb(object_store, base_path, transaction_file)
+    read_transaction_file_pb(storage, base_path, transaction_file)
         .await?
         .try_into()
 }
@@ -193,11 +193,7 @@ pub(crate) async fn read_transaction_file(
 /// have NOT landed (see [`verify_commit_outcome`]): a landed manifest
 /// references its transaction file by path, so deleting it would corrupt the
 /// version.
-async fn cleanup_transaction_file(
-    object_store: &ObjectStore,
-    base_path: &Path,
-    transaction_file: &str,
-) {
+async fn cleanup_transaction_file(storage: &ObjectStore, base_path: &Path, transaction_file: &str) {
     if transaction_file.is_empty() {
         return;
     }
@@ -205,7 +201,7 @@ async fn cleanup_transaction_file(
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
-    match object_store.delete(&path).await {
+    match storage.delete(&path).await {
         Ok(()) => {
             tracing::info!(
                 target: TRACE_FILE_AUDIT,
@@ -228,9 +224,9 @@ async fn cleanup_transaction_file(
 /// its commit conclusively failed (the relocated FRI entry's spilled
 /// `details.binpb`). Never called when the commit outcome is unknown: the
 /// clone may have landed and still need them.
-async fn cleanup_spilled_clone_files(object_store: &ObjectStore, spilled_files: &[Path]) {
+async fn cleanup_spilled_clone_files(storage: &ObjectStore, spilled_files: &[Path]) {
     for path in spilled_files {
-        if let Err(e) = object_store.delete(path).await {
+        if let Err(e) = storage.delete(path).await {
             log::warn!("Failed to clean up staged clone file '{}': {}", path, e);
         }
     }
@@ -275,7 +271,7 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
 async fn verify_commit_outcome(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     version: u64,
@@ -295,12 +291,10 @@ async fn verify_commit_outcome(
 
     let mut backoff = Backoff::default();
     let failure = loop {
-        let failure = match try_read_manifest_at(object_store, commit_handler, base_path, version)
-            .await
+        let failure = match try_read_manifest_at(storage, commit_handler, base_path, version).await
         {
             Ok(Some((manifest, location))) => {
-                match read_manifest_transaction(object_store, base_path, &manifest, &location).await
-                {
+                match read_manifest_transaction(storage, base_path, &manifest, &location).await {
                     Ok(Some(committed_transaction)) => {
                         return if committed_transaction == transaction_pb {
                             CommitOutcome::Ours {
@@ -353,24 +347,24 @@ async fn verify_commit_outcome(
 }
 
 async fn read_manifest_transaction(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base_path: &Path,
     manifest: &Manifest,
     location: &ManifestLocation,
 ) -> Result<Option<pb::Transaction>> {
     if let Some(position) = manifest.transaction_section {
         let reader = if let Some(size) = location.size {
-            object_store
+            storage
                 .open_with_size(&location.path, size as usize)
                 .await?
         } else {
-            object_store.open(&location.path).await?
+            storage.open(&location.path).await?
         };
         let transaction: pb::Transaction =
             lance_io::utils::read_message(reader.as_ref(), position).await?;
         Ok(Some(transaction))
     } else if let Some(transaction_file) = manifest.transaction_file.as_deref() {
-        read_transaction_file_pb(object_store, base_path, transaction_file)
+        read_transaction_file_pb(storage, base_path, transaction_file)
             .await
             .map(Some)
     } else {
@@ -381,20 +375,20 @@ async fn read_manifest_transaction(
 /// Read the manifest at `version`, distinguishing "no such version"
 /// (`Ok(None)`) from transient read failures (`Err`).
 async fn try_read_manifest_at(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     version: u64,
 ) -> Result<Option<(Manifest, ManifestLocation)>> {
     let location = match commit_handler
-        .resolve_version_location(base_path, version, &object_store.inner)
+        .resolve_version_location(base_path, version, storage)
         .await
     {
         Ok(location) => location,
         Err(Error::NotFound { .. }) => return Ok(None),
         Err(e) => return Err(e),
     };
-    match read_manifest(object_store, &location.path, location.size).await {
+    match read_manifest(storage, &location.path, location.size).await {
         Ok(manifest) => Ok(Some((manifest, location))),
         Err(Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(e),
@@ -403,7 +397,7 @@ async fn try_read_manifest_at(
 
 /// Write a transaction to a file and return the relative path.
 pub(crate) async fn write_transaction_file(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     base_path: &Path,
     transaction: &pb::Transaction,
 ) -> Result<String> {
@@ -414,7 +408,7 @@ pub(crate) async fn write_transaction_file(
         .join(file_name.as_str());
 
     let buf = transaction.encode_to_vec();
-    object_store.put(&path, &buf).await?;
+    storage.put(&path, &buf).await?;
 
     Ok(file_name)
 }
@@ -429,7 +423,7 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     source_store: Option<&ObjectStore>,
     commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
@@ -467,11 +461,11 @@ async fn do_commit_new_dataset(
         // The source manifest must be read through the source store, which may differ
         // from the destination store when cloning across object stores/accounts. Falls
         // back to the destination store for same-store clones.
-        let source_store = source_store.unwrap_or(object_store);
+        let source_store = source_store.unwrap_or(storage);
         let source_base_path =
             ObjectStore::extract_path_from_uri(session.store_registry(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
-            .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
+            .resolve_version_location(&source_base_path, *ref_version, source_store)
             .await?;
         let source_manifest = Dataset::load_manifest(
             source_store,
@@ -519,7 +513,7 @@ async fn do_commit_new_dataset(
                         session.store_registry(),
                         &index,
                         base_remap,
-                        object_store,
+                        storage,
                         base_path,
                     )
                     .await?;
@@ -549,10 +543,10 @@ async fn do_commit_new_dataset(
     };
 
     let transaction_file = if !write_config.disable_transaction_file() {
-        match write_transaction_file(object_store, base_path, &pb_transaction).await {
+        match write_transaction_file(storage, base_path, &pb_transaction).await {
             Ok(transaction_file) => transaction_file,
             Err(err) => {
-                cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
+                cleanup_spilled_clone_files(storage, &spilled_clone_files).await;
                 return Err(err);
             }
         }
@@ -603,7 +597,7 @@ async fn do_commit_new_dataset(
             new_manifest.fragments = Arc::new(new_frags);
 
             if source_manifest.has_managed_blobs() {
-                let source_store = source_store.unwrap_or(object_store);
+                let source_store = source_store.unwrap_or(storage);
                 let source = Dataset::checkout_manifest(
                     Arc::new(source_store.clone()),
                     ObjectStore::extract_path_from_uri(session.store_registry(), ref_path)?,
@@ -619,7 +613,7 @@ async fn do_commit_new_dataset(
                 .await?;
                 crate::dataset::blob::clone::copy_blob_columns(
                     Arc::new(source),
-                    Arc::new(object_store.clone()),
+                    Arc::new(storage.clone()),
                     base_path.clone(),
                     uri,
                     &mut new_manifest,
@@ -645,7 +639,7 @@ async fn do_commit_new_dataset(
     }
 
     let result = write_manifest_file(
-        object_store,
+        storage,
         commit_handler.as_ref(),
         base_path,
         &mut manifest,
@@ -675,7 +669,7 @@ async fn do_commit_new_dataset(
             // before reporting a conflict (and before deleting the
             // transaction file a landed manifest would reference).
             match verify_commit_outcome(
-                object_store,
+                storage,
                 commit_handler.as_ref(),
                 base_path,
                 manifest.version,
@@ -708,13 +702,13 @@ async fn do_commit_new_dataset(
                     ));
                 }
             }
-            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
-            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
+            cleanup_transaction_file(storage, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(storage, &spilled_clone_files).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
             match verify_commit_outcome(
-                object_store,
+                storage,
                 commit_handler.as_ref(),
                 base_path,
                 manifest.version,
@@ -747,8 +741,8 @@ async fn do_commit_new_dataset(
                     ));
                 }
             }
-            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
-            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
+            cleanup_transaction_file(storage, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(storage, &spilled_clone_files).await;
             Err(err)
         }
     }
@@ -780,7 +774,7 @@ async fn record_new_dataset_commit(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_new_dataset(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     source_store: Option<&ObjectStore>,
     commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
@@ -793,7 +787,7 @@ pub(crate) async fn commit_new_dataset(
     inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
-        object_store,
+        storage,
         source_store,
         commit_handler,
         base_path,
@@ -1057,9 +1051,9 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         let dataset = dataset.clone();
                         Either::Right(async move {
-                            let object_store = dataset.object_store_for_data_file(file).await?;
+                            let storage = dataset.storage_for_data_file(file).await?;
                             let data_dir = dataset.data_file_dir_for_base(file.base_id)?;
-                            object_store
+                            storage
                                 .size(&data_dir.join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
@@ -1091,7 +1085,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.storage.io_parallelism())
         // Filter out empty fragments
         .try_filter(|frag| futures::future::ready(frag.num_rows().map(|n| n > 0).unwrap_or(false)))
         .boxed();
@@ -1231,8 +1225,8 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 let index_dir = dataset
                     .indice_files_dir(index)?
                     .join(index.uuid.to_string());
-                let object_store = dataset.object_store_for_index(index).await?;
-                list_index_files_with_sizes(&object_store, &index_dir).await
+                let storage = dataset.storage_for_index(index).await?;
+                list_index_files_with_sizes(&storage, &index_dir).await
             }
             .await;
             match result {
@@ -1308,7 +1302,7 @@ pub(crate) fn detect_overlapping_fragments(
 
 pub(crate) async fn do_commit_detached_transaction(
     dataset: &Dataset,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -1354,7 +1348,7 @@ pub(crate) async fn do_commit_detached_transaction(
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
+        write_transaction_file(storage, &dataset.base, &pb_transaction).await?
     } else {
         String::new()
     };
@@ -1375,7 +1369,7 @@ pub(crate) async fn do_commit_detached_transaction(
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
-                    object_store,
+                    storage,
                     commit_handler,
                     &dataset.base,
                     version,
@@ -1419,7 +1413,7 @@ pub(crate) async fn do_commit_detached_transaction(
             )
             .await;
             if checked.is_err() {
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                cleanup_transaction_file(storage, &dataset.base, &transaction_file).await;
             }
             checked
         })
@@ -1463,14 +1457,14 @@ pub(crate) async fn do_commit_detached_transaction(
         )
         .await
         {
-            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            cleanup_transaction_file(storage, &dataset.base, &transaction_file).await;
             return Err(error);
         }
 
         // Try to commit the manifest
         dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
-            object_store,
+            storage,
             commit_handler,
             &dataset.base,
             &mut manifest,
@@ -1495,7 +1489,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 // our own write landed but returned an ambiguous error.
                 // Verify before retrying with a new random version.
                 match verify_commit_outcome(
-                    object_store,
+                    storage,
                     commit_handler,
                     &dataset.base,
                     manifest.version,
@@ -1521,14 +1515,14 @@ pub(crate) async fn do_commit_detached_transaction(
                     }
                 }
                 if start.elapsed() > retry_timeout {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    cleanup_transaction_file(storage, &dataset.base, &transaction_file).await;
                     return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
                 }
                 let sleep_fut = tokio::time::sleep(backoff.next_backoff());
                 if let Err(error) =
                     maybe_timeout(backoff.attempt(), start, retry_timeout, sleep_fut).await
                 {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    cleanup_transaction_file(storage, &dataset.base, &transaction_file).await;
                     return Err(error);
                 }
                 // The inline copy was moved into the failed attempt; rebuild
@@ -1541,7 +1535,7 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
-                    object_store,
+                    storage,
                     commit_handler,
                     &dataset.base,
                     manifest.version,
@@ -1566,7 +1560,7 @@ pub(crate) async fn do_commit_detached_transaction(
                         ));
                     }
                 }
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                cleanup_transaction_file(storage, &dataset.base, &transaction_file).await;
                 return Err(err);
             }
         }
@@ -1574,7 +1568,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+    cleanup_transaction_file(storage, &dataset.base, &transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -1587,7 +1581,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
 pub(crate) async fn commit_detached_transaction(
     dataset: &Dataset,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -1597,7 +1591,7 @@ pub(crate) async fn commit_detached_transaction(
     dataset.ensure_branch_exists().await?;
     let result = do_commit_detached_transaction(
         dataset,
-        object_store,
+        storage,
         commit_handler,
         transaction,
         write_config,
@@ -1743,7 +1737,7 @@ async fn record_successful_commit(
     if !indices.is_empty() {
         let key = IndexMetadataKey {
             version: manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
+            store_identity: dataset.storage.store_prefix(),
             e_tag: location.e_tag.as_deref(),
         };
         dataset
@@ -1769,7 +1763,7 @@ async fn record_successful_commit(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
@@ -1780,7 +1774,7 @@ pub(crate) async fn commit_transaction(
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
     dataset.ensure_branch_exists().await?;
-    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
+    // Note: object_store has been configured with WriteParams, but dataset.storage.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
@@ -1961,7 +1955,7 @@ pub(crate) async fn commit_transaction(
         let may_change_schema = operation_may_change_schema(&pb_transaction);
 
         current_transaction_file = if !write_config.disable_transaction_file() {
-            write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
+            write_transaction_file(storage, &dataset.base, &pb_transaction).await?
         } else {
             String::new()
         };
@@ -1983,7 +1977,7 @@ pub(crate) async fn commit_transaction(
                 // A restore reinstates its snapshot's index list and entry
                 // whole; nothing is prepared or withdrawn a second time.
                 Transaction::restore_old_manifest(
-                    object_store,
+                    storage,
                     commit_handler,
                     &dataset.base,
                     version,
@@ -2029,8 +2023,7 @@ pub(crate) async fn commit_transaction(
             )
             .await;
             if checked.is_err() {
-                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
-                    .await;
+                cleanup_transaction_file(storage, &dataset.base, &current_transaction_file).await;
             }
             checked
         })
@@ -2080,14 +2073,14 @@ pub(crate) async fn commit_transaction(
         )
         .await
         {
-            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            cleanup_transaction_file(storage, &dataset.base, &current_transaction_file).await;
             return Err(error);
         }
 
         // Try to commit the manifest
         original_dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
-            object_store,
+            storage,
             commit_handler,
             &dataset.base,
             &mut manifest,
@@ -2127,7 +2120,7 @@ pub(crate) async fn commit_transaction(
                 // treating the attempt as lost: deleting the artifacts of a
                 // commit that actually landed corrupts the version.
                 match verify_commit_outcome(
-                    object_store,
+                    storage,
                     commit_handler,
                     &dataset.base,
                     target_version,
@@ -2182,12 +2175,8 @@ pub(crate) async fn commit_transaction(
                 if next_attempt_i < num_attempts {
                     // The transaction file from this attempt is now stale; clean it up
                     // before the next attempt writes a new one (possibly rebased).
-                    cleanup_transaction_file(
-                        object_store,
-                        &dataset.base,
-                        &current_transaction_file,
-                    )
-                    .await;
+                    cleanup_transaction_file(storage, &dataset.base, &current_transaction_file)
+                        .await;
                     if retry_start.elapsed() > retry_timeout {
                         return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
                     }
@@ -2200,7 +2189,7 @@ pub(crate) async fn commit_transaction(
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
-                    object_store,
+                    storage,
                     commit_handler,
                     &dataset.base,
                     target_version,
@@ -2230,12 +2219,8 @@ pub(crate) async fn commit_transaction(
                     CommitOutcome::Foreign | CommitOutcome::Absent => {
                         // The attempt certainly did not land; its
                         // transaction file is orphaned.
-                        cleanup_transaction_file(
-                            object_store,
-                            &dataset.base,
-                            &current_transaction_file,
-                        )
-                        .await;
+                        cleanup_transaction_file(storage, &dataset.base, &current_transaction_file)
+                            .await;
                         if conditional_commit {
                             return Err(Error::retryable_commit_conflict_source(
                                 target_version,
@@ -2255,7 +2240,7 @@ pub(crate) async fn commit_transaction(
         }
     }
 
-    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+    cleanup_transaction_file(storage, &dataset.base, &current_transaction_file).await;
     let message = format!(
         "Failed to commit the transaction after {} retries.",
         commit_config.num_retries
@@ -2938,7 +2923,7 @@ mod tests {
             manifest: &mut Manifest,
             indices: Option<Vec<IndexMetadata>>,
             base_path: &Path,
-            object_store: &ObjectStore,
+            storage: &ObjectStore,
             manifest_writer: ManifestWriter,
             naming_scheme: ManifestNamingScheme,
             transaction: Option<lance_table::format::Transaction>,
@@ -2951,7 +2936,7 @@ mod tests {
                         &mut foreign_manifest,
                         None,
                         base_path,
-                        object_store,
+                        storage,
                         manifest_writer,
                         naming_scheme,
                         Some(foreign_transaction),
@@ -2965,7 +2950,7 @@ mod tests {
                     manifest,
                     indices,
                     base_path,
-                    object_store,
+                    storage,
                     manifest_writer,
                     naming_scheme,
                     transaction,
@@ -3119,7 +3104,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roundtrip_transaction_file() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let base_path = Path::from("test");
         let transaction = Transaction::new(
             42,
@@ -3128,13 +3113,13 @@ mod tests {
         );
 
         let file_name = write_transaction_file(
-            &object_store,
+            &storage,
             &base_path,
             &pb::Transaction::try_from(&transaction).unwrap(),
         )
         .await
         .unwrap();
-        let read_transaction = read_transaction_file(&object_store, &base_path, &file_name)
+        let read_transaction = read_transaction_file(&storage, &base_path, &file_name)
             .await
             .unwrap();
 
@@ -3272,7 +3257,7 @@ mod tests {
 
         let broken = dataset.load_index_by_name("id_idx").await.unwrap().unwrap();
         dataset
-            .object_store
+            .storage
             .remove_dir_all(dataset.indices_dir().join(broken.uuid.to_string()))
             .await
             .unwrap();
@@ -3292,7 +3277,7 @@ mod tests {
         // emits one - untrained indices get an empty bitmap, not none at all - so
         // the state an old manifest arrives in is set here by hand.
         let indices = read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )
@@ -3323,7 +3308,7 @@ mod tests {
         dataset.delete("false").await.unwrap();
 
         let migrated = read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )
@@ -3896,7 +3881,7 @@ mod tests {
             _manifest: &mut Manifest,
             _indices: Option<Vec<IndexMetadata>>,
             _base_path: &Path,
-            _object_store: &ObjectStore,
+            _storage: &ObjectStore,
             _manifest_writer: ManifestWriter,
             _naming_scheme: ManifestNamingScheme,
             _transaction: Option<lance_table::format::Transaction>,
@@ -4169,7 +4154,7 @@ mod tests {
         handler.fail_next(AmbiguousFailure::LandAndConflict);
         let (manifest, _) = commit_transaction(
             &dataset,
-            dataset.object_store.as_ref(),
+            dataset.storage.as_ref(),
             handler.as_ref(),
             &transaction,
             &write_config,
@@ -5120,11 +5105,7 @@ mod tests {
     /// its length prefix.
     async fn committed_manifest_message(dataset: &Dataset) -> Vec<u8> {
         let location = dataset.manifest_location();
-        let file = dataset
-            .object_store
-            .read_one_all(&location.path)
-            .await
-            .unwrap();
+        let file = dataset.storage.read_one_all(&location.path).await.unwrap();
         let footer = file.len() - 16;
         let pos = i64::from_le_bytes(file[footer..footer + 8].try_into().unwrap()) as usize;
         let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;

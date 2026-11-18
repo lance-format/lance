@@ -21,13 +21,13 @@ use std::time::Instant;
 
 use lance::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::storage::path::Path;
 use lance_core::utils::address::RowAddress;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_io::object_store::ObjectStore as LanceObjectStore;
+use lance_io::object_store::ObjectStore;
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringTreemap;
 use serde_json::json;
@@ -57,7 +57,7 @@ struct Config {
 
 struct StorageTarget {
     kind: &'static str,
-    store: Arc<LanceObjectStore>,
+    store: Arc<ObjectStore>,
     base_path: Path,
 }
 
@@ -472,7 +472,7 @@ fn measure_batch_order(
 
 impl StorageTarget {
     async fn open(uri: &str) -> Self {
-        let (store, base_path) = LanceObjectStore::from_uri(uri)
+        let (store, base_path) = ObjectStore::from_uri(uri)
             .await
             .unwrap_or_else(|error| panic!("failed to open benchmark storage URI {uri}: {error}"));
         let kind = if uri.starts_with("s3://") {

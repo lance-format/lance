@@ -13,7 +13,7 @@ async fn test_list_versions_under_ordering_and_limit() {
         let table_path = ns.base_path.clone().join("lv_test.lance");
         for v in 1..=7u64 {
             let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
-            ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+            ns.storage.put(&p, b"m".as_slice()).await.unwrap();
         }
         // A retained staging blob (sorts ahead of every committed
         // manifest) and a detached manifest (sorts after) must be excluded
@@ -23,15 +23,9 @@ async fn test_list_versions_under_ordering_and_limit() {
             ManifestNamingScheme::V2.manifest_path(&table_path, 8)
         ))
         .unwrap();
-        ns.object_store
-            .put(&staging, b"s".as_slice())
-            .await
-            .unwrap();
+        ns.storage.put(&staging, b"s".as_slice()).await.unwrap();
         let detached = table_path.clone().join(VERSIONS_DIR).join("d123.manifest");
-        ns.object_store
-            .put(&detached, b"d".as_slice())
-            .await
-            .unwrap();
+        ns.storage.put(&detached, b"d".as_slice()).await.unwrap();
         fn versions(r: &[TableVersion]) -> Vec<i64> {
             r.iter().map(|t| t.version).collect()
         }
@@ -87,11 +81,11 @@ async fn test_list_versions_under_ordering_and_limit() {
         .build()
         .await
         .unwrap();
-    assert!(ns_mem.object_store.list_is_lexically_ordered);
+    assert!(ns_mem.storage.list_is_lexically_ordered());
     seed_and_check(&ns_mem).await;
 
     let (ns_fs, _tmp) = create_test_namespace().await;
-    assert!(!ns_fs.object_store.list_is_lexically_ordered);
+    assert!(!ns_fs.storage.list_is_lexically_ordered());
     seed_and_check(&ns_fs).await;
 }
 
@@ -105,7 +99,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
 
     #[derive(Debug)]
     struct EntryCountingStore {
-        target: Arc<dyn OSObjectStore>,
+        target: Arc<dyn lance_io::object_store::StorageBackend>,
         entries_listed: Arc<AtomicUsize>,
     }
 
@@ -116,7 +110,26 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
     }
 
     #[async_trait]
-    impl OSObjectStore for EntryCountingStore {
+    impl lance_io::object_store::StorageBackend for EntryCountingStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: lance_io::object_store::PaginatedListOptions,
+        ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
+        async fn get_ranges(
+            &self,
+            path: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+            self.target.get_ranges(path, ranges).await
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -130,7 +143,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
             self.target.put_multipart_opts(location, opts).await
         }
 
@@ -162,6 +175,30 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.target.copy_opts(from, to, opts).await
         }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> futures::stream::BoxStream<
+            'static,
+            lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+        > {
+            let offset = offset.clone();
+            futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+                self.list(prefix),
+                move |meta| std::future::ready(meta.location > offset),
+            ))
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: lance_io::object_store::RenameOptions,
+        ) -> lance_io::object_store::Result<()> {
+            self.target.rename_opts(from, to, opts).await
+        }
     }
 
     #[derive(Debug)]
@@ -171,29 +208,35 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
 
     #[async_trait]
     impl lance_io::object_store::ObjectStoreProvider for EntryCountingMemoryProvider {
-        async fn new_store(
+        async fn new_backend(
             &self,
             base_path: Url,
-            params: &ObjectStoreParams,
-        ) -> Result<ObjectStore> {
-            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
-            store.inner = Arc::new(EntryCountingStore {
-                target: store.inner.clone(),
-                entries_listed: self.entries_listed.clone(),
-            });
-            Ok(store)
+            _params: &ObjectStoreParams,
+        ) -> Result<lance_io::object_store::BackendConfig> {
+            let backend = lance_io::object_store::backend::native::from_object_store(Arc::new(
+                object_store::memory::InMemory::new(),
+            ));
+            let mut config = lance_io::object_store::BackendConfig::new(
+                Arc::new(EntryCountingStore {
+                    target: backend,
+                    entries_listed: self.entries_listed.clone(),
+                }),
+                base_path.scheme(),
+            );
+            config.list_is_lexically_ordered = true;
+            Ok(config)
         }
 
         fn extract_path(&self, url: &Url) -> Result<Path> {
             MemoryStoreProvider.extract_path(url)
         }
 
-        fn calculate_object_store_prefix(
+        fn calculate_storage_prefix(
             &self,
             url: &Url,
             storage_options: Option<&HashMap<String, String>>,
         ) -> Result<String> {
-            MemoryStoreProvider.calculate_object_store_prefix(url, storage_options)
+            MemoryStoreProvider.calculate_storage_prefix(url, storage_options)
         }
     }
 
@@ -211,12 +254,12 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
         .build()
         .await
         .unwrap();
-    assert!(ns.object_store.list_is_lexically_ordered);
+    assert!(ns.storage.list_is_lexically_ordered());
 
     let table_path = ns.base_path.clone().join("lv_count.lance");
     for v in 1..=100u64 {
         let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
-        ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+        ns.storage.put(&p, b"m".as_slice()).await.unwrap();
     }
     // Sorts ahead of every committed manifest: the first raw entry.
     let staging = Path::parse(format!(
@@ -224,10 +267,7 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
         ManifestNamingScheme::V2.manifest_path(&table_path, 101)
     ))
     .unwrap();
-    ns.object_store
-        .put(&staging, b"s".as_slice())
-        .await
-        .unwrap();
+    ns.storage.put(&staging, b"s".as_slice()).await.unwrap();
 
     let consumed_before = entries_listed.load(Ordering::SeqCst);
     let got = ns
@@ -255,14 +295,18 @@ struct CountingFileStoreProvider {
 
 #[async_trait]
 impl lance_io::object_store::ObjectStoreProvider for CountingFileStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let provider = FileStoreProvider;
-        let mut store = provider.new_store(base_path, params).await?;
-        store.inner = Arc::new(CountingObjectStore::new(
-            store.inner.clone(),
-            self.listing_count.clone(),
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        _params: &ObjectStoreParams,
+    ) -> Result<lance_io::object_store::BackendConfig> {
+        let backend = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            object_store::local::LocalFileSystem::new(),
         ));
-        Ok(store)
+        Ok(lance_io::object_store::BackendConfig::new(
+            Arc::new(CountingBackend::new(backend, self.listing_count.clone())),
+            base_path.scheme(),
+        ))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -270,18 +314,18 @@ impl lance_io::object_store::ObjectStoreProvider for CountingFileStoreProvider {
         provider.extract_path(url)
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
         let provider = FileStoreProvider;
-        provider.calculate_object_store_prefix(url, storage_options)
+        provider.calculate_storage_prefix(url, storage_options)
     }
 }
 
 #[allow(dead_code)]
-fn file_object_store_uri(path: &str) -> String {
+fn file_storage_uri(path: &str) -> String {
     let file_url = uri_to_url(path).unwrap();
     let mut url = Url::parse("file-object-store:///").unwrap();
     url.set_path(file_url.path());
@@ -302,9 +346,9 @@ fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Sessio
 // `list_with_delimiter` (the call `check_table_status` makes) and delegates
 // everything else, so a table can be created before failures are injected.
 use futures::stream::BoxStream;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    PutMultipartOptions, PutPayload, PutResult, Result as OSResult,
+use lance_io::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutPayload,
+    PutResult, Result as OSResult,
 };
 use std::ops::Range;
 
@@ -319,7 +363,7 @@ enum ListBehavior {
 
 #[derive(Debug)]
 struct FailingListStore {
-    target: Arc<dyn OSObjectStore>,
+    target: Arc<dyn lance_io::object_store::StorageBackend>,
     behavior: Arc<Mutex<Option<ListBehavior>>>,
 }
 
@@ -330,7 +374,18 @@ impl std::fmt::Display for FailingListStore {
 }
 
 #[async_trait]
-impl OSObjectStore for FailingListStore {
+impl lance_io::object_store::StorageBackend for FailingListStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -344,7 +399,7 @@ impl OSObjectStore for FailingListStore {
         &self,
         location: &Path,
         opts: PutMultipartOptions,
-    ) -> OSResult<Box<dyn MultipartUpload>> {
+    ) -> OSResult<Box<dyn lance_io::object_store::backend::MultipartUpload>> {
         self.target.put_multipart_opts(location, opts).await
     }
 
@@ -403,6 +458,30 @@ impl OSObjectStore for FailingListStore {
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.target.copy_opts(from, to, opts).await
     }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| std::future::ready(meta.location > offset),
+        ))
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
 }
 
 #[derive(Debug)]
@@ -412,25 +491,33 @@ struct FailingListStoreProvider {
 
 #[async_trait]
 impl lance_io::object_store::ObjectStoreProvider for FailingListStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let mut store = FileStoreProvider.new_store(base_path, params).await?;
-        store.inner = Arc::new(FailingListStore {
-            target: store.inner.clone(),
-            behavior: self.behavior.clone(),
-        });
-        Ok(store)
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        _params: &ObjectStoreParams,
+    ) -> Result<lance_io::object_store::BackendConfig> {
+        let backend = lance_io::object_store::backend::native::from_object_store(Arc::new(
+            object_store::local::LocalFileSystem::new(),
+        ));
+        Ok(lance_io::object_store::BackendConfig::new(
+            Arc::new(FailingListStore {
+                target: backend,
+                behavior: self.behavior.clone(),
+            }),
+            base_path.scheme(),
+        ))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
         FileStoreProvider.extract_path(url)
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        FileStoreProvider.calculate_object_store_prefix(url, storage_options)
+        FileStoreProvider.calculate_storage_prefix(url, storage_options)
     }
 }
 
@@ -452,7 +539,7 @@ async fn failing_list_namespace() -> (
     Arc<Mutex<Option<ListBehavior>>>,
 ) {
     let temp_dir = TempStdDir::default();
-    let root_uri = file_object_store_uri(temp_dir.to_str().unwrap());
+    let root_uri = file_storage_uri(temp_dir.to_str().unwrap());
     let behavior = Arc::new(Mutex::new(None));
     let session = build_failing_list_session(behavior.clone());
     let namespace = DirectoryNamespaceBuilder::new(root_uri)
@@ -565,7 +652,7 @@ async fn test_table_resolution_missing_table_yields_table_not_found() {
 #[tokio::test]
 async fn test_hybrid_resolution_falls_through_and_does_not_mask_throttle() {
     let temp_dir = TempStdDir::default();
-    let root_uri = file_object_store_uri(temp_dir.to_str().unwrap());
+    let root_uri = file_storage_uri(temp_dir.to_str().unwrap());
     let behavior = Arc::new(Mutex::new(None));
     let session = build_failing_list_session(behavior.clone());
 
@@ -635,7 +722,7 @@ async fn test_hybrid_resolution_falls_through_and_does_not_mask_throttle() {
 async fn test_dir_listing_no_extra_calls_without_migration() {
     let temp_dir = TempStdDir::default();
     let temp_path = temp_dir.to_str().unwrap();
-    let root_uri = file_object_store_uri(temp_path);
+    let root_uri = file_storage_uri(temp_path);
     let listing_count = Arc::new(AtomicUsize::new(0));
     let session = build_listing_counting_session(listing_count.clone());
 
@@ -806,7 +893,7 @@ async fn test_migrate_updates_read_opened_legacy_manifest() {
 async fn test_describe_declared_table_checks_versions_only_when_requested() {
     let temp_dir = TempStdDir::default();
     let temp_path = temp_dir.to_str().unwrap();
-    let root_uri = file_object_store_uri(temp_path);
+    let root_uri = file_storage_uri(temp_path);
     let listing_count = Arc::new(AtomicUsize::new(0));
     let session = build_listing_counting_session(listing_count.clone());
 
@@ -854,7 +941,7 @@ async fn test_describe_declared_table_checks_versions_only_when_requested() {
 async fn test_dir_listing_extra_calls_with_migration() {
     let temp_dir = TempStdDir::default();
     let temp_path = temp_dir.to_str().unwrap();
-    let root_uri = file_object_store_uri(temp_path);
+    let root_uri = file_storage_uri(temp_path);
     let listing_count = Arc::new(AtomicUsize::new(0));
     let session = build_listing_counting_session(listing_count.clone());
 
@@ -1022,4 +1109,86 @@ async fn test_manifest_not_found_errors_include_full_table_id() {
     let err_msg = err.to_string();
     assert!(err_msg.contains("Table not found"));
     assert!(err_msg.contains("table id 'workspace$missing_table'"));
+}
+
+#[tokio::test]
+async fn test_manifest_conditional_copy_falls_back_without_overwrite() {
+    use lance_io::testing::MockStorageBackend;
+    use lance_io::utils::testing::TestWrappingObjectStore;
+    let mut namespace = DirectoryNamespaceBuilder::new("memory://")
+        .build()
+        .await
+        .unwrap();
+    let source = Path::from("staging");
+    let target = Path::from("final");
+    namespace
+        .storage
+        .put_payload(&source, bytes::Bytes::from_static(b"new").into())
+        .await
+        .unwrap();
+    namespace
+        .storage
+        .put_payload(&target, bytes::Bytes::from_static(b"old").into())
+        .await
+        .unwrap();
+    let mut storage = (*namespace.storage).clone();
+    storage.apply_wrapper(&TestWrappingObjectStore::new(|backend| {
+        let mut mock = MockStorageBackend::new();
+        mock.expect_copy_opts().returning(|_, _, _| {
+            Err(lance_io::object_store::Error::NotSupported {
+                source: "copy unavailable".into(),
+            })
+        });
+        let target = backend.clone();
+        // This fixture uses only the synchronous in-memory backend.
+        mock.expect_put_opts()
+            .returning(move |path, bytes, options| {
+                futures::executor::block_on(target.put_opts(path, bytes, options))
+            });
+        let target = backend.clone();
+        mock.expect_delete_stream()
+            .returning(move |paths| target.delete_stream(paths));
+        mock.expect_get_opts().returning(move |path, options| {
+            let target = backend.clone();
+            let path = path.clone();
+            Box::pin(async move { target.get_opts(&path, options).await })
+        });
+        Arc::new(mock)
+    }));
+    namespace.storage = Arc::new(storage);
+    let error = namespace
+        .materialize_version_manifest_create(&source, &target, "staging")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        lance_io::object_store::Error::AlreadyExists { .. }
+    ));
+    assert_eq!(
+        namespace
+            .storage
+            .read_object(&target)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        "old"
+    );
+    namespace.storage.delete(&target).await.unwrap();
+    namespace
+        .materialize_version_manifest_create(&source, &target, "staging")
+        .await
+        .unwrap();
+    assert_eq!(
+        namespace
+            .storage
+            .read_object(&target)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        "new"
+    );
 }

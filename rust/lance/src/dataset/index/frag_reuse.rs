@@ -132,7 +132,7 @@ impl Dataset {
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
     // check against index metadata before auto-remap
     let indices = read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -425,7 +425,7 @@ pub(crate) async fn derive_superseded_segments(
     dataset: &Dataset,
 ) -> lance_core::Result<Vec<IndexMetadata>> {
     let stored = read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -898,7 +898,7 @@ fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata])
 /// stable-partition transition are collected separately by dataset cleanup.
 pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<TaggedTrimOutcome> {
     let indices = read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -1250,7 +1250,7 @@ pub(crate) mod tests {
         assert_eq!(fri.index_version, 0);
         let raw_key = IndexMetadataKey {
             version: dataset.manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
+            store_identity: dataset.storage.store_prefix(),
             e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         let remapped_key = DerivedIndexListingKey {
@@ -2089,7 +2089,7 @@ pub(crate) mod tests {
 
         async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
             read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -2398,7 +2398,7 @@ pub(crate) mod tests {
                 ..entry.clone()
             };
             let indices = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )

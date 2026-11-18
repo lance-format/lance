@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::file::object_store_from_uri_or_path;
+use crate::file::storage_from_uri_or_path;
 use crate::rt;
 use arrow::compute::concat;
 use arrow::datatypes::Float32Type;
@@ -270,13 +270,13 @@ impl Hnsw {
 
     #[pyo3(signature = (file_path))]
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
-        let (object_store, path) =
-            rt().block_on(Some(py), object_store_from_uri_or_path(file_path, None))??;
+        let (storage, path) =
+            rt().block_on(Some(py), storage_from_uri_or_path(file_path, None))??;
         let mut writer = rt()
             .block_on(
                 Some(py),
                 V1FileWriter::<ManifestDescribing>::try_new(
-                    &object_store,
+                    &storage,
                     &path,
                     Schema::try_from(HNSW::schema().as_ref())
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,

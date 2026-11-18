@@ -82,6 +82,7 @@ rand_distr.workspace = true
 rangemap.workspace = true
 
 [dev-dependencies]
+lance-io = { workspace = true, features = ["test-util"] }
 approx.workspace = true
 criterion.workspace = true
 datafusion.workspace = true

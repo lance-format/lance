@@ -120,7 +120,7 @@ async fn apply_deletion(
             deletion_file,
             // Reference deletion file should never enter this apply_deletion. So base path is fine.
             &dataset.base,
-            dataset.object_store.as_ref(),
+            dataset.storage.as_ref(),
         )
         .await
         .unwrap()
@@ -135,7 +135,7 @@ async fn apply_deletion(
         fragment.id,
         dataset.manifest.version,
         &current_deletions,
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         0,
     )
     .await

@@ -3,12 +3,12 @@
 
 use std::{io::ErrorKind, path::PathBuf};
 
-use futures::{StreamExt, stream, stream::BoxStream};
-use lance_core::{Error, Result};
-use object_store::{
+use crate::object_store::{
     ObjectMeta,
     path::{Path, PathPart},
 };
+use futures::{StreamExt, stream, stream::BoxStream};
+use lance_core::{Error, Result};
 
 use super::ObjectStore;
 
@@ -29,7 +29,7 @@ impl ObjectStore {
         // Resolve the parent: LocalFileSystem rejects the staging filename itself.
         let local_parent = if let Some(operations) = &self.local_dir_operations {
             operations.directory_to_filesystem(&parent)?
-        } else if self.has_absolute_local_mapping() {
+        } else if self.direct_local_io {
             PathBuf::from(crate::local::to_local_path(&parent))
         } else {
             return Ok(None);
@@ -47,7 +47,7 @@ impl ObjectStore {
     /// ```
     /// # use lance_core::Result;
     /// # use lance_io::object_store::ObjectStore;
-    /// # use object_store::path::Path;
+    /// # use lance_core::storage::path::Path;
     /// # use futures::TryStreamExt;
     /// # async fn inspect(store: &ObjectStore, dir: &Path) -> Result<()> {
     /// let mut files = store.read_local_staging_files(dir);
@@ -63,7 +63,7 @@ impl ObjectStore {
     pub fn read_local_staging_files(&self, root: &Path) -> BoxStream<'_, Result<ObjectMeta>> {
         let local_root = if let Some(operations) = &self.local_dir_operations {
             operations.directory_to_filesystem(root)
-        } else if self.has_absolute_local_mapping() {
+        } else if self.direct_local_io {
             Ok(PathBuf::from(crate::local::to_local_path(root)))
         } else {
             return stream::empty().boxed();
@@ -182,7 +182,7 @@ mod tests {
 
     #[rstest]
     #[case::local("file")]
-    #[case::object_store("file-object-store")]
+    #[case::storage("file-object-store")]
     #[tokio::test]
     async fn lists_only_hidden_staging_files(#[case] scheme: &str) {
         let directory = tempfile::tempdir().unwrap();

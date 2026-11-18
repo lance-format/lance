@@ -1868,7 +1868,7 @@ async fn segment_ownership_mask(
     let key = SegmentOwnershipMaskKey {
         uuid: &index.uuid,
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: dataset.storage.store_prefix(),
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     let loader_dataset = dataset.clone();
@@ -4068,7 +4068,7 @@ mod tests {
             .get_with_key(&SegmentOwnershipMaskKey {
                 uuid: &old_segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
+                store_identity: dataset.storage.store_prefix(),
                 e_tag: dataset.manifest_location.e_tag.as_deref(),
             })
             .await
@@ -4214,7 +4214,7 @@ mod tests {
             SegmentOwnershipMaskKey {
                 uuid: &segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
+                store_identity: dataset.storage.store_prefix(),
                 e_tag: dataset.manifest_location.e_tag.as_deref(),
             }
         }

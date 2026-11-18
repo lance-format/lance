@@ -65,7 +65,7 @@ use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use uuid::Uuid;
 
 use self::util::{generate_random_hash, shard_base_path};

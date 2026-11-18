@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::Field;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 
 use super::locate::{BlobLocator, StoredBlob};
 use crate::Dataset;
@@ -84,7 +84,7 @@ impl SidecarRewrite {
                     let id = self.register(
                         base_id,
                         Source {
-                            store: file.source.object_store.clone(),
+                            store: file.source.storage.clone(),
                             path: file.source.path.clone(),
                         },
                     )?;
@@ -124,7 +124,7 @@ impl SidecarRewrite {
                     let id = self.register(
                         base,
                         Source {
-                            store: file.source.object_store.clone(),
+                            store: file.source.storage.clone(),
                             path: file.source.path.clone(),
                         },
                     )?;
@@ -270,7 +270,7 @@ mod tests {
 
         for fragment in dataset.get_fragments() {
             let objects = dataset
-                .object_store
+                .storage
                 .read_dir_all(
                     &dataset
                         .data_file_dir(&fragment.metadata().files[0])
@@ -290,7 +290,7 @@ mod tests {
         let (_dir, mut dataset) = fixture().await;
         let version = dataset.manifest.version;
         let before = dataset
-            .object_store
+            .storage
             .read_dir_all(&dataset.base, None)
             .try_collect::<Vec<_>>()
             .await
@@ -299,11 +299,7 @@ mod tests {
             .iter()
             .find(|o| o.location.extension() == Some("blob"))
             .unwrap();
-        dataset
-            .object_store
-            .delete(&sidecar.location)
-            .await
-            .unwrap();
+        dataset.storage.delete(&sidecar.location).await.unwrap();
         let error = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap_err();
@@ -311,12 +307,12 @@ mod tests {
         assert!(matches!(error, Error::NotFound { .. } | Error::IO { .. }));
         assert_eq!(dataset.manifest.version, version);
         let after = dataset
-            .object_store
+            .storage
             .read_dir_all(&dataset.base, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let data_paths = |objects: &[object_store::ObjectMeta]| {
+        let data_paths = |objects: &[lance_io::object_store::ObjectMeta]| {
             objects
                 .iter()
                 .filter(|o| o.location.extension() == Some("lance"))
@@ -405,7 +401,7 @@ mod tests {
                 .unwrap()
                 .join(data_file_key_from_path(&file.path));
             let retained = dataset
-                .object_store
+                .storage
                 .read_dir_all(&sidecar_dir, None)
                 .try_collect::<Vec<_>>()
                 .await
@@ -441,7 +437,7 @@ mod tests {
         scan.with_row_address();
         let batch = scan.try_into_batch().await.unwrap();
         let objects = dataset
-            .object_store
+            .storage
             .read_dir_all(&dataset.base, None)
             .try_collect::<Vec<_>>()
             .await
@@ -450,7 +446,7 @@ mod tests {
             .iter()
             .filter(|o| o.location.extension() == Some("blob"))
         {
-            dataset.object_store.delete(&object.location).await.unwrap();
+            dataset.storage.delete(&object.location).await.unwrap();
         }
         let plan =
             BlobV2BatchRewritePlan::try_new(dataset.schema(), batch.schema().as_ref(), false, true)

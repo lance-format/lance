@@ -582,7 +582,7 @@ impl UpdateJob {
         let (mut new_fragments, _) = write_fragments_internal(
             self.write_version,
             Some(&self.dataset),
-            self.dataset.object_store.clone(),
+            self.dataset.storage.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
@@ -606,7 +606,7 @@ impl UpdateJob {
                 .await;
             if let Err(e) = placed {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
+                    &self.dataset.storage,
                     &self.dataset.base,
                     None,
                     &new_fragments,
@@ -624,7 +624,7 @@ impl UpdateJob {
             Ok(v) => v,
             Err(e) => {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
+                    &self.dataset.storage,
                     &self.dataset.base,
                     None,
                     &new_fragments,
@@ -844,7 +844,7 @@ impl UpdateJob {
                     }
                 }
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism());
+            .buffer_unordered(self.dataset.storage.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -973,7 +973,7 @@ mod tests {
     use crate::{
         dataset::{InsertBuilder, ReadParams, WriteParams, builder::DatasetBuilder},
         session::Session,
-        utils::test::ThrottledStoreWrapper,
+        utils::test::DelayedStoreWrapper,
     };
 
     use super::*;
@@ -1008,10 +1008,10 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_io::utils::testing::DelayConfig;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::format::ROW_CREATED_AT_VERSION_FIELD_ID;
-    use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
 
@@ -1528,8 +1528,8 @@ mod tests {
         .unwrap();
 
         // Increase likelihood of contention by throttling the store
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_list_per_call: Duration::from_millis(1),
                 wait_get_per_call: Duration::from_millis(1),
                 ..Default::default()
@@ -1540,7 +1540,7 @@ mod tests {
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(throttled.clone()),
+                    backend_wrappers: vec![throttled.clone()],
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -1561,7 +1561,7 @@ mod tests {
                 let dataset = DatasetBuilder::from_uri("memory://")
                     .with_read_params(ReadParams {
                         store_options: Some(ObjectStoreParams {
-                            object_store_wrapper: Some(throttled_ref.clone()),
+                            backend_wrappers: vec![throttled_ref.clone()],
                             ..Default::default()
                         }),
                         session: Some(session_ref.clone()),
@@ -1622,8 +1622,8 @@ mod tests {
         .unwrap();
 
         // Increase likelihood of contention by throttling the store
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_list_per_call: Duration::from_millis(1),
                 wait_get_per_call: Duration::from_millis(1),
                 ..Default::default()
@@ -1634,7 +1634,7 @@ mod tests {
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(throttled.clone()),
+                    backend_wrappers: vec![throttled.clone()],
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -1655,7 +1655,7 @@ mod tests {
                 let dataset = DatasetBuilder::from_uri("memory://")
                     .with_read_params(ReadParams {
                         store_options: Some(ObjectStoreParams {
-                            object_store_wrapper: Some(throttled_ref.clone()),
+                            backend_wrappers: vec![throttled_ref.clone()],
                             ..Default::default()
                         }),
                         session: Some(session_ref.clone()),
@@ -2536,7 +2536,7 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(&routed_uri)
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(failing.clone()),
+                    backend_wrappers: vec![failing.clone()],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2641,7 +2641,7 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(&routed_uri)
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(failing),
+                    backend_wrappers: vec![failing],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3320,7 +3320,7 @@ mod tests {
         )
         .await
         .unwrap();
-        ds.object_store.io_stats_incremental();
+        ds.storage.io_stats_incremental();
         Arc::new(ds)
     }
 
@@ -3346,7 +3346,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows_updated, 32);
-        let read_bytes = ds.object_store.io_stats_incremental().read_bytes;
+        let read_bytes = ds.storage.io_stats_incremental().read_bytes;
         assert_eq!(
             read_bytes >= MATCHED_PAYLOAD_BYTES,
             reads_payload,

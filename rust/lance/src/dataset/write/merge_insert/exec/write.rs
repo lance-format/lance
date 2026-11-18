@@ -733,7 +733,7 @@ impl FullSchemaMergeInsertExec {
                     let (fragments, _) = write_fragments_internal_impl(
                         params.write_version(dataset),
                         Some(dataset),
-                        dataset.object_store.clone(),
+                        dataset.storage.clone(),
                         &dataset.base,
                         dataset.schema().clone(),
                         stream,
@@ -778,7 +778,7 @@ impl FullSchemaMergeInsertExec {
         }
         if let Some(error) = write_error {
             cleanup_data_fragments(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.base,
                 target_bases.as_deref(),
                 &fragments,
@@ -1365,7 +1365,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .await;
             if let Err(error) = lineage_result {
                 cleanup_data_fragments(
-                    &dataset.object_store,
+                    &dataset.storage,
                     &dataset.base,
                     cleanup_bases.as_deref(),
                     &new_fragments,
@@ -1399,7 +1399,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                         // The new data files are not committed; remove them (including
                         // ones routed to target bases) before surfacing the error.
                         cleanup_data_fragments(
-                            &dataset.object_store,
+                            &dataset.storage,
                             &dataset.base,
                             cleanup_bases.as_deref(),
                             &new_fragments,
@@ -1628,7 +1628,7 @@ mod tests {
         let (exec, state) = splitter_fixture().await;
         let mut before = exec
             .dataset
-            .object_store
+            .storage
             .read_dir(exec.dataset.data_dir())
             .await
             .unwrap();
@@ -1694,7 +1694,7 @@ mod tests {
             .unwrap();
         let mut after = exec
             .dataset
-            .object_store
+            .storage
             .read_dir(exec.dataset.data_dir())
             .await
             .unwrap();

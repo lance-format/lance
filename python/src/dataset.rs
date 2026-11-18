@@ -17,11 +17,11 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, Utc};
 use futures::{StreamExt, TryFutureExt};
+use lance_core::storage::path::Path;
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
-use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
@@ -80,7 +80,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::transaction::resolve_arrow_field_ids;
 
 use crate::error::PythonErrorExt;
-use crate::file::object_store_from_uri_or_path;
+use crate::file::storage_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::fts::FtsTokenizerOptions;
 use crate::indices::{
@@ -2760,19 +2760,15 @@ impl Dataset {
 
     /// Get a snapshot of current IO statistics without resetting counters
     fn io_stats_snapshot(&self) -> PyResult<IoStats> {
-        let object_store = rt()
-            .block_on(None, self.ds.object_store(None))?
-            .infer_error()?;
-        let stats = object_store.io_stats_snapshot();
+        let storage = rt().block_on(None, self.ds.storage(None))?.infer_error()?;
+        let stats = storage.io_stats_snapshot();
         Ok(IoStats::from_lance(stats))
     }
 
     /// Get incremental IO statistics for this dataset
     fn io_stats_incremental(&self) -> PyResult<IoStats> {
-        let object_store = rt()
-            .block_on(None, self.ds.object_store(None))?
-            .infer_error()?;
-        let stats = object_store.io_stats_incremental();
+        let storage = rt().block_on(None, self.ds.storage(None))?.infer_error()?;
+        let stats = storage.io_stats_incremental();
         Ok(IoStats::from_lance(stats))
     }
 
@@ -2784,12 +2780,11 @@ impl Dataset {
         ignore_not_found: Option<bool>,
     ) -> PyResult<()> {
         rt().spawn(None, async move {
-            let (object_store, path) =
-                object_store_from_uri_or_path(&dest, storage_options).await?;
-            validate_dataset_root_for_drop(&object_store, &path)
+            let (storage, path) = storage_from_uri_or_path(&dest, storage_options).await?;
+            validate_dataset_root_for_drop(&storage, &path)
                 .await
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let result = object_store.remove_dir_all(path).await;
+            let result = storage.remove_dir_all(path).await;
 
             match result {
                 Ok(_) => Ok(()),
@@ -2889,7 +2884,7 @@ impl Dataset {
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
-        let object_store_params = if accessor.is_some() {
+        let storage_params = if accessor.is_some() {
             Some(ObjectStoreParams {
                 storage_options_accessor: accessor,
                 ..Default::default()
@@ -2938,7 +2933,7 @@ impl Dataset {
                     PyWriteDest::Uri(uri) => {
                         match DatasetBuilder::from_uri(&**uri)
                             .with_read_params(ReadParams {
-                                store_options: object_store_params.clone(),
+                                store_options: storage_params.clone(),
                                 commit_handler: commit_handler.clone(),
                                 ..Default::default()
                             })
@@ -2987,7 +2982,7 @@ impl Dataset {
             builder = builder.use_stable_row_ids(enable);
         }
 
-        if let Some(store_params) = object_store_params {
+        if let Some(store_params) = storage_params {
             builder = builder.with_store_params(store_params);
         }
 
@@ -3026,7 +3021,7 @@ impl Dataset {
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
-        let object_store_params = if accessor.is_some() {
+        let storage_params = if accessor.is_some() {
             Some(ObjectStoreParams {
                 storage_options_accessor: accessor,
                 ..Default::default()
@@ -3049,7 +3044,7 @@ impl Dataset {
             .with_max_retries(max_retries.unwrap_or(20))
             .with_timeout(commit_timeout);
 
-        if let Some(store_params) = object_store_params {
+        if let Some(store_params) = storage_params {
             builder = builder.with_store_params(store_params);
         }
 

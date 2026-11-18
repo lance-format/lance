@@ -3,7 +3,7 @@
 
 //! AIMD-controlled token bucket rate limiter for ObjectStore operations.
 //!
-//! Wraps any [`object_store::ObjectStore`] with per-category token buckets
+//! Wraps any [`StorageBackend`] with per-category token buckets
 //! whose fill rates are dynamically adjusted by AIMD controllers. When cloud
 //! stores return HTTP 429/503, the fill rate decreases multiplicatively. During
 //! sustained success windows, it increases additively.
@@ -14,10 +14,16 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! use std::sync::Arc;
+//! use lance_io::object_store::backend::native::from_object_store;
+//! # fn example() -> lance_core::Result<()> {
+//! let target = from_object_store(Arc::new(object_store::memory::InMemory::new()));
 //! use lance_io::object_store::throttle::{AimdThrottleConfig, AimdThrottledStore};
 //!
-//! let throttled = AimdThrottledStore::new(target, AimdThrottleConfig::default()).unwrap();
+//! let throttled = AimdThrottledStore::new(target, AimdThrottleConfig::default())?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashMap;
@@ -25,37 +31,40 @@ use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Weak};
 
+use crate::object_store::{
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, RenameOptions, RenameTargetMode, Result as OSResult,
+    UploadPart,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use lance_core::storage::path::Path;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
-use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
-use object_store::ObjectStoreExt;
+use lance_core::utils::tracing::TRACE_STORAGE_THROTTLE;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::client::{
     ClientOptions, HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
     HttpResponseBody, HttpService,
 };
-use object_store::path::Path;
-use object_store::{
-    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    RenameTargetMode, Result as OSResult, UploadPart,
-};
 use rand::Rng;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
+#[cfg(test)]
+use crate::object_store::PaginatedListOptions;
+#[cfg(test)]
+use crate::object_store::PaginatedListResult;
 
 use crate::object_store::ObjectStoreParams;
+use crate::object_store::backend::{MultipartUpload, StorageBackend};
 
 /// Match ObjectStore's documented delete concurrency to bound in-flight operations
 /// and token reservations for stores without HTTP-level admission.
 const DELETE_CONCURRENCY: usize = 10;
 
-/// Check whether an `object_store::Error` represents a throttle response
+/// Check whether an `crate::object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
 /// Regrettably, this information is not fully exposed by the `object_store` crate.
@@ -72,9 +81,9 @@ const DELETE_CONCURRENCY: usize = 10;
 /// So, as a crude heuristic, which should work for the builtin object stores, but won't
 /// work for custom object stores, we simply look for the string "retries, max_retries"
 /// in the error message.
-pub fn is_throttle_error(err: &object_store::Error) -> bool {
+pub fn is_throttle_error(err: &crate::object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
-    if let object_store::Error::Generic { source, .. } = err {
+    if let crate::object_store::Error::Generic { source, .. } = err {
         let message = source.to_string();
         let lowercase = message.to_ascii_lowercase();
         lowercase.contains("retries, max_retries")
@@ -189,11 +198,11 @@ impl AimdThrottleConfig {
 
     /// Build an `AimdThrottleConfig` from storage options and environment variables.
     ///
-    /// Storage options take precedence over environment variables, which take
+    /// ObjectStore options take precedence over environment variables, which take
     /// precedence over defaults. A single AIMD config is applied to all four
     /// operation categories (read/write/delete/list).
     ///
-    /// | Setting              | Storage Option Key               | Env Var                          | Default |
+    /// | Setting              | ObjectStore Option Key               | Env Var                          | Default |
     /// |----------------------|----------------------------------|----------------------------------|---------|
     /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
     /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
@@ -415,7 +424,7 @@ impl OperationThrottle {
             Ok(_) => RequestOutcome::Success,
             Err(err) if is_throttle_error(err) => {
                 debug!(
-                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    target: TRACE_STORAGE_THROTTLE,
                     error = %err,
                     "Throttle error detected in stream"
                 );
@@ -443,7 +452,7 @@ impl OperationThrottle {
         if new_rate < prev_rate {
             if let Some(error) = error {
                 warn!(
-                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    target: TRACE_STORAGE_THROTTLE,
                     previous_rate = format!("{prev_rate:.1}"),
                     new_rate = format!("{new_rate:.1}"),
                     error = %error,
@@ -451,7 +460,7 @@ impl OperationThrottle {
                 );
             } else {
                 warn!(
-                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    target: TRACE_STORAGE_THROTTLE,
                     previous_rate = format!("{prev_rate:.1}"),
                     new_rate = format!("{new_rate:.1}"),
                     "AIMD throttle: rate reduced due to throttle errors"
@@ -476,7 +485,7 @@ impl OperationThrottle {
                 Ok(_) => RequestOutcome::Success,
                 Err(err) if is_throttle_error(err) => {
                     debug!(
-                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        target: TRACE_STORAGE_THROTTLE,
                         error = %err,
                         "Throttle error detected"
                     );
@@ -496,7 +505,7 @@ impl OperationThrottle {
                     let backoff_ms =
                         rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
-                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        target: TRACE_STORAGE_THROTTLE,
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
                         backoff_ms,
@@ -661,37 +670,17 @@ impl<C> AimdHttpConnector<C> {
     }
 }
 
-/// The caller's connector from [`ObjectStoreParams::http_connector`], or object_store's default.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-#[derive(Debug)]
-pub(crate) struct Transport(Arc<dyn HttpConnector>);
-
-#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-impl Transport {
-    pub(crate) fn new(connector: Option<&Arc<dyn HttpConnector>>) -> Self {
-        Self(
-            connector
-                .cloned()
-                .unwrap_or_else(|| Arc::new(object_store::client::ReqwestConnector::default())),
-        )
-    }
-}
-
-#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-impl HttpConnector for Transport {
-    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        self.0.connect(options)
-    }
-}
+use super::transport::Transport;
 
 /// OpenDAL opens its own HTTP clients, so it would drop the caller's connector without notice.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-pub(crate) fn reject_http_connector_for_opendal(
+pub(crate) fn reject_http_client_wrapper_for_opendal(
     params: &ObjectStoreParams,
 ) -> lance_core::Result<()> {
-    if params.http_connector.is_some() {
+    if params.http_client_wrapper.is_some() {
         return Err(lance_core::Error::not_supported(
-            "OpendalStore does not support an explicit http_connector; unset use_opendal to use it",
+            "OpendalStore does not support an explicit http_client_wrapper; unset use_opendal to use it",
         ));
     }
     Ok(())
@@ -1044,7 +1033,7 @@ impl HttpService for AimdHttpService {
                 let backoff_ms =
                     rand::rng().random_range(write.min_backoff_ms..=write.max_backoff_ms);
                 debug!(
-                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    target: TRACE_STORAGE_THROTTLE,
                     attempt = attempt + 1,
                     max_retries = write.max_retries,
                     backoff_ms,
@@ -1131,7 +1120,7 @@ impl MultipartUpload for ThrottledMultipartUpload {
     }
 }
 
-/// An ObjectStore wrapper that rate-limits operations using per-category token
+/// A StorageBackend wrapper that rate-limits operations using per-category token
 /// buckets whose fill rates are controlled by AIMD algorithms.
 ///
 /// Operations are split into four independent categories:
@@ -1147,10 +1136,10 @@ impl MultipartUpload for ThrottledMultipartUpload {
 /// Streaming list operations acquire a token before starting the underlying list stream.
 /// List items also feed their outcomes back to the AIMD controller.
 ///
-/// This is not perfect but probably as close as we can get without moving the throttle into
-/// the object_store crate itself.
+/// Providers with HTTP admission also account for internal requests and retries;
+/// other backends are limited at the StorageBackend operation boundary.
 pub struct AimdThrottledStore {
-    target: Arc<dyn ObjectStore>,
+    target: Arc<dyn StorageBackend>,
     read: Arc<OperationThrottle>,
     write: Arc<OperationThrottle>,
     delete: Arc<OperationThrottle>,
@@ -1179,7 +1168,7 @@ impl Display for AimdThrottledStore {
 
 impl AimdThrottledStore {
     pub fn new(
-        target: Arc<dyn ObjectStore>,
+        target: Arc<dyn StorageBackend>,
         config: AimdThrottleConfig,
     ) -> lance_core::Result<Self> {
         Ok(Self::new_with_state(
@@ -1190,7 +1179,7 @@ impl AimdThrottledStore {
     }
 
     pub(crate) fn new_with_state(
-        target: Arc<dyn ObjectStore>,
+        target: Arc<dyn StorageBackend>,
         state: AimdThrottleState,
         native_http_throttling: bool,
     ) -> Self {
@@ -1203,73 +1192,38 @@ impl AimdThrottledStore {
             native_http_throttling,
         }
     }
-
-    /// Put a paginated lister on the same list budget as this store.
-    pub fn wrap_paginated(
-        &self,
-        inner: Arc<dyn PaginatedListStore>,
-    ) -> Arc<dyn PaginatedListStore> {
-        Arc::new(ThrottledListStore {
-            inner,
-            throttle: self.list.clone(),
-        })
-    }
 }
 
-/// A store paired with the paginated lister that shares its rate limits.
-#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-type StoreWithLister = (Arc<dyn ObjectStore>, Option<Arc<dyn PaginatedListStore>>);
-
-/// Apply AIMD throttling to a store and to the lister that shares its list budget.
-///
-/// [`crate::object_store::ObjectStore::read_dir_page`] goes to the lister rather than
-/// through the store, so both have to be wrapped for list requests to be counted once
-/// against one rate.
+/// Apply the store's shared AIMD budget to all backend operations.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) fn with_throttling(
     state: Option<AimdThrottleState>,
     native_http_throttling: bool,
-    store: Arc<dyn ObjectStore>,
-    lister: Option<Arc<dyn PaginatedListStore>>,
-) -> StoreWithLister {
-    let Some(state) = state else {
-        return (store, lister);
-    };
-    let store = Arc::new(AimdThrottledStore::new_with_state(
-        store,
-        state,
-        native_http_throttling,
-    ));
-    let lister = lister.map(|lister| store.wrap_paginated(lister));
-    (store, lister)
-}
-
-/// A [`PaginatedListStore`] whose requests draw on a store's list token bucket.
-struct ThrottledListStore {
-    inner: Arc<dyn PaginatedListStore>,
-    throttle: Arc<OperationThrottle>,
-}
-
-// Throttling only adds waiting, so every semantic of the store it wraps has to reach the
-// listing unchanged; the lint keeps a method added to the trait from silently falling back to
-// its default here.
-#[async_trait]
-#[deny(clippy::missing_trait_methods)]
-impl PaginatedListStore for ThrottledListStore {
-    async fn list_paginated(
-        &self,
-        prefix: Option<&str>,
-        opts: PaginatedListOptions,
-    ) -> OSResult<PaginatedListResult> {
-        self.throttle
-            .throttled(|| self.inner.list_paginated(prefix, opts.clone()))
-            .await
+    store: Arc<dyn StorageBackend>,
+) -> Arc<dyn StorageBackend> {
+    match state {
+        Some(state) => Arc::new(AimdThrottledStore::new_with_state(
+            store,
+            state,
+            native_http_throttling,
+        )),
+        None => store,
     }
 }
 
 #[async_trait]
 #[deny(clippy::missing_trait_methods)]
-impl ObjectStore for AimdThrottledStore {
+impl StorageBackend for AimdThrottledStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        self.list
+            .throttled(|| self.target.list_paginated(prefix, options.clone()))
+            .await
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -1323,7 +1277,7 @@ impl ObjectStore for AimdThrottledStore {
                     // throttle failures that only the native client can parse.
                     // Admission and request-level outcomes stay at the HTTP hook.
                     let is_unobserved_throttle = item.as_ref().err().is_some_and(|error| {
-                        let object_store::Error::Generic { source, .. } = error else {
+                        let crate::object_store::Error::Generic { source, .. } = error else {
                             return false;
                         };
                         // Native per-object errors have no nested source. RetryError
@@ -1455,7 +1409,7 @@ impl ObjectStore for AimdThrottledStore {
                 // the outcome of the rename, so do not propagate the error.
                 if let Err(err) = self.delete.throttled(|| self.target.delete(from)).await {
                     warn!(
-                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        target: TRACE_STORAGE_THROTTLE,
                         source = %from,
                         destination = %to,
                         error = %err,
@@ -1471,7 +1425,12 @@ impl ObjectStore for AimdThrottledStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::StorageOptionsAccessor;
+    use crate::object_store::backend::MultipartUpload as NativeMultipartUpload;
+    use crate::object_store::backend::native::from_object_store;
+    use crate::object_store::{StorageOptionsAccessor, WrappingObjectStore};
+    use crate::utils::tracking_store::IOTracker;
+
+    use ::object_store::ObjectStoreExt;
 
     #[test]
     fn test_shared_throttle_state_follows_store_identity() {
@@ -1514,8 +1473,8 @@ mod tests {
 
     const THROTTLE_ERROR_RESPONSE: &str = "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s - Server returned non-2xx status code: 503: x-ms-request-id: azure-request-id";
 
-    fn make_generic_error(msg: &str) -> object_store::Error {
-        object_store::Error::Generic {
+    fn make_generic_error(msg: &str) -> crate::object_store::Error {
+        crate::object_store::Error::Generic {
             store: "test",
             source: msg.into(),
         }
@@ -1611,7 +1570,7 @@ mod tests {
 
     #[test]
     fn test_non_generic_errors_are_not_throttle() {
-        let err = object_store::Error::NotFound {
+        let err = crate::object_store::Error::NotFound {
             path: "test".to_string(),
             source: "not found".into(),
         };
@@ -1875,7 +1834,7 @@ mod tests {
 
     #[cfg(feature = "aws")]
     impl HttpConnector for BulkDeleteConnector {
-        fn connect(&self, _options: &ClientOptions) -> OSResult<HttpClient> {
+        fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
             Ok(HttpClient::new(BulkDeleteService {
                 requests: Arc::clone(&self.requests),
                 failures_remaining: Arc::clone(&self.failures_remaining),
@@ -1941,7 +1900,8 @@ mod tests {
     ) {
         use futures::stream;
         use object_store::aws::AmazonS3Builder;
-        use object_store::{BackoffConfig, RetryConfig};
+
+        use ::object_store::{BackoffConfig, RetryConfig};
 
         let requests = Arc::new(AtomicUsize::new(0));
         let failures_remaining = Arc::new(AtomicUsize::new(failures));
@@ -1982,7 +1942,8 @@ mod tests {
             .with_http_connector(connector)
             .build()
             .unwrap();
-        let throttled = AimdThrottledStore::new_with_state(Arc::new(target), state, true);
+        let throttled =
+            AimdThrottledStore::new_with_state(from_object_store(Arc::new(target)), state, true);
         let results = throttled
             .delete_stream(
                 stream::iter(vec![
@@ -2005,7 +1966,7 @@ mod tests {
             assert_eq!(results[0].as_ref().unwrap(), &Path::from("fragments/1"));
             assert!(matches!(
                 results[1],
-                Err(object_store::Error::Generic { .. })
+                Err(crate::object_store::Error::Generic { .. })
             ));
         }
         assert!(results.iter().any(|result| {
@@ -2031,7 +1992,7 @@ mod tests {
 
     #[cfg(feature = "azure")]
     impl HttpConnector for AzureBatchConnector {
-        fn connect(&self, _options: &ClientOptions) -> OSResult<HttpClient> {
+        fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
             Ok(HttpClient::new(AzureBatchService {
                 requests: Arc::clone(&self.requests),
             }))
@@ -2096,7 +2057,8 @@ mod tests {
             .with_http_connector(connector)
             .build()
             .unwrap();
-        let throttled = AimdThrottledStore::new_with_state(Arc::new(target), state, true);
+        let throttled =
+            AimdThrottledStore::new_with_state(from_object_store(Arc::new(target)), state, true);
         let results = throttled
             .delete_stream(
                 stream::iter(vec![
@@ -2112,7 +2074,7 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].as_ref().unwrap(), &Path::from("fragments/1"));
         let error = results[1].as_ref().unwrap_err();
-        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(matches!(error, crate::object_store::Error::Generic { .. }));
         assert!(error.to_string().contains("ServerBusy"), "{error}");
 
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -2127,7 +2089,8 @@ mod tests {
     async fn test_generic_delete_stream_shares_budget_and_preserves_errors() {
         use futures::{FutureExt, stream};
 
-        let target = Arc::new(InMemory::new());
+        let target =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let first = Path::from("fragments/1");
         let second = Path::from("fragments/2");
         for path in [&first, &second] {
@@ -2140,7 +2103,7 @@ mod tests {
             .with_burst_capacity(0)
             .with_delete_aimd(AimdConfig::default().with_initial_rate(1.0));
         let throttled = Arc::new(AimdThrottledStore::new(target.clone(), config).unwrap());
-        let input_error = object_store::Error::NotFound {
+        let input_error = crate::object_store::Error::NotFound {
             path: "input".to_string(),
             source: "upstream failure".into(),
         };
@@ -2160,7 +2123,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert_eq!(results.next().await.unwrap().unwrap(), first);
         let error = results.next().await.unwrap().unwrap_err();
-        assert!(matches!(error, object_store::Error::NotFound { .. }));
+        assert!(matches!(error, crate::object_store::Error::NotFound { .. }));
         assert!(error.to_string().contains("input"));
         assert!(target.head(&second).await.is_ok());
 
@@ -2190,7 +2153,7 @@ mod tests {
             .await;
         assert_eq!(results.len(), 1);
         let error = results[0].as_ref().unwrap_err();
-        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(matches!(error, crate::object_store::Error::Generic { .. }));
         assert!(
             error
                 .to_string()
@@ -2214,9 +2177,8 @@ mod tests {
         fail_with: Option<String>,
     }
 
-    #[async_trait]
-    impl PaginatedListStore for CountingListStore {
-        async fn list_paginated(
+    impl CountingListStore {
+        fn list_paginated(
             &self,
             _prefix: Option<&str>,
             _opts: PaginatedListOptions,
@@ -2236,15 +2198,20 @@ mod tests {
         }
     }
 
+    fn page_backend(lister: Arc<CountingListStore>) -> Arc<dyn StorageBackend> {
+        let mut mock = crate::testing::MockStorageBackend::new();
+        mock.expect_list_paginated()
+            .returning(move |prefix, options| lister.list_paginated(prefix, options));
+        Arc::new(mock)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_paginated_lister_acquires_a_token_before_listing() {
         let lister = Arc::new(CountingListStore::default());
-        let throttled = AimdThrottledStore::new(
-            Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
-            list_start_throttle_config(),
-        )
-        .unwrap();
-        let throttled_lister = throttled.wrap_paginated(lister.clone());
+        let throttled =
+            AimdThrottledStore::new(page_backend(lister.clone()), list_start_throttle_config())
+                .unwrap();
+        let throttled_lister = throttled;
 
         let mut page = Box::pin(
             throttled_lister.list_paginated(Some("prefix/"), PaginatedListOptions::default()),
@@ -2286,10 +2253,8 @@ mod tests {
         // untouched.
         config.min_backoff_ms = 5;
         config.max_backoff_ms = 5;
-        let throttled =
-            AimdThrottledStore::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, config)
-                .unwrap();
-        let throttled_lister = throttled.wrap_paginated(lister.clone());
+        let throttled = AimdThrottledStore::new(page_backend(lister.clone()), config).unwrap();
+        let throttled_lister = &throttled;
 
         assert!(
             throttled_lister
@@ -2305,22 +2270,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_put_get_through_wrapper() {
-        let store = Arc::new(InMemory::new());
+        // IoTrackingStore implements only StorageBackend, so the middleware stack
+        // cannot depend on converting back into an upstream OSObjectStore.
+        let store = IOTracker::default().wrap(
+            "memory",
+            crate::object_store::backend::native::from_object_store(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+        );
         let config = AimdThrottleConfig::default();
         let throttled = AimdThrottledStore::new(store, config).unwrap();
 
         let path = Path::from("test/file.txt");
         let data = PutPayload::from_static(b"hello world");
-        throttled.put(&path, data).await.unwrap();
+        (&throttled as &dyn StorageBackend)
+            .put(&path, data)
+            .await
+            .unwrap();
 
-        let result = throttled.get(&path).await.unwrap();
+        let result = (&throttled as &dyn StorageBackend)
+            .get(&path)
+            .await
+            .unwrap();
         let bytes = result.bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), b"hello world");
     }
 
     #[tokio::test]
     async fn test_rate_decreases_on_throttle() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default().with_aimd(
             AimdConfig::default()
                 .with_initial_rate(100.0)
@@ -2356,7 +2335,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_recovers_on_success() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default().with_aimd(
             AimdConfig::default()
                 .with_initial_rate(100.0)
@@ -2390,9 +2370,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_as_dyn_object_store() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let throttled: Arc<dyn ObjectStore> =
+    async fn test_as_dyn_storage() {
+        let store: Arc<dyn crate::object_store::StorageBackend> =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
+        let throttled: Arc<dyn StorageBackend> =
             Arc::new(AimdThrottledStore::new(store, AimdThrottleConfig::default()).unwrap());
 
         let path = Path::from("test/data.bin");
@@ -2406,7 +2387,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_bucket_delays_when_exhausted() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         // Very low rate and burst capacity to force waiting
         let config = AimdThrottleConfig::default()
             .with_burst_capacity(1)
@@ -2415,13 +2397,19 @@ mod tests {
 
         let path = Path::from("test/file.txt");
         let data = PutPayload::from_static(b"data");
-        throttled.put(&path, data).await.unwrap();
+        (throttled.as_ref() as &dyn StorageBackend)
+            .put(&path, data)
+            .await
+            .unwrap();
 
         // After consuming the burst token, the next request should take ~100ms
         // (1 token / 10 tokens-per-sec). We verify it takes at least 50ms.
         let start = std::time::Instant::now();
         let data2 = PutPayload::from_static(b"data2");
-        throttled.put(&path, data2).await.unwrap();
+        (throttled.as_ref() as &dyn StorageBackend)
+            .put(&path, data2)
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
         assert!(
@@ -2433,7 +2421,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_observes_outcomes() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default();
         let throttled = AimdThrottledStore::new(store.clone(), config).unwrap();
 
@@ -2450,7 +2439,7 @@ mod tests {
     /// Ok / throttle-error items. Used to verify that the AIMD wrapper
     /// observes errors surfaced inside list streams.
     struct ThrottlingListMockStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         /// Number of throttle errors to inject at the start of each list call.
         throttle_count: usize,
     }
@@ -2468,7 +2457,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for ThrottlingListMockStore {
+    impl crate::object_store::StorageBackend for ThrottlingListMockStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -2481,7 +2481,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn NativeMultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -2500,7 +2500,7 @@ mod tests {
             let n = self.throttle_count;
             let inner_stream = self.inner.list(prefix);
             let errors = futures::stream::iter((0..n).map(|_| {
-                Err(object_store::Error::Generic {
+                Err(crate::object_store::Error::Generic {
                     store: "ThrottlingListMock",
                     source: "request failed, after 3 retries, max_retries: 5, retry_timeout: 60s"
                         .into(),
@@ -2521,22 +2521,52 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     #[tokio::test]
     async fn test_list_stream_throttle_errors_decrease_rate() {
         let mock = Arc::new(ThrottlingListMockStore {
-            inner: InMemory::new(),
+            inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                InMemory::new(),
+            )),
             throttle_count: 5,
         });
 
         // Seed a file so the real items come through after the errors.
-        mock.put(
-            &Path::from("prefix/file.txt"),
-            PutPayload::from_static(b"data"),
-        )
-        .await
-        .unwrap();
+        (mock.as_ref() as &dyn StorageBackend)
+            .put(
+                &Path::from("prefix/file.txt"),
+                PutPayload::from_static(b"data"),
+            )
+            .await
+            .unwrap();
 
         let config = AimdThrottleConfig::default().with_list_aimd(
             AimdConfig::default()
@@ -2544,7 +2574,9 @@ mod tests {
                 .with_decrease_factor(0.5)
                 .with_window_duration(std::time::Duration::from_millis(10)),
         );
-        let throttled = AimdThrottledStore::new(mock as Arc<dyn ObjectStore>, config).unwrap();
+        let throttled =
+            AimdThrottledStore::new(mock as Arc<dyn crate::object_store::StorageBackend>, config)
+                .unwrap();
 
         let initial_rate = throttled.list.controller.current_rate();
         assert_eq!(initial_rate, 100.0);
@@ -2573,7 +2605,7 @@ mod tests {
     }
 
     struct CountingListStartStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         list_calls: AtomicUsize,
         offset_calls: AtomicUsize,
     }
@@ -2581,7 +2613,9 @@ mod tests {
     impl Default for CountingListStartStore {
         fn default() -> Self {
             Self {
-                inner: InMemory::new(),
+                inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                    InMemory::new(),
+                )),
                 list_calls: AtomicUsize::new(0),
                 offset_calls: AtomicUsize::new(0),
             }
@@ -2611,7 +2645,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for CountingListStartStore {
+    impl crate::object_store::StorageBackend for CountingListStartStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -2625,7 +2670,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn NativeMultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -2665,6 +2710,33 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     fn list_start_throttle_config() -> AimdThrottleConfig {
@@ -2679,7 +2751,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_list_acquires_token_before_starting_underlying_stream() {
         let store = Arc::new(CountingListStartStore::default());
-        store
+        (store.as_ref() as &dyn StorageBackend)
             .put(
                 &Path::from("prefix/file.txt"),
                 PutPayload::from_static(b"data"),
@@ -2687,7 +2759,7 @@ mod tests {
             .await
             .unwrap();
         let throttled = AimdThrottledStore::new(
-            store.clone() as Arc<dyn ObjectStore>,
+            store.clone() as Arc<dyn crate::object_store::StorageBackend>,
             list_start_throttle_config(),
         )
         .unwrap();
@@ -2715,12 +2787,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_list_with_offset_acquires_token_before_starting_underlying_stream() {
         let store = Arc::new(CountingListStartStore::default());
-        store
+        (store.as_ref() as &dyn StorageBackend)
             .put(&Path::from("prefix/b"), PutPayload::from_static(b"data"))
             .await
             .unwrap();
         let throttled = AimdThrottledStore::new(
-            store.clone() as Arc<dyn ObjectStore>,
+            store.clone() as Arc<dyn crate::object_store::StorageBackend>,
             list_start_throttle_config(),
         )
         .unwrap();
@@ -2748,7 +2820,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_per_category_independence() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default().with_aimd(
             AimdConfig::default()
                 .with_initial_rate(100.0)
@@ -2781,7 +2854,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_per_category_config() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default()
             .with_read_aimd(AimdConfig::default().with_initial_rate(200.0))
             .with_write_aimd(AimdConfig::default().with_initial_rate(100.0))
@@ -2795,11 +2869,11 @@ mod tests {
         assert_eq!(throttled.list.controller.current_rate(), 25.0);
     }
 
-    /// A mock [`ObjectStore`] that measures request rate over a sliding window
+    /// A mock [`OSObjectStore`] that measures request rate over a sliding window
     /// and returns 503 errors when the rate exceeds a configurable threshold.
     /// Write and metadata-only operations are not rate-limited.
     struct RateLimitingMockStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         /// Timestamps of recent successful (admitted) requests.
         timestamps: std::sync::Mutex<VecDeque<std::time::Instant>>,
         /// Maximum requests allowed within `window`.
@@ -2813,7 +2887,9 @@ mod tests {
     impl RateLimitingMockStore {
         fn new(max_per_window: usize, window: std::time::Duration) -> Self {
             Self {
-                inner: InMemory::new(),
+                inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                    InMemory::new(),
+                )),
                 timestamps: std::sync::Mutex::new(VecDeque::new()),
                 max_per_window,
                 window,
@@ -2843,8 +2919,8 @@ mod tests {
             }
         }
 
-        fn throttle_error() -> object_store::Error {
-            object_store::Error::Generic {
+        fn throttle_error() -> crate::object_store::Error {
+            crate::object_store::Error::Generic {
                 store: "RateLimitingMock",
                 source: THROTTLE_ERROR_RESPONSE.into(),
             }
@@ -2864,7 +2940,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for RateLimitingMockStore {
+    impl crate::object_store::StorageBackend for RateLimitingMockStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -2878,7 +2965,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn NativeMultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -2924,6 +3011,33 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     /// Verify that multiple concurrent readers sharing an AIMD-throttled store
@@ -2951,7 +3065,8 @@ mod tests {
 
         // Seed a test file so head() succeeds when admitted.
         let path = Path::from("test/data.bin");
-        mock.put(&path, PutPayload::from_static(b"test data"))
+        (mock.as_ref() as &dyn StorageBackend)
+            .put(&path, PutPayload::from_static(b"test data"))
             .await
             .unwrap();
 
@@ -2971,7 +3086,7 @@ mod tests {
         for _ in 0..num_readers {
             let store = Arc::new(
                 AimdThrottledStore::new(
-                    mock.clone() as Arc<dyn ObjectStore>,
+                    mock.clone() as Arc<dyn crate::object_store::StorageBackend>,
                     throttle_config.clone(),
                 )
                 .unwrap(),
@@ -2981,7 +3096,7 @@ mod tests {
                 let deadline = std::time::Instant::now() + test_duration;
                 let mut count = 0u64;
                 while std::time::Instant::now() < deadline {
-                    let _ = store.head(&p).await;
+                    let _ = (store.as_ref() as &dyn StorageBackend).head(&p).await;
                     count += 1;
                 }
                 count
@@ -3030,7 +3145,7 @@ mod tests {
     /// before succeeding on `get` and delete operations. Used to test the retry logic
     /// inside `OperationThrottle::throttled()`.
     struct RetryTestMockStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         /// Number of throttle errors remaining before success.
         errors_remaining: std::sync::Mutex<usize>,
         /// Total number of `get` calls observed.
@@ -3040,7 +3155,9 @@ mod tests {
     impl RetryTestMockStore {
         fn new(errors_before_success: usize) -> Self {
             Self {
-                inner: InMemory::new(),
+                inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                    InMemory::new(),
+                )),
                 errors_remaining: std::sync::Mutex::new(errors_before_success),
                 get_call_count: AtomicU64::new(0),
             }
@@ -3050,7 +3167,7 @@ mod tests {
             let mut remaining = self.errors_remaining.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
-                Err(object_store::Error::Generic {
+                Err(crate::object_store::Error::Generic {
                     store: "RetryTestMock",
                     source: THROTTLE_ERROR_RESPONSE.into(),
                 })
@@ -3073,7 +3190,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for RetryTestMockStore {
+    impl crate::object_store::StorageBackend for RetryTestMockStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -3086,7 +3214,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn NativeMultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -3122,6 +3250,33 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     #[tokio::test]
@@ -3129,15 +3284,19 @@ mod tests {
         // Mock returns 2 throttle errors then succeeds (within MAX_RETRIES=3)
         let mock = Arc::new(RetryTestMockStore::new(2));
         let path = Path::from("test/retry.txt");
-        mock.put(&path, PutPayload::from_static(b"retry data"))
+        (mock.as_ref() as &dyn StorageBackend)
+            .put(&path, PutPayload::from_static(b"retry data"))
             .await
             .unwrap();
 
         let config = AimdThrottleConfig::default();
-        let throttled =
-            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+        let throttled = AimdThrottledStore::new(
+            mock.clone() as Arc<dyn crate::object_store::StorageBackend>,
+            config,
+        )
+        .unwrap();
 
-        let result = throttled.get(&path).await;
+        let result = (&throttled as &dyn StorageBackend).get(&path).await;
         assert!(result.is_ok(), "Expected success after retries");
 
         let bytes = result.unwrap().bytes().await.unwrap();
@@ -3153,15 +3312,19 @@ mod tests {
         // so all 4 attempts (initial + 3 retries) will fail.
         let mock = Arc::new(RetryTestMockStore::new(10));
         let path = Path::from("test/fail.txt");
-        mock.put(&path, PutPayload::from_static(b"fail data"))
+        (mock.as_ref() as &dyn StorageBackend)
+            .put(&path, PutPayload::from_static(b"fail data"))
             .await
             .unwrap();
 
         let config = AimdThrottleConfig::default();
-        let throttled =
-            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+        let throttled = AimdThrottledStore::new(
+            mock.clone() as Arc<dyn crate::object_store::StorageBackend>,
+            config,
+        )
+        .unwrap();
 
-        let result = throttled.get(&path).await;
+        let result = (&throttled as &dyn StorageBackend).get(&path).await;
         assert!(result.is_err(), "Expected error after max retries");
         let err = result.unwrap_err();
         assert!(is_throttle_error(&err));
@@ -3345,9 +3508,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        let mut upload = store
+            .put_multipart(&object_store::path::Path::from("object"))
+            .await
+            .unwrap();
         upload
-            .put_part(PutPayload::from_static(b"payload"))
+            .put_part(object_store::PutPayload::from_static(b"payload"))
             .await
             .unwrap();
         upload.complete().await.unwrap();
@@ -3400,9 +3566,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        let mut upload = store
+            .put_multipart(&object_store::path::Path::from("object"))
+            .await
+            .unwrap();
         upload
-            .put_part(PutPayload::from_static(b"payload"))
+            .put_part(object_store::PutPayload::from_static(b"payload"))
             .await
             .unwrap();
         upload.complete().await.unwrap();
@@ -3489,8 +3658,8 @@ mod tests {
     /// `complete` and mask it with "Missing part".
     #[tokio::test(start_paused = true)]
     async fn test_throttled_multipart_complete_calls_target_once() {
-        use object_store::PutResult;
-        use object_store::UploadPart;
+        use crate::object_store::PutResult;
+        use crate::object_store::UploadPart;
 
         #[derive(Debug)]
         struct FailingComplete {
@@ -3543,12 +3712,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_throttled_multipart_reorders_parts() {
-        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()))
+                as Arc<dyn crate::object_store::StorageBackend>;
         let config = AimdThrottleConfig::default();
         let throttled = AimdThrottledStore::new(store.clone(), config).unwrap();
 
         let path = Path::from("test/multipart_ordering.bin");
-        let mut upload = throttled.put_multipart(&path).await.unwrap();
+        let mut upload = (&throttled as &dyn StorageBackend)
+            .put_multipart(&path)
+            .await
+            .unwrap();
 
         // Create futures for two parts in order: A then B.
         let fut_a = upload.put_part(PutPayload::from_static(b"AAAA"));
@@ -3574,58 +3748,75 @@ mod tests {
 
     #[tokio::test]
     async fn test_rename_moves_object() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default();
         let throttled = AimdThrottledStore::new(store, config).unwrap();
 
         let from = Path::from("test/from.txt");
         let to = Path::from("test/to.txt");
-        throttled
+        (&throttled as &dyn StorageBackend)
             .put(&from, PutPayload::from_static(b"payload"))
             .await
             .unwrap();
 
-        throttled.rename(&from, &to).await.unwrap();
+        (&throttled as &dyn StorageBackend)
+            .rename(&from, &to)
+            .await
+            .unwrap();
 
         // Destination has the data and source is gone.
-        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        let bytes = (&throttled as &dyn StorageBackend)
+            .get(&to)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(bytes.as_ref(), b"payload");
         assert!(matches!(
-            throttled.head(&from).await,
-            Err(object_store::Error::NotFound { .. })
+            (&throttled as &dyn StorageBackend).head(&from).await,
+            Err(crate::object_store::Error::NotFound { .. })
         ));
     }
 
     #[tokio::test]
     async fn test_rename_if_not_exists_rejects_existing_target() {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let config = AimdThrottleConfig::default();
         let throttled = AimdThrottledStore::new(store, config).unwrap();
 
         let from = Path::from("test/from.txt");
         let to = Path::from("test/to.txt");
-        throttled
+        (&throttled as &dyn StorageBackend)
             .put(&from, PutPayload::from_static(b"src"))
             .await
             .unwrap();
-        throttled
+        (&throttled as &dyn StorageBackend)
             .put(&to, PutPayload::from_static(b"existing"))
             .await
             .unwrap();
 
         // RenameTargetMode::Create must map to CopyMode::Create and reject the
         // pre-existing destination.
-        let err = throttled
+        let err = (&throttled as &dyn StorageBackend)
             .rename_if_not_exists(&from, &to)
             .await
             .unwrap_err();
         assert!(
-            matches!(err, object_store::Error::AlreadyExists { .. }),
+            matches!(err, crate::object_store::Error::AlreadyExists { .. }),
             "expected AlreadyExists, got {err:?}"
         );
 
         // The failed copy must not have deleted the source.
-        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        let bytes = (&throttled as &dyn StorageBackend)
+            .get(&from)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(bytes.as_ref(), b"src");
     }
 
@@ -3633,7 +3824,7 @@ mod tests {
     /// `copy_opts` and `delete` independently before succeeding. Used to verify
     /// that `rename_opts` retries the copy and the delete separately.
     struct RenameRetryMockStore {
-        inner: InMemory,
+        inner: Arc<dyn crate::object_store::StorageBackend>,
         copy_errors_remaining: std::sync::Mutex<usize>,
         delete_errors_remaining: std::sync::Mutex<usize>,
         copy_call_count: AtomicU64,
@@ -3643,7 +3834,9 @@ mod tests {
     impl RenameRetryMockStore {
         fn new(copy_errors: usize, delete_errors: usize) -> Self {
             Self {
-                inner: InMemory::new(),
+                inner: crate::object_store::backend::native::from_object_store(Arc::new(
+                    InMemory::new(),
+                )),
                 copy_errors_remaining: std::sync::Mutex::new(copy_errors),
                 delete_errors_remaining: std::sync::Mutex::new(delete_errors),
                 copy_call_count: AtomicU64::new(0),
@@ -3661,8 +3854,8 @@ mod tests {
             }
         }
 
-        fn throttle_error() -> object_store::Error {
-            object_store::Error::Generic {
+        fn throttle_error() -> crate::object_store::Error {
+            crate::object_store::Error::Generic {
                 store: "RenameRetryMock",
                 source: THROTTLE_ERROR_RESPONSE.into(),
             }
@@ -3682,7 +3875,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl ObjectStore for RenameRetryMockStore {
+    impl crate::object_store::StorageBackend for RenameRetryMockStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             location: &Path,
@@ -3695,7 +3899,7 @@ mod tests {
             &self,
             location: &Path,
             opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn NativeMultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -3704,7 +3908,7 @@ mod tests {
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
-        // `delete` is provided by `ObjectStoreExt` and delegates to
+        // `delete` is provided by `dyn StorageBackend` and delegates to
         // `delete_stream`, so we inject throttle errors here to exercise the
         // separate delete-retry path in `rename_opts`.
         fn delete_stream(
@@ -3739,6 +3943,33 @@ mod tests {
                 self.inner.copy_opts(from, to, opts).await
             }
         }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
     #[tokio::test]
@@ -3749,26 +3980,39 @@ mod tests {
         let mock = Arc::new(RenameRetryMockStore::new(2, 1));
         let from = Path::from("test/from.txt");
         let to = Path::from("test/to.txt");
-        mock.put(&from, PutPayload::from_static(b"payload"))
+        (mock.as_ref() as &dyn StorageBackend)
+            .put(&from, PutPayload::from_static(b"payload"))
             .await
             .unwrap();
 
         let config = AimdThrottleConfig::default();
-        let throttled =
-            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+        let throttled = AimdThrottledStore::new(
+            mock.clone() as Arc<dyn crate::object_store::StorageBackend>,
+            config,
+        )
+        .unwrap();
 
-        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+        (&throttled as &dyn StorageBackend)
+            .rename_if_not_exists(&from, &to)
+            .await
+            .unwrap();
 
         // Copy: 2 failures + 1 success. Delete: 1 failure + 1 success.
         assert_eq!(mock.copy_call_count.load(Ordering::Relaxed), 3);
         assert_eq!(mock.delete_call_count.load(Ordering::Relaxed), 2);
 
         // Source cleaned up, destination present.
-        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        let bytes = (&throttled as &dyn StorageBackend)
+            .get(&to)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(bytes.as_ref(), b"payload");
         assert!(matches!(
-            throttled.head(&from).await,
-            Err(object_store::Error::NotFound { .. })
+            (&throttled as &dyn StorageBackend).head(&from).await,
+            Err(crate::object_store::Error::NotFound { .. })
         ));
     }
 
@@ -3780,21 +4024,40 @@ mod tests {
         let mock = Arc::new(RenameRetryMockStore::new(0, 10));
         let from = Path::from("test/from.txt");
         let to = Path::from("test/to.txt");
-        mock.put(&from, PutPayload::from_static(b"payload"))
+        (mock.as_ref() as &dyn StorageBackend)
+            .put(&from, PutPayload::from_static(b"payload"))
             .await
             .unwrap();
 
         let config = AimdThrottleConfig::default();
-        let throttled =
-            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+        let throttled = AimdThrottledStore::new(
+            mock.clone() as Arc<dyn crate::object_store::StorageBackend>,
+            config,
+        )
+        .unwrap();
 
-        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+        (&throttled as &dyn StorageBackend)
+            .rename_if_not_exists(&from, &to)
+            .await
+            .unwrap();
 
         // Destination has the data.
-        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        let bytes = (&throttled as &dyn StorageBackend)
+            .get(&to)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(bytes.as_ref(), b"payload");
         // Source was not cleaned up because delete kept failing.
-        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        let bytes = (&throttled as &dyn StorageBackend)
+            .get(&from)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert_eq!(bytes.as_ref(), b"payload");
     }
 }

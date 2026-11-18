@@ -26,7 +26,7 @@ impl UringCurrentThreadFuture {
 }
 
 impl Future for UringCurrentThreadFuture {
-    type Output = object_store::Result<Bytes>;
+    type Output = crate::object_store::Result<Bytes>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Check thread safety
@@ -41,7 +41,7 @@ impl Future for UringCurrentThreadFuture {
             // Take result and return Ready
             match state.err.take() {
                 Some(err) => {
-                    return Poll::Ready(Err(object_store::Error::Generic {
+                    return Poll::Ready(Err(crate::object_store::Error::Generic {
                         store: "io_uring_ct",
                         source: Box::new(err),
                     }));
@@ -73,7 +73,7 @@ impl Future for UringCurrentThreadFuture {
             // Take result and return Ready
             match state.err.take() {
                 Some(err) => {
-                    return Poll::Ready(Err(object_store::Error::Generic {
+                    return Poll::Ready(Err(crate::object_store::Error::Generic {
                         store: "io_uring_ct",
                         source: Box::new(err),
                     }));

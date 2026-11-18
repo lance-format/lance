@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use lance::dataset::Dataset;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance_core::Result;
+use lance_core::storage::path::Path;
+use lance_io::object_store::Error as StorageError;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::DescribeTransactionResponse;
-use object_store::Error as ObjectStoreError;
-use object_store::path::Path;
 
 use super::DirectoryNamespace;
 
@@ -208,7 +208,7 @@ impl DirectoryNamespace {
     const TRANSACTION_ALTERATIONS_DIR: &'static str = "_alter_transactions";
 
     fn transaction_alteration_path(&self, table_uri: &str, txn_uuid: &str) -> Result<Path> {
-        let table_path = self.object_store_path_from_uri(table_uri)?;
+        let table_path = self.storage_path_from_uri(table_uri)?;
         Ok(table_path
             .join(Self::TRANSACTION_ALTERATIONS_DIR)
             .join(format!("{}.json", txn_uuid).as_str()))
@@ -220,7 +220,7 @@ impl DirectoryNamespace {
         txn_uuid: &str,
     ) -> Result<Option<TransactionAlteration>> {
         let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
-        match self.object_store.read_object(&path).await {
+        match self.storage.read_object(&path).await {
             Ok(get_result) => {
                 let bytes = get_result.bytes().await.map_err(|e| {
                     lance_core::Error::from(NamespaceError::Internal {
@@ -240,7 +240,7 @@ impl DirectoryNamespace {
                 })?;
                 Ok(Some(alteration))
             }
-            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(StorageError::NotFound { .. }) => Ok(None),
             Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
                 message: format!(
                     "Failed to load alter_transaction sidecar for '{}': {}",
@@ -265,7 +265,7 @@ impl DirectoryNamespace {
                 ),
             })
         })?;
-        self.object_store
+        self.storage
             .put_payload(&path, bytes.into())
             .await
             .map_err(|e| {

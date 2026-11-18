@@ -14,6 +14,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{FileReader, FileReaderOptions};
@@ -23,7 +24,6 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
-use object_store::path::Path;
 use rand::seq::{IteratorRandom, index};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::hint::black_box;
@@ -230,8 +230,8 @@ fn file_reader_take(
 
 async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     // Create file reader v2.
-    let object_store = dataset.object_store(None).await.unwrap();
-    let scheduler = ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
+    let storage = dataset.storage(None).await.unwrap();
+    let scheduler = ScanScheduler::new(storage, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
     let file = scheduler
         .open_file(file_path, &CachedFileSize::unknown())
         .await
@@ -531,11 +531,11 @@ fn bench_sparse_take_with_deletions(c: &mut Criterion) {
                 })
             };
             let dataset = open();
-            let object_store = rt.block_on(dataset.object_store(None)).unwrap();
+            let storage = rt.block_on(dataset.storage(None)).unwrap();
             if cache == "warm" {
                 take(&dataset);
             }
-            object_store.io_stats_incremental();
+            storage.io_stats_incremental();
             let batch = take(&dataset);
             assert_eq!(batch.num_rows(), 1);
             assert_eq!(
@@ -543,7 +543,7 @@ fn bench_sparse_take_with_deletions(c: &mut Criterion) {
                 (num_fragments * 4 - 1) as i32,
                 "{cache} take with {num_fragments} fragments returned the wrong value"
             );
-            let stats = object_store.io_stats_incremental();
+            let stats = storage.io_stats_incremental();
             let deletion_reads: Vec<_> = stats
                 .requests
                 .iter()
@@ -599,7 +599,7 @@ fn bench_sparse_take_with_deletions(c: &mut Criterion) {
                 } else {
                     b.iter_batched_ref(
                         || {
-                            object_store.io_stats_incremental();
+                            storage.io_stats_incremental();
                             dataset.clone()
                         },
                         |dataset| {

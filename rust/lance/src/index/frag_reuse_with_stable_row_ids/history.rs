@@ -760,7 +760,7 @@ pub mod tests {
     };
 
     #[derive(Clone, Copy, Debug)]
-    enum Storage {
+    enum HistoryStorage {
         Inline,
         External,
     }
@@ -875,7 +875,7 @@ pub mod tests {
                 &mut manifest,
                 Some(indices),
                 &dataset.base,
-                &dataset.object_store,
+                &dataset.storage,
                 write_manifest_file_to_path,
                 dataset.manifest_location.naming_scheme,
                 None,
@@ -907,7 +907,7 @@ pub mod tests {
     /// strict suffix to rewrite.
     async fn recording_table_with_index(
         uri: &str,
-        storage: Storage,
+        storage: HistoryStorage,
         index_type: Option<IndexType>,
     ) -> (Dataset, HashMap<u64, (u64, i32)>) {
         let mut dataset = gen_batch()
@@ -926,7 +926,7 @@ pub mod tests {
             .unwrap();
         dataset.delete("i IN (1, 2, 35)").await.unwrap();
         let mut before = rows_by_addr(&dataset).await;
-        if matches!(storage, Storage::External) {
+        if matches!(storage, HistoryStorage::External) {
             plant_padding_history(&mut dataset).await;
         }
         if let Some(index_type) = index_type {
@@ -971,12 +971,15 @@ pub mod tests {
                 details.content,
                 Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(_))
             ),
-            matches!(storage, Storage::External)
+            matches!(storage, HistoryStorage::External)
         );
         (dataset, before)
     }
 
-    async fn recording_table(uri: &str, storage: Storage) -> (Dataset, HashMap<u64, (u64, i32)>) {
+    async fn recording_table(
+        uri: &str,
+        storage: HistoryStorage,
+    ) -> (Dataset, HashMap<u64, (u64, i32)>) {
         recording_table_with_index(uri, storage, None).await
     }
 
@@ -1098,7 +1101,7 @@ pub mod tests {
             Change::Republished
         )]
         change: Change,
-        #[values(Storage::Inline, Storage::External)] storage: Storage,
+        #[values(HistoryStorage::Inline, HistoryStorage::External)] storage: HistoryStorage,
         #[values(false, true)] detached: bool,
         #[values(false, true)] drops_an_index: bool,
     ) {
@@ -1222,7 +1225,7 @@ pub mod tests {
         #[values(false, true)] detached: bool,
     ) {
         let dir = TempStrDir::default();
-        let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, _) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let before = rows_by_addr(&dataset).await;
         let (mut group, mut recorded) = rewrite_of(&mut dataset, &[6, 7]).await;
         let mut rows =
@@ -1338,7 +1341,7 @@ pub mod tests {
         #[values(false, true)] detached: bool,
     ) {
         let dir = TempStrDir::default();
-        let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, _) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         create_zone_map(&mut dataset).await;
         let (group, _) = rewrite_of(&mut dataset, &[6, 7]).await;
         let rewritten = group
@@ -1397,7 +1400,7 @@ pub mod tests {
         #[values(false, true)] trims_everything: bool,
     ) {
         let dir = TempStrDir::default();
-        let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, _) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let read = dataset.clone();
         let (group, recorded) = rewrite_of(&mut dataset, &[6, 7]).await;
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
@@ -1594,7 +1597,7 @@ pub mod tests {
         #[values(false, true)] detached: bool,
     ) {
         let dir = TempStrDir::default();
-        let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, _) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let recorded = history(&dataset).await;
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
         let planned_at = dataset.manifest.version;
@@ -1737,7 +1740,7 @@ pub mod tests {
         use lance_table::format::DETACHED_VERSION_MASK;
 
         let dir = TempStrDir::default();
-        let (mut dataset, before) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, before) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let recorded = history(&dataset).await;
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
         let stamp = DETACHED_VERSION_MASK | 5;
@@ -1775,7 +1778,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_promoting_an_index_built_on_a_detached_version_is_refused() {
         let dir = TempStrDir::default();
-        let (dataset, before) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (dataset, before) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let recorded = history(&dataset).await;
         // Staged rows, and an index built over them where they were staged.
         let batch = arrow_array::record_batch!(("i", Int32, [1000, 1001, 1002])).unwrap();
@@ -1840,7 +1843,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_promoting_a_detached_version_within_the_main_chain_is_allowed() {
         let dir = TempStrDir::default();
-        let (mut dataset, before) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, before) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         create_zone_map(&mut dataset).await;
         let recorded = history(&dataset).await;
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
@@ -1876,7 +1879,7 @@ pub mod tests {
         dataset: &Dataset,
         entry: &IndexMetadata,
         versions: &[FragReuseVersion],
-        storage: Storage,
+        storage: HistoryStorage,
     ) -> IndexMetadata {
         let uuid = uuid::Uuid::new_v4();
         stored_under(
@@ -1897,18 +1900,18 @@ pub mod tests {
         uuid: uuid::Uuid,
         file_name: &str,
         versions: &[FragReuseVersion],
-        storage: Storage,
+        storage: HistoryStorage,
     ) -> IndexMetadata {
         let content = InlineContent {
             legacy_versions: versions.iter().map(Into::into).collect(),
             transitions: vec![],
         };
         let content = match storage {
-            Storage::Inline => Content::Inline(content),
-            Storage::External => {
+            HistoryStorage::Inline => Content::Inline(content),
+            HistoryStorage::External => {
                 let bytes = content.encode_to_vec();
                 let path = dataset.indices_dir().join(uuid.to_string()).join(file_name);
-                dataset.object_store.put(&path, &bytes).await.unwrap();
+                dataset.storage.put(&path, &bytes).await.unwrap();
                 Content::External(ExternalFile {
                     path: file_name.to_string(),
                     offset: 0,
@@ -1960,7 +1963,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_equivalent_encodings_are_the_same_history(
         #[values(Encoding::OtherContainers, Encoding::OtherStorage)] encoding: Encoding,
-        #[values(Storage::Inline, Storage::External)] storage: Storage,
+        #[values(HistoryStorage::Inline, HistoryStorage::External)] storage: HistoryStorage,
     ) {
         let dir = TempStrDir::default();
         let (dataset, before) = recording_table(dir.as_str(), storage).await;
@@ -1979,8 +1982,8 @@ pub mod tests {
             }
             Encoding::OtherStorage => {
                 let other = match storage {
-                    Storage::Inline => Storage::External,
-                    Storage::External => Storage::Inline,
+                    HistoryStorage::Inline => HistoryStorage::External,
+                    HistoryStorage::External => HistoryStorage::Inline,
                 };
                 (recorded.clone(), other)
             }
@@ -1999,7 +2002,7 @@ pub mod tests {
         let published = frag_reuse_entry(&latest).await;
         assert_eq!(
             external_details_file(&published).is_some(),
-            matches!(stored, Storage::External)
+            matches!(stored, HistoryStorage::External)
         );
         assert_eq!(history(&latest).await, versions);
         assert_same_history(&history(&latest).await, &recorded);
@@ -2033,7 +2036,7 @@ pub mod tests {
     async fn test_a_history_is_identified_by_its_content_not_its_uuid(
         #[values(Identity::Reused, Identity::Fresh)] identity: Identity,
         #[values(false, true)] after_restore: bool,
-        #[values(Storage::Inline, Storage::External)] storage: Storage,
+        #[values(HistoryStorage::Inline, HistoryStorage::External)] storage: HistoryStorage,
         #[values(false, true)] detached: bool,
     ) {
         const FILTER: &str = "i >= 15 AND i < 45";
@@ -2058,7 +2061,7 @@ pub mod tests {
         let unrecorded = dataset.manifest.version;
         let options = compaction_of(&dataset, &[6, 7]);
         compact_files(&mut dataset, options, None).await.unwrap();
-        if matches!(storage, Storage::External) {
+        if matches!(storage, HistoryStorage::External) {
             let current = frag_reuse_entry(&dataset).await;
             let entry = stored_as(&dataset, &current, &history(&dataset).await, storage).await;
             let operation = Operation::CreateIndex {
@@ -2395,7 +2398,7 @@ pub mod tests {
         #[values(false, true)] rewrite_first: bool,
     ) {
         let dir = TempStrDir::default();
-        let (dataset, before) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (dataset, before) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let recorded = history(&dataset).await;
         let mut cleaner = Dataset::open(dir.as_str()).await.unwrap();
         let mut compactor = Dataset::open(dir.as_str()).await.unwrap();
@@ -2491,7 +2494,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_restore_and_overwrite_replace_the_history() {
         let dir = TempStrDir::default();
-        let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, _) = recording_table(dir.as_str(), HistoryStorage::Inline).await;
         let one_version = dataset.manifest.version;
         let options = compaction_of(&dataset, &[6, 7]);
         compact_files(&mut dataset, options, None).await.unwrap();
@@ -2545,7 +2548,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_clone_keeps_the_recorded_history(
         #[values(false, true)] is_shallow: bool,
-        #[values(Storage::Inline, Storage::External)] storage: Storage,
+        #[values(HistoryStorage::Inline, HistoryStorage::External)] storage: HistoryStorage,
     ) {
         let dir = TempStrDir::default();
         let source_uri = format!("{}/source", dir.as_str());
@@ -2572,7 +2575,7 @@ pub mod tests {
         let dir = TempStrDir::default();
         let source_uri = format!("{}/source", dir.as_str());
         let clone_uri = format!("{}/clone", dir.as_str());
-        let (mut source, _) = recording_table(&source_uri, Storage::Inline).await;
+        let (mut source, _) = recording_table(&source_uri, HistoryStorage::Inline).await;
         source.delete("i >= 0").await.unwrap();
         assert!(source.manifest.fragments.is_empty());
         let recorded = history(&source).await;
@@ -2710,7 +2713,7 @@ pub mod tests {
             Maintenance::CleanupOldVersions
         )]
         maintenance: Maintenance,
-        #[values(Storage::Inline, Storage::External)] storage: Storage,
+        #[values(HistoryStorage::Inline, HistoryStorage::External)] storage: HistoryStorage,
     ) {
         let dir = TempStrDir::default();
         let (mut dataset, before) = recording_table(dir.as_str(), storage).await;
@@ -2768,7 +2771,7 @@ pub mod tests {
             Indexing::CaughtUp(IndexType::BTree)
         )]
         indexing: Indexing,
-        #[values(Storage::Inline, Storage::External)] storage: Storage,
+        #[values(HistoryStorage::Inline, HistoryStorage::External)] storage: HistoryStorage,
         #[values(false, true)] defer_index_remap: bool,
     ) {
         let dir = TempStrDir::default();
@@ -2832,7 +2835,7 @@ pub mod tests {
         uri: &str,
         index_type: IndexType,
     ) -> (Dataset, HashMap<u64, (u64, i32)>) {
-        recording_table_with_index(uri, Storage::Inline, Some(index_type)).await
+        recording_table_with_index(uri, HistoryStorage::Inline, Some(index_type)).await
     }
 
     /// Catching up an index makes only the oldest prefix trimmable.
@@ -2899,7 +2902,7 @@ pub mod tests {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let (mut dataset, before) =
-            recording_table_with_index(uri, Storage::Inline, Some(index_type)).await;
+            recording_table_with_index(uri, HistoryStorage::Inline, Some(index_type)).await;
         let (behind, elsewhere) = if index_type == IndexType::BloomFilter {
             (["i = 5", "i = 55"], ["i = 25", "i = 44"])
         } else {
@@ -3031,7 +3034,7 @@ pub mod tests {
         let uri = dir.as_str();
         let (mut dataset, before) = match trim {
             Trim::Needed => indexed_recording_table(uri, IndexType::ZoneMap).await,
-            Trim::Resurrected => recording_table(uri, Storage::Inline).await,
+            Trim::Resurrected => recording_table(uri, HistoryStorage::Inline).await,
         };
         let recorded = history(&dataset).await;
         let (operation, refusal) = match trim {
@@ -3397,7 +3400,7 @@ pub mod tests {
             }
             _ => format!("{}/elsewhere", dir.as_str()),
         };
-        let (mut origin, before) = recording_table(&origin_uri, Storage::External).await;
+        let (mut origin, before) = recording_table(&origin_uri, HistoryStorage::External).await;
         // A source that is itself a shallow clone holds base id 0, so the clone's
         // history base gets an explicit id rather than 0, which `UpdateBases`
         // reads as "assign one". Its own recorded compaction stores the history

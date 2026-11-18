@@ -407,7 +407,7 @@ async fn open_pk_index(
     let index_cache = dataset.index_cache.for_index(&path_cache_uuid(path), None);
     let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
-        dataset.object_store.clone(),
+        dataset.storage.clone(),
         index_dir,
         Arc::new(index_cache.clone()),
     ));
@@ -475,9 +475,9 @@ pub async fn write_pk_sidecar(
         return Ok(());
     }
     let schema = training[0].schema();
-    let (object_store, base_path) = ObjectStore::from_uri(uri).await?;
+    let (storage, base_path) = ObjectStore::from_uri(uri).await?;
     let store = LanceIndexStore::new(
-        object_store,
+        storage,
         pk_index_path(&base_path),
         Arc::new(LanceCache::no_cache()),
     );
@@ -828,9 +828,9 @@ mod tests {
         index.insert(&batch, 0).unwrap();
         index.insert(&batch, 0).unwrap();
         let training = index.pk_training_batches(8192).unwrap();
-        let (object_store, base_path) = ObjectStore::from_uri(&path).await.unwrap();
+        let (storage, base_path) = ObjectStore::from_uri(&path).await.unwrap();
         let store = LanceIndexStore::new(
-            object_store,
+            storage,
             pk_index_path(&base_path),
             Arc::new(LanceCache::no_cache()),
         );

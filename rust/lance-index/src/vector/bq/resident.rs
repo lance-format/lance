@@ -1593,7 +1593,7 @@ mod tests {
         let factors: ArrayRef = Arc::new(Float32Array::from(values));
         let batch = RecordBatch::try_from_iter([("factor", factors)]).unwrap();
         let store = Arc::new(ObjectStore::memory());
-        let path = object_store::path::Path::from("resident/factors.lance");
+        let path = lance_core::storage::path::Path::from("resident/factors.lance");
         let mut writer = lance_file::versions::create_writer(
             LanceFileVersion::default().resolve(),
             store.create(&path).await.unwrap(),

@@ -22,6 +22,7 @@ use jni::{
 use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{BlobHandling, OnMissing, Projection, Schema};
+use lance_core::storage::path::Path;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
 use lance_file::versions as file_versions;
@@ -31,7 +32,6 @@ use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
-use object_store::path::Path;
 
 pub const NATIVE_READER: &str = "nativeFileReaderHandle";
 

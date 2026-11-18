@@ -11,8 +11,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -651,11 +651,11 @@ pub fn index_metadata_codec() -> lance_core::cache::CacheCodec {
 /// Returns a list of `IndexFile` structs containing relative paths and sizes.
 /// This is used to capture file metadata after index creation/modification.
 pub async fn list_index_files_with_sizes(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: &Path,
 ) -> Result<Vec<IndexFile>> {
     let mut files = Vec::new();
-    let mut stream = object_store.read_dir_all(index_dir, None);
+    let mut stream = storage.read_dir_all(index_dir, None);
     while let Some(meta) = stream.next().await {
         let meta = meta?;
         // Get relative path by stripping the index_dir prefix

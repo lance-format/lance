@@ -6,7 +6,7 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
 
 pub async fn write_vector_segment_metadata(
     dataset: &Dataset,
@@ -21,7 +21,7 @@ pub async fn write_vector_segment_metadata(
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
     dataset
-        .object_store
+        .storage
         .as_ref()
         .put(&index_path, payload)
         .await
@@ -812,7 +812,7 @@ pub async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &st
 /// Indices the manifest itself carries, bypassing the usable-index filter.
 pub async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
     lance_table::io::manifest::read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -847,7 +847,7 @@ pub async fn manifest_index_names(dataset: &Dataset) -> Vec<String> {
 
 #[derive(Debug)]
 pub struct RequestIndexStoreWrapper {
-    policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+    policy: Arc<Mutex<ProxyBackendPolicy>>,
     pub revoked: Arc<AtomicBool>,
     pub requests: Arc<Mutex<Vec<String>>>,
 }
@@ -856,7 +856,7 @@ impl RequestIndexStoreWrapper {
     pub fn new(index_path: String) -> Self {
         let revoked = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let mut policy = ProxyObjectStorePolicy::new();
+        let mut policy = ProxyBackendPolicy::new();
         let policy_revoked = revoked.clone();
         let policy_requests = requests.clone();
         policy.set_before_policy(
@@ -865,7 +865,7 @@ impl RequestIndexStoreWrapper {
                 if path.as_ref().contains(&index_path) {
                     policy_requests.lock().unwrap().push(method.to_owned());
                     if policy_revoked.load(Ordering::Relaxed) {
-                        return Err(object_store::Error::Generic {
+                        return Err(lance_io::object_store::Error::Generic {
                             store: "RequestIndexStoreWrapper",
                             source: "request credentials have been revoked".into(),
                         }
@@ -887,16 +887,8 @@ impl WrappingObjectStore for RequestIndexStoreWrapper {
     fn wrap(
         &self,
         _storage_prefix: &str,
-        original: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
-    }
-
-    fn wrap_paginated(
-        &self,
-        _store_prefix: &str,
-        _original: Arc<dyn object_store::list::PaginatedListStore>,
-    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-        None
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+        Arc::new(ProxyBackend::new(original, self.policy.clone()))
     }
 }

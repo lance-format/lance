@@ -45,7 +45,7 @@ pub struct ListResult {
     pub common_prefixes: Vec<Path>,
     /// Object metadata for the listing
     pub objects: Vec<ObjectMeta>,
-    /// Implementation-specific extensions. Intended for use by storage backend implementations
+    /// Implementation-specific extensions. Intended for use by [`StorageBackend`](super::backend::StorageBackend) implementations
     /// that need to return context-specific information (like cache status) from trait methods.
     ///
     /// HTTP-backed stores in this crate populate this with the extensions of the HTTP
@@ -129,7 +129,7 @@ pub struct PutOptions {
     ///
     /// Implementations that don't support an attribute should return an error
     pub attributes: Attributes,
-    /// Implementation-specific extensions. Intended for use by storage backend implementations
+    /// Implementation-specific extensions. Intended for use by [`StorageBackend`](super::backend::StorageBackend) implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
     /// Backends and wrappers may interpret these extensions. Unsupported extensions
@@ -146,14 +146,14 @@ impl From<PutMode> for PutOptions {
     }
 }
 
-/// Options for storage backend
+/// Options for [`StorageBackend::put_multipart_opts`](super::backend::StorageBackend::put_multipart_opts)
 #[derive(Debug, Clone, Default)]
 pub struct PutMultipartOptions {
     /// Provide a set of [`Attributes`]
     ///
     /// Implementations that don't support an attribute should return an error
     pub attributes: Attributes,
-    /// Implementation-specific extensions. Intended for use by storage backend implementations
+    /// Implementation-specific extensions. Intended for use by [`StorageBackend`](super::backend::StorageBackend) implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
     /// Backends may interpret these extensions without changing storage semantics.
@@ -169,7 +169,7 @@ pub struct PutResult {
     pub e_tag: Option<String>,
     /// A version indicator for the newly created object
     pub version: Option<String>,
-    /// Implementation-specific extensions. Intended for use by storage backend implementations
+    /// Implementation-specific extensions. Intended for use by [`StorageBackend`](super::backend::StorageBackend) implementations
     /// that need to return context-specific information (like cache status) from trait methods.
     ///
     /// HTTP-backed stores in this crate populate this with the extensions of the HTTP
@@ -193,7 +193,7 @@ pub enum CopyMode {
 pub struct CopyOptions {
     /// Configure the [`CopyMode`] for this operation
     pub mode: CopyMode,
-    /// Implementation-specific extensions. Intended for use by storage backend implementations
+    /// Implementation-specific extensions. Intended for use by [`StorageBackend`](super::backend::StorageBackend) implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
     /// Backends and wrappers may interpret these extensions. Unsupported extensions
@@ -220,7 +220,7 @@ pub enum RenameTargetMode {
 pub struct RenameOptions {
     /// Configure the [`RenameTargetMode`] for this operation
     pub target_mode: RenameTargetMode,
-    /// Implementation-specific extensions. Intended for use by storage backend implementations
+    /// Implementation-specific extensions. Intended for use by [`StorageBackend`](super::backend::StorageBackend) implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
     /// Backends and wrappers may interpret these extensions. Unsupported extensions

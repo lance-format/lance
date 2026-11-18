@@ -1640,7 +1640,7 @@ mod tests {
         .await
         .unwrap();
         let stored = read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )
@@ -1681,7 +1681,7 @@ mod tests {
             .unwrap();
         dataset = build_snapshot;
         let raw = read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )
@@ -1725,7 +1725,7 @@ mod tests {
         // postings. Warm the index while the original FRI mapping still exists.
         dataset.delete("false").await.unwrap();
         let stored = read_manifest_indexes(
-            &dataset.object_store,
+            &dataset.storage,
             &dataset.manifest_location,
             &dataset.manifest,
         )

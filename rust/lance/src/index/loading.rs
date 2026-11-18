@@ -344,14 +344,14 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
     let metadata_key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: dataset.storage.store_prefix(),
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     let mut indices = dataset
         .index_cache
         .get_or_insert_with_key(metadata_key, || async {
             let loaded = read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )
@@ -855,8 +855,8 @@ impl Dataset {
                 .clone()
                 .join(uuid.to_string())
                 .join(INDEX_FILE_NAME);
-            let object_store = self.object_store_for_index(&index_meta).await?;
-            object_store.exists(&index_file).await?
+            let storage = self.storage_for_index(&index_meta).await?;
+            storage.exists(&index_file).await?
         };
 
         if is_vector_index {
@@ -929,7 +929,7 @@ impl Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let uuid = &index_meta.uuid;
-        let object_store = self.object_store_for_index(index_meta).await?;
+        let storage = self.storage_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;
         // Hold the shared allocation before cache accesses can evict it.
         // The handle is dropped if this index does not use resident columns.
@@ -937,9 +937,7 @@ impl Dataset {
         // Translated partitions remain scoped to the dataset and FRI below.
         let file_cache = self.session.index_cache.with_key_prefix("ivf-file");
         let resident_columns_handle = Some(ResidentColumns::shared(&aux_file_key(
-            &object_store,
-            &index_dir,
-            uuid,
+            &storage, &index_dir, uuid,
         )));
         // What the session declares about the index, for whichever IVF open
         // or reconstruction below runs, and where a reconstruction adds the
@@ -972,7 +970,7 @@ impl Dataset {
             return entry
                 .0
                 .reconstruct(
-                    object_store,
+                    storage,
                     self.metadata_cache.as_ref(),
                     partition_cache,
                     remapping,
@@ -1003,14 +1001,10 @@ impl Dataset {
             .join(uuid.to_string())
             .join(INDEX_FILE_NAME);
         let file_sizes = index_meta.file_size_map();
-        let reader: Arc<dyn Reader> = vector::open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?
-        .into();
+        let reader: Arc<dyn Reader> =
+            vector::open_index_file(storage.as_ref(), &index_file, INDEX_FILE_NAME, &file_sizes)
+                .await?
+                .into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
@@ -1019,13 +1013,9 @@ impl Dataset {
         // were opened from: cleanup unlinks old index files while the cache still
         // holds an entry for them. Anything stored in the cached index must
         // therefore reopen the file per read instead of pinning a descriptor.
-        let lazy_reader = vector::open_cache_reader(
-            object_store.clone(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?;
+        let lazy_reader =
+            vector::open_cache_reader(storage.clone(), &index_file, INDEX_FILE_NAME, &file_sizes)
+                .await?;
 
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
@@ -1088,7 +1078,7 @@ impl Dataset {
 
             (0, 3) | (2, _) => {
                 let index_metadata = self
-                    .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
+                    .read_vector_index_metadata(&storage, &index_file, &file_sizes)
                     .await?;
 
                 // Resolve the column name and field
@@ -1102,7 +1092,7 @@ impl Dataset {
                     "IVF_FLAT" => match element_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
-                                object_store.clone(),
+                                storage.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
@@ -1116,7 +1106,7 @@ impl Dataset {
                         }
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
-                                object_store.clone(),
+                                storage.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
@@ -1136,7 +1126,7 @@ impl Dataset {
 
                     "IVF_PQ" => {
                         let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
-                            object_store.clone(),
+                            storage.clone(),
                             index_dir,
                             uuid.to_owned(),
                             remapping,
@@ -1151,7 +1141,7 @@ impl Dataset {
 
                     "IVF_SQ" => {
                         let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
-                            object_store.clone(),
+                            storage.clone(),
                             index_dir,
                             uuid.to_owned(),
                             remapping,
@@ -1166,7 +1156,7 @@ impl Dataset {
 
                     "IVF_RQ" => {
                         let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
-                            object_store.clone(),
+                            storage.clone(),
                             index_dir,
                             uuid.to_owned(),
                             remapping,
@@ -1182,7 +1172,7 @@ impl Dataset {
                     "IVF_HNSW_FLAT" => match element_type {
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
-                                object_store.clone(),
+                                storage.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
@@ -1196,7 +1186,7 @@ impl Dataset {
                         }
                         _ => {
                             let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
-                                object_store.clone(),
+                                storage.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
@@ -1212,7 +1202,7 @@ impl Dataset {
 
                     "IVF_HNSW_RQ" => {
                         let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
-                            object_store.clone(),
+                            storage.clone(),
                             index_dir,
                             uuid.to_owned(),
                             remapping,
@@ -1227,7 +1217,7 @@ impl Dataset {
 
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
-                            object_store.clone(),
+                            storage.clone(),
                             index_dir,
                             uuid.to_owned(),
                             remapping,
@@ -1242,7 +1232,7 @@ impl Dataset {
 
                     "IVF_HNSW_PQ" => {
                         let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
-                            object_store.clone(),
+                            storage.clone(),
                             index_dir,
                             uuid.to_owned(),
                             remapping,
@@ -1294,14 +1284,12 @@ impl Dataset {
     /// its distance type, both read before any centroid or quantizer.
     pub(crate) async fn read_vector_index_metadata(
         &self,
-        object_store: &Arc<lance_io::object_store::ObjectStore>,
-        index_file: &object_store::path::Path,
+        storage: &Arc<lance_io::object_store::ObjectStore>,
+        index_file: &lance_core::storage::path::Path,
         file_sizes: &HashMap<String, u64>,
     ) -> Result<lance_index::IndexMetadata> {
-        let scheduler = ScanScheduler::new(
-            object_store.clone(),
-            SchedulerConfig::max_bandwidth(object_store),
-        );
+        let scheduler =
+            ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(storage));
         let cached_size = file_sizes
             .get(INDEX_FILE_NAME)
             .map(|&size| CachedFileSize::new(size))

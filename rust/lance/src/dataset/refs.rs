@@ -7,12 +7,12 @@ use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
-use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
-use lance_table::io::deletion::DELETIONS_DIR;
-use object_store::{
+use lance_io::object_store::{
     Error as ObjectStoreError,
     path::{Path, PathPart},
 };
+use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
+use lance_table::io::deletion::DELETIONS_DIR;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -93,19 +93,19 @@ impl fmt::Display for Ref {
 
 #[derive(Debug, Clone)]
 pub struct Refs {
-    pub(crate) object_store: Arc<ObjectStore>,
+    pub(crate) storage: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
     pub(crate) base_location: BranchLocation,
 }
 
 impl Refs {
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         commit_handler: Arc<dyn CommitHandler>,
         base_location: BranchLocation,
     ) -> Self {
         Self {
-            object_store,
+            storage,
             commit_handler,
             base_location,
         }
@@ -141,26 +141,27 @@ pub struct Branches<'a> {
 }
 
 impl Tags<'_> {
-    fn object_store(&self) -> &ObjectStore {
-        &self.refs.object_store
+    fn storage(&self) -> &ObjectStore {
+        &self.refs.storage
     }
 }
 
 impl Branches<'_> {
-    fn object_store(&self) -> &ObjectStore {
-        &self.refs.object_store
+    fn storage(&self) -> &ObjectStore {
+        &self.refs.storage
     }
 }
 
 async fn put_ref_if_absent(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     contents: Vec<u8>,
     conflict_message: String,
 ) -> Result<()> {
-    object_store
+    storage
         .put_if_absent(path, contents.into())
         .await
+        .map(|_| ())
         .map_err(|error| match error {
             ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
                 Error::RefConflict {
@@ -175,7 +176,7 @@ impl Tags<'_> {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_tags_path(&root_location.path);
-        let tag_files = self.object_store().read_dir(base_path).await?;
+        let tag_files = self.storage().read_dir(base_path).await?;
 
         let tag_names: Vec<String> = tag_files
             .iter()
@@ -187,8 +188,7 @@ impl Tags<'_> {
         futures::stream::iter(tag_names)
             .map(|tag_name| async move {
                 let contents =
-                    TagContents::from_path(&tag_path(root_path, &tag_name), self.object_store())
-                        .await?;
+                    TagContents::from_path(&tag_path(root_path, &tag_name), self.storage()).await?;
                 Ok((tag_name, contents))
             })
             .buffer_unordered(10)
@@ -229,13 +229,13 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if !self.object_store().exists(&tag_file).await? {
+        if !self.storage().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
 
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let tag_contents = TagContents::from_path(&tag_file, self.storage()).await?;
         Ok(tag_contents)
     }
 
@@ -250,7 +250,7 @@ impl Tags<'_> {
             .await?;
 
         put_ref_if_absent(
-            self.object_store(),
+            self.storage(),
             &tag_file,
             serde_json::to_vec_pretty(&tag_contents)?,
             format!("tag {} already exists", tag),
@@ -264,13 +264,13 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if !self.object_store().exists(&tag_file).await? {
+        if !self.storage().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
 
-        self.object_store().delete(&tag_file).await
+        self.storage().delete(&tag_file).await
     }
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
@@ -278,12 +278,12 @@ impl Tags<'_> {
 
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
+        if !self.storage().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let mut tag_contents = TagContents::from_path(&tag_file, self.storage()).await?;
         let updated_reference = self
             .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
             .await?;
@@ -293,7 +293,7 @@ impl Tags<'_> {
         tag_contents.updated_at = updated_reference.updated_at;
         tag_contents.manifest_size = updated_reference.manifest_size;
 
-        self.object_store()
+        self.storage()
             .put(
                 &tag_file,
                 serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
@@ -311,16 +311,16 @@ impl Tags<'_> {
 
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
+        if !self.storage().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("tag {} does not exist", tag),
             });
         }
 
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let mut tag_contents = TagContents::from_path(&tag_file, self.storage()).await?;
         tag_contents.metadata = metadata;
 
-        self.object_store()
+        self.storage()
             .put(
                 &tag_file,
                 serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
@@ -354,20 +354,16 @@ impl Tags<'_> {
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
                 .commit_handler
-                .resolve_version_location(
-                    &branch_location.path,
-                    version_number,
-                    &self.refs.object_store.inner,
-                )
+                .resolve_version_location(&branch_location.path, version_number, &self.refs.storage)
                 .await?
         } else {
             self.refs
                 .commit_handler
-                .resolve_latest_location(&branch_location.path, &self.refs.object_store)
+                .resolve_latest_location(&branch_location.path, &self.refs.storage)
                 .await?
         };
 
-        if !self.object_store().exists(&manifest_file.path).await? {
+        if !self.storage().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
                 message: format!("version {} does not exist", Version(branch, version_number)),
             });
@@ -376,7 +372,7 @@ impl Tags<'_> {
         let manifest_size = if let Some(size) = manifest_file.size {
             size as usize
         } else {
-            self.object_store().size(&manifest_file.path).await? as usize
+            self.storage().size(&manifest_file.path).await? as usize
         };
 
         let tag_contents = TagContents {
@@ -403,7 +399,7 @@ impl Branches<'_> {
         // encoded separator in a flat key while others expose it as nested paths.
         // Recursively list the metadata prefix so both layouts are discoverable.
         let branch_files = self
-            .object_store()
+            .storage()
             .list(Some(base_path.clone()))
             .try_collect::<Vec<_>>()
             .await?;
@@ -428,7 +424,7 @@ impl Branches<'_> {
 
         futures::stream::iter(branches)
             .map(|(name, path)| async move {
-                match BranchContents::from_path(&path, self.object_store(), &name).await {
+                match BranchContents::from_path(&path, self.storage(), &name).await {
                     Ok(contents) => Ok(Some((name, contents))),
                     // A concurrent delete can remove a ref between LIST and GET.
                     Err(Error::NotFound { .. }) => Ok(None),
@@ -453,7 +449,7 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
 
-        BranchContents::from_path(&branch_file, self.object_store(), branch)
+        BranchContents::from_path(&branch_file, self.storage(), branch)
             .await
             .map_err(|error| match error {
                 error if error.is_not_found() => Error::RefNotFound {
@@ -493,14 +489,10 @@ impl Branches<'_> {
         let manifest_file = self
             .refs
             .commit_handler
-            .resolve_version_location(
-                &branch_location.path,
-                version_number,
-                &self.refs.object_store.inner,
-            )
+            .resolve_version_location(&branch_location.path, version_number, &self.refs.storage)
             .await?;
 
-        if !self.object_store().exists(&manifest_file.path).await? {
+        if !self.storage().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
                 message: format!("Manifest file {} does not exist", manifest_file.path),
             });
@@ -508,8 +500,8 @@ impl Branches<'_> {
 
         let parent_branch_id = if let Some(ref parent_branch) = source_branch {
             let parent_file = branch_contents_path(&root_location.path, parent_branch);
-            if self.object_store().exists(&parent_file).await? {
-                BranchContents::from_path(&parent_file, self.object_store(), parent_branch)
+            if self.storage().exists(&parent_file).await? {
+                BranchContents::from_path(&parent_file, self.storage(), parent_branch)
                     .await?
                     .identifier
             } else {
@@ -529,13 +521,13 @@ impl Branches<'_> {
             manifest_size: if let Some(size) = manifest_file.size {
                 size as usize
             } else {
-                self.object_store().size(&manifest_file.path).await? as usize
+                self.storage().size(&manifest_file.path).await? as usize
             },
             metadata: HashMap::new(),
         };
 
         put_ref_if_absent(
-            self.object_store(),
+            self.storage(),
             &branch_file,
             serde_json::to_vec_pretty(&branch_contents)?,
             format!("branch {} already exists", branch_name),
@@ -552,17 +544,17 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        if !self.object_store().exists(&branch_file).await? {
+        if !self.storage().exists(&branch_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("branch {} does not exist", branch),
             });
         }
 
         let mut branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+            BranchContents::from_path(&branch_file, self.storage(), branch).await?;
         branch_contents.metadata = metadata;
 
-        self.object_store()
+        self.storage()
             .put(
                 &branch_file,
                 serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
@@ -624,8 +616,8 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        if self.object_store().exists(&branch_file).await? {
-            self.object_store().delete(&branch_file).await?;
+        if self.storage().exists(&branch_file).await? {
+            self.storage().delete(&branch_file).await?;
         }
 
         // Callers must finish failed cleanup before reusing the branch name,
@@ -661,12 +653,11 @@ impl Branches<'_> {
             return Ok(());
         }
 
-        let has_local_paths =
-            self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
+        let has_local_paths = self.storage().is_local();
         let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
         for remaining in &remaining_branches {
             let path = self.refs.base_location.find_branch(Some(remaining))?.path;
-            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            let canonical_path = self.storage().canonicalize_local_path(&path).await?;
             let canonical_retained_dirs = if has_local_paths {
                 let retained_dirs = if canonical_path.is_some() {
                     self.collect_canonical_retained_dirs(&path, branch).await?
@@ -675,7 +666,7 @@ impl Branches<'_> {
                 };
                 let Some(retained_dirs) = retained_dirs else {
                     let remaining_ref = branch_contents_path(&self.refs.root()?.path, remaining);
-                    if !self.object_store().exists(&remaining_ref).await? {
+                    if !self.storage().exists(&remaining_ref).await? {
                         // Another delete finished after cleanup listed the refs.
                         continue;
                     }
@@ -698,7 +689,7 @@ impl Branches<'_> {
 
         if has_local_paths {
             let path = self.refs.root()?.path;
-            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            let canonical_path = self.storage().canonicalize_local_path(&path).await?;
             if canonical_path.is_none() {
                 log::warn!(
                     "Keeping branch directories after deleting {branch}: cannot resolve main dataset at {path}"
@@ -736,7 +727,7 @@ impl Branches<'_> {
             };
         }
 
-        if self.object_store().scheme() == "file-object-store" {
+        if self.storage().uses_backend_directory_listing() {
             cleanup = match cleanup {
                 BranchCleanup::Recursive(path) => BranchCleanup::Selective(path),
                 cleanup => cleanup,
@@ -746,7 +737,7 @@ impl Branches<'_> {
         match cleanup {
             BranchCleanup::Skip => Ok(()),
             BranchCleanup::Recursive(path) => {
-                if let Err(e) = self.object_store().remove_dir_all(path).await {
+                if let Err(e) = self.storage().remove_dir_all(path).await {
                     match &e {
                         Error::NotFound { .. } => {
                             log::debug!("Branch directory already deleted");
@@ -767,7 +758,7 @@ impl Branches<'_> {
                     }
                     let traverse_unrelated =
                         if matches!(classification, SharedBranchPath::Unrelated)
-                            && self.object_store().scheme() == "file-object-store"
+                            && self.storage().uses_backend_directory_listing()
                         {
                             self.recursive_delete_would_touch_retained_data(&path, &remaining_paths)
                                 .await?
@@ -776,7 +767,7 @@ impl Branches<'_> {
                         };
                     if matches!(classification, SharedBranchPath::Unrelated) && !traverse_unrelated
                     {
-                        if let Err(e) = self.object_store().remove_dir_all(path).await {
+                        if let Err(e) = self.storage().remove_dir_all(path).await {
                             match &e {
                                 Error::NotFound { .. } => {
                                     log::debug!("Branch directory already deleted");
@@ -793,16 +784,16 @@ impl Branches<'_> {
                     }
                     // A shared directory must remain, but the deleted branch's own
                     // files (especially its manifests) must not remain accessible.
-                    let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
+                    let entries = self.storage().list_with_delimiter(Some(&path)).await?;
                     futures::stream::iter(entries.objects.into_iter().map(Ok))
                         .try_for_each_concurrent(
-                            self.object_store().io_parallelism(),
-                            |file| async move { self.object_store().delete(&file.location).await },
+                            self.storage().io_parallelism(),
+                            |file| async move { self.storage().delete(&file.location).await },
                         )
                         .await?;
                     // Hierarchical stores may include the listed directory's marker.
                     let canonical_path = if has_local_paths {
-                        self.object_store().canonicalize_local_path(&path).await?
+                        self.storage().canonicalize_local_path(&path).await?
                     } else {
                         None
                     };
@@ -813,7 +804,7 @@ impl Branches<'_> {
                     {
                         if has_local_paths {
                             let canonical_child =
-                                self.object_store().canonicalize_local_path(&child).await?;
+                                self.storage().canonicalize_local_path(&child).await?;
                             match (&canonical_path, canonical_child) {
                                 (Some(parent), Some(child)) if child.starts_with(parent) => {}
                                 _ => {
@@ -846,16 +837,13 @@ impl Branches<'_> {
                 .chain(std::iter::once(REFS_DIR))
                 .map(|name| path.clone().join(name)),
         );
-        for name in self.object_store().read_dir(path.clone()).await? {
+        for name in self.storage().read_dir(path.clone()).await? {
             if is_mem_wal_dir_name(&name) {
                 owned_paths.push(path.clone().join(name));
             }
         }
         for owned_path in owned_paths {
-            let Some(canonical_dir) = self
-                .object_store()
-                .canonicalize_local_path(&owned_path)
-                .await?
+            let Some(canonical_dir) = self.storage().canonicalize_local_path(&owned_path).await?
             else {
                 // Optional dataset directories may not exist for this branch.
                 continue;
@@ -937,11 +925,11 @@ impl Branches<'_> {
         path: &Path,
         remaining_paths: &[RemainingBranchPath],
     ) -> Result<bool> {
-        let mut entries = self.object_store().read_dir_all(path, None);
+        let mut entries = self.storage().read_dir_all(path, None);
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             let Some(canonical_file) = self
-                .object_store()
+                .storage()
                 .canonicalize_local_path(&entry.location)
                 .await?
             else {
@@ -1023,11 +1011,8 @@ impl Branches<'_> {
         path: &Path,
         remaining_paths: &[RemainingBranchPath],
     ) -> Result<SharedBranchPath> {
-        let canonical_path = self.object_store().canonicalize_local_path(path).await?;
-        if canonical_path.is_none()
-            && (self.object_store().is_local()
-                || self.object_store().scheme() == "file-object-store")
-        {
+        let canonical_path = self.storage().canonicalize_local_path(path).await?;
+        if canonical_path.is_none() && (self.storage().is_local()) {
             log::warn!("Keeping local branch directory {path}: cannot resolve filesystem identity");
             return Ok(SharedBranchPath::Remaining);
         }
@@ -1391,11 +1376,11 @@ pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
     }
 }
 
-async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
+async fn from_path<T>(path: &Path, storage: &ObjectStore) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let tag_reader = object_store.open(path).await?;
+    let tag_reader = storage.open(path).await?;
     let tag_bytes = tag_reader
         .get_range(Range {
             start: 0,
@@ -1408,18 +1393,14 @@ where
 }
 
 impl TagContents {
-    pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
-        from_path(path, object_store).await
+    pub async fn from_path(path: &Path, storage: &ObjectStore) -> Result<Self> {
+        from_path(path, storage).await
     }
 }
 
 impl BranchContents {
-    pub async fn from_path(
-        path: &Path,
-        object_store: &ObjectStore,
-        branch_name: &str,
-    ) -> Result<Self> {
-        let mut contents: Self = from_path(path, object_store).await?;
+    pub async fn from_path(path: &Path, storage: &ObjectStore, branch_name: &str) -> Result<Self> {
+        let mut contents: Self = from_path(path, storage).await?;
         if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
             // Legacy branch files do not store an identifier. Derive a deterministic fallback
             // from stable branch metadata so repeated reads expose the same public
@@ -1538,8 +1519,8 @@ fn is_dataset_dir(segment: &str) -> bool {
         || is_mem_wal_dir_name(segment)
 }
 
-// Keep the portable admission limit for branch reference filenames. Local
-// staging uses a fixed-length basename independent of the branch name.
+// Conservative portable admission budget for branch reference filenames.
+// Local staging uses a fixed-length name independent of the branch name.
 const MAX_BRANCH_NAME_BYTES: usize = 211;
 
 /// Restrict storage length and reserved directories only for new branches so
@@ -1551,8 +1532,7 @@ const MAX_BRANCH_NAME_BYTES: usize = 211;
 pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
     check_valid_branch(branch_name)?;
 
-    // Metadata encodes the whole name as one path part. The local atomic
-    // writer encodes it again when constructing its staging path.
+    // Budget two encoding passes to remain conservative across backend path mappings.
     let encoded_name = PathPart::from(branch_name);
     let storage_name_length = PathPart::from(encoded_name.as_ref()).as_ref().len();
     if storage_name_length > MAX_BRANCH_NAME_BYTES {

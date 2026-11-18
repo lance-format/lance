@@ -133,7 +133,7 @@ async fn segment_files_are_staged_or_listed(
     let index_dir = dataset
         .indice_files_dir(index)?
         .join(index.uuid.to_string());
-    let store = dataset.object_store_for_index(index).await?;
+    let store = dataset.storage_for_index(index).await?;
     let files = lance_table::format::list_index_files_with_sizes(&store, &index_dir).await?;
     Ok(has_staged_file(&files))
 }
@@ -156,7 +156,7 @@ pub async fn vector_supports_batch_remapping(
                 .indice_files_dir(index)?
                 .join(index.uuid.to_string())
                 .join(INDEX_FILE_NAME);
-            let store = dataset.object_store_for_index(index).await?;
+            let store = dataset.storage_for_index(index).await?;
             let reader = super::vector::open_index_file(
                 store.as_ref(),
                 &path,

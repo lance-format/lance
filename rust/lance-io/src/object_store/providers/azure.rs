@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
+use crate::object_store::backend::native::from_error;
+use crate::object_store::transport::Transport;
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -8,8 +11,6 @@ use std::{
     time::Duration,
 };
 
-use object_store::ObjectStore as OSObjectStore;
-use object_store::list::PaginatedListStore;
 use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
@@ -20,11 +21,11 @@ use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
     throttle::{
-        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        AimdThrottleState, cloud_http_connector, reject_http_client_wrapper_for_opendal,
         shared_throttle_state, with_throttling,
     },
 };
@@ -167,7 +168,7 @@ impl AzureBlobStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<dyn crate::object_store::StorageBackend>> {
         let operator = Self::build_opendal_operator(base_path, storage_options)?;
         Ok(Arc::new(OpendalStore::new(operator)))
     }
@@ -204,18 +205,17 @@ impl AzureBlobStoreProvider {
             builder = builder.with_credentials(credentials);
         }
 
-        let store_prefix =
-            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+        let store_prefix = self.calculate_storage_prefix(base_path, Some(&storage_options.0))?;
         builder = builder.with_http_connector(cloud_http_connector(
             throttle_state,
             crate::object_store::metrics_base(&store_prefix, base_path),
             transport,
         ));
 
-        Ok(Arc::new(builder.build()?))
+        Ok(Arc::new(builder.build().map_err(from_error)?))
     }
 
-    fn calculate_object_store_prefix_with_env(
+    fn calculate_storage_prefix_with_env(
         url: &Url,
         storage_options: Option<&HashMap<String, String>>,
         env_options: &HashMap<String, String>,
@@ -254,7 +254,11 @@ impl AzureBlobStoreProvider {
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for AzureBlobStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
         let scheme = base_path.scheme().to_string();
         if scheme != "az" && scheme != "abfss" {
             return Err(Error::invalid_input(format!(
@@ -267,7 +271,6 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let mut storage_options =
             StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_azure();
-        let download_retry_count = storage_options.download_retry_count();
 
         let use_opendal = storage_options
             .0
@@ -278,20 +281,16 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let accessor = params.get_accessor();
 
         // Keyed like the registry cache so per-dataset stores share the bucket's budget.
-        let store_prefix =
-            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let store_prefix = self.calculate_storage_prefix(&base_path, params.storage_options())?;
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
-        let (inner, paginated_lister) = if use_opendal {
-            reject_http_connector_for_opendal(params)?;
+        let inner = if use_opendal {
+            reject_http_client_wrapper_for_opendal(params)?;
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
             // Listed in full: no paginated lister covers OpenDAL yet.
-            (
-                self.build_opendal_azure_store(&base_path, &storage_options)
-                    .await?,
-                None,
-            )
+            self.build_opendal_azure_store(&base_path, &storage_options)
+                .await?
         } else {
             let store = self
                 .build_microsoft_azure_store(
@@ -299,45 +298,40 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
                     &storage_options,
                     accessor,
                     throttle_state.as_ref(),
-                    Transport::new(params.http_connector.as_ref()),
+                    Transport::new(params.http_client_wrapper.as_ref()),
                 )
                 .await?;
-            (
-                store.clone() as Arc<dyn OSObjectStore>,
-                Some(store as Arc<dyn PaginatedListStore>),
+            crate::object_store::backend::native::from_object_store_with_pagination(
+                store.clone(),
+                store,
             )
         };
-        let (inner, paginated_lister) =
-            with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
+        let inner = with_throttling(throttle_state, !use_opendal, inner);
 
-        Ok(ObjectStore {
-            inner,
-            external_blob_inner: None,
-            direct_local_io: false,
-            _external_blob_origin: None,
+        Ok(BackendConfig {
+            store_prefix: None,
+            backend: inner,
             local_dir_operations: None,
             local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::object_store::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: None,
             scheme,
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count,
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
-            paginated_lister,
         })
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        Self::calculate_object_store_prefix_with_env(url, storage_options, &ENV_OPTIONS.0)
+        Self::calculate_storage_prefix_with_env(url, storage_options, &ENV_OPTIONS.0)
     }
 }
 
@@ -407,7 +401,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::object_store::test_utils::RecordingConnector;
+    use crate::object_store::test_utils::RecordingHttpClientWrapper;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use std::collections::HashMap;
@@ -449,7 +443,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_use_opendal_flag() {
-        let provider = AzureBlobStoreProvider;
         let url = Url::parse("az://test-container/path").unwrap();
         let params_with_flag = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -469,7 +462,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = provider
+        let store = crate::object_store::ObjectStoreRegistry::default()
             .new_store(url.clone(), &params_with_flag)
             .await
             .unwrap();
@@ -548,13 +541,13 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_object_store_prefix_from_url_and_options() {
+    fn test_calculate_storage_prefix_from_url_and_options() {
         let provider = AzureBlobStoreProvider;
         let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
         assert_eq!(
             "az$container@bob",
             provider
-                .calculate_object_store_prefix(
+                .calculate_storage_prefix(
                     &Url::parse("az://container/path").unwrap(),
                     Some(&options)
                 )
@@ -563,13 +556,13 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_object_store_prefix_from_url_and_ignored_options() {
+    fn test_calculate_storage_prefix_from_url_and_ignored_options() {
         let provider = AzureBlobStoreProvider;
         let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
         assert_eq!(
             "az$container@account",
             provider
-                .calculate_object_store_prefix(
+                .calculate_storage_prefix(
                     &Url::parse("az://container@account.dfs.core.windows.net/path").unwrap(),
                     Some(&options)
                 )
@@ -578,13 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_object_store_prefix_from_url_short_account() {
+    fn test_calculate_storage_prefix_from_url_short_account() {
         let provider = AzureBlobStoreProvider;
         let options = HashMap::from_iter([("account_name".to_string(), "bob".to_string())]);
         assert_eq!(
             "az$container@account",
             provider
-                .calculate_object_store_prefix(
+                .calculate_storage_prefix(
                     &Url::parse("az://container@account/path").unwrap(),
                     Some(&options)
                 )
@@ -594,11 +587,11 @@ mod tests {
 
     /// A prefix for a URI without an account in it, from an upper-case key.
     #[test]
-    fn test_calculate_object_store_prefix_from_upper_case_account_key() {
+    fn test_calculate_storage_prefix_from_upper_case_account_key() {
         let options = HashMap::from_iter([("ACCOUNT_NAME".to_string(), "bob".to_string())]);
         assert_eq!(
             "az$container@bob",
-            AzureBlobStoreProvider::calculate_object_store_prefix_with_env(
+            AzureBlobStoreProvider::calculate_storage_prefix_with_env(
                 &Url::parse("az://container/path").unwrap(),
                 Some(&options),
                 &HashMap::new(),
@@ -608,10 +601,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fail_to_calculate_object_store_prefix_from_url() {
+    fn test_fail_to_calculate_storage_prefix_from_url() {
         let options = HashMap::from_iter([("access_key".to_string(), "myaccesskey".to_string())]);
         let expected = "Invalid user input: Unable to find object store prefix: no Azure account name in URI, and no storage account configured.";
-        let result = AzureBlobStoreProvider::calculate_object_store_prefix_with_env(
+        let result = AzureBlobStoreProvider::calculate_storage_prefix_with_env(
             &Url::parse("az://container/path").unwrap(),
             Some(&options),
             &HashMap::new(),
@@ -631,7 +624,7 @@ mod tests {
         let path = provider.extract_path(&url).unwrap();
         assert_eq!(
             path,
-            object_store::path::Path::from("path/to/dataset.lance")
+            lance_core::storage::path::Path::from("path/to/dataset.lance")
         );
     }
 
@@ -639,7 +632,7 @@ mod tests {
     fn test_calculate_abfss_prefix() {
         let provider = AzureBlobStoreProvider;
         let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path/to/data").unwrap();
-        let prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
+        let prefix = provider.calculate_storage_prefix(&url, None).unwrap();
         assert_eq!(prefix, "abfss$myfs@myaccount");
     }
 
@@ -650,7 +643,7 @@ mod tests {
             HashMap::from_iter([("account_name".to_string(), "other_account".to_string())]);
         let url = Url::parse("abfss://myfs@myaccount.dfs.core.windows.net/path").unwrap();
         let prefix = provider
-            .calculate_object_store_prefix(&url, Some(&options))
+            .calculate_storage_prefix(&url, Some(&options))
             .unwrap();
         assert_eq!(prefix, "abfss$myfs@myaccount");
     }
@@ -658,9 +651,11 @@ mod tests {
     #[tokio::test]
     async fn test_abfss_default_uses_microsoft_builder() {
         use crate::object_store::StorageOptionsAccessor;
-        let provider = AzureBlobStoreProvider;
         let url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+        let transport =
+            Arc::new(crate::object_store::test_utils::RecordingHttpClientWrapper::default());
         let params = ObjectStoreParams {
+            http_client_wrapper: Some(transport.clone()),
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("account_name".to_string(), "testaccount".to_string()),
@@ -670,7 +665,10 @@ mod tests {
             ..Default::default()
         };
 
-        let store = provider.new_store(url, &params).await.unwrap();
+        let store = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
         assert_eq!(store.scheme, "abfss");
         assert!(!store.is_local());
         assert!(store.is_cloud());
@@ -680,18 +678,33 @@ mod tests {
             "abfss:// without use_opendal should use MicrosoftAzureBuilder, got: {}",
             inner_desc
         );
+        let error = store
+            .inner
+            .list_paginated(None, Default::default())
+            .await
+            .unwrap_err();
         assert!(
-            store.paginated_lister.is_some(),
-            "the native store pages an ADLS Gen2 account by continuation token"
+            !matches!(error, crate::object_store::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|uri| uri.contains("comp=list"))
         );
     }
 
     #[tokio::test]
     async fn test_a_blob_container_is_paged() {
         use crate::object_store::StorageOptionsAccessor;
-        let provider = AzureBlobStoreProvider;
         let url = Url::parse("az://container@testaccount.blob.core.windows.net/data").unwrap();
+        let transport =
+            Arc::new(crate::object_store::test_utils::RecordingHttpClientWrapper::default());
         let params = ObjectStoreParams {
+            http_client_wrapper: Some(transport.clone()),
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("account_name".to_string(), "testaccount".to_string()),
@@ -701,14 +714,32 @@ mod tests {
             ..Default::default()
         };
 
-        let store = provider.new_store(url, &params).await.unwrap();
-        assert!(store.paginated_lister.is_some());
+        let store = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
+        let error = store
+            .inner
+            .list_paginated(None, Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(error, crate::object_store::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|uri| uri.contains("comp=list"))
+        );
     }
 
     #[tokio::test]
     async fn test_unsupported_scheme_rejected() {
         use crate::object_store::StorageOptionsAccessor;
-        let provider = AzureBlobStoreProvider;
         let url = Url::parse("wasbs://container@myaccount.blob.core.windows.net/path").unwrap();
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -720,8 +751,8 @@ mod tests {
             ..Default::default()
         };
 
-        let err = provider
-            .new_store(url, &params)
+        let err = AzureBlobStoreProvider
+            .new_backend(url, &params)
             .await
             .expect_err("expected error for unsupported scheme");
         assert!(
@@ -734,7 +765,6 @@ mod tests {
     #[tokio::test]
     async fn test_abfss_with_opendal_uses_azdls() {
         use crate::object_store::StorageOptionsAccessor;
-        let provider = AzureBlobStoreProvider;
         let url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -747,7 +777,10 @@ mod tests {
             ..Default::default()
         };
 
-        let store = provider.new_store(url, &params).await.unwrap();
+        let store = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
         assert_eq!(store.scheme, "abfss");
         assert!(!store.is_local());
         assert!(store.is_cloud());
@@ -798,8 +831,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_azure_store_opens_its_clients_with_the_given_http_connector() {
-        let connector = Arc::new(RecordingConnector::default());
+    async fn test_azure_store_opens_its_clients_with_the_given_http_client_wrapper() {
+        let wrapper = Arc::new(RecordingHttpClientWrapper::default());
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
@@ -810,27 +843,26 @@ mod tests {
                     ("azure_skip_signature".to_string(), "true".to_string()),
                 ]),
             ))),
-            http_connector: Some(connector.clone()),
+            http_client_wrapper: Some(wrapper.clone()),
             ..Default::default()
         };
 
         let url = Url::parse("az://container/path").unwrap();
-        let store = AzureBlobStoreProvider
+        let store = crate::object_store::ObjectStoreRegistry::default()
             .new_store(url, &params)
             .await
             .unwrap();
-        let found = object_store::ObjectStoreExt::get(
-            store.inner.as_ref(),
-            &object_store::path::Path::from("path/file"),
-        )
-        .await;
+        let found = store
+            .inner
+            .get(&lance_core::storage::path::Path::from("path/file"))
+            .await;
 
         assert!(
-            matches!(found, Err(object_store::Error::NotFound { .. })),
+            matches!(found, Err(crate::object_store::Error::NotFound { .. })),
             "{found:?}"
         );
-        assert!(connector.connects.load(std::sync::atomic::Ordering::SeqCst) >= 1);
-        let requests = connector.requests.lock().unwrap();
+        assert!(wrapper.clients.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let requests = wrapper.requests.lock().unwrap();
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert!(
             requests[0].ends_with("/container/path/file"),

@@ -5268,7 +5268,7 @@ impl MemIndex for FtsMemIndex {
         let mut builder = self.to_index_builder(partition_id, generation.total_rows)?;
         let (uuid, dir) = generation.new_index_dir();
         let store = LanceIndexStore::new(
-            generation.object_store.clone(),
+            generation.storage.clone(),
             dir,
             Arc::new(LanceCache::no_cache()),
         );

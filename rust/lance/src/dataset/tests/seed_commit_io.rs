@@ -49,7 +49,7 @@ async fn commit_requests(dataset: &mut Dataset) -> [(u64, u64); 3] {
         )
         .await
         .unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     dataset
         .append(
             RecordBatchIterator::new([Ok(rows(100..110))], schema()),
@@ -57,7 +57,7 @@ async fn commit_requests(dataset: &mut Dataset) -> [(u64, u64); 3] {
         )
         .await
         .unwrap();
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.storage.io_stats_incremental();
     out[0] = (io.read_iops, io.write_iops);
 
     let updated = UpdateBuilder::new(Arc::new(dataset.clone()))
@@ -71,7 +71,7 @@ async fn commit_requests(dataset: &mut Dataset) -> [(u64, u64); 3] {
         .await
         .unwrap();
     *dataset = updated.new_dataset.as_ref().clone();
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.storage.io_stats_incremental();
     out[1] = (io.read_iops, io.write_iops);
 
     let (merged, _) =
@@ -85,7 +85,7 @@ async fn commit_requests(dataset: &mut Dataset) -> [(u64, u64); 3] {
             .await
             .unwrap();
     *dataset = merged.as_ref().clone();
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.storage.io_stats_incremental();
     out[2] = (io.read_iops, io.write_iops);
     out
 }

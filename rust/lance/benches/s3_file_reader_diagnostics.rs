@@ -33,7 +33,7 @@ use lance_encoding::format::metadata;
 use lance_file::reader::{
     DEFAULT_READ_CHUNK_SIZE, FileReader as LanceFileReader, FileReaderOptions,
 };
-use lance_io::object_store::ObjectStore as LanceObjectStore;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, ScanStats, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use serde_json::{Value, json};
@@ -637,8 +637,8 @@ async fn describe_layout(config: &Config) -> Result<()> {
     }
 
     let data_path = dataset.data_dir().join(data_file.path.as_str());
-    let (object_store, _) = LanceObjectStore::from_uri(&config.uri).await?;
-    let scheduler = ScanScheduler::new(object_store, SchedulerConfig::new(8 * GIB));
+    let (storage, _) = ObjectStore::from_uri(&config.uri).await?;
+    let scheduler = ScanScheduler::new(storage, SchedulerConfig::new(8 * GIB));
     let file_scheduler = scheduler
         .open_file(&data_path, &CachedFileSize::unknown())
         .await?;
@@ -1525,11 +1525,11 @@ async fn run_scheduler_raw_case(
             .load()
             .await?,
     );
-    let (object_store, _) = LanceObjectStore::from_uri(&config.uri).await?;
+    let (storage, _) = ObjectStore::from_uri(&config.uri).await?;
     let scheduler_config = io_buffer_gib
         .map(|gib| SchedulerConfig::new(gib * GIB))
-        .unwrap_or_else(|| SchedulerConfig::max_bandwidth(object_store.as_ref()));
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        .unwrap_or_else(|| SchedulerConfig::max_bandwidth(storage.as_ref()));
+    let scheduler = ScanScheduler::new(storage, scheduler_config);
 
     let (selected_files, planned) = match config.raw_range_mode {
         RawRangeMode::FileSequential => {
@@ -1829,11 +1829,11 @@ async fn run_case(
             .await?,
     );
     let projection = Arc::new(projected_schema(dataset.schema(), &config.columns)?);
-    let (object_store, _) = LanceObjectStore::from_uri(&config.uri).await?;
+    let (storage, _) = ObjectStore::from_uri(&config.uri).await?;
     let scheduler_config = io_buffer_gib
         .map(|gib| SchedulerConfig::new(gib * GIB))
-        .unwrap_or_else(|| SchedulerConfig::max_bandwidth(object_store.as_ref()));
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        .unwrap_or_else(|| SchedulerConfig::max_bandwidth(storage.as_ref()));
+    let scheduler = ScanScheduler::new(storage, scheduler_config);
 
     let mut planned = Vec::new();
     let mut remaining_rows = config.limit_rows;

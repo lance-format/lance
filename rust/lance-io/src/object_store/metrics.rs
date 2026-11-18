@@ -5,7 +5,7 @@
 //!
 //! Two layers cooperate:
 //!
-//! * [`MeteredObjectStore`] wraps any [`object_store::ObjectStore`] and records
+//! * [`MeteredBackend`] wraps any [`super::StorageBackend`] and records
 //!   per-operation request counts, transferred bytes, latency, errors, and the
 //!   number of requests currently in flight. It works for every store
 //!   regardless of backend.
@@ -16,7 +16,7 @@
 //!   every retried response, which a store-level wrapper cannot observe.
 //!
 //! The two layers have different coverage: every store gets the request-level
-//! metrics from [`MeteredObjectStore`], but only the native cloud stores get
+//! metrics from [`MeteredBackend`], but only the native cloud stores get
 //! the HTTP-level throttle metrics. Opendal-backed stores (tos, oss, etc.)
 //! bypass `object_store`'s HTTP client, so there is no place to install the
 //! connector for them.
@@ -55,21 +55,22 @@
 //! [`InFlightGuard`]) are public so custom object stores can emit the same
 //! metrics.
 
+use crate::object_store::{StorageBackend, backend::MultipartUpload};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use bytes::Bytes;
-use futures::stream::BoxStream;
-use futures::{FutureExt, Stream, StreamExt};
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+use crate::object_store::{
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
     UploadPart,
 };
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::{FutureExt, Stream, StreamExt};
+use lance_core::storage::path::Path;
 use url::Url;
 
 /// Total number of object store requests, labelled by `operation` and `base`.
@@ -321,20 +322,37 @@ impl Drop for InFlightGuard {
 }
 
 #[derive(Debug)]
-pub struct MeteredObjectStore {
-    target: Arc<dyn object_store::ObjectStore>,
+pub struct MeteredBackend {
+    target: Arc<dyn StorageBackend>,
     base: String,
 }
 
-impl std::fmt::Display for MeteredObjectStore {
+impl std::fmt::Display for MeteredBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MeteredObjectStore({})", self.target)
+        write!(f, "MeteredBackend({})", self.target)
     }
 }
 
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
-impl object_store::ObjectStore for MeteredObjectStore {
+impl StorageBackend for MeteredBackend {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        let _in_flight = InFlightGuard::new(&self.base, "list_paginated");
+        let start = Instant::now();
+        let result = self.target.list_paginated(prefix, options).await;
+        if !matches!(
+            &result,
+            Err(crate::object_store::Error::NotSupported { .. })
+        ) {
+            record_request(&self.base, "list_paginated", start, 0, &result);
+        }
+        result
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -632,14 +650,20 @@ impl MultipartUpload for MeteredMultipartUpload {
     }
 }
 
-pub trait ObjectStoreMetricsExt {
+pub trait StorageBackendMetricsExt {
     /// Wrap this store so its operations publish metrics under the given `base` label.
-    fn metered(self, base: String) -> Arc<dyn object_store::ObjectStore>;
+    fn metered(self, base: String) -> Arc<dyn StorageBackend>;
 }
 
-impl ObjectStoreMetricsExt for Arc<dyn object_store::ObjectStore> {
-    fn metered(self, base: String) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(MeteredObjectStore { target: self, base })
+impl StorageBackendMetricsExt for Arc<dyn StorageBackend> {
+    fn metered(self, base: String) -> Arc<dyn StorageBackend> {
+        Arc::new(MeteredBackend { target: self, base })
+    }
+}
+
+impl<T: StorageBackend> StorageBackendMetricsExt for Arc<T> {
+    fn metered(self, base: String) -> Arc<dyn StorageBackend> {
+        Arc::new(MeteredBackend { target: self, base })
     }
 }
 
@@ -648,7 +672,7 @@ impl ObjectStoreMetricsExt for Arc<dyn object_store::ObjectStore> {
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 mod http {
     use super::*;
-    use crate::object_store::throttle::Transport;
+    use crate::object_store::transport::Transport;
     use object_store::client::{
         ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService,
     };
@@ -850,24 +874,100 @@ pub use http::MeteringHttpConnector;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store::backend::MultipartUpload;
     use rstest::rstest;
 
+    use crate::object_store::PutPayload;
     use lance_core::utils::tempfile::TempStdDir;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use object_store::memory::InMemory;
-    use object_store::{ObjectStoreExt, PutPayload};
     use tokio::io::AsyncWriteExt;
     use url::Url;
 
-    use crate::object_store::ObjectStore as LanceObjectStore;
+    use crate::object_store::ObjectStore;
     use crate::traits::Writer;
 
     fn payload(data: &[u8]) -> PutPayload {
-        PutPayload::from_bytes(Bytes::copy_from_slice(data))
+        Bytes::copy_from_slice(data).into()
     }
 
-    fn metered_store() -> Arc<dyn object_store::ObjectStore> {
-        (Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>).metered("memory".into())
+    #[test]
+    fn pagination_preserves_dataset_metrics_labels() {
+        // The process caches label mode. An isolated test process avoids changing
+        // the environment of concurrently running metric tests.
+        if std::env::var(BASE_LABEL_ENV_VAR).as_deref() != Ok("dataset") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::metrics::tests::pagination_preserves_dataset_metrics_labels",
+                ])
+                .env(BASE_LABEL_ENV_VAR, "dataset")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let recorded = capture_metrics(|| async {
+            let mut backend = crate::testing::MockStorageBackend::new();
+            backend.expect_list_paginated().times(1).returning(|_, _| {
+                Ok(crate::object_store::PaginatedListResult {
+                    result: ListResult {
+                        common_prefixes: vec![],
+                        objects: vec![],
+                        extensions: Default::default(),
+                    },
+                    page_token: None,
+                })
+            });
+            backend
+                .expect_list_with_delimiter()
+                .times(1)
+                .returning(|_| {
+                    Ok(ListResult {
+                        common_prefixes: vec![],
+                        objects: vec![],
+                        extensions: Default::default(),
+                    })
+                });
+            let config = crate::object_store::BackendConfig::new(Arc::new(backend), "test");
+            let store = crate::utils::testing::TestObjectStoreProvider(config).build(
+                Url::parse("test://bucket/dataset").unwrap(),
+                &Default::default(),
+            );
+            store
+                .read_dir_page("dataset", Default::default())
+                .await
+                .unwrap();
+            store
+                .list_with_delimiter(Some(&Path::from("dataset")))
+                .await
+                .unwrap();
+            assert_eq!(store.io_stats_snapshot().read_iops, 2);
+        });
+        for operation in ["list_paginated", "list"] {
+            assert_eq!(
+                counter_value(
+                    &recorded,
+                    METRIC_REQUESTS,
+                    &[
+                        ("operation", operation),
+                        ("base", "test$bucket"),
+                        ("dataset", "test://bucket/dataset"),
+                    ]
+                ),
+                1
+            );
+        }
+    }
+
+    fn metered_store() -> Arc<dyn crate::object_store::StorageBackend> {
+        crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()))
+            .metered("memory".into())
     }
 
     /// A single materialized snapshot of recorded metrics. It must be taken
@@ -1016,8 +1116,9 @@ mod tests {
         // No env var is set in the test process, so the default `scheme` mode
         // applies: the full prefix collapses to just the scheme.
         let recorded = capture_metrics(|| async {
-            let store = (Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>)
-                .metered("s3$my-bucket".into());
+            let store =
+                crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()))
+                    .metered("s3$my-bucket".into());
             store.put(&Path::from("a"), payload(b"x")).await.unwrap();
         });
 
@@ -1361,8 +1462,7 @@ mod tests {
     #[test]
     fn test_multipart_part_error_is_counted() {
         let recorded = capture_metrics(|| async {
-            let store = (Arc::new(FailingStreamStore) as Arc<dyn object_store::ObjectStore>)
-                .metered("memory".into());
+            let store = Arc::new(FailingStreamStore).metered("memory".into());
             let mut upload = store.put_multipart(&Path::from("a/big")).await.unwrap();
             let _ = upload.put_part(payload(b"data")).await;
         });
@@ -1489,11 +1589,11 @@ mod tests {
                 let started = Arc::new(tokio::sync::Notify::new());
                 // Never signalled: the request stays blocked mid-flight.
                 let release = Arc::new(tokio::sync::Notify::new());
-                let store = (Arc::new(BlockingStore {
+                let store = Arc::new(BlockingStore {
                     started: started.clone(),
                     release,
-                }) as Arc<dyn object_store::ObjectStore>)
-                    .metered("memory".into());
+                })
+                .metered("memory".into());
 
                 let path = Path::from("a/b");
                 let mut fut = Box::pin(store.get(&path));
@@ -1521,12 +1621,10 @@ mod tests {
     #[test]
     fn test_streaming_errors_are_counted() {
         let recorded = capture_metrics(|| async {
-            let delete_store = (Arc::new(FailingStreamStore) as Arc<dyn object_store::ObjectStore>)
-                .metered("memory".into());
+            let delete_store = Arc::new(FailingStreamStore).metered("memory".into());
             let _ = delete_store.delete(&Path::from("a/b")).await;
 
-            let list_store = (Arc::new(FailingStreamStore) as Arc<dyn object_store::ObjectStore>)
-                .metered("memory".into());
+            let list_store = Arc::new(FailingStreamStore).metered("memory".into());
             let _: Vec<_> = list_store.list(None).collect().await;
         });
 
@@ -1542,7 +1640,7 @@ mod tests {
     }
 
     /// The optimized local reads and writes talk to the filesystem directly, so
-    /// they never reach [`MeteredObjectStore`] and publish these metrics
+    /// they never reach [`MeteredBackend`] and publish these metrics
     /// themselves. They must land under the same `base` label as the store's
     /// metered operations, which for a local store is its scheme.
     #[test]
@@ -1552,7 +1650,7 @@ mod tests {
         let data = b"hello world";
         let recorded = capture_metrics(|| async {
             // Built through the registry, like any store opened from a URI.
-            let (store, path) = LanceObjectStore::from_uri(dir.join("a.bin").to_str().unwrap())
+            let (store, path) = ObjectStore::from_uri(dir.join("a.bin").to_str().unwrap())
                 .await
                 .unwrap();
             // Writes go through LocalWriter.
@@ -1618,7 +1716,7 @@ mod tests {
     fn test_local_read_error_is_counted() {
         let tmp = TempStdDir::default();
         let recorded = capture_metrics(|| async {
-            let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+            let (store, path) = ObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
                 .await
                 .unwrap();
             store.put(&path, b"hello").await.unwrap();
@@ -1649,7 +1747,7 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                let (store, path) = ObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
                     .await
                     .unwrap();
                 let mut writer = store.create(&path).await.unwrap();
@@ -1672,21 +1770,19 @@ mod tests {
     #[test]
     fn test_caller_supplied_store_is_metered() {
         let recorded = capture_metrics(|| async {
-            #[allow(deprecated)]
-            let params = crate::object_store::ObjectStoreParams {
-                object_store: Some((
-                    Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>,
-                    Url::parse("memory:///").unwrap(),
-                )),
-                ..Default::default()
-            };
-            let (store, _) = LanceObjectStore::from_uri_and_params(
-                Arc::new(crate::object_store::ObjectStoreRegistry::default()),
-                "memory:///",
-                &params,
-            )
-            .await
-            .unwrap();
+            let provider = crate::utils::testing::TestObjectStoreProvider(
+                crate::object_store::BackendConfig::new(
+                    crate::object_store::backend::native::from_object_store(Arc::new(
+                        InMemory::new(),
+                    )),
+                    "memory",
+                ),
+            );
+            let params = crate::object_store::ObjectStoreParams::default();
+            let (store, _) =
+                ObjectStore::from_uri_and_params(provider.registry(), "memory:///", &params)
+                    .await
+                    .unwrap();
             store.put(&Path::from("a"), b"hello").await.unwrap();
         });
 
@@ -1700,31 +1796,27 @@ mod tests {
         );
     }
 
-    /// `ObjectStore::new` is how `DatasetBuilder` wraps a caller-supplied store,
-    /// so it must meter both halves of the store: the operations that go through
-    /// `inner`, and the local ones that bypass it. Metering only one half would
-    /// report a partial picture that reads like a complete one.
+    /// Custom providers publish the same metrics as built-in providers.
     #[test]
-    fn test_store_built_from_new_is_metered() {
+    fn test_custom_local_backend_is_metered() {
         let tmp = TempStdDir::default();
         let recorded = capture_metrics(|| async {
-            let store = LanceObjectStore::new(
-                Arc::new(object_store::local::LocalFileSystem::new()),
-                Url::parse("file:///").unwrap(),
-                None,
-                None,
-                false,
-                false,
-                1,
-                3,
-                None,
-            );
+            let store = {
+                let url = Url::parse("file:///").unwrap();
+                let mut config = crate::object_store::BackendConfig::new(
+                    crate::object_store::backend::native::from_object_store(Arc::new(
+                        object_store::local::LocalFileSystem::new(),
+                    )),
+                    url.scheme(),
+                );
+                config.io_parallelism = 1;
+                crate::utils::testing::TestObjectStoreProvider(config)
+                    .build(url, &Default::default())
+            };
             let path = Path::from_absolute_path(tmp.join("a.bin")).unwrap();
-            // put and open bypass `inner` and publish for themselves.
             store.put(&path, b"hello").await.unwrap();
             let reader = store.open(&path).await.unwrap();
             assert_eq!(reader.get_all().await.unwrap().len(), 5);
-            // delete goes through `inner`, so only MeteredObjectStore can count it.
             store.delete(&path).await.unwrap();
         });
 
@@ -1750,15 +1842,26 @@ mod tests {
         }
     }
 
-    fn test_error() -> object_store::Error {
-        object_store::Error::Generic {
+    fn test_error() -> crate::object_store::Error {
+        crate::object_store::Error::Generic {
             store: "FailingStreamStore",
             source: "injected failure".into(),
         }
     }
 
     #[async_trait::async_trait]
-    impl object_store::ObjectStore for FailingStreamStore {
+    impl crate::object_store::StorageBackend for FailingStreamStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             _location: &Path,
@@ -1772,7 +1875,7 @@ mod tests {
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             Ok(Box::new(FailingUpload))
         }
 
@@ -1815,6 +1918,17 @@ mod tests {
         ) -> OSResult<()> {
             unimplemented!()
         }
+        async fn get_ranges(
+            &self,
+            location: &crate::object_store::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> crate::object_store::Result<Vec<bytes::Bytes>> {
+            futures::future::try_join_all(ranges.iter().map(|range| {
+                (self as &dyn crate::object_store::StorageBackend)
+                    .get_range(location, range.clone())
+            }))
+            .await
+        }
     }
 
     /// A [`MultipartUpload`] whose part uploads always fail, used to exercise the
@@ -1852,7 +1966,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl object_store::ObjectStore for BlockingStore {
+    impl crate::object_store::StorageBackend for BlockingStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             _location: &Path,
@@ -1866,7 +1991,7 @@ mod tests {
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             unimplemented!()
         }
 
@@ -1910,6 +2035,17 @@ mod tests {
             _opts: RenameOptions,
         ) -> OSResult<()> {
             unimplemented!()
+        }
+        async fn get_ranges(
+            &self,
+            location: &crate::object_store::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> crate::object_store::Result<Vec<bytes::Bytes>> {
+            futures::future::try_join_all(ranges.iter().map(|range| {
+                (self as &dyn crate::object_store::StorageBackend)
+                    .get_range(location, range.clone())
+            }))
+            .await
         }
     }
 }

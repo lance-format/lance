@@ -31,6 +31,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use futures::stream;
+use lance_core::storage::path::Path;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -42,7 +43,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
-use object_store::path::Path;
 
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
@@ -2131,14 +2131,14 @@ pub(crate) async fn open_vector_index(
 /// for older indices that did not record sizes, this falls back to `open`, which
 /// issues a HEAD to learn the size.
 pub(crate) async fn open_index_file(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     file_name: &str,
     file_sizes: &HashMap<String, u64>,
 ) -> Result<Box<dyn Reader>> {
     match file_sizes.get(file_name) {
-        Some(&size) => object_store.open_with_size(path, size as usize).await,
-        None => object_store.open(path).await,
+        Some(&size) => storage.open_with_size(path, size as usize).await,
+        None => storage.open(path).await,
     }
 }
 
@@ -2152,21 +2152,17 @@ pub(crate) async fn open_index_file(
 /// Other stores hold no descriptor, and their readers cache small files in
 /// memory, so they keep the regular reader.
 pub(crate) async fn open_cache_reader(
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     path: &Path,
     file_name: &str,
     file_sizes: &HashMap<String, u64>,
 ) -> Result<Arc<dyn Reader>> {
-    if object_store.scheme().starts_with("file") {
+    if storage.is_local() {
         let known_size = file_sizes.get(file_name).map(|&size| size as usize);
-        Ok(Arc::new(LazyReader::new(
-            object_store,
-            path.clone(),
-            known_size,
-        )))
+        Ok(Arc::new(LazyReader::new(storage, path.clone(), known_size)))
     } else {
         Ok(
-            open_index_file(object_store.as_ref(), path, file_name, file_sizes)
+            open_index_file(storage.as_ref(), path, file_name, file_sizes)
                 .await?
                 .into(),
         )
@@ -2198,7 +2194,7 @@ pub(crate) async fn open_vector_index_v2(
     // From the caller's metadata, not the listing: a segment a commit is
     // about to publish is not listed yet.
     let index_dir = dataset.indice_files_dir(index_meta)?;
-    let object_store = dataset.object_store_for_index(index_meta).await?;
+    let storage = dataset.storage_for_index(index_meta).await?;
     let file_sizes = index_meta.file_size_map();
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
@@ -2210,7 +2206,7 @@ pub(crate) async fn open_vector_index_v2(
             // The cached index keeps this reader alive, so it must not pin an
             // open descriptor (see [`open_cache_reader`]).
             let aux_reader = open_cache_reader(
-                object_store.clone(),
+                storage.clone(),
                 &aux_path,
                 INDEX_AUXILIARY_FILE_NAME,
                 &file_sizes,
@@ -2246,7 +2242,7 @@ pub(crate) async fn open_vector_index_v2(
                 .join(uuid.to_string())
                 .join(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = open_cache_reader(
-                object_store.clone(),
+                storage.clone(),
                 &aux_path,
                 INDEX_AUXILIARY_FILE_NAME,
                 &file_sizes,
@@ -2710,11 +2706,11 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 16);
 
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         let counted = count_trainable_vectors(&dataset, "vec", ROWS, 256)
             .await
             .unwrap();
-        let bounded_reads = dataset.object_store.io_stats_incremental();
+        let bounded_reads = dataset.storage.io_stats_incremental();
         assert!((256..ROWS).contains(&counted), "counted {counted}");
 
         assert_eq!(
@@ -2723,7 +2719,7 @@ mod tests {
                 .unwrap(),
             ROWS
         );
-        let full_reads = dataset.object_store.io_stats_incremental();
+        let full_reads = dataset.storage.io_stats_incremental();
         assert!(
             bounded_reads.read_bytes < full_reads.read_bytes / 2,
             "threshold check read {} bytes; full count read {} bytes",
@@ -3879,7 +3875,7 @@ mod tests {
         let training_path = out_base.clone().join("global_training.idx");
 
         let writer = dataset
-            .object_store
+            .storage
             .as_ref()
             .create(&training_path)
             .await

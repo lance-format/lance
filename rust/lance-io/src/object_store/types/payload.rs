@@ -22,8 +22,9 @@ use std::sync::Arc;
 ///
 /// A [`PutPayload`] is fully materialized in memory. To upload large objects
 /// without buffering them entirely in memory, use the multipart API instead:
-/// multipart uploads, the Lance object writer
+/// [`StorageBackend::put_multipart_opts`], the Lance object writer
 ///
+/// [`StorageBackend::put_multipart_opts`]: crate::object_store::backend::StorageBackend::put_multipart_opts
 #[derive(Debug, Clone, Default)]
 pub struct PutPayload(Arc<[Bytes]>);
 

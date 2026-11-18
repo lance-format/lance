@@ -33,8 +33,8 @@ async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
     .unwrap();
 
     // Increase likelihood of contention by throttling the store
-    let throttled = Arc::new(ThrottledStoreWrapper {
-        config: ThrottleConfig {
+    let throttled = Arc::new(DelayedStoreWrapper {
+        config: DelayConfig {
             // For benchmarking: Increase this to simulate object storage.
             wait_list_per_call: Duration::from_millis(20),
             wait_get_per_call: Duration::from_millis(20),
@@ -47,7 +47,7 @@ async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
     let mut dataset = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled.clone()),
+                backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -72,7 +72,7 @@ async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
             let dataset = DatasetBuilder::from_uri("memory://")
                 .with_read_params(ReadParams {
                     store_options: Some(ObjectStoreParams {
-                        object_store_wrapper: Some(throttled_ref.clone()),
+                        backend_wrappers: vec![throttled_ref.clone()],
                         ..Default::default()
                     }),
                     session: Some(session_ref.clone()),
@@ -163,8 +163,8 @@ async fn test_merge_insert_large_concurrent() {
     .unwrap();
 
     // Adding latency helps ensure we get contention
-    let throttled = Arc::new(ThrottledStoreWrapper {
-        config: ThrottleConfig {
+    let throttled = Arc::new(DelayedStoreWrapper {
+        config: DelayConfig {
             wait_list_per_call: Duration::from_millis(10),
             wait_get_per_call: Duration::from_millis(10),
             ..Default::default()
@@ -175,7 +175,7 @@ async fn test_merge_insert_large_concurrent() {
     let dataset = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled.clone()),
+                backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -236,7 +236,7 @@ async fn test_merge_insert_large_concurrent() {
     let dataset2 = DatasetBuilder::from_uri("memory://")
         .with_read_params(ReadParams {
             store_options: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled.clone()),
+                backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -478,8 +478,8 @@ async fn test_upsert_concurrent_full_frag() {
     .unwrap();
 
     // Increase likelihood of contention by throttling the store
-    let throttled = Arc::new(ThrottledStoreWrapper {
-        config: ThrottleConfig {
+    let throttled = Arc::new(DelayedStoreWrapper {
+        config: DelayConfig {
             wait_list_per_call: Duration::from_millis(5),
             wait_get_per_call: Duration::from_millis(5),
             wait_put_per_call: Duration::from_millis(5),
@@ -491,7 +491,7 @@ async fn test_upsert_concurrent_full_frag() {
     let mut dataset = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
             store_params: Some(ObjectStoreParams {
-                object_store_wrapper: Some(throttled.clone()),
+                backend_wrappers: vec![throttled.clone()],
                 ..Default::default()
             }),
             session: Some(session.clone()),
@@ -780,7 +780,7 @@ async fn test_transaction_inserted_rows_filter_roundtrip(
         .await
         .unwrap();
     let tx_path = committed.manifest().transaction_file.clone().unwrap();
-    let tx_read = read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
+    let tx_read = read_transaction_file(dataset.storage.as_ref(), &dataset.base, &tx_path)
         .await
         .unwrap();
     let Operation::Update {
@@ -1836,7 +1836,7 @@ async fn test_merge_insert_cleans_up_data_on_apply_deletions_failure() {
     let dataset = DatasetBuilder::from_uri(&routed_uri)
         .with_read_params(ReadParams {
             store_options: Some(ObjectStoreParams {
-                object_store_wrapper: Some(failing.clone()),
+                backend_wrappers: vec![failing.clone()],
                 ..Default::default()
             }),
             ..Default::default()

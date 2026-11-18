@@ -14,11 +14,11 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use lance_core::datatypes::{BlobHandling, BlobKind, Field};
+use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::{Fragment, Manifest};
-use object_store::path::Path;
 use uuid::Uuid;
 
 use super::BlobV2BatchRewritePlan;
@@ -223,10 +223,10 @@ pub async fn copy_blob_columns(
     manifest: &mut Manifest,
 ) -> Result<()> {
     let mut target = source.as_ref().clone();
-    target.object_store = store;
+    target.storage = store;
     target.base = base;
     target.uri = uri.to_string();
-    target.base_object_stores = Default::default();
+    target.base_storage_cache = Default::default();
     target.manifest = Arc::new(manifest.clone());
     let target = Arc::new(target);
     let mut copies = HashMap::new();
@@ -241,9 +241,9 @@ pub async fn copy_blob_columns(
         };
         let target_path = join_base_and_relative_path(&target.base, &target_uri)?;
         source
-            .object_store(id)
+            .storage(id)
             .await?
-            .copy_bulk(&path, &target.object_store, &target_path)
+            .copy_bulk(&path, &target.storage, &target_path)
             .await?;
         if id.is_some() {
             copies.insert((id, uri), target_uri);

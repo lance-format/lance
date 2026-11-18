@@ -161,7 +161,7 @@ pub async fn load_spilled_row_lineage<'a>(
         }
     }
     let loaded: SpilledRowLineage = futures::stream::iter(loads)
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.storage.io_parallelism())
         .try_collect()
         .await?;
     Ok(Arc::new(loaded))
@@ -208,7 +208,7 @@ pub fn load_row_id_sequences<'a>(
         .map(|fragment| {
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.storage.io_parallelism())
 }
 
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
@@ -449,7 +449,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
         loads.push(read_row_id_sequence(dataset, fragment).map_ok(Arc::new));
     }
     let sequences: Vec<Arc<RowIdSequence>> = futures::stream::iter(loads)
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.storage.io_parallelism())
         .try_collect()
         .await?;
 
@@ -482,7 +482,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
         });
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.storage.io_parallelism())
         .try_collect()
         .await?;
     RowIdIndex::new(&fragment_indices)
@@ -894,7 +894,7 @@ mod test {
         let dataset = DatasetBuilder::from_uri(&uri)
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(failing.clone()),
+                    backend_wrappers: vec![failing.clone()],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -902,7 +902,7 @@ mod test {
             .load()
             .await
             .unwrap();
-        let store = dataset.object_store(None).await.unwrap();
+        let store = dataset.storage(None).await.unwrap();
         let visibility = IndexVisibility::from_physical_rows(
             Arc::new(dataset),
             HashMap::from([(fragment_id, [1, 2, 3].into_iter().collect())]),
@@ -955,7 +955,7 @@ mod test {
         let dataset = DatasetBuilder::from_uri(&routed_uri)
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(failing_store.clone()),
+                    backend_wrappers: vec![failing_store.clone()],
                     ..Default::default()
                 }),
                 ..Default::default()

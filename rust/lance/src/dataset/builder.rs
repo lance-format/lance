@@ -11,11 +11,11 @@ use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{Dataset, Error, Result, session::Session};
 use futures::{FutureExt, TryStreamExt};
+use lance_core::storage::path::Path;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
-    DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
-    ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptionsAccessor,
 };
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
@@ -25,9 +25,6 @@ use lance_table::{
     io::commit::external_manifest::ExternalManifestCommitHandler,
     io::commit::{CommitHandler, ManifestLocation, commit_handler_from_url},
 };
-#[cfg(feature = "aws")]
-use object_store::aws::AwsCredentialProvider;
-use object_store::{DynObjectStore, path::Path};
 use prost::Message;
 use tracing::{info, instrument};
 use url::Url;
@@ -50,13 +47,13 @@ pub struct DatasetBuilder {
     version: Option<Ref>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
-    /// Storage options that override user-provided options (e.g., from namespace client)
+    /// ObjectStore options that override user-provided options (e.g., from namespace client)
     storage_options_override: Option<HashMap<String, String>>,
     /// Runtime-only exact object store bindings keyed by base path URI.
     base_store_params: HashMap<String, ObjectStoreParams>,
     /// Namespace-managed table info `(client, table_id)`, set by `from_namespace`
     /// when the table uses managed versioning. The commit handler is built in
-    /// `build_object_store`, rooted at the resolved table path; the branch a
+    /// `build_storage`, rooted at the resolved table path; the branch a
     /// namespace request targets is derived per call from the base path the
     /// handler is handed.
     namespace_managed: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
@@ -107,7 +104,7 @@ impl DatasetBuilder {
     /// This will automatically fetch the table location and storage options from the namespace
     /// client via `describe_table()`.
     ///
-    /// Storage options from the namespace client will override any user-provided storage options
+    /// ObjectStore options from the namespace client will override any user-provided storage options
     /// set via `.with_storage_options()`. This ensures the namespace client is always the source
     /// of truth for storage options.
     ///
@@ -135,7 +132,6 @@ impl DatasetBuilder {
     /// .load()
     /// .await?;
     /// ```
-    #[allow(deprecated)]
     pub async fn from_namespace(
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
@@ -261,32 +257,10 @@ impl DatasetBuilder {
         self
     }
 
-    /// Sets the s3 credentials refresh.
-    /// This only applies to s3 storage.
+    /// Sets the refresh offset for the built-in AWS SDK credential chain.
+    /// Dynamic storage options use `refresh_offset_millis` instead.
     pub fn with_s3_credentials_refresh_offset(mut self, offset: Duration) -> Self {
         self.options.s3_credentials_refresh_offset = offset;
-        self
-    }
-
-    /// Sets the aws credentials provider.
-    /// This only applies to aws object store.
-    #[cfg(feature = "aws")]
-    pub fn with_aws_credentials_provider(mut self, credentials: AwsCredentialProvider) -> Self {
-        self.options.aws_credentials = Some(credentials);
-        self
-    }
-
-    /// Directly set the object store to use.
-    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
-    #[allow(deprecated)]
-    pub fn with_object_store(
-        mut self,
-        object_store: Arc<DynObjectStore>,
-        location: Url,
-        commit_handler: Arc<dyn CommitHandler>,
-    ) -> Self {
-        self.options.object_store = Some((object_store, location));
-        self.commit_handler = Some(commit_handler);
         self
     }
 
@@ -304,9 +278,9 @@ impl DatasetBuilder {
     /// Options may be passed in the HashMap or set as environment variables. See documentation of
     /// underlying object store implementation for details.
     ///
-    /// - [Azure options](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html#variants)
-    /// - [S3 options](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants)
-    /// - [Google options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants)
+    /// - [Azure options](https://docs.rs/storage/latest/storage/azure/enum.AzureConfigKey.html#variants)
+    /// - [S3 options](https://docs.rs/storage/latest/storage/aws/enum.AmazonS3ConfigKey.html#variants)
+    /// - [Google options](https://docs.rs/storage/latest/storage/gcp/enum.GoogleConfigKey.html#variants)
     ///
     /// Set `scheduler_error_mode` to `fail_fast` to return the first observed
     /// scheduler error and cancel the remaining physical reads in the same
@@ -380,7 +354,7 @@ impl DatasetBuilder {
     /// before they expire. The namespace client should return `expires_at_millis`
     /// in the storage_options from `describe_table()`.
     ///
-    /// Use `with_s3_credentials_refresh_offset()` to configure how early
+    /// Set `refresh_offset_millis` in storage options to configure how early
     /// credentials should be refreshed before they expire (default is 5 minutes).
     ///
     /// # Arguments
@@ -415,7 +389,9 @@ impl DatasetBuilder {
     /// // With custom refresh offset (refresh 10 minutes before expiration)
     /// let dataset = DatasetBuilder::from_uri("s3://bucket/table.lance")
     ///     .with_storage_options_provider(provider.clone())
-    ///     .with_s3_credentials_refresh_offset(Duration::from_secs(600))
+    ///     .with_storage_options(std::collections::HashMap::from([
+    ///         ("refresh_offset_millis".into(), "600000".into()),
+    ///     ]))
     ///     .load()
     ///     .await?;
     pub fn with_storage_options_provider(
@@ -541,46 +517,18 @@ impl DatasetBuilder {
     }
 
     /// Build a lance object store for the given config
-    pub async fn build_object_store(
+    pub async fn build_storage(
         mut self,
     ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
-        let storage_options = self
-            .options
-            .storage_options()
-            .cloned()
-            .map(StorageOptions::new)
-            .unwrap_or_default();
-        let download_retry_count = storage_options.download_retry_count();
-
         let store_registry = self
             .session
             .as_ref()
             .map(|s| s.store_registry())
             .unwrap_or_default();
 
-        #[allow(deprecated)]
-        let (object_store, base_path) = match &self.options.object_store {
-            Some(store) => (
-                Arc::new(ObjectStore::new(
-                    store.0.clone(),
-                    store.1.clone(),
-                    self.options.block_size,
-                    self.options.object_store_wrapper.clone(),
-                    self.options.use_constant_size_upload_parts,
-                    store.1.scheme() != "file",
-                    // If user supplied an object store then we just assume it's probably
-                    // cloud-like
-                    DEFAULT_CLOUD_IO_PARALLELISM,
-                    download_retry_count,
-                    None, // No storage_options available here
-                )),
-                Path::from(store.1.path()),
-            ),
-            None => {
-                ObjectStore::from_uri_and_params(store_registry, &self.table_uri, &self.options)
-                    .await?
-            }
-        };
+        let (storage, base_path) =
+            ObjectStore::from_uri_and_params(store_registry, &self.table_uri, &self.options)
+                .await?;
 
         // Resolve the commit handler: an explicitly set one wins; otherwise a
         // namespace-managed table builds a manifest store rooted at the resolved
@@ -603,7 +551,7 @@ impl DatasetBuilder {
                 commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await?
             };
 
-        Ok((object_store, base_path, commit_handler))
+        Ok((storage, base_path, commit_handler))
     }
 
     /// List manifest locations without reading the manifest contents.
@@ -629,9 +577,9 @@ impl DatasetBuilder {
             ));
         }
         self.apply_storage_options_override();
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let (storage, base_path, commit_handler) = self.build_storage().await?;
         commit_handler
-            .list_manifest_locations(&base_path, object_store.as_ref(), false)
+            .list_manifest_locations(&base_path, storage.as_ref(), false)
             .try_collect()
             .await
     }
@@ -728,7 +676,7 @@ impl DatasetBuilder {
         let managed_store_active =
             self.namespace_managed.is_some() && self.commit_handler.is_none();
 
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let (storage, base_path, commit_handler) = self.build_storage().await?;
 
         // Two cases that need to check out after loading the manifest:
         // 1. If the target is configured as a branch, we need to check the branch field in the manifest
@@ -751,7 +699,7 @@ impl DatasetBuilder {
             // If tag not found, we need to delay checkout after loading by uri
             Some(Ref::Tag(tag_name)) => {
                 let refs = Refs::new(
-                    object_store.clone(),
+                    storage.clone(),
                     commit_handler.clone(),
                     BranchLocation {
                         path: base_path.clone(),
@@ -824,7 +772,7 @@ impl DatasetBuilder {
             file_reader_options,
             table_uri,
             load_version,
-            object_store,
+            storage,
             base_path,
             commit_handler,
             Some(store_params),
@@ -879,7 +827,7 @@ impl DatasetBuilder {
         file_reader_options: Option<FileReaderOptions>,
         table_uri: String,
         version_number: Option<u64>,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         commit_handler: Arc<dyn CommitHandler>,
         store_params: Option<ObjectStoreParams>,
@@ -889,10 +837,10 @@ impl DatasetBuilder {
             ensure_can_read_manifest(&manifest)?;
             versions::check_manifest_storage_version(&mut manifest)?;
             let location = commit_handler
-                .resolve_version_location(&base_path, manifest.version, &object_store.inner)
+                .resolve_version_location(&base_path, manifest.version, &storage)
                 .await?;
             if manifest.schema.has_dictionary_types() {
-                let reader = object_store.open(&location.path).await?;
+                let reader = storage.open(&location.path).await?;
                 populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
             }
             (Arc::new(manifest), location)
@@ -900,7 +848,7 @@ impl DatasetBuilder {
             let manifest_location = match version_number {
                 Some(version) => {
                     let target_manifest_result = commit_handler
-                        .resolve_version_location(&base_path, version, &object_store.inner)
+                        .resolve_version_location(&base_path, version, &storage)
                         .await;
                     // This may fail due to the uri is not the right branch
                     // In this case we should try to load the latest version and checkout the right branch and version_number
@@ -910,7 +858,7 @@ impl DatasetBuilder {
                             if let Error::VersionNotFound { message: _ } = e {
                                 // If the version is not found, we need to try to load the latest version.
                                 commit_handler
-                                    .resolve_latest_location(&base_path, &object_store)
+                                    .resolve_latest_location(&base_path, &storage)
                                     .await?
                             } else {
                                 return Err(e);
@@ -919,7 +867,7 @@ impl DatasetBuilder {
                     }
                 }
                 None => commit_handler
-                    .resolve_latest_location(&base_path, &object_store)
+                    .resolve_latest_location(&base_path, &storage)
                     .await
                     .map_err(|e| match &e {
                         Error::NotFound { .. } => {
@@ -929,18 +877,14 @@ impl DatasetBuilder {
                     })?,
             };
 
-            let manifest = Dataset::get_manifest(
-                &object_store,
-                &manifest_location,
-                &table_uri,
-                session.as_ref(),
-            )
-            .await?;
+            let manifest =
+                Dataset::get_manifest(&storage, &manifest_location, &table_uri, session.as_ref())
+                    .await?;
             (manifest, manifest_location)
         };
 
         Dataset::checkout_manifest(
-            object_store,
+            storage,
             base_path,
             table_uri,
             manifest,

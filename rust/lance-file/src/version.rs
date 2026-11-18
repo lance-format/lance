@@ -299,8 +299,8 @@ fn unknown_version(value: impl Display) -> Error {
 mod tests {
     use std::str::FromStr;
 
+    use lance_core::storage::path::Path;
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
 
     use super::*;
 
@@ -448,17 +448,17 @@ mod tests {
 
     #[tokio::test]
     async fn file_version_detection_accepts_all_legacy_footer_aliases() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         for minor in 0u16..=2 {
             let path = Path::from(format!("legacy-{minor}.lance"));
             let mut footer = Vec::with_capacity(8);
             footer.extend_from_slice(&0u16.to_le_bytes());
             footer.extend_from_slice(&minor.to_le_bytes());
             footer.extend_from_slice(crate::format::MAGIC);
-            object_store.put(&path, &footer).await.unwrap();
+            storage.put(&path, &footer).await.unwrap();
 
             assert_eq!(
-                crate::determine_file_version(&object_store, &path, Some(footer.len()))
+                crate::determine_file_version(&storage, &path, Some(footer.len()))
                     .await
                     .unwrap(),
                 ConcreteFileVersion::V1

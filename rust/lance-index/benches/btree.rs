@@ -37,6 +37,7 @@ use datafusion_expr::{Expr, col, lit};
 use futures::TryStreamExt;
 use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_datafusion_exec::datagen::DatafusionDatagenExt;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::metrics::NoOpMetricsCollector;
@@ -52,7 +53,6 @@ use lance_index::scalar::{AnyQuery, SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
-use object_store::path::Path;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 /// Selectivity level for range queries

@@ -12,9 +12,9 @@ use std::time::Duration;
 use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::storage::path::Path;
 use lance_core::{Result, datatypes::Schema};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -88,7 +88,7 @@ pub(super) async fn blob_sidecars(store: &ObjectStore, data_dir: &Path) -> Vec<P
     use futures::TryStreamExt;
 
     let mut paths = store
-        .list_objects(Some(data_dir))
+        .list(Some(data_dir.clone()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()

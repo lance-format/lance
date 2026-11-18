@@ -705,11 +705,11 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
+    use lance_core::storage::path::Path;
     use lance_core::utils::tempfile::{TempObjFile, TempStrDir};
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
     use lance_linalg::kernels::normalize_fsl;
-    use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 
     use crate::index::vector::ivf::build_ivf_model;
@@ -724,12 +724,9 @@ mod tests {
     const DIM: usize = 128;
 
     #[tokio::test]
-    async fn empty_legacy_ivf_pq_partition_does_not_read_object_store() {
-        let object_store = ObjectStore::memory();
-        let reader = object_store
-            .open(&Path::from("missing-index"))
-            .await
-            .unwrap();
+    async fn empty_legacy_ivf_pq_partition_does_not_read_storage() {
+        let storage = ObjectStore::memory();
+        let reader = storage.open(&Path::from("missing-index")).await.unwrap();
         let codebook_values = Float32Array::from_iter_values((0..256).map(|value| value as f32));
         let codebook = FixedSizeListArray::try_new_from_values(codebook_values, 1).unwrap();
         let index = PQIndex::new(
@@ -746,14 +743,14 @@ mod tests {
     #[tokio::test]
     async fn legacy_index_values_are_read_from_the_requested_offset() {
         let path = TempObjFile::default();
-        let object_store = ObjectStore::local();
-        let mut writer = object_store.create(&path).await.unwrap();
+        let storage = ObjectStore::local();
+        let mut writer = storage.create(&path).await.unwrap();
         writer.write_all(&[0xFF]).await.unwrap();
         writer.write_all(&11_u64.to_le_bytes()).await.unwrap();
         writer.write_all(&12_u64.to_le_bytes()).await.unwrap();
         Writer::shutdown(writer.as_mut()).await.unwrap();
 
-        let reader = object_store.open(&path).await.unwrap();
+        let reader = storage.open(&path).await.unwrap();
         let values = read_legacy_index_values(reader.as_ref(), &DataType::UInt64, 1, 2)
             .await
             .unwrap();

@@ -917,7 +917,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
     let metadata_path = index_dir
         .clone()
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    if dataset.object_store.as_ref().exists(&metadata_path).await? {
+    if dataset.storage.as_ref().exists(&metadata_path).await? {
         return Ok(None);
     }
 
@@ -926,7 +926,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
         &segment.uuid,
     )?);
     let files = lance_index::scalar::inverted::builder::merge_index_files_with_options(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         &index_dir,
         store,
         lance_index::scalar::inverted::builder::FinalizeOptions::default(),
@@ -1575,7 +1575,7 @@ mod tests {
             .unwrap();
         let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
         let staged_paths = dataset
-            .object_store
+            .storage
             .read_dir_all(&index_dir, None)
             .try_collect::<Vec<_>>()
             .await
@@ -1588,7 +1588,7 @@ mod tests {
         );
         assert!(
             !dataset
-                .object_store
+                .storage
                 .exists(&index_dir.clone().join(METADATA_FILE))
                 .await
                 .unwrap()
@@ -1602,14 +1602,14 @@ mod tests {
         assert_eq!(merged.fragment_bitmap, segment.fragment_bitmap);
         assert!(
             dataset
-                .object_store
+                .storage
                 .exists(&index_dir.clone().join(METADATA_FILE))
                 .await
                 .unwrap(),
             "finalize publishes the root metadata"
         );
         let final_paths = dataset
-            .object_store
+            .storage
             .read_dir_all(&index_dir, None)
             .try_collect::<Vec<_>>()
             .await
@@ -1633,7 +1633,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(listed, reported, "metadata lists exactly the final files");
         let index_dirs = dataset
-            .object_store
+            .storage
             .read_dir(dataset.indices_dir())
             .await
             .unwrap();
@@ -1800,7 +1800,7 @@ mod tests {
                 .await
                 .unwrap();
             let index_dirs = dataset
-                .object_store
+                .storage
                 .read_dir(dataset.indices_dir())
                 .await
                 .unwrap()

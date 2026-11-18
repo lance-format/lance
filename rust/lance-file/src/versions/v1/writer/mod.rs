@@ -17,10 +17,10 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::{WriteExt, Writer};
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -97,12 +97,12 @@ pub struct FileWriterOptions {
 
 impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     pub async fn try_new(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         schema: Schema,
         options: &FileWriterOptions,
     ) -> Result<Self> {
-        let object_writer = object_store.create(path).await?;
+        let object_writer = storage.create(path).await?;
         Self::with_object_writer(object_writer, schema, options)
     }
 
@@ -1206,13 +1206,11 @@ mod tests {
     }
 
     async fn read_file_as_one_batch(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         schema: Schema,
     ) -> RecordBatch {
-        let reader = FileReader::try_new(object_store, path, schema)
-            .await
-            .unwrap();
+        let reader = FileReader::try_new(storage, path, schema).await.unwrap();
         let mut batches = vec![];
         for i in 0..reader.num_batches() {
             batches.push(

@@ -6,18 +6,19 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::object_store::backend::native::{from_error, to_path};
+use crate::object_store::{
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
+};
+use ::object_store::ObjectStoreExt;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use http::{HeaderValue, header::IF_NONE_MATCH};
+use lance_core::storage::path::Path;
 use object_store::ClientOptions;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::multipart::MultipartStore;
-use object_store::path::Path;
-use object_store::{
-    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result,
-};
 
 /// S3's whole-object copy and UploadPart size limit.
 const MAX_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -27,6 +28,7 @@ const MIN_PART_SIZE: u64 = 8 * 1024 * 1024;
 #[derive(Debug)]
 pub(super) struct ConditionalS3Store {
     inner: Arc<AmazonS3>,
+    backend: Arc<dyn crate::object_store::StorageBackend>,
     /// Used ONLY for completion: its default If-None-Match header makes the
     /// published MultipartStore::complete_multipart operation conditional.
     completion: AmazonS3,
@@ -53,19 +55,33 @@ impl ConditionalS3Store {
         headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
         let completion = builder
             .with_client_options(client_options.with_default_headers(headers))
-            .build()?;
-        Ok(Self { inner, completion })
+            .build()
+            .map_err(from_error)?;
+        Ok(Self {
+            backend: crate::object_store::backend::native::from_object_store_with_pagination(
+                inner.clone(),
+                inner.clone(),
+            ),
+            inner,
+            completion,
+        })
     }
 
     async fn copy_large(&self, from: &Path, to: &Path, size: u64, part_size: u64) -> Result<()> {
-        let upload_id = self.inner.create_multipart(to).await?;
+        let from = &to_path(from)?;
+        let to = &to_path(to)?;
+        let upload_id = self.inner.create_multipart(to).await.map_err(from_error)?;
         let result = async {
             let mut parts = Vec::with_capacity(size.div_ceil(part_size) as usize);
             for (index, start) in (0..size).step_by(part_size as usize).enumerate() {
                 let end = start.saturating_add(part_size).min(size);
-                let bytes = self.inner.get_range(from, start..end).await?;
+                let bytes = self
+                    .inner
+                    .get_range(from, start..end)
+                    .await
+                    .map_err(from_error)?;
                 if bytes.len() as u64 != end - start {
-                    return Err(object_store::Error::Generic {
+                    return Err(crate::object_store::Error::Generic {
                         store: "S3 conditional copy",
                         source: format!(
                             "source {from} range {start}..{end} returned {} bytes",
@@ -77,12 +93,14 @@ impl ConditionalS3Store {
                 parts.push(
                     self.inner
                         .put_part(to, &upload_id, index, bytes.into())
-                        .await?,
+                        .await
+                        .map_err(from_error)?,
                 );
             }
             self.completion
                 .complete_multipart(to, &upload_id, parts)
-                .await?;
+                .await
+                .map_err(from_error)?;
             Ok(())
         }
         .await;
@@ -96,37 +114,53 @@ impl ConditionalS3Store {
 }
 
 #[async_trait]
-impl ObjectStore for ConditionalS3Store {
+impl crate::object_store::StorageBackend for ConditionalS3Store {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        self.backend.list_paginated(prefix, options).await
+    }
+
     async fn put_opts(
         &self,
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult> {
-        self.inner.put_opts(path, payload, options).await
+        self.backend.put_opts(path, payload, options).await
     }
 
     async fn put_multipart_opts(
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(path, options).await
+    ) -> Result<Box<dyn crate::object_store::backend::MultipartUpload>> {
+        self.backend.put_multipart_opts(path, options).await
     }
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
-        self.inner.get_opts(path, options).await
+        self.backend.get_opts(path, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        path: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<bytes::Bytes>> {
+        self.backend.get_ranges(path, ranges).await
     }
 
     fn delete_stream(
         &self,
         paths: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(paths)
+        self.backend.delete_stream(paths)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        self.backend.list(prefix)
     }
 
     fn list_with_offset(
@@ -134,18 +168,18 @@ impl ObjectStore for ConditionalS3Store {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
+        self.backend.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
+        self.backend.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         if options.mode == CopyMode::Create {
-            let size = self.inner.head(from).await?.size;
+            let size = self.backend.head(from).await?.size;
             if size == 0 {
-                self.inner
+                self.backend
                     .put_opts(
                         to,
                         PutPayload::default(),
@@ -162,11 +196,11 @@ impl ObjectStore for ConditionalS3Store {
                 return self.copy_large(from, to, size, part_size).await;
             }
         }
-        self.inner.copy_opts(from, to, options).await
+        self.backend.copy_opts(from, to, options).await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        self.inner.rename_opts(from, to, options).await
+        self.backend.rename_opts(from, to, options).await
     }
 }
 
@@ -174,19 +208,15 @@ impl ObjectStore for ConditionalS3Store {
 mod tests {
     use std::collections::HashMap;
 
-    use object_store::{RetryConfig, aws::S3CopyIfNotExists};
+    use ::object_store::{RetryConfig, aws::S3CopyIfNotExists};
     use rstest::rstest;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::object_store::providers::aws::AwsStoreProvider;
-    use crate::object_store::{
-        ObjectStore as LanceObjectStore, ObjectStoreParams, ObjectStoreProvider,
-        StorageOptionsAccessor,
-    };
+    use crate::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 
-    async fn provider_store(server: &MockServer, mode: Option<&str>) -> LanceObjectStore {
+    async fn provider_store(server: &MockServer, mode: Option<&str>) -> Arc<ObjectStore> {
         let mut options = HashMap::from([
             ("aws_endpoint".into(), server.uri()),
             ("aws_region".into(), "us-east-1".into()),
@@ -199,7 +229,7 @@ mod tests {
         if let Some(mode) = mode {
             options.insert("aws_copy_if_not_exists".into(), mode.into());
         }
-        AwsStoreProvider
+        crate::object_store::ObjectStoreRegistry::default()
             .new_store(
                 "s3://bucket".parse().unwrap(),
                 &ObjectStoreParams {
@@ -461,7 +491,7 @@ mod tests {
             let error = result.unwrap_err();
             if outcome == 412 {
                 assert!(
-                    matches!(error, object_store::Error::Precondition { .. }),
+                    matches!(error, crate::object_store::Error::Precondition { .. }),
                     "{error}"
                 );
             }

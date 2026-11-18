@@ -4,12 +4,12 @@
 
 use bytes::Bytes;
 use lance_core::Result;
+use lance_core::storage::path::Path;
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
-use object_store::path::Path;
 use rand::{RngCore, seq::SliceRandom};
 use std::{fmt::Display, process::Command, sync::Arc};
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};

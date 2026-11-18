@@ -10,11 +10,11 @@
 
 use std::sync::Arc;
 
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::{Reader, Writer};
 use lance_io::{bytes_read_counter, iops_counter};
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 /// Both schedulers answer an empty range without a request and count the

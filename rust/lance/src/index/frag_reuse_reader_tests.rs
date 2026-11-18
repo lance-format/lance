@@ -618,7 +618,7 @@ async fn projected_coverage_does_not_skip_address_translation() {
     index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: dataset.storage.store_prefix(),
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     dataset
@@ -1310,7 +1310,7 @@ async fn externalize_legacy_history(dataset: &mut Dataset) {
     fri.uuid = Uuid::new_v4();
     let name = "legacy-external.binpb";
     let path = dataset.indices_dir().join(fri.uuid.to_string()).join(name);
-    let mut writer = dataset.object_store.create(&path).await.unwrap();
+    let mut writer = dataset.storage.create(&path).await.unwrap();
     writer.write_all(&bytes).await.unwrap();
     writer.shutdown().await.unwrap();
     details.content = Some(pb::fragment_reuse_index_details::Content::External(
@@ -2058,7 +2058,7 @@ async fn unsupported_scalar_type_is_not_advertised_for_rewritten_fragments() {
     ));
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: dataset.storage.store_prefix(),
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     dataset
@@ -2310,7 +2310,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     // sibling would fail. The open must still succeed from the cached plan.
     let metadata_key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: dataset.storage.store_prefix(),
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     dataset
@@ -3107,7 +3107,7 @@ async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
     index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: dataset.storage.store_prefix(),
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     dataset
@@ -3322,7 +3322,7 @@ async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
             .unwrap();
             let index_dir = dataset.indices_dir().join(direct.uuid.to_string());
             lance_index::scalar::inverted::builder::merge_index_files(
-                dataset.object_store.as_ref(),
+                dataset.storage.as_ref(),
                 &index_dir,
                 Arc::new(store),
                 Arc::new(crate::index::NoopIndexBuildProgress),
@@ -3859,11 +3859,11 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
     for name in ["tokens.lance", "invert.lance", "docs.lance"] {
         let from = index_dir.clone().join(format!("part_0_{name}"));
         let to = index_dir.clone().join(name);
-        dataset.object_store.copy(&from, &to).await.unwrap();
-        dataset.object_store.delete(&from).await.unwrap();
+        dataset.storage.copy(&from, &to).await.unwrap();
+        dataset.storage.delete(&from).await.unwrap();
     }
     dataset
-        .object_store
+        .storage
         .delete(&index_dir.clone().join("metadata.lance"))
         .await
         .unwrap();
@@ -4756,7 +4756,7 @@ async fn fri_read_cost(dataset: &Dataset, value: i32) -> (usize, u64) {
         .await
         .unwrap();
     assert!(plan.contains("ScalarIndexQuery"), "{plan}");
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.storage.as_ref().io_stats_incremental();
     let batch = dataset
         .scan()
         .filter(&filter)
@@ -4764,7 +4764,7 @@ async fn fri_read_cost(dataset: &Dataset, value: i32) -> (usize, u64) {
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset.storage.as_ref().io_stats_incremental();
     assert_eq!(batch.num_rows(), 1, "{filter}");
     assert_eq!(
         batch

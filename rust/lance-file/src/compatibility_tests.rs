@@ -236,7 +236,7 @@ async fn write_current_fixture(
     schema: &LanceSchema,
 ) -> Vec<u8> {
     let fs = FsFixture::default();
-    let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+    let object_writer = fs.storage.create(&fs.tmp_path).await.unwrap();
     let options = FileWriterOptions {
         data_cache_bytes: Some(1),
         max_page_bytes: Some(1024),
@@ -283,7 +283,7 @@ async fn write_current_fixture(
             writer.finish().await.unwrap()
         }
     };
-    fs.object_store
+    fs.storage
         .open(&fs.tmp_path)
         .await
         .unwrap()
@@ -322,7 +322,7 @@ async fn assert_current_reader_roundtrip(
     expected: &RecordBatch,
 ) -> FileReader {
     let fs = FsFixture::default();
-    let mut fixture_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+    let mut fixture_writer = fs.storage.create(&fs.tmp_path).await.unwrap();
     fixture_writer.write_all(fixture).await.unwrap();
     Writer::shutdown(fixture_writer.as_mut()).await.unwrap();
     let scheduler = fs
@@ -477,7 +477,7 @@ async fn v1_writer_and_reader_are_wire_compatible() {
     schema.set_dictionary(&batch).unwrap();
     let fs = FsFixture::default();
     let mut writer = V1Writer::<NotSelfDescribing>::try_new(
-        fs.object_store.as_ref(),
+        fs.storage.as_ref(),
         &fs.tmp_path,
         schema.clone(),
         &V1WriterOptions {
@@ -492,7 +492,7 @@ async fn v1_writer_and_reader_are_wire_compatible() {
     }
     let summary = writer.finish().await.unwrap();
     let actual = fs
-        .object_store
+        .storage
         .open(&fs.tmp_path)
         .await
         .unwrap()
@@ -507,14 +507,14 @@ async fn v1_writer_and_reader_are_wire_compatible() {
 
     let fixture_fs = FsFixture::default();
     let mut fixture_writer = fixture_fs
-        .object_store
+        .storage
         .create(&fixture_fs.tmp_path)
         .await
         .unwrap();
     fixture_writer.write_all(expected).await.unwrap();
     Writer::shutdown(fixture_writer.as_mut()).await.unwrap();
     let reader = V1Reader::try_new(
-        fixture_fs.object_store.as_ref(),
+        fixture_fs.storage.as_ref(),
         &fixture_fs.tmp_path,
         schema.clone(),
     )
@@ -719,7 +719,7 @@ async fn planar_writer_rejects_blob_v1() {
     let batch = compatibility_fixture_batch();
     let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
     let fs = FsFixture::default();
-    let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+    let object_writer = fs.storage.create(&fs.tmp_path).await.unwrap();
     let result = versions::v2_3::create_writer(object_writer, schema, FileWriterOptions::default());
     let error = result.err().expect("Blob v1 must be rejected");
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));

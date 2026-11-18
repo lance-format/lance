@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
@@ -18,7 +18,6 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
@@ -31,7 +30,7 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::dataset::mem_wal::util::{generate_random_hash, sstable_path};
 use crate::dataset::write::InsertBuilder;
 use crate::index::CreateIndexBuilder;
 use crate::session::Session;
@@ -67,7 +66,7 @@ fn compute_dedup_deletions(batches: &[RecordBatch], pk_indices: &[usize]) -> Roa
 }
 
 pub struct MemTableFlusher {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_path: Path,
     base_uri: String,
     /// The MemWAL's `dir_id`; generations are written under its directory.
@@ -79,7 +78,7 @@ pub struct MemTableFlusher {
     warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Store params the base dataset was opened with, reused for the flusher's
     /// own opens + writes. Used verbatim only for the base's own URI; generation
-    /// URIs go through [`derived_store_params`]. `None` opens by URI alone.
+    /// URIs resolve their own storage through the registry. `None` opens by URI alone.
     store_params: Option<ObjectStoreParams>,
     /// Session for those opens, sharing the base's store registry. `None` opens
     /// with a fresh session.
@@ -140,7 +139,7 @@ const TRAINING_BATCH_SIZE: usize = 8192;
 impl MemTableFlusher {
     /// Create a flusher writing `shard_id`'s generations under the MemWAL `dir_id`.
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
         dir_id: impl Into<String>,
@@ -148,7 +147,7 @@ impl MemTableFlusher {
         manifest_store: Arc<ShardManifestStore>,
     ) -> Self {
         Self {
-            object_store,
+            storage,
             base_path,
             base_uri: base_uri.into(),
             dir_id: dir_id.into(),
@@ -178,19 +177,9 @@ impl MemTableFlusher {
         self
     }
 
-    /// Open the base table, reusing the injected store params verbatim — they
-    /// were resolved for exactly this URI, so a path-bound `object_store`
-    /// binding still points where it should.
+    /// Open the base table with its configured session and storage options.
     async fn open_base(&self) -> Result<Dataset> {
         self.open_uri(&self.base_uri, self.store_params.clone())
-            .await
-    }
-
-    /// Open an SSTable under `_mem_wal/`. The params must be adapted
-    /// first: a path-bound store binding would redirect the open at the base
-    /// table (see [`derived_store_params`]).
-    async fn open_generation(&self, uri: &str) -> Result<Dataset> {
-        self.open_uri(uri, self.store_params.as_ref().map(derived_store_params))
             .await
     }
 
@@ -278,7 +267,7 @@ impl MemTableFlusher {
         ))
     }
 
-    /// Storage file version of the shard's base dataset. SSTables
+    /// ObjectStore file version of the shard's base dataset. SSTables
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
     ///
@@ -353,7 +342,7 @@ impl MemTableFlusher {
         // SSTable exposes newest-per-PK on every read path.
         if !deleted.is_empty() {
             let uri = self.path_to_uri(&gen_path);
-            let dataset = self.open_generation(&uri).await?;
+            let dataset = self.open_uri(&uri, self.store_params.clone()).await?;
             self.finalize_generation(&dataset, &deleted, None).await?;
         }
 
@@ -453,7 +442,7 @@ impl MemTableFlusher {
 
         let uri = self.path_to_uri(path);
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
-            match self.open_generation(&uri).await {
+            match self.open_uri(&uri, self.store_params.clone()).await {
                 Ok(dataset) => {
                     let fragments = dataset.get_fragments();
                     let is_expected = fragments.len() == 1
@@ -487,11 +476,8 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: u32::MAX as usize,
             data_storage_version: Some(storage_version.to_selector()),
-            // Write the generation through the base's store params + session so it
-            // uses the same store the base was opened with. Adapted for the
-            // generation URI: a path-bound store binding would send this write at
-            // the base table's own path (see [`derived_store_params`]).
-            store_params: self.store_params.as_ref().map(derived_store_params),
+            // Resolve the generation URI with the base table's credentials and session.
+            store_params: self.store_params.clone(),
             session: self.session.clone(),
             ..Default::default()
         };
@@ -536,7 +522,7 @@ impl MemTableFlusher {
                 0, // 1 fragment per SSTable
                 dataset.version().version,
                 &dv,
-                dataset.object_store.as_ref(),
+                dataset.storage.as_ref(),
                 dataset.inline_deletions_max_bytes()?,
             )
             .await?;
@@ -551,15 +537,9 @@ impl MemTableFlusher {
         manifest.index_section = None;
         manifest.transaction_section = None;
         manifest.transaction_file = None;
-        write_manifest_file_to_path(
-            &self.object_store,
-            &mut manifest,
-            indexes,
-            &manifest_path,
-            None,
-        )
-        .await
-        .map_err(|e| Error::io(format!("Failed to write generation manifest: {}", e)))?;
+        write_manifest_file_to_path(&self.storage, &mut manifest, indexes, &manifest_path, None)
+            .await
+            .map_err(|e| Error::io(format!("Failed to write generation manifest: {}", e)))?;
         Ok(())
     }
 
@@ -569,8 +549,8 @@ impl MemTableFlusher {
         bloom: &lance_core::utils::bloomfilter::sbbf::Sbbf,
     ) -> Result<()> {
         let data = bloom.to_bytes();
-        self.object_store
-            .put_payload(path, Bytes::from(data).into())
+        self.storage
+            .put_payload(path, data.into())
             .await
             .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e)))?;
         Ok(())
@@ -633,7 +613,7 @@ impl MemTableFlusher {
         // Dataset::write already committed the data; the indexes join it in
         // one manifest below.
         let uri = self.path_to_uri(&gen_path);
-        let mut dataset = self.open_generation(&uri).await?;
+        let mut dataset = self.open_uri(&uri, self.store_params.clone()).await?;
         let all_indexes = self
             .create_indexes(
                 &mut dataset,
@@ -716,7 +696,7 @@ impl MemTableFlusher {
             };
             let generation = GenerationWrite {
                 path: gen_path,
-                object_store: &self.object_store,
+                storage: &self.storage,
                 dataset,
                 total_rows,
                 name: &spec.name,
@@ -783,7 +763,7 @@ impl MemTableFlusher {
 
         let schema = batches[0].schema();
         let store = LanceIndexStore::new(
-            self.object_store.clone(),
+            self.storage.clone(),
             pk_index_path(gen_path),
             Arc::new(LanceCache::no_cache()),
         );

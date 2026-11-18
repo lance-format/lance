@@ -42,6 +42,7 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{
     BuiltinIndexType, CreatedIndex, ScalarIndexParams, index_files_to_table,
 };
+use lance_io::object_store::{Error as ObjectStoreError, path::Path};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::stream::RecordBatchStream as LanceRecordBatchStream;
 use lance_namespace::LanceNamespace;
@@ -64,7 +65,6 @@ use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
 use lance_table::transaction::validate_non_reusable_field_id_transition;
-use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -975,7 +975,7 @@ pub struct ManifestNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
     session: Option<Arc<Session>>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     base_path: Path,
     manifest_dataset: DatasetConsistencyWrapper,
     /// Whether directory listing is enabled in dual mode
@@ -1073,7 +1073,7 @@ impl ManifestNamespace {
         root: String,
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
@@ -1087,7 +1087,7 @@ impl ManifestNamespace {
             root,
             storage_options,
             session,
-            object_store,
+            storage,
             base_path,
             manifest_dataset,
             dir_listing_enabled,
@@ -1102,7 +1102,7 @@ impl ManifestNamespace {
         root: String,
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
@@ -1115,7 +1115,7 @@ impl ManifestNamespace {
             root,
             storage_options,
             session,
-            object_store,
+            storage,
             base_path,
             manifest_dataset,
             dir_listing_enabled,
@@ -1129,7 +1129,7 @@ impl ManifestNamespace {
         root: String,
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         manifest_dataset: DatasetConsistencyWrapper,
         dir_listing_enabled: bool,
@@ -1140,7 +1140,7 @@ impl ManifestNamespace {
             root,
             storage_options,
             session,
-            object_store,
+            storage,
             base_path,
             manifest_dataset,
             dir_listing_enabled,
@@ -2055,7 +2055,7 @@ impl ManifestNamespace {
     /// file) — otherwise it would orphan files a committed manifest still references.
     async fn cleanup_staged_manifest_files(
         &self,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         data_files: &HashSet<String>,
         index_uuids: &[Uuid],
     ) {
@@ -2066,7 +2066,7 @@ impl ManifestNamespace {
             .join(LANCE_DATA_DIR);
         for path in data_files {
             let data_path = data_dir.clone().join(path.as_str());
-            if let Err(err) = object_store.delete(&data_path).await {
+            if let Err(err) = storage.delete(&data_path).await {
                 log::warn!(
                     "Failed to clean up uncommitted manifest rewrite data file '{}': {}",
                     data_path,
@@ -2074,13 +2074,13 @@ impl ManifestNamespace {
                 );
             }
         }
-        self.cleanup_uncommitted_manifest_index_dirs(object_store, index_uuids.iter().copied())
+        self.cleanup_uncommitted_manifest_index_dirs(storage, index_uuids.iter().copied())
             .await;
     }
 
     async fn cleanup_uncommitted_manifest_index_dirs(
         &self,
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         index_uuids: impl IntoIterator<Item = Uuid>,
     ) {
         for index_uuid in index_uuids {
@@ -2090,7 +2090,7 @@ impl ManifestNamespace {
                 .join(MANIFEST_TABLE_NAME)
                 .join(LANCE_INDICES_DIR)
                 .join(index_uuid.to_string());
-            if let Err(err) = object_store.remove_dir_all(index_dir.clone()).await
+            if let Err(err) = storage.remove_dir_all(index_dir.clone()).await
                 && !matches!(err, LanceError::NotFound { .. })
             {
                 log::warn!(
@@ -2133,13 +2133,10 @@ impl ManifestNamespace {
         manifest.set_timestamp(timestamp_nanos);
         manifest.update_max_fragment_id();
 
-        // Commit through the dataset's own object store, not `self.object_store`: for
+        // Commit through the dataset's own object store, not `self.storage`: for
         // stores like `memory://` the namespace and the dataset can hold different
         // instances, and a commit written to the wrong one is invisible to reads.
-        let object_store = dataset
-            .object_store(None)
-            .await
-            .map_err(CommitError::from)?;
+        let storage = dataset.storage(None).await.map_err(CommitError::from)?;
         let base_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
         let naming_scheme = dataset.manifest_location().naming_scheme;
         let inline_transaction =
@@ -2149,7 +2146,7 @@ impl ManifestNamespace {
                 manifest,
                 indices,
                 &base_path,
-                &object_store,
+                &storage,
                 write_manifest_file_to_path,
                 naming_scheme,
                 Some(inline_transaction),
@@ -2248,7 +2245,7 @@ impl ManifestNamespace {
             ensure_writable(dataset.metadata())?;
             // Staged files, indices, the commit, and cleanup must all use the dataset's
             // own object store (see `commit_manifest_overwrite`).
-            let object_store = dataset.object_store(None).await?;
+            let storage = dataset.storage(None).await?;
 
             let source = Self::manifest_projected_stream(&dataset).await?;
             let resolution = make_mutation().conflict_resolution();
@@ -2306,7 +2303,7 @@ impl ManifestNamespace {
                 .collect::<HashSet<_>>();
 
             if !mutation.has_changes {
-                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                self.cleanup_staged_manifest_files(&storage, &staged_data_files, &[])
                     .await;
                 return Ok(mutation.result);
             }
@@ -2337,7 +2334,7 @@ impl ManifestNamespace {
                 &manifest,
                 &transaction.operation,
             ) {
-                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                self.cleanup_staged_manifest_files(&storage, &staged_data_files, &[])
                     .await;
                 return Err(err);
             }
@@ -2352,7 +2349,7 @@ impl ManifestNamespace {
                     Ok(indices) => Some(indices),
                     Err(err) => {
                         self.cleanup_staged_manifest_files(
-                            &object_store,
+                            &storage,
                             &staged_data_files,
                             &index_uuids,
                         )
@@ -2392,7 +2389,7 @@ impl ManifestNamespace {
                         return Ok(mutation.result);
                     }
                     self.cleanup_staged_manifest_files(
-                        &object_store,
+                        &storage,
                         &staged_data_files,
                         staged_index_uuids,
                     )
@@ -2559,7 +2556,7 @@ impl ManifestNamespace {
     }
 
     pub(crate) async fn path_has_actual_manifests(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         table_path: &Path,
     ) -> Result<bool> {
         let versions_path = table_path
@@ -2567,7 +2564,7 @@ impl ManifestNamespace {
             .join(lance_table::io::commit::VERSIONS_DIR);
         // `_versions/` should only contain manifest files, so probing the first entry is enough
         // to distinguish declared-only tables (empty `_versions/`) from created tables.
-        Ok(object_store
+        Ok(storage
             .list(Some(versions_path))
             .try_next()
             .await?
@@ -2586,9 +2583,9 @@ impl ManifestNamespace {
     /// such input. `Path::parse` preserves raw segment bytes, so escaped slashes and
     /// non-ASCII names stay literal.
     fn join_location(
-        base: &object_store::path::Path,
+        base: &lance_core::storage::path::Path,
         location: &str,
-    ) -> Result<object_store::path::Path> {
+    ) -> Result<lance_core::storage::path::Path> {
         let mut canonical = String::new();
         for segment in location.split('/') {
             if segment.is_empty() || segment == "." {
@@ -2611,14 +2608,14 @@ impl ManifestNamespace {
         if canonical.is_empty() {
             return Ok(base.clone());
         }
-        Ok(object_store::path::Path::parse(format!(
+        Ok(lance_core::storage::path::Path::parse(format!(
             "{base}/{canonical}"
         ))?)
     }
 
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
         let path = Self::join_location(&self.base_path, location)?;
-        Self::path_has_actual_manifests(&self.object_store, &path).await
+        Self::path_has_actual_manifests(&self.storage, &path).await
     }
 
     // Validate the recursive delete before removing the manifest row. Registrations
@@ -3652,7 +3649,7 @@ impl LanceNamespace for ManifestNamespace {
                 self.delete_from_manifest(&object_id).boxed().await?;
 
                 // Remove the table directory
-                self.object_store
+                self.storage
                     .remove_dir_all(table_path)
                     .boxed()
                     .await
@@ -4113,7 +4110,7 @@ impl LanceNamespace for ManifestNamespace {
         // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
         let reserved_file_path = table_path.clone().join(".lance-reserved");
         super::put_marker_file_atomic(
-            &self.object_store,
+            &self.storage,
             &reserved_file_path,
             &format!("table {}", table_name),
         )
@@ -4503,7 +4500,7 @@ mod tests {
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
     ) -> ManifestNamespace {
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             root,
             &ObjectStoreParams::default(),
@@ -4514,7 +4511,7 @@ mod tests {
             root.to_string(),
             None,
             None,
-            object_store,
+            storage,
             base_path,
             true,
             inline_optimization_enabled,
@@ -4669,7 +4666,7 @@ mod tests {
             .clone()
             .join(MANIFEST_TABLE_NAME)
             .join(LANCE_DATA_DIR);
-        let mut stream = manifest_ns.object_store.read_dir_all(&data_dir, None);
+        let mut stream = manifest_ns.storage.read_dir_all(&data_dir, None);
         let mut paths = HashSet::new();
         while let Some(meta) = stream.next().await.transpose().unwrap() {
             paths.insert(meta.location.to_string());
@@ -4683,7 +4680,7 @@ mod tests {
             .clone()
             .join(MANIFEST_TABLE_NAME)
             .join(LANCE_INDICES_DIR);
-        let mut stream = manifest_ns.object_store.read_dir_all(&index_dir, None);
+        let mut stream = manifest_ns.storage.read_dir_all(&index_dir, None);
         let mut paths = HashSet::new();
         while let Some(meta) = stream.next().await.transpose().unwrap() {
             paths.insert(meta.location.to_string());

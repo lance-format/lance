@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::backend::MultipartUpload;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::object_store::path::Path;
+use crate::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, StorageBackend,
+};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions,
-};
 use tokio::sync::RwLock;
 
 use crate::object_store::StorageOptionsAccessor;
@@ -118,13 +118,6 @@ impl DynamicOpenDalStore {
         });
         Ok(store)
     }
-
-    fn map_store_error(&self, error: lance_core::Error) -> object_store::Error {
-        object_store::Error::Generic {
-            store: "DynamicOpenDalStore",
-            source: Box::new(error),
-        }
-    }
 }
 
 impl fmt::Display for DynamicOpenDalStore {
@@ -134,16 +127,43 @@ impl fmt::Display for DynamicOpenDalStore {
 }
 
 #[async_trait::async_trait]
-impl OSObjectStore for DynamicOpenDalStore {
+impl StorageBackend for DynamicOpenDalStore {
+    async fn list_paginated(
+        &self,
+        _prefix: Option<&str>,
+        _options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        Err(crate::object_store::Error::NotSupported {
+            source: "OpenDAL pagination is unavailable".into(),
+        })
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, crate::object_store::Result<ObjectMeta>> {
+        let prefix = prefix.cloned();
+        let offset = offset.clone();
+        let this = self.clone();
+        stream::once(async move {
+            this.current_store()
+                .await
+                .map_err(crate::object_store::Error::from)
+        })
+        .map_ok(move |store| store.list_with_offset(prefix.as_ref(), &offset))
+        .try_flatten()
+        .boxed()
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
         payload: PutPayload,
         opts: PutOptions,
-    ) -> object_store::Result<PutResult> {
+    ) -> crate::object_store::Result<PutResult> {
         self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
+            .await?
             .put_opts(location, payload, opts)
             .await
     }
@@ -152,10 +172,9 @@ impl OSObjectStore for DynamicOpenDalStore {
         &self,
         location: &Path,
         opts: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> crate::object_store::Result<Box<dyn MultipartUpload>> {
         self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
+            .await?
             .put_multipart_opts(location, opts)
             .await
     }
@@ -164,10 +183,9 @@ impl OSObjectStore for DynamicOpenDalStore {
         &self,
         location: &Path,
         options: GetOptions,
-    ) -> object_store::Result<GetResult> {
+    ) -> crate::object_store::Result<GetResult> {
         self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
+            .await?
             .get_opts(location, options)
             .await
     }
@@ -176,48 +194,52 @@ impl OSObjectStore for DynamicOpenDalStore {
         &self,
         location: &Path,
         ranges: &[Range<u64>],
-    ) -> object_store::Result<Vec<Bytes>> {
+    ) -> crate::object_store::Result<Vec<Bytes>> {
         self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
+            .await?
             .get_ranges(location, ranges)
             .await
     }
 
     fn delete_stream(
         &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
+        locations: BoxStream<'static, crate::object_store::Result<Path>>,
+    ) -> BoxStream<'static, crate::object_store::Result<Path>> {
         let this = self.clone();
         stream::once(async move {
             let store = this
                 .current_store()
                 .await
-                .map_err(|e| this.map_store_error(e))?;
-            Ok::<_, object_store::Error>((store, locations))
+                .map_err(crate::object_store::Error::from)?;
+            Ok::<_, crate::object_store::Error>((store, locations))
         })
         .map_ok(|(store, locations)| store.delete_stream(locations))
         .try_flatten()
         .boxed()
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, crate::object_store::Result<ObjectMeta>> {
         let prefix = prefix.cloned();
         let this = self.clone();
         stream::once(async move {
             this.current_store()
                 .await
-                .map_err(|e| this.map_store_error(e))
+                .map_err(crate::object_store::Error::from)
         })
         .map_ok(move |store| store.list(prefix.as_ref()))
         .try_flatten()
         .boxed()
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> crate::object_store::Result<ListResult> {
         self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
+            .await?
             .list_with_delimiter(prefix)
             .await
     }
@@ -227,12 +249,8 @@ impl OSObjectStore for DynamicOpenDalStore {
         from: &Path,
         to: &Path,
         opts: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
-            .copy_opts(from, to, opts)
-            .await
+    ) -> crate::object_store::Result<()> {
+        self.current_store().await?.copy_opts(from, to, opts).await
     }
 
     async fn rename_opts(
@@ -240,10 +258,9 @@ impl OSObjectStore for DynamicOpenDalStore {
         from: &Path,
         to: &Path,
         opts: RenameOptions,
-    ) -> object_store::Result<()> {
+    ) -> crate::object_store::Result<()> {
         self.current_store()
-            .await
-            .map_err(|e| self.map_store_error(e))?
+            .await?
             .rename_opts(from, to, opts)
             .await
     }
@@ -258,7 +275,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use object_store::ObjectStoreExt as _;
+
     use opendal::{Operator, services::Memory};
 
     use super::*;
@@ -276,6 +293,25 @@ mod tests {
             operator,
             storage_options.client_max_retries(),
         )))
+    }
+
+    #[tokio::test]
+    async fn invalid_dynamic_configuration_keeps_core_io_boundary() {
+        let store = DynamicOpenDalStore::new(
+            "memory",
+            HashMap::new(),
+            Arc::new(StorageOptionsAccessor::with_static_options(HashMap::new())),
+            |_| Err(lance_core::Error::invalid_input("invalid endpoint")),
+            |_| panic!("invalid configuration must not build a backend"),
+        );
+        let error = (&store as &dyn StorageBackend)
+            .head(&Path::from("data"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::object_store::Error::Generic { .. }));
+        let error = lance_core::Error::from(error);
+        assert!(matches!(error, lance_core::Error::IO { .. }));
+        assert!(error.to_string().contains("invalid endpoint"));
     }
 
     #[tokio::test]
@@ -305,20 +341,24 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         let dynamic = Arc::new(store);
-        let (mut object_store, _) = ObjectStore::from_uri("memory://").await.unwrap();
-        let object_store_mut = Arc::get_mut(&mut object_store).unwrap();
-        object_store_mut.inner = dynamic.clone();
-        first
+        let (mut storage, _) = ObjectStore::from_uri("memory://").await.unwrap();
+        let storage_mut = Arc::get_mut(&mut storage).unwrap();
+        storage_mut.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| dynamic.clone(),
+        ));
+        (first.as_ref() as &dyn StorageBackend)
             .put(
                 &Path::from("dataset/file"),
                 Bytes::from_static(b"test").into(),
             )
             .await
             .unwrap();
-        object_store.remove_dir_all("dataset").await.unwrap();
+        storage.remove_dir_all("dataset").await.unwrap();
         assert!(matches!(
-            first.head(&Path::from("dataset/file")).await,
-            Err(object_store::Error::NotFound { .. })
+            (first.as_ref() as &dyn StorageBackend)
+                .head(&Path::from("dataset/file"))
+                .await,
+            Err(crate::object_store::Error::NotFound { .. })
         ));
     }
 

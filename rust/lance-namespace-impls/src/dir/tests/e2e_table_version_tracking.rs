@@ -382,14 +382,13 @@ async fn test_dataset_commit_with_external_manifest_store() {
     .await
     .unwrap();
 
-    // Verify version 2 was created using the dataset's object_store
+    // Verify version 2 was created using the dataset's storage
     // List manifests in the versions directory to find the V2 named manifest
     let manifest_metas: Vec<_> = dataset
-        .object_store(None)
+        .storage(None)
         .await
         .unwrap()
-        .inner
-        .list(Some(&dataset.versions_dir()))
+        .list(Some(dataset.versions_dir().clone()))
         .try_collect()
         .await
         .unwrap();

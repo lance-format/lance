@@ -16,11 +16,12 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::{StageParams, VectorIndexParams};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
-use lance_core::utils::testing::CountingObjectStore;
 use lance_index::IndexType;
 use lance_index::scalar::inverted::query::{FtsQuery, Operator};
 use lance_io::object_store::providers::local::FileStoreProvider;
+use lance_io::object_store::{Error as ObjectStoreError, PutOptions};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, uri_to_url};
+use lance_io::utils::testing::CountingBackend;
 use lance_linalg::distance::MetricType;
 use lance_namespace::error::{ErrorCode, NamespaceError};
 use lance_namespace::models::{
@@ -40,9 +41,6 @@ use lance_namespace::models::{
 };
 use lance_namespace::schema::convert_json_arrow_schema;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
-use object_store::{
-    Error as ObjectStoreError, ObjectStore as OSObjectStore, ObjectStoreExt, PutOptions,
-};
 use rstest::rstest;
 use url::Url;
 

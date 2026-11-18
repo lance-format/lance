@@ -232,7 +232,7 @@ impl MergeInsertJob {
         let patched = Arc::new(PatchSink::default());
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
-        let task_limit = dataset.object_store.as_ref().io_parallelism();
+        let task_limit = dataset.storage.as_ref().io_parallelism();
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
@@ -250,7 +250,7 @@ impl MergeInsertJob {
             tasks.shutdown().await;
             let written = new_fragments.lock().unwrap().clone();
             cleanup_data_fragments(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.base,
                 target_bases_info.as_deref(),
                 &written,
@@ -567,7 +567,7 @@ impl MergeInsertJob {
                 let (fragments, _) = write_fragments_internal(
                     write_version,
                     Some(dataset.as_ref()),
-                    dataset.object_store.clone(),
+                    dataset.storage.clone(),
                     &dataset.base,
                     write_schema,
                     stream,

@@ -55,6 +55,7 @@ use criterion::{Criterion, Throughput};
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID};
@@ -80,7 +81,6 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::scheduler::{bytes_read_counter, iops_counter};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::utils::CachedFileSize;
-use object_store::path::Path;
 
 const NUM_FLUSH_GROUPS: usize = 20;
 const NUM_PARTITIONS: usize = 4_096;
@@ -127,9 +127,9 @@ impl BaselineTwoFileShuffleReader {
         output_dir: Path,
         manifest: &TwoFileShuffleFixtureManifest,
     ) -> lance_core::Result<Arc<dyn ShuffleReader>> {
-        let object_store = Arc::new(ObjectStore::local());
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let storage = Arc::new(ObjectStore::local());
+        let scheduler_config = SchedulerConfig::max_bandwidth(&storage);
+        let scheduler = ScanScheduler::new(storage, scheduler_config);
 
         let data_path = output_dir.clone().join("shuffle_data.lance");
         let file_reader = FileReader::try_open(

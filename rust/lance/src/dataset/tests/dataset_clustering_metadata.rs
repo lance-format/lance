@@ -95,13 +95,13 @@ async fn commit_edited_manifest(
 ) -> Dataset {
     let mut manifest = dataset.manifest().clone();
     let mut indices =
-        read_manifest_indexes(&dataset.object_store, &dataset.manifest_location, &manifest)
+        read_manifest_indexes(&dataset.storage, &dataset.manifest_location, &manifest)
             .await
             .unwrap();
     edit(&mut manifest, &mut indices);
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         dataset.commit_handler.as_ref(),
         &dataset.base,
         &mut manifest,
@@ -414,7 +414,7 @@ async fn branch_and_shallow_clone_carry_definitions_and_metadata() {
 
 async fn named_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
     read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         dataset.manifest(),
     )
@@ -1745,7 +1745,7 @@ async fn a_prior_writers_index_list_cache_entry_is_not_consulted() {
         .insert_with_key(
             &PriorWriterIndexMetadataKey {
                 version: dataset.manifest().version,
-                store_identity: &dataset.object_store.store_prefix,
+                store_identity: dataset.storage.store_prefix(),
                 e_tag: dataset.manifest_location.e_tag.as_deref(),
             },
             Arc::new(stripped),

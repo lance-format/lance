@@ -4,8 +4,7 @@
 //! Paginated listing of a single directory level.
 //!
 //! [`ObjectStore::read_dir_page`] returns one page of the immediate children of a prefix, plus
-//! a token that resumes after it. Where the backend implements `object_store`'s paginated list
-//! API — S3, GCS and Azure do — the page size and the resume position are pushed into the list
+//! a token that resumes after it. Where the backend implements paginated listing — S3, GCS and Azure do — the page size and the resume position are pushed into the list
 //! request, so a caller that wants the first few children pays for the first few children
 //! rather than for the whole prefix. Everything else lists the level in full and pages
 //! locally, which is correct but costs what the whole directory costs.
@@ -15,24 +14,16 @@
 //! That is what lets a store without key-ordered listings, such as S3 Express, be paged at
 //! all — nothing outside this module compares one token to another.
 
-use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
-use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
-use tracing::instrument;
+use crate::object_store::PaginatedListOptions;
+use crate::object_store::PaginatedListResult;
+use crate::object_store::{ListResult, ObjectMeta, path::Path};
 
 use lance_core::{Error, Result};
 
 use super::ObjectStore;
 
-#[cfg(feature = "metrics")]
-use crate::object_store::metrics::{InFlightGuard, record_outcome};
-#[cfg(feature = "metrics")]
-use std::time::Instant;
-
 /// The path delimiter that separates directory levels.
 const DELIMITER: &str = "/";
-
-/// Operation label for the metrics and IO statistics a paginated listing records.
-const LIST_OP: &str = "list_paginated";
 
 /// Options for [`ObjectStore::read_dir_page`].
 #[derive(Debug, Clone, Default)]
@@ -100,53 +91,29 @@ impl ObjectStore {
                 "read_dir_page limit must be at least 1, got 0",
             ));
         }
-        match &self.paginated_lister {
-            Some(lister) => self.pushdown_page(lister.as_ref(), &dir, options).await,
-            // Goes through `inner`, so the wrappers around it instrument the request. The
-            // pushdown path talks to the backend directly and instruments itself.
-            None => full_listing_page(self.inner.as_ref(), &dir, options).await,
-        }
-    }
-
-    /// One page from the backend's own paginated list API.
-    ///
-    /// The pushdown path holds the backend directly, so its request never passes through the
-    /// wrappers around [`Self::inner`] that would otherwise record it, and it records itself.
-    #[instrument(level = "debug", skip_all, fields(dir = %dir))]
-    async fn pushdown_page(
-        &self,
-        lister: &dyn PaginatedListStore,
-        dir: &Path,
-        options: ReadDirOptions,
-    ) -> Result<PaginatedListResult> {
-        let prefix = list_prefix(dir);
-        self.io_tracker.record_read(LIST_OP, dir.clone(), 0, None);
-        #[cfg(feature = "metrics")]
-        let _in_flight = InFlightGuard::new(&self.store_prefix, LIST_OP);
-        #[cfg(feature = "metrics")]
-        let start = Instant::now();
-
-        let page = lister
+        let prefix = list_prefix(&dir);
+        match self
+            .inner
             .list_paginated(
                 prefix.as_deref(),
                 PaginatedListOptions {
                     delimiter: Some(DELIMITER.into()),
                     max_keys: options.limit,
-                    page_token: options.page_token,
-                    // `offset` is left unset: a continuation token is a position of its own,
-                    // and a caller-supplied key means something different on every store —
-                    // S3 excludes it, Azure includes it.
+                    page_token: options.page_token.clone(),
                     ..Default::default()
                 },
             )
-            .await;
-
-        #[cfg(feature = "metrics")]
-        record_outcome(&self.store_prefix, LIST_OP, start, 0, page.is_err());
-        let mut page = page?;
-
-        retain_children(&mut page.result, prefix.as_deref());
-        Ok(page)
+            .await
+        {
+            Ok(mut page) => {
+                retain_children(&mut page.result, prefix.as_deref());
+                Ok(page)
+            }
+            Err(super::Error::NotSupported { .. }) => {
+                full_listing_page(self.inner.as_ref(), &dir, options).await
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -166,7 +133,7 @@ fn list_prefix(dir: &Path) -> Option<String> {
 /// `list_with_delimiter` does not promise — a sort over children already in memory, costing no
 /// extra request.
 async fn full_listing_page(
-    store: &dyn OSObjectStore,
+    store: &dyn super::StorageBackend,
     dir: &Path,
     options: ReadDirOptions,
 ) -> Result<PaginatedListResult> {
@@ -275,10 +242,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+    use crate::object_store::ObjectStoreParams;
+    use crate::object_store::PutPayload;
     use chrono::Utc;
     use object_store::memory::InMemory;
-    use object_store::{ObjectStoreExt, PutPayload};
     use rstest::rstest;
 
     /// How the store under test resolves a listing.
@@ -311,13 +278,12 @@ mod tests {
         requests: Arc<Mutex<Vec<ListRequest>>>,
     }
 
-    #[async_trait::async_trait]
-    impl PaginatedListStore for FakeListStore {
-        async fn list_paginated(
+    impl FakeListStore {
+        fn list_paginated(
             &self,
             prefix: Option<&str>,
             opts: PaginatedListOptions,
-        ) -> object_store::Result<PaginatedListResult> {
+        ) -> crate::object_store::Result<PaginatedListResult> {
             self.requests.lock().unwrap().push(ListRequest {
                 prefix: prefix.map(String::from),
                 opts: opts.clone(),
@@ -437,10 +403,94 @@ mod tests {
         paged_test_store(backend, keys, usize::MAX).await
     }
 
+    #[rstest]
+    #[case::page("page")]
+    #[case::fallback("fallback")]
+    #[case::denied("denied")]
+    #[tokio::test]
+    async fn pagination_obeys_backend_wrapper(
+        #[case] mode: &'static str,
+        #[values(false, true)] apply_late: bool,
+    ) {
+        use crate::object_store::{BackendConfig, ObjectStoreParams, WrappingObjectStore};
+        use crate::testing::MockStorageBackend;
+        use crate::utils::testing::{TestObjectStoreProvider, TestWrappingObjectStore};
+        let mut wrapped = MockStorageBackend::new();
+        wrapped
+            .expect_list_paginated()
+            .times(1)
+            .returning(move |prefix, _| {
+                assert_eq!(prefix, Some("db/"));
+                match mode {
+                    "page" => Ok(PaginatedListResult {
+                        result: ListResult {
+                            common_prefixes: vec![Path::from("db/visible")],
+                            objects: vec![],
+                            extensions: Default::default(),
+                        },
+                        page_token: None,
+                    }),
+                    "fallback" => Err(crate::object_store::Error::NotSupported {
+                        source: "no pagination".into(),
+                    }),
+                    _ => Err(crate::object_store::Error::PermissionDenied {
+                        path: "db/".into(),
+                        source: "denied by policy".into(),
+                    }),
+                }
+            });
+        if mode == "fallback" {
+            wrapped
+                .expect_list_with_delimiter()
+                .times(1)
+                .returning(|_| {
+                    Ok(ListResult {
+                        common_prefixes: vec![Path::from("db/visible")],
+                        objects: vec![],
+                        extensions: Default::default(),
+                    })
+                });
+        }
+        let wrapped: Arc<dyn crate::object_store::StorageBackend> = Arc::new(wrapped);
+        let wrapper: Arc<dyn WrappingObjectStore> =
+            Arc::new(TestWrappingObjectStore::new(move |_| wrapped.clone()));
+        // Any access to the unwrapped backend panics: it must never serve a page or fallback.
+        let provider = TestObjectStoreProvider(BackendConfig::new(
+            Arc::new(MockStorageBackend::new()),
+            "test",
+        ));
+        let params = ObjectStoreParams {
+            backend_wrappers: if apply_late {
+                vec![]
+            } else {
+                vec![wrapper.clone()]
+            },
+            ..Default::default()
+        };
+        let mut storage = provider.build(url::Url::parse("test://bucket").unwrap(), &params);
+        if apply_late {
+            storage.apply_wrapper(wrapper.as_ref());
+        }
+        let result = storage.read_dir_page("db", Default::default()).await;
+        if mode == "denied" {
+            assert!(result.unwrap_err().to_string().contains("denied by policy"));
+        } else {
+            assert_eq!(
+                result.unwrap().result.common_prefixes,
+                vec![Path::from("db/visible")]
+            );
+            assert_eq!(
+                storage.io_stats_snapshot().read_iops,
+                u64::from(!apply_late)
+            );
+        }
+    }
+
     /// A store over `keys`, listing them in the order given. `page_bound` is the store's own
     /// cap on a page, which only the pushdown backend has.
     async fn paged_test_store(backend: Backend, keys: &[&str], page_bound: usize) -> TestStore {
-        let inner = Arc::new(InMemory::new());
+        let inner =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         for key in keys {
             // `Path::parse`, so that a key holding a character `Path::from` would encode is
             // stored under the name it was given.
@@ -449,32 +499,31 @@ mod tests {
                 .await
                 .unwrap();
         }
-        #[allow(deprecated)]
-        let params = ObjectStoreParams {
-            object_store: Some((inner, url::Url::parse("memory:///").unwrap())),
-            // Set because the deprecated hand-built path assumes nothing about the store it
-            // was given, and set conservatively: nothing on the `read_dir_page` path reads it,
-            // since the fallback sorts what it listed and the pushdown never compares keys.
-            list_is_lexically_ordered: Some(false),
-            ..Default::default()
-        };
-        let (store, _) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
-            "memory:///",
-            &params,
-        )
-        .await
-        .unwrap();
-        let mut store = Arc::try_unwrap(store).unwrap();
-
         let requests = Arc::new(Mutex::new(Vec::new()));
-        if backend == Pushdown {
-            store.paginated_lister = Some(Arc::new(FakeListStore {
+        let inner: Arc<dyn super::super::StorageBackend> = if backend == Pushdown {
+            let lister = FakeListStore {
                 keys: keys.iter().map(|key| key.to_string()).collect(),
                 page_bound,
                 requests: requests.clone(),
-            }));
-        }
+            };
+            let mut mock = crate::testing::MockStorageBackend::new();
+            mock.expect_list_paginated()
+                .returning(move |prefix, options| lister.list_paginated(prefix, options));
+            Arc::new(mock)
+        } else {
+            inner
+        };
+        let provider = crate::utils::testing::TestObjectStoreProvider(
+            crate::object_store::BackendConfig::new(inner, "memory"),
+        );
+        let (store, _) = ObjectStore::from_uri_and_params(
+            provider.registry(),
+            "memory:///",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let store = Arc::try_unwrap(store).unwrap();
         TestStore { store, requests }
     }
 
@@ -489,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_listing_page_preserves_response_extensions() {
-        let mut store = crate::testing::MockObjectStore::new();
+        let mut store = crate::testing::MockStorageBackend::new();
         store.expect_list_with_delimiter().once().returning(|_| {
             let mut extensions = object_store::Extensions::new();
             extensions.insert(String::from("listing-request-id"));
@@ -500,8 +549,9 @@ mod tests {
             })
         });
 
+        let store = std::sync::Arc::new(store);
         let page = full_listing_page(
-            &store,
+            store.as_ref(),
             &Path::from("db"),
             ReadDirOptions {
                 limit: Some(1),

@@ -33,8 +33,8 @@ mod test {
         },
     };
     use futures::future::join_all;
+    use lance_io::object_store::path::Path;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::{ObjectStoreExt, local::LocalFileSystem, path::Path};
 
     use crate::{
         Dataset,
@@ -326,21 +326,21 @@ mod test {
         }
 
         // manually simulate last version is out of sync
-        let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
         // Move version 6 to a temporary location, put that in the store.
         let base_path = Path::parse(ds_uri).unwrap();
         let version_six_staging_location = base_path
             .clone()
             .join(format!("6.manifest-{}", uuid::Uuid::new_v4()));
-        localfs
+        ds.storage
             .rename(
                 &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
                 &version_six_staging_location,
             )
             .await
             .unwrap();
-        let size = localfs
-            .head(&version_six_staging_location)
+        let size = ds
+            .storage
+            .stat(&version_six_staging_location)
             .await
             .unwrap()
             .size;

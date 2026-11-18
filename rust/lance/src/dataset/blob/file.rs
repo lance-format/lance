@@ -13,9 +13,9 @@ use std::{
 
 use bytes::Bytes;
 use futures::FutureExt;
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
-use object_store::path::Path;
 use tokio::sync::{Mutex, OnceCell, oneshot};
 
 use lance_core::datatypes::BlobKind;
@@ -31,7 +31,7 @@ use lance_core::{Error, Result};
 /// existing I/O scheduler.
 #[derive(Debug)]
 pub(super) struct BlobSource {
-    pub(super) object_store: Arc<ObjectStore>,
+    pub(super) storage: Arc<ObjectStore>,
     pub(super) path: Path,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
@@ -42,9 +42,9 @@ pub(super) struct BlobSource {
 
 impl BlobSource {
     /// Create a shared read context for one physical backing object.
-    pub(super) fn new(object_store: Arc<ObjectStore>, path: Path) -> Self {
+    pub(super) fn new(storage: Arc<ObjectStore>, path: Path) -> Self {
         Self {
-            object_store,
+            storage,
             path,
             scheduler: OnceCell::new(),
             pending_reads: Mutex::new(PendingBlobReads::default()),
@@ -67,10 +67,10 @@ impl BlobSource {
         let scheduler = self
             .scheduler
             .get_or_try_init(|| async {
-                let reader = self.object_store.open(&self.path).await?;
+                let reader = self.storage.open(&self.path).await?;
                 let scheduler = ScanScheduler::new(
-                    self.object_store.clone(),
-                    SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
+                    self.storage.clone(),
+                    SchedulerConfig::max_bandwidth(self.storage.as_ref()),
                 );
                 Ok::<_, Error>(scheduler.open_reader(reader.into()))
             })
@@ -239,7 +239,7 @@ impl BlobSourceKey {
     /// Build the cache key for one shared [`BlobSource`].
     pub(super) fn new(source: &BlobSource) -> Self {
         Self {
-            store_id: Arc::as_ptr(&source.object_store) as usize,
+            store_id: Arc::as_ptr(&source.storage) as usize,
             path: source.path.to_string(),
         }
     }
@@ -251,16 +251,16 @@ impl BlobSourceKey {
 /// single lazy-open scheduler and pending-read queue.
 pub(super) fn shared_blob_source(
     source_cache: &mut HashMap<BlobSourceKey, Arc<BlobSource>>,
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     path: &Path,
 ) -> Arc<BlobSource> {
     let key = BlobSourceKey {
-        store_id: Arc::as_ptr(&object_store) as usize,
+        store_id: Arc::as_ptr(&storage) as usize,
         path: path.to_string(),
     };
     source_cache
         .entry(key)
-        .or_insert_with(|| Arc::new(BlobSource::new(object_store, path.clone())))
+        .or_insert_with(|| Arc::new(BlobSource::new(storage, path.clone())))
         .clone()
 }
 
@@ -307,14 +307,9 @@ impl BlobFile {
     /// * `path` - Full path to the data file containing inline blob bytes.
     /// * `position` - Byte offset of the blob payload inside the data file.
     /// * `size` - Blob payload length in bytes.
-    pub fn new_inline(
-        object_store: Arc<ObjectStore>,
-        path: Path,
-        position: u64,
-        size: u64,
-    ) -> Self {
+    pub fn new_inline(storage: Arc<ObjectStore>, path: Path, position: u64, size: u64) -> Self {
         Self::with_source(
-            Arc::new(BlobSource::new(object_store, path)),
+            Arc::new(BlobSource::new(storage, path)),
             position,
             size,
             BlobKind::Inline,
@@ -332,9 +327,9 @@ impl BlobFile {
     /// * `object_store` - The store that owns `path`; reads are issued against this store.
     /// * `path` - Full path to the dedicated sidecar blob file.
     /// * `size` - Total byte length to expose from the sidecar file.
-    pub fn new_dedicated(object_store: Arc<ObjectStore>, path: Path, size: u64) -> Self {
+    pub fn new_dedicated(storage: Arc<ObjectStore>, path: Path, size: u64) -> Self {
         Self::with_source(
-            Arc::new(BlobSource::new(object_store, path)),
+            Arc::new(BlobSource::new(storage, path)),
             0,
             size,
             BlobKind::Dedicated,
@@ -353,14 +348,9 @@ impl BlobFile {
     /// * `path` - Full path to the packed sidecar blob file.
     /// * `position` - Start offset of this blob within the packed sidecar.
     /// * `size` - Blob payload length in bytes.
-    pub fn new_packed(
-        object_store: Arc<ObjectStore>,
-        path: Path,
-        position: u64,
-        size: u64,
-    ) -> Self {
+    pub fn new_packed(storage: Arc<ObjectStore>, path: Path, position: u64, size: u64) -> Self {
         Self::with_source(
-            Arc::new(BlobSource::new(object_store, path)),
+            Arc::new(BlobSource::new(storage, path)),
             position,
             size,
             BlobKind::Packed,
@@ -382,14 +372,14 @@ impl BlobFile {
     /// * `position` - Start offset of the blob payload in the external object.
     /// * `size` - Number of bytes exposed from `position`.
     pub fn new_external(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         path: Path,
         uri: String,
         position: u64,
         size: u64,
     ) -> Self {
         Self::with_source(
-            Arc::new(BlobSource::new(object_store, path)),
+            Arc::new(BlobSource::new(storage, path)),
             position,
             size,
             BlobKind::External,
@@ -762,13 +752,13 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use lance_core::datatypes::BlobKind;
+    use lance_core::storage::path::Path;
     use lance_core::{
         Error,
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
-    use object_store::path::Path;
     use rstest::rstest;
     use std::sync::{Arc, atomic::Ordering};
     use std::time::Duration;
@@ -1002,13 +992,10 @@ mod tests {
         blob.set_buffer_size(buffer_size).await.unwrap();
 
         blob.read_up_to(1024).await.unwrap();
-        let _ = dataset.object_store.io_stats_incremental();
+        let _ = dataset.storage.io_stats_incremental();
         let rest = blob.read().await.unwrap();
         assert_eq!(rest.as_ref(), &payload[1024..]);
-        assert_eq!(
-            dataset.object_store.io_stats_incremental().read_bytes,
-            fetched
-        );
+        assert_eq!(dataset.storage.io_stats_incremental().read_bytes, fetched);
         assert_eq!(blob.range_submission_count(), submissions);
         assert_eq!(blob.tell().await.unwrap(), payload.len() as u64);
     }

@@ -26,6 +26,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -34,7 +35,6 @@ use lance_index::scalar::{SargableQuery, ScalarIndex, bitmap::BitmapIndexPlugin}
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
-use object_store::path::Path;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 // Lazy static runtime - only created once

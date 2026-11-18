@@ -9,7 +9,7 @@ use std::sync::Arc;
 // TODO: Once we re-use this logic for S3, we can instead use tests against
 // Minio to validate the multipart upload logic.
 use lance_io::object_store::ObjectStore;
-use object_store::{ObjectStoreExt, path::Path};
+use lance_io::object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 async fn get_store() -> Arc<ObjectStore> {
@@ -33,7 +33,7 @@ async fn test_small_upload() {
     // Write an empty file.
     let mut writer = store.create(&path).await.unwrap();
     writer.shutdown().await.unwrap();
-    let meta = store.inner.head(&path).await.unwrap();
+    let meta = store.stat(&path).await.unwrap();
     assert_eq!(meta.size, 0);
     store.delete(&path).await.unwrap();
 
@@ -42,7 +42,7 @@ async fn test_small_upload() {
     writer.write_all(b"hello").await.unwrap();
     writer.write_all(b"world").await.unwrap();
     writer.shutdown().await.unwrap();
-    let meta = store.inner.head(&path).await.unwrap();
+    let meta = store.stat(&path).await.unwrap();
     assert_eq!(meta.size, 10);
     store.delete(&path).await.unwrap();
 }
@@ -86,10 +86,16 @@ async fn test_large_upload() {
     writer.flush().await.unwrap();
     writer.shutdown().await.unwrap();
 
-    let meta = store.inner.head(&path).await.unwrap();
+    let meta = store.stat(&path).await.unwrap();
     assert_eq!(meta.size, 52 * 1024 * 1024);
 
-    let data = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+    let data = store
+        .read_object(&path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
     assert_eq!(data.len(), 52 * 1024 * 1024);
     assert_eq!(data[0], b'a');
     assert_eq!(data[3 * 1024 * 1024], b'b');

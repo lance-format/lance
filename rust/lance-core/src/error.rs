@@ -193,7 +193,7 @@ pub enum Error {
     },
     #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
-        path: object_store::path::Path,
+        path: crate::storage::path::Path,
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
@@ -506,7 +506,7 @@ impl Error {
     }
 
     #[track_caller]
-    pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
+    pub fn corrupt_file(path: crate::storage::path::Path, message: impl Into<String>) -> Self {
         CorruptFileSnafu { path }.into_error(message.into().into())
     }
 
@@ -519,7 +519,7 @@ impl Error {
     /// use [`Self::corrupt_file`] instead.
     #[track_caller]
     pub fn corrupt_file_named(name: &str, message: impl Into<String>) -> Self {
-        Self::corrupt_file(object_store::path::Path::from(name), message)
+        Self::corrupt_file(crate::storage::path::Path::from(name), message)
     }
 
     #[track_caller]
@@ -874,10 +874,11 @@ fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool
     if let Some(error) = source.downcast_ref::<Error>() {
         return error.is_not_found();
     }
-    if let Some(error) = source.downcast_ref::<object_store::Error>() {
-        return matches!(error, object_store::Error::NotFound { .. })
+    if let Some(error) = source.downcast_ref::<crate::storage::Error>() {
+        return matches!(error, crate::storage::Error::NotFound { .. })
             || std::error::Error::source(error).is_some_and(error_source_is_not_found);
     }
+
     source.source().is_some_and(error_source_is_not_found)
 }
 
@@ -941,13 +942,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<object_store::Error> for Error {
+impl From<crate::storage::Error> for Error {
     #[track_caller]
-    fn from(e: object_store::Error) -> Self {
-        match e {
-            // source intentionally dropped; Error::NotFound carries only the path
-            object_store::Error::NotFound { path, .. } => Self::not_found(path),
-            other => Self::io_source(box_error(other)),
+    fn from(error: crate::storage::Error) -> Self {
+        match error {
+            crate::storage::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(Box::new(other)),
         }
     }
 }
@@ -980,9 +980,9 @@ impl From<tokio::task::JoinError> for Error {
     }
 }
 
-impl From<object_store::path::Error> for Error {
+impl From<crate::storage::path::Error> for Error {
     #[track_caller]
-    fn from(e: object_store::path::Error) -> Self {
+    fn from(e: crate::storage::path::Error) -> Self {
         Self::io_source(box_error(e))
     }
 }
@@ -1094,18 +1094,6 @@ impl From<datafusion_common::DataFusionError> for Error {
                 }
             }
             _ => Self::io_source(box_error(e)),
-        }
-    }
-}
-
-// This is a bit odd but some object_store functions only accept
-// Stream<Result<T, ObjectStoreError>> and so we need to convert
-// to ObjectStoreError to call the methods.
-impl From<Error> for object_store::Error {
-    fn from(err: Error) -> Self {
-        Self::Generic {
-            store: "N/A",
-            source: Box::new(err),
         }
     }
 }
@@ -1357,7 +1345,7 @@ mod test {
         // Taken by value while other clones live, a clone becomes `Error::Shared`;
         // is_not_found must still propagate through a downstream error chain.
         let downstream_error = Error::wrapped(Box::new(Error::io_source(Box::new(
-            object_store::Error::Generic {
+            crate::storage::Error::Generic {
                 store: "N/A",
                 source: Box::new(cloned.into_inner()),
             },
@@ -1381,7 +1369,7 @@ mod test {
         // make sure ? captures the correct location
         // .into() WILL NOT capture the correct location
         let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
-            Err(object_store::Error::Generic {
+            Err(crate::storage::Error::Generic {
                 store: "",
                 source: "".into(),
             })?;
@@ -1389,7 +1377,7 @@ mod test {
         });
         match f().unwrap_err() {
             Error::IO { location, .. } => {
-                // +4 is the beginning of object_store::Error::Generic...
+                // +4 is the beginning of crate::storage::Error::Generic...
                 assert_eq!(location.line(), current_fn.line() + 4, "{}", location)
             }
             #[allow(unreachable_patterns)]
@@ -1401,7 +1389,7 @@ mod test {
     fn test_caller_location_capture_not_found() {
         let current_fn = get_caller_location();
         let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
-            Err(object_store::Error::NotFound {
+            Err(crate::storage::Error::NotFound {
                 path: "some/path".to_string(),
                 source: "not found".into(),
             })?;
@@ -1409,7 +1397,7 @@ mod test {
         });
         match f().unwrap_err() {
             Error::NotFound { location, .. } => {
-                // +2 is the beginning of object_store::Error::NotFound...
+                // +2 is the beginning of crate::storage::Error::NotFound...
                 assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
             }
             #[allow(unreachable_patterns)]
@@ -1418,8 +1406,8 @@ mod test {
     }
 
     #[test]
-    fn test_object_store_not_found_converts_to_not_found() {
-        let os_err = object_store::Error::NotFound {
+    fn test_storage_not_found_converts_to_not_found() {
+        let os_err = crate::storage::Error::NotFound {
             path: "test/path".to_string(),
             source: "no such file".into(),
         };
@@ -1430,6 +1418,33 @@ mod test {
             }
             other => panic!("Expected NotFound, got {:?}", other),
         }
+    }
+
+    #[rstest::rstest]
+    #[case(crate::storage::Error::InvalidInput { source: "bad option".into() })]
+    #[case(crate::storage::Error::InvalidPath { source: "bad path".into() })]
+    #[case(crate::storage::Error::NotSupported { source: "unsupported operation".into() })]
+    fn test_storage_failures_keep_io_category(#[case] error: crate::storage::Error) {
+        let message = error.to_string();
+        let error = Error::from(error);
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(error.to_string().contains(&message));
+    }
+
+    #[rstest::rstest]
+    #[case(Error::not_found("missing object"))]
+    #[case(Error::invalid_input("invalid configuration"))]
+    #[case(Error::not_supported("unsupported configuration"))]
+    fn test_core_failures_cross_storage_as_generic_io(#[case] error: Error) {
+        let message = error.to_string();
+        let storage_error = crate::storage::Error::from(error);
+        assert!(matches!(
+            storage_error,
+            crate::storage::Error::Generic { .. }
+        ));
+        let error = Error::from(storage_error);
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains(&message));
     }
 
     #[derive(Debug)]

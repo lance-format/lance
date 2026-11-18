@@ -45,9 +45,9 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::testing::DelayConfig;
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
-use object_store::throttle::ThrottleConfig;
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, blob_field};
@@ -62,7 +62,7 @@ use crate::datatypes::Schema;
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::io::exec::filtered_read::FilteredReadThreadingMode;
-use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper};
+use crate::utils::test::{DatagenExt, DelayedStoreWrapper, FragmentCount, FragmentRowCount};
 use crate::{Error, Result};
 
 fn structural_list_test_values(kind: &str) -> ArrayRef {
@@ -496,8 +496,8 @@ async fn test_list_structure_omits_image_payload(
     let mut found = 0;
     let mut actual_layouts = BTreeSet::new();
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     for fragment in dataset.get_fragments() {
         for file in &fragment.metadata().files {
@@ -505,7 +505,7 @@ async fn test_list_structure_omits_image_payload(
                 .data_file_dir(file)
                 .unwrap()
                 .join(file.path.as_str());
-            let bytes = dataset.object_store.read_one_all(&path).await.unwrap();
+            let bytes = dataset.storage.read_one_all(&path).await.unwrap();
             let reader = FileReader::try_open(
                 scheduler
                     .open_file(&path, &file.file_size_bytes)
@@ -566,7 +566,7 @@ async fn test_list_structure_omits_image_payload(
         format!("array_length({column}, 1)"),
     ] {
         let dataset = Dataset::open(&dir).await.unwrap();
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         let lengths = dataset
             .scan()
             .project_with_transform(&[("length", expression.as_str())])
@@ -583,7 +583,7 @@ async fn test_list_structure_omits_image_payload(
                 .collect::<Vec<_>>(),
             vec![None, Some(0), Some(1), Some(1), Some(1), Some(2), Some(2)]
         );
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = dataset.storage.io_stats_incremental();
         assert!(stats.read_iops > 0);
         for request in &stats.requests {
             if let Some(payloads) = forbidden.get(&request.path) {
@@ -625,7 +625,7 @@ async fn test_list_structure_omits_image_payload(
         )
         .await
         .unwrap();
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     let count = dataset
         .count_rows(Some(format!(
             "id >= 2 AND {column} IS NOT NULL AND array_length({column}) > 0"
@@ -633,7 +633,7 @@ async fn test_list_structure_omits_image_payload(
         .await
         .unwrap();
     assert_eq!(count, 4);
-    for request in &dataset.object_store.io_stats_incremental().requests {
+    for request in &dataset.storage.io_stats_incremental().requests {
         if let (Some(payloads), Some(range)) = (forbidden.get(&request.path), &request.range) {
             assert!(
                 !payloads
@@ -1117,7 +1117,7 @@ async fn test_column_not_exist() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn test_local_object_store() {
+async fn test_local_storage() {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("i", DataType::Int32, true),
         ArrowField::new("s", DataType::Utf8, true),
@@ -1683,15 +1683,15 @@ async fn test_limit_cancel() {
     // reason.
 
     // Make the store slow so that if we don't cancel the scan, it will take a loooong time.
-    let throttled = Arc::new(ThrottledStoreWrapper {
-        config: ThrottleConfig {
+    let throttled = Arc::new(DelayedStoreWrapper {
+        config: DelayConfig {
             wait_get_per_call: Duration::from_millis(100),
             ..Default::default()
         },
     });
     let write_params = WriteParams {
         store_params: Some(ObjectStoreParams {
-            object_store_wrapper: Some(throttled.clone()),
+            backend_wrappers: vec![throttled.clone()],
             ..Default::default()
         }),
         max_rows_per_file: 1,

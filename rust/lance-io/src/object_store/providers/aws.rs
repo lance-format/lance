@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
+use crate::object_store::backend::native::from_error;
+use crate::object_store::transport::Transport;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(test)]
@@ -9,8 +12,6 @@ use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
 #[cfg(not(test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use object_store::ObjectStore as OSObjectStore;
-use object_store::list::PaginatedListStore;
 use opendal::{Operator, services::S3};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
@@ -23,7 +24,7 @@ use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
     StaticCredentialProvider,
     aws::{
-        AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
+        AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
         AwsCredentialProvider, S3CopyIfNotExists,
     },
 };
@@ -32,11 +33,11 @@ use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{
-        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        AimdThrottleState, cloud_http_connector, reject_http_client_wrapper_for_opendal,
         shared_throttle_state, with_throttling,
     },
 };
@@ -95,8 +96,7 @@ impl AwsStoreProvider {
         mut resolved_s3_options: ResolvedS3StorageOptions,
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
-        // Keep the concrete client for paginated listing alongside the copy adapter.
-    ) -> Result<(Arc<dyn OSObjectStore>, Arc<AmazonS3>)> {
+    ) -> Result<Arc<dyn crate::object_store::StorageBackend>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -114,7 +114,6 @@ impl AwsStoreProvider {
 
         let (aws_creds, region) = build_aws_credential(
             params.s3_credentials_refresh_offset,
-            params.aws_credentials.clone(),
             Some(&resolved_s3_options.options),
             region,
             accessor,
@@ -131,8 +130,7 @@ impl AwsStoreProvider {
 
         // Compute the metrics label before rewriting the URL below so it
         // matches the prefix the registry uses to key this store.
-        let store_prefix =
-            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+        let store_prefix = self.calculate_storage_prefix(base_path, Some(&storage_options.0))?;
         let metrics_base = crate::object_store::metrics_base(&store_prefix, base_path);
 
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
@@ -163,31 +161,29 @@ impl AwsStoreProvider {
         builder = builder.with_http_connector(cloud_http_connector(
             throttle_state,
             metrics_base,
-            Transport::new(params.http_connector.as_ref()),
+            Transport::new(params.http_client_wrapper.as_ref()),
         ));
 
         let use_multipart_copy = builder
             .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
             .is_some_and(|mode| mode.trim() == "multipart");
-        let store = Arc::new(builder.clone().build()?);
-        let inner: Arc<dyn OSObjectStore> = if use_multipart_copy {
-            Arc::new(ConditionalS3Store::new(
-                store.clone(),
-                builder,
-                client_options,
-            )?)
+        let store = Arc::new(builder.clone().build().map_err(from_error)?);
+        let inner: Arc<dyn crate::object_store::StorageBackend> = if use_multipart_copy {
+            Arc::new(ConditionalS3Store::new(store, builder, client_options)?)
         } else {
-            store.clone()
+            crate::object_store::backend::native::from_object_store_with_pagination(
+                store.clone(),
+                store,
+            )
         };
-        Ok((inner, store))
+        Ok(inner)
     }
 
     async fn build_opendal_s3_store(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-        aws_credentials: Option<&AwsCredentialProvider>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<dyn crate::object_store::StorageBackend>> {
         let bucket = base_path
             .host_str()
             .ok_or_else(|| Error::invalid_input("S3 URL must contain bucket name"))?
@@ -206,16 +202,6 @@ impl AwsStoreProvider {
             )));
         }
 
-        // The provider reaches the native store through the params, which this
-        // arm does not pass on, so a request here would be signed with whatever
-        // credentials OpenDAL resolves for itself instead.
-        if aws_credentials.is_some() {
-            return Result::Err(Error::not_supported(
-                "OpendalStore does not currently support an explicit aws_credentials provider"
-                    .to_string(),
-            ));
-        }
-
         // Set required OpenDAL configuration
         config_map.insert("bucket".to_string(), bucket);
 
@@ -227,22 +213,21 @@ impl AwsStoreProvider {
             .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
         let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn crate::object_store::StorageBackend>)
     }
 }
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for AwsStoreProvider {
-    async fn new_store(
+    async fn new_backend(
         &self,
         mut base_path: Url,
         params: &ObjectStoreParams,
-    ) -> Result<ObjectStore> {
+    ) -> Result<BackendConfig> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
             StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         storage_options.with_env_s3();
-        let download_retry_count = storage_options.download_retry_count();
 
         let use_opendal = storage_options
             .0
@@ -265,59 +250,46 @@ impl ObjectStoreProvider for AwsStoreProvider {
             resolved_s3_options.requires_constant_size_upload_parts();
 
         // Keyed like the registry cache so per-dataset stores share the bucket's budget.
-        let store_prefix =
-            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let store_prefix = self.calculate_storage_prefix(&base_path, params.storage_options())?;
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
-        let (inner, paginated_lister) = if use_opendal {
-            reject_http_connector_for_opendal(params)?;
+        let inner = if use_opendal {
+            reject_http_client_wrapper_for_opendal(params)?;
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
-            (
-                self.build_opendal_s3_store(
-                    &base_path,
-                    &storage_options,
-                    params.aws_credentials.as_ref(),
-                )
-                .await?,
-                None,
-            )
+            self.build_opendal_s3_store(&base_path, &storage_options)
+                .await?
         } else {
             // Use default Amazon S3 implementation
-            let (inner, store) = self
-                .build_amazon_s3_store(
-                    &mut base_path,
-                    params,
-                    &storage_options,
-                    resolved_s3_options,
-                    is_s3_express,
-                    throttle_state.as_ref(),
-                )
-                .await?;
-            (inner, Some(store as Arc<dyn PaginatedListStore>))
+            self.build_amazon_s3_store(
+                &mut base_path,
+                params,
+                &storage_options,
+                resolved_s3_options,
+                is_s3_express,
+                throttle_state.as_ref(),
+            )
+            .await?
         };
-        let (inner, paginated_lister) =
-            with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
+        let inner = with_throttling(throttle_state, !use_opendal, inner);
 
-        Ok(ObjectStore {
-            inner,
-            external_blob_inner: None,
-            direct_local_io: false,
-            _external_blob_origin: None,
+        Ok(BackendConfig {
+            store_prefix: Some(
+                self.calculate_storage_prefix(&base_path, params.storage_options())?,
+            ),
+            backend: inner,
             local_dir_operations: None,
             local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::object_store::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: Some(5 * 1024 * 1024 * 1024),
             scheme: String::from(base_path.scheme()),
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count,
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
-            paginated_lister,
         })
     }
 }
@@ -368,8 +340,9 @@ async fn resolve_s3_region(
             }
         }
 
-        let bucket_region =
-            object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
+        let bucket_region = object_store::aws::resolve_bucket_region(bucket, &client_options)
+            .await
+            .map_err(from_error)?;
         Ok(Some(bucket_region))
     } else {
         Ok(resolved_s3_options.profile_region.clone())
@@ -398,16 +371,15 @@ pub enum AwsProviderScheme {
 /// Build AWS credentials
 ///
 /// This resolves credentials from the following sources in order:
-/// 1. An explicit `credentials` provider
-/// 2. An explicit `storage_options_accessor` with a provider
-/// 3. If `provider_scheme` is set:
+/// 1. An explicit `storage_options_accessor` with a provider
+/// 2. If `provider_scheme` is set:
 ///    - [`AwsProviderScheme::Token`]: static access-key credentials (error if absent)
 ///    - [`AwsProviderScheme::Ecs`]: ECS container credential provider
 ///    - [`AwsProviderScheme::Irsa`]: web identity token (IRSA) provider
-/// 4. Static access-key credentials from `storage_options`, if present
-/// 5. The default AWS credential provider chain
+/// 3. Static access-key credentials from `storage_options`, if present
+/// 4. The default AWS credential provider chain
 ///
-/// # Storage Options Accessor
+/// # ObjectStore Options Accessor
 ///
 /// When `storage_options_accessor` is provided and has a dynamic provider,
 /// credentials are fetched and cached by the accessor with automatic refresh
@@ -416,7 +388,6 @@ pub enum AwsProviderScheme {
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
 pub async fn build_aws_credential(
     credentials_refresh_offset: Duration,
-    credentials: Option<AwsCredentialProvider>,
     storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
     region: Option<String>,
     storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
@@ -436,12 +407,6 @@ pub async fn build_aws_credential(
             .unwrap_or(DEFAULT_REGION.to_string())
     };
 
-    // If the user supplied their own credential provider that takes top priority
-    if let Some(creds) = credentials {
-        return Ok((creds, region));
-    }
-
-    // Otherwise, if the user provided a storage_options_accessor, try and use that
     if let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
         storage_options_accessor.clone(),
     )
@@ -457,7 +422,7 @@ pub async fn build_aws_credential(
         .is_some_and(|a| a.has_provider())
     {
         log::debug!(
-            "Storage options from provider do not contain explicit AWS credentials, \
+            "ObjectStore options from provider do not contain explicit AWS credentials, \
              falling back to default AWS credentials chain."
         );
     }
@@ -653,12 +618,12 @@ impl AwsCredentialAdapter {
     }
 
     async fn do_refresh(&self) -> ObjectStoreResult<Arc<aws_credential_types::Credentials>> {
-        let credentials = Arc::new(
-            self.inner
-                .provide_credentials()
-                .await
-                .map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
-        );
+        let credentials = Arc::new(self.inner.provide_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
+                store: "AWS credentials",
+                source: format!("Failed to get AWS credentials: {e:?}").into(),
+            }
+        })?);
         *self.credentials.write().await = Some(credentials.clone());
         Ok(credentials)
     }
@@ -713,25 +678,6 @@ impl StorageOptions {
     }
 }
 
-impl ObjectStoreParams {
-    /// Create a new instance of [`ObjectStoreParams`] based on the AWS credentials.
-    pub fn with_aws_credentials(
-        aws_credentials: Option<AwsCredentialProvider>,
-        region: Option<String>,
-    ) -> Self {
-        let storage_options_accessor = region.map(|region| {
-            let opts: HashMap<String, String> =
-                [("region".into(), region)].iter().cloned().collect();
-            Arc::new(StorageOptionsAccessor::with_static_options(opts))
-        });
-        Self {
-            aws_credentials,
-            storage_options_accessor,
-            ..Default::default()
-        }
-    }
-}
-
 pub type DynamicStorageOptionsCredentialProvider =
     NamespaceCredentialsProvider<ObjectStoreAwsCredential>;
 
@@ -742,12 +688,12 @@ mod tests {
     #[allow(deprecated)]
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_credential_types::provider::error::CredentialsError;
+    use lance_core::storage::path::Path;
     use mock_instant::thread_local::MockClock;
-    use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
-    use crate::object_store::test_utils::RecordingConnector;
+    use crate::object_store::test_utils::RecordingHttpClientWrapper;
 
     #[rstest::rstest]
     #[case::canonical("aws_region", "region")]
@@ -776,25 +722,6 @@ mod tests {
                 options.as_s3_options(),
                 HashMap::from([(AmazonS3ConfigKey::Region, preferred_value.to_string())])
             );
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct MockAwsCredentialsProvider {
-        called: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl CredentialProvider for MockAwsCredentialsProvider {
-        type Credential = ObjectStoreAwsCredential;
-
-        async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
-            self.called.store(true, Ordering::Relaxed);
-            Ok(Arc::new(Self::Credential {
-                key_id: "".to_string(),
-                secret_key: "".to_string(),
-                token: None,
-            }))
         }
     }
 
@@ -836,14 +763,9 @@ mod tests {
         );
 
         let error = provider.get_credential().await.unwrap_err();
-        let object_store::Error::Generic { source, .. } = &error else {
-            panic!("expected a generic object store error, got {error}");
-        };
-        assert!(matches!(
-            source.downcast_ref::<Error>(),
-            Some(Error::IO { .. })
-        ));
-
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        let error = Error::from(from_error(error));
+        assert!(matches!(error, Error::IO { .. }));
         let message = error.to_string();
         assert!(message.contains("Failed to get AWS credentials"));
         assert!(message.contains("Glue credential endpoint unavailable"));
@@ -957,35 +879,6 @@ mod tests {
         assert_eq!(first.unwrap().key_id, "key-2");
         assert_eq!(second.unwrap().key_id, "key-2");
         assert_eq!(inner.calls.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn test_injected_aws_creds_option_is_used() {
-        let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
-        let registry = Arc::new(ObjectStoreRegistry::default());
-
-        let params = ObjectStoreParams {
-            aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
-            ..ObjectStoreParams::default()
-        };
-
-        // Not called yet
-        assert!(!mock_provider.called.load(Ordering::Relaxed));
-
-        let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
-            .await
-            .unwrap();
-
-        // fails, but we don't care
-        let _ = store
-            .open(&Path::parse("/").unwrap())
-            .await
-            .unwrap()
-            .get_range(0..1)
-            .await;
-
-        // Not called yet
-        assert!(mock_provider.called.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -1124,9 +1017,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ddb_binding_prefix_uses_resolved_s3_scheme() {
+        let prefixes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[derive(Debug)]
+        struct PrefixObserver(Arc<std::sync::Mutex<Vec<String>>>);
+        impl crate::object_store::WrappingObjectStore for PrefixObserver {
+            fn wrap(
+                &self,
+                prefix: &str,
+                backend: Arc<dyn crate::object_store::StorageBackend>,
+            ) -> Arc<dyn crate::object_store::StorageBackend> {
+                self.0.lock().unwrap().push(prefix.to_owned());
+                backend
+            }
+        }
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("region".to_owned(), "eu-west-1".to_owned()),
+                    ("aws_access_key_id".to_owned(), "test".to_owned()),
+                    ("aws_secret_access_key".to_owned(), "test".to_owned()),
+                ]),
+            ))),
+            backend_wrappers: vec![Arc::new(PrefixObserver(prefixes.clone()))],
+            ..Default::default()
+        };
+        let registry = Arc::new(crate::object_store::ObjectStoreRegistry::default());
+        let (store, _) = crate::object_store::ObjectStore::from_uri_and_params(
+            registry.clone(),
+            "s3+ddb://bucket/data?ddbTableName=commits",
+            &params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.store_prefix(), "s3$bucket");
+        assert_eq!(*prefixes.lock().unwrap(), vec!["s3$bucket"]);
+        let (same, _) = crate::object_store::ObjectStore::from_uri_and_params(
+            registry.clone(),
+            "s3+ddb://bucket/data?ddbTableName=commits",
+            &params,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&store, &same));
+        let (plain, _) = crate::object_store::ObjectStore::from_uri_and_params(
+            registry,
+            "s3://bucket/data",
+            &params,
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&store, &plain));
+    }
+
+    #[tokio::test]
     async fn test_use_opendal_flag() {
         use crate::object_store::StorageOptionsAccessor;
-        let provider = AwsStoreProvider;
         let url = Url::parse("s3://test-bucket/path").unwrap();
         let params_with_flag = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
@@ -1138,46 +1084,44 @@ mod tests {
             ..Default::default()
         };
 
-        let store = provider
+        let store = crate::object_store::ObjectStoreRegistry::default()
             .new_store(url.clone(), &params_with_flag)
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
     }
 
-    /// A credential provider handed to the OpenDAL arm would be dropped, and
-    /// the requests signed from the environment instead.
     #[tokio::test]
-    async fn test_use_opendal_rejects_an_explicit_credential_provider() {
+    async fn test_use_opendal_uses_initial_dynamic_options() {
         use crate::object_store::StorageOptionsAccessor;
-        let provider = AwsStoreProvider;
         let url = Url::parse("s3://test-bucket/path").unwrap();
+        let provider = Arc::new(MockStorageOptionsProvider::new(Some(600_000)));
         let params = ObjectStoreParams {
-            aws_credentials: Some(
-                Arc::new(MockAwsCredentialsProvider::default()) as AwsCredentialProvider
-            ),
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([
-                    ("use_opendal".to_string(), "true".to_string()),
-                    ("region".to_string(), "us-west-2".to_string()),
-                ]),
-            ))),
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    HashMap::from([
+                        ("use_opendal".to_string(), "true".to_string()),
+                        ("region".to_string(), "us-west-2".to_string()),
+                    ]),
+                    provider.clone(),
+                ),
+            )),
             ..Default::default()
         };
 
-        let err = provider.new_store(url, &params).await.unwrap_err();
-        assert!(
-            matches!(err, Error::NotSupported { .. }),
-            "got: {err:?}, expected NotSupported"
-        );
-        assert!(err.to_string().contains("aws_credentials"), "got: {err}");
+        let store = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme(), "s3");
+        assert_eq!(provider.get_call_count().await, 0);
     }
 
     /// OpenDAL opens its own clients, so a connector handed to it would be dropped.
     #[tokio::test]
-    async fn test_use_opendal_rejects_an_explicit_http_connector() {
+    async fn test_use_opendal_rejects_an_http_client_wrapper() {
         let params = ObjectStoreParams {
-            http_connector: Some(Arc::new(RecordingConnector::default())),
+            http_client_wrapper: Some(Arc::new(RecordingHttpClientWrapper::default())),
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("use_opendal".to_string(), "true".to_string()),
@@ -1188,12 +1132,18 @@ mod tests {
         };
 
         let url = Url::parse("s3://test-bucket/path").unwrap();
-        let err = AwsStoreProvider.new_store(url, &params).await.unwrap_err();
+        let err = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, Error::NotSupported { .. }),
             "got: {err:?}, expected NotSupported"
         );
-        assert!(err.to_string().contains("http_connector"), "got: {err}");
+        assert!(
+            err.to_string().contains("http_client_wrapper"),
+            "got: {err}"
+        );
     }
 
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back
@@ -1207,56 +1157,123 @@ mod tests {
         #[case] use_opendal: &str,
         #[case] paginated: bool,
     ) {
-        let provider = AwsStoreProvider;
         // Express bucket names carry their availability zone, which the S3 client validates.
         let url = Url::parse("s3://test-bucket--use1-az4--x-s3/path").unwrap();
+        let transport =
+            Arc::new(crate::object_store::test_utils::RecordingHttpClientWrapper::default());
         let params = ObjectStoreParams {
+            http_client_wrapper: paginated.then(|| {
+                transport.clone() as Arc<dyn crate::object_store::transport::HttpClientWrapper>
+            }),
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("use_opendal".to_string(), use_opendal.to_string()),
+                    ("skip_signature".to_string(), "true".to_string()),
                     ("region".to_string(), "us-east-1".to_string()),
                 ]),
             ))),
             ..Default::default()
         };
 
-        let store = provider.new_store(url, &params).await.unwrap();
+        let store = crate::object_store::ObjectStoreRegistry::default()
+            .new_store(url, &params)
+            .await
+            .unwrap();
 
         assert!(!store.list_is_lexically_ordered);
-        assert_eq!(store.paginated_lister.is_some(), paginated);
+        let error = store
+            .inner
+            .list_paginated(None, Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            !matches!(error, crate::object_store::Error::NotSupported { .. }),
+            paginated
+        );
+        if paginated {
+            assert!(!transport.requests.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn test_s3_store_opens_its_clients_with_the_given_http_connector() {
-        let connector = Arc::new(RecordingConnector::default());
+    async fn test_s3_client_wrapper_observes_refreshed_credentials() {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let wrapper = Arc::new(RecordingHttpClientWrapper::default());
+        let credentials = Arc::new(MockStorageOptionsProvider::new(Some(600_000)));
+        let initial = HashMap::from([
+            ("region".to_string(), "us-west-2".to_string()),
+            ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
+            ("allow_http".to_string(), "true".to_string()),
+            ("refresh_offset_millis".to_string(), "300000".to_string()),
+        ]);
         let params = ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([
-                    ("region".to_string(), "us-east-1".to_string()),
-                    ("aws_access_key_id".to_string(), "key".to_string()),
-                    ("aws_secret_access_key".to_string(), "secret".to_string()),
-                    ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
-                    ("allow_http".to_string(), "true".to_string()),
-                ]),
-            ))),
-            http_connector: Some(connector.clone()),
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    initial.clone(),
+                    credentials.clone(),
+                ),
+            )),
+            http_client_wrapper: Some(wrapper.clone()),
             ..Default::default()
         };
-        assert_ne!(params, ObjectStoreParams::default());
-
+        let registry = ObjectStoreRegistry::default();
         let url = Url::parse("s3://bucket/path").unwrap();
-        let store = AwsStoreProvider.new_store(url, &params).await.unwrap();
-        let found =
-            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("path/file")).await;
+        let store = registry.get_store(url.clone(), &params).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &store,
+            &registry
+                .get_store(url.clone(), &params.clone())
+                .await
+                .unwrap()
+        ));
 
+        // Distinct credential identities cannot reuse a configured store.
+        let other_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    initial,
+                    Arc::new(MockStorageOptionsProvider::new(Some(600_000))),
+                ),
+            )),
+            ..params.clone()
+        };
+        assert_ne!(params, other_params);
+        assert!(!Arc::ptr_eq(
+            &store,
+            &registry.get_store(url, &other_params).await.unwrap()
+        ));
+
+        for _ in 0..2 {
+            let result = store.stat(&Path::from("path/file")).await;
+            assert!(
+                matches!(result, Err(crate::object_store::Error::NotFound { .. })),
+                "{result:?}"
+            );
+            MockClock::advance_system_time(Duration::from_secs(360));
+        }
+        assert_eq!(credentials.get_call_count().await, 2);
+        assert!(wrapper.clients.load(Ordering::SeqCst) >= 1);
+        let requests = wrapper.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
         assert!(
-            matches!(found, Err(object_store::Error::NotFound { .. })),
-            "{found:?}"
+            requests
+                .iter()
+                .all(|uri| uri.ends_with("/bucket/path/file")),
+            "{requests:?}"
         );
-        assert!(connector.connects.load(Ordering::SeqCst) >= 1);
-        let requests = connector.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1, "{requests:?}");
-        assert!(requests[0].ends_with("/bucket/path/file"), "{requests:?}");
+        let headers = wrapper.headers.lock().unwrap();
+        for (index, headers) in headers.iter().enumerate() {
+            assert!(
+                headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains(&format!("Credential=AKID_{}", index + 1))
+            );
+            assert_eq!(
+                headers["x-amz-security-token"],
+                format!("TOKEN_{}", index + 1)
+            );
+        }
     }
 
     #[derive(Debug)]
@@ -1652,51 +1669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_explicit_aws_credentials_takes_precedence_over_accessor() {
-        // Create a mock storage options provider that should NOT be called
-        let mock_storage_provider = Arc::new(MockStorageOptionsProvider::new(Some(600_000)));
-
-        // Create an accessor with the mock provider
-        let accessor = Arc::new(StorageOptionsAccessor::with_provider(
-            mock_storage_provider.clone(),
-        ));
-
-        // Create an explicit AWS credentials provider
-        let explicit_cred_provider = Arc::new(MockAwsCredentialsProvider::default());
-
-        // Build credentials with both aws_credentials AND accessor
-        // The explicit aws_credentials should take precedence
-        let (result, _region) = build_aws_credential(
-            Duration::from_secs(300),
-            Some(explicit_cred_provider.clone() as AwsCredentialProvider),
-            None, // no storage_options
-            Some("us-west-2".to_string()),
-            Some(accessor),
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Get credential from the result
-        let cred = result.get_credential().await.unwrap();
-
-        // The explicit provider should have been called (it returns empty strings)
-        assert!(explicit_cred_provider.called.load(Ordering::Relaxed));
-
-        // The storage options provider should NOT have been called
-        assert_eq!(
-            mock_storage_provider.get_call_count().await,
-            0,
-            "Storage options provider should not be called when explicit aws_credentials is provided"
-        );
-
-        // Verify we got credentials from the explicit provider (empty strings)
-        assert_eq!(cred.key_id, "");
-        assert_eq!(cred.secret_key, "");
-    }
-
-    #[tokio::test]
-    async fn test_accessor_used_when_no_explicit_aws_credentials() {
+    async fn test_accessor_credentials_refresh() {
         MockClock::set_system_time(Duration::from_secs(100_000));
 
         let now_ms = MockClock::system_time().as_millis() as u64;
@@ -1729,10 +1702,9 @@ mod tests {
             mock_storage_provider.clone(),
         ));
 
-        // Build credentials with accessor but NO explicit aws_credentials
+        // Build credentials from the initial options and refresh through the provider.
         let (result, _region) = build_aws_credential(
             Duration::from_secs(300),
-            None, // no explicit aws_credentials
             None, // no storage_options
             Some("us-west-2".to_string()),
             Some(accessor),
@@ -1746,7 +1718,7 @@ mod tests {
         assert_eq!(cred.key_id, "AKID_FROM_ACCESSOR");
         assert_eq!(cred.secret_key, "SECRET_FROM_ACCESSOR");
 
-        // Storage options provider should NOT have been called yet (using cached initial creds)
+        // ObjectStore options provider should NOT have been called yet (using cached initial creds)
         assert_eq!(mock_storage_provider.get_call_count().await, 0);
 
         // Advance time to trigger refresh (past the 5 minute refresh offset)
@@ -1757,7 +1729,7 @@ mod tests {
         assert_eq!(cred.key_id, "AKID_1");
         assert_eq!(cred.secret_key, "SECRET_1");
 
-        // Storage options provider should have been called once
+        // ObjectStore options provider should have been called once
         assert_eq!(mock_storage_provider.get_call_count().await, 1);
     }
 
@@ -1771,7 +1743,6 @@ mod tests {
 
         let (provider, _) = build_aws_credential(
             Duration::from_secs(300),
-            None,
             Some(&opts),
             Some("us-east-1".to_string()),
             None,
@@ -1792,7 +1763,6 @@ mod tests {
 
         let result = build_aws_credential(
             Duration::from_secs(300),
-            None,
             Some(&opts),
             Some("us-east-1".to_string()),
             None,
@@ -1817,7 +1787,6 @@ mod tests {
 
         let result = build_aws_credential(
             Duration::from_secs(300),
-            None,
             Some(&opts),
             Some("us-east-1".to_string()),
             None,
@@ -1836,7 +1805,6 @@ mod tests {
 
         let (provider, _) = build_aws_credential(
             Duration::from_secs(300),
-            None,
             Some(&opts),
             Some("us-east-1".to_string()),
             None,
@@ -1873,7 +1841,6 @@ mod tests {
 
         let result = build_aws_credential(
             Duration::from_secs(300),
-            None,
             Some(&opts),
             Some("us-east-1".to_string()),
             None,

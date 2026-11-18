@@ -2540,9 +2540,9 @@ mod tests {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
         let spill_files = builder.train(data).await.unwrap();
         let tmpdir = TempDir::default();
-        let object_store = Arc::new(ObjectStore::local());
+        let storage = Arc::new(ObjectStore::local());
         let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
+            storage.clone(),
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
@@ -2556,9 +2556,9 @@ mod tests {
         let num_lists = index.tokens.len();
         assert_eq!(num_lists, values.len());
 
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         index.prewarm().await.unwrap();
-        let prewarm_iops = object_store.io_stats_incremental().read_iops;
+        let prewarm_iops = storage.io_stats_incremental().read_iops;
         assert!(
             prewarm_iops < num_lists as u64 / 4,
             "prewarm issued {prewarm_iops} requests for {num_lists} posting lists"

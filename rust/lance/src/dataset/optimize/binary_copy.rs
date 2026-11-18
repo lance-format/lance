@@ -32,7 +32,7 @@ async fn init_writer_if_necessary(
     if current_writer.is_none() {
         let filename = format!("{}.lance", generate_random_filename());
         let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
-        let object_writer = dataset.object_store.create(&path).await?;
+        let object_writer = dataset.storage.create(&path).await?;
         *current_writer = Some(file_versions::create_lazy_writer(
             version,
             object_writer,
@@ -181,16 +181,14 @@ pub async fn rewrite_files_binary_copy(
     // Visit each fragment and all of its data files (a fragment may contain multiple files)
     for frag in fragments.iter() {
         for df in frag.files.iter() {
-            let object_store = if let Some(base_id) = df.base_id {
-                dataset.object_store(Some(base_id)).await?
+            let storage = if let Some(base_id) = df.base_id {
+                dataset.storage(Some(base_id)).await?
             } else {
-                dataset.object_store.clone()
+                dataset.storage.clone()
             };
             let full_path = dataset.data_file_dir(df)?.clone().join(df.path.as_str());
-            let scan_scheduler = ScanScheduler::new(
-                object_store.clone(),
-                SchedulerConfig::max_bandwidth(&object_store),
-            );
+            let scan_scheduler =
+                ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
             let file_scheduler = scan_scheduler
                 .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
                 .await?;

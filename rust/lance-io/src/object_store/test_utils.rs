@@ -27,42 +27,54 @@ impl StorageOptionsProvider for StaticMockStorageOptionsProvider {
 /// Answers every request with 404 and records what reached it.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 #[derive(Debug, Default)]
-pub struct RecordingConnector {
-    pub connects: std::sync::atomic::AtomicUsize,
+pub struct RecordingHttpClientWrapper {
+    pub clients: std::sync::atomic::AtomicUsize,
     pub requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pub headers: std::sync::Arc<std::sync::Mutex<Vec<http::HeaderMap>>>,
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 #[derive(Debug)]
-struct NotFound(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+struct NotFound {
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    headers: std::sync::Arc<std::sync::Mutex<Vec<http::HeaderMap>>>,
+}
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-#[async_trait::async_trait]
-impl object_store::client::HttpService for NotFound {
-    async fn call(
+#[async_trait]
+impl super::transport::HttpClient for NotFound {
+    async fn execute(
         &self,
-        req: object_store::client::HttpRequest,
-    ) -> std::result::Result<object_store::client::HttpResponse, object_store::client::HttpError>
-    {
-        self.0.lock().unwrap().push(req.uri().to_string());
-        let mut response = object_store::client::HttpResponse::new(
-            object_store::client::HttpResponseBody::from(String::new()),
-        );
-        *response.status_mut() = http::StatusCode::NOT_FOUND;
-        Ok(response)
+        request: super::transport::HttpRequest,
+    ) -> std::result::Result<super::transport::HttpResponse, super::transport::HttpError> {
+        use http_body_util::BodyExt;
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.uri().to_string());
+        self.headers.lock().unwrap().push(request.headers().clone());
+        Ok(http::Response::builder()
+            .status(http::StatusCode::NOT_FOUND)
+            .body(
+                http_body_util::Full::new(bytes::Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap())
     }
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-impl object_store::client::HttpConnector for RecordingConnector {
-    fn connect(
+impl super::transport::HttpClientWrapper for RecordingHttpClientWrapper {
+    fn wrap(
         &self,
-        _options: &object_store::ClientOptions,
-    ) -> object_store::Result<object_store::client::HttpClient> {
-        self.connects
+        _client: std::sync::Arc<dyn super::transport::HttpClient>,
+    ) -> Result<std::sync::Arc<dyn super::transport::HttpClient>> {
+        self.clients
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(object_store::client::HttpClient::new(NotFound(
-            self.requests.clone(),
-        )))
+        Ok(std::sync::Arc::new(NotFound {
+            requests: self.requests.clone(),
+            headers: self.headers.clone(),
+        }))
     }
 }

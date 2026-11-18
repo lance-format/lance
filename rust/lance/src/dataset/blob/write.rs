@@ -19,8 +19,8 @@ use lance_arrow::{
     BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
     BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, FieldExt, list::ListArrayExt, r#struct::StructArrayExt,
 };
+use lance_core::storage::path::Path;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use object_store::path::Path;
 
 use super::external::{
     ExternalBaseResolver, collect_external_blob_uris, normalize_external_absolute_uri,
@@ -51,11 +51,8 @@ const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
 pub struct BlobPayloadInventory(Arc<Mutex<Vec<(ObjectStore, Path)>>>);
 
 impl BlobPayloadInventory {
-    fn record(&self, object_store: &ObjectStore, path: &Path) {
-        self.0
-            .lock()
-            .unwrap()
-            .push((object_store.clone(), path.clone()));
+    fn record(&self, storage: &ObjectStore, path: &Path) {
+        self.0.lock().unwrap().push((storage.clone(), path.clone()));
     }
 
     /// Delete every recorded payload and clear the inventory.
@@ -64,8 +61,8 @@ impl BlobPayloadInventory {
     /// either way, so ordinary garbage collection still reclaims them.
     pub async fn delete_all(&self) {
         let payloads = std::mem::take(&mut *self.0.lock().unwrap());
-        for (object_store, path) in payloads {
-            match object_store.delete(&path).await {
+        for (storage, path) in payloads {
+            match storage.delete(&path).await {
                 // A path is recorded before its writer opens, so a writer that
                 // failed to open leaves nothing behind.
                 Ok(()) | Err(Error::NotFound { .. }) => {}
@@ -82,13 +79,13 @@ impl BlobPayloadInventory {
 fn new_managed_payload(
     base_id: Option<u32>,
     root: &Path,
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     created_payloads: Option<&BlobPayloadInventory>,
 ) -> (ManagedBlobLocation, Path) {
     let location = ManagedBlobLocation::new(base_id);
     let path = location.path(root);
     if let Some(created_payloads) = created_payloads {
-        created_payloads.record(object_store, &path);
+        created_payloads.record(storage, &path);
     }
     (location, path)
 }
@@ -209,7 +206,7 @@ pub struct BlobPreprocessor {
     copied_dedicated: HashMap<u32, BlobDescriptor>,
     managed_base: Option<(Option<u32>, Path)>,
     created_payloads: Option<BlobPayloadInventory>,
-    object_store: ObjectStore,
+    storage: ObjectStore,
     data_dir: Path,
     data_file_key: String,
     blob_id_allocator: BlobIdAllocator,
@@ -399,7 +396,7 @@ impl BlobWriteSource<'_> {
 impl BlobPreprocessor {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::dataset) fn new(
-        object_store: ObjectStore,
+        storage: ObjectStore,
         data_dir: Path,
         data_file_key: String,
         schema: &lance_core::datatypes::Schema,
@@ -422,7 +419,7 @@ impl BlobPreprocessor {
             copied_dedicated: HashMap::new(),
             managed_base: None,
             created_payloads: None,
-            object_store,
+            storage,
             data_dir,
             data_file_key,
             blob_id_allocator: BlobIdAllocator::new(1),
@@ -498,10 +495,10 @@ impl BlobPreprocessor {
             let (location, path) = new_managed_payload(
                 *base_id,
                 root,
-                &self.object_store,
+                &self.storage,
                 self.created_payloads.as_ref(),
             );
-            let mut writer = BlobObjectWriter::try_new(self.object_store.clone(), path).await?;
+            let mut writer = BlobObjectWriter::try_new(self.storage.clone(), path).await?;
             let range = match source {
                 BlobWriteSource::Bytes(data) => writer.write_blob(data).await?,
                 BlobWriteSource::External(source) => {
@@ -519,7 +516,7 @@ impl BlobPreprocessor {
             .clone()
             .join(format!("{}.lance", self.data_file_key));
         let mut writer = crate::blob::DedicatedBlobWriter::try_new(
-            self.object_store.clone(),
+            self.storage.clone(),
             data_file_path,
             self.blob_id_allocator.next()?,
         )
@@ -560,7 +557,7 @@ impl BlobPreprocessor {
                 let (location, path) = new_managed_payload(
                     *base_id,
                     root,
-                    &self.object_store,
+                    &self.storage,
                     self.created_payloads.as_ref(),
                 );
                 (BlobPackAddress::Managed(location), path)
@@ -576,7 +573,7 @@ impl BlobPreprocessor {
                 )
             };
             self.current_pack = Some(BlobPack {
-                writer: BlobObjectWriter::try_new(self.object_store.clone(), path).await?,
+                writer: BlobObjectWriter::try_new(self.storage.clone(), path).await?,
                 address,
                 max_size: max_pack_size,
             });
@@ -774,7 +771,7 @@ impl BlobPreprocessor {
                         );
                         source
                             .store
-                            .copy_bulk(&source.path, &self.object_store, &destination)
+                            .copy_bulk(&source.path, &self.storage, &destination)
                             .await?;
                         BlobDescriptor::Dedicated {
                             blob_id: id,
@@ -868,13 +865,13 @@ impl BlobPreprocessor {
         position: Option<u64>,
         size: Option<u64>,
     ) -> Result<ExternalBlobSource> {
-        let (object_store, path) = ObjectStore::from_uri_and_params(
+        let (storage, path) = ObjectStore::from_uri_and_params(
             self.source_store_registry.clone(),
             uri,
             &self.source_store_params,
         )
         .await?;
-        let reader = object_store.open(&path).await?;
+        let reader = storage.open(&path).await?;
         match (position, size) {
             (Some(position), Some(size)) => {
                 position.checked_add(size).ok_or_else(|| {
@@ -1482,13 +1479,13 @@ mod tests {
         BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
     };
     use lance_core::datatypes::{BlobHandling, BlobKind};
+    use lance_core::storage::path::Path;
     use lance_core::{
         Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, Result,
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-    use object_store::path::Path;
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -2013,14 +2010,14 @@ mod tests {
         blob_len: usize,
         num_blobs: usize,
     ) -> Result<arrow_array::StructArray> {
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             "memory://blob_preprocessor",
             &ObjectStoreParams::default(),
         )
         .await
         .unwrap();
-        let object_store = object_store.as_ref().clone();
+        let storage = storage.as_ref().clone();
         let data_dir = base_path.clone().join("data");
 
         let mut field = blob_field("blob", true);
@@ -2034,7 +2031,7 @@ mod tests {
         let writer_schema = lance_core::datatypes::Schema::try_from(&writer_arrow_schema).unwrap();
 
         let mut preprocessor = BlobPreprocessor::new(
-            object_store.clone(),
+            storage.clone(),
             data_dir,
             "data_file_key".to_string(),
             &writer_schema,
@@ -2276,14 +2273,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_inline_threshold_is_per_column() {
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             "memory://blob_preprocessor",
             &ObjectStoreParams::default(),
         )
         .await
         .unwrap();
-        let object_store = object_store.as_ref().clone();
+        let storage = storage.as_ref().clone();
         let data_dir = base_path.clone().join("data");
 
         let mut inline_field = blob_field("inline_blob", true);
@@ -2306,7 +2303,7 @@ mod tests {
         let writer_schema = lance_core::datatypes::Schema::try_from(&writer_arrow_schema).unwrap();
 
         let mut preprocessor = BlobPreprocessor::new(
-            object_store.clone(),
+            storage.clone(),
             data_dir,
             "data_file_key".to_string(),
             &writer_schema,
@@ -2367,14 +2364,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_v2_pack_file_threshold_starts_new_packed_blob() {
-        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+        let (storage, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             "memory://blob_preprocessor",
             &ObjectStoreParams::default(),
         )
         .await
         .unwrap();
-        let object_store = object_store.as_ref().clone();
+        let storage = storage.as_ref().clone();
         let data_dir = base_path.clone().join("data");
 
         let mut field = blob_field("blob", true);
@@ -2393,7 +2390,7 @@ mod tests {
         let writer_schema = lance_core::datatypes::Schema::try_from(&writer_arrow_schema).unwrap();
 
         let mut preprocessor = BlobPreprocessor::new(
-            object_store.clone(),
+            storage.clone(),
             data_dir,
             "data_file_key".to_string(),
             &writer_schema,

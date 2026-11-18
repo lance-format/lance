@@ -20,9 +20,8 @@ pub mod object_store;
 pub mod object_writer;
 pub mod scheduler;
 pub mod spill;
-pub mod storage;
 pub mod stream;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 pub mod traits;
 #[cfg(target_os = "linux")]

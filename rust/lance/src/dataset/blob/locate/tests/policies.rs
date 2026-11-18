@@ -10,6 +10,7 @@ use crate::dataset::blob::read::{
 use crate::dataset::blob::test_util::create_multi_base_blob_v2_fixture;
 use crate::dataset::{DatasetBuilder, ReadParams, WriteParams};
 use crate::session::Session;
+use ::object_store::memory::InMemory;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -17,15 +18,13 @@ use futures::stream::BoxStream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{
-    ChainedWrappingObjectStore, ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry,
-    WrappingObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult,
+};
+use lance_io::object_store::{
+    ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
-use object_store::list::PaginatedListStore;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
-};
 use rstest::rstest;
 use std::sync::{
     Mutex,
@@ -33,30 +32,43 @@ use std::sync::{
 };
 use url::Url;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BlobProvider {
-    origin: Arc<InMemory>,
+    origin: Arc<dyn lance_io::object_store::StorageBackend>,
     tracker: IOTracker,
     calls: AtomicUsize,
     params: Mutex<Vec<ObjectStoreParams>>,
 }
 
+impl Default for BlobProvider {
+    fn default() -> Self {
+        Self {
+            origin: lance_io::object_store::backend::native::from_object_store(Arc::new(
+                InMemory::new(),
+            )),
+            tracker: IOTracker::default(),
+            calls: AtomicUsize::default(),
+            params: Mutex::default(),
+        }
+    }
+}
+
 #[async_trait]
 impl ObjectStoreProvider for BlobProvider {
-    async fn new_store(&self, _uri: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+    async fn new_backend(
+        &self,
+        _uri: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<lance_io::object_store::BackendConfig> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.params.lock().unwrap().push(params.clone());
-        Ok(ObjectStore::new(
+        let mut config = lance_io::object_store::BackendConfig::new(
             self.tracker.wrap("", self.origin.clone()),
-            Url::parse("memory://").unwrap(),
-            params.block_size,
-            None,
-            false,
-            true,
-            4,
-            0,
-            params.storage_options(),
-        ))
+            "memory",
+        );
+        config.list_is_lexically_ordered = true;
+        config.io_parallelism = 4;
+        Ok(config)
     }
 
     fn extract_path(&self, uri: &Url) -> Result<Path> {
@@ -65,7 +77,7 @@ impl ObjectStoreProvider for BlobProvider {
             .map_err(|error| Error::invalid_input(format!("Invalid source path: {error}")))
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         _uri: &Url,
         _options: Option<&HashMap<String, String>>,
@@ -77,8 +89,8 @@ impl ObjectStoreProvider for BlobProvider {
 
 #[derive(Debug)]
 struct ReadThroughCache {
-    cache: Arc<InMemory>,
-    original: Arc<dyn object_store::ObjectStore>,
+    cache: Arc<dyn lance_io::object_store::StorageBackend>,
+    original: Arc<dyn lance_io::object_store::StorageBackend>,
 }
 
 impl std::fmt::Display for ReadThroughCache {
@@ -88,8 +100,36 @@ impl std::fmt::Display for ReadThroughCache {
 }
 
 #[async_trait]
-impl object_store::ObjectStore for ReadThroughCache {
-    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+impl lance_io::object_store::StorageBackend for ReadThroughCache {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
+    async fn get_ranges(
+        &self,
+        path: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> lance_io::object_store::Result<Vec<bytes::Bytes>> {
+        object_store::coalesce_ranges(
+            ranges,
+            |range| (self as &dyn lance_io::object_store::StorageBackend).get_range(path, range),
+            object_store::OBJECT_STORE_COALESCE_DEFAULT,
+        )
+        .await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: GetOptions,
+    ) -> lance_io::object_store::Result<GetResult> {
         if self.cache.head(path).await.is_err() {
             let bytes = self.original.get(path).await?.bytes().await?;
             self.cache.put(path, bytes.into()).await?;
@@ -102,7 +142,7 @@ impl object_store::ObjectStore for ReadThroughCache {
         path: &Path,
         bytes: PutPayload,
         options: PutOptions,
-    ) -> object_store::Result<PutResult> {
+    ) -> lance_io::object_store::Result<PutResult> {
         self.original.put_opts(path, bytes, options).await
     }
 
@@ -110,22 +150,29 @@ impl object_store::ObjectStore for ReadThroughCache {
         &self,
         path: &Path,
         options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> lance_io::object_store::Result<Box<dyn lance_io::object_store::backend::MultipartUpload>>
+    {
         self.original.put_multipart_opts(path, options).await
     }
 
     fn delete_stream(
         &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
+        locations: BoxStream<'static, lance_io::object_store::Result<Path>>,
+    ) -> BoxStream<'static, lance_io::object_store::Result<Path>> {
         self.original.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, lance_io::object_store::Result<ObjectMeta>> {
         self.original.list(prefix)
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> lance_io::object_store::Result<ListResult> {
         self.original.list_with_delimiter(prefix).await
     }
 
@@ -134,8 +181,32 @@ impl object_store::ObjectStore for ReadThroughCache {
         from: &Path,
         to: &Path,
         options: CopyOptions,
-    ) -> object_store::Result<()> {
+    ) -> lance_io::object_store::Result<()> {
         self.original.copy_opts(from, to, options).await
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        lance_io::object_store::Result<lance_io::object_store::ObjectMeta>,
+    > {
+        let offset = offset.clone();
+        futures::StreamExt::boxed(futures::TryStreamExt::try_filter(
+            self.list(prefix),
+            move |meta| std::future::ready(meta.location > offset),
+        ))
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: lance_io::object_store::RenameOptions,
+    ) -> lance_io::object_store::Result<()> {
+        self.original.rename_opts(from, to, opts).await
     }
 }
 
@@ -151,10 +222,10 @@ impl WrappingObjectStore for ImmutableCache {
     fn wrap(
         &self,
         _prefix: &str,
-        original: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
         Arc::new(ReadThroughCache {
-            cache: self.cache.clone(),
+            cache: lance_io::object_store::backend::native::from_object_store(self.cache.clone()),
             original,
         })
     }
@@ -162,19 +233,11 @@ impl WrappingObjectStore for ImmutableCache {
     fn wrap_external_blob(
         &self,
         _prefix: &str,
-        original: Arc<dyn object_store::ObjectStore>,
-        _wrapped: Arc<dyn object_store::ObjectStore>,
-    ) -> Arc<dyn object_store::ObjectStore> {
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+        _wrapped: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
         self.external_wraps.fetch_add(1, Ordering::Relaxed);
         original
-    }
-
-    fn wrap_paginated(
-        &self,
-        _prefix: &str,
-        _original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>> {
-        None
     }
 }
 
@@ -304,7 +367,7 @@ async fn test_external_write_policy_and_error(
 
 #[rstest]
 #[case::file("file:///etc/passwd")]
-#[case::object_store("file-object-store:///etc/passwd")]
+#[case::storage("file-object-store:///etc/passwd")]
 #[case::uring("file+uring:///etc/passwd")]
 #[case::bare("/etc/passwd")]
 #[case::relative("relative/payload")]
@@ -535,7 +598,10 @@ async fn test_unregistered_external_blob_allowed_by_default(#[case] is_wrapped: 
     );
     let cache = Arc::new(ImmutableCache::default());
     let params = ObjectStoreParams {
-        object_store_wrapper: is_wrapped.then(|| cache.clone() as Arc<dyn WrappingObjectStore>),
+        backend_wrappers: is_wrapped
+            .then(|| cache.clone() as Arc<dyn WrappingObjectStore>)
+            .into_iter()
+            .collect(),
         ..Default::default()
     };
     let dataset = DatasetBuilder::from_uri(fixture.dataset.uri())
@@ -582,14 +648,16 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
         .unwrap();
     let dataset = DatasetBuilder::from_uri(fixture.dataset.uri())
         .with_store_params(ObjectStoreParams {
-            object_store_wrapper: is_wrapped
-                .then(|| Arc::new(IOTracker::default()) as Arc<dyn WrappingObjectStore>),
+            backend_wrappers: is_wrapped
+                .then(|| Arc::new(IOTracker::default()) as Arc<dyn WrappingObjectStore>)
+                .into_iter()
+                .collect(),
             ..Default::default()
         })
         .load()
         .await
         .unwrap();
-    let store = dataset.object_store(Some(2)).await.unwrap();
+    let store = dataset.storage(Some(2)).await.unwrap();
     let root = dataset.blob_base_path(Some(2)).unwrap();
     store
         .put(&root.clone().join("payload"), b"old")
@@ -609,7 +677,7 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
         .await
         .unwrap();
     if !is_wrapped {
-        assert!(Arc::ptr_eq(&file.source.object_store, &store));
+        assert!(Arc::ptr_eq(&file.source.storage, &store));
     }
     assert_eq!(file.read().await.unwrap().as_ref(), b"old");
     store.put(&root.join("payload"), b"new").await.unwrap();
@@ -651,16 +719,13 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
     );
     let cache = Arc::new(ImmutableCache::default());
     let observer = Arc::new(IOTracker::default());
-    let wrapper = Arc::new(ChainedWrappingObjectStore::new(vec![
-        cache.clone(),
-        observer.clone(),
-    ]));
+    let wrappers: Vec<Arc<dyn WrappingObjectStore>> = vec![cache.clone(), observer.clone()];
     let options = HashMap::from([
         ("credential".to_string(), "base-secret".to_string()),
         ("endpoint".to_string(), "base-endpoint".to_string()),
     ]);
     let params = ObjectStoreParams {
-        object_store_wrapper: Some(wrapper.clone()),
+        backend_wrappers: wrappers.clone(),
         block_size: Some(4096),
         ..Default::default()
     };

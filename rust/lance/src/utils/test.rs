@@ -28,12 +28,12 @@ use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
 pub mod covering;
+mod delay_store;
 mod failing_store;
 pub mod serializing_cache;
-mod throttle_store;
 
+pub use delay_store::DelayedStoreWrapper;
 pub use failing_store::FailingProxyStore;
-pub use throttle_store::ThrottledStoreWrapper;
 
 /// A dataset generator that can generate random layouts. This is used to test
 /// dataset operations are robust to different layouts.
@@ -916,8 +916,8 @@ impl CommitHandler for AmbiguousCommitHandler {
         &self,
         manifest: &mut lance_table::format::Manifest,
         indices: Option<Vec<lance_table::format::IndexMetadata>>,
-        base_path: &object_store::path::Path,
-        object_store: &lance_io::object_store::ObjectStore,
+        base_path: &lance_core::storage::path::Path,
+        storage: &lance_io::object_store::ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<TableTransaction>,
@@ -944,7 +944,7 @@ impl CommitHandler for AmbiguousCommitHandler {
                         manifest,
                         indices,
                         base_path,
-                        object_store,
+                        storage,
                         manifest_writer,
                         naming_scheme,
                         transaction,
@@ -957,7 +957,7 @@ impl CommitHandler for AmbiguousCommitHandler {
                         manifest,
                         indices,
                         base_path,
-                        object_store,
+                        storage,
                         manifest_writer,
                         naming_scheme,
                         transaction,
@@ -974,7 +974,7 @@ impl CommitHandler for AmbiguousCommitHandler {
                         manifest,
                         indices,
                         base_path,
-                        object_store,
+                        storage,
                         manifest_writer,
                         naming_scheme,
                         transaction,
@@ -995,9 +995,9 @@ impl CommitHandler for AmbiguousCommitHandler {
 
     async fn resolve_version_location(
         &self,
-        base_path: &object_store::path::Path,
+        base_path: &lance_core::storage::path::Path,
         version: u64,
-        object_store: &dyn object_store::ObjectStore,
+        storage: &lance_io::object_store::ObjectStore,
     ) -> lance_core::Result<ManifestLocation> {
         self.resolve_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_resolve.load(Ordering::SeqCst) {
@@ -1020,7 +1020,7 @@ impl CommitHandler for AmbiguousCommitHandler {
             }
         }
         ConditionalPutCommitHandler
-            .resolve_version_location(base_path, version, object_store)
+            .resolve_version_location(base_path, version, storage)
             .await
     }
 }
@@ -1237,8 +1237,8 @@ pub mod geo {
 pub async fn data_file_schema(dataset: &Dataset, path: &str) -> Schema {
     let file_path = dataset.data_dir().join(path);
     let scheduler = lance_io::scheduler::ScanScheduler::new(
-        dataset.object_store.clone(),
-        lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let file = scheduler
         .open_file(&file_path, &lance_io::utils::CachedFileSize::unknown())

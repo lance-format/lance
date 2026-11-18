@@ -672,7 +672,7 @@ async fn test_vector_prefilter_prunes_scalar_segments(
     let tracker = Arc::new(IOTracker::default());
     test_ds.dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_ds.tmp_dir.as_str())
         .with_store_params(ObjectStoreParams {
-            object_store_wrapper: Some(tracker.clone()),
+            backend_wrappers: vec![tracker.clone()],
             ..Default::default()
         })
         .load()

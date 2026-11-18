@@ -9,14 +9,13 @@ use std::{
     },
 };
 
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use url::Url;
 
-use crate::object_store::WrappingObjectStore;
 use crate::object_store::uri_to_url;
 use crate::scheduler::SchedulerErrorMode;
 
-use super::{ObjectStore, ObjectStoreParams, StorageOptions, tracing::ObjectStoreTracingExt};
+use super::{ObjectStore, ObjectStoreParams, StorageOptions, tracing::StorageBackendTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
@@ -50,9 +49,126 @@ pub mod tencent;
 #[cfg(feature = "tos")]
 pub mod tos;
 
+/// Physical backend and its IO capabilities, returned by a [`ObjectStoreProvider`].
+///
+/// The registry applies request policies, wrappers and instrumentation exactly once.
+/// Construct with [`Self::new`] and override only capabilities the backend provides.
+#[derive(Clone)]
+pub struct BackendConfig {
+    // Keep native capabilities tied to the backend that the provider constructed.
+    pub(super) backend: Arc<dyn super::StorageBackend>,
+    /// Physical storage scheme, including aliases resolved by the provider.
+    pub scheme: String,
+    /// Provider-resolved object identity for wrappers and the configured handle.
+    /// None retains the URI-derived prefix. The registry cache key is unchanged.
+    pub store_prefix: Option<String>,
+    /// Preferred read block size in bytes; explicit caller configuration takes precedence.
+    pub block_size: usize,
+    /// Maximum suggested number of concurrent IO operations.
+    pub io_parallelism: usize,
+    /// Whether multipart uploads require equal-sized non-final parts.
+    pub use_constant_size_upload_parts: bool,
+    /// Whether listing is lexically ordered by object path.
+    pub list_is_lexically_ordered: bool,
+    pub(super) local_dir_operations: Option<Arc<dyn super::LocalDirOperations>>,
+    pub(super) local_fsync: bool,
+    pub(super) direct_local_io: bool,
+    pub(super) local_io: super::LocalIo,
+    /// Whether paths have local directory semantics, including possible aliases.
+    /// Enables conservative cleanup when physical paths cannot be resolved.
+    /// This does not grant access to the host filesystem.
+    pub is_local: bool,
+    /// Whether callers should apply cloud IO policies, including scheduling and bulk copy.
+    pub is_remote: bool,
+    /// Largest server-side copy supported in one request; None means no known limit.
+    pub max_single_copy_size: Option<u64>,
+}
+
+impl BackendConfig {
+    /// Describe a backend with conservative capabilities and a 64 KiB read block.
+    /// Native filesystem access is reserved for the built-in file provider.
+    pub fn new(backend: Arc<dyn super::StorageBackend>, scheme: impl Into<String>) -> Self {
+        let scheme = scheme.into();
+        Self {
+            backend,
+            store_prefix: None,
+            block_size: 64 * 1024,
+            scheme,
+            io_parallelism: super::DEFAULT_CLOUD_IO_PARALLELISM,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: false,
+
+            local_dir_operations: None,
+            local_fsync: false,
+            direct_local_io: false,
+            local_io: super::LocalIo::Backend,
+            is_local: false,
+            is_remote: true,
+            max_single_copy_size: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field("backend", &self.backend)
+            .field("scheme", &self.scheme)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Resolve a location and its configuration into a Lance I/O binding.
+///
+/// ObjectStore integrations own authorization, credential refresh, and cache identity.
+/// Return a [`BackendConfig`] backed by a [`super::StorageBackend`];
+/// reuse its handles rather than rebuilding a backend from the URI. Native
+/// implementations can be adapted with [`super::backend::native::from_object_store`].
+///
+/// ```
+/// use std::sync::Arc;
+/// use async_trait::async_trait;
+/// use lance_io::object_store::{BackendConfig, ObjectStore, StorageBackend,
+///     ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry};
+/// use url::Url;
+///
+/// #[derive(Debug)]
+/// struct CustomProvider(Arc<dyn StorageBackend>);
+///
+/// #[async_trait]
+/// impl ObjectStoreProvider for CustomProvider {
+///     async fn new_backend(&self, url: Url, _: &ObjectStoreParams)
+///         -> lance_core::Result<BackendConfig>
+///     {
+///         Ok(BackendConfig::new(self.0.clone(), url.scheme()))
+///     }
+/// }
+///
+/// # async fn open(backend: Arc<dyn StorageBackend>) -> lance_core::Result<()> {
+/// let registry = Arc::new(ObjectStoreRegistry::default());
+/// registry.insert("custom", Arc::new(CustomProvider(backend)));
+/// let (storage, path) = ObjectStore::from_uri_and_params(
+///     registry, "custom://base/data.bin", &ObjectStoreParams::default(),
+/// ).await?;
+/// storage.put(&path, b"data").await?;
+/// # Ok(())
+/// # }
+/// ```
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
+    /// Construct the physical backend without installing caller wrappers or IO tracking.
+    /// The registry applies these policies after this method returns.
+    async fn new_backend(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig>;
+
+    /// Whether this provider resolves native filesystem locations.
+    /// Used to compare unopened locations across aliases; does not grant native IO.
+    fn is_local(&self) -> bool {
+        false
+    }
 
     /// Extract the path relative to the base of the store.
     ///
@@ -83,7 +199,7 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// this will be something like 'az$account_name@container'
     ///
     /// Providers should override this if they have special requirements like Azure's.
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
@@ -121,8 +237,8 @@ type BuildLock = Arc<tokio::sync::Mutex<()>>;
 /// - `file+uring`: A local file object store using io_uring (Linux only).
 /// - `s3`: An S3 object store.
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
-/// - `az`: An Azure Blob Storage object store.
-/// - `gs`: A Google Cloud Storage object store.
+/// - `az`: An Azure Blob ObjectStore object store.
+/// - `gs`: A Google Cloud ObjectStore object store.
 /// - `tos`: A Volcengine TOS object store.
 ///
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
@@ -207,10 +323,10 @@ impl ObjectStoreRegistry {
     /// dead entries (default [`DEFAULT_MIN_PRUNE_THRESHOLD`]); `0` disables the
     /// sweep. Applies to the whole registry, i.e. to every dataset sharing the
     /// session. Also settable per call through the
-    /// [`OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION`] storage option, e.g. from
+    /// [`STORAGE_CACHE_PRUNE_THRESHOLD_OPTION`] storage option, e.g. from
     /// the storage options a namespace returns in `describe_table`.
     ///
-    /// [`OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION`]: crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION
+    /// [`STORAGE_CACHE_PRUNE_THRESHOLD_OPTION`]: crate::object_store::STORAGE_CACHE_PRUNE_THRESHOLD_OPTION
     pub fn set_min_prune_threshold(&self, threshold: usize) {
         self.min_prune_threshold.store(threshold, Ordering::Relaxed);
         self.prune_threshold.store(threshold, Ordering::Relaxed);
@@ -289,37 +405,77 @@ impl ObjectStoreRegistry {
         base_path: Url,
         params: &ObjectStoreParams,
         metrics_base: &str,
+        store_prefix: &str,
         scheduler_error_mode: SchedulerErrorMode,
     ) -> Result<Arc<ObjectStore>> {
-        let mut store = provider.new_store(base_path, params).await?;
-        // Providers only know the explicit parameter; the storage option is
-        // applied here so every store honours it the same way.
-        if let Some(block_size) = params.resolved_block_size()? {
-            store.block_size = block_size;
+        let block_size = params.resolved_block_size()?;
+        let mut config = provider.new_backend(base_path, params).await?;
+        if let Some(block_size) = block_size {
+            config.block_size = block_size;
         }
-        // Providers construct the physical store, while the registry owns policies
-        // that affect how the shared store is consumed. Applying the validated mode
-        // here covers built-in and out-of-tree providers uniformly.
-        store.scheduler_error_mode = scheduler_error_mode;
-
+        let mut store = Self::assemble(config, params, store_prefix, scheduler_error_mode);
         store.inner = store.inner.traced();
-
-        // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
-        // `az$container@account`) so multiple stores on one cloud differ, or by
-        // the dataset URI when the label mode asks for it.
         crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, metrics_base);
-
-        if let Some(wrapper) = &params.object_store_wrapper {
+        for wrapper in &params.backend_wrappers {
             store.apply_wrapper(wrapper.as_ref());
         }
-
-        // Always wrap with IO tracking
-        if let Some(external) = &mut store.external_blob_inner {
-            external.inner = store.io_tracker.wrap("", external.inner.clone());
-        }
-        store.inner = store.io_tracker.wrap("", store.inner);
-
+        store.track_io();
         Ok(Arc::new(store))
+    }
+
+    // Both asynchronous providers and infallible built-ins finish through this path.
+    fn assemble(
+        config: BackendConfig,
+        params: &ObjectStoreParams,
+        store_prefix: &str,
+        scheduler_error_mode: SchedulerErrorMode,
+    ) -> ObjectStore {
+        ObjectStore {
+            inner: config.backend,
+            has_wrappers: false,
+            external_blob_inner: None,
+            _external_blob_origin: None,
+            local_dir_operations: config.local_dir_operations,
+            local_fsync: config.local_fsync,
+            direct_local_io: config.direct_local_io,
+            local_io: config.local_io,
+            is_local: config.is_local,
+            is_remote: config.is_remote,
+            max_single_copy_size: config.max_single_copy_size,
+            scheme: config.scheme,
+            block_size: config.block_size,
+            max_iop_size: *super::DEFAULT_MAX_IOP_SIZE,
+            use_constant_size_upload_parts: config.use_constant_size_upload_parts,
+            list_is_lexically_ordered: config.list_is_lexically_ordered,
+            io_parallelism: config.io_parallelism,
+            download_retry_count: StorageOptions::new(
+                params.storage_options().cloned().unwrap_or_default(),
+            )
+            .download_retry_count(),
+            scheduler_error_mode,
+            io_tracker: Default::default(),
+            store_prefix: config
+                .store_prefix
+                .unwrap_or_else(|| store_prefix.to_owned()),
+        }
+    }
+
+    pub(super) fn local() -> ObjectStore {
+        Self::builtin(local::FileStoreProvider::default_backend())
+    }
+
+    pub(super) fn memory() -> ObjectStore {
+        Self::builtin(memory::MemoryStoreProvider::default_backend())
+    }
+
+    fn builtin(config: BackendConfig) -> ObjectStore {
+        let prefix = config.scheme.clone();
+        Self::assemble(
+            config,
+            &ObjectStoreParams::default(),
+            &prefix,
+            SchedulerErrorMode::default(),
+        )
     }
 
     /// Build a fresh object store without consulting or populating the cache.
@@ -343,7 +499,7 @@ impl ObjectStoreRegistry {
             return Err(self.scheme_not_found_error(scheme));
         };
         let store_prefix =
-            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
+            provider.calculate_storage_prefix(&base_path, params.storage_options())?;
         let metrics_base = crate::object_store::metrics_base(&store_prefix, &base_path);
 
         self.build_store(
@@ -351,6 +507,7 @@ impl ObjectStoreRegistry {
             base_path,
             params,
             &metrics_base,
+            &store_prefix,
             scheduler_error_mode,
         )
         .await
@@ -392,7 +549,7 @@ impl ObjectStoreRegistry {
         };
         if let Some(options) = params.storage_options()
             && let Some(threshold) =
-                StorageOptions(options.clone()).object_store_cache_prune_threshold()?
+                StorageOptions(options.clone()).storage_cache_prune_threshold()?
             && threshold != self.min_prune_threshold.load(Ordering::Relaxed)
         {
             self.set_min_prune_threshold(threshold);
@@ -402,7 +559,7 @@ impl ObjectStoreRegistry {
         // `dataset` label mode that is the dataset URI, so datasets sharing a
         // bucket get separate stores and their metrics stay attributed.
         let store_prefix =
-            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
+            provider.calculate_storage_prefix(&base_path, params.storage_options())?;
         let cache_path = crate::object_store::metrics_base(&store_prefix, &base_path);
         let cache_key = (cache_path.clone(), params.clone(), scheduler_error_mode);
 
@@ -473,6 +630,7 @@ impl ObjectStoreRegistry {
                 base_path,
                 params,
                 &cache_path,
+                &store_prefix,
                 scheduler_error_mode,
             )
             .await?;
@@ -495,7 +653,7 @@ impl ObjectStoreRegistry {
 
     /// Calculate the datastore prefix based on the URI and the storage options.
     /// The data store prefix should uniquely identify the datastore.
-    pub fn calculate_object_store_prefix(
+    pub fn calculate_storage_prefix(
         &self,
         uri: &str,
         storage_options: Option<&HashMap<String, String>>,
@@ -509,7 +667,7 @@ impl ObjectStoreRegistry {
                     Err(self.scheme_not_found_error(url.scheme()))
                 }
             }
-            Some(provider) => provider.calculate_object_store_prefix(&url, storage_options),
+            Some(provider) => provider.calculate_storage_prefix(&url, storage_options),
         }
     }
 }
@@ -586,18 +744,53 @@ impl ObjectStoreRegistry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
-    use crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION;
-    use object_store::ObjectStore as OSObjectStore;
+    use crate::object_store::STORAGE_CACHE_PRUNE_THRESHOLD_OPTION;
 
     use crate::object_store::providers::memory::MemoryStoreProvider;
     use crate::object_store::{StorageOptionsAccessor, StorageOptionsProvider};
     use crate::scheduler::SCHEDULER_ERROR_MODE_STORAGE_OPTION;
-    use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
     use rstest::rstest;
+
+    #[rstest]
+    #[case::local("file:///tmp", false)]
+    #[case::local_backend("file-object-store:///tmp", false)]
+    #[case::memory("memory://", true)]
+    #[tokio::test]
+    async fn test_provider_fixed_options_take_precedence(#[case] uri: &str, #[case] ordered: bool) {
+        let params = ObjectStoreParams {
+            use_constant_size_upload_parts: true,
+            list_is_lexically_ordered: Some(!ordered),
+            ..Default::default()
+        };
+        let store = ObjectStoreRegistry::default()
+            .get_store(Url::parse(uri).unwrap(), &params)
+            .await
+            .unwrap();
+        assert!(!store.use_constant_size_upload_parts());
+        assert_eq!(store.list_is_lexically_ordered(), ordered);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_registry_preserves_resolved_backend_options(#[case] enabled: bool) {
+        let mut config = super::memory::MemoryStoreProvider::default_backend();
+        config.use_constant_size_upload_parts = enabled;
+        config.list_is_lexically_ordered = enabled;
+        let params = ObjectStoreParams {
+            use_constant_size_upload_parts: !enabled,
+            list_is_lexically_ordered: Some(!enabled),
+            ..Default::default()
+        };
+        let storage = crate::utils::testing::TestObjectStoreProvider(config)
+            .build(Url::parse("memory://").unwrap(), &params);
+        assert_eq!(storage.use_constant_size_upload_parts(), enabled);
+        assert_eq!(storage.list_is_lexically_ordered(), enabled);
+    }
 
     #[tokio::test]
     async fn test_without_providers_discards_cached_bindings() {
@@ -641,11 +834,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ObjectStoreProvider for DummyProvider {
-        async fn new_store(
+        async fn new_backend(
             &self,
             _base_path: Url,
             _params: &ObjectStoreParams,
-        ) -> Result<ObjectStore> {
+        ) -> Result<BackendConfig> {
             unreachable!("This test doesn't create stores")
         }
     }
@@ -669,141 +862,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ObjectStoreProvider for SchedulerModeIgnoringStoreProvider {
-        async fn new_store(
+        async fn new_backend(
             &self,
             _base_path: Url,
             _params: &ObjectStoreParams,
-        ) -> Result<ObjectStore> {
-            Ok(ObjectStore::memory())
-        }
-    }
-
-    /// A lister that exists only to be handed to a wrapper.
-    struct StubLister;
-
-    #[async_trait::async_trait]
-    impl PaginatedListStore for StubLister {
-        async fn list_paginated(
-            &self,
-            _prefix: Option<&str>,
-            _opts: PaginatedListOptions,
-        ) -> object_store::Result<PaginatedListResult> {
-            unimplemented!("this lister exists to be wrapped, not to list")
-        }
-    }
-
-    /// A provider whose stores come with a paginated lister, which the memory store does not.
-    #[derive(Debug)]
-    struct PaginatedProvider;
-
-    #[async_trait::async_trait]
-    impl ObjectStoreProvider for PaginatedProvider {
-        async fn new_store(
-            &self,
-            base_path: Url,
-            params: &ObjectStoreParams,
-        ) -> Result<ObjectStore> {
-            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
-            store.paginated_lister = Some(Arc::new(StubLister));
-            Ok(store)
-        }
-
-        fn calculate_object_store_prefix(
-            &self,
-            _url: &Url,
-            _storage_options: Option<&HashMap<String, String>>,
-        ) -> Result<String> {
-            Ok("memory".to_string())
-        }
-    }
-
-    /// Swaps the store out for an empty one, the way a wrapper enforcing visibility would, and
-    /// records the prefix each call was labelled with. `keep_pushdown` is what it answers when
-    /// asked about the lister.
-    #[derive(Debug)]
-    struct RecordingWrapper {
-        keep_pushdown: bool,
-        prefixes: Mutex<Vec<String>>,
-    }
-
-    impl WrappingObjectStore for RecordingWrapper {
-        fn wrap(
-            &self,
-            store_prefix: &str,
-            _original: Arc<dyn OSObjectStore>,
-        ) -> Arc<dyn OSObjectStore> {
-            self.prefixes
-                .lock()
-                .unwrap()
-                .push(format!("wrap@{store_prefix}"));
-            Arc::new(object_store::memory::InMemory::new())
-        }
-
-        fn wrap_paginated(
-            &self,
-            store_prefix: &str,
-            original: Arc<dyn PaginatedListStore>,
-        ) -> Option<Arc<dyn PaginatedListStore>> {
-            self.prefixes
-                .lock()
-                .unwrap()
-                .push(format!("wrap_paginated@{store_prefix}"));
-            self.keep_pushdown.then_some(original)
-        }
-    }
-
-    /// A decorator supplied through [`ObjectStoreParams`] has to reach the paginated lister
-    /// too, or `read_dir_page` would talk to the backend behind its back — and a decorator
-    /// that gives the pushdown up gets a store with no lister, so its listings go through the
-    /// wrapped `inner` and see what the wrapper allows rather than what the backend holds.
-    #[rstest]
-    #[case::keeps_the_pushdown(true)]
-    #[case::gives_up_the_pushdown(false)]
-    #[tokio::test]
-    async fn test_the_registry_hands_the_lister_to_the_wrapper(#[case] keep_pushdown: bool) {
-        let wrapper = Arc::new(RecordingWrapper {
-            keep_pushdown,
-            prefixes: Mutex::new(Vec::new()),
-        });
-        let registry = ObjectStoreRegistry::default();
-        registry.insert("pagmem", Arc::new(PaginatedProvider));
-
-        let store = registry
-            .get_store(
-                Url::parse("pagmem:///").unwrap(),
-                &ObjectStoreParams {
-                    object_store_wrapper: Some(wrapper.clone()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(store.paginated_lister.is_some(), keep_pushdown);
-        // Both halves of the store are labelled with the same prefix.
-        assert_eq!(
-            *wrapper.prefixes.lock().unwrap(),
-            vec!["wrap@memory", "wrap_paginated@memory"]
-        );
-        if !keep_pushdown {
-            // `StubLister` panics if it is ever asked to list, so reaching a page at all is
-            // the other half of the assertion.
-            let page = store
-                .read_dir_page(Path::from(""), Default::default())
-                .await
-                .unwrap();
-            assert!(page.result.common_prefixes.is_empty());
-            assert!(page.result.objects.is_empty());
+        ) -> Result<BackendConfig> {
+            MemoryStoreProvider.new_backend(_base_path, _params).await
         }
     }
 
     #[test]
-    fn test_calculate_object_store_prefix() {
+    fn test_calculate_storage_prefix() {
         let provider = DummyProvider;
         let url = Url::parse("dummy://blah/path").unwrap();
         assert_eq!(
             "dummy$blah",
-            provider.calculate_object_store_prefix(&url, None).unwrap()
+            provider.calculate_storage_prefix(&url, None).unwrap()
         );
     }
 
@@ -916,12 +990,12 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_object_store_scheme_not_found() {
+    fn test_calculate_storage_scheme_not_found() {
         let registry = ObjectStoreRegistry::empty();
         registry.insert("dummy", Arc::new(DummyProvider));
         let s = "Invalid user input: No object store provider found for scheme: 'dummy2'\nValid schemes: dummy";
         let result = registry
-            .calculate_object_store_prefix("dummy2://mybucket/my/long/path", None)
+            .calculate_storage_prefix("dummy2://mybucket/my/long/path", None)
             .expect_err("expected error")
             .to_string();
         assert_eq!(s, &result[..s.len()]);
@@ -929,37 +1003,37 @@ mod tests {
 
     // Test that paths without a scheme get treated as local paths.
     #[test]
-    fn test_calculate_object_store_prefix_for_local() {
+    fn test_calculate_storage_prefix_for_local() {
         let registry = ObjectStoreRegistry::empty();
         assert_eq!(
             "file",
             registry
-                .calculate_object_store_prefix("/tmp/foobar", None)
+                .calculate_storage_prefix("/tmp/foobar", None)
                 .unwrap()
         );
     }
 
     // Test that paths with a single-letter scheme that is not registered for anything get treated as local paths.
     #[test]
-    fn test_calculate_object_store_prefix_for_local_windows_path() {
+    fn test_calculate_storage_prefix_for_local_windows_path() {
         let registry = ObjectStoreRegistry::empty();
         assert_eq!(
             "file",
             registry
-                .calculate_object_store_prefix("c://dos/path", None)
+                .calculate_storage_prefix("c://dos/path", None)
                 .unwrap()
         );
     }
 
     // Test that paths with a given scheme get mapped to that storage provider.
     #[test]
-    fn test_calculate_object_store_prefix_for_dummy_path() {
+    fn test_calculate_storage_prefix_for_dummy_path() {
         let registry = ObjectStoreRegistry::empty();
         registry.insert("dummy", Arc::new(DummyProvider));
         assert_eq!(
             "dummy$mybucket",
             registry
-                .calculate_object_store_prefix("dummy://mybucket/my/long/path", None)
+                .calculate_storage_prefix("dummy://mybucket/my/long/path", None)
                 .unwrap()
         );
     }
@@ -1007,17 +1081,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ObjectStoreProvider for SlowProvider {
-        async fn new_store(
+        async fn new_backend(
             &self,
             base_path: Url,
             params: &ObjectStoreParams,
-        ) -> Result<ObjectStore> {
+        ) -> Result<BackendConfig> {
             self.builds.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(100)).await;
             if self.fail {
                 return Err(Error::io("build failed"));
             }
-            MemoryStoreProvider.new_store(base_path, params).await
+            MemoryStoreProvider.new_backend(base_path, params).await
         }
     }
 
@@ -1145,7 +1219,7 @@ mod tests {
         // A namespace configures this through the storage options it returns
         // from `describe_table`.
         let registry = ObjectStoreRegistry::default();
-        let extra = [(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION, threshold)];
+        let extra = [(STORAGE_CACHE_PRUNE_THRESHOLD_OPTION, threshold)];
         let len = cache_len_after_distinct_dropped_stores(&registry, n, &extra).await;
         assert!(len <= max_cache_len, "cache has {len} entries");
         assert_eq!(registry.stats().active_stores, 0);
@@ -1171,7 +1245,7 @@ mod tests {
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([(
-                    OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION.to_string(),
+                    STORAGE_CACHE_PRUNE_THRESHOLD_OPTION.to_string(),
                     "lots".to_string(),
                 )]),
             ))),
@@ -1183,7 +1257,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION),
+                .contains(STORAGE_CACHE_PRUNE_THRESHOLD_OPTION),
             "{err}"
         );
     }

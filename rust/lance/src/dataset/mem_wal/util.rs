@@ -3,8 +3,7 @@
 
 //! Utility functions for MemWAL operations.
 
-use lance_io::object_store::ObjectStoreParams;
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 use uuid::Uuid;
 
 // ============================================================================
@@ -129,26 +128,6 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
     }
     let reversed = u64::from_str_radix(stem, 2).ok()?;
     Some(bit_reverse_u64(reversed))
-}
-
-/// Adapt the store params a base dataset was opened with for use on a URI
-/// *derived* from it (an SSTable under `_mem_wal/`).
-///
-/// The deprecated `object_store` binding pins a store to one location: given
-/// `Some((store, url))`, both `ObjectStore::from_uri_and_params` and
-/// `DatasetBuilder::build_object_store` take the path from `url` and ignore the
-/// URI they were asked to open. Carried onto a generation URI it would silently
-/// redirect the open — and, on the flush path, the write — at the base table
-/// itself. Drop it so the generation URI resolves its own store; everything
-/// else (storage options, wrapper, credentials, block size) still carries over.
-///
-/// Only the base's *own* URI may reuse the params verbatim.
-pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStoreParams {
-    #[allow(deprecated)]
-    ObjectStoreParams {
-        object_store: None,
-        ..params.clone()
-    }
 }
 
 /// Name of the legacy MemWAL directory, used when the index carries no `dir_id`.
@@ -442,41 +421,5 @@ mod tests {
         let handle = tokio::spawn(async move { reader.await_value().await });
         drop(cell);
         assert_eq!(handle.await.unwrap(), None);
-    }
-
-    /// The path-bound store binding is the only thing dropped — credentials and
-    /// storage options must still reach the generation's store.
-    #[test]
-    fn test_derived_store_params_drops_only_the_path_bound_store() {
-        let accessor = lance_io::object_store::StorageOptionsAccessor::with_static_options(
-            std::collections::HashMap::from([("access_key_id".to_string(), "key".to_string())]),
-        );
-        #[allow(deprecated)]
-        let params = ObjectStoreParams {
-            object_store: Some((
-                std::sync::Arc::new(object_store::memory::InMemory::new()),
-                url::Url::parse("memory:///base").unwrap(),
-            )),
-            block_size: Some(1234),
-            storage_options_accessor: Some(std::sync::Arc::new(accessor)),
-            ..Default::default()
-        };
-
-        let derived = derived_store_params(&params);
-
-        #[allow(deprecated)]
-        {
-            assert!(
-                derived.object_store.is_none(),
-                "a store pinned to the base path must not be reused for a generation URI"
-            );
-        }
-        assert_eq!(derived.block_size, Some(1234));
-        assert_eq!(
-            derived
-                .storage_options()
-                .and_then(|o| o.get("access_key_id")),
-            Some(&"key".to_string()),
-        );
     }
 }

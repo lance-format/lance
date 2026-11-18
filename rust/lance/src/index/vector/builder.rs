@@ -28,6 +28,7 @@ use futures::{
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::ROW_ID;
 use lance_core::datatypes::Schema;
+use lance_core::storage::path::Path;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID_FIELD, Result};
@@ -82,7 +83,6 @@ use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::IndexFile;
 use log::info;
-use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
@@ -537,7 +537,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
         Ok(Self {
-            store: dataset.object_store.as_ref().clone(),
+            store: dataset.storage.as_ref().clone(),
             column,
             index_dir,
             distance_type,
@@ -606,7 +606,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
         Ok(Self {
-            store: dataset.object_store.as_ref().clone(),
+            store: dataset.storage.as_ref().clone(),
             column,
             index_dir,
             distance_type: ivf_index.metric_type(),

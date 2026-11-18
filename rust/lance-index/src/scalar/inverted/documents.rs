@@ -18,11 +18,11 @@ use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use lance_core::cache::{CacheKey, CacheLoadOrigin, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 

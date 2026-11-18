@@ -1058,7 +1058,7 @@ async fn test_optimize_reports_segment_open_errors(
             .indices_dir()
             .join(segment.uuid.to_string())
             .join(file.path.as_str());
-        dataset.object_store.delete(&path).await.unwrap();
+        dataset.storage.delete(&path).await.unwrap();
     }
 
     let result = dataset.optimize_indices(&OptimizeOptions::default()).await;

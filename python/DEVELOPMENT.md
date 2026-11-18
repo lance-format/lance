@@ -334,7 +334,7 @@ maturin build --release \
 
 When an operation should run in parallel you typically need to specify how many threads
 to use. For example, as input to `StreamExt::buffered`. There are two numbers you can
-use. You can use `ObjectStore::io_parallelism` or `get_num_compute_intensive_cpus`.
+use. You can use `Storage::io_parallelism` or `get_num_compute_intensive_cpus`.
 
 Often, operations will do a little of both compute and I/O, and you will need to make
 a judgement call. If you are unsure, and you are doing any I/O, then picking the

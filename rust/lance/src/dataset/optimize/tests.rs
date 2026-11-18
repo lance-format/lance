@@ -440,7 +440,7 @@ async fn frag_reuse_watermarks(dataset: &Dataset) -> Vec<u64> {
 
 async fn stored_index(dataset: &Dataset, name: &str) -> IndexMetadata {
     read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )
@@ -492,8 +492,8 @@ impl CommitHandler for RaceBeforeRewrite {
         &self,
         manifest: &mut Manifest,
         indices: Option<Vec<IndexMetadata>>,
-        base_path: &object_store::path::Path,
-        object_store: &ObjectStore,
+        base_path: &lance_core::storage::path::Path,
+        storage: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
         transaction: Option<lance_table::format::Transaction>,
@@ -557,7 +557,7 @@ impl CommitHandler for RaceBeforeRewrite {
                 manifest,
                 indices,
                 base_path,
-                object_store,
+                storage,
                 manifest_writer,
                 naming_scheme,
                 transaction,
@@ -1157,7 +1157,7 @@ async fn uncached_listed_manifest(rebasing: &Dataset, version: u64) -> ManifestL
         .commit_handler
         .list_manifest_locations_since(
             &rebasing.base,
-            rebasing.object_store.as_ref(),
+            rebasing.storage.as_ref(),
             rebasing.manifest.version,
         )
         .try_filter(|location| std::future::ready(location.version == version))
@@ -1819,7 +1819,7 @@ async fn commit_overlay(
     let overlay_schema = dataset.schema().project_by_ids(fields, true);
     let filename = format!("{}.lance", Uuid::new_v4());
     let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
-    let obj_writer = dataset.object_store.create(&path).await.unwrap();
+    let obj_writer = dataset.storage.create(&path).await.unwrap();
     let file_version = LanceFileVersion::Stable.resolve();
     let mut writer = lance_file::versions::create_writer(
         file_version,

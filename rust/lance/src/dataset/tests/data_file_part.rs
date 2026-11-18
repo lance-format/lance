@@ -24,19 +24,15 @@ use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
 use lance_core::{
     Error,
     datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling},
-    utils::{
-        blob::blob_path,
-        tempfile::TempDir,
-        testing::{ProxyObjectStore, ProxyObjectStorePolicy},
-    },
+    utils::{blob::blob_path, tempfile::TempDir},
 };
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::ObjectStoreParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::testing::{DelayConfig, DelayedBackend, ProxyBackend, ProxyBackendPolicy};
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
-use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
@@ -209,7 +205,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
         parts.push(write_part(&dataset, &target, None, batch).await);
     }
 
-    assert_eq!(dataset.object_store.block_size(), block_size);
+    assert_eq!(dataset.storage.block_size(), block_size);
     assert!(parts.iter().all(|part| if block_size == 64 {
         part.size_bytes() > block_size as u64
     } else {
@@ -221,7 +217,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
     let requests = Arc::new(AtomicUsize::new(0));
     let completed = Mutex::new(HashSet::new());
     let active = active_opens.clone();
-    let mut completed_policy = ProxyObjectStorePolicy::new();
+    let mut completed_policy = ProxyBackendPolicy::new();
     completed_policy.set_before_policy(
         "complete_part_open_request",
         Arc::new(move |method, path| {
@@ -243,44 +239,45 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
             Ok(metadata)
         }),
     );
-    let delayed = Arc::new(ThrottledStore::new(
-        Arc::new(ProxyObjectStore::new(
-            dataset.object_store.inner.clone(),
-            Arc::new(Mutex::new(completed_policy)),
-        )),
-        ThrottleConfig::default(),
-    ));
-    let first_part = parts[0].file_name.clone();
-    let started = Mutex::new(HashSet::new());
-    let mut policy = ProxyObjectStorePolicy::new();
-    let active = active_opens.clone();
-    let peak = peak_opens.clone();
-    let request_count = requests.clone();
-    let throttle = delayed.clone();
-    policy.set_before_policy(
-        "observe_part_open_requests",
-        Arc::new(move |method, path| {
-            if method == "get_opts" {
-                request_count.fetch_add(1, Ordering::SeqCst);
-                // Force later parts to finish opening before the first input.
-                throttle.config_mut(|config| {
-                    config.wait_get_per_call = if path.as_ref().ends_with(&first_part) {
-                        Duration::from_millis(15)
-                    } else {
-                        Duration::from_millis(1)
-                    };
-                });
-                // Observe the first size-validation request for each part.
-                if started.lock().unwrap().insert(path.clone()) {
-                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(count, Ordering::SeqCst);
-                }
-            }
-            Ok(())
+    let completed_policy = Arc::new(Mutex::new(completed_policy));
+    Arc::make_mut(&mut dataset.storage).apply_wrapper(
+        &lance_io::utils::testing::TestWrappingObjectStore::new(|backend| {
+            let delayed = Arc::new(DelayedBackend::new(
+                Arc::new(ProxyBackend::new(backend, completed_policy.clone())),
+                DelayConfig::default(),
+            ));
+            let first_part = parts[0].file_name.clone();
+            let started = Mutex::new(HashSet::new());
+            let mut policy = ProxyBackendPolicy::new();
+            let active = active_opens.clone();
+            let peak = peak_opens.clone();
+            let request_count = requests.clone();
+            let throttle = delayed.clone();
+            policy.set_before_policy(
+                "observe_part_open_requests",
+                Arc::new(move |method, path| {
+                    if method == "get_opts" {
+                        request_count.fetch_add(1, Ordering::SeqCst);
+                        // Force later parts to finish opening before the first input.
+                        throttle.config_mut(|config| {
+                            config.wait_get_per_call = if path.as_ref().ends_with(&first_part) {
+                                Duration::from_millis(15)
+                            } else {
+                                Duration::from_millis(1)
+                            };
+                        });
+                        // Observe the first size-validation request for each part.
+                        if started.lock().unwrap().insert(path.clone()) {
+                            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(count, Ordering::SeqCst);
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+            Arc::new(ProxyBackend::new(delayed, Arc::new(Mutex::new(policy))))
         }),
     );
-    Arc::make_mut(&mut dataset.object_store).inner =
-        Arc::new(ProxyObjectStore::new(delayed, Arc::new(Mutex::new(policy))));
 
     let opened = DataFilePart::open_all(&dataset, &target, &parts)
         .await
@@ -301,7 +298,7 @@ async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] b
     }
     let peak = peak_opens.load(Ordering::SeqCst);
     assert!(
-        peak > 1 || dataset.object_store.io_parallelism() == 1,
+        peak > 1 || dataset.storage.io_parallelism() == 1,
         "independent part opens stayed serial"
     );
     assert!(
@@ -443,7 +440,7 @@ async fn managed_part_checks_real_file_before_creating_output(
     assert!(error.to_string().contains(message), "{error}");
     assert!(
         !dataset
-            .object_store
+            .storage
             .exists(&dataset.data_dir().join(target.file_name.as_str()))
             .await
             .unwrap()
@@ -508,7 +505,7 @@ async fn managed_part_rejects_invalid_descriptions_and_duplicate_inputs() {
     assert!(error.to_string().contains("duplicate part"), "{error}");
     assert!(
         !dataset
-            .object_store
+            .storage
             .exists(&dataset.data_dir().join(target.file_name.as_str()))
             .await
             .unwrap()
@@ -573,7 +570,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
         .join(assembled.path.as_str());
     assert!(
         dataset
-            .object_store(base_id)
+            .storage(base_id)
             .await
             .unwrap()
             .exists(&assembled_path)
@@ -594,7 +591,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("injected input failure"));
-    let store = dataset.object_store(base_id).await.unwrap();
+    let store = dataset.storage(base_id).await.unwrap();
     let data_dir = dataset.data_file_dir_for_base(base_id).unwrap();
     let staging = data_dir
         .clone()
@@ -742,7 +739,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
     assert_eq!(target.schema.as_ref(), dataset.schema());
     assert_eq!(target.base_id, base_id);
     let data_dir = dataset.data_file_dir_for_base(base_id).unwrap();
-    let store = dataset.object_store(base_id).await.unwrap();
+    let store = dataset.storage(base_id).await.unwrap();
     assert!(
         !store
             .exists(&data_dir.clone().join(target.file_name.as_str()))
@@ -764,7 +761,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
         .checkout_version(snapshot)
         .await
         .unwrap();
-    let store = dataset.object_store(base_id).await.unwrap();
+    let store = dataset.storage(base_id).await.unwrap();
     let blob_dir = data_dir
         .clone()
         .join(target.file_name.strip_suffix(".lance").unwrap());
@@ -863,7 +860,7 @@ async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
     let dataset = dataset_of(batch, LanceFileVersion::V2_2).await;
     let data_file = &only_fragment(&dataset).metadata.files[0];
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
+        dataset.storage.clone(),
         SchedulerConfig::default_for_testing(),
     );
     let file = scheduler
@@ -1034,7 +1031,7 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     assert!(error.to_string().contains("belongs to target"), "{error}");
     assert!(
         !dataset
-            .object_store
+            .storage
             .exists(&dataset.data_dir().join(other_target.file_name.as_str()))
             .await
             .unwrap()
@@ -1073,7 +1070,7 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
     let path = target
         .parts_dir(&dataset.data_dir())
         .join(part.file_name.as_str());
-    let store = dataset.object_store(None).await.unwrap();
+    let store = dataset.storage(None).await.unwrap();
     let original = store
         .read_object(&path)
         .await

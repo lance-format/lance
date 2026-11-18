@@ -14,13 +14,13 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use lance_arrow::ArrowFloatType;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{DistanceType, dot_u8::dot_u8_u64, l2_u8::l2_u8_u64};
 use lance_table::format::SelfDescribingFileReader;
 use num_traits::AsPrimitive;
-use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -224,11 +224,11 @@ impl ScalarQuantizationStorage {
     }
 
     pub async fn load(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(storage, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema

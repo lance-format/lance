@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{Attributes, ObjectMeta};
-use crate::storage::{Error, Result};
+use crate::object_store::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use http::Extensions;
@@ -170,7 +170,7 @@ impl GetResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Path;
+    use crate::object_store::Path;
 
     fn response(payload: GetResultPayload, range: Range<u64>, size: u64) -> GetResult {
         GetResult {

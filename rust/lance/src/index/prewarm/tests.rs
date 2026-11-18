@@ -32,7 +32,7 @@ use crate::utils::test::copy_test_data_to_tmp;
 #[case::credential_stores(false)]
 #[case::request_wrappers(true)]
 #[tokio::test]
-async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: bool) {
+async fn test_scalar_cache_uses_current_storage(#[case] request_wrappers: bool) {
     async fn search_ids(dataset: &Dataset, term: &str) -> Vec<i32> {
         let result = dataset
             .scan()
@@ -121,7 +121,7 @@ async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: b
     let mut requests = Vec::with_capacity(2);
     for (generation, wrapper) in [("a", &wrapper_a), ("b", &wrapper_b)] {
         let request = if request_wrappers {
-            dataset.with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>])
+            dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>])
         } else {
             let store_params = ObjectStoreParams {
                 storage_options_accessor: Some(Arc::new(
@@ -130,7 +130,7 @@ async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: b
                         format!("secret-generation-{generation}"),
                     )])),
                 )),
-                object_store_wrapper: Some(wrapper.clone()),
+                backend_wrappers: vec![wrapper.clone()],
                 ..Default::default()
             };
             let (store, _) = ObjectStore::from_uri_and_params(
@@ -140,20 +140,13 @@ async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: b
             )
             .await
             .unwrap();
-            dataset.with_object_store(store, Some(store_params))
+            dataset.with_storage(store, Some(store_params))
         };
         requests.push(request);
     }
     let dataset_a = &requests[0];
     let dataset_b = &requests[1];
-    assert!(!Arc::ptr_eq(
-        &dataset_a.object_store,
-        &dataset_b.object_store
-    ));
-    assert!(!Arc::ptr_eq(
-        &dataset_a.object_store.inner,
-        &dataset_b.object_store.inner
-    ));
+    assert!(!Arc::ptr_eq(&dataset_a.storage, &dataset_b.storage));
 
     let initial_metrics = LocalMetricsCollector::default();
     let initial = dataset_a
@@ -297,7 +290,7 @@ async fn test_request_wrappers_reload_legacy_fts_fixture() {
     for _ in 0..2 {
         let wrapper = Arc::new(RequestIndexStoreWrapper::new(format!("_indices/{uuid}")));
         let request =
-            dataset.with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+            dataset.with_backend_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
         let metrics = LocalMetricsCollector::default();
         let index = request
             .open_scalar_index("text", &uuid, &metrics)

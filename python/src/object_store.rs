@@ -11,13 +11,13 @@
 //!   `lance.dataset("myscheme://...")` dispatches through the new provider.
 //! - `PyObjectStoreProvider` is a bridge that adapts a built-in Rust provider
 //!   (currently just `MemoryStoreProvider`), a Python object that implements
-//!   the `new_store` protocol, or an `Arc<dyn ObjectStoreProvider>` produced
+//!   the `new_backend` protocol, or an `Arc<dyn ObjectStoreProvider>` produced
 //!   by a *separate* wheel and handed across a `PyCapsule`, to
 //!   `Arc<dyn ObjectStoreProvider>`.
 //!
 //! The Python-callable path is intentionally stubbed for this first cut: the
 //! full Python-to-Rust `ObjectStore` bridge (i.e. wrapping a Python-returned
-//! object as an `object_store::ObjectStore`) is a follow-up. The smoke test
+//! object as a Lance `StorageBackend`) is a follow-up. The smoke test
 //! against the built-in memory provider proves the registration + dispatch
 //! plumbing works end to end.
 //!
@@ -30,7 +30,7 @@
 //! no stable ABI, this is sound **only when both wheels are built in lockstep**:
 //! identical `rustc`, identical `lance-io` / `object_store` source, and
 //! identical resolved dependency versions, so the trait object's vtable and the
-//! types in `new_store`'s signature have the same layout on both sides. In
+//! types in `new_backend`'s signature have the same layout on both sides. In
 //! Phase I both wheels are built locally from the same branch and toolchain, so
 //! the constraint holds; distributing pre-built wheels that must interoperate
 //! is deferred (a packaging-phase concern).
@@ -43,9 +43,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods};
 
 use lance_io::object_store::providers::memory::MemoryStoreProvider;
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry,
-};
+use lance_io::object_store::{ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry};
 
 /// Name that every capsule passed to [`PyObjectStoreProvider::from_capsule`]
 /// must carry. External wheels create their capsule with this exact name so a
@@ -57,12 +55,12 @@ pub const PROVIDER_CAPSULE_NAME: &CStr = c"lance_object_store_provider";
 /// For the memory variant we short-circuit to a real Rust provider so the
 /// smoke test can prove the scheme-dispatch plumbing works. For the Python
 /// callable variant we hold a `Py<PyAny>` and (in a follow-up) will call
-/// `new_store(base_path, storage_options)` on it via the GIL.
+/// `new_backend(base_path, storage_options)` on it via the GIL.
 #[derive(Debug)]
 enum PyProviderBridge {
     /// Built-in `MemoryStoreProvider`, wrapped directly.
     Memory(MemoryStoreProvider),
-    /// A Python object implementing the `new_store(base_path, storage_options)`
+    /// A Python object implementing the `new_backend(base_path, storage_options)`
     /// protocol. Not yet dispatchable end-to-end (see module docstring).
     ///
     /// The wrapped `Py<PyAny>` is intentionally held even though we do not
@@ -74,13 +72,13 @@ enum PyProviderBridge {
 
 #[async_trait::async_trait]
 impl ObjectStoreProvider for PyProviderBridge {
-    async fn new_store(
+    async fn new_backend(
         &self,
         base_path: url::Url,
         params: &ObjectStoreParams,
-    ) -> lance_core::Result<ObjectStore> {
+    ) -> lance_core::Result<lance_io::object_store::BackendConfig> {
         match self {
-            Self::Memory(inner) => inner.new_store(base_path, params).await,
+            Self::Memory(inner) => inner.new_backend(base_path, params).await,
             Self::PyCallable(_) => Err(lance_core::Error::not_supported(
                 "PyObjectStoreProvider: the Python-callable bridge is not yet \
                  implemented. Use PyObjectStoreProvider.memory() for the current cut.",
@@ -96,7 +94,7 @@ impl ObjectStoreProvider for PyProviderBridge {
 ///
 /// 1. `_ObjectStoreProvider.from_capsule(capsule)` — **fully dispatches.**
 ///    Adopt an `Arc<dyn ObjectStoreProvider>` built by a separate,
-///    ABI-compatible wheel and handed over in a `PyCapsule`. `new_store` then
+///    ABI-compatible wheel and handed over in a `PyCapsule`. `new_backend` then
 ///    calls that provider's own Rust implementation directly — the
 ///    `PyProviderBridge` below is not involved. This is how an out-of-tree Rust
 ///    provider (e.g. an on-node NVMe cache) plugs in without living in the
@@ -106,10 +104,10 @@ impl ObjectStoreProvider for PyProviderBridge {
 ///    `MemoryStoreProvider`; registrable under any scheme and functional for
 ///    read/write. Primarily a test/reference vehicle.
 /// 3. `_ObjectStoreProvider(py_obj)` — **stub; does not dispatch yet.** Hold a
-///    Python object implementing `new_store(base_path, storage_options)`.
+///    Python object implementing `new_backend(base_path, storage_options)`.
 ///    Registration succeeds, but dispatch raises `not_supported`: the full
 ///    Python-to-Rust `ObjectStore` bridge (calling back into Python from
-///    `new_store` under the GIL) is a follow-up.
+///    `new_backend` under the GIL) is a follow-up.
 #[pyclass(name = "_ObjectStoreProvider", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct PyObjectStoreProvider {
@@ -118,7 +116,7 @@ pub struct PyObjectStoreProvider {
 
 #[pymethods]
 impl PyObjectStoreProvider {
-    /// Wrap a Python object implementing the `new_store(base_path, storage_options)`
+    /// Wrap a Python object implementing the `new_backend(base_path, storage_options)`
     /// protocol. Registration will succeed, but scheme-dispatch will raise until
     /// the full Python-to-Rust `ObjectStore` bridge is implemented.
     #[new]
@@ -129,7 +127,7 @@ impl PyObjectStoreProvider {
     }
 
     /// Return a provider backed by the built-in `MemoryStoreProvider`. Every
-    /// call to `new_store` allocates a fresh in-memory `object_store::InMemory`;
+    /// call to `new_backend` allocates a fresh in-memory `object_store::InMemory`;
     /// the enclosing `ObjectStoreRegistry` caches the resulting `ObjectStore`
     /// so writers and readers using the same scheme share storage as long as
     /// something holds a strong reference.

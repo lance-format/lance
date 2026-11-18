@@ -55,11 +55,11 @@ pub(super) async fn open_ledger(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> Result<Arc<FragReuseLedger>> {
-    let store = dataset.object_store_for_index(index).await?;
+    let store = dataset.storage_for_index(index).await?;
     let key = LedgerKey {
         uuid: index.uuid,
         version: index.index_version,
-        store: store.store_prefix.clone(),
+        store: store.store_prefix().to_owned(),
         directory: dataset.indice_files_dir(index)?.to_string(),
     };
     dataset
@@ -72,7 +72,7 @@ pub(super) async fn open_ledger(
 struct MappingKey {
     fingerprint: [u8; 32],
     directory: String,
-    // In-memory only. The cached reader retains this ObjectStore, preventing
+    // In-memory only. The cached reader retains this Storage, preventing
     // pointer reuse while the entry exists. Store rotation gets a fresh reader.
     binding: u64,
 }
@@ -173,7 +173,7 @@ pub async fn open_mapping(
                     .extract_path(dataset.session.store_registry())?,
             };
             let directory = base.join("_fri").join(reference.map_id.as_str());
-            let store = dataset.object_store(reference.base_id).await?;
+            let store = dataset.storage(reference.base_id).await?;
             (
                 MappingKey {
                     fingerprint: *transition.fingerprint(),

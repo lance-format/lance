@@ -733,13 +733,7 @@ pub(super) async fn cleanup_new_column_data_files(
         .collect::<Vec<_>>();
 
     let dataset = first_fragment.dataset();
-    cleanup_data_fragments(
-        &dataset.object_store,
-        &dataset.base,
-        None,
-        &fragments_to_cleanup,
-    )
-    .await;
+    cleanup_data_fragments(&dataset.storage, &dataset.base, None, &fragments_to_cleanup).await;
 }
 
 struct AddColumnFragments {
@@ -6413,7 +6407,7 @@ mod test {
             };
             let metadata_key = IndexMetadataKey {
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
+                store_identity: dataset.storage.store_prefix(),
                 e_tag: dataset.manifest_location.e_tag.as_deref(),
             };
             dataset

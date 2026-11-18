@@ -230,7 +230,7 @@ async fn test_shallow_clone_loads_external_frag_reuse_details() {
             .load()
             .await
             .unwrap();
-        let store = fresh.object_store(clone_meta.base_id).await.unwrap();
+        let store = fresh.storage(clone_meta.base_id).await.unwrap();
         store.io_stats_incremental();
         for load in 0..2 {
             let details = load_frag_reuse_index_details(&fresh, &clone_meta)
@@ -1836,9 +1836,9 @@ async fn test_deferred_compaction_writes_reuse_details_once(
         .await
         .unwrap();
     let dirs_before = reuse_details_dirs(dir.as_str());
-    dataset.object_store.io_stats_incremental();
+    dataset.storage.io_stats_incremental();
     commit_one(&mut dataset, result, &options).await.unwrap();
-    let stats = dataset.object_store.io_stats_incremental();
+    let stats = dataset.storage.io_stats_incremental();
 
     assert_eq!(reuse_details_requests(&stats, "put"), 1);
     // With a cache, only the stored history is read, once.

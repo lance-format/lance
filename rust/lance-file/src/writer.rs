@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::decoder::{ColumnInfo, PageEncoding};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
 
@@ -150,20 +150,20 @@ impl From<versions::v2_3::Writer> for FileWriter {
 
 impl FileWriter {
     /// Spill page metadata to a sidecar file.
-    pub fn with_page_metadata_spill(self, object_store: Arc<ObjectStore>, path: Path) -> Self {
+    pub fn with_page_metadata_spill(self, storage: Arc<ObjectStore>, path: Path) -> Self {
         match self {
-            Self::V2_0(writer) => Self::V2_0(Box::new(
-                (*writer).with_page_metadata_spill(object_store, path),
-            )),
-            Self::V2_1(writer) => Self::V2_1(Box::new(
-                (*writer).with_page_metadata_spill(object_store, path),
-            )),
-            Self::V2_2(writer) => Self::V2_2(Box::new(
-                (*writer).with_page_metadata_spill(object_store, path),
-            )),
-            Self::V2_3(writer) => Self::V2_3(Box::new(
-                (*writer).with_page_metadata_spill(object_store, path),
-            )),
+            Self::V2_0(writer) => {
+                Self::V2_0(Box::new((*writer).with_page_metadata_spill(storage, path)))
+            }
+            Self::V2_1(writer) => {
+                Self::V2_1(Box::new((*writer).with_page_metadata_spill(storage, path)))
+            }
+            Self::V2_2(writer) => {
+                Self::V2_2(Box::new((*writer).with_page_metadata_spill(storage, path)))
+            }
+            Self::V2_3(writer) => {
+                Self::V2_3(Box::new((*writer).with_page_metadata_spill(storage, path)))
+            }
         }
     }
 

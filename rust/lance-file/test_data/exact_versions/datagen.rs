@@ -105,7 +105,7 @@ async fn write_current_fixture(
     schema: &LanceSchema,
 ) -> Result<Vec<u8>, DynError> {
     let fs = FsFixture::default();
-    let object_writer = fs.object_store.create(&fs.tmp_path).await?;
+    let object_writer = fs.storage.create(&fs.tmp_path).await?;
     let mut writer = FileWriter::try_new(
         object_writer,
         schema.clone(),
@@ -122,7 +122,7 @@ async fn write_current_fixture(
     }
     let summary = writer.finish().await?;
     Ok(fs
-        .object_store
+        .storage
         .open(&fs.tmp_path)
         .await?
         .get_range(0..summary.size_bytes as usize)
@@ -133,7 +133,7 @@ async fn write_current_fixture(
 async fn write_v1_fixture(batch: &RecordBatch, schema: &LanceSchema) -> Result<Vec<u8>, DynError> {
     let fs = FsFixture::default();
     let mut writer = V1Writer::<NoManifest>::try_new(
-        fs.object_store.as_ref(),
+        fs.storage.as_ref(),
         &fs.tmp_path,
         schema.clone(),
         &V1WriterOptions {
@@ -147,7 +147,7 @@ async fn write_v1_fixture(batch: &RecordBatch, schema: &LanceSchema) -> Result<V
     }
     let summary = writer.finish().await?;
     Ok(fs
-        .object_store
+        .storage
         .open(&fs.tmp_path)
         .await?
         .get_range(0..summary.size_bytes as usize)

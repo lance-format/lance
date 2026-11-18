@@ -869,7 +869,7 @@ mod tests {
                     .data_file_dir(file)
                     .unwrap()
                     .join(file.path.as_str());
-                let bytes = written.object_store.read_one_all(&path).await.unwrap();
+                let bytes = written.storage.read_one_all(&path).await.unwrap();
                 let spans: Vec<_> = payloads
                     .iter()
                     .filter_map(|payload| {
@@ -887,7 +887,7 @@ mod tests {
         }
         assert_eq!(found, payloads.len());
         let dataset = Arc::new(Dataset::open(&dir).await.unwrap());
-        dataset.object_store.io_stats_incremental();
+        dataset.storage.io_stats_incremental();
         let mut scanner = dataset.scan();
         if nonempty {
             scanner
@@ -951,7 +951,7 @@ mod tests {
                 vec![None, Some(0), Some(2), Some(2)]
             );
         }
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = dataset.storage.io_stats_incremental();
         assert!(stats.read_iops > 0);
         for request in &stats.requests {
             if let Some(payloads) = forbidden.get(&request.path) {

@@ -1008,8 +1008,8 @@ pub(crate) async fn infer_scalar_index_details(
     let bitmap_page_lookup = index_dir.clone().join(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.clone().join(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.clone().join(INVERT_LIST_FILE);
-    let object_store = dataset.object_store_for_index(index).await?;
-    let index_details = if object_store.exists(&inverted_list_lookup).await? {
+    let storage = dataset.storage_for_index(index).await?;
+    let index_details = if storage.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
@@ -1024,11 +1024,11 @@ pub(crate) async fn infer_scalar_index_details(
             Some(prost_types::Any::from_msg(&details).unwrap())
         };
         parse_params().await.unwrap_or(default_details)
-    } else if object_store.exists(&legacy_inverted_list_lookup).await? {
+    } else if storage.exists(&legacy_inverted_list_lookup).await? {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else if let DataType::List(_) | DataType::LargeList(_) = col.data_type() {
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
-    } else if object_store.exists(&bitmap_page_lookup).await? {
+    } else if storage.exists(&bitmap_page_lookup).await? {
         prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()

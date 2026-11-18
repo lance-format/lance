@@ -20,8 +20,8 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
-use object_store::path::Path;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;
@@ -32,7 +32,7 @@ use crate::object_writer::WriteResult;
 use crate::traits::{ByteStream, Reader, Writer};
 use crate::utils::tracking_store::IOTracker;
 
-/// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
+/// Convert an [`lance_core::storage::path::Path`] to a [`std::path::Path`].
 pub fn to_local_path(path: &Path) -> String {
     if cfg!(windows) {
         path.to_string()
@@ -68,7 +68,7 @@ pub(crate) fn create_dir_all_durable(parent: &std::path::Path) -> std::io::Resul
     Ok(())
 }
 
-/// Recursively remove a directory, specified by [`object_store::path::Path`].
+/// Recursively remove a directory, specified by [`lance_core::storage::path::Path`].
 pub fn remove_dir_all(path: &Path) -> Result<()> {
     std::fs::remove_dir_all(to_local_path(path)).map_err(|err| match err.kind() {
         ErrorKind::NotFound => Error::not_found(path.to_string()),
@@ -99,7 +99,7 @@ pub(crate) fn remove_empty_dirs(
     let mut discovered_dirs = Vec::new();
     let mut file_bearing_roots = HashSet::new();
     let mut first_error = None;
-    while let Some((local_dir, object_store_dir, index_root)) = pending_dirs.pop() {
+    while let Some((local_dir, storage_dir, index_root)) = pending_dirs.pop() {
         let entries = match std::fs::read_dir(&local_dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
@@ -118,7 +118,7 @@ pub(crate) fn remove_empty_dirs(
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let child = object_store_dir.clone().join(name);
+            let child = storage_dir.clone().join(name);
             if retained_dirs.contains(&child) {
                 continue;
             }
@@ -151,7 +151,7 @@ pub(crate) fn remove_empty_dirs(
     }
 
     discovered_dirs.sort_unstable_by_key(|(_, path, _, _)| std::cmp::Reverse(path.parts_count()));
-    for (local_dir, object_store_dir, index_root, is_old_enough) in discovered_dirs {
+    for (local_dir, storage_dir, index_root, is_old_enough) in discovered_dirs {
         if file_bearing_roots.contains(&index_root) {
             continue;
         }
@@ -164,7 +164,7 @@ pub(crate) fn remove_empty_dirs(
                 continue;
             }
         }
-        let is_verified = verified_dirs.contains(&object_store_dir);
+        let is_verified = verified_dirs.contains(&storage_dir);
         if !is_verified && !is_old_enough {
             continue;
         }
@@ -225,13 +225,16 @@ pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
 /// caller's metrics recording for exactly the failure worth counting.
 pub(crate) async fn join_local_io<T>(
     handle: tokio::task::JoinHandle<std::io::Result<T>>,
-) -> object_store::Result<T> {
+) -> crate::object_store::Result<T> {
     match handle.await {
-        Ok(result) => result.map_err(|err| object_store::Error::Generic {
+        Ok(result) => result.map_err(|err| crate::object_store::Error::Generic {
             store: "LocalFileSystem",
             source: err.into(),
         }),
-        Err(err) => Err(err.into()),
+        Err(err) => Err(crate::object_store::Error::Generic {
+            store: "local",
+            source: Box::new(err),
+        }),
     }
 }
 
@@ -269,8 +272,8 @@ impl LocalObjectReader {
         known_size: Option<usize>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.as_ref().to_owned();
-        let object_store_path = Path::from_filesystem_path(&path)?;
-        Self::open(&object_store_path, block_size, known_size).await
+        let storage_path = Path::from_filesystem_path(&path)?;
+        Self::open(&storage_path, block_size, known_size).await
     }
 
     /// Open a local object reader, with default prefetch size.
@@ -327,7 +330,7 @@ impl Reader for LocalObjectReader {
     }
 
     /// Returns the file size.
-    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
         Box::pin(async move {
             let file = self.file.clone();
             self.size
@@ -347,7 +350,10 @@ impl Reader for LocalObjectReader {
 
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
-    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+    fn get_range(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'static, crate::object_store::Result<Bytes>> {
         let file = self.file.clone();
         let io_tracker = self.io_tracker.clone();
         let path = self.path.clone();
@@ -381,7 +387,7 @@ impl Reader for LocalObjectReader {
 
     /// Reads the entire file.
     #[instrument(level = "debug", skip(self))]
-    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+    fn get_all(&self) -> BoxFuture<'_, crate::object_store::Result<Bytes>> {
         Box::pin(async move {
             let mut file = self.file.clone();
             let io_tracker = self.io_tracker.clone();
@@ -405,7 +411,7 @@ impl Reader for LocalObjectReader {
         })
     }
 
-    fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+    fn get_stream(&self) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
         Box::pin(async move {
             let size = self.size().await?;
             Ok(stream_local_range(
@@ -421,7 +427,7 @@ impl Reader for LocalObjectReader {
     fn get_range_stream(
         &self,
         range: Range<usize>,
-    ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+    ) -> BoxFuture<'_, crate::object_store::Result<ByteStream>> {
         let file = self.file.clone();
         let path = self.path.clone();
         let io_tracker = self.io_tracker.clone();

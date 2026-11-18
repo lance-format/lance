@@ -288,7 +288,7 @@ fn require_same_snapshot(producer: &Dataset, consumer: &Dataset) -> DataFusionRe
     // handles; a decoder resolves the pinned table once for the whole corpus.
     if producer.uri() != consumer.uri()
         || !Arc::ptr_eq(&producer.manifest, &consumer.manifest)
-        || !Arc::ptr_eq(&producer.object_store, &consumer.object_store)
+        || !Arc::ptr_eq(&producer.storage, &consumer.storage)
     {
         return Err(DataFusionError::Plan(format!(
             "FTS corpus branches must share an opened dataset snapshot (producer version {}, consumer version {})",

@@ -16,10 +16,10 @@ use arrow_schema::{DataType, Field, Schema};
 use itertools::Itertools;
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
+use lance_core::storage::path::Path;
 use lance_datagen::{RowCount, array};
 use lance_index::scalar::inverted::flat_full_text_search;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
-use object_store::path::Path;
 
 #[tokio::main]
 async fn main() {

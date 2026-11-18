@@ -26,6 +26,7 @@ use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::storage::path::Path;
 use lance_core::{
     Error, ROW_ADDR, Result,
     cache::{
@@ -38,7 +39,6 @@ use lance_core::{
 use lance_io::object_store::ObjectStore;
 use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
@@ -1717,12 +1717,12 @@ async fn drain_same_key_bitmaps(
 }
 
 async fn list_bitmap_shard_files(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: &Path,
     progress: &dyn IndexBuildProgress,
 ) -> Result<Vec<String>> {
     let mut shard_files = Vec::new();
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
+    let mut list_stream = storage.list(Some(index_dir.clone()));
     while let Some(item) = list_stream.next().await {
         match item {
             Ok(meta) => {
@@ -2128,7 +2128,7 @@ impl BitmapIndexPlugin {
 }
 
 pub async fn merge_index_files(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     index_dir: &Path,
     store: Arc<dyn IndexStore>,
     progress: Arc<dyn IndexBuildProgress>,
@@ -2136,7 +2136,7 @@ pub async fn merge_index_files(
     progress
         .stage_start("scan_bitmap_shards", None, "files")
         .await?;
-    let shard_files = list_bitmap_shard_files(object_store, index_dir, progress.as_ref()).await?;
+    let shard_files = list_bitmap_shard_files(storage, index_dir, progress.as_ref()).await?;
     progress.stage_complete("scan_bitmap_shards").await?;
 
     BitmapIndexPlugin::merge_shards(store.as_ref(), &shard_files, progress).await?;
@@ -5048,12 +5048,12 @@ mod tests {
         const KEYS: u64 = 2_000;
 
         async fn build(
-            object_store: &Arc<ObjectStore>,
+            storage: &Arc<ObjectStore>,
             first_row: u64,
         ) -> (TempObjDir, Arc<BitmapIndex>) {
             let tmpdir = TempObjDir::default();
             let store = Arc::new(LanceIndexStore::new(
-                object_store.clone(),
+                storage.clone(),
                 tmpdir.clone(),
                 Arc::new(LanceCache::no_cache()),
             ));
@@ -5068,23 +5068,23 @@ mod tests {
             (tmpdir, index)
         }
 
-        let object_store = Arc::new(ObjectStore::local());
-        let (_left_dir, left) = build(&object_store, 0).await;
-        let (_right_dir, right) = build(&object_store, KEYS).await;
+        let storage = Arc::new(ObjectStore::local());
+        let (_left_dir, left) = build(&storage, 0).await;
+        let (_right_dir, right) = build(&storage, KEYS).await;
 
         // Baseline: loading the bitmaps one key at a time costs a request per key.
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         for key in left.index_map.keys() {
             left.load_bitmap(key, None).await.unwrap();
         }
-        let per_key_iops = object_store.io_stats_incremental().read_iops;
+        let per_key_iops = storage.io_stats_incremental().read_iops;
         assert!(
             per_key_iops >= KEYS,
             "expected >= {KEYS} requests for per-key reads, got {per_key_iops}"
         );
 
         let (_dest_dir, dest_store) = test_util::index_store();
-        object_store.io_stats_incremental();
+        storage.io_stats_incremental();
         BitmapIndex::merge_segments(
             &[left, right],
             utf8_value_stream(std::iter::empty::<Option<&str>>(), std::iter::empty()),
@@ -5093,7 +5093,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let merge_iops = object_store.io_stats_incremental().read_iops;
+        let merge_iops = storage.io_stats_incremental().read_iops;
         assert!(
             merge_iops < KEYS / 100,
             "merging two sources of {KEYS} keys issued {merge_iops} requests \

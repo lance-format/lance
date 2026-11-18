@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::StorageBackend;
 use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
@@ -19,8 +20,8 @@ use futures::{
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, error::CloneableError};
-use object_store::ObjectStoreExt;
-use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
+
+use crate::object_store::{GetOptions, GetResult, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
@@ -37,7 +38,7 @@ trait StaticGetRange {
 /// A wrapper around an object store and a path that implements a static
 /// get_range method by assuming self is stored in an Arc.
 struct GetRequest {
-    object_store: Arc<dyn ObjectStore>,
+    storage: Arc<dyn StorageBackend>,
     path: Path,
     options: GetOptions,
 }
@@ -51,7 +52,7 @@ impl StaticGetRange for Arc<GetRequest> {
         let store_and_path = self.clone();
         Box::pin(async move {
             store_and_path
-                .object_store
+                .storage
                 .get_opts(&store_and_path.path, store_and_path.options.clone())
                 .await
         })
@@ -64,7 +65,7 @@ impl StaticGetRange for Arc<GetRequest> {
 #[derive(Debug)]
 pub struct CloudObjectReader {
     // Object Store.
-    pub object_store: Arc<dyn ObjectStore>,
+    pub storage: Arc<dyn StorageBackend>,
     // File path
     pub path: Path,
     // File size, if known.
@@ -85,14 +86,14 @@ impl DeepSizeOf for CloudObjectReader {
 impl CloudObjectReader {
     /// Create an ObjectReader from URI
     pub fn new(
-        object_store: Arc<dyn ObjectStore>,
+        storage: Arc<dyn StorageBackend>,
         path: Path,
         block_size: usize,
         known_size: Option<usize>,
         download_retry_count: usize,
     ) -> Result<Self> {
         Ok(Self {
-            object_store,
+            storage,
             path,
             size: OnceCell::new_with(known_size),
             block_size,
@@ -138,7 +139,7 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
 // However, this failure is pretty common (e.g. timeout) and we want to retry in these
 // situations.  In addition, we provide additional logging information in these
 // failures cases.
-async fn do_get_with_outer_retry<E: From<object_store::Error> + From<Error>>(
+async fn do_get_with_outer_retry<E: From<crate::object_store::Error> + From<Error>>(
     download_retry_count: usize,
     get_request: Arc<GetRequest>,
     expected_size: Option<usize>,
@@ -230,12 +231,11 @@ impl Reader for CloudObjectReader {
     }
 
     /// Object/File Size.
-    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+    fn size(&self) -> BoxFuture<'_, crate::object_store::Result<usize>> {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
-                    let meta =
-                        do_with_retry(|| Box::pin(self.object_store.head(&self.path))).await?;
+                    let meta = do_with_retry(|| Box::pin(self.storage.head(&self.path))).await?;
                     Ok(meta.size as usize)
                 })
                 .await
@@ -254,16 +254,16 @@ impl Reader for CloudObjectReader {
         // retries the request, and the outer loop retries a body that stops
         // partway.
         let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
+            storage: self.storage.clone(),
             path: self.path.clone(),
             options: GetOptions {
-                range: Some(range.clone().into()),
+                range: Some(range.clone()),
                 ..Default::default()
             },
         });
         let download_retry_count = self.download_retry_count;
         Box::pin(async move {
-            do_get_with_outer_retry::<object_store::Error>(
+            do_get_with_outer_retry::<crate::object_store::Error>(
                 download_retry_count,
                 get_request,
                 None,
@@ -276,12 +276,12 @@ impl Reader for CloudObjectReader {
     #[instrument(level = "debug", skip_all)]
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
         let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
+            storage: self.storage.clone(),
             path: self.path.clone(),
             options: GetOptions::default(),
         });
         Box::pin(async move {
-            do_get_with_outer_retry::<object_store::Error>(
+            do_get_with_outer_retry::<crate::object_store::Error>(
                 self.download_retry_count,
                 get_request,
                 None,
@@ -293,7 +293,7 @@ impl Reader for CloudObjectReader {
 
     fn get_stream(&self) -> BoxFuture<'_, OSResult<ByteStream>> {
         let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
+            storage: self.storage.clone(),
             path: self.path.clone(),
             options: GetOptions::default(),
         });
@@ -306,16 +306,13 @@ impl Reader for CloudObjectReader {
 
     fn get_range_stream(&self, range: Range<usize>) -> BoxFuture<'_, OSResult<ByteStream>> {
         let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
+            storage: self.storage.clone(),
             path: self.path.clone(),
             options: GetOptions {
-                range: Some(
-                    Range {
-                        start: range.start as u64,
-                        end: range.end as u64,
-                    }
-                    .into(),
-                ),
+                range: Some(Range {
+                    start: range.start as u64,
+                    end: range.end as u64,
+                }),
                 ..Default::default()
             },
         });
@@ -367,7 +364,7 @@ impl std::fmt::Debug for SmallReaderState {
 
 impl SmallReader {
     pub fn new(
-        store: Arc<dyn ObjectStore>,
+        store: Arc<dyn StorageBackend>,
         path: Path,
         download_retry_count: usize,
         size: usize,
@@ -382,13 +379,13 @@ impl SmallReader {
     /// Admit a checkpoint length before exposing the reader to its caller.
     /// Ordinary known-size readers do not require this stricter contract.
     pub(crate) async fn open_with_expected_size(
-        store: Arc<dyn ObjectStore>,
+        store: Arc<dyn StorageBackend>,
         path: Path,
         download_retry_count: usize,
         expected_size: usize,
     ) -> Result<Self> {
         let request = Arc::new(GetRequest {
-            object_store: store,
+            storage: store,
             path: path.clone(),
             options: GetOptions::default(),
         });
@@ -469,11 +466,14 @@ impl Reader for SmallReader {
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let inner = self.inner.clone();
         Box::pin(async move {
-            let bytes = inner.wait().await.map_err(object_store::Error::from)?;
+            let bytes = inner
+                .wait()
+                .await
+                .map_err(crate::object_store::Error::from)?;
             let start = range.start;
             let end = range.end;
             if start >= bytes.len() || end > bytes.len() {
-                return Err(object_store::Error::Generic {
+                return Err(crate::object_store::Error::Generic {
                     store: "memory",
                     source: format!(
                         "Invalid range {}..{} for object '{}' of size {} bytes",
@@ -490,7 +490,12 @@ impl Reader for SmallReader {
     }
 
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
-        Box::pin(async move { self.inner.wait().await.map_err(object_store::Error::from) })
+        Box::pin(async move {
+            self.inner
+                .wait()
+                .await
+                .map_err(crate::object_store::Error::from)
+        })
     }
 }
 
@@ -568,7 +573,7 @@ impl DeepSizeOf for SmallReader {
 /// data is actually re-read.
 #[derive(Debug)]
 pub struct LazyReader {
-    object_store: Arc<crate::object_store::ObjectStore>,
+    storage: Arc<crate::object_store::ObjectStore>,
     path: Path,
     size: OnceCell<usize>,
     block_size: usize,
@@ -581,14 +586,14 @@ impl LazyReader {
     /// `known_size`, when given, saves the HEAD request that the first
     /// [`Reader::size`] call would otherwise make.
     pub fn new(
-        object_store: Arc<crate::object_store::ObjectStore>,
+        storage: Arc<crate::object_store::ObjectStore>,
         path: Path,
         known_size: Option<usize>,
     ) -> Self {
         Self {
-            block_size: object_store.block_size(),
-            io_parallelism: object_store.io_parallelism(),
-            object_store,
+            block_size: storage.block_size(),
+            io_parallelism: storage.io_parallelism(),
+            storage,
             path,
             size: OnceCell::new_with(known_size),
         }
@@ -612,8 +617,7 @@ impl Reader for LazyReader {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async {
-                    let meta = do_with_retry(|| Box::pin(self.object_store.inner.head(&self.path)))
-                        .await?;
+                    let meta = do_with_retry(|| Box::pin(self.storage.stat(&self.path))).await?;
                     Ok(meta.size as usize)
                 })
                 .await
@@ -622,25 +626,25 @@ impl Reader for LazyReader {
     }
 
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let object_store = self.object_store.clone();
+        let storage = self.storage.clone();
         let path = self.path.clone();
         Box::pin(async move {
-            let reader = object_store
+            let reader = storage
                 .open(&path)
                 .await
-                .map_err(object_store::Error::from)?;
+                .map_err(crate::object_store::Error::from)?;
             reader.get_range(range).await
         })
     }
 
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
-        let object_store = self.object_store.clone();
+        let storage = self.storage.clone();
         let path = self.path.clone();
         Box::pin(async move {
-            let reader = object_store
+            let reader = storage
                 .open(&path)
                 .await
-                .map_err(object_store::Error::from)?;
+                .map_err(crate::object_store::Error::from)?;
             reader.get_all().await
         })
     }
@@ -658,14 +662,13 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use futures::stream::BoxStream;
-    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-    use object_store::memory::InMemory;
-    use object_store::{
-        Attributes, CopyOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-        ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-        Result as OSResult, path::Path,
+    use crate::object_store::{
+        Attributes, CopyOptions, GetResult, GetResultPayload, ListResult, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, path::Path,
     };
+    use crate::utils::testing::{ProxyBackend, ProxyBackendPolicy};
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
     use rstest::rstest;
 
     use super::*;
@@ -707,7 +710,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ObjectStore for PartialBodyStore {
+    impl crate::object_store::StorageBackend for PartialBodyStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            options: crate::object_store::PaginatedListOptions,
+        ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+            let _ = (prefix, options);
+            Err(crate::object_store::Error::NotSupported {
+                source: "native pagination is unavailable".into(),
+            })
+        }
+
         async fn put_opts(
             &self,
             _location: &Path,
@@ -720,7 +734,7 @@ mod tests {
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
-        ) -> OSResult<Box<dyn MultipartUpload>> {
+        ) -> OSResult<Box<dyn crate::object_store::backend::MultipartUpload>> {
             unimplemented!("put_multipart_opts is not used by these tests")
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -731,11 +745,14 @@ mod tests {
             let range = self.returned_range.clone().unwrap_or_else(|| {
                 options
                     .range
-                    .map(|r| r.as_range(self.metadata_size).unwrap())
+                    .map(|r| {
+                        assert!(r.start < r.end && r.start < self.metadata_size);
+                        r.start..r.end.min(self.metadata_size)
+                    })
                     .unwrap_or(0..self.metadata_size)
             });
             let chunks = if request < self.failed_downloads {
-                vec![Err(object_store::Error::Generic {
+                vec![Err(crate::object_store::Error::Generic {
                     store: "PartialBodyStore",
                     source: "connection reset".into(),
                 })]
@@ -788,9 +805,61 @@ mod tests {
         async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
             unimplemented!("copy_opts is not used by these tests")
         }
+        async fn get_ranges(
+            &self,
+            location: &crate::object_store::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> crate::object_store::Result<Vec<bytes::Bytes>> {
+            futures::future::try_join_all(ranges.iter().map(|range| {
+                (self as &dyn crate::object_store::StorageBackend)
+                    .get_range(location, range.clone())
+            }))
+            .await
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&crate::object_store::Path>,
+            offset: &crate::object_store::Path,
+        ) -> futures::stream::BoxStream<
+            'static,
+            crate::object_store::Result<crate::object_store::ObjectMeta>,
+        > {
+            let offset = offset.clone();
+            Box::pin(futures::TryStreamExt::try_filter(
+                self.list(prefix),
+                move |meta| futures::future::ready(meta.location > offset),
+            ))
+        }
+        async fn rename_opts(
+            &self,
+            from: &crate::object_store::Path,
+            to: &crate::object_store::Path,
+            options: crate::object_store::RenameOptions,
+        ) -> crate::object_store::Result<()> {
+            let mode = match options.target_mode {
+                crate::object_store::RenameTargetMode::Create => {
+                    crate::object_store::CopyMode::Create
+                }
+                crate::object_store::RenameTargetMode::Overwrite => {
+                    crate::object_store::CopyMode::Overwrite
+                }
+            };
+            self.copy_opts(
+                from,
+                to,
+                crate::object_store::CopyOptions {
+                    mode,
+                    extensions: options.extensions,
+                },
+            )
+            .await?;
+            (self as &dyn crate::object_store::StorageBackend)
+                .delete(from)
+                .await
+        }
     }
 
-    fn reader(store: Arc<dyn ObjectStore>, download_retry_count: usize) -> CloudObjectReader {
+    fn reader(store: Arc<dyn StorageBackend>, download_retry_count: usize) -> CloudObjectReader {
         CloudObjectReader::new(
             store,
             Path::from("test/data.lance"),
@@ -830,7 +899,7 @@ mod tests {
         // succeed, and none of these do.
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = requests.clone();
-        let mut policy = ProxyObjectStorePolicy::new();
+        let mut policy = ProxyBackendPolicy::new();
         policy.set_before_policy(
             "fail_every_request",
             Arc::new(move |_, _| {
@@ -838,13 +907,53 @@ mod tests {
                 Err(Error::io("connection reset"))
             }),
         );
-        let store = ProxyObjectStore::new(Arc::new(InMemory::new()), Arc::new(Mutex::new(policy)));
+        let store = ProxyBackend::new(
+            crate::object_store::backend::native::from_object_store(Arc::new(
+                object_store::memory::InMemory::new(),
+            )),
+            Arc::new(Mutex::new(policy)),
+        );
         let reader = reader(Arc::new(store), 10);
 
         reader.get_range(0..128).await.unwrap_err();
 
         assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
+    #[rstest]
+    #[tokio::test]
+    async fn cached_readers_keep_missing_object_as_io(#[values(false, true)] lazy: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let reader: Box<dyn Reader> = if lazy {
+            Box::new(LazyReader::new(
+                Arc::new(crate::object_store::ObjectStore::local()),
+                Path::from_absolute_path(dir.path().join("missing")).unwrap(),
+                None,
+            ))
+        } else {
+            Box::new(SmallReader::new(
+                crate::object_store::backend::native::from_object_store(Arc::new(
+                    ::object_store::memory::InMemory::new(),
+                )),
+                Path::from("missing"),
+                0,
+                1,
+            ))
+        };
+        for error in [
+            reader.get_all().await.unwrap_err(),
+            reader.get_range(0..1).await.unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, crate::object_store::Error::Generic { .. }),
+                "{error:?}"
+            );
+            assert!(matches!(
+                lance_core::Error::from(error),
+                lance_core::Error::IO { .. }
+            ));
+        }
+    }
+
     #[rstest]
     #[case::same_size(1024, None)]
     #[case::stale_hint(1023, None)]
@@ -862,7 +971,9 @@ mod tests {
             ..Default::default()
         });
         let mut store = crate::object_store::ObjectStore::memory();
-        store.inner = inner.clone();
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| inner.clone(),
+        ));
         let reader = store
             .open_with_size(&Path::from("part"), known_size)
             .await
@@ -953,7 +1064,8 @@ mod tests {
     #[case::grown(5)]
     #[tokio::test]
     async fn small_reader_checks_replaced_object_on_first_read(#[case] size: usize) {
-        let store = Arc::new(InMemory::new());
+        let store =
+            crate::object_store::backend::native::from_object_store(Arc::new(InMemory::new()));
         let path = Path::from("part");
         store
             .put(&path, Bytes::from_static(b"old!").into())
@@ -991,7 +1103,9 @@ mod tests {
             failed_downloads: 0,
             ..Default::default()
         });
-        store.inner = inner.clone();
+        store.apply_wrapper(&crate::utils::testing::TestWrappingObjectStore::new(
+            |_backend| inner.clone(),
+        ));
         let reader = store
             .open_with_expected_size(&Path::from("part"), size as u64)
             .await

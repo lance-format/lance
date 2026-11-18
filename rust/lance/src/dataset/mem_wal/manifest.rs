@@ -39,7 +39,6 @@
 //! its write collides. Pruning deletes oldest first, so the versions left are
 //! always contiguous and a lookup from any of them reaches the latest.
 
-use object_store::ObjectStoreExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -48,12 +47,12 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use lance_core::storage::path::Path;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{ShardManifest, ShardStatus};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
-use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -80,7 +79,7 @@ struct VersionHint {
 /// and PUT-IF-NOT-EXISTS atomicity.
 #[derive(Debug)]
 pub struct ShardManifestStore {
-    object_store: Arc<ObjectStore>,
+    storage: Arc<ObjectStore>,
     shard_id: Uuid,
     manifest_dir: Path,
     manifest_scan_batch_size: usize,
@@ -111,13 +110,13 @@ impl ShardManifestStore {
     ///
     /// # Arguments
     ///
-    /// * `object_store` - Object store for reading/writing manifests
+    /// * `storage` - Object store for reading/writing manifests
     /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
     /// * `dir_id` - The MemWAL's `dir_id` (empty for the legacy `_mem_wal`)
     /// * `shard_id` - Shard UUID
     /// * `manifest_scan_batch_size` - Batch size for parallel HEAD requests when scanning versions
     pub fn new(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: &Path,
         dir_id: &str,
         shard_id: Uuid,
@@ -125,7 +124,7 @@ impl ShardManifestStore {
     ) -> Self {
         let manifest_dir = shard_manifest_path(base_path, dir_id, &shard_id);
         Self {
-            object_store,
+            storage,
             shard_id,
             manifest_dir,
             manifest_scan_batch_size,
@@ -237,7 +236,7 @@ impl ShardManifestStore {
         let filename = manifest_filename(version);
         let path = self.manifest_dir.clone().join(filename.as_str());
 
-        let data = self.object_store.read_object(&path).await.map_err(|e| {
+        let data = self.storage.read_object(&path).await.map_err(|e| {
             Error::io(format!(
                 "Failed to read manifest version {} for shard {}: {}",
                 version, self.shard_id, e
@@ -341,15 +340,15 @@ impl ShardManifestStore {
         let bytes = pb_manifest.encode_to_vec();
 
         let started = Instant::now();
-        self.object_store
+        self.storage
             .put_if_absent(&path, Bytes::from(bytes).into())
             .await
             .inspect_err(|_| self.invalidate())
             .map_err(|error| {
                 if matches!(
                     error,
-                    object_store::Error::AlreadyExists { .. }
-                        | object_store::Error::Precondition { .. }
+                    lance_io::object_store::Error::AlreadyExists { .. }
+                        | lance_io::object_store::Error::Precondition { .. }
                 ) {
                     self.version_taken(version)
                 } else {
@@ -423,9 +422,9 @@ impl ShardManifestStore {
         let filename = manifest_filename(version);
         let path = self.manifest_dir.clone().join(filename.as_str());
 
-        match self.object_store.stat(&path).await {
+        match self.storage.stat(&path).await {
             Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(lance_io::object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(Error::io(format!(
                 "HEAD request failed for version {}: {}",
                 version, e
@@ -438,10 +437,10 @@ impl ShardManifestStore {
     /// versions instead.
     async fn read_version_hint(&self) -> Option<u64> {
         let path = self.manifest_dir.clone().join("version_hint.json");
-        let read = async { self.object_store.read_object(&path).await?.bytes().await };
+        let read = async { self.storage.read_object(&path).await?.bytes().await };
         let bytes = match read.await {
             Ok(bytes) => bytes,
-            Err(object_store::Error::NotFound { .. }) => return None,
+            Err(lance_io::object_store::Error::NotFound { .. }) => return None,
             Err(e) => {
                 warn!(
                     "Failed to read version hint for shard {}: {}",
@@ -462,11 +461,7 @@ impl ShardManifestStore {
 
         match serde_json::to_vec(&hint) {
             Ok(bytes) => {
-                if let Err(e) = self
-                    .object_store
-                    .put_payload(&path, Bytes::from(bytes).into())
-                    .await
-                {
+                if let Err(e) = self.storage.put_payload(&path, bytes.into()).await {
                     warn!(
                         "Failed to write version hint for shard {}: {}",
                         self.shard_id, e
@@ -493,7 +488,7 @@ impl ShardManifestStore {
     /// version order.
     async fn list_version_times(&self) -> Result<Vec<(u64, DateTime<Utc>)>> {
         let mut versions = Vec::new();
-        let mut listing = self.object_store.list_objects(Some(&self.manifest_dir));
+        let mut listing = self.storage.list_objects(Some(&self.manifest_dir));
         while let Some(item) = listing.next().await {
             let meta = item.map_err(|e| {
                 Error::io(format!(
@@ -544,8 +539,9 @@ impl ShardManifestStore {
             .collect();
         let count = pruned.len();
         for path in pruned {
-            match self.object_store.inner.delete(&path).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            match self.storage.delete(&path).await {
+                Ok(()) => {}
+                Err(error) if error.is_not_found() => {}
                 Err(e) => {
                     return Err(Error::io(format!(
                         "Failed to prune manifest version {path} for shard {}: {e}",
@@ -828,7 +824,7 @@ impl ShardManifestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -1381,12 +1377,12 @@ mod tests {
         method: &'static str,
         fails: impl Fn(&Path) -> bool + Send + Sync + 'static,
     ) -> Arc<ObjectStore> {
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
         policy.lock().unwrap().set_before_policy(
             method,
             Arc::new(move |called: &str, path: &Path| {
                 if called == method && fails(path) {
-                    return Err(object_store::Error::Generic {
+                    return Err(lance_io::object_store::Error::Generic {
                         store: "test",
                         source: format!("{method} refused").into(),
                     }
@@ -1396,7 +1392,9 @@ mod tests {
             }),
         );
         let mut proxied = store.clone();
-        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        proxied.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
+        ));
         Arc::new(proxied)
     }
 
@@ -1417,7 +1415,6 @@ mod tests {
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 20);
 
         store
-            .inner
             .delete(&hint_path(&base_path, &shard_id))
             .await
             .unwrap();
@@ -1504,7 +1501,6 @@ mod tests {
         let writer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         write_versions(&writer, shard_id, 3).await;
         store
-            .inner
             .delete(&hint_path(&base_path, &shard_id))
             .await
             .unwrap();
@@ -1600,13 +1596,13 @@ mod tests {
             .unwrap();
 
         // A store whose HEAD on v3 gets a transient 503.
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        let policy = Arc::new(Mutex::new(ProxyBackendPolicy::new()));
         let v3_file = manifest_filename(3);
         policy.lock().unwrap().set_before_policy(
             "503",
             Arc::new(move |method: &str, path: &Path| {
                 if method == "get_opts" && path.as_ref().ends_with(v3_file.as_str()) {
-                    return Err(object_store::Error::Generic {
+                    return Err(lance_io::object_store::Error::Generic {
                         store: "test",
                         source: "503 slow down".into(),
                     }
@@ -1616,7 +1612,9 @@ mod tests {
             }),
         );
         let mut proxied = (*store).clone();
-        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy.clone()));
+        proxied.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| Arc::new(ProxyBackend::new(backend, policy.clone())),
+        ));
         let ours = ShardManifestStore::new(Arc::new(proxied), &base_path, "", shard_id, 2);
 
         let err = ours.refresh_latest().await.unwrap_err();

@@ -48,7 +48,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
             let deletion_vector = fragment.get_deletion_vector().await?;
             Result::Ok((fragment, sequence, deletion_vector))
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.storage.io_parallelism())
         .try_collect()
         .await?;
 

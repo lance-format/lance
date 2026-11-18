@@ -52,6 +52,7 @@ use dashmap::DashSet;
 use futures::future::try_join_all;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
+use lance_core::storage::path::Path;
 use lance_core::{
     Error, Result,
     utils::tracing::{
@@ -60,6 +61,7 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
+use lance_io::object_store::ObjectMeta;
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry, uri_to_url};
 use lance_table::{
     feature_flags::{
@@ -72,8 +74,6 @@ use lance_table::{
         manifest::{read_manifest, read_manifest_indexes},
     },
 };
-use object_store::ObjectMeta;
-use object_store::path::Path;
 use prost::Message;
 
 use std::fmt::Debug;
@@ -350,25 +350,29 @@ fn may_be_same_location(
         return true;
     };
     // The prefix includes the base's storage options, including the Azure account.
-    let same_store = match registry.calculate_object_store_prefix(uri, storage_options) {
+    let same_store = match registry.calculate_storage_prefix(uri, storage_options) {
         Ok(prefix) => super::blob::may_be_same_store(registry, store, url.scheme(), &prefix),
         Err(_) => true,
     };
     if !same_store {
         return false;
     }
-    let is_local = |scheme: &str| matches!(scheme, "file" | "file-object-store" | "file+uring");
-    if !is_local(store.scheme()) || !is_local(url.scheme()) {
+    let is_local = |scheme: &str| {
+        registry
+            .get_provider(scheme)
+            .is_some_and(|provider| provider.is_local())
+    };
+    if !store.is_local() || !is_local(url.scheme()) {
         return path == *base;
     }
     if path == *base {
         return true;
     }
-    let local = object_store::local::LocalFileSystem::new();
     let identify = |path: &Path| {
-        local
-            .path_to_filesystem(path)
+        store
+            .local_directory_path(path)
             .ok()
+            .flatten()
             .and_then(|path| directory_identity(&path))
     };
     identify(&path)
@@ -544,13 +548,13 @@ fn is_removed_detached_version(location: &ManifestLocation, base: &Path, error: 
 }
 
 async fn read_manifest_and_indexes(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     location: &ManifestLocation,
 ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-    let manifest = read_manifest(object_store, &location.path, location.size).await?;
+    let manifest = read_manifest(storage, &location.path, location.size).await?;
     ensure_can_read_manifest(&manifest)?;
     ensure_can_write_manifest(&manifest)?;
-    let indexes = read_manifest_indexes(object_store, location, &manifest).await?;
+    let indexes = read_manifest_indexes(storage, location, &manifest).await?;
     Ok((manifest, indexes))
 }
 
@@ -559,12 +563,12 @@ async fn read_manifest_and_indexes(
 /// deleted once the commit is finalized, after it is copied to the canonical path,
 /// so a staging copy that is gone when read is retried at the canonical path.
 async fn read_listed_manifest(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     location: ManifestLocation,
     base: &Path,
 ) -> (ManifestLocation, Result<(Manifest, Vec<IndexMetadata>)>) {
     let canonical = ManifestNamingScheme::V2.manifest_path(base, location.version);
-    match read_manifest_and_indexes(object_store, &location).await {
+    match read_manifest_and_indexes(storage, &location).await {
         Err(error)
             if is_detached_version(location.version)
                 && location.path != canonical
@@ -576,7 +580,7 @@ async fn read_listed_manifest(
                 e_tag: None,
                 ..location
             };
-            let read = read_manifest_and_indexes(object_store, &location).await;
+            let read = read_manifest_and_indexes(storage, &location).await;
             (location, read)
         }
         read => (location, read),
@@ -891,7 +895,7 @@ impl<'a> CleanupTask<'a> {
         if action.deletes_files() && delete_execution.is_none() {
             let concurrency = operation
                 .delete_concurrency
-                .unwrap_or_else(|| operation.dataset.object_store.io_parallelism());
+                .unwrap_or_else(|| operation.dataset.storage.io_parallelism());
             validate_delete_concurrency(concurrency)?;
             delete_execution = Some(Arc::new(DeleteExecution {
                 concurrency,
@@ -904,9 +908,7 @@ impl<'a> CleanupTask<'a> {
             }));
         }
         let managed_scan_permits = managed_scan_permits.unwrap_or_else(|| {
-            Arc::new(Semaphore::new(
-                operation.dataset.object_store.io_parallelism(),
-            ))
+            Arc::new(Semaphore::new(operation.dataset.storage.io_parallelism()))
         });
         Ok(Self {
             managed_scan_permits,
@@ -953,8 +955,8 @@ impl<'a> CleanupTask<'a> {
         }) {
             let anchor = {
                 // Other readers can use a durable hint even when this process disables it.
-                let hinted_version = if !self.dataset.object_store.list_is_lexically_ordered {
-                    read_version_hint(&self.dataset.object_store, &self.dataset.base).await?
+                let hinted_version = if !self.dataset.storage.list_is_lexically_ordered() {
+                    read_version_hint(&self.dataset.storage, &self.dataset.base).await?
                 } else {
                     None
                 };
@@ -966,15 +968,12 @@ impl<'a> CleanupTask<'a> {
                             .resolve_version_location(
                                 &self.dataset.base,
                                 version,
-                                self.dataset.object_store.inner.as_ref(),
+                                &self.dataset.storage,
                             )
                             .await?;
-                        let manifest = read_manifest(
-                            &self.dataset.object_store,
-                            &location.path,
-                            location.size,
-                        )
-                        .await?;
+                        let manifest =
+                            read_manifest(&self.dataset.storage, &location.path, location.size)
+                                .await?;
                         ensure_can_read_manifest(&manifest)?;
                         Ok::<_, Error>(manifest)
                     }
@@ -1108,7 +1107,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(inspection);
         self.manifest_locations(&self.dataset.base)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
-            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+            .try_for_each_concurrent(self.dataset.storage.io_parallelism(), |location| {
                 self.process_manifest_file(
                     location,
                     &inspection,
@@ -1122,18 +1121,15 @@ impl<'a> CleanupTask<'a> {
         // Re-read only one manifest per occupied bucket, keeping the planning pass
         // bounded by bucket count rather than retaining large manifests in memory.
         stream::iter(survivors.into_values().map(Ok))
-            .try_for_each_concurrent(
-                self.dataset.object_store.io_parallelism(),
-                |(_, location)| {
-                    self.process_manifest_file(
-                        location,
-                        &inspection,
-                        tagged_versions,
-                        &branch_versions,
-                        true,
-                    )
-                },
-            )
+            .try_for_each_concurrent(self.dataset.storage.io_parallelism(), |(_, location)| {
+                self.process_manifest_file(
+                    location,
+                    &inspection,
+                    tagged_versions,
+                    &branch_versions,
+                    true,
+                )
+            })
             .await?;
         Ok(inspection.into_inner().unwrap())
     }
@@ -1146,7 +1142,7 @@ impl<'a> CleanupTask<'a> {
         base: &'b Path,
     ) -> stream::BoxStream<'b, Result<ManifestLocation>> {
         let commit_handler = &self.dataset.commit_handler;
-        let object_store = &self.dataset.object_store;
+        let storage = &self.dataset.storage;
         // A staging copy of a detached manifest shares its name prefix and is deleted
         // once the commit is finalized. It is the version's manifest only while the
         // commit handler names it, as when the copy to the canonical path failed.
@@ -1154,7 +1150,7 @@ impl<'a> CleanupTask<'a> {
         // finalized after the listing passed its canonical path, so that path is
         // read if it exists.
         let detached = commit_handler
-            .list_detached_manifest_locations(base, object_store)
+            .list_detached_manifest_locations(base, storage)
             .try_filter_map(move |location| async move {
                 let canonical = ManifestNamingScheme::V2.manifest_path(base, location.version);
                 if location.path == canonical
@@ -1163,13 +1159,13 @@ impl<'a> CleanupTask<'a> {
                             base,
                             location.version,
                             &location.path,
-                            object_store.inner.as_ref(),
+                            storage,
                         )
                         .await?
                 {
                     return Ok(Some(location));
                 }
-                Ok(object_store
+                Ok(storage
                     .exists(&canonical)
                     .await?
                     .then_some(ManifestLocation {
@@ -1180,7 +1176,7 @@ impl<'a> CleanupTask<'a> {
                     }))
             });
         commit_handler
-            .list_manifest_locations(base, object_store, false)
+            .list_manifest_locations(base, storage, false)
             .chain(detached)
             .boxed()
     }
@@ -1225,7 +1221,7 @@ impl<'a> CleanupTask<'a> {
         stream::iter(dataset.get_fragments())
             .map(|fragment| {
                 let key = ManagedScanKey {
-                    store_prefix: dataset.object_store.store_prefix.clone(),
+                    store_prefix: dataset.storage.store_prefix().to_owned(),
                     data_dir: dataset.data_dir(),
                     bases: bases.clone(),
                     owner_base_ids: owner_base_ids.clone(),
@@ -1249,7 +1245,7 @@ impl<'a> CleanupTask<'a> {
                 let detached_manifest = detached_manifest.clone();
                 let version = dataset.manifest.version;
                 let fragment_id = fragment.id();
-                let store = dataset.object_store.clone();
+                let store = dataset.storage.clone();
                 async move {
                     let scanned = cell
                         .get_or_try_init(|| async {
@@ -1387,7 +1383,7 @@ impl<'a> CleanupTask<'a> {
         // referenced.
 
         let (location, manifest_and_indexes) =
-            read_listed_manifest(&self.dataset.object_store, location, &self.dataset.base).await;
+            read_listed_manifest(&self.dataset.storage, location, &self.dataset.base).await;
         let (manifest, indexes) = match manifest_and_indexes {
             Ok(manifest_and_indexes) => manifest_and_indexes,
             Err(error) if is_removed_detached_version(&location, &self.dataset.base, &error) => {
@@ -1659,10 +1655,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = inspection;
         let cleanup_result = Mutex::new(CleanupRunResult::default());
         let deletes_files = self.action.deletes_files();
-        let removes_empty_dirs = matches!(
-            self.dataset.object_store.scheme(),
-            "file" | "file+uring" | "file-object-store"
-        );
+        let maintains_local_dirs = self.dataset.storage.is_local();
         let indices_dir = self.dataset.indices_dir();
         let data_dir = self.dataset.data_dir();
         let retained_index_dirs = inspection
@@ -1673,7 +1666,7 @@ impl<'a> CleanupTask<'a> {
             .collect::<HashSet<_>>();
         let index_dirs_to_remove = Mutex::new(HashSet::new());
         // Sidecar directories inherit their parent data file's retention, even if empty.
-        let retained_data_dirs = if deletes_files && removes_empty_dirs {
+        let retained_data_dirs = if deletes_files && maintains_local_dirs {
             inspection
                 .referenced_files
                 .data_paths
@@ -1697,7 +1690,7 @@ impl<'a> CleanupTask<'a> {
         let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
             self.dataset
-                .object_store
+                .storage
                 .read_dir_all(&dir, unmodified_since)
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
@@ -1767,40 +1760,37 @@ impl<'a> CleanupTask<'a> {
         // never be referenced, even inside a retained index or blob directory.
         // Scan without the retained-manifest cutoff: an orphan can be newer than
         // every retained manifest and still age past the unverified threshold.
-        let mut local_staging_roots = vec![
-            (
-                self.dataset.versions_dir(),
-                CleanupFileKind::TemporaryManifest,
-            ),
-            (
-                self.dataset.transactions_dir(),
-                CleanupFileKind::Transaction,
-            ),
-            (self.dataset.data_dir(), CleanupFileKind::Data),
-            (
-                self.dataset.base.clone().join("_blobs"),
-                CleanupFileKind::Data,
-            ),
-            (self.dataset.indices_dir(), CleanupFileKind::Index),
-            (self.dataset.deletions_dir(), CleanupFileKind::Deletion),
-            (
-                self.dataset.base.clone().join("_fri"),
-                CleanupFileKind::Index,
-            ),
-            // Refs do not have a dedicated cleanup accounting kind.
-            (
-                self.dataset.base.clone().join(REFS_DIR),
-                CleanupFileKind::Data,
-            ),
-        ];
-        // Avoid listing every dataset root on remote stores that cannot expose
-        // hidden local staging files.
-        if self.dataset.object_store.is_local()
-            || self.dataset.object_store.scheme() == "file-object-store"
-        {
+        let mut local_staging_roots = Vec::new();
+        if maintains_local_dirs {
+            local_staging_roots.extend([
+                (
+                    self.dataset.versions_dir(),
+                    CleanupFileKind::TemporaryManifest,
+                ),
+                (
+                    self.dataset.transactions_dir(),
+                    CleanupFileKind::Transaction,
+                ),
+                (self.dataset.data_dir(), CleanupFileKind::Data),
+                (
+                    self.dataset.base.clone().join("_blobs"),
+                    CleanupFileKind::Data,
+                ),
+                (self.dataset.indices_dir(), CleanupFileKind::Index),
+                (self.dataset.deletions_dir(), CleanupFileKind::Deletion),
+                (
+                    self.dataset.base.clone().join("_fri"),
+                    CleanupFileKind::Index,
+                ),
+                // Refs do not have a dedicated cleanup accounting kind.
+                (
+                    self.dataset.base.clone().join(REFS_DIR),
+                    CleanupFileKind::Data,
+                ),
+            ]);
             for name in self
                 .dataset
-                .object_store
+                .storage
                 .read_dir(self.dataset.base.clone())
                 .await?
             {
@@ -1813,7 +1803,7 @@ impl<'a> CleanupTask<'a> {
         let local_staging_files = stream::iter(local_staging_roots)
             .flat_map(|(dir, kind)| {
                 self.dataset
-                    .object_store
+                    .storage
                     .read_local_staging_files(&dir)
                     .try_filter_map(move |meta| {
                         let can_remove = self.policy.delete_unverified
@@ -1832,8 +1822,7 @@ impl<'a> CleanupTask<'a> {
         let manifest_files = stream::iter(old_manifests)
             .map(|(path, expired)| async move {
                 let size_bytes =
-                    expired_manifest_size(&self.dataset.object_store, &path, expired.size_bytes)
-                        .await?;
+                    expired_manifest_size(&self.dataset.storage, &path, expired.size_bytes).await?;
                 Ok::<CleanupFile, Error>(CleanupFile {
                     path,
                     kind: CleanupFileKind::Manifest,
@@ -1841,7 +1830,7 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 })
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism())
+            .buffer_unordered(self.dataset.storage.io_parallelism())
             .boxed();
 
         let all_files = stream::iter(vec![
@@ -1876,7 +1865,7 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             if deletes_files
-                && removes_empty_dirs
+                && maintains_local_dirs
                 && matches!(file.kind, CleanupFileKind::Index | CleanupFileKind::Data)
             {
                 let (root, dirs_to_remove) = if matches!(file.kind, CleanupFileKind::Index) {
@@ -1907,7 +1896,7 @@ impl<'a> CleanupTask<'a> {
             // Deleting here rather than through `remove_stream` keeps each outcome
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
-            let store = &self.dataset.object_store;
+            let store = &self.dataset.storage;
             all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
@@ -1980,7 +1969,7 @@ impl<'a> CleanupTask<'a> {
                     .await?;
             }
 
-            if removes_empty_dirs {
+            if maintains_local_dirs {
                 for (root, retained_dirs, dirs_to_remove) in [
                     (indices_dir, retained_index_dirs, index_dirs_to_remove),
                     (data_dir, retained_data_dirs, data_dirs_to_remove),
@@ -1992,7 +1981,7 @@ impl<'a> CleanupTask<'a> {
                     })?;
                     if let Err(error) = self
                         .dataset
-                        .object_store
+                        .storage
                         .remove_empty_dirs(
                             root.clone(),
                             retained_dirs,
@@ -2083,7 +2072,7 @@ impl<'a> CleanupTask<'a> {
                         &self.dataset.base,
                         version,
                         &path,
-                        self.dataset.object_store.inner.as_ref(),
+                        &self.dataset.storage,
                     )
                     .await?
             {
@@ -2382,12 +2371,12 @@ impl<'a> CleanupTask<'a> {
                             .resolve_version_location(
                                 &dataset.base,
                                 *referenced_version,
-                                &dataset.object_store.inner,
+                                &dataset.storage,
                             )
                             .await?;
 
                         read_manifest(
-                            &dataset.object_store,
+                            &dataset.storage,
                             &manifest_location.path,
                             manifest_location.size,
                         )
@@ -2505,7 +2494,7 @@ impl<'a> CleanupTask<'a> {
                 .try_filter(|location| {
                     future::ready(!removed_branch_manifests.contains(&location.path))
                 })
-                .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                .try_for_each_concurrent(self.dataset.storage.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
                         &branch_location.path,
                         location,
@@ -2538,7 +2527,7 @@ impl<'a> CleanupTask<'a> {
             by_lineage
                 || may_be_same_location(
                     &registry,
-                    &self.dataset.object_store,
+                    &self.dataset.storage,
                     base_params.storage_options(),
                     &base.path,
                     &self.dataset.base,
@@ -2620,7 +2609,7 @@ impl<'a> CleanupTask<'a> {
                 let path = indices_dir
                     .join(entry.uuid.to_string())
                     .join(file.path.as_str());
-                let store = store.as_deref().unwrap_or(&self.dataset.object_store);
+                let store = store.as_deref().unwrap_or(&self.dataset.storage);
                 store
                     .open(&path)
                     .await?
@@ -2662,7 +2651,7 @@ impl<'a> CleanupTask<'a> {
         // Read the index section before a checkout, which may finalize a detached
         // version and delete the staging copy this location names.
         let (location, manifest_and_indexes) =
-            read_listed_manifest(&self.dataset.object_store, location, branch_root).await;
+            read_listed_manifest(&self.dataset.storage, location, branch_root).await;
         let (manifest, indexes) = match manifest_and_indexes {
             Ok(manifest_and_indexes) => manifest_and_indexes,
             Err(error) if is_removed_detached_version(&location, branch_root, &error) => {
@@ -2798,13 +2787,13 @@ impl<'a> CleanupTask<'a> {
 /// the outcome this sweep wanted. Propagating `NotFound` here would abandon an entire
 /// sweep over a single file that is already in the desired state.
 async fn expired_manifest_size(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     path: &Path,
     known: Option<u64>,
 ) -> Result<u64> {
     match known {
         Some(size_bytes) => Ok(size_bytes),
-        None => match object_store.size(path).await {
+        None => match storage.size(path).await {
             Ok(size_bytes) => Ok(size_bytes),
             Err(error) if error.is_not_found() => Ok(0),
             Err(error) => Err(error),
@@ -3343,19 +3332,18 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
     use lance_io::object_store::storage_options::StorageOptionsAccessor;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
+    use lance_io::utils::testing::{DelayConfig, DelayedBackend};
+    use lance_io::utils::testing::{ProxyBackend, ProxyBackendPolicy};
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::{RenameCommitHandler, uses_version_hint, write_version_hint};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
-    use object_store::ObjectStoreExt;
-    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -3383,47 +3371,39 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MockObjectStore {
+    struct MockWrappingObjectStore {
         delete_latency: Duration,
-        policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+        policy: Arc<Mutex<ProxyBackendPolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
 
-    impl WrappingObjectStore for MockObjectStore {
+    impl WrappingObjectStore for MockWrappingObjectStore {
         fn wrap(
             &self,
             _storage_prefix: &str,
-            original: Arc<dyn object_store::ObjectStore>,
-        ) -> Arc<dyn object_store::ObjectStore> {
-            let original: Arc<dyn object_store::ObjectStore> = if self.delete_latency.is_zero() {
-                original
-            } else {
-                Arc::new(ThrottledStore::new(
-                    original,
-                    ThrottleConfig {
-                        wait_delete_per_call: self.delete_latency,
-                        ..Default::default()
-                    },
-                ))
-            };
-            Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
-        }
-
-        // Injects behaviour into every request, so a listing must not go around it.
-        fn wrap_paginated(
-            &self,
-            _store_prefix: &str,
-            _original: Arc<dyn object_store::list::PaginatedListStore>,
-        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-            None
+            original: Arc<dyn lance_io::object_store::StorageBackend>,
+        ) -> Arc<dyn lance_io::object_store::StorageBackend> {
+            let original: Arc<dyn lance_io::object_store::StorageBackend> =
+                if self.delete_latency.is_zero() {
+                    original
+                } else {
+                    Arc::new(DelayedBackend::new(
+                        original,
+                        DelayConfig {
+                            wait_delete_per_call: self.delete_latency,
+                            ..Default::default()
+                        },
+                    ))
+                };
+            Arc::new(ProxyBackend::new(original, self.policy.clone()))
         }
     }
 
-    impl MockObjectStore {
+    impl MockWrappingObjectStore {
         pub(crate) fn new() -> Self {
             let instance = Self {
                 delete_latency: Duration::ZERO,
-                policy: Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
+                policy: Arc::new(Mutex::new(ProxyBackendPolicy::new())),
                 last_modified_times: Arc::new(Mutex::new(HashMap::new())),
             };
             instance.add_timestamp_policy();
@@ -3470,7 +3450,7 @@ mod tests {
         // is dropped
         tmpdir: TempStrDir,
         dataset_path: String,
-        mock_store: Arc<MockObjectStore>,
+        mock_store: Arc<MockWrappingObjectStore>,
     }
 
     impl MockDatasetFixture {
@@ -3484,7 +3464,7 @@ mod tests {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();
             // Use file-object-store:// scheme so that writes go through the ObjectStore
-            // wrapper chain (MockObjectStore) instead of the optimized local writer path.
+            // wrapper chain (MockWrappingObjectStore) instead of the optimized local writer path.
             // The path must always start with "/" (three slashes after the scheme) so that
             // on Windows, a drive letter like "C:" isn't parsed as the URL authority.
             let path_prefix = if tmpdir_path.starts_with('/') {
@@ -3496,7 +3476,7 @@ mod tests {
             Ok(Self {
                 tmpdir,
                 dataset_path,
-                mock_store: Arc::new(MockObjectStore::new()),
+                mock_store: Arc::new(MockWrappingObjectStore::new()),
             })
         }
 
@@ -3509,7 +3489,7 @@ mod tests {
 
         fn os_params(&self) -> ObjectStoreParams {
             ObjectStoreParams {
-                object_store_wrapper: Some(self.mock_store.clone()),
+                backend_wrappers: vec![self.mock_store.clone()],
                 ..Default::default()
             }
         }
@@ -3765,12 +3745,12 @@ mod tests {
     async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
         dataset
-            .object_store
+            .storage
             .as_ref()
             .put(&index_dir.clone().join("index.idx"), b"idx")
             .await?;
         dataset
-            .object_store
+            .storage
             .as_ref()
             .put(&index_dir.clone().join("auxiliary.idx"), b"aux")
             .await?;
@@ -3787,12 +3767,12 @@ mod tests {
             .join(staging_uuid.to_string())
             .join(format!("partial_{}", shard_uuid));
         dataset
-            .object_store
+            .storage
             .as_ref()
             .put(&shard_dir.clone().join("index.idx"), b"idx")
             .await?;
         dataset
-            .object_store
+            .storage
             .as_ref()
             .put(&shard_dir.clone().join("auxiliary.idx"), b"aux")
             .await?;
@@ -4083,24 +4063,25 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 3);
         // Pause real descriptor reads so polling exposes exactly which scans own
         // permits, without timing assumptions or a production-only test hook.
-        dataset.object_store = Arc::new(ObjectStore::new(
-            Arc::new(ThrottledStore::new(
-                dataset.object_store.inner.clone(),
-                ThrottleConfig {
-                    wait_get_per_call: Duration::from_secs(3600),
-                    ..Default::default()
-                },
-            )),
-            url::Url::parse("memory://").unwrap(),
-            None,
-            None,
-            false,
-            true,
-            2,
-            0,
-            None,
+        let mut storage = dataset
+            .storage
+            .as_ref()
+            .clone()
+            .with_io_parallelism(2)
+            .unwrap();
+        storage.apply_wrapper(&lance_io::utils::testing::TestWrappingObjectStore::new(
+            |backend| {
+                Arc::new(DelayedBackend::new(
+                    backend,
+                    DelayConfig {
+                        wait_get_per_call: Duration::from_secs(3600),
+                        ..Default::default()
+                    },
+                ))
+            },
         ));
-        old.object_store = dataset.object_store.clone();
+        dataset.storage = Arc::new(storage);
+        old.storage = dataset.storage.clone();
         let operation = dataset.cleanup(CleanupPolicy::default());
         let task = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
         let independent = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
@@ -4251,10 +4232,7 @@ mod tests {
         let permits = task.managed_scan_permits.clone();
         task.run().await.unwrap();
         assert!(reads.load(Ordering::SeqCst) > 0);
-        assert_eq!(
-            permits.available_permits(),
-            parent.object_store.io_parallelism()
-        );
+        assert_eq!(permits.available_permits(), parent.storage.io_parallelism());
         assert_eq!(parent.count_rows(None).await.unwrap(), 6);
         for name in ["first", "second"] {
             let child = parent.checkout_version((name, None)).await.unwrap();
@@ -4353,14 +4331,14 @@ mod tests {
             .data_dir()
             .join(dataset.manifest.fragments[0].files[0].path.as_str());
         let saved = dataset
-            .object_store
+            .storage
             .read_object(&file)
             .await
             .unwrap()
             .bytes()
             .await
             .unwrap();
-        dataset.object_store.inner.delete(&file).await.unwrap();
+        dataset.storage.delete(&file).await.unwrap();
         let before = fixture.count_files().await.unwrap();
         let result = dataset
             .cleanup(CleanupPolicy {
@@ -4397,7 +4375,7 @@ mod tests {
         );
         assert_eq!(task.managed_scan_permits.available_permits(), 1);
         dataset
-            .object_store
+            .storage
             .put_payload(&file, saved.into())
             .await
             .unwrap();
@@ -4467,17 +4445,13 @@ mod tests {
 
         let old_manifest = dataset
             .commit_handler
-            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .list_manifest_locations(&dataset.base, &dataset.storage, false)
             .try_filter(|location| future::ready(location.version == 1))
             .try_next()
             .await
             .unwrap()
             .unwrap();
-        dataset
-            .object_store
-            .delete(&old_manifest.path)
-            .await
-            .unwrap();
+        dataset.storage.delete(&old_manifest.path).await.unwrap();
 
         let cleanup = CleanupTask::new(
             &dataset.cleanup(CleanupPolicyBuilder::default().build()),
@@ -5014,12 +4988,7 @@ mod tests {
                 }),
             );
         } else {
-            parent
-                .object_store
-                .inner
-                .delete(&source_manifest)
-                .await
-                .unwrap();
+            parent.storage.delete(&source_manifest).await.unwrap();
         }
         let before = fixture.count_files().await.unwrap();
         let policy = CleanupPolicy {
@@ -5195,7 +5164,7 @@ mod tests {
         let dirs =
             ["data", "_deletions", "_indices", "_blobs"].map(|dir| dataset.base.clone().join(dir));
         dataset
-            .object_store
+            .storage
             .read_dir_all(&dataset.base, None)
             .map_ok(|meta| meta.location)
             .try_filter(|path| future::ready(dirs.iter().any(|dir| path.prefix_matches(dir))))
@@ -5219,7 +5188,7 @@ mod tests {
 
     #[rstest]
     #[case::recorded_path(str::to_string)]
-    #[case::file_object_store_scheme(|dir: &str| local_file_uri("file-object-store", dir))]
+    #[case::file_storage_scheme(|dir: &str| local_file_uri("file-object-store", dir))]
     #[tokio::test]
     async fn cleanup_keeps_then_reclaims_a_branch_blob_on_a_nested_base(
         #[case] base_uri: fn(&str) -> String,
@@ -5292,7 +5261,7 @@ mod tests {
         parent.delete_branch("branch").await.unwrap();
         clean_every_old_version(uri.as_str()).await;
         assert!(
-            !parent.object_store.exists(&receipt).await.unwrap(),
+            !parent.storage.exists(&receipt).await.unwrap(),
             "cleanup retained {receipt}"
         );
     }
@@ -5367,7 +5336,7 @@ mod tests {
         clean_every_old_version(uri.as_str()).await;
         let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
         assert!(
-            parent.object_store.exists(&receipt).await.unwrap(),
+            parent.storage.exists(&receipt).await.unwrap(),
             "parent cleanup deleted a live blob registered only on its child"
         );
         let child = Arc::new(
@@ -5388,7 +5357,7 @@ mod tests {
         parent.delete_branch("child").await.unwrap();
         clean_every_old_version(uri.as_str()).await;
         assert!(
-            !parent.object_store.exists(&receipt).await.unwrap(),
+            !parent.storage.exists(&receipt).await.unwrap(),
             "cleanup retained {receipt}"
         );
     }
@@ -5462,17 +5431,17 @@ mod tests {
             .await
             .unwrap();
         let child = parent.checkout_branch("child").await.unwrap();
-        let foreign = child.object_store(Some(7)).await.unwrap();
-        assert_eq!(foreign.store_prefix, "s3$bucket-b");
+        let foreign = child.storage(Some(7)).await.unwrap();
+        assert_eq!(foreign.store_prefix(), "s3$bucket-b");
         assert!(!crate::dataset::blob::may_be_same_store(
             child.session.store_registry().as_ref(),
-            &parent.object_store,
+            &parent.storage,
             foreign.scheme(),
-            &foreign.store_prefix,
+            foreign.store_prefix(),
         ));
 
         let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
-        assert!(parent.object_store.exists(&receipt).await.unwrap());
+        assert!(parent.storage.exists(&receipt).await.unwrap());
         cleanup_old_versions(
             &parent,
             CleanupPolicy {
@@ -5484,9 +5453,9 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !parent.object_store.exists(&receipt).await.unwrap(),
+            !parent.storage.exists(&receipt).await.unwrap(),
             "parent cleanup kept {receipt} for a root on {prefix}",
-            prefix = foreign.store_prefix
+            prefix = foreign.store_prefix()
         );
     }
 
@@ -5748,7 +5717,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut dataset = dataset.with_object_store(owner, Some(params));
+            let mut dataset = dataset.with_storage(owner, Some(params));
             dataset.base = owner_base;
             let base = BasePath::new(
                 7,
@@ -5759,7 +5728,7 @@ mod tests {
             Arc::make_mut(&mut dataset.manifest)
                 .base_paths
                 .insert(7, base);
-            let opened = dataset.object_store(Some(7)).await.unwrap();
+            let opened = dataset.storage(Some(7)).await.unwrap();
             let mut manifest = dataset.manifest.as_ref().clone();
             manifest.branch = Some("branch".to_string());
             let task = CleanupTask::new(
@@ -5768,7 +5737,7 @@ mod tests {
             )
             .unwrap();
             (
-                opened.store_prefix.clone(),
+                opened.store_prefix().to_owned(),
                 task.parent_base_ids(&manifest).contains(&Some(7)),
             )
         }
@@ -5793,7 +5762,7 @@ mod tests {
             let registry = parent.session.store_registry();
             assert!(!may_be_same_location(
                 registry.as_ref(),
-                &parent.object_store,
+                &parent.storage,
                 parent.initial_storage_options(),
                 "../dataset",
                 &parent.base,
@@ -5855,7 +5824,7 @@ mod tests {
             .versions_dir()
             .join(format!("d{detached_version}.manifest-{}", Uuid::new_v4()));
         dataset
-            .object_store
+            .storage
             .put(&staging_manifest, b"orphan")
             .await
             .unwrap();
@@ -5874,11 +5843,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !dataset
-                .object_store
-                .exists(&staging_manifest)
-                .await
-                .unwrap(),
+            !dataset.storage.exists(&staging_manifest).await.unwrap(),
             "cleanup retained a detached staging manifest"
         );
     }
@@ -6498,7 +6463,7 @@ mod tests {
         assert!(!fixture.local_index_dir(seg_a).exists());
         assert!(
             !dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(
                     &dataset
@@ -6512,7 +6477,7 @@ mod tests {
         );
         assert!(
             dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(
                     &dataset
@@ -6526,7 +6491,7 @@ mod tests {
         );
         assert!(
             dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(
                     &dataset
@@ -6614,7 +6579,7 @@ mod tests {
             .join("index.idx");
         assert!(
             !dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(&old_index_file)
                 .await
@@ -6622,7 +6587,7 @@ mod tests {
         );
         assert!(
             dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(&current_index_file)
                 .await
@@ -6660,7 +6625,7 @@ mod tests {
         assert!(!fixture.local_index_dir(built_segment_uuid).exists());
         assert!(
             !dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(
                     &dataset
@@ -6675,7 +6640,7 @@ mod tests {
         );
         assert!(
             !dataset
-                .object_store
+                .storage
                 .as_ref()
                 .exists(
                     &dataset
@@ -6976,13 +6941,13 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         let dataset = fixture.open().await.unwrap();
 
-        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let _ = dataset.storage.as_ref().io_stats_incremental();
         let policy = CleanupPolicyBuilder::default()
             .retain_n_versions(&dataset, 2)
             .await
             .unwrap()
             .build();
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
 
         assert_eq!(policy.before_version, Some(2));
         assert_eq!(io_stats.read_bytes, 0);
@@ -7019,7 +6984,7 @@ mod tests {
             deleted
         } else {
             dataset
-                .object_store
+                .storage
                 .remove_dir_all(dataset.base.clone())
                 .await
                 .unwrap();
@@ -7218,12 +7183,12 @@ mod tests {
     #[case::wrapped(true)]
     #[tokio::test]
     async fn expired_manifest_size_tolerates_a_vanished_manifest(#[case] is_wrapped: bool) {
-        let wrapper = Arc::new(MockObjectStore::new());
+        let wrapper = Arc::new(MockWrappingObjectStore::new());
         let (store, _) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             "memory://",
             &ObjectStoreParams {
-                object_store_wrapper: Some(wrapper.clone()),
+                backend_wrappers: vec![wrapper.clone()],
                 ..Default::default()
             },
         )
@@ -7549,16 +7514,16 @@ mod tests {
         } else {
             Duration::ZERO
         };
-        let mock_store = Arc::new(MockObjectStore {
+        let mock_store = Arc::new(MockWrappingObjectStore {
             delete_latency,
-            ..MockObjectStore::new()
+            ..MockWrappingObjectStore::new()
         });
         let mut parent = Dataset::write(
             data(),
             "memory://cleanup",
             Some(WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(mock_store.clone()),
+                    backend_wrappers: vec![mock_store.clone()],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -7770,11 +7735,11 @@ mod tests {
                     .ok_or_else(|| Error::not_found(format!("@{version}")))
             };
             let before = row()?;
-            if let Some((_, object_store, canonical)) = finalize {
+            if let Some((_, storage, canonical)) = finalize {
                 let staging = Path::parse(&before.0).unwrap();
-                object_store.copy(&staging, &canonical).await?;
+                storage.copy(&staging, &canonical).await?;
                 self.rows.lock().unwrap().get_mut(&version).unwrap().0 = canonical.to_string();
-                object_store.delete(&staging).await?;
+                storage.delete(&staging).await?;
             }
             let row = if self.answers_before_finalizing {
                 before
@@ -7944,16 +7909,16 @@ mod tests {
         let current_manifest =
             Path::parse(format!("{}-{}", canonical_current_manifest, Uuid::new_v4())).unwrap();
         dataset
-            .object_store
+            .storage
             .copy(&canonical_current_manifest, &current_manifest)
             .await
             .unwrap();
         dataset
-            .object_store
+            .storage
             .delete(&canonical_current_manifest)
             .await
             .unwrap();
-        let current_manifest_size = dataset.object_store.size(&current_manifest).await.unwrap();
+        let current_manifest_size = dataset.storage.size(&current_manifest).await.unwrap();
         store
             .put_if_exists(
                 "",
@@ -7971,7 +7936,7 @@ mod tests {
             .versions_dir()
             .join(format!("999.manifest-{}", Uuid::new_v4()));
         dataset
-            .object_store
+            .storage
             .put(&orphan_manifest, b"orphan")
             .await
             .unwrap();
@@ -7979,7 +7944,7 @@ mod tests {
         // Version 1's object is already gone, as after a cleanup that stopped
         // before retiring records.
         let v1 = Path::parse(store.get("", 1).await.unwrap()).unwrap();
-        dataset.object_store.delete(&v1).await.unwrap();
+        dataset.storage.delete(&v1).await.unwrap();
 
         cleanup_old_versions(
             &dataset,
@@ -7991,14 +7956,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            dataset
-                .object_store
-                .exists(&current_manifest)
-                .await
-                .unwrap()
-        );
-        assert!(!dataset.object_store.exists(&orphan_manifest).await.unwrap());
+        assert!(dataset.storage.exists(&current_manifest).await.unwrap());
+        assert!(!dataset.storage.exists(&orphan_manifest).await.unwrap());
 
         let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
         remaining.sort();
@@ -8020,9 +7979,9 @@ mod tests {
         let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: store.clone(),
         });
-        let mock_store = Arc::new(MockObjectStore::new());
+        let mock_store = Arc::new(MockWrappingObjectStore::new());
         let os_params = ObjectStoreParams {
-            object_store_wrapper: Some(mock_store.clone()),
+            backend_wrappers: vec![mock_store.clone()],
             ..Default::default()
         };
         let uri = TempStrDir::default();
@@ -8466,7 +8425,7 @@ mod tests {
                 .indices_dir()
                 .join(uuid.to_string())
                 .join("frag_reuse_details.binpb");
-            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            let mut writer = dataset.storage.create(&details_path).await.unwrap();
             use tokio::io::AsyncWriteExt;
             writer.write_all(&content).await.unwrap();
             writer.shutdown().await.unwrap();
@@ -8550,7 +8509,7 @@ mod tests {
             // An entry whose content an earlier release removed is skipped when
             // only detached versions carry it, and still disables `_fri`
             // collection when an attached version does.
-            dataset.object_store.delete(&details_path).await.unwrap();
+            dataset.storage.delete(&details_path).await.unwrap();
             for attached in [false, true] {
                 let mut inspection = CleanupInspection::default();
                 inspection
@@ -8708,7 +8667,7 @@ mod tests {
 
         async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
             lance_table::io::manifest::read_manifest_indexes(
-                &dataset.object_store,
+                &dataset.storage,
                 &dataset.manifest_location,
                 &dataset.manifest,
             )

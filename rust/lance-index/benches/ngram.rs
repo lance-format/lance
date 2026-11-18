@@ -13,6 +13,7 @@ use futures::stream;
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_datagen::{RowCount, array};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
@@ -22,7 +23,6 @@ use lance_index::scalar::{TextQuery, registry::ScalarIndexPlugin};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
-use object_store::path::Path;
 
 fn bench_ngram(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;

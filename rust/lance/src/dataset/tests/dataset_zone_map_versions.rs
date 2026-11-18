@@ -44,7 +44,7 @@ const INDEX_NAME: &str = "val_zonemap";
 /// Indices the manifest itself carries, bypassing the usable-index filter.
 async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
     lance_table::io::manifest::read_manifest_indexes(
-        &dataset.object_store,
+        &dataset.storage,
         &dataset.manifest_location,
         &dataset.manifest,
     )

@@ -82,7 +82,7 @@ async fn apply_deletions(
                 }
             }
         })
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.storage.io_parallelism());
 
     while let Some(res) = stream.next().await.transpose()? {
         match res {
@@ -853,11 +853,11 @@ mod tests {
         use crate::{
             dataset::{InsertBuilder, ReadParams, WriteParams, builder::DatasetBuilder},
             session::Session,
-            utils::test::ThrottledStoreWrapper,
+            utils::test::DelayedStoreWrapper,
         };
         use futures::future::try_join_all;
         use lance_io::object_store::ObjectStoreParams;
-        use object_store::throttle::ThrottleConfig;
+        use lance_io::utils::testing::DelayConfig;
         use tokio::sync::Barrier;
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -875,8 +875,8 @@ mod tests {
         .unwrap();
 
         // Increase likelihood of contention by throttling the store
-        let throttled = Arc::new(ThrottledStoreWrapper {
-            config: ThrottleConfig {
+        let throttled = Arc::new(DelayedStoreWrapper {
+            config: DelayConfig {
                 wait_list_per_call: Duration::from_millis(1),
                 wait_get_per_call: Duration::from_millis(1),
                 ..Default::default()
@@ -887,7 +887,7 @@ mod tests {
         let mut dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(throttled.clone()),
+                    backend_wrappers: vec![throttled.clone()],
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
@@ -908,7 +908,7 @@ mod tests {
                 let dataset = DatasetBuilder::from_uri("memory://")
                     .with_read_params(ReadParams {
                         store_options: Some(ObjectStoreParams {
-                            object_store_wrapper: Some(throttled_ref.clone()),
+                            backend_wrappers: vec![throttled_ref.clone()],
                             ..Default::default()
                         }),
                         session: Some(session_ref.clone()),

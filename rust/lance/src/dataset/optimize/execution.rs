@@ -185,18 +185,16 @@ pub async fn can_use_binary_copy_current(
             }
 
             // check file global buffer
-            let object_store = match data_file.base_id {
-                Some(base_id) => dataset.object_store(Some(base_id)).await?,
-                None => dataset.object_store.clone(),
+            let storage = match data_file.base_id {
+                Some(base_id) => dataset.storage(Some(base_id)).await?,
+                None => dataset.storage.clone(),
             };
             let full_path = dataset
                 .data_file_dir(data_file)?
                 .clone()
                 .join(data_file.path.as_str());
-            let scan_scheduler = ScanScheduler::new(
-                object_store.clone(),
-                SchedulerConfig::max_bandwidth(&object_store),
-            );
+            let scan_scheduler =
+                ScanScheduler::new(storage.clone(), SchedulerConfig::max_bandwidth(&storage));
             let file_scheduler = scan_scheduler
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
@@ -796,7 +794,7 @@ pub(super) async fn rewrite_files(
         let (frags, _) = write_fragments_internal_impl(
             write_version,
             Some(dataset.as_ref()),
-            dataset.object_store.clone(),
+            dataset.storage.clone(),
             &dataset.base,
             write_schema,
             stream,
@@ -853,8 +851,7 @@ pub(super) async fn rewrite_files(
     let row_addrs = match row_addrs_result {
         Ok(v) => v,
         Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
+            cleanup_data_fragments(&dataset.storage, &dataset.base, None, &new_fragments).await;
             return Err(e);
         }
     };

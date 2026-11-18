@@ -518,7 +518,7 @@ pub async fn infer_vector_index_details(
     let index_file = file_dir.clone().join(INDEX_FILE_NAME);
     let file_sizes = index.file_size_map();
     let reader: Arc<dyn Reader> = super::open_index_file(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         &index_file,
         INDEX_FILE_NAME,
         &file_sizes,
@@ -577,7 +577,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
 
 async fn convert_v3_metadata_to_details(
     dataset: &Dataset,
-    file_dir: &object_store::path::Path,
+    file_dir: &lance_core::storage::path::Path,
 ) -> Result<prost_types::Any> {
     use lance_index::INDEX_AUXILIARY_FILE_NAME;
     use lance_index::pb::vector_index_details::*;
@@ -724,11 +724,11 @@ enum CompressionKind {
 
 async fn open_lance_file(
     dataset: &Dataset,
-    path: &object_store::path::Path,
+    path: &lance_core::storage::path::Path,
 ) -> Result<lance_file::reader::FileReader> {
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let file = scheduler
         .open_file(path, &CachedFileSize::unknown())

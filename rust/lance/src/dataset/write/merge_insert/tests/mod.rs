@@ -34,7 +34,7 @@ use crate::{
     },
     session::Session,
     utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_string_matches,
+        DatagenExt, DelayedStoreWrapper, FragmentCount, FragmentRowCount, assert_string_matches,
     },
 };
 use arrow_array::ArrayRef;
@@ -73,10 +73,10 @@ use lance_index::IndexCriteria;
 use lance_index::IndexType;
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_io::object_store::ObjectStoreParams;
+use lance_io::utils::testing::DelayConfig;
 use lance_linalg::distance::MetricType;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use mock_instant::thread_local::MockClock;
-use object_store::throttle::ThrottleConfig;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;

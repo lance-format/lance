@@ -204,11 +204,11 @@ fn ivf_centroids_from_proto(ivf: &pb::Ivf) -> Result<Option<FixedSizeListArray>>
 }
 
 async fn open_sibling_index_reader(
-    object_store: &lance_io::object_store::ObjectStore,
+    storage: &lance_io::object_store::ObjectStore,
     sched: &Arc<ScanScheduler>,
-    idx_path: &object_store::path::Path,
+    idx_path: &lance_core::storage::path::Path,
 ) -> Result<Option<V2Reader>> {
-    if !object_store.exists(idx_path).await? {
+    if !storage.exists(idx_path).await? {
         return Ok(None);
     }
 
@@ -251,8 +251,8 @@ fn init_writer_for_storage(
 
 /// Create and initialize a unified writer for FLAT storage.
 pub async fn init_writer_for_flat(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_out: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_out: &lance_core::storage::path::Path,
     d0: usize,
     item_type: &DataType,
     dt: DistanceType,
@@ -269,7 +269,7 @@ pub async fn init_writer_for_flat(
             true,
         ),
     ]);
-    let writer = object_store.create(aux_out).await?;
+    let writer = storage.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
         writer,
@@ -286,8 +286,8 @@ pub async fn init_writer_for_flat(
 /// This always writes the codebook into the unified file and resets
 /// `buffer_index` in the metadata to point at the new location.
 pub async fn init_writer_for_pq(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_out: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_out: &lance_core::storage::path::Path,
     dt: DistanceType,
     pm: &ProductQuantizationMetadata,
     format_version: ConcreteFileVersion,
@@ -308,7 +308,7 @@ pub async fn init_writer_for_pq(
             true,
         ),
     ]);
-    let writer = object_store.create(aux_out).await?;
+    let writer = storage.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
         writer,
@@ -331,8 +331,8 @@ pub async fn init_writer_for_pq(
 
 /// Create and initialize a unified writer for SQ storage.
 pub async fn init_writer_for_sq(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_out: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_out: &lance_core::storage::path::Path,
     dt: DistanceType,
     sq_meta: &ScalarQuantizationMetadata,
     format_version: ConcreteFileVersion,
@@ -349,7 +349,7 @@ pub async fn init_writer_for_sq(
             true,
         ),
     ]);
-    let writer = object_store.create(aux_out).await?;
+    let writer = storage.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
         writer,
@@ -363,8 +363,8 @@ pub async fn init_writer_for_sq(
 
 /// Create and initialize a unified writer for RQ storage.
 pub async fn init_writer_for_rq(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_out: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_out: &lance_core::storage::path::Path,
     dt: DistanceType,
     rq_meta: &RabitQuantizationMetadata,
     format_version: ConcreteFileVersion,
@@ -384,7 +384,7 @@ pub async fn init_writer_for_rq(
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
     }
     let arrow_schema = ArrowSchema::new(fields);
-    let writer = object_store.create(aux_out).await?;
+    let writer = storage.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
         writer,
@@ -830,20 +830,19 @@ fn filter_batch_to_owned_rows(
 /// segments share the same quantizer/codebook and distance type; it reuses the
 /// first encountered metadata.
 pub async fn merge_partial_vector_auxiliary_files(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_paths: &[object_store::path::Path],
-    target_dir: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_paths: &[lance_core::storage::path::Path],
+    target_dir: &lance_core::storage::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<lance_table::format::IndexFile> {
-    merge_partial_vector_auxiliary_files_inner(object_store, aux_paths, target_dir, None, progress)
-        .await
+    merge_partial_vector_auxiliary_files_inner(storage, aux_paths, target_dir, None, progress).await
 }
 
 /// Merge auxiliary files while retaining only rows owned by each source segment.
 pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_paths: &[object_store::path::Path],
-    target_dir: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_paths: &[lance_core::storage::path::Path],
+    target_dir: &lance_core::storage::path::Path,
     row_filters: &[OldIndexDataFilter],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<lance_table::format::IndexFile> {
@@ -855,7 +854,7 @@ pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
         )));
     }
     merge_partial_vector_auxiliary_files_inner(
-        object_store,
+        storage,
         aux_paths,
         target_dir,
         Some(row_filters),
@@ -865,9 +864,9 @@ pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
 }
 
 async fn merge_partial_vector_auxiliary_files_inner(
-    object_store: &lance_io::object_store::ObjectStore,
-    aux_paths: &[object_store::path::Path],
-    target_dir: &object_store::path::Path,
+    storage: &lance_io::object_store::ObjectStore,
+    aux_paths: &[lance_core::storage::path::Path],
+    target_dir: &lance_core::storage::path::Path,
     row_filters: Option<&[OldIndexDataFilter]>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<lance_table::format::IndexFile> {
@@ -895,8 +894,8 @@ async fn merge_partial_vector_auxiliary_files_inner(
 
     // We'll also need a scheduler to open readers efficiently
     let sched = ScanScheduler::new(
-        Arc::new(object_store.clone()),
-        SchedulerConfig::max_bandwidth(object_store),
+        Arc::new(storage.clone()),
+        SchedulerConfig::max_bandwidth(storage),
     );
 
     // Track IVF partition count consistency and accumulate lengths per partition
@@ -959,7 +958,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
         if detected_index_type.is_none() {
             // Try to derive precise type from sibling partial index.idx metadata if available
             if !idx_reader_checked {
-                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+                idx_reader = open_sibling_index_reader(storage, &sched, &idx_path).await?;
                 idx_reader_checked = true;
             }
             if let Some(idx_reader) = idx_reader.as_ref()
@@ -1004,7 +1003,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
         let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
         if current_centroids.is_none() {
             if !idx_reader_checked {
-                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+                idx_reader = open_sibling_index_reader(storage, &sched, &idx_path).await?;
             }
             if let Some(idx_reader) = idx_reader.as_ref()
                 && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
@@ -1103,8 +1102,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let w =
-                        init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
+                    let w = init_writer_for_sq(storage, &aux_out, dt, &sq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1211,8 +1209,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     rq_meta = Some(rq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let w =
-                        init_writer_for_rq(object_store, &aux_out, dt, &rq_meta_parsed, fv).await?;
+                    let w = init_writer_for_rq(storage, &aux_out, dt, &rq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1311,8 +1308,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    let w =
-                        init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
+                    let w = init_writer_for_pq(storage, &aux_out, dt, &pm_for_unified, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1340,8 +1336,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
-                    let w = init_writer_for_flat(object_store, &aux_out, d0, &item_type, dt, fv)
-                        .await?;
+                    let w = init_writer_for_flat(storage, &aux_out, d0, &item_type, dt, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1373,8 +1368,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
-                    let w = init_writer_for_flat(object_store, &aux_out, d0, &item_type, dt, fv)
-                        .await?;
+                    let w = init_writer_for_flat(storage, &aux_out, d0, &item_type, dt, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1469,8 +1463,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    let w =
-                        init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
+                    let w = init_writer_for_pq(storage, &aux_out, dt, &pm_for_unified, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1521,8 +1514,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let w =
-                        init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
+                    let w = init_writer_for_sq(storage, &aux_out, dt, &sq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1751,12 +1743,12 @@ mod tests {
     use futures::StreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
+    use lance_core::storage::path::Path;
     use lance_file::writer::FileWriterOptions as V2WriterOptions;
     use lance_io::object_store::ObjectStore;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::DistanceType;
-    use object_store::path::Path;
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
@@ -1932,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_flat_success_basic() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -1945,7 +1937,7 @@ mod tests {
         let dim = 2_i32;
 
         write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux0,
             dim,
             &lengths0,
@@ -1956,7 +1948,7 @@ mod tests {
         .await
         .unwrap();
         write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             dim,
             &lengths1,
@@ -1969,7 +1961,7 @@ mod tests {
 
         let progress = Arc::new(RecordingProgress::default());
         merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             progress.clone(),
@@ -2048,12 +2040,12 @@ mod tests {
         );
 
         let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        assert!(object_store.exists(&aux_out).await.unwrap());
+        assert!(storage.exists(&aux_out).await.unwrap());
 
         // Use ScanScheduler to obtain a FileScheduler (required by V2Reader::try_open)
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
@@ -2118,7 +2110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_flat_filters_each_source_by_ownership() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
         let aux0 = index_dir
             .clone()
@@ -2131,7 +2123,7 @@ mod tests {
         let lengths = vec![2_u32, 1_u32];
 
         write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux0,
             2,
             &lengths,
@@ -2142,7 +2134,7 @@ mod tests {
         .await
         .unwrap();
         write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             2,
             &lengths,
@@ -2154,7 +2146,7 @@ mod tests {
         .unwrap();
 
         merge_partial_vector_auxiliary_files_with_row_filters(
-            &object_store,
+            &storage,
             &[aux0, aux1],
             &index_dir,
             &[
@@ -2171,8 +2163,8 @@ mod tests {
 
         let aux_out = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let reader = V2Reader::try_open(
             sched
@@ -2212,7 +2204,7 @@ mod tests {
     async fn test_merge_streams_partitions_longer_than_a_read_batch(
         #[values(false, true)] filtered: bool,
     ) {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
         let aux = index_dir
             .clone()
@@ -2221,7 +2213,7 @@ mod tests {
         let batch_rows = MERGE_READ_BATCH_ROWS;
         let lengths = vec![batch_rows * 2 + 7, 3, batch_rows + 1];
         let total = write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux,
             2,
             &lengths,
@@ -2236,7 +2228,7 @@ mod tests {
         let kept: Vec<u64> = (0..total).filter(|id| !filtered || id % 3 != 0).collect();
         if filtered {
             merge_partial_vector_auxiliary_files_with_row_filters(
-                &object_store,
+                &storage,
                 std::slice::from_ref(&aux),
                 &index_dir,
                 &[OldIndexDataFilter::RowIds(
@@ -2248,7 +2240,7 @@ mod tests {
             .unwrap();
         } else {
             merge_partial_vector_auxiliary_files(
-                &object_store,
+                &storage,
                 std::slice::from_ref(&aux),
                 &index_dir,
                 Arc::new(RecordingProgress::default()),
@@ -2259,8 +2251,8 @@ mod tests {
 
         let aux_out = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let reader = V2Reader::try_open(
             sched
@@ -2305,7 +2297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_distance_type_mismatch() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2317,7 +2309,7 @@ mod tests {
         let dim = 2_i32;
 
         write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux0,
             dim,
             &lengths,
@@ -2328,7 +2320,7 @@ mod tests {
         .await
         .unwrap();
         write_flat_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             dim,
             &lengths,
@@ -2340,7 +2332,7 @@ mod tests {
         .unwrap();
 
         let res = merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             crate::progress::noop_progress(),
@@ -2363,7 +2355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_flat_preserves_float64_schema() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/float64_uuid");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2374,15 +2366,15 @@ mod tests {
         let lengths = vec![2_u32, 2_u32];
         let dim = 3_i32;
 
-        write_flat_partial_aux_f64(&object_store, &aux0, dim, &lengths, 0, DistanceType::L2)
+        write_flat_partial_aux_f64(&storage, &aux0, dim, &lengths, 0, DistanceType::L2)
             .await
             .unwrap();
-        write_flat_partial_aux_f64(&object_store, &aux1, dim, &lengths, 100, DistanceType::L2)
+        write_flat_partial_aux_f64(&storage, &aux1, dim, &lengths, 100, DistanceType::L2)
             .await
             .unwrap();
 
         merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             Arc::new(RecordingProgress::default()),
@@ -2392,8 +2384,8 @@ mod tests {
 
         let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
@@ -2646,7 +2638,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_pq_success() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2671,7 +2663,7 @@ mod tests {
 
         // Non-overlapping row id ranges across shards.
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux0,
             nbits,
             num_sub_vectors,
@@ -2686,7 +2678,7 @@ mod tests {
         .unwrap();
 
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             nbits,
             num_sub_vectors,
@@ -2702,7 +2694,7 @@ mod tests {
 
         // Merge PQ auxiliary files.
         merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             crate::progress::noop_progress(),
@@ -2712,12 +2704,12 @@ mod tests {
 
         // 3) Unified auxiliary file exists.
         let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        assert!(object_store.exists(&aux_out).await.unwrap());
+        assert!(storage.exists(&aux_out).await.unwrap());
 
         // Open merged auxiliary file.
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
@@ -2778,7 +2770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_pq_rejects_transposed_source_shard() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq_transposed");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2795,7 +2787,7 @@ mod tests {
         let codebook = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
 
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux0,
             nbits,
             num_sub_vectors,
@@ -2810,7 +2802,7 @@ mod tests {
         .unwrap();
 
         let res = merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             std::slice::from_ref(&aux0),
             &index_dir,
             crate::progress::noop_progress(),
@@ -2838,7 +2830,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_rq_success() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2860,18 +2852,11 @@ mod tests {
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
+        write_rq_partial_aux(&storage, &aux0, &rq_meta, &lengths0, 0, DistanceType::L2)
+            .await
+            .unwrap();
         write_rq_partial_aux(
-            &object_store,
-            &aux0,
-            &rq_meta,
-            &lengths0,
-            0,
-            DistanceType::L2,
-        )
-        .await
-        .unwrap();
-        write_rq_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             &rq_meta,
             &lengths1,
@@ -2882,7 +2867,7 @@ mod tests {
         .unwrap();
 
         merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             crate::progress::noop_progress(),
@@ -2891,11 +2876,11 @@ mod tests {
         .unwrap();
 
         let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        assert!(object_store.exists(&aux_out).await.unwrap());
+        assert!(storage.exists(&aux_out).await.unwrap());
 
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
@@ -2974,7 +2959,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_rq_rejects_packed_source_shard() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq_packed");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -2992,19 +2977,12 @@ mod tests {
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
-        write_rq_partial_aux(
-            &object_store,
-            &aux0,
-            &rq_meta,
-            &lengths,
-            0,
-            DistanceType::L2,
-        )
-        .await
-        .unwrap();
+        write_rq_partial_aux(&storage, &aux0, &rq_meta, &lengths, 0, DistanceType::L2)
+            .await
+            .unwrap();
 
         let res = merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             std::slice::from_ref(&aux0),
             &index_dir,
             crate::progress::noop_progress(),
@@ -3032,7 +3010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_rq_multi_bit_preserves_split_columns() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq_multi_bit");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -3054,18 +3032,11 @@ mod tests {
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
+        write_rq_partial_aux(&storage, &aux0, &rq_meta, &lengths0, 0, DistanceType::L2)
+            .await
+            .unwrap();
         write_rq_partial_aux(
-            &object_store,
-            &aux0,
-            &rq_meta,
-            &lengths0,
-            0,
-            DistanceType::L2,
-        )
-        .await
-        .unwrap();
-        write_rq_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             &rq_meta,
             &lengths1,
@@ -3076,7 +3047,7 @@ mod tests {
         .unwrap();
 
         merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             crate::progress::noop_progress(),
@@ -3086,8 +3057,8 @@ mod tests {
 
         let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())
@@ -3149,7 +3120,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_ivf_pq_codebook_mismatch() {
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq_mismatch");
 
         let partial0 = index_dir.clone().join("partial_0");
@@ -3178,7 +3149,7 @@ mod tests {
 
         // Non-overlapping row id ranges across shards.
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux0,
             nbits,
             num_sub_vectors,
@@ -3193,7 +3164,7 @@ mod tests {
         .unwrap();
 
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux1,
             nbits,
             num_sub_vectors,
@@ -3208,7 +3179,7 @@ mod tests {
         .unwrap();
 
         let res = merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux0.clone(), aux1.clone()],
             &index_dir,
             crate::progress::noop_progress(),
@@ -3234,7 +3205,7 @@ mod tests {
         // Two partial directories that map to the same (min_fragment_id, dataset_version)
         // but differ in their parent directory name. This exercises the third
         // lexicographic tie-breaker component of the sort key.
-        let object_store = ObjectStore::memory();
+        let storage = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_tie");
 
         let partial_a = index_dir.clone().join("partial_1_10");
@@ -3259,7 +3230,7 @@ mod tests {
 
         // Shard A: base_row_id = 0.
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux_a,
             nbits,
             num_sub_vectors,
@@ -3275,7 +3246,7 @@ mod tests {
 
         // Shard B: base_row_id = 1_000, identical lengths and PQ metadata.
         write_pq_partial_aux(
-            &object_store,
+            &storage,
             &aux_b,
             nbits,
             num_sub_vectors,
@@ -3291,7 +3262,7 @@ mod tests {
 
         // Merge must succeed and produce a unified auxiliary file.
         merge_partial_vector_auxiliary_files(
-            &object_store,
+            &storage,
             &[aux_a.clone(), aux_b.clone()],
             &index_dir,
             crate::progress::noop_progress(),
@@ -3300,15 +3271,15 @@ mod tests {
         .unwrap();
 
         let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        assert!(object_store.exists(&aux_out).await.unwrap());
+        assert!(storage.exists(&aux_out).await.unwrap());
 
         // Open merged auxiliary file and verify that the per-partition write
         // order follows the lexicographic parent-dir tiebreaker: rows from
         // `partial_1_10` (row ids starting at 0) should precede rows from
         // `partial_1_10b` (row ids starting at 1_000) for the first partition.
         let sched = ScanScheduler::new(
-            Arc::new(object_store.clone()),
-            SchedulerConfig::max_bandwidth(&object_store),
+            Arc::new(storage.clone()),
+            SchedulerConfig::max_bandwidth(&storage),
         );
         let fh = sched
             .open_file(&aux_out, &CachedFileSize::unknown())

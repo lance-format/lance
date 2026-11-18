@@ -30,10 +30,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures::stream::{BoxStream, FuturesUnordered};
 use futures::{Future, StreamExt};
 use lance_core::Result;
+use lance_core::storage::path::Path;
 use lance_table::format::{IndexMetadata, Manifest};
 use lance_table::io::commit::ManifestLocation;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
-use object_store::path::Path;
 
 use super::remove_prefix;
 use crate::Dataset;
@@ -115,7 +115,7 @@ impl ManifestScan {
 /// a caller building a deletion predicate must leave it unset.
 pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestScan {
     let base = dataset.base.clone();
-    let object_store = dataset.object_store.clone();
+    let storage = dataset.storage.clone();
     let commit_handler = dataset.commit_handler.clone();
 
     let (tx_manifest, rx_manifest) = tokio::sync::mpsc::channel::<Result<ScannedManifest>>(2);
@@ -128,7 +128,7 @@ pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestSc
 
     spawn_lister(
         commit_handler,
-        object_store.clone(),
+        storage.clone(),
         base.clone(),
         min_version,
         tx_locations,
@@ -136,7 +136,7 @@ pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestSc
         tx_manifest.clone(),
     );
     spawn_reader(
-        object_store,
+        storage,
         base,
         rx_locations,
         tx_manifest,
@@ -158,7 +158,7 @@ pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestSc
 /// ahead of the reader.
 fn spawn_lister(
     commit_handler: Arc<dyn lance_table::io::commit::CommitHandler>,
-    object_store: Arc<lance_io::object_store::ObjectStore>,
+    storage: Arc<lance_io::object_store::ObjectStore>,
     base: Path,
     min_version: Option<u64>,
     tx_locations: tokio::sync::mpsc::Sender<ManifestLocation>,
@@ -167,7 +167,7 @@ fn spawn_lister(
 ) {
     lance_core::utils::tokio::spawn(async move {
         let result: Result<()> = async {
-            let mut locations = commit_handler.list_manifest_locations(&base, &object_store, false);
+            let mut locations = commit_handler.list_manifest_locations(&base, &storage, false);
             let mut count = 0usize;
             while let Some(location) = locations.next().await {
                 let location = location?;
@@ -197,7 +197,7 @@ fn spawn_lister(
 /// Read failures travel as `Err` items in the stream rather than ending the
 /// walk, so this task itself is infallible.
 fn spawn_reader(
-    object_store: Arc<lance_io::object_store::ObjectStore>,
+    storage: Arc<lance_io::object_store::ObjectStore>,
     base: Path,
     mut rx_locations: tokio::sync::mpsc::Receiver<ManifestLocation>,
     tx_manifest: tokio::sync::mpsc::Sender<Result<ScannedManifest>>,
@@ -206,7 +206,7 @@ fn spawn_reader(
 ) {
     let inflight_mem = inflight_mem.clone();
     lance_core::utils::tokio::spawn(async move {
-        let max_parallelism = object_store.io_parallelism();
+        let max_parallelism = storage.io_parallelism();
         type ScanResult = Result<ScannedManifest>;
         let mut in_flight: FuturesUnordered<
             std::pin::Pin<Box<dyn Future<Output = ScanResult> + Send>>,
@@ -246,17 +246,17 @@ fn spawn_reader(
                                 notify: mem_notify.clone(),
                             };
 
-                            let object_store = object_store.clone();
+                            let storage = storage.clone();
                             let base = base.clone();
                             in_flight.push(Box::pin(async move {
                                 let manifest = read_manifest(
-                                    &object_store,
+                                    &storage,
                                     &location.path,
                                     location.size,
                                 )
                                 .await?;
                                 let indexes = read_manifest_indexes(
-                                    &object_store,
+                                    &storage,
                                     &location,
                                     &manifest,
                                 )
@@ -439,7 +439,7 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(uri)
             .with_read_params(ReadParams {
                 store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(failing.clone()),
+                    backend_wrappers: vec![failing.clone()],
                     ..Default::default()
                 }),
                 ..Default::default()

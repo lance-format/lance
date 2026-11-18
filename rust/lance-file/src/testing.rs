@@ -21,18 +21,17 @@ use crate::{versions, writer::FileWriterOptions};
 
 pub struct FsFixture {
     pub tmp_path: TempObjFile,
-    pub object_store: Arc<ObjectStore>,
+    pub storage: Arc<ObjectStore>,
     pub scheduler: Arc<ScanScheduler>,
 }
 
 impl Default for FsFixture {
     fn default() -> Self {
         let tmp_path = TempObjFile::default();
-        let object_store = Arc::new(ObjectStore::local());
-        let scheduler =
-            ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
+        let storage = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(storage.clone(), SchedulerConfig::default_for_testing());
         Self {
-            object_store,
+            storage,
             tmp_path,
             scheduler,
         }
@@ -51,7 +50,7 @@ pub async fn write_lance_file(
     version: ConcreteFileVersion,
     options: FileWriterOptions,
 ) -> WrittenFile {
-    let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+    let writer = fs.storage.create(&fs.tmp_path).await.unwrap();
 
     let lance_schema = lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap();
 

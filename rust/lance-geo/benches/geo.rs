@@ -13,6 +13,7 @@ use geoarrow_array::GeoArrowArray;
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_schema::Dimension;
 use lance_core::cache::LanceCache;
+use lance_core::storage::path::Path;
 use lance_core::{Error, ROW_ID};
 use lance_geo::bbox::BoundingBox;
 use lance_geo::query::{GeoQuery, RelationQuery};
@@ -23,7 +24,6 @@ use lance_index::scalar::registry::BasicTrainer;
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
-use object_store::path::Path;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

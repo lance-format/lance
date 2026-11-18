@@ -638,8 +638,8 @@ async fn test_compact_with_data_cache_bytes(
         .unwrap()
         .join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let file_scheduler = scheduler
         .open_file(&path, &data_file.file_size_bytes)

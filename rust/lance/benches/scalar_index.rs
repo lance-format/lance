@@ -46,12 +46,12 @@ fn test_data_stream() -> SendableRecordBatchStream {
 impl BenchmarkFixture {
     fn test_store(tempdir: &TempStrDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.as_str();
-        let (object_store, test_path) = ObjectStore::from_uri(test_path)
+        let (storage, test_path) = ObjectStore::from_uri(test_path)
             .now_or_never()
             .unwrap()
             .unwrap();
         Arc::new(LanceIndexStore::new(
-            object_store,
+            storage,
             test_path,
             Arc::new(LanceCache::no_cache()),
         ))

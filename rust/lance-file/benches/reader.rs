@@ -8,6 +8,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{FutureExt, StreamExt};
+use lance_core::storage::path::Path;
 use lance_core::utils::{tempfile::TempDir, tokio::get_num_compute_intensive_cpus};
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::decoder::{DecoderConfig, DecoderPlugins, FilterExpression};
@@ -23,7 +24,6 @@ use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
-use object_store::path::Path;
 use std::collections::HashMap;
 use tokio::runtime::Runtime;
 
@@ -41,12 +41,12 @@ fn bench_reader(c: &mut Criterion) {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let tmpdir = TempDir::default();
-        let (object_store, base_path) = rt
+        let (storage, base_path) = rt
             .block_on(ObjectStore::from_uri(&tmpdir.path_str()))
             .unwrap();
 
         let file_path = base_path.clone().join("foo.lance");
-        let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
+        let object_writer = rt.block_on(storage.create(&file_path)).unwrap();
 
         let mut writer = file_versions::create_writer(
             version,
@@ -62,14 +62,12 @@ fn bench_reader(c: &mut Criterion) {
         ));
         group.bench_function("decode", |b| {
             b.iter(|| {
-                let object_store = &object_store;
+                let storage = &storage;
                 let file_path = &file_path;
                 let data = &data;
                 rt.block_on(async move {
-                    let store_scheduler = ScanScheduler::new(
-                        object_store.clone(),
-                        SchedulerConfig::default_for_testing(),
-                    );
+                    let store_scheduler =
+                        ScanScheduler::new(storage.clone(), SchedulerConfig::default_for_testing());
                     let scheduler = store_scheduler
                         .open_file(file_path, &CachedFileSize::unknown())
                         .await
@@ -193,7 +191,7 @@ fn get_cached_readers(
     let num_threads = get_num_compute_intensive_cpus();
 
     // Create object store
-    let (object_store, base_path) = if filesystem == "mem" {
+    let (storage, base_path) = if filesystem == "mem" {
         rt.block_on(ObjectStore::from_uri("memory://")).unwrap()
     } else {
         rt.block_on(ObjectStore::from_uri(&tmpdir.path_str()))
@@ -211,7 +209,7 @@ fn get_cached_readers(
         .unwrap();
 
     // Write file
-    let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
+    let object_writer = rt.block_on(storage.create(&file_path)).unwrap();
     let mut writer = file_versions::create_writer(
         version,
         object_writer,
@@ -237,7 +235,7 @@ fn get_cached_readers(
                 .build()
                 .unwrap(),
         );
-        let reader = open_reader(&runtime, &object_store, &file_path);
+        let reader = open_reader(&runtime, &storage, &file_path);
         // Warm up reader
         read_task(
             &runtime,
@@ -262,10 +260,10 @@ fn get_cached_readers(
     cached_readers
 }
 
-fn open_reader(rt: &Runtime, object_store: &Arc<ObjectStore>, file_path: &Path) -> Arc<FileReader> {
+fn open_reader(rt: &Runtime, storage: &Arc<ObjectStore>, file_path: &Path) -> Arc<FileReader> {
     rt.block_on(async {
         let store_scheduler =
-            ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
+            ScanScheduler::new(storage.clone(), SchedulerConfig::default_for_testing());
         let scheduler = store_scheduler
             .open_file(file_path, &CachedFileSize::unknown())
             .await

@@ -49,6 +49,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+lance-io = { workspace = true, features = ["test-util"] }
 lance-datagen.workspace = true
 lance-testing.workspace = true
 arrow-schema.workspace = true

@@ -60,11 +60,11 @@ use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
+use lance_core::storage::path::Path;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 use lance_file::version::{ConcreteFileVersion, warn_if_legacy_storage_version};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -206,7 +206,7 @@ impl Transaction {
     }
 
     pub async fn restore_old_manifest(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         commit_handler: &dyn CommitHandler,
         base_path: &Path,
         version: u64,
@@ -223,9 +223,9 @@ impl Transaction {
             ));
         }
         let location = commit_handler
-            .resolve_version_location(base_path, version, &object_store.inner)
+            .resolve_version_location(base_path, version, storage)
             .await?;
-        let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
+        let mut manifest = read_manifest(storage, &location.path, location.size).await?;
         // This read bypasses Dataset's feature gates. Refuse unsupported target
         // manifests before apply_feature_flags can clear their unknown bits and
         // republish the referenced files as legacy-compatible.
@@ -233,7 +233,7 @@ impl Transaction {
         ensure_can_write_manifest(&manifest)?;
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
-        let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
+        let indices = read_manifest_indexes(storage, &location, &manifest).await?;
         validate_flags(&manifest, &indices)?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
@@ -7869,10 +7869,10 @@ mod tests {
     /// Write `manifest` as a manifest file and return the manifest message in
     /// it, without its length prefix.
     async fn write_manifest_message(manifest: &mut Manifest) -> Vec<u8> {
+        use lance_core::storage::path::Path;
         use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
         use lance_io::object_store::ObjectStore;
         use lance_io::traits::{WriteExt, Writer};
-        use object_store::path::Path;
 
         let store = ObjectStore::memory();
         let path = Path::from("manifest");

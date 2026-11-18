@@ -10,12 +10,12 @@ use std::{
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use lance_core::storage::path::{Path, PathPart};
 use lance_core::{
     Error, Result,
     datatypes::{Field, Schema},
 };
 use lance_file::{concat::BlobTargetId, format::pb, version::ConcreteFileVersion};
-use object_store::path::{Path, PathPart};
 use prost::Message;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -173,7 +173,7 @@ impl DataFileTarget {
     /// ```
     pub async fn finish(&self, dataset: &Dataset) -> Result<()> {
         let data_dir = dataset.data_file_dir_for_base(self.base_id)?;
-        let store = dataset.object_store(self.base_id).await?;
+        let store = dataset.storage(self.base_id).await?;
         if let Err(error) = store.remove_dir_all(self.parts_dir(&data_dir)).await
             && !error.is_not_found()
         {
@@ -203,7 +203,7 @@ impl DataFileTarget {
     pub async fn cleanup(&self, dataset: &Dataset) -> Result<()> {
         self.finish(dataset).await?;
         let data_dir = dataset.data_file_dir_for_base(self.base_id)?;
-        let store = dataset.object_store(self.base_id).await?;
+        let store = dataset.storage(self.base_id).await?;
         if let Err(error) = store.delete(&self.object_path(&data_dir)).await
             && !error.is_not_found()
         {

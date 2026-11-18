@@ -29,9 +29,8 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::versions as file_versions;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
-    ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
-    ObjectStoreParams, StorageOptions, StorageOptionsAccessor, StorageOptionsProvider,
-    WrappingObjectStore,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    StorageOptionsAccessor, StorageOptionsProvider, WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::{
@@ -49,8 +48,8 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
+use lance_core::storage::path::Path;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
-use object_store::path::Path;
 use prost::Message;
 use rand::{Rng, seq::index::sample as sample_indices};
 use roaring::RoaringBitmap;
@@ -250,9 +249,9 @@ pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 /// Lance Dataset
 #[derive(Clone)]
 pub struct Dataset {
-    /// The primary dataset object store. Use [`Self::object_store`] when
+    /// The primary dataset object store. Use [`Self::storage`] when
     /// resolving files that may carry a base id.
-    pub(crate) object_store: Arc<ObjectStore>,
+    pub(crate) storage: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
     /// Uri of the dataset.
     ///
@@ -286,11 +285,11 @@ pub struct Dataset {
     pub(crate) base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
-    pub(crate) base_object_stores: BaseObjectStores,
+    pub(crate) base_storage_cache: BaseStorageCache,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
-pub(crate) type BaseObjectStores =
+pub(crate) type BaseStorageCache =
     Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
 
 impl std::fmt::Debug for Dataset {
@@ -395,8 +394,8 @@ pub struct ReadParams {
     /// If this is not set then a default behavior is chosen that is appropriate for the
     /// filesystem.
     ///
-    /// If a custom object store is provided (via store_params.object_store) then this
-    /// must also be provided.
+    /// Custom storage providers must supply a commit handler when the URI scheme
+    /// has no built-in commit protocol.
     pub commit_handler: Option<Arc<dyn CommitHandler>>,
 
     /// File reader options to use when reading data files.
@@ -613,7 +612,7 @@ impl Dataset {
     /// when `base_paths` is unchanged.
     fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
         if manifest.base_paths != self.manifest.base_paths {
-            self.base_object_stores = Default::default();
+            self.base_storage_cache = Default::default();
         }
         self.manifest = manifest;
         self.manifest_location = manifest_location;
@@ -681,13 +680,13 @@ impl Dataset {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
-        if self.object_store.exists(&branch_file).await? {
+        if self.storage.exists(&branch_file).await? {
             return Err(Error::RefConflict {
                 message: format!("branch {branch} already exists"),
             });
         }
         let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
-        if has_any_entry(&self.object_store, &versions_path).await? {
+        if has_any_entry(&self.storage, &versions_path).await? {
             return Err(Error::RefConflict {
                 message: format!(
                     "Cannot create branch {branch}: {versions_path} contains leftover version data. \
@@ -717,7 +716,7 @@ impl Dataset {
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+            .with_storage(Arc::new(self.storage.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
             .execute(transaction)
@@ -726,8 +725,9 @@ impl Dataset {
 
     /// Deletes a branch and removes its directory when safe.
     ///
-    /// The ref is removed before directory cleanup. If cleanup fails, this
-    /// returns the cleanup error even though the ref may already be gone. Use
+    /// If local directory cleanup is required, an unsupported wrapper directory
+    /// policy is rejected before removing the ref. Other cleanup failures can
+    /// occur after the ref has been removed and return the cleanup error. Use
     /// [`Self::force_delete_branch`] to retry failed cleanup.
     ///
     /// Legacy branches like `outer/data` may share a directory with another
@@ -798,15 +798,11 @@ impl Dataset {
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
-                .resolve_version_location(
-                    &new_location.path,
-                    version_number,
-                    &self.object_store.inner,
-                )
+                .resolve_version_location(&new_location.path, version_number, &self.storage)
                 .await?
         } else {
             self.commit_handler
-                .resolve_latest_location(&new_location.path, &self.object_store)
+                .resolve_latest_location(&new_location.path, &self.storage)
                 .await?
         };
 
@@ -816,7 +812,7 @@ impl Dataset {
         }
 
         let manifest = Self::get_manifest(
-            self.object_store.as_ref(),
+            self.storage.as_ref(),
             &manifest_location,
             &new_location.uri,
             self.session.as_ref(),
@@ -837,7 +833,7 @@ impl Dataset {
         }
 
         let dataset = Self::checkout_manifest(
-            self.object_store.clone(),
+            self.storage.clone(),
             new_location.path,
             new_location.uri,
             manifest,
@@ -861,17 +857,17 @@ impl Dataset {
     }
 
     pub(crate) async fn load_manifest(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_location: &ManifestLocation,
         uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
         let object_reader = if let Some(size) = manifest_location.size {
-            object_store
+            storage
                 .open_with_size(&manifest_location.path, size as usize)
                 .await
         } else {
-            object_store.open(&manifest_location.path).await
+            storage.open(&manifest_location.path).await
         };
         let object_reader = object_reader.map_err(|e| match &e {
             Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
@@ -879,7 +875,7 @@ impl Dataset {
         })?;
 
         let manifest_size = object_reader.size().await.map_err(|err| match err {
-            object_store::Error::NotFound { path, source } => {
+            lance_io::object_store::Error::NotFound { path, source } => {
                 Error::dataset_not_found(path, source)
             }
             _ => Error::io(format!(
@@ -894,7 +890,7 @@ impl Dataset {
                     ..manifest_location.clone()
                 };
                 return Box::pin(Self::load_manifest(
-                    object_store,
+                    storage,
                     &manifest_location,
                     uri,
                     session,
@@ -911,7 +907,7 @@ impl Dataset {
             read_last_block(object_reader.as_ref())
                 .await
                 .map_err(|err| match err {
-                    object_store::Error::NotFound { path, source } => {
+                    lance_io::object_store::Error::NotFound { path, source } => {
                         Error::dataset_not_found(path, source)
                     }
                     _ => Error::io(format!(
@@ -930,7 +926,7 @@ impl Dataset {
                     ..manifest_location.clone()
                 };
                 return Box::pin(Self::load_manifest(
-                    object_store,
+                    storage,
                     &manifest_location,
                     uri,
                     session,
@@ -1000,7 +996,7 @@ impl Dataset {
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
-                store_identity: &object_store.store_prefix,
+                store_identity: storage.store_prefix(),
                 e_tag: manifest_location.e_tag.as_deref(),
             };
             ds_index_cache
@@ -1038,14 +1034,14 @@ impl Dataset {
     /// Fetch the manifest for `manifest_location` from the session metadata
     /// cache, loading and caching it on a miss.
     pub(crate) async fn get_manifest(
-        object_store: &ObjectStore,
+        storage: &ObjectStore,
         manifest_location: &ManifestLocation,
         uri: &str,
         session: &Session,
     ) -> Result<Arc<Manifest>> {
         if manifest_location.size.is_none() {
             return Ok(Arc::new(
-                Self::load_manifest(object_store, manifest_location, uri, session).await?,
+                Self::load_manifest(storage, manifest_location, uri, session).await?,
             ));
         }
         let metadata_cache = session.metadata_cache.for_dataset(uri);
@@ -1057,8 +1053,7 @@ impl Dataset {
             ensure_can_read_manifest(&cached)?;
             return Ok(cached);
         }
-        let loaded =
-            Arc::new(Self::load_manifest(object_store, manifest_location, uri, session).await?);
+        let loaded = Arc::new(Self::load_manifest(storage, manifest_location, uri, session).await?);
         metadata_cache
             .insert_with_key(&manifest_key, loaded.clone())
             .await;
@@ -1067,7 +1062,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn checkout_manifest(
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         base_path: Path,
         uri: String,
         manifest: Arc<Manifest>,
@@ -1079,7 +1074,7 @@ impl Dataset {
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Self> {
         let refs = Refs::new(
-            object_store.clone(),
+            storage.clone(),
             commit_handler.clone(),
             BranchLocation {
                 path: base_path.clone(),
@@ -1101,7 +1096,7 @@ impl Dataset {
             log::Level::Debug,
         );
         Ok(Self {
-            object_store,
+            storage,
             base: base_path,
             uri,
             manifest,
@@ -1116,13 +1111,13 @@ impl Dataset {
             file_reader_options: file_reader_options.map(Arc::new),
             store_params: store_params.map(Box::new),
             base_store_params,
-            base_object_stores: Default::default(),
+            base_storage_cache: Default::default(),
         })
     }
 
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
     ///
-    /// `dest` can be a `&str`, `object_store::path::Path` or `Arc<Dataset>`.
+    /// `dest` can be a `&str`, `lance_core::storage::path::Path` or `Arc<Dataset>`.
     ///
     /// Returns the newly created [`Dataset`].
     /// Or Returns [Error] if the dataset already exists.
@@ -1436,7 +1431,7 @@ impl Dataset {
         self.ensure_branch_exists().await?;
         let location = self
             .commit_handler
-            .resolve_latest_location(&self.base, &self.object_store)
+            .resolve_latest_location(&self.base, &self.storage)
             .await?;
 
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
@@ -1445,7 +1440,7 @@ impl Dataset {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let manifest =
-            Self::get_manifest(&self.object_store, &location, &self.uri, &self.session).await?;
+            Self::get_manifest(&self.storage, &location, &self.uri, &self.session).await?;
         self.ensure_branch_exists().await?;
         Ok((manifest, location))
     }
@@ -1485,11 +1480,11 @@ impl Dataset {
         if let Some(pos) = manifest.transaction_section {
             let reader = match manifest_location.size {
                 Some(size) => {
-                    self.object_store
+                    self.storage
                         .open_with_size(&manifest_location.path, size as usize)
                         .await?
                 }
-                None => self.object_store.open(&manifest_location.path).await?,
+                None => self.storage.open(&manifest_location.path).await?,
             };
 
             // A concurrent overwrite can leave the listed size too small; retry
@@ -1499,7 +1494,7 @@ impl Dataset {
                     if manifest_location.size.is_some()
                         && e.to_string().contains("file size is too small") =>
                 {
-                    let reader = self.object_store.open(&manifest_location.path).await?;
+                    let reader = self.storage.open(&manifest_location.path).await?;
                     read_message(reader.as_ref(), pos).await?
                 }
                 other => other?,
@@ -1508,7 +1503,7 @@ impl Dataset {
         } else if let Some(path) = &manifest.transaction_file {
             // Fallback: read external transaction file if present
             let path = self.transactions_dir().join(path.as_str());
-            let data = self.object_store.read_object(&path).await?.bytes().await?;
+            let data = self.storage.read_object(&path).await?.bytes().await?;
             let transaction = lance_table::format::pb::Transaction::decode(data)?;
             Transaction::try_from(transaction).map(Some)
         } else {
@@ -1562,7 +1557,7 @@ impl Dataset {
         // Resolve against this dataset's current branch.
         let manifest_location = self
             .commit_handler
-            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .resolve_version_location(&self.base, version, &self.storage)
             .await?;
 
         // Mirror `get_manifest`: only a location with a known size (and hence
@@ -1584,7 +1579,7 @@ impl Dataset {
                 // Keep the DatasetNotFound variant callers expect for a missing
                 // version.
                 let manifest = read_manifest(
-                    &self.object_store,
+                    &self.storage,
                     &manifest_location.path,
                     manifest_location.size,
                 )
@@ -1989,7 +1984,7 @@ impl Dataset {
         // Keep the retry and rebase state machine out of every caller's future.
         let (manifest, manifest_location) = Box::pin(commit_transaction(
             self,
-            self.object_store.as_ref(),
+            self.storage.as_ref(),
             self.commit_handler.as_ref(),
             &transaction,
             write_config,
@@ -2437,7 +2432,7 @@ impl Dataset {
     pub async fn count_deleted_rows(&self) -> Result<usize> {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.count_deletions().await })
-            .buffer_unordered(self.object_store.io_parallelism())
+            .buffer_unordered(self.storage.io_parallelism())
             .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
             .await
     }
@@ -2447,14 +2442,14 @@ impl Dataset {
     /// The returned dataset shares metadata, session state, and caches with the
     /// original dataset, but all subsequent operations on the returned dataset
     /// use the supplied object store.
-    pub fn with_object_store(
+    pub fn with_storage(
         &self,
-        object_store: Arc<ObjectStore>,
+        storage: Arc<ObjectStore>,
         store_params: Option<ObjectStoreParams>,
     ) -> Self {
         let mut cloned = self.clone();
-        cloned.object_store = object_store;
-        cloned.base_object_stores = Default::default();
+        cloned.storage = storage;
+        cloned.base_storage_cache = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
@@ -2466,7 +2461,7 @@ impl Dataset {
     /// The returned dataset uses the wrappers for the already-open primary object
     /// store and appends the same wrappers to the dataset-level and base-specific
     /// object store params used when additional base stores are opened later.
-    pub fn with_object_store_wrappers(
+    pub fn with_backend_wrappers(
         &self,
         wrappers: impl IntoIterator<Item = Arc<dyn WrappingObjectStore>>,
     ) -> Self {
@@ -2479,20 +2474,20 @@ impl Dataset {
         // Each wrapper application defines a new store lifetime. Keep base
         // stores alive within the derived dataset without sharing stateful
         // provider layers (such as an AIMD throttle) with other scopes.
-        cloned.base_object_stores = Default::default();
-        let mut object_store = self.object_store.as_ref().clone();
+        cloned.base_storage_cache = Default::default();
+        let mut storage = self.storage.as_ref().clone();
         for wrapper in &wrappers {
-            object_store.apply_wrapper(wrapper.as_ref());
+            storage.apply_wrapper(wrapper.as_ref());
         }
-        cloned.object_store = Arc::new(object_store);
+        cloned.storage = Arc::new(storage);
         cloned.refs = Refs::new(
-            cloned.object_store.clone(),
+            cloned.storage.clone(),
             cloned.commit_handler.clone(),
             cloned.branch_location(),
         );
 
         let store_params = self.store_params.as_deref().cloned().unwrap_or_default();
-        cloned.store_params = Some(Box::new(Self::append_object_store_wrappers(
+        cloned.store_params = Some(Box::new(Self::append_backend_wrappers(
             store_params,
             &wrappers,
         )));
@@ -2503,7 +2498,7 @@ impl Dataset {
                     .map(|(base_path, store_params)| {
                         (
                             base_path.clone(),
-                            Self::append_object_store_wrappers(store_params.clone(), &wrappers),
+                            Self::append_backend_wrappers(store_params.clone(), &wrappers),
                         )
                     })
                     .collect(),
@@ -2512,22 +2507,13 @@ impl Dataset {
         cloned
     }
 
-    fn append_object_store_wrappers(
+    fn append_backend_wrappers(
         mut store_params: ObjectStoreParams,
         wrappers: &[Arc<dyn WrappingObjectStore>],
     ) -> ObjectStoreParams {
-        let mut all_wrappers = Vec::with_capacity(
-            store_params.object_store_wrapper.as_ref().map_or(0, |_| 1) + wrappers.len(),
-        );
-        if let Some(wrapper) = store_params.object_store_wrapper.take() {
-            all_wrappers.push(wrapper);
-        }
-        all_wrappers.extend(wrappers.iter().cloned());
-        store_params.object_store_wrapper = match all_wrappers.len() {
-            0 => None,
-            1 => all_wrappers.pop(),
-            _ => Some(Arc::new(ChainedWrappingObjectStore::new(all_wrappers))),
-        };
+        store_params
+            .backend_wrappers
+            .extend(wrappers.iter().cloned());
         store_params
     }
 
@@ -2601,7 +2587,7 @@ impl Dataset {
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(options))` - Storage options are available (static or refreshed)
+    /// - `Ok(Some(options))` - ObjectStore options are available (static or refreshed)
     /// - `Ok(None)` - No storage options were configured for this dataset
     /// - `Err(...)` - Error occurred while fetching/refreshing options from provider
     pub async fn latest_storage_options(&self) -> Result<Option<StorageOptions>> {
@@ -2663,7 +2649,7 @@ impl Dataset {
         data_file: &DataFile,
     ) -> Result<(Arc<ObjectStore>, Path)> {
         let path = self.data_file_dir(data_file)?.join(data_file.path.as_str());
-        let store = self.object_store_for_data_file(data_file).await?;
+        let store = self.storage_for_data_file(data_file).await?;
         Ok((store, path))
     }
 
@@ -2682,14 +2668,14 @@ impl Dataset {
         let data_dir = self.data_file_dir_for_base(base_id)?;
         let filepath = data_dir.clone().join(path);
 
-        let object_store = self.object_store(base_id).await?;
+        let storage = self.storage(base_id).await?;
 
         // Get file size
-        let file_size = object_store.size(&filepath).await?;
+        let file_size = storage.size(&filepath).await?;
 
         // Read file metadata
         let scheduler = ScanScheduler::new(
-            object_store.clone(),
+            storage.clone(),
             SchedulerConfig::new(2 * 1024 * 1024 * 1024),
         );
         let file = scheduler
@@ -2888,7 +2874,7 @@ impl Dataset {
         }
     }
 
-    async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
+    async fn base_storage(&self, base_id: u32) -> Result<Arc<ObjectStore>> {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
@@ -2901,12 +2887,12 @@ impl Dataset {
                 matches!(params.scoped_to_base(Some(base_id)), Cow::Borrowed(_))
             })
         {
-            return Ok(self.object_store.clone());
+            return Ok(self.storage.clone());
         }
         let store_params = self.store_params_for_base(Some(base_path));
 
         let cell = {
-            let mut stores = self.base_object_stores.lock().unwrap();
+            let mut stores = self.base_storage_cache.lock().unwrap();
             stores.entry(base_id).or_default().clone()
         };
         let store = cell
@@ -2915,7 +2901,7 @@ impl Dataset {
                 // fully resolved store in this dataset's OnceCell, but do not
                 // also put it in the global registry: provider-local state
                 // such as GCS AIMD token buckets must not cross that scope.
-                let (store, _) = if store_params.object_store_wrapper.is_some() {
+                let (store, _) = if !store_params.backend_wrappers.is_empty() {
                     ObjectStore::from_uri_and_params_uncached(
                         self.session.store_registry(),
                         &base_path.path,
@@ -2940,10 +2926,10 @@ impl Dataset {
     ///
     /// Pass `None` to get the primary dataset object store. Pass `Some(base_id)`
     /// when resolving a file whose metadata references an additional base.
-    pub async fn object_store(&self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
+    pub async fn storage(&self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
         match base_id {
-            Some(base_id) => self.base_object_store(base_id).await,
-            None => Ok(self.object_store.clone()),
+            Some(base_id) => self.base_storage(base_id).await,
+            None => Ok(self.storage.clone()),
         }
     }
 
@@ -2975,40 +2961,40 @@ impl Dataset {
         self.file_reader_options.as_deref()
     }
 
-    pub(crate) async fn object_store_for_data_file(
+    pub(crate) async fn storage_for_data_file(
         &self,
         data_file: &DataFile,
     ) -> Result<Arc<ObjectStore>> {
-        self.object_store(data_file.base_id).await
+        self.storage(data_file.base_id).await
     }
 
-    pub(crate) async fn object_store_for_deletion(
+    pub(crate) async fn storage_for_deletion(
         &self,
         deletion_file: &DeletionFile,
     ) -> Result<Arc<ObjectStore>> {
-        self.object_store(deletion_file.base_id).await
+        self.storage(deletion_file.base_id).await
     }
 
-    pub(crate) async fn object_store_for_index(
+    pub(crate) async fn storage_for_index(
         &self,
         index: &IndexMetadata,
     ) -> Result<Arc<ObjectStore>> {
-        self.object_store(index.base_id).await
+        self.storage(index.base_id).await
     }
 
     /// This table as a reader of `manifest`, another manifest of it, sees its
     /// files: through that manifest's base paths, with base stores opened
-    /// afresh when those differ, since `base_object_stores` caches by id alone.
+    /// afresh when those differ, since `base_storage_cache` caches by id alone.
     pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
-        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
-            self.base_object_stores.clone()
+        let base_storage_cache = if manifest.base_paths == self.manifest.base_paths {
+            self.base_storage_cache.clone()
         } else {
             Default::default()
         };
         Self {
             fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
             manifest,
-            base_object_stores,
+            base_storage_cache,
             ..self.clone()
         }
     }
@@ -3104,10 +3090,10 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
             .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
+            .list_manifest_locations(&self.base, &self.storage, false)
             .try_filter_map(|location| async move {
                 let manifest_size = location.size;
-                match read_manifest(&self.object_store, &location.path, manifest_size).await {
+                match read_manifest(&self.storage, &location.path, manifest_size).await {
                     Ok(manifest) => {
                         let mut version = Version::from(&manifest);
                         version.manifest_size = manifest_size;
@@ -3131,7 +3117,7 @@ impl Dataset {
     /// deserialize every manifest.
     pub async fn count_versions(&self) -> Result<u64> {
         self.commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
+            .list_manifest_locations(&self.base, &self.storage, false)
             .try_fold(0_u64, |count, _| async move { Ok(count + 1) })
             .await
     }
@@ -3146,7 +3132,7 @@ impl Dataset {
     pub async fn version_refs(&self) -> Result<Vec<VersionRef>> {
         let mut versions: Vec<_> = self
             .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
+            .list_manifest_locations(&self.base, &self.storage, false)
             .map_ok(|location| VersionRef {
                 version: location.version,
             })
@@ -3172,7 +3158,7 @@ impl Dataset {
     /// ```
     pub async fn list_detached_manifests(&self) -> Result<Vec<ManifestLocation>> {
         self.commit_handler
-            .list_detached_manifest_locations(&self.base, &self.object_store)
+            .list_detached_manifest_locations(&self.base, &self.storage)
             .try_collect()
             .await
     }
@@ -3183,7 +3169,7 @@ impl Dataset {
     pub async fn latest_version_id(&self) -> Result<u64> {
         Ok(self
             .commit_handler
-            .resolve_latest_location(&self.base, &self.object_store)
+            .resolve_latest_location(&self.base, &self.storage)
             .await?
             .version)
     }
@@ -3214,7 +3200,7 @@ impl Dataset {
             .version_exists(
                 &self.base,
                 next_version,
-                self.object_store.inner.as_ref(),
+                &self.storage,
                 self.manifest_location.naming_scheme,
             )
             .await?;
@@ -3433,7 +3419,7 @@ impl Dataset {
             })
             .collect::<Vec<_>>();
         let dvs = stream::iter(dv_futs)
-            .buffered(self.object_store.io_parallelism())
+            .buffered(self.storage.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -3544,7 +3530,7 @@ impl Dataset {
     pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.physical_rows().await })
-            .buffered(self.object_store.io_parallelism())
+            .buffered(self.storage.io_parallelism())
             .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
             .await
@@ -3592,7 +3578,7 @@ impl Dataset {
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })
-            .buffer_unordered(self.object_store.io_parallelism())
+            .buffer_unordered(self.storage.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
 
@@ -3677,7 +3663,7 @@ impl Dataset {
     /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
     /// ```
     pub async fn migrate_manifest_paths_v2(&mut self) -> Result<()> {
-        migrate_scheme_to_v2(self.object_store.as_ref(), &self.base).await?;
+        migrate_scheme_to_v2(self.storage.as_ref(), &self.base).await?;
         // We need to re-open.
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
@@ -3855,7 +3841,7 @@ impl Dataset {
         Self::ensure_clone_target_absent(
             self.commit_handler.as_ref(),
             &target_base,
-            &self.object_store,
+            &self.storage,
             target_path,
         )
         .await?;
@@ -3875,7 +3861,7 @@ impl Dataset {
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+            .with_storage(Arc::new(self.storage.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         builder.execute(transaction).await
@@ -3948,11 +3934,11 @@ impl Dataset {
             path
         };
 
-        let configured_io_parallelism = src_ds.object_store.io_parallelism();
+        let configured_io_parallelism = src_ds.storage.io_parallelism();
         // Provider-native copy can fall back to streaming for large objects, so every
         // non-direct-local transfer stays within the bounded file-copy window.
-        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
-            && target_store.has_direct_local_paths());
+        let uses_streaming_copy =
+            !(src_ds.storage.has_direct_local_paths() && target_store.has_direct_local_paths());
         let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
             Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
             Err(std::env::VarError::NotPresent) => None,
@@ -3973,7 +3959,7 @@ impl Dataset {
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
-                let source_store = Arc::clone(&src_ds.object_store);
+                let source_store = Arc::clone(&src_ds.storage);
                 let target_store = Arc::clone(&target_store);
                 let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
@@ -4006,8 +3992,8 @@ impl Dataset {
         let txn = Transaction::new(ref_version, clone_op, None);
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params.clone().unwrap_or_default())
-            .with_object_store(target_store.clone())
-            .with_source_store(src_ds.object_store.clone())
+            .with_storage(target_store.clone())
+            .with_source_store(src_ds.storage.clone())
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
             .with_deep_clone_files_copied();
@@ -4024,7 +4010,7 @@ impl Dataset {
                     let branch_location = self.branch_location().find_branch(branch.as_deref())?;
                     let version_number = self
                         .commit_handler
-                        .resolve_latest_location(&branch_location.path, &self.object_store)
+                        .resolve_latest_location(&branch_location.path, &self.storage)
                         .await?
                         .version;
                     Ok((branch, version_number))
@@ -4077,7 +4063,7 @@ impl Dataset {
                 let blob_dir = base_root.clone().join(DATA_DIR).join(data_file_key);
                 // Overlays can make the same data file reachable from multiple fragments.
                 if blob_dirs.insert(blob_dir.clone()) {
-                    let mut stream = self.object_store.read_dir_all(&blob_dir, None);
+                    let mut stream = self.storage.read_dir_all(&blob_dir, None);
                     while let Some(meta) = stream.next().await.transpose()? {
                         if let Some(filename) = meta.location.filename() {
                             file_paths.push((
@@ -4110,7 +4096,7 @@ impl Dataset {
         }
 
         let indices = read_manifest_indexes(
-            self.object_store.as_ref(),
+            self.storage.as_ref(),
             &self.manifest_location,
             &self.manifest,
         )
@@ -4141,7 +4127,7 @@ impl Dataset {
                 .clone()
                 .join(INDICES_DIR)
                 .join(index.uuid.to_string());
-            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            let mut stream = self.storage.read_dir_all(&index_root, None);
             while let Some(meta) = stream.next().await.transpose()? {
                 if let Some(filename) = meta.location.filename() {
                     file_paths.push((
@@ -4171,12 +4157,12 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     // Resolve every manifest with version > our current version (the latest plus
     // the ones in between). On non-lexically-ordered stores this uses the version
     // hint to avoid an O(n) listing.
-    let io_parallelism = dataset.object_store.as_ref().io_parallelism();
+    let io_parallelism = dataset.storage.as_ref().io_parallelism();
     // Both stages must poll their input even when the store permits only one I/O.
     let stage_parallelism = (io_parallelism / 2).max(1);
     let locations = dataset.commit_handler.list_manifest_locations_since(
         &dataset.base,
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         dataset.manifest.version,
     );
 
@@ -4189,7 +4175,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             let latest_tx = latest_tx.take();
             async move {
                 let manifest = Dataset::get_manifest(
-                    dataset.object_store.as_ref(),
+                    dataset.storage.as_ref(),
                     &location,
                     &dataset.uri,
                     dataset.session.as_ref(),
@@ -4436,7 +4422,7 @@ impl Dataset {
                     || BuiltinIndexType::Inverted.as_str().to_string(),
                 )?;
                 lance_index::scalar::inverted::builder::merge_index_files(
-                    self.object_store.as_ref(),
+                    self.storage.as_ref(),
                     &index_dir,
                     Arc::new(store),
                     observed.progress(),
@@ -4824,7 +4810,7 @@ fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transa
 /// Commit a manifest file and create a copy at the latest manifest path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
-    object_store: &ObjectStore,
+    storage: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     manifest: &mut Manifest,
@@ -4913,7 +4899,7 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices,
             base_path,
-            object_store,
+            storage,
             write_manifest_file_to_path,
             naming_scheme,
             transaction,
@@ -4967,20 +4953,20 @@ const NAMESPACE_TABLE_MARKERS: &[&str] = &[".lance-reserved", ".lance-deregister
 /// This cannot protect files that another dataset references through `base_paths`;
 /// shallow-clone sources still need the reference tracking discussed in
 /// [#7514](https://github.com/lance-format/lance/issues/7514).
-pub async fn validate_dataset_root_for_drop(object_store: &ObjectStore, base: &Path) -> Result<()> {
-    if holds_readable_manifest(object_store, base).await? {
+pub async fn validate_dataset_root_for_drop(storage: &ObjectStore, base: &Path) -> Result<()> {
+    if holds_readable_manifest(storage, base).await? {
         return Ok(());
     }
 
     for marker in NAMESPACE_TABLE_MARKERS {
-        if object_store.exists(&base.clone().join(*marker)).await? {
+        if storage.exists(&base.clone().join(*marker)).await? {
             return Ok(());
         }
     }
 
     // Rejecting a path that holds nothing would replace the not-found error callers
     // already handle, and `ignore_not_found` relies on, with a different error kind.
-    if !has_any_entry(object_store, base).await? {
+    if !has_any_entry(storage, base).await? {
         return Ok(());
     }
 
@@ -4999,8 +4985,8 @@ pub async fn validate_dataset_root_for_drop(object_store: &ObjectStore, base: &P
 ///
 /// Returns on the first manifest that reads, so a real dataset costs one listing plus one
 /// manifest read no matter how many versions it has.
-async fn holds_readable_manifest(object_store: &ObjectStore, base: &Path) -> Result<bool> {
-    let mut entries = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
+async fn holds_readable_manifest(storage: &ObjectStore, base: &Path) -> Result<bool> {
+    let mut entries = storage.list(Some(base.clone().join(VERSIONS_DIR)));
     loop {
         let meta = match entries.try_next().await {
             Ok(Some(meta)) => meta,
@@ -5015,7 +5001,7 @@ async fn holds_readable_manifest(object_store: &ObjectStore, base: &Path) -> Res
             continue;
         }
 
-        match read_manifest(object_store, &meta.location, Some(meta.size)).await {
+        match read_manifest(storage, &meta.location, Some(meta.size)).await {
             Ok(_) => return Ok(true),
             // A file that only looks like a manifest proves nothing, so keep looking
             // rather than authorizing the delete. The reason is logged because a read
@@ -5030,7 +5016,7 @@ async fn holds_readable_manifest(object_store: &ObjectStore, base: &Path) -> Res
 }
 
 /// Whether `meta` names a manifest, using the same parsing that manifest discovery uses.
-fn is_manifest_location(meta: &object_store::ObjectMeta) -> bool {
+fn is_manifest_location(meta: &lance_io::object_store::ObjectMeta) -> bool {
     if ManifestLocation::try_from(meta.clone()).is_ok() {
         return true;
     }
@@ -5042,8 +5028,8 @@ fn is_manifest_location(meta: &object_store::ObjectMeta) -> bool {
 
 /// Whether anything at all lives under `prefix`. Stops at the first entry, so this stays
 /// cheap even on a storage root holding millions of objects.
-async fn has_any_entry(object_store: &ObjectStore, prefix: &Path) -> Result<bool> {
-    match object_store.list(Some(prefix.clone())).try_next().await {
+async fn has_any_entry(storage: &ObjectStore, prefix: &Path) -> Result<bool> {
+    match storage.list(Some(prefix.clone())).try_next().await {
         Ok(entry) => Ok(entry.is_some()),
         // Local filesystems report a missing directory as an error where object stores
         // return an empty listing. Neither has anything to protect.

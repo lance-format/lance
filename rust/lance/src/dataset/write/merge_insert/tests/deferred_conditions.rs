@@ -49,9 +49,8 @@ async fn fixture() -> Fixture {
     .await
     .unwrap();
     let io = IOTracker::default();
-    let ds = Arc::new(
-        ds.with_object_store_wrappers([Arc::new(io.clone()) as Arc<dyn WrappingObjectStore>]),
-    );
+    let ds =
+        Arc::new(ds.with_backend_wrappers([Arc::new(io.clone()) as Arc<dyn WrappingObjectStore>]));
     io.incremental_stats();
     Fixture { ds, batch, io }
 }

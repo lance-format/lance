@@ -305,12 +305,12 @@ async fn test_non_overlapping_rebase_delete_update() {
         .await
         .unwrap();
 
-    dataset.object_store.as_ref().io_stats_incremental(); // reset
+    dataset.storage.as_ref().io_stats_incremental(); // reset
     for (other_version, other_transaction) in other_transactions.iter().enumerate() {
         rebase
             .check_txn(other_transaction, other_version as u64)
             .unwrap();
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
     }
@@ -324,7 +324,7 @@ async fn test_non_overlapping_rebase_delete_update() {
     let rebased_transaction = rebase.finish(&dataset).await.unwrap();
     assert_eq!(rebased_transaction, expected_transaction);
     // We didn't need to do any IO, so the stats should be 0.
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
     assert_io_eq!(io_stats, write_iops, 0);
 }
@@ -392,7 +392,7 @@ async fn test_rebase_errors_when_read_version_was_cleaned_up() {
     // Simulate a concurrent `cleanup_old_versions` removing version 1.
     let naming_scheme = dataset.manifest_location().naming_scheme;
     let v1_manifest = naming_scheme.manifest_path(&dataset.base, 1);
-    dataset.object_store.delete(&v1_manifest).await.unwrap();
+    dataset.storage.delete(&v1_manifest).await.unwrap();
 
     // Rebasing now needs to check out version 1, which no longer exists.
     // This used to panic; it should return `DatasetNotFound` instead.
@@ -462,12 +462,12 @@ async fn test_non_conflicting_rebase_delete_update() {
                 .await
                 .unwrap();
 
-        dataset.object_store.as_ref().io_stats_incremental(); // reset
+        dataset.storage.as_ref().io_stats_incremental(); // reset
         for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
             rebase
                 .check_txn(other_transaction, other_version as u64)
                 .unwrap();
-            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+            let io_stats = dataset.storage.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 0);
             assert_io_eq!(io_stats, write_iops, 0);
         }
@@ -478,7 +478,7 @@ async fn test_non_conflicting_rebase_delete_update() {
         let rebased_transaction = rebase.finish(&dataset).await.unwrap();
         assert_eq!(rebased_transaction.read_version, dataset.manifest.version);
 
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset.storage.as_ref().io_stats_incremental();
         if expected_rewrite {
             // Read the current deletion file, and write the new one.
             assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
@@ -503,7 +503,7 @@ async fn test_non_conflicting_rebase_delete_update() {
             //     original_fragment.id,
             //     original_fragment.deletion_file.as_ref().unwrap(),
             // );
-            // assert!(!dataset.object_store.as_ref().exists(&old_path).await.unwrap());
+            // assert!(!dataset.storage.as_ref().exists(&old_path).await.unwrap());
             // The new deletion file should exist.
             let final_fragment = match &rebased_transaction.operation {
                 Operation::Update {
@@ -521,14 +521,7 @@ async fn test_non_conflicting_rebase_delete_update() {
                 final_fragment.id,
                 final_fragment.deletion_file.as_ref().unwrap(),
             );
-            assert!(
-                dataset
-                    .object_store
-                    .as_ref()
-                    .exists(&new_path)
-                    .await
-                    .unwrap()
-            );
+            assert!(dataset.storage.as_ref().exists(&new_path).await.unwrap());
 
             assert_io_eq!(io_stats, num_stages, 1);
         } else {
@@ -638,12 +631,12 @@ async fn test_conflicting_rebase(
 
     let affected_rows = RowAddrTreeMap::from_iter([0]);
 
-    dataset.object_store.as_ref().io_stats_incremental(); // reset
+    dataset.storage.as_ref().io_stats_incremental(); // reset
     let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
         .await
         .unwrap();
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
     assert_io_eq!(io_stats, write_iops, 0);
 
@@ -668,7 +661,7 @@ async fn test_conflicting_rebase(
         vec![(0, true)],
     );
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);
     assert_io_eq!(io_stats, write_iops, 0);
 
@@ -678,7 +671,7 @@ async fn test_conflicting_rebase(
         Err(crate::Error::RetryableCommitConflict { .. })
     ));
 
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = dataset.storage.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
     assert_io_eq!(io_stats, write_iops, 0, "failed before writing");
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Storage options provider and accessor for dynamic credential fetching
+//! ObjectStore options provider and accessor for dynamic credential fetching
 //!
 //! This module provides:
 //! - [`StorageOptionsProvider`] trait for fetching storage options from various sources
@@ -48,7 +48,7 @@ const DEFAULT_REFRESH_OFFSET_MILLIS: u64 = 60_000;
 ///
 /// # Future Possible Use Cases
 ///
-/// - **Dynamic Storage Location Resolution**: Resolve logical names to actual storage
+/// - **Dynamic ObjectStore Location Resolution**: Resolve logical names to actual storage
 ///   locations (bucket aliases, S3 Access Points, region-specific endpoints) that may
 ///   change based on region, tier, data migration, or failover scenarios
 /// - **Runtime S3 Tags Assignment**: Inject cost allocation tags, security labels, or
@@ -626,7 +626,7 @@ impl StorageOptionsAccessor {
 
     /// Resolve this accessor for a single base path scope.
     ///
-    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// ObjectStore options may carry base-scoped entries (`base_<id>.<key>`) that
     /// apply only to one registered base path. The returned accessor resolves
     /// options for `base_id`: entries scoped to that base overlay the unscoped
     /// defaults, and all other scoped entries are dropped. `None` resolves the

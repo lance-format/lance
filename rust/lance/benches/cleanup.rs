@@ -52,13 +52,13 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use futures::stream::{BoxStream, StreamExt};
 use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result as OSResult,
+use lance_core::storage::path::Path;
+use lance_io::object_store::backend::MultipartUpload;
+use lance_io::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
+use lance_io::object_store::{ObjectStoreParams, StorageBackend, WrappingObjectStore};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -97,7 +97,7 @@ struct DeleteCountSnapshot {
 /// benchmark works for both implementations.
 #[derive(Debug)]
 struct CountingStore {
-    inner: Arc<dyn OSObjectStore>,
+    inner: Arc<dyn StorageBackend>,
     counters: Arc<DeleteCounters>,
 }
 
@@ -108,7 +108,18 @@ impl std::fmt::Display for CountingStore {
 }
 
 #[async_trait]
-impl OSObjectStore for CountingStore {
+impl StorageBackend for CountingStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: lance_io::object_store::PaginatedListOptions,
+    ) -> lance_io::object_store::Result<lance_io::object_store::PaginatedListResult> {
+        let _ = (prefix, options);
+        Err(lance_io::object_store::Error::NotSupported {
+            source: "native pagination is unavailable".into(),
+        })
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -186,21 +197,12 @@ impl WrappingObjectStore for CountingStoreWrapper {
     fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn OSObjectStore>,
-    ) -> Arc<dyn OSObjectStore> {
+        original: Arc<dyn lance_io::object_store::StorageBackend>,
+    ) -> Arc<dyn lance_io::object_store::StorageBackend> {
         Arc::new(CountingStore {
             inner: original,
             counters: Arc::clone(&self.counters),
         })
-    }
-
-    // The wrapper only observes deletes, so listings can keep their pushdown.
-    fn wrap_paginated(
-        &self,
-        _store_prefix: &str,
-        original: Arc<dyn object_store::list::PaginatedListStore>,
-    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
-        Some(original)
     }
 }
 
@@ -225,7 +227,7 @@ fn batch_reader() -> RecordBatchIterator<Vec<Result<RecordBatch, ArrowError>>> {
 ///
 /// This follows the local URI construction used by the cleanup tests: normalize
 /// separators and ensure the path starts with `/` after the scheme.
-fn file_object_store_uri(path: &std::path::Path) -> String {
+fn file_storage_uri(path: &std::path::Path) -> String {
     let path = path.display().to_string().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
@@ -239,13 +241,13 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
 /// `file-object-store://` scheme keeps writes on the object-store path so that
 /// the delete counter observes cleanup's requests.
 async fn write_dataset(dir: &TempDir, counters: Arc<DeleteCounters>, versions: usize) -> Dataset {
-    let uri = file_object_store_uri(&dir.path().join("db"));
+    let uri = file_storage_uri(&dir.path().join("db"));
     let write_params = || WriteParams {
         mode: WriteMode::Overwrite,
         store_params: Some(ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(CountingStoreWrapper {
+            backend_wrappers: vec![Arc::new(CountingStoreWrapper {
                 counters: Arc::clone(&counters),
-            })),
+            })],
             ..Default::default()
         }),
         skip_auto_cleanup: true,
@@ -275,7 +277,7 @@ async fn setup_orphans(orphans: usize) -> (TempDir, Dataset, Arc<DeleteCounters>
     let counters = Arc::new(DeleteCounters::default());
     let dataset = write_dataset(&dir, Arc::clone(&counters), 1).await;
     let data_dir = dataset.data_dir();
-    let store = dataset.object_store(None).await.unwrap();
+    let store = dataset.storage(None).await.unwrap();
 
     let writes = futures::stream::iter(0..orphans).map(move |i| {
         let store = Arc::clone(&store);

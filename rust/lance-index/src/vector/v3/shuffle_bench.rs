@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use lance_core::Result;
+use lance_core::storage::path::Path;
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::shuffler::{ShuffleReader, TwoFileShuffleReader};

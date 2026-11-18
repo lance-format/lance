@@ -559,8 +559,8 @@ fn serving_file(fragment: &Fragment, field_id: i32) -> &DataFile {
 
 async fn open_data_file(dataset: &Dataset, path: &str) -> FileReader {
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.storage.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.storage),
     );
     let path = dataset.base.clone().join(DATA_DIR).join(path);
     let file_scheduler = scheduler
@@ -1866,7 +1866,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
     manifest.version += 1;
     let indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
     write_manifest_file(
-        dataset.object_store.as_ref(),
+        dataset.storage.as_ref(),
         dataset.commit_handler.as_ref(),
         &dataset.base,
         &mut manifest,
@@ -2470,7 +2470,7 @@ async fn test_binary_copy_translates_remapped_seed_fields() {
             assert!(seed_in_file(&source, &file.path, "id").await.is_some());
             assert!(seed_in_file(&source, &file.path, "val").await.is_some());
             destination
-                .object_store
+                .storage
                 .copy(
                     &source.base.clone().join(DATA_DIR).join(file.path.as_str()),
                     &destination

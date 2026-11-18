@@ -137,7 +137,7 @@ async fn test_cold_open_reads_full_manifest() {
     // Cold open with a fresh session: opening the dataset reads the full
     // manifest before any query can run.
     let ds = Dataset::open(uri).await.unwrap();
-    let io = ds.object_store.as_ref().io_stats_snapshot();
+    let io = ds.storage.as_ref().io_stats_snapshot();
     assert!(
         io.read_bytes >= manifest,
         "expected a cold open to read at least the manifest size \
@@ -173,10 +173,10 @@ async fn test_version_refresh_rereads_manifest() {
 
     // The reader's next version refresh reads the full manifest for the new
     // version.
-    reader.object_store.as_ref().io_stats_incremental();
+    reader.storage.as_ref().io_stats_incremental();
     reader.checkout_latest().await.unwrap();
     assert_eq!(reader.version().version, 2);
-    let io = reader.object_store.as_ref().io_stats_incremental();
+    let io = reader.storage.as_ref().io_stats_incremental();
     assert!(
         io.read_bytes >= manifest_v2,
         "expected version refresh to re-read the full manifest \
@@ -235,11 +235,11 @@ async fn test_compaction_rewrites_every_column() {
         .max()
         .expect("the backfilled file should report its size");
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.storage.as_ref().io_stats_incremental();
     let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
         .await
         .unwrap();
-    let io = dataset.object_store.as_ref().io_stats_incremental();
+    let io = dataset.storage.as_ref().io_stats_incremental();
 
     assert_eq!(metrics.fragments_removed, NUM_FRAGMENTS);
     assert_eq!(metrics.fragments_added, 1);

@@ -1,48 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::BackendConfig;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::object_store::path::Path;
 use crate::object_store::{
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, ObjectStoreParams, ObjectStoreProvider,
 };
+use ::object_store::memory::InMemory;
 use lance_core::error::Result;
-use object_store::{memory::InMemory, path::Path};
 use url::Url;
 
-/// Provides a fresh in-memory object store for each call to `new_store`.
+/// Provides a fresh in-memory object store for each call to `new_backend`.
 #[derive(Default, Debug)]
 pub struct MemoryStoreProvider;
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for MemoryStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
-        let download_retry_count = storage_options.download_retry_count();
-        Ok(ObjectStore {
-            inner: Arc::new(InMemory::new()),
-            external_blob_inner: None,
-            direct_local_io: false,
-            _external_blob_origin: None,
+impl MemoryStoreProvider {
+    pub(super) fn default_backend() -> BackendConfig {
+        let block_size = DEFAULT_LOCAL_BLOCK_SIZE;
+        BackendConfig {
+            store_prefix: None,
+            backend: crate::object_store::backend::native::from_object_store(Arc::new(
+                InMemory::new(),
+            )),
             local_dir_operations: None,
             local_fsync: false,
+            direct_local_io: false,
+            local_io: crate::object_store::LocalIo::Backend,
+            is_local: false,
+            is_remote: false,
+            max_single_copy_size: None,
             scheme: String::from("memory"),
             block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count,
-            scheduler_error_mode: Default::default(),
-            io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
             // Listed in full: the store is already in memory, so a page costs no less than
             // the directory does.
-            paginated_lister: None,
-        })
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for MemoryStoreProvider {
+    async fn new_backend(
+        &self,
+        _base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<BackendConfig> {
+        let mut config = Self::default_backend();
+        config.block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
+        Ok(config)
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -57,7 +66,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         Ok(Path::from(output))
     }
 
-    fn calculate_object_store_prefix(
+    fn calculate_storage_prefix(
         &self,
         _url: &Url,
         _storage_options: Option<&HashMap<String, String>>,
@@ -81,12 +90,12 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_object_store_prefix() {
+    fn test_calculate_storage_prefix() {
         let provider = MemoryStoreProvider;
         assert_eq!(
             "memory",
             provider
-                .calculate_object_store_prefix(&Url::parse("memory://etc").unwrap(), None)
+                .calculate_storage_prefix(&Url::parse("memory://etc").unwrap(), None)
                 .unwrap()
         );
     }

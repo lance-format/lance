@@ -1674,7 +1674,7 @@ async fn test_binary_copy_gate_rejects_unrecognized_extra_buffers() {
             .clone()
             .join(crate::dataset::DATA_DIR)
             .join(filename.as_str());
-        let object_writer = dataset.object_store.create(&path).await.unwrap();
+        let object_writer = dataset.storage.create(&path).await.unwrap();
         let mut writer = file_versions::create_writer(
             version,
             object_writer,
@@ -1796,7 +1796,7 @@ async fn test_binary_copy_seed_carry_follows_inputs() {
                     .clone()
                     .join(crate::dataset::DATA_DIR)
                     .join(file.path.as_str());
-                let store = dataset.object_store.clone();
+                let store = dataset.storage.clone();
                 let scheduler = lance_io::scheduler::ScanScheduler::new(
                     store.clone(),
                     lance_io::scheduler::SchedulerConfig::max_bandwidth(&store),

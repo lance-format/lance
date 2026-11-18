@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Make assertions about IO operations to an [ObjectStore].
+//! Make assertions about IO operations to an [StorageBackend].
 //!
 //! When testing code that performs IO, you will often want to make assertions
 //! about the number of reads and writes performed, the amount of data read or
 //! written, and the number of disjoint periods where at least one IO is in-flight.
 //!
 //! This modules provides [`IOTracker`] which can be used to wrap any object store.
+use crate::object_store::backend::MultipartUpload;
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
 #[cfg(feature = "test-util")]
@@ -16,21 +17,19 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "metrics")]
 use std::time::Instant;
 
+use crate::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result as OSResult, UploadPart,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
-use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-    UploadPart,
-};
+use lance_core::storage::path::Path;
 
-use crate::object_store::WrappingObjectStore;
 #[cfg(feature = "metrics")]
 use crate::object_store::metrics::{InFlightGuard, record_outcome};
-use object_store::list::PaginatedListStore;
+use crate::object_store::{StorageBackend, WrappingObjectStore};
 
 #[derive(Debug, Default, Clone)]
 pub struct IOTracker {
@@ -62,7 +61,7 @@ impl IOTracker {
 
     /// Record a read operation for tracking.
     ///
-    /// This is used by readers that bypass the ObjectStore layer (like LocalObjectReader)
+    /// This is used by readers that bypass the backend layer (like LocalObjectReader)
     /// to ensure their IO operations are still tracked.
     pub fn record_read(
         &self,
@@ -84,7 +83,7 @@ impl IOTracker {
 
     /// Record a write operation for tracking.
     ///
-    /// This is used by writers that bypass the ObjectStore layer (like LocalWriter)
+    /// This is used by writers that bypass the backend layer (like LocalWriter)
     /// to ensure their IO operations are still tracked.
     pub fn record_write(
         &self,
@@ -121,7 +120,7 @@ impl IOTracker {
     }
 
     /// Begin an operation that talks to storage without going through the
-    /// `object_store` layer, and so is invisible to the `MeteredObjectStore`
+    /// `object_store` layer, and so is invisible to the `MeteredBackend`
     /// wrapper: the optimized local reads and writes go straight to the
     /// filesystem. `operation` must be one of the labels that wrapper uses
     /// (`get`, `put`, `head`, ...) so this IO aggregates with the rest.
@@ -187,18 +186,12 @@ impl IoMetricsGuard {
 }
 
 impl WrappingObjectStore for IOTracker {
-    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-        Arc::new(IoTrackingStore::new(target, self.stats.clone()))
-    }
-
-    // A pushed-down listing records itself against the store's tracker, so it is already
-    // counted without passing through here.
-    fn wrap_paginated(
+    fn wrap(
         &self,
         _store_prefix: &str,
-        original: Arc<dyn PaginatedListStore>,
-    ) -> Option<Arc<dyn PaginatedListStore>> {
-        Some(original)
+        target: Arc<dyn crate::object_store::StorageBackend>,
+    ) -> Arc<dyn crate::object_store::StorageBackend> {
+        Arc::new(IoTrackingStore::new(target, self.stats.clone()))
     }
 }
 
@@ -332,7 +325,7 @@ impl Display for IoStats {
 
 #[derive(Debug)]
 pub struct IoTrackingStore {
-    target: Arc<dyn ObjectStore>,
+    target: Arc<dyn StorageBackend>,
     stats: Arc<Mutex<IoStats>>,
     #[cfg(feature = "test-util")]
     active_requests: Arc<AtomicU16>,
@@ -345,7 +338,7 @@ impl Display for IoTrackingStore {
 }
 
 impl IoTrackingStore {
-    pub fn new(target: Arc<dyn ObjectStore>, stats: Arc<Mutex<IoStats>>) -> Self {
+    pub fn new(target: Arc<dyn StorageBackend>, stats: Arc<Mutex<IoStats>>) -> Self {
         Self {
             target,
             stats,
@@ -401,7 +394,28 @@ impl IoTrackingStore {
 
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
-impl ObjectStore for IoTrackingStore {
+impl StorageBackend for IoTrackingStore {
+    async fn list_paginated(
+        &self,
+        prefix: Option<&str>,
+        options: crate::object_store::PaginatedListOptions,
+    ) -> crate::object_store::Result<crate::object_store::PaginatedListResult> {
+        let _guard = self.stage_guard();
+        let result = self.target.list_paginated(prefix, options).await;
+        if !matches!(
+            &result,
+            Err(crate::object_store::Error::NotSupported { .. })
+        ) {
+            self.record_read(
+                "list_paginated",
+                Path::from(prefix.unwrap_or_default()),
+                0,
+                None,
+            );
+        }
+        result
+    }
+
     async fn put_opts(
         &self,
         location: &Path,

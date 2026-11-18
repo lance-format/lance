@@ -819,7 +819,7 @@ async fn materialize_blob_v2_descriptors(
 
     let blobs = execute_blob_entries_with_execution(
         entries,
-        dataset.object_store.io_parallelism(),
+        dataset.storage.io_parallelism(),
         context.execution.clone(),
     )
     .await?;

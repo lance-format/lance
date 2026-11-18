@@ -9,8 +9,8 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use lance_arrow::FieldExt;
+use lance_core::storage::path::Path;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, uri_to_url};
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 use url::Url;
 
@@ -72,7 +72,7 @@ impl ExternalBaseResolver {
         for candidate in &self.candidates {
             let uri_store_prefix = self
                 .store_registry
-                .calculate_object_store_prefix(uri, candidate.store_params.storage_options())?;
+                .calculate_storage_prefix(uri, candidate.store_params.storage_options())?;
             if candidate.store_prefix != uri_store_prefix {
                 continue;
             }
@@ -399,13 +399,13 @@ mod tests {
             vec![
                 ExternalBaseCandidate {
                     base_id: base_a.id,
-                    store_prefix: store_a.store_prefix.clone(),
+                    store_prefix: store_a.store_prefix().to_owned(),
                     base_path: extracted_a,
                     store_params: base_a_params,
                 },
                 ExternalBaseCandidate {
                     base_id: base_b.id,
-                    store_prefix: store_b.store_prefix.clone(),
+                    store_prefix: store_b.store_prefix().to_owned(),
                     base_path: extracted_b,
                     store_params: base_b_params,
                 },

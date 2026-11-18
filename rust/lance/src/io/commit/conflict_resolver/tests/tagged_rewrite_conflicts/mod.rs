@@ -250,7 +250,7 @@ async fn reuse_fixture(uri: &str, external: bool) -> (Dataset, usize) {
 
 fn take_reuse_details_reads(dataset: &Dataset) -> usize {
     dataset
-        .object_store
+        .storage
         .io_stats_incremental()
         .requests
         .iter()

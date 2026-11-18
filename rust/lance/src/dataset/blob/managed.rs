@@ -11,7 +11,7 @@ use arrow::datatypes::UInt64Type;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use futures::TryStreamExt;
-use object_store::path::Path;
+use lance_core::storage::path::Path;
 
 use super::locate::{BlobLocator, StoredBlob, join_base_and_relative_path};
 use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
@@ -226,9 +226,9 @@ fn primary_root(dataset: &Dataset, owner: &Dataset) -> BaseResolution {
     let registry = dataset.session.store_registry();
     if may_be_same_store(
         registry.as_ref(),
-        &owner.object_store,
-        dataset.object_store.scheme(),
-        &dataset.object_store.store_prefix,
+        &owner.storage,
+        dataset.storage.scheme(),
+        dataset.storage.store_prefix(),
     ) {
         BaseResolution::Resolved(dataset.base.clone())
     } else {
@@ -247,13 +247,13 @@ async fn registered_root(
         return Ok(root.clone());
     }
     let registry = dataset.session.store_registry();
-    let root = match dataset.object_store(Some(base_id)).await {
+    let root = match dataset.storage(Some(base_id)).await {
         Ok(base_store) => {
             if !may_be_same_store(
                 registry.as_ref(),
-                &owner.object_store,
+                &owner.storage,
                 base_store.scheme(),
-                &base_store.store_prefix,
+                base_store.store_prefix(),
             ) {
                 BaseResolution::Foreign
             } else {
@@ -288,14 +288,18 @@ pub(in crate::dataset) fn may_be_same_store(
     scheme: &str,
     prefix: &str,
 ) -> bool {
-    if owner.store_prefix == prefix {
+    if owner.store_prefix() == prefix {
         return true;
     }
-    let local = |scheme: &str| matches!(scheme, "file" | "file-object-store" | "file+uring");
-    if local(owner.scheme()) && local(scheme) {
+    let local = |scheme: &str| {
+        registry
+            .get_provider(scheme)
+            .is_some_and(|provider| provider.is_local())
+    };
+    if owner.is_local() && local(scheme) {
         return true;
     }
-    if local(owner.scheme()) || local(scheme) {
+    if owner.is_local() || local(scheme) {
         return false;
     }
     let Some(owner_provider) = registry.get_provider(owner.scheme()) else {
@@ -308,7 +312,7 @@ pub(in crate::dataset) fn may_be_same_store(
         return false;
     }
     match (
-        prefix_location(&owner.store_prefix, owner.scheme()),
+        prefix_location(owner.store_prefix(), owner.scheme()),
         prefix_location(prefix, scheme),
     ) {
         (Some(owner_location), Some(location)) => owner_location == location,
@@ -489,13 +493,13 @@ mod tests {
         BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME,
     };
     use lance_core::datatypes::BlobKind;
+    use lance_core::storage::path::Path;
     use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::storage_options::StorageOptionsAccessor;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_table::feature_flags::FLAG_MANAGED_BLOBS;
     use lance_table::format::BasePath;
-    use object_store::path::Path;
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::{Arc, atomic::Ordering};
@@ -657,7 +661,7 @@ mod tests {
             &registry,
             &owner,
             base.scheme(),
-            &base.store_prefix
+            base.store_prefix()
         ));
     }
 
@@ -678,19 +682,19 @@ mod tests {
             &registry,
             &owner,
             same_bucket.scheme(),
-            &same_bucket.store_prefix
+            same_bucket.store_prefix()
         ));
         assert!(!super::may_be_same_store(
             &registry,
             &owner,
             other_bucket.scheme(),
-            &other_bucket.store_prefix
+            other_bucket.store_prefix()
         ));
         assert!(super::may_be_same_store(
             &registry,
             &owner,
             dynamo_alias.scheme(),
-            &dynamo_alias.store_prefix
+            dynamo_alias.store_prefix()
         ));
     }
 
@@ -714,26 +718,26 @@ mod tests {
             &[("account_name", "account-a")],
         )
         .await;
-        assert_eq!(owner.store_prefix, "az$container@account-a");
-        assert_eq!(same_account.store_prefix, "az$container@account-a");
-        assert_eq!(other_account.store_prefix, "az$container@account-b");
+        assert_eq!(owner.store_prefix(), "az$container@account-a");
+        assert_eq!(same_account.store_prefix(), "az$container@account-a");
+        assert_eq!(other_account.store_prefix(), "az$container@account-b");
         assert!(super::may_be_same_store(
             &registry,
             &owner,
             same_account.scheme(),
-            &same_account.store_prefix
+            same_account.store_prefix()
         ));
         assert!(!super::may_be_same_store(
             &registry,
             &owner,
             other_account.scheme(),
-            &other_account.store_prefix
+            other_account.store_prefix()
         ));
         assert!(super::may_be_same_store(
             &registry,
             &owner,
             scheme_alias.scheme(),
-            &scheme_alias.store_prefix
+            scheme_alias.store_prefix()
         ));
     }
 }

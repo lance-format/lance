@@ -676,7 +676,7 @@ async fn test_compaction_merges_compatible_vector_segments(
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter([fragment.id() as u32]));
         for file in ["index.idx", "auxiliary.idx"] {
             dataset
-                .object_store
+                .storage
                 .copy(
                     &dataset
                         .indices_dir()
@@ -806,7 +806,7 @@ async fn test_stale_vector_segment_merge_requires_replan() {
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter(fragment_ids));
         for file in template.files.as_ref().unwrap() {
             dataset
-                .object_store
+                .storage
                 .copy(
                     &dataset
                         .indices_dir()
