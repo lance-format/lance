@@ -105,6 +105,9 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 # Exposes `scalar::inverted::oracle`, the brute-force scoring reference, to
 # downstream test and bench targets. Enable it as a dev-dependency feature only.
 test-oracle = []
+# Times the phases of k-means training into `vector::kmeans::profile`, for
+# benchmarks. Off by default: every timer then compiles to nothing.
+kmeans-profile = []
 
 [[bench]]
 name = "find_partitions"

@@ -39,6 +39,7 @@ use rand::seq::index::sample;
 use rayon::prelude::*;
 
 use super::KMeans;
+use super::profile::{self, Phase, Work};
 use assign::{Assignment, NearestCentroid};
 
 mod assign;
@@ -243,6 +244,7 @@ impl Trainer<'_> {
             None => SmallRng::from_os_rng(),
         };
 
+        let init_busy = profile::work(Work::Other);
         let mut centroids: Vec<T::Native> = sample(&mut rng, n, k)
             .into_iter()
             .flat_map(|row| &values[row * dimension..(row + 1) * dimension])
@@ -261,14 +263,21 @@ impl Trainer<'_> {
         // last-epoch-mean finalization.
         let mut last_epoch_stats = BatchStats::zeros(k, dimension);
         let mut t = 0;
+        drop(init_busy);
         for epoch in 0..params.epochs {
             let is_last_epoch = epoch + 1 == params.epochs;
+            let shuffle_busy = profile::work(Work::Gather);
             order.shuffle(&mut rng);
+            drop(shuffle_busy);
             // The tail that does not fill a batch is skipped; the next shuffle
             // puts other vectors there.
             for batch in order.chunks_exact(batch_size) {
+                let assign_phase = profile::phase(Phase::EMeansAssign);
                 let batch_stats = assign_batch(values, dimension, &centroids, k, batch);
+                drop(assign_phase);
 
+                let _update_phase = profile::phase(Phase::EMeansUpdate);
+                let _update_busy = profile::work(Work::Update);
                 let step = step_at(peak_step, t, total_updates);
                 let decay = 1.0 - step;
                 for (count, batch_count) in counts.iter_mut().zip(&batch_stats.counts) {
@@ -297,6 +306,8 @@ impl Trainer<'_> {
         // Last-epoch-mean finalization: the last epoch's counts and sums are
         // exactly those of its recorded assignments. A cluster that caught no
         // vector in the last epoch keeps its EMA centroid.
+        let _finalize_phase = profile::phase(Phase::EMeansFinalize);
+        let _finalize_busy = profile::work(Work::Update);
         read_centroids(
             &last_epoch_stats.counts,
             &last_epoch_stats.sums,
@@ -382,8 +393,11 @@ fn assign_batch<N: NearestCentroid>(
     batch: &[usize],
 ) -> BatchStats {
     let rows_per_task = rows_per_task(batch.len(), k, dimension);
+    let prepare_busy = profile::work(Work::Assign);
     let prepared = N::prepare_centroids(centroids, dimension);
+    drop(prepare_busy);
     let assign = |rows: &[usize]| {
+        let _busy = profile::work(Work::Assign);
         let mut assignments = Vec::with_capacity(rows.len());
         N::assign_rows(
             values,
@@ -396,6 +410,7 @@ fn assign_batch<N: NearestCentroid>(
         assignments
     };
     let accumulate = |stats: &mut BatchStats, rows: &[usize], assignments: &[Assignment]| {
+        let _busy = profile::work(Work::Update);
         for (&row, assignment) in rows.iter().zip(assignments) {
             if let Some((cluster, distance)) = *assignment {
                 let vector = &values[row * dimension..(row + 1) * dimension];
@@ -414,6 +429,7 @@ fn assign_batch<N: NearestCentroid>(
                 partial
             })
             .collect();
+        let _busy = profile::work(Work::Update);
         for partial in &partials {
             stats.merge(partial);
         }

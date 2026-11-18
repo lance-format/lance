@@ -54,8 +54,10 @@ use crate::vector::utils::SimpleIndex;
 use lance_core::{Error, Result};
 
 pub mod emeans;
+pub mod profile;
 
 use emeans::{EMeansParams, train_emeans};
+use profile::{Phase, Work};
 
 /// The clustering each node of hierarchical k-means runs to split its vectors
 /// into [`KMeansParams::hierarchical_k`] sub-clusters. The tree around the
@@ -409,6 +411,7 @@ pub trait KMeansAlgo<T: Num> {
             index,
         );
 
+        let _busy = profile::work(Work::Assign);
         let k = centroids.len() / dimension;
         let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
@@ -517,6 +520,7 @@ fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
         .par_chunks(rows_per_chunk * dimension)
         .zip(membership.par_chunks(rows_per_chunk))
         .map(|(vectors, members)| {
+            let _busy = profile::work(Work::Update);
             let mut sums = vec![N::zero(); k * dimension];
             for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
                 if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
@@ -527,6 +531,7 @@ fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
             sums
         })
         .collect::<Vec<_>>();
+    let _busy = profile::work(Work::Update);
     partial_sums
         .into_iter()
         .reduce(|mut total, sums| {
@@ -557,6 +562,7 @@ fn sum_members_centroid_split<N: Float + AddAssign + Send + Sync>(
         .enumerate()
         .with_max_len(1)
         .for_each(|(i, centroids)| {
+            let _busy = profile::work(Work::Update);
             let start = i * chunk_size;
             let end = ((i + 1) * chunk_size).min(k);
             data.chunks(dimension)
@@ -722,6 +728,7 @@ where
                             .map_init(
                                 || vec![0f32; prepared.num_targets()],
                                 |dists, vec| {
+                                    let _busy = profile::work(Work::Assign);
                                     prepared.distances_into(vec, dists);
                                     argmin_value_float_with_bias(dists.iter().copied(), biases())
                                 },
@@ -733,6 +740,7 @@ where
                         .map_init(
                             || vec![0.0; centroids.len() / dimension],
                             |distances, vec| {
+                                let _busy = profile::work(Work::Assign);
                                 l2_distance_batch_into(vec, centroids, dimension, distances);
                                 argmin_value_float_with_bias(distances.iter().copied(), biases())
                             },
@@ -780,6 +788,7 @@ where
             },
         };
 
+        let _busy = profile::work(Work::Assign);
         cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
@@ -804,12 +813,14 @@ where
             .par_chunks_mut(dimension)
             .zip(cluster_sizes.par_iter())
             .for_each(|(centroid, &cnt)| {
+                let _busy = profile::work(Work::Update);
                 if cnt > 0 {
                     let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
                     centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
 
+        let _busy = profile::work(Work::Update);
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             if data.len() / dimension < k * 256 {
@@ -871,6 +882,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 )
             })
             .collect::<Vec<_>>();
+        let _busy = profile::work(Work::Assign);
         cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
@@ -1264,6 +1276,7 @@ impl KMeans {
 
         let mut rng = params.rng();
         for redo in 1..=params.redos {
+            let init_busy = profile::work(Work::Other);
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
                     data.values(),
@@ -1283,6 +1296,7 @@ impl KMeans {
             // Random samples and caller-provided training seeds may have
             // different norms; constrain them before the first assignment.
             kmeans.normalize_dot_centroids();
+            drop(init_busy);
             let mut loss = f64::MAX;
             for i in 1..=params.max_iters {
                 if let Some(cb) = &params.on_progress {
@@ -1301,6 +1315,7 @@ impl KMeans {
                     kmeans.distance_type,
                 )?;
 
+                let assign_phase = profile::phase(Phase::LloydAssign);
                 let balance_factor = adjusted_balance_factor.min(params.balance_factor);
                 let (membership, radius, losses) = Algo::compute_membership_and_loss(
                     kmeans.centroids.as_primitive::<T>().values(),
@@ -1312,10 +1327,15 @@ impl KMeans {
                     index.as_ref(),
                 );
 
+                drop(assign_phase);
+
+                let update_phase = profile::phase(Phase::LloydUpdate);
+                let sizes_busy = profile::work(Work::Update);
                 adjusted_balance_factor =
                     compute_cluster_sizes(&membership, &radius, &losses, &mut cluster_sizes);
                 let balance_loss = compute_balance_loss(&cluster_sizes, n, balance_factor);
                 let last_loss = losses.iter().sum::<f64>() + balance_loss as f64;
+                drop(sizes_busy);
 
                 kmeans = Algo::to_kmeans(
                     data.values(),
@@ -1326,6 +1346,7 @@ impl KMeans {
                     params.distance_type,
                     last_loss,
                 );
+                drop(update_phase);
                 // Keep `last_loss` as the scale reference to preserve the legacy
                 // convergence threshold.
                 if kmeans_has_converged(loss, last_loss, params.tolerance) {
@@ -1367,10 +1388,12 @@ impl KMeans {
         indices
             .par_chunks(chunk_rows)
             .flat_map_iter(|chunk| {
+                let gather_busy = profile::work(Work::Gather);
                 let mut rows = Vec::with_capacity(chunk.len() * dimension);
                 for &idx in chunk {
                     rows.extend_from_slice(&data_values[idx * dimension..(idx + 1) * dimension]);
                 }
+                drop(gather_busy);
                 let (membership, _) = Algo::compute_membership_and_dist(
                     centroids,
                     &rows,
@@ -1394,6 +1417,7 @@ impl KMeans {
         T::Native: Clone,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
+        let _busy = profile::work(Work::Gather);
         let mut subset_data = Vec::with_capacity(indices.len() * dimension);
         for &idx in indices {
             let start = idx * dimension;
@@ -1534,6 +1558,8 @@ impl KMeans {
         // or allocating another full index array. All rows still get assigned.
         let node_params = params.derive(salt);
         let training_rows = n.min(k * TRAINING_ROWS_PER_CENTROID);
+        let sample_phase = profile::phase(Phase::NodeSample);
+        let shuffle_busy = profile::work(Work::Gather);
         let training_indices = if training_rows < n {
             indices
                 .partial_shuffle(&mut node_params.rng(), training_rows)
@@ -1541,8 +1567,11 @@ impl KMeans {
         } else {
             indices.as_mut_slice()
         };
+        drop(shuffle_busy);
         let training =
             Self::create_array_from_indices::<T>(training_indices, data_values, dimension)?;
+        drop(sample_phase);
+        let train_phase = profile::phase(Phase::NodeTrain);
         let kmeans = match &params.hierarchical_node_algorithm {
             HierarchicalNodeAlgorithm::Lloyd => {
                 Self::train_kmeans::<T, Algo>(&training, k, &node_params)?
@@ -1556,7 +1585,9 @@ impl KMeans {
                     .map_err(|e| ArrowError::ExternalError(Box::new(e)))?
             }
         };
+        drop(train_phase);
         drop(training);
+        let membership_phase = profile::phase(Phase::Membership);
         let membership = Self::membership_of_rows::<T, Algo>(
             kmeans.centroids.as_primitive::<T>().values(),
             data_values,
@@ -1564,6 +1595,8 @@ impl KMeans {
             &indices,
             params.distance_type,
         );
+        drop(membership_phase);
+        let children_busy = profile::work(Work::Other);
         let mut children: Vec<(usize, Vec<usize>)> =
             (0..k).map(|centroid| (centroid, Vec::new())).collect();
         for (local, cluster) in membership.iter().enumerate() {
@@ -1572,6 +1605,7 @@ impl KMeans {
             }
         }
         children.retain(|(_, child)| !child.is_empty());
+        drop(children_busy);
 
         if children.len() <= 1 {
             // Every vector landed in the same sub-cluster (duplicates): the node
@@ -1713,6 +1747,7 @@ impl KMeans {
         T::Native: Num,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
+        let _phase = profile::phase(Phase::Leaves);
         let sub_data = Self::create_array_from_indices::<T>(&indices, data_values, dimension)?;
         let membership = vec![Some(0); indices.len()];
         let mut sizes = vec![indices.len()];
