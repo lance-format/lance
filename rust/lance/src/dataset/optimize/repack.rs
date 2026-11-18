@@ -257,11 +257,7 @@ pub(super) async fn execute_repack(
     let source = FileFragment::new(Arc::new(dataset.clone()), base);
     let schema = dataset.schema();
     let batch_size = options.batch_size.map(|size| size as u32);
-    // The writer options `rewrite_files` uses.
-    let file_writer_options = FileWriterOptions {
-        data_cache_bytes: options.data_cache_bytes,
-        ..Default::default()
-    };
+    let file_writer_options = options.file_writer_options();
 
     let mut written: Vec<DataFile> = Vec::with_capacity(files.len());
     for column_ids in files {

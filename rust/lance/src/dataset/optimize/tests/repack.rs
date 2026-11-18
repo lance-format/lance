@@ -1193,25 +1193,20 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
         let file = dataset.fragments()[0].files.last().unwrap().clone();
         assert_eq!(file.fields.as_ref(), &[3, 4]);
 
-        let path = dataset.data_dir().join(file.path.as_str());
-        let scheduler = lance_io::scheduler::ScanScheduler::new(
+        let path = dataset
+            .data_file_dir(&file)
+            .unwrap()
+            .join(file.path.as_str());
+        let scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
-            lance_io::scheduler::SchedulerConfig::default_for_testing(),
+            SchedulerConfig::default_for_testing(),
         );
-        let file = scheduler
-            .open_file(&path, &lance_io::utils::CachedFileSize::unknown())
+        let file_scheduler = scheduler
+            .open_file(&path, &file.file_size_bytes)
             .await
             .unwrap();
-        let reader = lance_file::reader::FileReader::try_open(
-            file,
-            None,
-            Default::default(),
-            &dataset.metadata_cache.file_metadata_cache(&path),
-            lance_file::reader::FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-        reader.metadata().column_metadatas[0].pages.len()
+        let metadata = LFReader::read_all_metadata(&file_scheduler).await.unwrap();
+        metadata.column_infos[0].page_infos.len()
     }
 
     let default_pages = pages_of_the_repacked_file(version, None).await;
