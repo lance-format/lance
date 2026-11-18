@@ -433,7 +433,7 @@ async fn growth_fixture(version: LanceFileVersion, is_raw: bool) -> (Dataset, Re
     .unwrap();
     assert_eq!(dataset.fragments().len(), 2);
     let scheduler = ScanScheduler::new(dataset.object_store.clone(), SchedulerConfig::new(1024));
-    for fragment in dataset.fragments() {
+    for fragment in dataset.fragments().iter() {
         let file = &fragment.files[0];
         let source = scheduler
             .open_file(
