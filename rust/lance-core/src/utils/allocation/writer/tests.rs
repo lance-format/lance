@@ -14,7 +14,10 @@ use crate::utils::allocation::AllocationBudget;
 #[case::cache_line(64)]
 #[case::beyond_cache_line(65)]
 #[case::beyond_page(4097)]
-fn exact_layout_initializes_only_appended_bytes(#[case] len: usize) {
+fn exact_layout_initializes_only_appended_bytes(
+    #[case] len: usize,
+    #[values(false, true)] foreign: bool,
+) {
     let budget = AllocationBudget::new(len);
     let mut work = budget.try_reserve(len).unwrap();
     let mut writer = work.try_allocate_writer(len).unwrap().unwrap();
@@ -24,7 +27,20 @@ fn exact_layout_initializes_only_appended_bytes(#[case] len: usize) {
     let prefix = len.min(7);
     writer.extend_zeros(prefix).unwrap();
     let suffix: Vec<u8> = (prefix..len).map(|i| (i % 251 + 1) as u8).collect();
-    writer.extend_from_slice(&suffix).unwrap();
+    if foreign {
+        // SAFETY: initializes the complete bounded suffix without reading it.
+        unsafe {
+            writer.try_extend_with(suffix.len(), |output| {
+                for (byte, value) in output.iter_mut().zip(&suffix) {
+                    byte.write(*value);
+                }
+                Ok(output.len())
+            })
+        }
+        .unwrap();
+    } else {
+        writer.extend_from_slice(&suffix).unwrap();
+    }
     writer.extend_from_slice(&[]).unwrap();
     writer.extend_zeros(0).unwrap();
     if prefix != 0 {
@@ -133,4 +149,95 @@ fn unwinding_an_incomplete_writer_releases_its_credit() {
     }));
     assert!(caught.is_err());
     assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[case::error(None)]
+#[case::short(Some(1))]
+#[case::long(Some(4))]
+fn unsuccessful_foreign_write_preserves_readable_prefix(#[case] returned: Option<usize>) {
+    let pool = AllocationBudget::new(5);
+    let mut work = pool.try_reserve(5).unwrap();
+    let mut writer = work.try_allocate_writer(5).unwrap().unwrap();
+    writer.extend_from_slice(b"ab").unwrap();
+    // SAFETY: no successful exact-length result, only bounded writes and no reads.
+    let error = unsafe {
+        writer.try_extend_with(3, |output| {
+            output[0].write(99);
+            returned.ok_or_else(|| Error::invalid_input("injected initializer error"))
+        })
+    }
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(if returned.is_some() {
+        "expected 3"
+    } else {
+        "injected initializer error"
+    }));
+    assert_eq!(writer.initialized_mut(), b"ab");
+    writer.extend_from_slice(b"cde").unwrap();
+    let bytes = writer.finish().unwrap();
+    assert_eq!(bytes.as_ref(), b"abcde");
+    let alias = bytes.slice(4..5);
+    drop(bytes);
+    assert_eq!(pool.reserved(), 5);
+    assert_eq!(alias.as_ref(), b"e");
+    drop(alias);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[test]
+fn refused_foreign_write_does_not_call_initializer() {
+    let pool = AllocationBudget::new(2);
+    let mut work = pool.try_reserve(2).unwrap();
+    let mut writer = work.try_allocate_writer(2).unwrap().unwrap();
+    for len in [3, usize::MAX] {
+        // SAFETY: the closure never returns and cannot expose any memory.
+        let error = unsafe {
+            writer.try_extend_with(len, |_| panic!("capacity must be checked before callback"))
+        }
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds reserved allocation length")
+        );
+    }
+    assert!(writer.initialized_mut().is_empty());
+    writer.recycle(&mut work).unwrap();
+    assert_eq!(work.len(), 2);
+}
+
+#[test]
+fn panicking_foreign_writer_can_be_recycled_without_releasing_capacity() {
+    let pool = AllocationBudget::new(8);
+    let mut work = pool.try_reserve(8).unwrap();
+    let mut writer = work.try_allocate_writer(8).unwrap().unwrap();
+    writer.extend_from_slice(b"abc").unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: only a bounded write, and unwinding cannot publish the suffix.
+        unsafe {
+            writer.try_extend_with(5, |output| {
+                output[0].write(7);
+                panic!("injected foreign initializer panic");
+            })
+        }
+        .unwrap();
+    }));
+    assert!(result.is_err());
+    assert_eq!(writer.initialized_mut(), b"abc");
+    writer.recycle(&mut work).unwrap();
+    assert_eq!(work.len(), 8);
+    assert_eq!(pool.reserved(), 8);
+    assert!(pool.try_reserve(1).is_none());
+    let other = AllocationBudget::new(3);
+    let mut foreign = other.try_reserve(3).unwrap();
+    let writer = work.try_allocate_writer(8).unwrap().unwrap();
+    let error = writer.recycle(&mut foreign).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("different allocation budgets"));
+    assert_eq!(foreign.len(), 3);
+    assert_eq!(other.reserved(), 3);
+    assert_eq!(pool.reserved(), 0);
 }

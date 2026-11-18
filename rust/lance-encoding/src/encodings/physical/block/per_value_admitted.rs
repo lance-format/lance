@@ -2,9 +2,15 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! General per-value decode with exact output and caller-owned codec context.
+//!
+//! Raw copies and Zstd initialize output once. The writer publishes only complete
+//! output; partial decoder failures recycle its allocation into the same workspace.
 
 use arrow_buffer::Buffer;
-use lance_core::{Error, Result, utils::allocation::Reservation};
+use lance_core::{
+    Error, Result,
+    utils::allocation::{Reservation, ReservedBufferWriter},
+};
 
 use super::CompressionScheme;
 use crate::{
@@ -118,58 +124,41 @@ pub(super) fn plan(
 }
 
 #[cfg(feature = "zstd")]
-fn zstd_into(input: &[u8], output: &mut [u8], context: &mut [u8]) -> Result<()> {
+fn zstd_append(
+    input: &[u8],
+    len: usize,
+    output: &mut ReservedBufferWriter,
+    context: &mut [u8],
+) -> Result<()> {
     use ::zstd::zstd_safe::zstd_sys;
     // SAFETY: Reservation supplies exclusive, 64-byte-aligned storage, sized by
-    // ZSTD_estimateDCtxSize. It outlives the context and synchronous decode. Input,
-    // output and context are disjoint live slices. Static DCtx never allocates or
-    // resizes; it errors if more memory is needed. No dictionary/streaming/legacy
-    // context is installed. Reinitialization permits scratch reuse across values.
-    let written = unsafe {
+    // ZSTD_estimateDCtxSize. Input, output and context are disjoint. The pinned
+    // ZSTD_decompressDCtx accepts uninitialized output (as in zstd-safe's WriteBuf)
+    // and returns its initialized length. Never form an uninitialized u8 slice.
+    // Only an exact successful length advances the writer; errors leave the
+    // private suffix unreadable. Static DCtx never allocates or resizes. No
+    // dictionary/streaming/legacy context is installed. The context is reinitialized
+    // before each value, so it cannot reuse any preceding output pointer.
+    unsafe {
         let ctx = zstd_sys::ZSTD_initStaticDCtx(context.as_mut_ptr().cast(), context.len());
         if ctx.is_null() {
             return Err(Error::internal("Zstd rejected the admitted static context"));
         }
-        zstd_sys::ZSTD_decompressDCtx(
-            ctx,
-            output.as_mut_ptr().cast(),
-            output.len(),
-            input.as_ptr().cast(),
-            input.len(),
-        )
-    };
-    // SAFETY: the return-code predicate has no pointer arguments.
-    if unsafe { zstd_sys::ZSTD_isError(written) } != 0 {
-        return Err(Error::invalid_input(::zstd::zstd_safe::get_error_name(
-            written,
-        )));
-    }
-    if written != output.len() {
-        return Err(Error::invalid_input(
-            "Zstd produced a different per-value length",
-        ));
-    }
-    Ok(())
-}
-
-fn decode_frame(
-    scheme: CompressionScheme,
-    input: &[u8],
-    output: &mut [u8],
-    _context: &mut [u8],
-) -> Result<()> {
-    match scheme {
-        CompressionScheme::None => {
-            output.copy_from_slice(input);
-            Ok(())
-        }
-        #[cfg(feature = "lz4")]
-        CompressionScheme::Lz4 => super::admitted::lz4_into(input, output),
-        #[cfg(feature = "zstd")]
-        CompressionScheme::Zstd => zstd_into(input, output, _context),
-        _ => Err(Error::not_supported(
-            "general per-value codec is not enabled",
-        )),
+        output.try_extend_with(len, |target| {
+            let written = zstd_sys::ZSTD_decompressDCtx(
+                ctx,
+                target.as_mut_ptr().cast(),
+                target.len(),
+                input.as_ptr().cast(),
+                input.len(),
+            );
+            if zstd_sys::ZSTD_isError(written) != 0 {
+                return Err(Error::invalid_input(::zstd::zstd_safe::get_error_name(
+                    written,
+                )));
+            }
+            Ok(written)
+        })
     }
 }
 
@@ -178,6 +167,33 @@ pub(super) fn decode(
     data: &VariableWidthBlock,
     workspace: &mut Reservation,
 ) -> Result<Option<DataBlock>> {
+    match scheme {
+        CompressionScheme::None => decode_with(scheme, data, workspace, |input, _, output, _| {
+            output.extend_from_slice(input)
+        }),
+        #[cfg(feature = "lz4")]
+        CompressionScheme::Lz4 => decode_with(scheme, data, workspace, |input, len, output, _| {
+            let start = output.initialized_mut().len();
+            output.extend_zeros(len)?;
+            super::admitted::lz4_into(input, &mut output.initialized_mut()[start..])
+        }),
+        #[cfg(feature = "zstd")]
+        CompressionScheme::Zstd => decode_with(scheme, data, workspace, zstd_append),
+        _ => Err(Error::not_supported(
+            "general per-value codec is not enabled",
+        )),
+    }
+}
+
+fn decode_with<F>(
+    scheme: CompressionScheme,
+    data: &VariableWidthBlock,
+    workspace: &mut Reservation,
+    mut append: F,
+) -> Result<Option<DataBlock>>
+where
+    F: FnMut(&[u8], usize, &mut ReservedBufferWriter, &mut [u8]) -> Result<()>,
+{
     let budget = plan(scheme, data)?;
     if budget.workspace_bytes > workspace.len() {
         return Ok(None);
@@ -185,7 +201,7 @@ pub(super) fn decode(
     let mut offsets = workspace
         .try_allocate(data.offsets.len())?
         .ok_or_else(|| Error::internal("general offsets exceeded complete admission"))?;
-    let mut values = match workspace.try_allocate(budget.output_bytes - data.offsets.len()) {
+    let mut values = match workspace.try_allocate_writer(budget.output_bytes - data.offsets.len()) {
         Ok(Some(value)) => value,
         other => {
             offsets.recycle(workspace)?;
@@ -207,9 +223,8 @@ pub(super) fn decode(
     let result = variable::visit(data, &mut |input| {
         let (compressed, len) = frame(scheme, input)?;
         let end = written + len; // the immutable input was fully checked by plan
-        let output = &mut values.as_mut()[written..end];
         if !input.is_empty() {
-            decode_frame(scheme, compressed, output, context.as_mut())?;
+            append(compressed, len, &mut values, context.as_mut())?;
         }
         written = end;
         row += 1;
@@ -224,7 +239,7 @@ pub(super) fn decode(
         return Err(error);
     }
     Ok(Some(DataBlock::VariableWidth(VariableWidthBlock {
-        data: LanceBuffer::from(Buffer::from(values.freeze())),
+        data: LanceBuffer::from(Buffer::from(values.finish()?)),
         offsets: LanceBuffer::from(Buffer::from(offsets.freeze())),
         bits_per_offset: data.bits_per_offset,
         num_values: data.num_values,

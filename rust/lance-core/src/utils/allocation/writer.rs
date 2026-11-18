@@ -3,7 +3,7 @@
 
 //! Sequential initialization without a redundant full-payload zeroing pass.
 
-use std::{alloc::Layout, ptr::NonNull};
+use std::{alloc::Layout, mem::MaybeUninit, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::alloc::ALIGNMENT;
 use bytes::Bytes;
@@ -82,9 +82,10 @@ impl Reservation {
 
 /// An admitted allocation whose initialized prefix grows through checked appends.
 ///
-/// Construct with [`Reservation::try_allocate_writer`]. No uninitialized slice or
-/// raw pointer is exposed; [`Self::finish`] requires the complete layout to have
-/// been initialized. It never reallocates or obtains additional credit.
+/// Construct with [`Reservation::try_allocate_writer`]. Safe append operations
+/// copy bytes or zeros; [`Self::try_extend_with`] also supports audited foreign
+/// initializers. [`Self::finish`] requires the complete layout to have been
+/// initialized. It never reallocates or obtains additional credit.
 #[derive(Debug)]
 pub struct ReservedBufferWriter {
     // Free the allocation before returning its reservation, including on error.
@@ -131,6 +132,95 @@ impl ReservedBufferWriter {
                 .write_bytes(0, bytes);
         }
         self.initialized = end;
+        Ok(())
+    }
+
+    /// Initialize exactly `bytes` through a bounded foreign writer.
+    ///
+    /// The initializer runs once after checking capacity. An error, panic, or
+    /// returned length different from `bytes` leaves the readable prefix unchanged.
+    /// The private, possibly partially written suffix can then be retried or freed.
+    ///
+    /// # Safety
+    ///
+    /// If `initialize` returns `Ok(bytes)`, every byte in the supplied slice must
+    /// have been initialized. On every return path, including unwinding, it must
+    /// keep accesses through this slice's pointers within its bounds, never read
+    /// an uninitialized byte or create a reference to one as `u8`, and never
+    /// access this slice after returning.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// let pool = AllocationBudget::new(4);
+    /// let mut work = pool.try_reserve(4).unwrap();
+    /// let mut writer = work.try_allocate_writer(4).unwrap().unwrap();
+    /// // SAFETY: every byte is initialized, with no escaped pointer or reads.
+    /// unsafe {
+    ///     writer.try_extend_with(4, |output| {
+    ///         for byte in output.iter_mut() { byte.write(7); }
+    ///         Ok(output.len())
+    ///     }).unwrap();
+    /// }
+    /// assert_eq!(writer.finish().unwrap().as_ref(), &[7; 4]);
+    /// assert_eq!(pool.reserved(), 0);
+    /// ```
+    pub unsafe fn try_extend_with<F>(&mut self, bytes: usize, initialize: F) -> Result<()>
+    where
+        F: FnOnce(&mut [MaybeUninit<u8>]) -> Result<usize>,
+    {
+        let end = self.appended_len(bytes)?;
+        // SAFETY: the range is within our exclusive allocation, including the
+        // zero-length case. MaybeUninit permits forming this slice before writes.
+        let output = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.storage.pointer.as_ptr().add(self.initialized).cast(),
+                bytes,
+            )
+        };
+        let written = initialize(output)?;
+        if written != bytes {
+            return Err(Error::invalid_input(format!(
+                "initializer produced {written} bytes, expected {bytes}"
+            )));
+        }
+        // The caller's safety contract proves this entire prefix initialized.
+        self.initialized = end;
+        Ok(())
+    }
+
+    /// Free this exclusive allocation and restore credit to the same budget's workspace.
+    ///
+    /// No shared capacity is released between freeing and restoring the credit.
+    /// A budget mismatch consumes the writer but leaves `workspace` unchanged.
+    ///
+    /// ```
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// let pool = AllocationBudget::new(8);
+    /// let mut work = pool.try_reserve(8).unwrap();
+    /// let mut writer = work.try_allocate_writer(8).unwrap().unwrap();
+    /// writer.extend_from_slice(b"part").unwrap();
+    /// writer.recycle(&mut work).unwrap();
+    /// assert_eq!(work.len(), 8);
+    /// assert_eq!(pool.reserved(), 8);
+    /// ```
+    pub fn recycle(self, workspace: &mut Reservation) -> Result<()> {
+        if !Arc::ptr_eq(&self.reservation.budget, &workspace.budget) {
+            return Err(Error::invalid_input(
+                "writer and workspace use different allocation budgets",
+            ));
+        }
+        let recycled = workspace
+            .bytes
+            .checked_add(self.reservation.bytes)
+            .ok_or_else(|| Error::internal("allocation credit overflow"))?;
+        let Self {
+            storage,
+            mut reservation,
+            ..
+        } = self;
+        drop(storage);
+        workspace.bytes = recycled;
+        reservation.bytes = 0;
         Ok(())
     }
 

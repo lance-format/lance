@@ -103,6 +103,8 @@ fn general_per_value_owner_and_refusal(
 #[case::prefix_mismatch(0)]
 #[case::truncated(1)]
 #[case::checksum(2)]
+#[case::short_decoded_output(3)]
+#[case::insufficient_declared_output(4)]
 fn general_per_value_zstd_corruption_refunds(#[case] kind: u8) {
     let codec = codec(CompressionScheme::Zstd);
     // Independent writer with checksum makes corruption detectable even when
@@ -110,6 +112,10 @@ fn general_per_value_zstd_corruption_refunds(#[case] kind: u8) {
     let mut encoder = ::zstd::stream::Encoder::new(Vec::new(), 0).unwrap();
     encoder.include_checksum(true).unwrap();
     encoder.set_pledged_src_size(Some(4)).unwrap();
+    if kind >= 3 {
+        // Without frame content size, only decoding can disprove the prefix.
+        encoder.include_contentsize(false).unwrap();
+    }
     std::io::Write::write_all(&mut encoder, &[1, 2, 3, 4]).unwrap();
     let mut frame = 4_u64.to_le_bytes().to_vec();
     frame.extend_from_slice(&encoder.finish().unwrap());
@@ -121,16 +127,88 @@ fn general_per_value_zstd_corruption_refunds(#[case] kind: u8) {
         2 => {
             *frame.last_mut().unwrap() ^= 1;
         }
+        3 => frame[0] = 5,
+        4 => frame[0] = 3,
         _ => unreachable!(),
     }
-    let data = input(&[frame], 64, 1);
+    // Checksum failure occurs after both the previous value and this frame's
+    // output have been written. Neither output may escape the failed attempt.
+    let previous = ::zstd::bulk::compress(&[17; 4097], 0).unwrap();
+    let data = input(&[previous, frame], 64, 1);
     let pool = AllocationBudget::new(1024 * 1024);
     let mut work = pool.try_reserve(1024 * 1024).unwrap();
     for _ in 0..2 {
-        assert!(codec.try_decompress_in(&data, &mut work).is_err());
+        let error = codec.try_decompress_in(&data, &mut work).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(match kind {
+            0 => "prefix disagrees",
+            1 => "Src size is incorrect",
+            2 => "checksum",
+            3 => "initializer produced 4 bytes, expected 5",
+            4 => "Destination buffer is too small",
+            _ => unreachable!(),
+        }));
         assert_eq!(work.len(), 1024 * 1024);
         assert_eq!(pool.reserved(), 1024 * 1024);
     }
+}
+
+#[cfg(feature = "zstd")]
+#[rstest]
+fn mixed_zstd_frames_match_independent_decoder(
+    #[values(32, 64)] bits: u8,
+    #[values(0, 1)] displacement: usize,
+) {
+    let expected: Vec<Vec<u8>> = [0, 1, 63, 64, 65, 32777, 0]
+        .into_iter()
+        .map(|len| (0..len).map(|i| ((i * 31) ^ (i >> 4)) as u8).collect())
+        .collect();
+    let mut frames = Vec::new();
+    for (i, value) in expected.iter().enumerate() {
+        let compressed = ::zstd::bulk::compress(value, 0).unwrap();
+        assert_eq!(
+            ::zstd::bulk::decompress(&compressed, value.len()).unwrap(),
+            *value
+        );
+        let mut frame = if i % 2 == 0 {
+            (value.len() as u64).to_le_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        frame.extend_from_slice(&compressed);
+        frames.push(frame);
+    }
+    // A null slot has no frame; the first empty slot keeps its real Zstd frame.
+    frames.last_mut().unwrap().clear();
+    let codec = codec(CompressionScheme::Zstd);
+    let data = input(&frames, bits, displacement);
+    let plan = codec.plan_decode(&data).unwrap();
+    let pool = AllocationBudget::new(plan.workspace_bytes);
+    let mut work = pool.try_reserve(plan.workspace_bytes).unwrap();
+    let output = codec
+        .try_decompress_in(&data, &mut work)
+        .unwrap()
+        .unwrap()
+        .as_variable_width()
+        .unwrap();
+    let mut actual = Vec::new();
+    variable::visit(&output, &mut |value| {
+        actual.push(value.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(work.len(), plan.workspace_bytes - plan.output_bytes);
+    let last = expected.concat().last().copied().unwrap();
+    let alias = output.data.slice_with_length(output.data.len() - 1, 1);
+    drop((output, work));
+    assert_eq!(
+        pool.reserved(),
+        expected.iter().map(Vec::len).sum::<usize>()
+    );
+    assert_eq!(alias.as_ref(), &[last]);
+    drop(alias);
+    assert_eq!(pool.reserved(), 0);
 }
 
 #[cfg(feature = "zstd")]
