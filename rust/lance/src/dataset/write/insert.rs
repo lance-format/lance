@@ -174,7 +174,8 @@ impl<'a> InsertBuilder<'a> {
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone())
-            .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
+            .with_skip_auto_cleanup(context.params.skip_auto_cleanup)
+            .with_disable_transaction_file(context.params.disable_transaction_file);
 
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
