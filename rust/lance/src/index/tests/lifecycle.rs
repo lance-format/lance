@@ -2893,13 +2893,17 @@ async fn test_a_detached_commit_does_not_erase_an_unsupported_index() {
     assert_eq!(detached.count_rows(None).await.unwrap(), 20);
 }
 
-/// Compaction bins fragments so that no rewrite group splits an index's
-/// coverage, and `recalculate_fragment_bitmap` rejects the plan if one does.
-/// Both sides therefore have to count the same indices: planning from the
-/// filtered view while the commit carries the complete one makes compaction
-/// fail outright on a dataset holding an index from a newer build.
+/// Compaction must succeed while retaining an unreadable index segment.
+/// Supported segments follow stable row ids into rewritten fragments, while
+/// unsupported segments lose rewritten coverage and fall back to scans.
+#[rstest]
+#[case::supported(None)]
+#[case::future_version(Some(UnreadableIndexKind::NewerVersion))]
+#[case::unknown_type(Some(UnreadableIndexKind::UnknownType))]
 #[tokio::test]
-async fn test_compaction_survives_an_unsupported_index() {
+async fn test_compaction_only_expands_supported_index_coverage(
+    #[case] unreadable_kind: Option<UnreadableIndexKind>,
+) {
     let test_dir = tempfile::tempdir().unwrap();
     let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2911,7 +2915,7 @@ async fn test_compaction_survives_an_unsupported_index() {
         lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
             .col("payload", array::step::<Int32Type>())
-            .col("text", array::rand_utf8(ByteCount::from(8), false))
+            .col("text", array::fill_utf8("shared".to_string()))
             .into_reader_rows(RowCount::from(10), BatchCount::from(1))
     }
 
@@ -2925,18 +2929,22 @@ async fn test_compaction_survives_an_unsupported_index() {
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
 
-    // Row-id-domain: its coverage is recalculated (not dropped) across a
-    // rewrite under stable row ids, which is exactly the property this test
-    // checks. The other scalar index types moved to row-address domain and
-    // no longer exercise it.
+    // A supported row-id-domain index can follow stable row ids into rewritten
+    // fragments. Neither a future version nor an unknown type may do so.
     let inverted_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
     dataset
         .create_index_builder(&["text"], IndexType::Inverted, &inverted_params)
         .name("id_idx".to_string())
-        .train(false)
         .await
         .unwrap();
-    hide_index_from_this_build(&mut dataset, "id_idx").await;
+    let readable = manifest_index(&dataset, "id_idx").await;
+    assert_eq!(
+        readable.fragment_bitmap,
+        Some([0_u32, 1].into_iter().collect())
+    );
+    if let Some(kind) = unreadable_kind {
+        hide_index_as(&mut dataset, "id_idx", kind).await;
+    }
 
     // A fragment the index does not cover, so a bin holding it together with
     // the covered ones would split the index's coverage.
@@ -2969,9 +2977,54 @@ async fn test_compaction_survives_an_unsupported_index() {
         .iter()
         .map(|f| f.id() as u32)
         .collect::<RoaringBitmap>();
-    assert!(
-        !after.fragment_bitmap.unwrap().is_disjoint(&live),
-        "the surviving index covers only fragments the rewrite deleted"
+    if unreadable_kind.is_some() {
+        assert_eq!(
+            after,
+            IndexMetadata {
+                fragment_bitmap: Some(RoaringBitmap::new()),
+                ..before
+            },
+            "unsupported metadata must survive with rewritten coverage removed"
+        );
+
+        // Model a reader that understands the preserved segment by restoring
+        // the real file format's identity. Empty coverage must trigger scanning
+        // the rewritten rows instead of trusting stale entries in the segment.
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![IndexMetadata {
+                            index_details: readable.index_details,
+                            index_version: readable.index_version,
+                            ..after.clone()
+                        }],
+                        removed_indices: vec![after],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    } else {
+        let coverage = after.fragment_bitmap.unwrap();
+        assert_eq!(coverage.len(), 1);
+        assert!(coverage.is_subset(&live));
+        assert!(coverage.is_disjoint(&before.fragment_bitmap.unwrap()));
+    }
+    assert_eq!(
+        dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("shared".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        20
     );
 }
 
@@ -2982,8 +3035,8 @@ async fn test_compaction_survives_an_unsupported_index() {
 /// longer exist. Those fragments are held back from the plan instead; the
 /// rest of the table still compacts.
 ///
-/// The stable-row-id case is the test above: there the fragment-reuse index
-/// repairs the coverage afterwards, so nothing has to be held back.
+/// In the stable-row-id case above, unsupported coverage can shrink instead,
+/// so nothing has to be held back.
 #[rstest]
 #[case::newer_version(UnreadableIndexKind::NewerVersion)]
 #[case::unknown_type(UnreadableIndexKind::UnknownType)]
