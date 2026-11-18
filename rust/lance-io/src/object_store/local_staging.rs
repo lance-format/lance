@@ -29,7 +29,7 @@ impl ObjectStore {
         // Resolve the parent: LocalFileSystem rejects the staging filename itself.
         let local_parent = if let Some(operations) = &self.local_dir_operations {
             operations.directory_to_filesystem(&parent)?
-        } else if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        } else if self.has_absolute_local_mapping() {
             PathBuf::from(crate::local::to_local_path(&parent))
         } else {
             return Ok(None);
@@ -63,7 +63,7 @@ impl ObjectStore {
     pub fn read_local_staging_files(&self, root: &Path) -> BoxStream<'_, Result<ObjectMeta>> {
         let local_root = if let Some(operations) = &self.local_dir_operations {
             operations.directory_to_filesystem(root)
-        } else if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        } else if self.has_absolute_local_mapping() {
             Ok(PathBuf::from(crate::local::to_local_path(root)))
         } else {
             return stream::empty().boxed();
