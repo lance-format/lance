@@ -87,7 +87,11 @@ impl<'a> InsertBuilder<'a> {
     ///     .with_initial_config(HashMap::from([("app.owner".into(), "analytics".into())]));
     /// ```
     pub fn with_initial_config(mut self, config: HashMap<String, String>) -> Self {
-        self.initial_config = Some(config);
+        self.initial_config = if config.is_empty() {
+            None
+        } else {
+            Some(config)
+        };
         self
     }
 

@@ -80,7 +80,7 @@ public class WriteDatasetBuilder {
   private FileWriteOptions fileWriteOptions = FileWriteOptions.builder().build();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<String> dataStorageVersion = Optional.empty();
-  private Map<String, String> initialConfig = new HashMap<>();
+  private Optional<Map<String, String>> initialConfig = Optional.empty();
 
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
@@ -100,11 +100,11 @@ public class WriteDatasetBuilder {
    * <p>For example: {@code Dataset.write().allocator(allocator).uri(path).schema(schema)
    * .initialConfig(Map.of("app.owner", "analytics")).execute()}.
    *
-   * @param config initial dataset config
+   * @param config initial dataset config; an empty map means no initial config
    * @return this builder
    */
   public WriteDatasetBuilder initialConfig(Map<String, String> config) {
-    this.initialConfig = new HashMap<>(config);
+    this.initialConfig = config.isEmpty() ? Optional.empty() : Optional.of(new HashMap<>(config));
     return this;
   }
 
@@ -506,12 +506,12 @@ public class WriteDatasetBuilder {
     WriteParams.Builder paramsBuilder =
         new WriteParams.Builder()
             .withMode(mode)
-            .withInitialConfig(initialConfig)
             .withStorageOptions(mergedStorageOptions)
             .withBaseStoreParams(baseStoreParams)
             .withFileWriteOptions(fileWriteOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
+    initialConfig.ifPresent(paramsBuilder::withInitialConfig);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
@@ -546,12 +546,12 @@ public class WriteDatasetBuilder {
     WriteParams.Builder paramsBuilder =
         new WriteParams.Builder()
             .withMode(mode)
-            .withInitialConfig(initialConfig)
             .withStorageOptions(storageOptions)
             .withBaseStoreParams(baseStoreParams)
             .withFileWriteOptions(fileWriteOptions);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
+    initialConfig.ifPresent(paramsBuilder::withInitialConfig);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);

@@ -125,6 +125,18 @@ public class DatasetTest {
   }
 
   @Test
+  void testInitialConfigOptional() {
+    WriteParams.Builder builder = new WriteParams.Builder();
+    assertEquals(Optional.empty(), builder.build().getInitialConfig());
+    assertEquals(
+        Optional.of(Map.of("app.owner", "analytics")),
+        builder.withInitialConfig(Map.of("app.owner", "analytics")).build().getInitialConfig());
+    assertEquals(
+        Optional.empty(),
+        builder.withInitialConfig(Collections.emptyMap()).build().getInitialConfig());
+  }
+
+  @Test
   void testCreateEmptyDatasetWithInitialConfig(@TempDir Path tempDir) {
     String path = tempDir.resolve("initial_config").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

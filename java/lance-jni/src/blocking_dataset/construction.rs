@@ -108,13 +108,14 @@ impl BlockingDataset {
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
         params: WriteParams,
-        initial_config: HashMap<String, String>,
+        initial_config: Option<HashMap<String, String>>,
     ) -> Result<Self> {
+        let mut builder = InsertBuilder::new(uri).with_params(&params);
+        if let Some(config) = initial_config {
+            builder = builder.with_initial_config(config);
+        }
         let inner = block_on(
-            InsertBuilder::new(uri)
-                .with_params(&params)
-                .with_initial_config(initial_config)
-                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>),
+            builder.execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>),
         )?;
         Ok(Self { inner })
     }
@@ -515,8 +516,10 @@ fn create_dataset<'local>(
         &file_write_options,
     )?;
 
-    let initial_config = JMap::from_env(env, &initial_config)?;
-    let initial_config = to_rust_map(env, &initial_config)?;
+    let initial_config = env.get_optional(&initial_config, |env, config| {
+        let config = JMap::from_env(env, &config)?;
+        to_rust_map(env, &config)
+    })?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
     if let Some((namespace, table_id)) = namespace_info {

@@ -47,7 +47,7 @@ public class WriteParams {
   private final Optional<List<String>> targetBases;
   private final Optional<Boolean> allowExternalBlobOutsideBases;
   private final Optional<Long> blobPackFileSizeThreshold;
-  private final Map<String, String> initialConfig;
+  private final Optional<Map<String, String>> initialConfig;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -64,7 +64,7 @@ public class WriteParams {
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
-      Map<String, String> initialConfig) {
+      Optional<Map<String, String>> initialConfig) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -79,16 +79,16 @@ public class WriteParams {
     this.targetBases = targetBases;
     this.allowExternalBlobOutsideBases = allowExternalBlobOutsideBases;
     this.blobPackFileSizeThreshold = blobPackFileSizeThreshold;
-    this.initialConfig = new HashMap<>(initialConfig);
+    this.initialConfig = initialConfig.map(HashMap::new);
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
     return maxRowsPerFile;
   }
 
-  /** Returns the initial manifest config for a new dataset. */
-  public Map<String, String> getInitialConfig() {
-    return new HashMap<>(initialConfig);
+  /** Returns the initial manifest config, or empty when none was supplied. */
+  public Optional<Map<String, String>> getInitialConfig() {
+    return initialConfig.map(HashMap::new);
   }
 
   public Optional<Integer> getMaxRowsPerGroup() {
@@ -192,16 +192,16 @@ public class WriteParams {
     private Optional<List<String>> targetBases = Optional.empty();
     private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
     private Optional<Long> blobPackFileSizeThreshold = Optional.empty();
-    private Map<String, String> initialConfig = new HashMap<>();
+    private Optional<Map<String, String>> initialConfig = Optional.empty();
 
     /**
      * Set manifest config to commit with a new dataset. Writes to an existing dataset ignore it.
      *
-     * @param config initial dataset config
+     * @param config initial dataset config; an empty map means no initial config
      * @return this builder
      */
     public Builder withInitialConfig(Map<String, String> config) {
-      this.initialConfig = new HashMap<>(config);
+      this.initialConfig = config.isEmpty() ? Optional.empty() : Optional.of(new HashMap<>(config));
       return this;
     }
 

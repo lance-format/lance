@@ -233,7 +233,7 @@ public class Dataset implements Closeable {
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
       FileWriteOptions fileWriteOptions,
-      Map<String, String> initialConfig);
+      Optional<Map<String, String>> initialConfig);
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -273,7 +273,7 @@ public class Dataset implements Closeable {
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
       FileWriteOptions fileWriteOptions,
-      Map<String, String> initialConfig,
+      Optional<Map<String, String>> initialConfig,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
