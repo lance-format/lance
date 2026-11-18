@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use futures::stream::BoxStream;
+use futures::{TryStreamExt, stream::BoxStream};
 use lance_io::object_store::WrappingObjectStore;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -95,6 +95,48 @@ impl ObjectStore for GatedStore {
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> StoreResult<()> {
         self.target.rename_opts(from, to, options).await
     }
+}
+
+#[tokio::test]
+async fn dropping_prefetch_cancels_gated_file_open_and_releases_owners() {
+    let dataset = write_payload_dataset(LanceFileVersion::V2_3, false, false).await;
+    let gate = Arc::new(ReadGate {
+        armed: AtomicBool::new(true),
+        started: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    let wrapped = dataset.with_object_store_wrappers([
+        Arc::new(GateWrapper(gate.clone())) as Arc<dyn WrappingObjectStore>
+    ]);
+    let budget = AllocationBudget::new(65536);
+    let mut stream = wrapped
+        .try_scan_admitted_fullzip(
+            wrapped.schema().clone(),
+            Default::default(),
+            2,
+            32768,
+            budget.clone(),
+        )
+        .unwrap()
+        .into_prefetched_batches();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            result = stream.try_next() => panic!("gated read must remain pending: {result:?}"),
+            () = gate.started.notified() => {}
+        }
+    })
+    .await
+    .unwrap();
+    drop(stream);
+    gate.release.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        budget.wait_for_capacity(65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(budget.reserved(), 0);
 }
 
 #[rstest]

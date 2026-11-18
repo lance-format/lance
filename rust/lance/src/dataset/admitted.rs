@@ -4,6 +4,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
+use futures::stream::BoxStream;
 use lance_core::{Error, Result, datatypes::Schema, utils::allocation::AllocationBudget};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
@@ -13,6 +14,8 @@ use super::{
         AdmittedFragmentScanOutcome, BaseSchedulers, FileFragment, FragReadConfig, FragmentReader,
     },
 };
+
+mod prefetch;
 
 /// Next physical position in the cursor's immutable dataset snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +202,46 @@ impl Dataset {
 }
 
 impl AdmittedDatasetScan {
+    /// Consume this cursor and prepare at most one batch ahead of its consumer.
+    ///
+    /// The producer runs on the current Tokio runtime. It obtains the single
+    /// output slot before starting another attempt, so a stopped consumer cannot
+    /// cause unbounded reads or queued output. Every attempt still reserves this
+    /// cursor's entire workspace from the original shared allocation budget.
+    /// There is no extra pool, larger workspace, or dependent credit wait.
+    /// To overlap work, leave room for retained output as well as an attempt:
+    /// for example, use a 32 KiB workspace within a 64 KiB shared pool. This can
+    /// select smaller prefixes; it does not guarantee a performance benefit.
+    ///
+    /// Batches preserve snapshot order, including empty deletion-filtered batches.
+    /// A minimal prefix that does not fit is a terminal error, never partial
+    /// success or EOF. Use the cursor APIs instead when workspace replanning or
+    /// resuming after cancellation is required. Producer failures are also errors.
+    /// Dropping the stream aborts its producer and discards queued output;
+    /// already-dispatched I/O/CPU and consumer aliases retain their charges until
+    /// they actually finish. Consumers must independently release retained output
+    /// when it is the only owner that can unblock admission.
+    ///
+    /// ```
+    /// use futures::TryStreamExt;
+    /// use lance::{Dataset, Result};
+    /// use lance_core::utils::allocation::AllocationBudget;
+    /// async fn drain(dataset: &Dataset) -> Result<()> {
+    ///     let scan = dataset.try_scan_admitted_fullzip(
+    ///         dataset.schema().clone(), Default::default(), 256, 32768,
+    ///         AllocationBudget::new(65536),
+    ///     )?;
+    ///     let mut batches = scan.into_prefetched_batches();
+    ///     while let Some(batch) = batches.try_next().await? {
+    ///         drop(batch);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn into_prefetched_batches(self) -> BoxStream<'static, Result<RecordBatch>> {
+        prefetch::start(self)
+    }
+
     /// Replan the per-attempt workspace without consuming or restarting the scan.
     ///
     /// This does not change the shared budget or release output still owned by

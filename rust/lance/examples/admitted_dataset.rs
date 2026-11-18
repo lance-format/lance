@@ -12,7 +12,11 @@
 //! fixture is not qualified and is not overwritten on a retry. Both workloads
 //! use the same run/run-many commands; fixture validation is outside measured reads.
 //! `run MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US`
-//! drains it without collecting batches. MODE is `ordinary` or `admitted`.
+//! drains it without collecting batches. MODE is `ordinary`, `admitted`, or
+//! `prefetched`. The last mode uses half of WORKSPACE_BYTES per attempt and a
+//! single queued batch; the original total payload pool and I/O budget remain
+//! unchanged. A smaller workspace may refuse a row that fits the sequential
+//! mode. This is an explicit overlap experiment, not an automatic fallback.
 //! `run-many MODE URI EXPECTED_ROWS EXPECTED_HASH BATCH_ROWS WORKSPACE_BYTES SLOW_US REQUESTS POOL_BYTES`
 //! runs finite independent complete drains against one immutable snapshot. Admitted
 //! requests share one payload pool, while each mode keeps the same per-request I/O
@@ -71,6 +75,7 @@ enum Fixture {
 enum Mode {
     Ordinary,
     Admitted,
+    Prefetched,
 }
 
 #[derive(Serialize, Debug)]
@@ -353,7 +358,7 @@ async fn drain(
                 drop(batch);
             }
         }
-        Mode::Admitted => {
+        Mode::Admitted | Mode::Prefetched => {
             let scheduler = ScanScheduler::new(
                 dataset.object_store(None).await?,
                 SchedulerConfig::new(workspace as u64),
@@ -363,9 +368,30 @@ async fn drain(
                 dataset.schema().clone(),
                 read_config,
                 batch_rows,
-                workspace,
+                if matches!(mode, Mode::Prefetched) {
+                    workspace / 2
+                } else {
+                    workspace
+                },
                 budget.clone(),
             )?;
+            if matches!(mode, Mode::Prefetched) {
+                let mut batches = scan.into_prefetched_batches();
+                while let Some(batch) = batches.try_next().await? {
+                    sink.shared_reserved_bytes_on_batch_max = sink
+                        .shared_reserved_bytes_on_batch_max
+                        .max(budget.reserved());
+                    sink.consume(&batch)?;
+                    if !slow.is_zero() {
+                        tokio::time::sleep(slow).await;
+                    }
+                    if config.requests > 1 {
+                        tokio::task::yield_now().await;
+                    }
+                    drop(batch);
+                }
+                return Ok(sink.finish());
+            }
             loop {
                 match scan.next_when_available().await? {
                     AdmittedDatasetScanOutcome::Batch { batch, .. } => {
@@ -460,7 +486,7 @@ async fn main() -> Result<()> {
             let source_head = option_env!("T210_SOURCE_HEAD")
                 .filter(|value| value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or("benchmark build requires T210_SOURCE_HEAD with the verified full source SHA")?;
-            let mode = match args[1].as_str() { "ordinary" => Mode::Ordinary, "admitted" => Mode::Admitted, _ => return Err("mode must be ordinary or admitted".into()) };
+            let mode = match args[1].as_str() { "ordinary" => Mode::Ordinary, "admitted" => Mode::Admitted, "prefetched" => Mode::Prefetched, _ => return Err("mode must be ordinary, admitted or prefetched".into()) };
             let workspace = args[6].parse()?;
             let config = DrainConfig {
                 mode, workspace, batch_rows: args[5].parse()?, slow: Duration::from_micros(args[7].parse()?),
@@ -474,6 +500,7 @@ async fn main() -> Result<()> {
             let mut outputs = drain_all(&dataset, &config, &budget, args[3].parse()?, &args[4], Some(started)).await?;
             let mut result = serde_json::json!({"mode":args[1],"uri":args[2],"source_head":source_head,
                 "batch_rows":args[5],"workspace_bytes":workspace,"slow_us":args[7],
+                "attempt_workspace_bytes":if matches!(mode, Mode::Prefetched) { workspace / 2 } else { workspace },
                 "requests":config.requests,"shared_payload_budget_bytes":config.pool_bytes,
                 "io_budget_per_request_bytes":workspace,"io_budget_configured_sum_bytes":io_total,
                 "elapsed_seconds":started.elapsed().as_secs_f64(),"peak_rss_kib":peak_rss_kib()});
@@ -514,7 +541,7 @@ mod tests {
             .await
             .unwrap();
         let dataset = Dataset::open(&uri).await.unwrap();
-        for mode in [Mode::Ordinary, Mode::Admitted] {
+        for mode in [Mode::Ordinary, Mode::Admitted, Mode::Prefetched] {
             let config = DrainConfig {
                 mode,
                 batch_rows,
@@ -644,7 +671,7 @@ mod tests {
         let uri = dir.path().join("data.lance").to_str().unwrap().to_string();
         let expected = prepare(Fixture::FullZip, &uri, 55, 4096, 7).await.unwrap();
         let dataset = Dataset::open(&uri).await.unwrap();
-        for mode in [Mode::Ordinary, Mode::Admitted] {
+        for mode in [Mode::Ordinary, Mode::Admitted, Mode::Prefetched] {
             let config = DrainConfig {
                 mode,
                 batch_rows: 3,

@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 2);
         let pool_bytes = slots * 128 * 1024;
         assert!(expected.payload_bytes > pool_bytes as u64);
-        for mode in [Mode::Ordinary, Mode::Admitted] {
+        for mode in [Mode::Ordinary, Mode::Admitted, Mode::Prefetched] {
             let config = DrainConfig {
                 mode,
                 batch_rows: 17,

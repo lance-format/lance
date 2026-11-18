@@ -9,6 +9,7 @@ use crate::dataset::{
 
 mod cancellation;
 mod dictionary;
+mod prefetch;
 mod waiting;
 
 #[rstest]

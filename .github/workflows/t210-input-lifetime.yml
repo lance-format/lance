@@ -25,13 +25,15 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-      - name: Verify direct credit wakes and actual file composition
+      - name: Verify bounded dataset prefetch and complete output
         env:
           LANCE_CPU_THREADS: 1
         run: |
-          cargo test --profile ci --locked -p lance-io --lib scheduler::read_into::tests:: -- --nocapture
-          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::multi::batched_reads:: -- --nocapture
+          cargo test --profile ci --locked -p lance --lib dataset::admitted::prefetch:: -- --nocapture
+          cargo test --profile ci --locked -p lance --lib dataset::fragment::tests::overlay_read::admitted::dataset_cursor:: -- --nocapture
+          cargo test --profile ci --locked -p lance --example admitted_dataset -- --nocapture
+          cargo test --profile ci --locked -p lance --doc into_prefetched_batches -- --nocapture
       - name: Lint touched paths
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy --profile ci --locked -p lance-io --all-features --all-targets --no-deps -- -D warnings
+          cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
