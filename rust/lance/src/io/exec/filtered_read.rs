@@ -897,7 +897,8 @@ impl FilteredReadStream {
     // If the scan range is ignoring the filters we can push it down here.
     // If the scan range is not ignoring the filters we can only push it down if:
     // 1. The index result is an exact match (we know exactly which rows will be in the result)
-    // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
+    // 2. The index result is AtLeast and its guaranteed matches fill the range before the first
+    //    row that still needs a recheck
     // Returns: FilteredReadInternalPlan
     #[instrument(name = "plan_scan", skip_all)]
     fn plan_scan(
@@ -1208,12 +1209,24 @@ impl FilteredReadStream {
                         &index_result.lower,
                         None,
                     );
+                    // Rows outside the lower bound may match as well, so the
+                    // guaranteed matches serve the requested range only before
+                    // the first such candidate; past it, a guaranteed row could
+                    // take the place of a matching candidate.
+                    let first_candidate = Self::first_uncovered_row(&to_read, &guaranteed_ranges);
+                    if let Some(first_candidate) = first_candidate {
+                        guaranteed_ranges.retain(|range| range.end <= first_candidate);
+                    }
                     // Candidates outside the lower bound still need a recheck if
                     // the guaranteed matches cannot satisfy the requested limit.
                     fragments_to_read.insert(fragment_id, to_read);
 
                     Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-                    scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                    // A fragment left without a mirror keeps the regular plan,
+                    // which rechecks the candidates in scan order.
+                    if first_candidate.is_none() || *to_take == 0 {
+                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                    }
                 } else {
                     // AtMost or true Refined: read everything in `upper`
                     // and rely on the full-filter recheck for survivors.
@@ -1316,6 +1329,21 @@ impl FilteredReadStream {
         }
 
         result
+    }
+
+    /// The first row of `ranges` missing from `covered`, a sorted subset of `ranges`.
+    fn first_uncovered_row(ranges: &[Range<u64>], covered: &[Range<u64>]) -> Option<u64> {
+        let mut covered = covered.iter().peekable();
+        for range in ranges {
+            let mut row = range.start;
+            while row < range.end {
+                let Some(next) = covered.next_if(|next| next.start == row) else {
+                    return Some(row);
+                };
+                row = next.end;
+            }
+        }
+        None
     }
 
     fn intersect_index_ranges(
@@ -4756,22 +4784,29 @@ mod tests {
     #[case::offset_fallback(Some(1..10), vec![13, 23, 33])]
     #[case::partial_limit_fallback(Some(0..3), vec![3, 13, 23])]
     #[case::partial_offset_fallback(Some(1..3), vec![13, 23])]
-    #[case::limit_pushdown(Some(0..1), vec![3])]
+    #[case::first_match(Some(0..1), vec![3])]
     #[tokio::test]
     async fn test_at_least_index_preserves_candidates(
         #[case] scan_range: Option<Range<u64>>,
         #[case] expected_values: Vec<u32>,
         #[values(false, true)] uses_stable_row_ids: bool,
-        #[values(false, true)] has_guaranteed_matches: bool,
+        // Fragments whose match (offset 3) the lower bound guarantees.
+        #[values(vec![], vec![0], vec![1, 2, 3])] guaranteed_fragments: Vec<u32>,
     ) {
         let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
         // An empty lower bound models untokenizable NGram needles; other results
-        // can guarantee a match while leaving further rows to recheck.
-        let guaranteed_rows = if has_guaranteed_matches {
-            RowAddrTreeMap::from_iter([3])
-        } else {
-            RowAddrTreeMap::new()
-        };
+        // can guarantee a match while leaving further rows to recheck, including
+        // rows that come before the guaranteed ones.
+        let guaranteed_rows = guaranteed_fragments
+            .into_iter()
+            .map(|fragment_id| {
+                if uses_stable_row_ids {
+                    u64::from(fragment_id) * 10 + 3
+                } else {
+                    RowAddress::new_from_parts(fragment_id, 3).into()
+                }
+            })
+            .collect::<RowAddrTreeMap>();
         let index_input = index_result_input(
             IndexExprResult::at_least(RowAddrMask::from_allowed(guaranteed_rows)),
             dataset.fragments(),
@@ -4796,6 +4831,51 @@ mod tests {
                 .values()
                 .as_ref(),
             expected_values.as_slice()
+        );
+    }
+
+    /// The guaranteed matches of an `AtLeast` result can serve a limit on their own
+    /// only while no row that still needs a recheck comes before them.
+    #[rstest]
+    #[case::guaranteed_first(0..5, true)]
+    #[case::candidates_first(5..10, false)]
+    #[tokio::test]
+    async fn test_at_least_limit_pushdown_needs_guaranteed_prefix(
+        #[case] guaranteed_rows: Range<u64>,
+        #[case] is_pushed_down: bool,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        // Fragment 0's row addresses and initial stable row ids are both 0..10.
+        let index_input = index_result_input(
+            IndexExprResult::at_least(RowAddrMask::from_allowed(RowAddrTreeMap::from(
+                guaranteed_rows,
+            ))),
+            dataset.fragments(),
+        );
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value < 1000").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(1..4)
+            .unwrap();
+        let read = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+
+        let plan = read
+            .get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        assert_eq!(plan.scan_range_after_filter.is_none(), is_pushed_down);
+
+        let stream = read.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(
+            batch["value"].as_primitive::<UInt32Type>().values(),
+            &[1, 2, 3]
         );
     }
 
