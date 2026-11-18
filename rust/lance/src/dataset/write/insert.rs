@@ -550,6 +550,17 @@ mod test {
         };
         let updated = InsertBuilder::new(Arc::new(reopened))
             .with_params(&params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(updated.config().get("app.owner").unwrap(), "analytics");
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            initial_config: Some(HashMap::from([("app.owner".into(), "other".into())])),
+            ..Default::default()
+        };
+        let updated = InsertBuilder::new(Arc::new(updated))
+            .with_params(&params)
             .execute(vec![batch])
             .await
             .unwrap();
