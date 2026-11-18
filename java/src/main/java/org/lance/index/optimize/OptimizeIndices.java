@@ -53,9 +53,8 @@ import java.util.stream.Collectors;
  * allow it. A BloomFilter index stays one task while its segments do not merge by their zones, for
  * example a tagged history, differing build parameters, or zones left over a rewritten fragment.
  *
- * <p>LabelList keeps old segments in the merge stage even when only one task builds new fragments.
- * Its segments must match the identifier domain written by the dataset; incompatible groups use one
- * unsplit task instead.
+ * <p>LabelList segments must match the identifier domain written by the dataset. Incompatible
+ * groups use one unsplit task.
  *
  * <p>An ordinary commit publishes every merged segment in one transaction anchored at the plan's
  * read version, so conflict detection covers everything committed since the plan was made. Results

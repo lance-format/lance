@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_index::scalar::IndexStore;
+use std::sync::Arc;
+
+use datafusion::execution::SendableRecordBatchStream;
+use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::label_list::{
     BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION, LabelListIndex,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{CreatedIndex, IndexStore, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
 
-use super::segment_merge::{SegmentMerge, open_source};
+use super::segment_merge::{SegmentMerge, open_source, open_sources};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 async fn validate_nullable_segment_for_merge(
@@ -50,12 +54,57 @@ async fn validate_nullable_segment_for_merge(
     Ok(())
 }
 
+/// Check whether append can reuse the stored postings and list-null rows.
+pub(in crate::index) fn segments_support_merge(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> Result<bool> {
+    let Some(first) = segments.first() else {
+        return Ok(false);
+    };
+    let field = first
+        .keyed_field()
+        .and_then(|id| dataset.schema().field_by_id(id))
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "LabelList segment {} is missing its indexed field",
+                first.uuid
+            ))
+        })?;
+    let row_addresses = first.results_are_row_addrs();
+    Ok(segments.iter().all(|segment| {
+        segment.results_are_row_addrs() == row_addresses
+            && (!field.nullable || segment.index_version >= LABEL_LIST_NULLS_MIN_VERSION)
+    }))
+}
+
+pub(in crate::index) async fn open_and_merge_segments(
+    dataset: &Dataset,
+    field_path: &str,
+    segments: &[&IndexMetadata],
+    new_data: SendableRecordBatchStream,
+    new_store: &LanceIndexStore,
+    old_data_filters: &[Option<OldIndexDataFilter>],
+) -> Result<CreatedIndex> {
+    let source_indices =
+        open_sources::<LabelListIndex>(dataset, field_path, segments, None, "LabelList").await?;
+    let segments = source_indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    LabelListIndex::merge_segments(
+        &segments,
+        Some(new_data),
+        new_store,
+        old_data_filters,
+        &NoopIndexBuildProgress,
+    )
+    .await
+}
+
 /// Merge one caller-defined group of source LabelList segments into a single segment.
 ///
 /// A LabelList index is a bitmap over the unnested list values plus a `list_nulls`
 /// row set, so segments are recombined by unioning the underlying bitmap states and
-/// null sets (see [`lance_index::scalar::label_list::merge_label_list_indices`])
-/// rather than rebuilding from source text.
+/// null sets (see [`LabelListIndex::merge_segments`]) rather than rebuilding
+/// from source text.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
@@ -64,27 +113,8 @@ pub(in crate::index) async fn merge_segments(
     let merge = SegmentMerge::new(dataset, "LabelList", &segments)?;
     merge.reject_legacy_segments_on_stable(dataset, "LabelList")?;
     let field_id = merge.field_id();
-
-    let (effective_old_frags, deleted_old_frags) = merge.coverage_union(dataset)?;
-    let fragment_bitmap = effective_old_frags.clone();
-    // A live fragment can have deleted rows even when no whole fragment was
-    // retired. Clean both value postings and list-null rows in that case too.
-    let has_partial_deletions = effective_old_frags.iter().any(|id| {
-        dataset
-            .find_fragment(u64::from(id))
-            .is_some_and(|fragment| fragment.deletion_file.is_some())
-    });
-    let old_data_filter = if deleted_old_frags.is_empty() && !has_partial_deletions {
-        None
-    } else {
-        crate::index::append::build_old_data_filter(
-            dataset,
-            &effective_old_frags,
-            &deleted_old_frags,
-            true,
-        )
-        .await?
-    };
+    let (fragment_bitmap, old_data_filters) =
+        merge.per_segment_filters(dataset, staged, true).await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
     for segment in merge.segments() {
@@ -102,11 +132,13 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let (new_uuid, new_store) = merge.new_store(dataset)?;
-    let created_index = lance_index::scalar::label_list::merge_label_list_indices(
-        &source_indices,
+    let sources = source_indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    let created_index = LabelListIndex::merge_segments(
+        &sources,
+        None,
         &new_store,
-        old_data_filter,
-        lance_index::progress::noop_progress(),
+        &old_data_filters,
+        &NoopIndexBuildProgress,
     )
     .await?;
 

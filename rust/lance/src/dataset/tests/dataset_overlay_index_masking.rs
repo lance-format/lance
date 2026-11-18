@@ -2578,35 +2578,38 @@ async fn test_label_list_update_rescans_overlay_stale_fragment() {
     assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
 }
 
-/// Bounded optimize keeps the old LabelList segment in the merge stage while a
-/// task builds the appended fragment. The pure merge must not hide the overlay
-/// mask: stale value and list-null postings stay excluded from index results and
-/// their rows are re-evaluated against the current values on the flat path.
+#[rstest::rstest]
+#[case::single_task(6, true)]
+#[case::multiple_tasks(3, false)]
 #[tokio::test]
-async fn test_label_list_bounded_merge_preserves_overlay_masking() {
-    let mut dataset = create_tags_dataset().await;
-    dataset
-        .create_index(
-            &["tags"],
-            IndexType::LabelList,
-            Some("tags_idx".to_string()),
-            &ScalarIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
+async fn test_label_list_bounded_merge_with_overlays(
+    #[case] max_rows_per_task: u64,
+    #[case] single_task: bool,
+) {
+    let mut dataset = commit_overlay(
+        create_tags_dataset().await,
+        "tags_initial_null",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![null_string_list()],
+    )
+    .await;
+    let source_version =
+        commit_single_fragment_segments(&mut dataset, "tags", IndexType::LabelList, "tags_idx")
+            .await;
+    assert_ids_match_oracle(&dataset, "tags IS NULL", &[1]).await;
 
-    // Fragment 0 offset 1 (id 1): ["blue"] -> ["green", "tiny"].
+    // These rows exercise NULL-to-empty and label replacement in the same source.
     let dataset = commit_overlay(
         dataset,
         "tags_overlay_replaced",
         0,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
-        vec![string_lists(&[&["green", "tiny"]])],
+        &[1, 2],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1, 2])),
+        vec![string_lists(&[&[], &["green", "tiny"]])],
     )
     .await;
-    // Fragment 1 offset 1 (id 4): ["blue", "small"] -> NULL.
     let mut dataset = commit_overlay(
         dataset,
         "tags_overlay_null",
@@ -2617,52 +2620,73 @@ async fn test_label_list_bounded_merge_preserves_overlay_masking() {
     )
     .await;
 
-    // Fragment 2: ids 6, 7, 8.
-    let ids = Arc::new(Int32Array::from_iter_values(6..9)) as ArrayRef;
-    let tags = string_lists(&[&["blue"], &["tiny"], &["red"]]);
+    let ids = Arc::new(Int32Array::from_iter_values(6..12)) as ArrayRef;
+    let tags = string_lists(&[&["blue"], &["tiny"], &["red"], &[], &[], &[]]);
     let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
     let schema = batch.schema();
     dataset
-        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
         .await
         .unwrap();
 
-    let options = OptimizeOptions::merge(1).max_rows_per_task(Some(3));
+    let options = OptimizeOptions::merge(2).max_rows_per_task(Some(max_rows_per_task));
     let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
-    assert_eq!(plan.tasks.len(), 1);
-    assert_eq!(plan.tasks[0].fragments, vec![2]);
-    assert!(plan.tasks[0].old_segments.is_empty());
     assert_eq!(plan.merges.len(), 1);
-    assert_eq!(plan.merges[0].old_segments.len(), 1);
+    if single_task {
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].fragments, vec![2, 3]);
+        assert_eq!(plan.tasks[0].old_segments.len(), 2);
+        assert!(plan.merges[0].old_segments.is_empty());
+    } else {
+        assert_eq!(plan.tasks.len(), 2);
+        assert!(plan.tasks.iter().all(|task| task.old_segments.is_empty()));
+        assert_eq!(plan.merges[0].old_segments.len(), 2);
+    }
 
-    let mut built = Vec::new();
+    let mut built = Vec::with_capacity(plan.tasks.len());
     for task in &plan.tasks {
-        built.extend(task.execute(&dataset).await.unwrap());
+        built.push(task.execute(&dataset).await.unwrap().unwrap());
     }
-    let mut merged = Vec::new();
-    for merge in &plan.merges {
-        merged.extend(merge.execute(&dataset, &built).await.unwrap());
+    let result = plan.merges[0]
+        .execute(&dataset, &built)
+        .await
+        .unwrap()
+        .unwrap();
+    if single_task {
+        assert_eq!(result.segment.uuid, built[0].segment.uuid);
+        assert_eq!(result.segment.dataset_version, dataset.manifest.version);
+    } else {
+        assert_eq!(result.segment.dataset_version, source_version);
     }
-    commit_optimize_indices(&mut dataset, merged, &options)
+    assert_eq!(
+        result.segment.fragment_bitmap,
+        Some(RoaringBitmap::from_iter(0..4))
+    );
+    commit_optimize_indices(&mut dataset, vec![result], &options)
         .await
         .unwrap();
 
     let committed = dataset.load_indices_by_name("tags_idx").await.unwrap();
     assert_eq!(committed.len(), 1);
-    assert_eq!(
-        committed[0].fragment_bitmap,
-        Some(RoaringBitmap::from_iter(0u32..3))
-    );
     for (filter, expected) in [
         ("array_has_any(tags, ['blue'])", vec![6]),
-        ("array_has_any(tags, ['tiny'])", vec![1, 7]),
-        ("array_has_any(tags, ['green'])", vec![1, 3]),
+        ("array_has_any(tags, ['tiny'])", vec![2, 7]),
+        ("array_has_any(tags, ['green'])", vec![2, 3]),
         ("array_has_any(tags, ['small'])", vec![]),
         ("array_has_all(tags, ['red', 'big'])", vec![0]),
         ("tags IS NULL", vec![4]),
     ] {
         assert_ids_match_oracle(&dataset, filter, &expected).await;
     }
+    let not_blue = "NOT array_has_any(tags, ['blue'])";
+    assert_ids_match_oracle(&dataset, not_blue, &[0, 1, 2, 3, 5, 7, 8, 9, 10, 11]).await;
+    assert_answered_by_index(&dataset, not_blue).await;
     assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
 }
 

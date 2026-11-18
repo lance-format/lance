@@ -48,6 +48,7 @@ use super::{
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::pbold;
+use crate::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use crate::scalar::bitmap::{
     BitmapIndexState, OldSegment, build_index_map, merge_index_maps, merge_source_entry_count,
     new_bitmap_batch_writer, remap_index_map, remap_row_addrs_with,
@@ -295,6 +296,161 @@ impl LabelListIndex {
             files: vec![file],
         })
     }
+
+    /// Merge existing LabelList segments and optional new list rows into one segment.
+    ///
+    /// `old_data_filters` carries one filter per segment, in the same order.
+    /// Each filter applies to both the label postings and list-null rows.
+    /// `new_data` starts with a list-valued `value` column and includes a
+    /// `UInt64` `_rowaddr` column.
+    /// Retained source rows and new rows must be disjoint and use the same row
+    /// identifier domain.
+    /// With `new_data` set to `None`, progress reports consumed source entries and
+    /// the final index file write.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datafusion_physical_plan::SendableRecordBatchStream;
+    /// use lance_core::Result;
+    /// use lance_index::progress::NoopIndexBuildProgress;
+    /// use lance_index::scalar::{IndexStore, OldIndexDataFilter, label_list::LabelListIndex};
+    ///
+    /// async fn merge(
+    ///     segments: &[&LabelListIndex],
+    ///     new_data: SendableRecordBatchStream,
+    ///     destination: &dyn IndexStore,
+    ///     old_data_filters: &[Option<OldIndexDataFilter>],
+    /// ) -> Result<()> {
+    ///     LabelListIndex::merge_segments(
+    ///         segments,
+    ///         Some(new_data),
+    ///         destination,
+    ///         old_data_filters,
+    ///         &NoopIndexBuildProgress,
+    ///     )
+    ///     .await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn merge_segments(
+        segments: &[&Self],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filters: &[Option<OldIndexDataFilter>],
+        progress: &dyn IndexBuildProgress,
+    ) -> Result<CreatedIndex> {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "LabelList segment merge requires at least one source segment".to_string(),
+            ));
+        };
+        if old_data_filters.len() != segments.len() {
+            return Err(Error::invalid_input(format!(
+                "LabelList merge: expected one old-data filter per source segment \
+                 (segments={}, filters={})",
+                segments.len(),
+                old_data_filters.len()
+            )));
+        }
+
+        let value_type = first.values_index.value_type();
+        let row_addresses = first.results_are_row_addresses();
+        let mut old_segments = Vec::with_capacity(segments.len());
+        let mut list_nulls = RowAddrTreeMap::new();
+        for (&index, filter) in segments.iter().zip(old_data_filters) {
+            validate_merge_source(index, value_type, row_addresses)?;
+            let filter = filter.as_ref();
+            old_segments.push(OldSegment {
+                index: &index.values_index,
+                filter,
+            });
+
+            // Prune each source before adding replacements, which may reuse row IDs.
+            if let Some(filter) = filter {
+                let mut nulls = index.list_nulls.as_ref().clone();
+                filter.retain_old_rows(&mut nulls);
+                list_nulls |= &nulls;
+            } else {
+                list_nulls |= index.list_nulls.as_ref();
+            }
+        }
+
+        let file = if let Some(new_data) = new_data {
+            let schema = new_data.schema();
+            let value_field = schema
+                .fields()
+                .first()
+                .filter(|field| field.name() == VALUE_COLUMN_NAME)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "LabelList merge requires {VALUE_COLUMN_NAME} as the first column"
+                    ))
+                })?;
+            validate_label_list_data_type(value_field.data_type())?;
+            let row_addr_field = schema.field_with_name(ROW_ADDR).map_err(|_| {
+                Error::invalid_input(format!("LabelList merge requires a {ROW_ADDR} column"))
+            })?;
+            if row_addr_field.data_type() != &DataType::UInt64 {
+                return Err(Error::invalid_input(format!(
+                    "LabelList merge requires {ROW_ADDR} to be UInt64, got {}",
+                    row_addr_field.data_type()
+                )));
+            }
+
+            let new_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
+            let new_data = unnest_labels(new_data, new_nulls.clone(), ROW_ADDR)?;
+            let new_value_type = new_data.schema().field(0).data_type().clone();
+            if &new_value_type != value_type {
+                return Err(Error::invalid_input(format!(
+                    "Cannot update a LabelList index with value type {value_type} \
+                     from new data whose list items are {new_value_type}"
+                )));
+            }
+            let (sorted, _sort_plan) = sort_labels_by_value(new_data, None)?;
+            write_label_list_index(dest_store, value_type, sorted, old_segments, || {
+                list_nulls |= &*new_nulls.lock().unwrap();
+                list_nulls
+            })
+            .await?
+        } else {
+            let entry_count =
+                merge_source_entry_count(old_segments.iter().map(|source| source.index));
+            progress
+                .stage_start("merge_label_list_segments", Some(entry_count), "entries")
+                .await?;
+
+            let mut writer =
+                new_bitmap_batch_writer(dest_store, BITMAP_LOOKUP_NAME, value_type).await?;
+            writer
+                .add_global_buffer(
+                    LABEL_LIST_NULLS_METADATA_KEY.to_string(),
+                    serialize_list_nulls(&list_nulls)?,
+                )
+                .await?;
+            merge_index_maps(
+                old_segments,
+                &mut writer,
+                Some((progress, "merge_label_list_segments")),
+            )
+            .await?;
+            progress.stage_complete("merge_label_list_segments").await?;
+
+            progress
+                .stage_start("write_label_list_index", Some(1), "files")
+                .await?;
+            let file = writer.finish().await?;
+            progress.stage_progress("write_label_list_index", 1).await?;
+            progress.stage_complete("write_label_list_index").await?;
+            file
+        };
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())?,
+            index_version: label_list_version_for_domain(row_addresses),
+            files: vec![file],
+        })
+    }
 }
 
 #[async_trait]
@@ -360,19 +516,14 @@ impl ScalarIndex for LabelListIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let file =
-            update_label_list_index(self, new_data, dest_store, old_data_filter.as_ref()).await?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
-                .unwrap(),
-            // Preserve this segment's own domain -- see the matching comment
-            // on `remap`. The caller is responsible for never reaching this
-            // with new address-domain data to merge onto a row-id-domain
-            // segment (see `legacy_domain_mismatch` in `append.rs`).
-            index_version: label_list_version_for_domain(self.results_are_row_addresses()),
-            files: vec![file],
-        })
+        Self::merge_segments(
+            &[self],
+            Some(new_data),
+            dest_store,
+            &[old_data_filter],
+            &NoopIndexBuildProgress,
+        )
+        .await
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
@@ -620,23 +771,15 @@ async fn write_label_list_index(
     store: &dyn IndexStore,
     value_type: &DataType,
     sorted_labels: SendableRecordBatchStream,
-    old_index: Option<&BitmapIndex>,
-    old_data_filter: Option<&OldIndexDataFilter>,
-    list_nulls: impl FnOnce() -> Result<RowAddrTreeMap>,
+    old_segments: Vec<OldSegment<'_>>,
+    list_nulls: impl FnOnce() -> RowAddrTreeMap,
 ) -> Result<IndexFile> {
     let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, value_type).await?;
-    let old_segments = old_index
-        .map(|index| OldSegment {
-            index,
-            filter: old_data_filter,
-        })
-        .into_iter()
-        .collect();
     build_index_map(sorted_labels, old_segments, &mut writer, ROW_ADDR).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-            serialize_list_nulls(&list_nulls()?)?,
+            serialize_list_nulls(&list_nulls())?,
         )
         .await?;
     writer.finish().await
@@ -671,8 +814,8 @@ async fn train_label_list_index_with_plan(
     progress
         .stage_start("write_label_list_index", None, "files")
         .await?;
-    let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
-        Ok(list_nulls.lock().unwrap().clone())
+    let file = write_label_list_index(index_store, &value_type, sorted, Vec::new(), || {
+        list_nulls.lock().unwrap().clone()
     })
     .await?;
     progress.stage_complete("write_label_list_index").await?;
@@ -690,156 +833,48 @@ async fn train_label_list_index(
         .map(|(file, _sort_plan)| file)
 }
 
-/// Add `new_data` to an existing LabelList index, writing the result to
-/// `dest_store`.
-///
-/// The existing index joins the new labels through bitmap's merge-join, which
-/// walks its `index_map` and loads one old bitmap at a time. Files written before
-/// this change have their keys in arbitrary on-disk order, which does not matter:
-/// `BitmapIndex::load` builds `index_map` as a `BTreeMap` recording each key's
-/// file offset, so iteration is sorted regardless.
-async fn update_label_list_index(
-    existing: &LabelListIndex,
-    new_data: SendableRecordBatchStream,
-    dest_store: &dyn IndexStore,
-    old_data_filter: Option<&OldIndexDataFilter>,
-) -> Result<IndexFile> {
-    let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
-    let new_data = unnest_labels(new_data, list_nulls.clone(), ROW_ADDR)?;
-
-    // The destination file's schema is declared from the existing index while
-    // every new key comes from the stream. If the two disagree the written
-    // batches would not match the schema they are declared under, so reject it
-    // here rather than emit a file whose schema lies about its key type.
-    let value_type = existing.values_index.value_type().clone();
-    let new_value_type = new_data.schema().field(0).data_type().clone();
-    if new_value_type != value_type {
+fn validate_merge_source(
+    index: &LabelListIndex,
+    value_type: &DataType,
+    row_addresses: bool,
+) -> Result<()> {
+    if index.values_index.value_type() != value_type {
         return Err(Error::invalid_input(format!(
-            "Cannot update a LabelList index with value type {value_type} \
-             from new data whose list items are {new_value_type}"
+            "LabelList segment has value type {:?}, expected {:?}",
+            index.values_index.value_type(),
+            value_type
         )));
     }
-
-    let (sorted, _sort_plan) = sort_labels_by_value(new_data, None)?;
-    let existing_nulls = existing.list_nulls.clone();
-
-    write_label_list_index(
-        dest_store,
-        &value_type,
-        sorted,
-        Some(&existing.values_index),
-        old_data_filter,
-        || {
-            let mut merged = (*existing_nulls).clone();
-            // Prune old state before adding replacements, which may reuse row IDs.
-            if let Some(filter) = old_data_filter {
-                filter.retain_old_rows(&mut merged);
-            }
-            merged |= &*list_nulls.lock().unwrap();
-            Ok(merged)
-        },
-    )
-    .await
+    if index.results_are_row_addresses() != row_addresses {
+        return Err(Error::index(
+            "cannot merge LabelList segments that disagree on whether they store row \
+             ids or row addresses -- rebuild them into one segment first"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
-/// Merge multiple LabelList index segments into a single index.
+/// Merge built LabelList segments with a shared old-data filter.
 ///
-/// A [`LabelListIndex`] is a [`BitmapIndex`] over the unnested list values plus a
-/// separate `list_nulls` row set. Because distributed segments cover disjoint rows
-/// (distinct fragments), merging streams and unions the bitmap payloads by key
-/// and separately unions the `list_nulls` sets; no source-data re-scan is
-/// required. This mirrors [`crate::scalar::bitmap::BitmapIndex::merge_segments`]
-/// but also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
-/// rows from retired fragments are removed from both the value bitmaps and
-/// `list_nulls`.
+/// Forwards to [`LabelListIndex::merge_segments`] with no new list rows.
+#[deprecated(note = "use LabelListIndex::merge_segments")]
 pub async fn merge_label_list_indices(
     source_indices: &[Arc<LabelListIndex>],
     dest_store: &dyn IndexStore,
     old_data_filter: Option<OldIndexDataFilter>,
-    progress: Arc<dyn crate::progress::IndexBuildProgress>,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
-    if source_indices.is_empty() {
-        return Err(Error::invalid_input(
-            "LabelList segment merge requires at least one source segment".to_string(),
-        ));
-    }
-
-    let value_type = source_indices[0].values_index.value_type().clone();
-    let results_are_row_addresses = source_indices[0].results_are_row_addresses();
-    let mut merged_nulls = RowAddrTreeMap::new();
-
-    let mut values_indices = Vec::with_capacity(source_indices.len());
-    for source_index in source_indices.iter() {
-        if source_index.values_index.value_type() != &value_type {
-            return Err(Error::invalid_input(format!(
-                "LabelList segment has value type {:?}, expected {:?}",
-                source_index.values_index.value_type(),
-                value_type
-            )));
-        }
-        if source_index.results_are_row_addresses() != results_are_row_addresses {
-            return Err(Error::index(
-                "cannot merge LabelList segments that disagree on whether they store row \
-                 ids or row addresses -- rebuild them into one segment first"
-                    .to_string(),
-            ));
-        }
-        values_indices.push(source_index.values_index.clone());
-
-        // `list_nulls` records whole rows whose list was null, so it is a row
-        // set per segment rather than a per-label bitmap. It stays outside both
-        // the key merge and the aggregation-state budget.
-        // Only copy when there is a filter to apply: an unfiltered merge is the
-        // common case, and each copy is a whole segment's row set.
-        if let Some(filter) = old_data_filter.as_ref() {
-            let mut list_nulls = source_index.list_nulls.as_ref().clone();
-            filter.retain_old_rows(&mut list_nulls);
-            merged_nulls |= &list_nulls;
-        } else {
-            merged_nulls |= source_index.list_nulls.as_ref();
-        }
-    }
-
-    progress
-        .stage_start(
-            "merge_label_list_segments",
-            Some(merge_source_entry_count(&values_indices)),
-            "entries",
-        )
-        .await?;
-
-    let mut writer = new_bitmap_batch_writer(dest_store, BITMAP_LOOKUP_NAME, &value_type).await?;
-    writer
-        .add_global_buffer(
-            LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-            serialize_list_nulls(&merged_nulls)?,
-        )
-        .await?;
-    merge_index_maps(
-        &values_indices,
-        old_data_filter.as_ref(),
-        &mut writer,
-        Some((progress.as_ref(), "merge_label_list_segments")),
+    let segments = source_indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    let old_data_filters = vec![old_data_filter; segments.len()];
+    LabelListIndex::merge_segments(
+        &segments,
+        None,
+        dest_store,
+        &old_data_filters,
+        progress.as_ref(),
     )
-    .await?;
-    progress.stage_complete("merge_label_list_segments").await?;
-
-    progress
-        .stage_start("write_label_list_index", Some(1), "files")
-        .await?;
-    let file = writer.finish().await?;
-    progress.stage_progress("write_label_list_index", 1).await?;
-    progress.stage_complete("write_label_list_index").await?;
-
-    Ok(CreatedIndex {
-        index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
-            .unwrap(),
-        // Preserve the source segments' own domain (checked above to agree)
-        // rather than the latest version this build can write -- see the
-        // matching comment on `ScalarIndex::remap` for `LabelListIndex`.
-        index_version: label_list_version_for_domain(results_are_row_addresses),
-        files: vec![file],
-    })
+    .await
 }
 
 /// The serializable state of a [`LabelListIndex`].
@@ -1014,7 +1049,7 @@ impl BasicTrainer for LabelListIndexPlugin {
         // Training over a fragment subset is supported for distributed builds: the
         // provided `data` stream is already scoped to those fragments, so a partial
         // index covering exactly those rows is produced. Segments are recombined by
-        // `merge_label_list_indices`.
+        // `LabelListIndex::merge_segments`.
         _fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
@@ -1843,9 +1878,16 @@ mod tests {
 
         let (_dest_dir, dest_store) = test_util::index_store();
         let progress = Arc::new(RecordingProgress::default());
-        merge_label_list_indices(&segments, dest_store.as_ref(), None, progress.clone())
-            .await
-            .unwrap();
+        let segments = segments.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        LabelListIndex::merge_segments(
+            &segments,
+            None,
+            dest_store.as_ref(),
+            &[const { None }; NUM_SEGMENTS],
+            progress.as_ref(),
+        )
+        .await
+        .unwrap();
 
         let merged = read_index_contents(dest_store.as_ref()).await;
         assert_eq!(
@@ -1978,14 +2020,31 @@ mod tests {
         let (_retired_dir, retired_index) = build_label_list_segment(&retired).await;
         let (_dest_dir, dest_store) = test_util::index_store();
         let progress = Arc::new(RecordingProgress::default());
-        merge_label_list_indices(
-            &[kept_index, retired_index],
+        let segments = [kept_index.as_ref(), retired_index.as_ref()];
+        let filter = OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([0u32]),
+            to_remove: RoaringBitmap::from_iter([1u32]),
+        };
+        let Err(error) = LabelListIndex::merge_segments(
+            &segments,
+            None,
             dest_store.as_ref(),
-            Some(OldIndexDataFilter::Fragments {
-                to_keep: RoaringBitmap::from_iter([0u32]),
-                to_remove: RoaringBitmap::from_iter([1u32]),
-            }),
-            progress.clone(),
+            &[None],
+            &NoopIndexBuildProgress,
+        )
+        .await
+        else {
+            panic!("a missing segment filter must be rejected");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("segments=2, filters=1"));
+
+        LabelListIndex::merge_segments(
+            &segments,
+            None,
+            dest_store.as_ref(),
+            &[None, Some(filter)],
+            progress.as_ref(),
         )
         .await
         .unwrap();
@@ -2066,6 +2125,53 @@ mod tests {
         assert_eq!(build_label_list_index(&expected_rows).await, actual);
     }
 
+    #[rstest]
+    #[case::empty(None, None, "requires value as the first column")]
+    #[case::non_list(Some(DataType::Utf8), Some(DataType::UInt64), "List or LargeList")]
+    #[case::missing_row_addr(
+        Some(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))),
+        None,
+        "requires a _rowaddr column"
+    )]
+    #[case::wrong_row_addr(
+        Some(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))),
+        Some(DataType::Int64),
+        "requires _rowaddr to be UInt64, got Int64"
+    )]
+    #[tokio::test]
+    async fn test_segment_merge_rejects_invalid_new_data_schema(
+        #[case] value_type: Option<DataType>,
+        #[case] row_addr_type: Option<DataType>,
+        #[case] expected_error: &str,
+    ) {
+        let (_src_dir, index) =
+            build_label_list_segment(&[(0, Some(vec![Some("label".to_string())]))]).await;
+        let (_dest_dir, dest_store) = test_util::index_store();
+        let fields = value_type
+            .map(|data_type| Field::new(VALUE_COLUMN_NAME, data_type, true))
+            .into_iter()
+            .chain(row_addr_type.map(|data_type| Field::new(ROW_ADDR, data_type, false)))
+            .collect::<Vec<_>>();
+        let new_data = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::new(fields)),
+            futures::stream::empty(),
+        ));
+
+        let Err(error) = LabelListIndex::merge_segments(
+            &[index.as_ref()],
+            Some(new_data),
+            dest_store.as_ref(),
+            &[None],
+            &NoopIndexBuildProgress,
+        )
+        .await
+        else {
+            panic!("an invalid stream schema must be rejected");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_error), "{error}");
+    }
+
     /// The spill and destination file schemas are declared from the existing
     /// index while the keys come from the new stream, so a disagreement must be
     /// rejected rather than written as a file whose schema lies about its keys.
@@ -2098,9 +2204,9 @@ mod tests {
             futures::stream::iter(vec![Ok(batch)]),
         ));
 
-        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref(), None)
-            .await
-            .expect_err("a value-type mismatch must be rejected");
+        let Err(error) = index.update(new_data, dest_store.as_ref(), None).await else {
+            panic!("a value-type mismatch must be rejected");
+        };
         let message = error.to_string();
         assert!(
             message.contains("value type Utf8") && message.contains("items are LargeUtf8"),
@@ -2175,14 +2281,14 @@ mod tests {
         let mut all = initial.clone();
         all.extend(additional.clone());
         let (_updated_dir, updated_store) = test_util::index_store();
-        update_label_list_index(
-            legacy.as_ref(),
-            sample_rows_to_stream(&additional),
-            updated_store.as_ref(),
-            None,
-        )
-        .await
-        .unwrap();
+        legacy
+            .update(
+                sample_rows_to_stream(&additional),
+                updated_store.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             build_label_list_index(&all).await,
             read_index_contents(updated_store.as_ref()).await,
@@ -2192,11 +2298,12 @@ mod tests {
         // Merging: an unsorted segment must merge correctly with a sorted one.
         let (_other_dir, other_index) = build_label_list_segment(&additional).await;
         let (_merged_dir, merged_store) = test_util::index_store();
-        merge_label_list_indices(
-            &[legacy, other_index],
-            merged_store.as_ref(),
+        LabelListIndex::merge_segments(
+            &[legacy.as_ref(), other_index.as_ref()],
             None,
-            crate::progress::noop_progress(),
+            merged_store.as_ref(),
+            &[None, None],
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2211,8 +2318,9 @@ mod tests {
     #[case::list(ListBuilder::new(StringBuilder::new()))]
     #[case::large_list(LargeListBuilder::new(StringBuilder::new()))]
     #[tokio::test]
-    async fn test_build_ignores_children_of_null_lists<O: OffsetSizeTrait>(
+    async fn test_label_list_ignores_children_of_null_lists<O: OffsetSizeTrait>(
         #[case] mut lists: GenericListBuilder<O, StringBuilder>,
+        #[values(false, true)] merge_new_rows: bool,
     ) {
         lists.values().append_value("outside slice");
         lists.append(true);
@@ -2234,16 +2342,31 @@ mod tests {
             futures::stream::iter([Ok(batch)]),
         ));
         let (_dir, store) = test_util::index_store();
-        train_label_list_index(stream, store.as_ref(), &NoopIndexBuildProgress)
+        let mut expected = IndexContents {
+            labels: vec![(None, vec![12]), (Some("visible".into()), vec![12])],
+            list_nulls: vec![10],
+        };
+        if merge_new_rows {
+            let old_addr = u64::from(RowAddress::new_from_parts(1, 0));
+            let (_source_dir, source) =
+                build_label_list_segment(&[(old_addr, Some(vec![Some("old".into())]))]).await;
+            LabelListIndex::merge_segments(
+                &[source.as_ref()],
+                Some(stream),
+                store.as_ref(),
+                &[None],
+                &NoopIndexBuildProgress,
+            )
             .await
             .unwrap();
-        assert_eq!(
-            read_index_contents(store.as_ref()).await,
-            IndexContents {
-                labels: vec![(None, vec![12]), (Some("visible".into()), vec![12])],
-                list_nulls: vec![10],
-            }
-        );
+            expected.labels.push((Some("old".into()), vec![old_addr]));
+            expected.labels.sort();
+        } else {
+            train_label_list_index(stream, store.as_ref(), &NoopIndexBuildProgress)
+                .await
+                .unwrap();
+        }
+        assert_eq!(read_index_contents(store.as_ref()).await, expected);
     }
 
     /// A null element has a posting, a null list is recorded in the list-null
@@ -2263,7 +2386,7 @@ mod tests {
             (3, Some(vec![Some("a".to_string()), None])), // null element
         ];
 
-        // `merge_label_list_indices` is documented to assume its segments cover
+        // `LabelListIndex::merge_segments` assumes that its segments cover
         // disjoint fragments, and every other merge test in this file honors
         // that by giving each segment its own fragment rather than by relying
         // on addresses 0-3 happening not to collide. Follow the same
@@ -2286,14 +2409,10 @@ mod tests {
                 let (first, second) = rows.split_at(2);
                 let (_src_dir, index) = build_label_list_segment(first).await;
                 let (_dest_dir, dest_store) = test_util::index_store();
-                update_label_list_index(
-                    index.as_ref(),
-                    sample_rows_to_stream(second),
-                    dest_store.as_ref(),
-                    None,
-                )
-                .await
-                .unwrap();
+                index
+                    .update(sample_rows_to_stream(second), dest_store.as_ref(), None)
+                    .await
+                    .unwrap();
                 read_index_contents(dest_store.as_ref()).await
             }
             "merge" => {
@@ -2305,11 +2424,12 @@ mod tests {
                 let (_a_dir, a) = build_label_list_segment(first).await;
                 let (_b_dir, b) = build_label_list_segment(&second).await;
                 let (_dest_dir, dest_store) = test_util::index_store();
-                merge_label_list_indices(
-                    &[a, b],
-                    dest_store.as_ref(),
+                LabelListIndex::merge_segments(
+                    &[a.as_ref(), b.as_ref()],
                     None,
-                    crate::progress::noop_progress(),
+                    dest_store.as_ref(),
+                    &[None, None],
+                    &NoopIndexBuildProgress,
                 )
                 .await
                 .unwrap();
