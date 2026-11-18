@@ -1401,8 +1401,8 @@ impl ObjectStore {
         }
 
         if self.is_local() {
-            let staging_path =
-                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            let name = format!("lance-io.staging.{}", uuid::Uuid::new_v4().simple());
+            let staging_path = path.parent().unwrap_or_default().join(name.as_str());
             self.inner.put(&staging_path, content).await?;
             let result = self.inner.rename_if_not_exists(&staging_path, path).await;
             if result.is_err()
@@ -2769,7 +2769,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_if_absent() {
         let temp_dir = TempStrDir::default();
-        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let parent = Path::from(temp_dir.as_str()).join("目录");
+        let basename = format!(".{}", "x".repeat(240));
+        let path = parent.join(basename.as_str());
         let store = ObjectStore::local();
         store
             .put_if_absent(&path, Bytes::from_static(b"first").into())
