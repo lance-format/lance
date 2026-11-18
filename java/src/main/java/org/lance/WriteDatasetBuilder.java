@@ -80,6 +80,8 @@ public class WriteDatasetBuilder {
   private FileWriteOptions fileWriteOptions = FileWriteOptions.builder().build();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<String> dataStorageVersion = Optional.empty();
+  private Map<String, String> initialConfig = new HashMap<>();
+
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
   private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
@@ -89,6 +91,21 @@ public class WriteDatasetBuilder {
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
   WriteDatasetBuilder() {
     // allocator is optional and can be set via allocator() method
+  }
+
+  /**
+   * Set manifest config for a new dataset, committed with its first version. Writes to an existing
+   * dataset ignore this setting.
+   *
+   * <p>For example: {@code Dataset.write().allocator(allocator).uri(path).schema(schema)
+   * .initialConfig(Map.of("app.owner", "analytics")).execute()}.
+   *
+   * @param config initial dataset config
+   * @return this builder
+   */
+  public WriteDatasetBuilder initialConfig(Map<String, String> config) {
+    this.initialConfig = new HashMap<>(config);
+    return this;
   }
 
   /**
@@ -489,6 +506,7 @@ public class WriteDatasetBuilder {
     WriteParams.Builder paramsBuilder =
         new WriteParams.Builder()
             .withMode(mode)
+            .withInitialConfig(initialConfig)
             .withStorageOptions(mergedStorageOptions)
             .withBaseStoreParams(baseStoreParams)
             .withFileWriteOptions(fileWriteOptions);
@@ -528,6 +546,7 @@ public class WriteDatasetBuilder {
     WriteParams.Builder paramsBuilder =
         new WriteParams.Builder()
             .withMode(mode)
+            .withInitialConfig(initialConfig)
             .withStorageOptions(storageOptions)
             .withBaseStoreParams(baseStoreParams)
             .withFileWriteOptions(fileWriteOptions);

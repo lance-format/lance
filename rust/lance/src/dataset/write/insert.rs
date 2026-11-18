@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -285,7 +284,7 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                let mut upsert_values = HashMap::new();
+                let mut upsert_values = context.params.initial_config.clone().unwrap_or_default();
                 if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
                     upsert_values.insert(
                         String::from("lance.auto_cleanup.interval"),
@@ -521,6 +520,63 @@ mod test {
     use crate::session::Session;
 
     use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn initial_config_is_committed_only_for_new_datasets(
+        #[values(WriteMode::Create, WriteMode::Append, WriteMode::Overwrite)] mode: WriteMode,
+    ) {
+        let dir = TempStrDir::default();
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let params = WriteParams {
+            mode,
+            initial_config: Some(HashMap::from([("app.owner".into(), "analytics".into())])),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(dir.as_ref())
+            .with_params(&params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+        assert_eq!(dataset.config().get("app.owner").unwrap(), "analytics");
+        let reopened = Dataset::open(dir.as_ref()).await.unwrap();
+        assert_eq!(reopened.config().get("app.owner").unwrap(), "analytics");
+
+        let params = WriteParams {
+            mode: WriteMode::Overwrite,
+            initial_config: Some(HashMap::from([("app.owner".into(), "other".into())])),
+            ..Default::default()
+        };
+        let updated = InsertBuilder::new(Arc::new(reopened))
+            .with_params(&params)
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(updated.config().get("app.owner").unwrap(), "analytics");
+    }
+
+    #[tokio::test]
+    async fn auto_cleanup_overrides_initial_config() {
+        let dir = TempStrDir::default();
+        let params = WriteParams {
+            initial_config: Some(HashMap::from([(
+                "lance.auto_cleanup.interval".into(),
+                "99".into(),
+            )])),
+            auto_cleanup: Some(Default::default()),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(dir.as_ref())
+            .with_params(&params)
+            .execute(vec![record_batch!(("id", Int32, [1])).unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.config().get("lance.auto_cleanup.interval").unwrap(),
+            "20"
+        );
+    }
 
     #[rstest]
     #[tokio::test]

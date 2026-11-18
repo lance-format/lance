@@ -681,6 +681,20 @@ pub struct WriteParams {
     /// when you actually need to reclaim space.
     pub auto_cleanup: Option<AutoCleanupParams>,
 
+    /// Initial manifest config for a newly created dataset. It is persisted in
+    /// the first version and has no effect on writes to an existing dataset.
+    /// If `auto_cleanup` is also supplied, its values take precedence.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance::dataset::WriteParams;
+    /// let params = WriteParams {
+    ///     initial_config: Some(HashMap::from([("app.owner".into(), "analytics".into())])),
+    ///     ..Default::default()
+    /// };
+    /// ```
+    pub initial_config: Option<HashMap<String, String>>,
+
     /// If true, skip auto cleanup during commits. This should be set to true
     /// for high frequency writes to improve performance. This is also useful
     /// if the writer does not have delete permissions and the clean up would
@@ -760,6 +774,7 @@ impl Default for WriteParams {
             enable_v2_manifest_paths: true,
             session: None,
             auto_cleanup: None,
+            initial_config: None,
             skip_auto_cleanup: false,
             transaction_properties: None,
             initial_bases: None,

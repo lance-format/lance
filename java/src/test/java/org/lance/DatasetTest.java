@@ -135,6 +135,40 @@ public class DatasetTest {
   }
 
   @Test
+  void testCreateWithInitialConfig(@TempDir Path tempDir) throws IOException {
+    String path = tempDir.resolve("initial_config").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      Schema schema = new TestUtils.SimpleTestDataset(allocator, path).getSchema();
+      try (Dataset created =
+          Dataset.write()
+              .allocator(allocator)
+              .schema(schema)
+              .uri(path)
+              .initialConfig(Map.of("app.owner", "analytics"))
+              .execute()) {
+        assertEquals(1, created.version());
+        assertEquals("analytics", created.getConfig().get("app.owner"));
+      }
+      try (Dataset reopened = Dataset.open().allocator(allocator).uri(path).build()) {
+        assertEquals(1, reopened.version());
+        assertEquals("analytics", reopened.getConfig().get("app.owner"));
+        try (LanceScanner scanner = reopened.newScan();
+            ArrowReader reader = scanner.scanBatches();
+            Dataset streamed =
+                Dataset.write()
+                    .allocator(allocator)
+                    .reader(reader)
+                    .uri(tempDir.resolve("streamed_config").toString())
+                    .initialConfig(Map.of("app.owner", "events"))
+                    .execute()) {
+          assertEquals(1, streamed.version());
+          assertEquals("events", streamed.getConfig().get("app.owner"));
+        }
+      }
+    }
+  }
+
+  @Test
   void testWriteRejectsNegativeDataCacheBytes(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("negative_data_cache_bytes").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

@@ -181,7 +181,8 @@ public class Dataset implements Closeable {
               params.getTargetBases(),
               params.getAllowExternalBlobOutsideBases(),
               params.getBlobPackFileSizeThreshold(),
-              params.getFileWriteOptions());
+              params.getFileWriteOptions(),
+              params.getInitialConfig());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -231,7 +232,8 @@ public class Dataset implements Closeable {
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
-      FileWriteOptions fileWriteOptions);
+      FileWriteOptions fileWriteOptions,
+      Map<String, String> initialConfig);
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -271,6 +273,7 @@ public class Dataset implements Closeable {
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
       FileWriteOptions fileWriteOptions,
+      Map<String, String> initialConfig,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
@@ -324,6 +327,7 @@ public class Dataset implements Closeable {
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
             params.getFileWriteOptions(),
+            params.getInitialConfig(),
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
