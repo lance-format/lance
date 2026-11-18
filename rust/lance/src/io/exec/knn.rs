@@ -19,6 +19,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::utils::get_available_parallelism;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ChildStats;
 use datafusion::physical_plan::PlanProperties;
@@ -2063,14 +2064,30 @@ fn effective_query_parallelism(
     index: &dyn VectorIndex,
     target_partitions: usize,
 ) -> usize {
-    let cpu_pool_size = get_num_compute_intensive_cpus()
-        .min(target_partitions)
-        .max(1);
+    let cpu_pool_size = capped_cpu_pool_size(
+        get_num_compute_intensive_cpus(),
+        target_partitions,
+        get_available_parallelism(),
+    );
     effective_query_parallelism_for(
         query,
         cpu_pool_size,
         index.auto_query_parallelism(cpu_pool_size),
     )
+}
+
+/// Caps the CPU pool at `target_partitions` only when a caller set it (#7087).
+///
+/// DataFusion's default `target_partitions` is the core count. Capping at that
+/// would undo a `LANCE_CPU_THREADS` set above the core count, which is how callers
+/// oversubscribe partition search: each probed partition is loaded from object
+/// storage, so an 8-CPU container would otherwise load at most 8 at a time.
+fn capped_cpu_pool_size(cpu_pool_size: usize, target_partitions: usize, cores: usize) -> usize {
+    if target_partitions == cores {
+        cpu_pool_size.max(1)
+    } else {
+        cpu_pool_size.min(target_partitions).max(1)
+    }
 }
 
 fn effective_query_parallelism_for(
@@ -3230,6 +3247,26 @@ mod tests {
 
         query.query_parallelism = 128;
         assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+    }
+
+    #[rstest]
+    // DataFusion's default (the core count) leaves an oversubscribed pool alone.
+    #[case::default_target_oversubscribed(64, 8, 8, 64)]
+    #[case::default_target_default_pool(6, 8, 8, 6)]
+    // A caller-set target_partitions still caps the pool (#7087).
+    #[case::explicit_lower_target(64, 4, 8, 4)]
+    #[case::explicit_higher_target(64, 16, 8, 16)]
+    #[case::empty_pool(0, 8, 8, 1)]
+    fn test_capped_cpu_pool_size(
+        #[case] cpu_pool_size: usize,
+        #[case] target_partitions: usize,
+        #[case] cores: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(
+            capped_cpu_pool_size(cpu_pool_size, target_partitions, cores),
+            expected
+        );
     }
 
     #[test]
