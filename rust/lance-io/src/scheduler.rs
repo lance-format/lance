@@ -1708,7 +1708,8 @@ mod tests {
     use crate::{
         object_store::{
             DEFAULT_DOWNLOAD_RETRY_COUNT, DEFAULT_MAX_IOP_SIZE, ObjectStoreParams,
-            ObjectStoreRegistry, StorageOptionsAccessor,
+            ObjectStoreProvider, ObjectStoreRegistry, StorageOptionsAccessor,
+            providers::local::FileStoreProvider,
         },
         testing::MockObjectStore,
     };
@@ -3236,18 +3237,18 @@ mod tests {
         let scheduler = ScanScheduler::new(memory_store.clone(), config);
         assert!(!scheduler.uses_lite_scheduler());
 
-        // A file+uring:// store should use the lite scheduler when config is None
-        let uring_store = Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("file+uring:///tmp").unwrap(),
-            None,
-            None,
-            false,
-            false,
-            8,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
+        // Use the local provider: a custom store with this URI need not support
+        // direct local I/O. Only scheduler selection is tested, so constructing
+        // the provider directly also covers platforms without io_uring reads.
+        let uring_store = Arc::new(
+            FileStoreProvider
+                .new_store(
+                    Url::parse("file+uring:///tmp").unwrap(),
+                    &ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap(),
+        );
         assert!(uring_store.prefers_lite_scheduler());
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
