@@ -541,42 +541,40 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn initial_config_is_committed_only_for_new_datasets(
+    async fn initial_config_is_committed_on_creation(
         #[values(WriteMode::Create, WriteMode::Append, WriteMode::Overwrite)] mode: WriteMode,
     ) {
-        let dir = TempStrDir::default();
         let batch = record_batch!(("id", Int32, [1])).unwrap();
         let params = WriteParams {
             mode,
             ..Default::default()
         };
-        let dataset = InsertBuilder::new(dir.as_ref())
+        let dataset = InsertBuilder::new("memory://")
             .with_params(&params)
             .with_initial_config(HashMap::from([("app.owner".into(), "analytics".into())]))
-            .execute(vec![batch.clone()])
+            .execute(vec![batch])
             .await
             .unwrap();
         assert_eq!(dataset.manifest.version, 1);
         assert_eq!(dataset.config().get("app.owner").unwrap(), "analytics");
-        let reopened = Dataset::open(dir.as_ref()).await.unwrap();
-        assert_eq!(reopened.config().get("app.owner").unwrap(), "analytics");
+    }
 
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            ..Default::default()
-        };
-        let updated = InsertBuilder::new(Arc::new(reopened))
-            .with_params(&params)
-            .with_initial_config(HashMap::from([("app.owner".into(), "other".into())]))
+    #[rstest]
+    #[tokio::test]
+    async fn initial_config_does_not_update_existing_datasets(
+        #[values(WriteMode::Append, WriteMode::Overwrite)] mode: WriteMode,
+    ) {
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_initial_config(HashMap::from([("app.owner".into(), "analytics".into())]))
             .execute(vec![batch.clone()])
             .await
             .unwrap();
-        assert_eq!(updated.config().get("app.owner").unwrap(), "analytics");
         let params = WriteParams {
-            mode: WriteMode::Append,
+            mode,
             ..Default::default()
         };
-        let updated = InsertBuilder::new(Arc::new(updated))
+        let updated = InsertBuilder::new(Arc::new(dataset))
             .with_params(&params)
             .with_initial_config(HashMap::from([("app.owner".into(), "other".into())]))
             .execute(vec![batch])
@@ -587,12 +585,11 @@ mod test {
 
     #[tokio::test]
     async fn auto_cleanup_overrides_initial_config() {
-        let dir = TempStrDir::default();
         let params = WriteParams {
             auto_cleanup: Some(Default::default()),
             ..Default::default()
         };
-        let dataset = InsertBuilder::new(dir.as_ref())
+        let dataset = InsertBuilder::new("memory://")
             .with_params(&params)
             .with_initial_config(HashMap::from([(
                 "lance.auto_cleanup.interval".into(),

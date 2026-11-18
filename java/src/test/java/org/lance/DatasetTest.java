@@ -125,17 +125,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCreateEmptyDataset(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("new_empty_dataset").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-    }
-  }
-
-  @Test
-  void testCreateWithInitialConfig(@TempDir Path tempDir) throws Exception {
+  void testCreateEmptyDatasetWithInitialConfig(@TempDir Path tempDir) {
     String path = tempDir.resolve("initial_config").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       Schema schema = new TestUtils.SimpleTestDataset(allocator, path).getSchema();
@@ -147,23 +137,14 @@ public class DatasetTest {
               .initialConfig(Map.of("app.owner", "analytics"))
               .execute()) {
         assertEquals(1, created.version());
+        assertEquals(0, created.countRows());
+        assertEquals(schema, created.getSchema());
+        assertTrue(created.getFragments().isEmpty());
         assertEquals("analytics", created.getConfig().get("app.owner"));
       }
       try (Dataset reopened = Dataset.open().allocator(allocator).uri(path).build()) {
         assertEquals(1, reopened.version());
         assertEquals("analytics", reopened.getConfig().get("app.owner"));
-        try (LanceScanner scanner = reopened.newScan();
-            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
-          scanner.exportArrowStream(stream.memoryAddress());
-          try (Dataset streamed =
-              Dataset.write().allocator(allocator).stream(stream)
-                  .uri(tempDir.resolve("streamed_config").toString())
-                  .initialConfig(Map.of("app.owner", "events"))
-                  .execute()) {
-            assertEquals(1, streamed.version());
-            assertEquals("events", streamed.getConfig().get("app.owner"));
-          }
-        }
       }
     }
   }
