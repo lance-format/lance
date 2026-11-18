@@ -37,6 +37,13 @@ jobs:
           print(io[0])
           print("lance-examples benchmark has no lance-io/test-util feature")
           PYFEATURES
+      - name: Verify consumed unzip ownership and cross-page file composition
+        env:
+          LANCE_CPU_THREADS: 1
+        run: |
+          cargo test --profile ci --locked -p lance-encoding --lib encodings::logical::primitive::fullzip_decode::unzip_admitted::tests:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --lib reader::admitted_fullzip_tests::take:: -- --nocapture
+          cargo test --profile ci --locked -p lance-file --doc prepare_admitted_fullzip_take_in -- --nocapture
       - name: Verify fragment and dataset growth, cancellation and prefetch
         env:
           LANCE_CPU_THREADS: 1
@@ -51,6 +58,6 @@ jobs:
       - name: Lint benchmark paths
         if: ${{ !cancelled() }}
         run: cargo clippy --profile ci --locked -p lance-examples --example admitted_dataset --no-deps -- -D warnings
-      - name: Lint changed Lance paths
+      - name: Lint changed encoding, file and Lance paths
         if: ${{ !cancelled() }}
-        run: cargo clippy --profile ci --locked -p lance --all-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --profile ci --locked -p lance-encoding -p lance-file -p lance --all-features --all-targets --no-deps -- -D warnings

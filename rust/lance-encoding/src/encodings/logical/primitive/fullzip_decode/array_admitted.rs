@@ -219,8 +219,9 @@ impl FullZipArrayInput {
     /// without intermediate definition levels. One List/LargeList layer over raw
     /// bytes similarly uses only the final parent and child allocations, without
     /// dense repetition/definition levels. Deeper/compressed shapes retain the
-    /// general admitted decoder. Every output alias retains its full backing
-    /// allocation.
+    /// general admitted decoder. Consumed unzip scratch returns to this workspace
+    /// only after its last shared view is gone; output aliases retain their full
+    /// backing allocation.
     /// Errors consume input; previously decoded sibling columns remain the
     /// caller's responsibility. See [`FullZipScheduler::prepare_array_range_in`].
     pub fn decode_in(self, workspace: &mut Reservation) -> Result<Option<ArrayRef>> {

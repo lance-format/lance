@@ -5,6 +5,8 @@ use super::scan::{GateIo, RangeIo};
 use super::*;
 use crate::reader::PreparedFullZipTake;
 use arrow_array::{UInt32Array, cast::AsArray};
+use lance_encoding::constants::COMPRESSION_META_KEY;
+use lance_encoding::format::metadata::{CompressionScheme, compressive_encoding::Compression};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
@@ -359,4 +361,127 @@ async fn sparse_take_cancel_error_and_retry(#[values(false, true)] lite: bool) {
     assert_eq!(values.value(1), array(1, 0).as_binary::<i64>().value(0));
     drop((output, work));
     assert_eq!(budget.reserved(), 0);
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn compressed_cross_page_take_reuses_unzip_workspace(
+    #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)] version: ConcreteFileVersion,
+    #[values(false, true)] lite: bool,
+    #[values(false, true)] nested: bool,
+) {
+    let metadata = HashMap::from([
+        (
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        ),
+        (COMPRESSION_META_KEY.to_string(), "zstd".to_string()),
+    ]);
+    // Independent deterministic bytes keep compressed input comparable to output.
+    // Repeated strings would conceal the intermediate ownership cost.
+    let mut seed = 17_u64;
+    let mut payload_bytes = 0;
+    let arrays = (0..2)
+        .map(|_| {
+            let values = (0..8)
+                .map(|row| {
+                    if row == 1 {
+                        return None;
+                    }
+                    let bytes = if row == 2 {
+                        Vec::new()
+                    } else {
+                        (0..65536)
+                            .map(|_| {
+                                seed ^= seed << 13;
+                                seed ^= seed >> 7;
+                                seed ^= seed << 17;
+                                seed as u8
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    payload_bytes += bytes.len();
+                    Some(bytes)
+                })
+                .collect::<Vec<_>>();
+            let leaf: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+                values.iter().map(|value| value.as_deref()),
+            ));
+            if nested {
+                Arc::new(ListArray::new(
+                    Arc::new(
+                        Field::new("item", DataType::LargeBinary, true)
+                            .with_metadata(metadata.clone()),
+                    ),
+                    OffsetBuffer::new(vec![0_i32, 2, 2, 2, 5, 8].into()),
+                    leaf,
+                    Some(NullBuffer::from(vec![true, true, false, true, true])),
+                )) as ArrayRef
+            } else {
+                leaf
+            }
+        })
+        .collect::<Vec<_>>();
+    let expected =
+        arrow_select::concat::concat(&arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+            .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("payload", expected.data_type().clone(), true).with_metadata(metadata),
+    ]));
+    let batches = arrays
+        .into_iter()
+        .map(|array| RecordBatch::try_new(schema.clone(), vec![array]).unwrap())
+        .collect();
+    let (_fs, reader) = fixture_batches(version, lite, batches, 1).await;
+    let pages = &reader.metadata().column_infos[0].page_infos;
+    assert_eq!(pages.len(), 2);
+    for page in pages.iter() {
+        let layout = match &page.encoding {
+            PageEncoding::Structural(layout) => layout.clone(),
+            PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+            _ => panic!("dense writer fixture"),
+        };
+        let Some(Layout::FullZipLayout(layout)) = layout.layout else {
+            panic!("stored FullZip required");
+        };
+        let Some(Compression::General(general)) = layout
+            .value_compression
+            .as_ref()
+            .and_then(|encoding| encoding.compression.as_ref())
+        else {
+            panic!("stored general compression required");
+        };
+        assert_eq!(
+            general.compression.as_ref().unwrap().scheme(),
+            CompressionScheme::CompressionAlgorithmZstd
+        );
+    }
+    let indices = (0..expected.len() as u32).collect::<Vec<_>>();
+    // Two copies of the final payload fit (decoded chunks + concat), with room
+    // for Zstd context and structural metadata. A third full payload does not.
+    let limit = payload_bytes * 2 + 128 * 1024;
+    let budget = AllocationBudget::new(limit);
+    for _ in 0..2 {
+        let mut work = budget.try_reserve(limit).unwrap();
+        let input = reader
+            .prepare_admitted_fullzip_take_in(&indices, &mut work)
+            .await
+            .unwrap()
+            .unwrap();
+        let output = input
+            .decode_in(&mut work)
+            .unwrap()
+            .expect("cross-page output must fit");
+        assert_eq!(output.column(0).to_data(), expected.to_data());
+        let alias = output.column(0).slice(0, 1);
+        drop((output, work));
+        let retained = budget.reserved();
+        assert!(retained > 0 && retained < limit);
+        let peer = budget.try_reserve(limit - retained).unwrap();
+        assert!(budget.try_reserve(1).is_none());
+        drop(alias);
+        assert_eq!(budget.reserved(), peer.len());
+        drop(peer);
+        assert_eq!(budget.reserved(), 0);
+    }
 }

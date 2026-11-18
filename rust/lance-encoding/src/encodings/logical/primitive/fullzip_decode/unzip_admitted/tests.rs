@@ -401,6 +401,13 @@ fn owned_unzip_refusal_releases_compact_input(#[case] kind: &str, #[case] fsst: 
     drop((input, sibling));
     assert!(work.is_empty());
     assert!(task.decode(&mut work).unwrap().is_none());
+    assert_eq!(
+        work.len(),
+        stage,
+        "exclusive unzip credit returns to this attempt"
+    );
+    assert_eq!(pool.reserved(), stage);
+    drop(work);
     assert_eq!(pool.reserved(), 0);
 }
 
@@ -545,3 +552,121 @@ fn fullzip_unzip_invalid_request_preserves_credit(#[values(false, true)] invalid
 
 mod read;
 mod widths;
+
+#[rstest]
+fn compressed_unzip_recycles_consumed_input_before_next_stage(
+    #[values(32, 64)] bits: u8,
+    #[values("flat", "list", "deep")] kind: &str,
+) {
+    let f = fixture(bits, true, kind);
+    let limit = 256 * 1024;
+    let pool = AllocationBudget::new(limit);
+    let mut work = pool.try_reserve(limit).unwrap();
+    let mut input = work.try_allocate(f.zipped.len()).unwrap().unwrap();
+    input.as_mut().copy_from_slice(f.zipped.as_ref());
+    let task = f
+        .scheduler
+        .try_unzip_owned_in(std::slice::from_ref(&input), 4, 0..4, &mut work)
+        .unwrap()
+        .unwrap();
+    input.recycle(&mut work).unwrap();
+    let page = task.decode(&mut work).unwrap().unwrap();
+    // All dead intermediate storage is back in this attempt, not available to a
+    // competing request. The next dependent stage needs no second admission.
+    assert_eq!(pool.reserved(), limit);
+    assert!(pool.try_reserve(1).is_none());
+    let remaining = work.len();
+    let next_stage = work.try_allocate(remaining).unwrap().unwrap();
+    assert!(work.is_empty());
+    next_stage.recycle(&mut work).unwrap();
+    let ty = if bits == 32 {
+        DataType::Binary
+    } else {
+        DataType::LargeBinary
+    };
+    let arrow = page.data.try_to_arrow_in(&ty, &mut work).unwrap().unwrap();
+    let refs = f.values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let expected = if bits == 32 {
+        BinaryArray::from_vec(refs).to_data()
+    } else {
+        LargeBinaryArray::from_vec(refs).to_data()
+    };
+    assert_eq!(arrow, expected);
+    let alias = arrow.slice(0, 1);
+    drop((page, arrow, work));
+    assert!(pool.reserved() > 0);
+    drop(alias);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[test]
+fn owned_unzip_error_recycles_exclusive_storage() {
+    let f = fixture(64, true, "nullable");
+    let pool = AllocationBudget::new(256 * 1024);
+    let mut work = pool.try_reserve(256 * 1024).unwrap();
+    let mut input = work.try_allocate(f.zipped.len()).unwrap().unwrap();
+    input.as_mut().copy_from_slice(f.zipped.as_ref());
+    let mut task = f
+        .scheduler
+        .try_unzip_owned_in(std::slice::from_ref(&input), 4, 0..4, &mut work)
+        .unwrap()
+        .unwrap();
+    input.recycle(&mut work).unwrap();
+    task.task.num_visible_items += 1;
+    let error = task.decode(&mut work).err().unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("visible levels disagree"));
+    assert_eq!(work.len(), 256 * 1024);
+    assert_eq!(pool.reserved(), work.len());
+    drop(work);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[test]
+fn compressed_unzip_does_not_recycle_a_retained_alias() {
+    let f = fixture(64, true, "flat");
+    let limit = 256 * 1024;
+    let pool = AllocationBudget::new(limit);
+    let mut work = pool.try_reserve(limit).unwrap();
+    let mut input = work.try_allocate(f.zipped.len()).unwrap().unwrap();
+    input.as_mut().copy_from_slice(f.zipped.as_ref());
+    let task = f
+        .scheduler
+        .try_unzip_owned_in(std::slice::from_ref(&input), 4, 0..4, &mut work)
+        .unwrap()
+        .unwrap();
+    input.recycle(&mut work).unwrap();
+    let stage = task.allocation.capacity();
+    let alias = task.task.data.clone();
+    let expected = alias.as_ref().to_vec();
+    let page = task.decode(&mut work).unwrap().unwrap();
+    drop((page, work));
+    assert_eq!(pool.reserved(), stage);
+    assert_eq!(alias.as_ref(), expected.as_slice());
+    let peer = pool.try_reserve(limit - stage).unwrap();
+    assert!(pool.try_reserve(1).is_none());
+    drop(alias);
+    assert_eq!(pool.reserved(), peer.len());
+    drop(peer);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[test]
+fn dropping_owned_unzip_task_releases_all_shared_views() {
+    let f = fixture(64, true, "deep");
+    let pool = AllocationBudget::new(256 * 1024);
+    let mut work = pool.try_reserve(256 * 1024).unwrap();
+    let mut input = work.try_allocate(f.zipped.len()).unwrap().unwrap();
+    input.as_mut().copy_from_slice(f.zipped.as_ref());
+    let task = f
+        .scheduler
+        .try_unzip_owned_in(std::slice::from_ref(&input), 4, 0..4, &mut work)
+        .unwrap()
+        .unwrap();
+    input.recycle(&mut work).unwrap();
+    let stage = task.allocation.capacity();
+    drop(work);
+    assert_eq!(pool.reserved(), stage);
+    drop(task);
+    assert_eq!(pool.reserved(), 0);
+}

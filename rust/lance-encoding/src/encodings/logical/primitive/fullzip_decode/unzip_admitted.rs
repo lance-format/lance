@@ -3,10 +3,14 @@
 
 //! Select rows directly from charged zipped input without a whole-page index.
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use arrow_buffer::{Buffer, ScalarBuffer};
-use lance_core::{Error, Result, utils::allocation::Reservation};
+use bytes::Bytes;
+use lance_core::{
+    Error, Result,
+    utils::allocation::{Reservation, ReservedBuffer},
+};
 
 use super::{FullZipScheduler, PerValueDecompressor, VariableFullZipDecodeTask};
 use crate::{
@@ -29,11 +33,30 @@ struct Plan {
 
 // Construction is private: all slices share exactly one newly admitted unzip
 // allocation. This proof must not be inferred from a generic task's visible size.
-pub(super) struct AdmittedUnzipTask(VariableFullZipDecodeTask);
+pub(super) struct AdmittedUnzipTask {
+    task: VariableFullZipDecodeTask,
+    allocation: Arc<ReservedBuffer>,
+}
+
+// Bytes and Arrow views share this owner, so uniqueness proves that no decoded
+// output or codec-retained alias can still access the allocation.
+struct UnzipOwner(Arc<ReservedBuffer>);
+
+impl AsRef<[u8]> for UnzipOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref().as_ref()
+    }
+}
 
 impl AdmittedUnzipTask {
     pub(super) fn decode(self, workspace: &mut Reservation) -> Result<Option<DecodedPage>> {
-        super::admitted::decode_reusing_values(&self.0, workspace)
+        let Self { task, allocation } = self;
+        let result = super::admitted::decode_reusing_values(&task, workspace);
+        drop(task);
+        if let Ok(buffer) = Arc::try_unwrap(allocation) {
+            buffer.recycle(workspace)?;
+        }
+        result
     }
 }
 
@@ -314,7 +337,7 @@ impl FullZipScheduler {
     ) -> Result<Option<Box<dyn DecodePageTask>>> {
         Ok(self
             .try_unzip_owned_in(data, num_rows, range, workspace)?
-            .map(|task| Box::new(task.0) as Box<dyn DecodePageTask>))
+            .map(|task| Box::new(task.task) as Box<dyn DecodePageTask>))
     }
 
     pub(super) fn try_unzip_owned_in(
@@ -369,25 +392,29 @@ impl FullZipScheduler {
             output.recycle(workspace)?;
             return Err(Error::internal("validated variable FullZip codec changed"));
         };
-        let storage = Buffer::from(output.freeze());
-        Ok(Some(AdmittedUnzipTask(VariableFullZipDecodeTask {
-            details: self.details.clone(),
-            decompressor: codec.clone(),
-            offsets: LanceBuffer::from(storage.slice_with_length(0, plan.offsets)),
-            data: LanceBuffer::from(storage.slice_with_length(data_start, plan.payload)),
-            rep: ScalarBuffer::new(
-                storage.slice_with_length(rep_start, plan.rep),
-                0,
-                plan.rep / 2,
-            ),
-            def: ScalarBuffer::new(
-                storage.slice_with_length(def_start, plan.def),
-                0,
-                plan.def / 2,
-            ),
-            bits_per_offset: self.bits_per_offset,
-            num_visible_items: plan.values as u64,
-        })))
+        let allocation = Arc::new(output);
+        let storage = Buffer::from(Bytes::from_owner(UnzipOwner(allocation.clone())));
+        Ok(Some(AdmittedUnzipTask {
+            task: VariableFullZipDecodeTask {
+                details: self.details.clone(),
+                decompressor: codec.clone(),
+                offsets: LanceBuffer::from(storage.slice_with_length(0, plan.offsets)),
+                data: LanceBuffer::from(storage.slice_with_length(data_start, plan.payload)),
+                rep: ScalarBuffer::new(
+                    storage.slice_with_length(rep_start, plan.rep),
+                    0,
+                    plan.rep / 2,
+                ),
+                def: ScalarBuffer::new(
+                    storage.slice_with_length(def_start, plan.def),
+                    0,
+                    plan.def / 2,
+                ),
+                bits_per_offset: self.bits_per_offset,
+                num_visible_items: plan.values as u64,
+            },
+            allocation,
+        }))
     }
 }
 
