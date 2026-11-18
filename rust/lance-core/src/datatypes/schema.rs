@@ -572,7 +572,8 @@ impl Schema {
     fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for field in other.fields.iter() {
-            if let Some(candidate_field) = self.field(&field.name) {
+            // Schema fields carry literal root names, not field paths.
+            if let Some(candidate_field) = self.fields.iter().find(|f| f.name == field.name) {
                 candidates.push(candidate_field.do_intersection(field, ignore_types)?);
             }
         }
@@ -2832,10 +2833,12 @@ mod tests {
         assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
     }
 
-    #[test]
-    fn test_intersection() {
+    #[rstest]
+    #[case::plain("a")]
+    #[case::backtick("a`b")]
+    fn test_intersection(#[case] name: &str) {
         let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(name, DataType::Int32, false),
             ArrowField::new(
                 "b",
                 DataType::Struct(ArrowFields::from(vec![
@@ -2848,6 +2851,8 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(schema.intersection(&schema).unwrap(), schema);
+        assert_eq!(schema.intersection_ignore_types(&schema).unwrap(), schema);
 
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
