@@ -556,10 +556,14 @@ impl InlineBitpacking {
         // checked above), and `decompressed` is one block.
         unsafe { unpack_u128_chunk(bit_width, body, &mut decompressed) };
 
-        decompressed.truncate(range.end as usize);
-        decompressed.drain(..range.start as usize);
+        // `allocates_output` promises exact capacity, so a partial range gets its own `Vec`.
+        let selected = if range == (0..ELEMS_PER_CHUNK) {
+            decompressed
+        } else {
+            decompressed[range.start as usize..range.end as usize].to_vec()
+        };
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::reinterpret_vec(decompressed),
+            data: LanceBuffer::reinterpret_vec(selected),
             bits_per_value: 128,
             num_values: range.end - range.start,
             block_info: BlockInfo::new(),
@@ -747,6 +751,7 @@ impl InlineBitpacking {
             16 => LanceBuffer::reinterpret_vec(Vec::<u16>::new()),
             32 => LanceBuffer::reinterpret_vec(Vec::<u32>::new()),
             64 => LanceBuffer::reinterpret_vec(Vec::<u64>::new()),
+            128 => LanceBuffer::reinterpret_vec(Vec::<u128>::new()),
             _ => LanceBuffer::empty(),
         };
         DataBlock::FixedWidth(FixedWidthDataBlock {
@@ -1858,6 +1863,11 @@ mod test {
         assert_eq!(block.bits_per_value, bit_width);
         assert_eq!(block.num_values, 0);
         assert_eq!(block.data.len(), 0);
+        // Arrow checks alignment even for empty buffers when building an array.
+        assert_eq!(
+            block.data.as_ptr().align_offset((bit_width / 8) as usize),
+            0
+        );
     }
 
     fn roundtrip_unchunk<T>(values: &[T], bit_width: usize)
@@ -2497,6 +2507,61 @@ mod test {
             decoded.data.borrow_to_typed_slice::<u128>().as_ref(),
             values
         );
+    }
+
+    /// `decompress_range` on one 128-bit chunk returns exactly the selected values in a
+    /// buffer of exact capacity, which the single-instruction take path hands to Arrow as is.
+    #[rstest]
+    #[case::zero(0)]
+    #[case::narrow_u32(24)]
+    #[case::narrow_u64(40)]
+    #[case::split_u64(80)]
+    #[case::full_width(128)]
+    fn test_u128_inline_decompress_range(#[case] bit_width: u32) {
+        for num_values in [1000_u64, ELEMS_PER_CHUNK] {
+            let values: Vec<u128> = (0..num_values as u128)
+                .map(|i| match bit_width {
+                    0 => 0,
+                    128 => u128::MAX - i,
+                    w => (1 << (w - 1)) | i,
+                })
+                .collect();
+            let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(values.clone()),
+                bits_per_value: 128,
+                num_values,
+                block_info: BlockInfo::new(),
+            });
+            block.compute_stat();
+            let codec = InlineBitpacking::new(128);
+            let (payload, _) = BlockCompressor::compress(&codec, block).unwrap();
+            let payload = payload.unwrap();
+
+            let n = num_values;
+            for range in [0..0, 5..6, 60..75, n - 1..n, 0..n] {
+                let decoded = codec
+                    .decompress_range(vec![payload.clone()], n, range.clone())
+                    .unwrap();
+                let DataBlock::FixedWidth(decoded) = decoded else {
+                    panic!("expected fixed-width data");
+                };
+                assert_eq!(decoded.num_values, range.end - range.start);
+                assert_eq!(
+                    decoded.data.borrow_to_typed_slice::<u128>().as_ref(),
+                    &values[range.start as usize..range.end as usize],
+                    "{range:?}"
+                );
+                let buffer = decoded.data.into_buffer();
+                assert_eq!(buffer.capacity(), buffer.len(), "{range:?}");
+            }
+            for range in [std::ops::Range { start: 3, end: 2 }, 0..n + 1] {
+                let error = codec
+                    .decompress_range(vec![payload.clone()], n, range)
+                    .unwrap_err();
+                assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+                assert!(error.to_string().contains("selection"), "{error}");
+            }
+        }
     }
 
     /// Pins the per-width layout of a 128-bit packed block, the format contract in the
