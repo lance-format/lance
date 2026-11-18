@@ -333,6 +333,108 @@ def test_shard_writer_delete_binding_masks_base_row(tmp_path):
     assert rows[4] == "writer_4"
 
 
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize("max_bytes", [1, 2 * 128 * 1024 + 16 * 1024])
+def test_shard_writer_reader_byte_limit(tmp_path, operation, max_bytes):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+    batch_bytes = 128 * 1024
+    generated = 0
+    baseline = pa.total_allocated_bytes()
+    peak_bytes = 0
+
+    def batches():
+        nonlocal generated, peak_bytes
+        for i in range(20):
+            # Fresh Arrow allocations make retention observable without relying
+            # on RSS or allocating a large fixture. Delete must bound ignored
+            # non-key columns too.
+            batch = pa.record_batch(
+                [pa.array([i], pa.int64()), pa.array(["x" * batch_bytes])],
+                schema=_LOOKUP_SCHEMA,
+            )
+            generated += 1
+            peak_bytes = max(peak_bytes, pa.total_allocated_bytes() - baseline)
+            yield batch
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        with pytest.raises(OSError, match=f"exceeds max_bytes={max_bytes}"):
+            getattr(writer, operation)(reader, max_bytes=max_bytes)
+        assert generated == (1 if max_bytes == 1 else 3)
+        assert peak_bytes <= max_bytes + 2 * batch_bytes + 4096
+        assert writer.stats()["put_count"] == 0
+        assert writer.lsm_scanner().to_table() == _lookup_table([0], "base")
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_shard_writer_reader_row_limit(tmp_path, operation):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+    generated = 0
+
+    def batches():
+        nonlocal generated
+        for i in range(10):
+            generated += 1
+            yield _lookup_table([i], "input").to_batches()[0]
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4()), max_memtable_rows=2) as writer:
+        with pytest.raises(OSError, match="exceeds max_memtable_rows=2"):
+            getattr(writer, operation)(reader)
+        assert generated == 3
+        assert writer.stats()["put_count"] == 0
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize("reader_error", [None, ValueError, KeyboardInterrupt])
+def test_shard_writer_reader_atomicity(tmp_path, operation, reader_error):
+    ds = lance.write_dataset(_lookup_table([0, 1], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+
+    def batches():
+        yield _lookup_table([0], "input").to_batches()[0]
+        if reader_error is not None:
+            raise reader_error("reader failed")
+        yield _lookup_table([1], "input").to_batches()[0]
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        if reader_error is not None:
+            with pytest.raises(reader_error, match="reader failed"):
+                getattr(writer, operation)(reader, max_bytes=1024 * 1024)
+            expected = _lookup_table([0, 1], "base")
+            assert writer.stats()["put_count"] == 0
+        else:
+            getattr(writer, operation)(reader, max_bytes=1024 * 1024)
+            expected = (
+                _lookup_table([0, 1], "input")
+                if operation == "put"
+                else _lookup_table([], "base")
+            )
+            assert writer.stats()["put_count"] == 1
+        assert writer.lsm_scanner().to_table().sort_by("id") == expected
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_shard_writer_reader_validation_before_consumption(tmp_path, operation):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+
+    def batches():
+        raise AssertionError("reader should not be consumed")
+        yield
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    writer = ds.mem_wal_writer(str(uuid.uuid4()))
+    with pytest.raises(OSError, match="max_bytes must be positive"):
+        getattr(writer, operation)(reader, max_bytes=0)
+    writer.close()
+    with pytest.raises(OSError, match="already closed"):
+        getattr(writer, operation)(reader)
+
+
 _VDIM = 4  # matches Rust test fixture dimension
 
 
