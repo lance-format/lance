@@ -1816,16 +1816,29 @@ impl<'a> CleanupTask<'a> {
             let store = self.dataset.object_store.as_ref();
             let concurrency = execution.concurrency.max(1);
             let batch_size = concurrency.saturating_mul(BULK_DELETE_BATCH_FILES);
-            let mut chunks = all_files_to_remove.try_chunks(batch_size);
+            // Not `try_chunks`: it reserves `batch_size` slots up front, which overflows
+            // or aborts on allocation for a large but valid `delete_concurrency`.
+            let mut files = std::pin::pin!(all_files_to_remove);
             let mut first_error = None;
-            while let Some(chunk) = chunks.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        first_error = first_error.or(Some(error.1));
-                        error.0
+            let mut is_exhausted = false;
+            while !is_exhausted {
+                let mut chunk = Vec::new();
+                while chunk.len() < batch_size {
+                    match files.next().await {
+                        Some(Ok(file)) => chunk.push(file),
+                        Some(Err(error)) => {
+                            first_error = first_error.or(Some(error));
+                            break;
+                        }
+                        None => {
+                            is_exhausted = true;
+                            break;
+                        }
                     }
-                };
+                }
+                if chunk.is_empty() {
+                    continue;
+                }
                 let deletion = Self::delete_chunk(
                     chunk,
                     store,
@@ -3179,8 +3192,8 @@ mod tests {
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{
-            AutoCleanupParams, CommitBuilder, DeleteBuilder, ReadParams, WriteMode, WriteParams,
-            builder::DatasetBuilder,
+            AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder, ReadParams, WriteMode,
+            WriteParams, builder::DatasetBuilder,
         },
         index::vector::VectorIndexParams,
     };
@@ -3388,14 +3401,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::execute("execute", false)]
-    #[case::bulk_execute("execute", true)]
-    #[case::standalone_cascade("standalone", false)]
-    #[case::sibling_cascade("siblings", false)]
+    #[case::execute("execute", false, None)]
+    #[case::bulk_execute("execute", true, None)]
+    #[case::max_concurrency("execute", false, Some(tokio::sync::Semaphore::MAX_PERMITS))]
+    #[case::standalone_cascade("standalone", false, None)]
+    #[case::sibling_cascade("siblings", false, None)]
     #[tokio::test(start_paused = true)]
     async fn cleanup_error_drains_submitted_deletes(
         #[case] mode: &str,
         #[case] is_bulk: bool,
+        #[case] concurrency: Option<usize>,
         #[values(false, true)] is_local: bool,
     ) {
         let dir = TempStrDir::default();
@@ -3513,16 +3528,16 @@ mod tests {
                 } else {
                     &deleting
                 };
-                dataset
-                    .cleanup(CleanupPolicy {
-                        before_version: Some(dataset.version_id()),
-                        error_if_tagged_old_versions: false,
-                        clean_referenced_branches: mode == "siblings",
-                        ..Default::default()
-                    })
-                    .execute()
-                    .await
-                    .unwrap_err()
+                let mut cleanup = dataset.cleanup(CleanupPolicy {
+                    before_version: Some(dataset.version_id()),
+                    error_if_tagged_old_versions: false,
+                    clean_referenced_branches: mode == "siblings",
+                    ..Default::default()
+                });
+                if let Some(concurrency) = concurrency {
+                    cleanup = cleanup.with_delete_concurrency(concurrency).unwrap();
+                }
+                cleanup.execute().await.unwrap_err()
             }
         })
         .await
@@ -3586,6 +3601,43 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert_contains!(error.to_string(), "delete_concurrency");
         assert_contains!(error.to_string(), value.to_string());
+    }
+
+    #[rstest]
+    #[case::large(1_000_000)]
+    #[case::max(tokio::sync::Semaphore::MAX_PERMITS)]
+    #[tokio::test]
+    async fn test_cleanup_with_large_delete_concurrency(#[case] concurrency: usize) {
+        let test_dir = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let dataset = InsertBuilder::new(test_dir.as_str())
+            .execute(vec![rows.clone()])
+            .await
+            .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            })
+            .execute(vec![rows])
+            .await
+            .unwrap();
+
+        let stats = dataset
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1])
+                    .unwrap()
+                    .build(),
+            )
+            .with_delete_concurrency(concurrency)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, 1);
+        assert_eq!(stats.failed_deletes, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
     }
 
     #[derive(Debug)]

@@ -1161,6 +1161,62 @@ async fn repack_counts_only_the_files_it_reads_against_the_byte_budget() {
     assert_eq!(plan.tasks.len(), 2, "{plan:?}");
 }
 
+/// A repack writes with `data_cache_bytes`, as a rewrite does: a cache too
+/// small for one batch flushes more pages than the default.
+#[rstest]
+#[case::v2_0(LanceFileVersion::V2_0)]
+#[case::v2_3(LanceFileVersion::V2_3)]
+#[tokio::test]
+async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
+    async fn pages_of_the_repacked_file(
+        version: LanceFileVersion,
+        data_cache_bytes: Option<u64>,
+    ) -> usize {
+        let mut dataset = write("memory://", version).await;
+        for (name, expr) in [("d", "a + 1"), ("e", "a + 2")] {
+            dataset
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(name.into(), expr.into())]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let options = CompactionOptions {
+            batch_size: Some(1),
+            data_cache_bytes,
+            ..repack_options(Some(2))
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        // d and e, merged into one file.
+        let file = dataset.fragments()[0].files.last().unwrap().clone();
+        assert_eq!(file.fields.as_ref(), &[3, 4]);
+
+        let path = dataset
+            .data_file_dir(&file)
+            .unwrap()
+            .join(file.path.as_str());
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::default_for_testing(),
+        );
+        let file_scheduler = scheduler
+            .open_file(&path, &file.file_size_bytes)
+            .await
+            .unwrap();
+        let metadata = LFReader::read_all_metadata(&file_scheduler).await.unwrap();
+        metadata.column_infos[0].page_infos.len()
+    }
+
+    let default_pages = pages_of_the_repacked_file(version, None).await;
+    let bounded_pages = pages_of_the_repacked_file(version, Some(1)).await;
+    assert!(
+        bounded_pages > default_pages,
+        "default={default_pages}, bounded={bounded_pages}"
+    );
+}
+
 /// A fragment both rewritten and repacked is refused before either commit.
 #[tokio::test]
 async fn commit_rejects_a_fragment_in_both_kinds_of_task() {
