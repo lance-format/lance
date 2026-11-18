@@ -17,7 +17,7 @@ import textwrap
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -36,6 +36,7 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.optimize import AutoCleanupConfig
+from lance._dataset.refs import _convert_version_timestamp
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
@@ -670,11 +671,45 @@ def test_asof_checkout(tmp_path: Path):
     assert ds.version == 3
     assert len(ds.to_table()) == 9
 
+    # Aware cutoffs name the same instants in any zone.
+    for offset in (timedelta(hours=-12), timedelta(hours=14)):
+        aware_ts_1 = ts_1.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_1).version == 1
+        assert lance.dataset(base_dir, asof=pd.Timestamp(aware_ts_1)).version == 1
+        aware_ts_2 = ts_2.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_2.isoformat()).version == 2
+
     with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
         lance.dataset(base_dir, asof=pd.NaT)
 
     # An explicit version takes precedence over the timestamp cutoff.
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
+
+
+class _NoOffsetTzInfo(tzinfo):
+    """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+def test_asof_cutoff_without_utc_offset_is_naive(tmp_path: Path):
+    lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+    version_ts = lance.dataset(tmp_path).versions()[0]["timestamp"]
+    cutoff = (version_ts + timedelta(days=1)).replace(tzinfo=_NoOffsetTzInfo())
+    assert cutoff.tzinfo is not None
+    assert cutoff.utcoffset() is None
+
+    # Python compares this as a naive local time, so it keeps the pre-existing
+    # behavior for naive cutoffs instead of treating it as an aware instant.
+    assert lance.dataset(tmp_path, asof=cutoff).version == 1
+    assert lance.dataset(tmp_path, asof=cutoff.replace(tzinfo=None)).version == 1
 
 
 @pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])
@@ -715,6 +750,37 @@ def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
         after_cleanup = lance.dataset(tmp_path, asof=cutoff)
         assert after_cleanup.version == 1
         assert after_cleanup.to_table()["x"].to_pylist() == [1]
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is Unix-only")
+def test_asof_aware_cutoff_in_repeated_local_hour(tmp_path: Path, monkeypatch):
+    # In New York, 05:30Z and 06:30Z are both 01:30 local time on 2026-11-01.
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+        for x in (2, 3):
+            lance.write_dataset(pa.table({"x": [x]}), tmp_path, mode="append")
+        versions = [
+            _convert_version_timestamp(
+                {"version": version, "timestamp": int(instant.timestamp()) * 10**9}
+            )
+            for version, instant in enumerate(
+                [
+                    datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                ],
+                start=1,
+            )
+        ]
+        monkeypatch.setattr(lance.LanceDataset, "versions", lambda self: versions)
+
+        cutoff = datetime(2026, 11, 1, 5, 45, tzinfo=timezone.utc)
+        assert lance.dataset(tmp_path, asof=cutoff).version == 2
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 @pytest.mark.parametrize(
