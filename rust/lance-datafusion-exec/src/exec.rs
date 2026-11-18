@@ -43,6 +43,7 @@ use lance_core::{
     memory::{Component, register_component},
     utils::{
         futures::FinallyStreamExt,
+        tokio::get_num_compute_intensive_cpus,
         tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
     },
 };
@@ -447,14 +448,18 @@ const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 
 impl LanceExecutionOptions {
     /// The number of partitions the DataFusion session will actually run with.
     ///
-    /// When `target_partition` is not set we do not override the session config,
-    /// so the session falls back to DataFusion's default `target_partitions`,
-    /// which is the available parallelism (number of CPU cores). The memory pool
-    /// must be sized for that effective partition count, not for a single
-    /// partition, or sort-heavy plans exhaust the pool.
+    /// When `target_partition` is not set the session uses the available
+    /// parallelism (number of CPU cores), raised to the CPU pool size when
+    /// `LANCE_CPU_THREADS` asks for more threads than cores. Exec nodes cap
+    /// their concurrency at `target_partitions`, so without the raise an
+    /// 8-CPU container would load at most 8 IVF partitions at once whatever
+    /// `LANCE_CPU_THREADS` says. The memory pool must be sized for that
+    /// effective partition count, not for a single partition, or sort-heavy
+    /// plans exhaust the pool.
     fn effective_target_partition(&self) -> u64 {
         self.target_partition
-            .unwrap_or_else(get_available_parallelism) as u64
+            .unwrap_or_else(|| get_available_parallelism().max(get_num_compute_intensive_cpus()))
+            as u64
     }
 
     pub fn mem_pool_size(&self) -> u64 {
@@ -545,10 +550,8 @@ impl LanceExecutionOptions {
 /// This ignores [`LanceExecutionOptions::batch_size`], which applies to one
 /// execution rather than to a session.
 pub fn new_session_config(options: &LanceExecutionOptions) -> SessionConfig {
-    let mut session_config = SessionConfig::new();
-    if let Some(target_partition) = options.target_partition {
-        session_config = session_config.with_target_partitions(target_partition);
-    }
+    let mut session_config =
+        SessionConfig::new().with_target_partitions(options.effective_target_partition() as usize);
     if options.use_spilling() {
         // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
         // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
