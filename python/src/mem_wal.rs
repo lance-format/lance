@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -248,6 +248,52 @@ struct ClosedShardWriterState {
 
 const DEFAULT_MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
 
+// Arrow FFI exposes lengths needed by a slice, but its release callback keeps
+// the source allocations alive. Inspect PyArrow owners before losing that size
+// information, including explicit Buffer.slice parents and dictionary children.
+fn retained_pyarrow_bytes(batch: &Bound<'_, PyAny>) -> PyResult<usize> {
+    let mut arrays: Vec<Bound<'_, PyAny>> = batch.getattr("columns")?.extract()?;
+    let mut allocations = HashSet::new();
+    let mut bytes = 0usize;
+    while let Some(array) = arrays.pop() {
+        for buffer in array.call_method0("buffers")?.try_iter()? {
+            let mut buffer = buffer?;
+            if buffer.is_none() {
+                continue;
+            }
+            loop {
+                let parent = buffer.getattr("parent")?;
+                if parent.is_none() {
+                    break;
+                }
+                buffer = parent;
+            }
+            let address: usize = buffer.getattr("address")?.extract()?;
+            let size: usize = buffer.getattr("size")?.extract()?;
+            if allocations.insert((address, size)) {
+                bytes = bytes.checked_add(size).ok_or_else(|| {
+                    PyIOError::new_err("retained Arrow buffer byte count exceeds usize::MAX")
+                })?;
+            }
+        }
+        // buffers() includes nested buffers, but omits dictionary values.
+        // Traverse children too so nested dictionaries and extension storage
+        // are covered; allocation identities avoid charging them twice here.
+        for child in ["dictionary", "storage", "values"] {
+            if array.hasattr(child)? {
+                arrays.push(array.getattr(child)?);
+            }
+        }
+        if array.hasattr("field")? {
+            let num_fields: usize = array.getattr("type")?.getattr("num_fields")?.extract()?;
+            for i in 0..num_fields {
+                arrays.push(array.call_method1("field", (i,))?);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 impl PyShardWriter {
     fn collect_record_batches(
         &self,
@@ -267,18 +313,21 @@ impl PyShardWriter {
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         // Iterating Python readers directly preserves their exceptions, including
         // KeyboardInterrupt; exporting through the C stream turns them into strings.
-        let mut reader: Box<dyn Iterator<Item = PyResult<RecordBatch>> + '_> = if data
+        let mut reader: Box<dyn Iterator<Item = PyResult<(RecordBatch, usize)>> + '_> = if data
             .is_instance(&py.import("pyarrow")?.getattr("RecordBatchReader")?)?
         {
-            Box::new(
-                data.try_iter()?
-                    .map(|batch| RecordBatch::from_pyarrow_bound(&batch?)),
-            )
+            Box::new(data.try_iter()?.map(|batch| {
+                let batch = batch?;
+                let retained_bytes = retained_pyarrow_bytes(&batch)?;
+                Ok((RecordBatch::from_pyarrow_bound(&batch)?, retained_bytes))
+            }))
         } else {
             let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
                 .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
             Box::new(reader.map(|batch| {
-                batch.map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+                batch
+                    .map(|batch| (batch, 0))
+                    .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
             }))
         };
         loop {
@@ -286,8 +335,9 @@ impl PyShardWriter {
             let Some(batch) = reader.next() else {
                 break;
             };
+            let (batch, retained_bytes) = batch?;
             buffer
-                .push(batch?)
+                .push_with_retained_size(batch, retained_bytes)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
         }
         py.check_signals()?;

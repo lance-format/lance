@@ -58,6 +58,21 @@ impl WriteBatchBuffer {
     /// A single oversized batch is rejected without splitting it. On error,
     /// the batch is dropped and the previously buffered input is unchanged.
     pub fn push(&mut self, batch: RecordBatch) -> Result<()> {
+        self.push_with_retained_size(batch, 0)
+    }
+
+    /// Retain a batch, also charging source allocations hidden by an FFI import.
+    ///
+    /// `retained_bytes` must include the complete source buffers kept alive by
+    /// the batch, including parents of slices. It is measured before conversion
+    /// and used when larger than the imported arrays' memory size. Shared source
+    /// allocations may be counted again across batches. Batch structures are
+    /// charged separately, as in [`Self::push`].
+    pub fn push_with_retained_size(
+        &mut self,
+        batch: RecordBatch,
+        retained_bytes: usize,
+    ) -> Result<()> {
         let rows = self
             .rows
             .checked_add(batch.num_rows())
@@ -72,7 +87,7 @@ impl WriteBatchBuffer {
         }
         let bytes = self
             .bytes
-            .checked_add(batch.get_array_memory_size())
+            .checked_add(retained_bytes.max(batch.get_array_memory_size()))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RecordBatch>()))
             .ok_or_else(|| Error::invalid_input("write buffer byte count exceeds usize::MAX"))?;
         if bytes > self.max_bytes {

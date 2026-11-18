@@ -229,9 +229,10 @@ class ShardWriter:
         schema : pa.Schema, optional
             Schema hint, needed when *data* is a generator.
         max_bytes : int, default 268435456 (256 MiB)
-            Positive byte budget for the input buffer. Counts Arrow array memory
-            and batch structures, conservatively counting shared buffers more
-            than once. The reader must produce a batch before its size can be
+            Positive byte budget for the input buffer. Counts Arrow array memory,
+            complete retained PyArrow parent buffers, and batch structures,
+            conservatively counting shared buffers across batches more than
+            once. The reader must produce a batch before its size can be
             checked, so peak input memory can exceed this budget by one incoming
             batch. A single oversized batch is rejected without splitting it.
             This budget excludes the writer's WAL, memtables, and indices.

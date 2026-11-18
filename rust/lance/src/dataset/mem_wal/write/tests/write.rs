@@ -34,6 +34,27 @@ fn test_write_buffer_byte_limit() {
 }
 
 #[rstest]
+#[case::imported_size(0)]
+#[case::source_size(3)]
+fn test_write_buffer_retained_size(#[case] source_size_multiple: usize) {
+    let config = ShardWriterConfig::default();
+    let batch = record_batch!(("id", Int64, [1, 2])).unwrap();
+    let retained_bytes = source_size_multiple * batch.get_array_memory_size();
+    let batch_bytes =
+        retained_bytes.max(batch.get_array_memory_size()) + std::mem::size_of::<RecordBatch>();
+    let mut buffer = WriteBatchBuffer::new(&config, batch_bytes).unwrap();
+    buffer
+        .push_with_retained_size(batch.clone(), retained_bytes)
+        .unwrap();
+    let error = buffer
+        .push_with_retained_size(batch.clone(), retained_bytes)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("exceeds max_bytes="));
+    assert_eq!(buffer.into_batches(), vec![batch]);
+}
+
+#[rstest]
 #[case::memtable(true)]
 #[case::wal_only(false)]
 fn test_write_buffer_row_limit(#[case] enable_memtable: bool) {

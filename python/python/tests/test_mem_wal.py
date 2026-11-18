@@ -368,6 +368,72 @@ def test_shard_writer_reader_byte_limit(tmp_path, operation, max_bytes):
 
 
 @pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize("slice_kind", ["array", "buffer", "dictionary", "nested"])
+@pytest.mark.parametrize("max_bytes", [64 * 1024, 2 * 128 * 1024 + 16 * 1024])
+def test_shard_writer_reader_retained_parent_limit(
+    tmp_path, operation, slice_kind, max_bytes
+):
+    dictionary_type = pa.dictionary(pa.int8(), pa.string())
+    name_type = {
+        "array": pa.string(),
+        "buffer": pa.string(),
+        "dictionary": dictionary_type,
+        "nested": pa.struct([("value", dictionary_type)]),
+    }[slice_kind]
+    schema = pa.schema([_LOOKUP_SCHEMA.field("id"), pa.field("name", name_type)])
+    base_name = {"value": "base"} if slice_kind == "nested" else "base"
+    base = pa.table({"id": [0], "name": [base_name]}, schema=schema)
+    ds = lance.write_dataset(base, tmp_path / "base")
+    ds.initialize_mem_wal()
+    parent_bytes = 128 * 1024
+    generated = 0
+    baseline = pa.total_allocated_bytes()
+    peak_bytes = 0
+
+    def batches():
+        nonlocal generated, peak_bytes
+        for i in range(12):
+            if slice_kind == "buffer":
+                parent = pa.allocate_buffer(parent_bytes)
+                memoryview(parent).cast("B")[:5] = b"small"
+                names = pa.Array.from_buffers(
+                    pa.string(),
+                    1,
+                    [
+                        None,
+                        pa.array([0, 5], pa.int32()).buffers()[1],
+                        parent.slice(0, 5),
+                    ],
+                )
+                del parent
+            else:
+                names = pa.array(["small", "x" * parent_bytes]).slice(0, 1)
+                if slice_kind in ("dictionary", "nested"):
+                    names = pa.DictionaryArray.from_arrays(
+                        pa.array([0], pa.int8()), names
+                    )
+                if slice_kind == "nested":
+                    names = pa.StructArray.from_arrays([names], names=["value"])
+            batch = pa.record_batch([pa.array([i + 1], pa.int64()), names], schema)
+            generated += 1
+            peak_bytes = max(peak_bytes, pa.total_allocated_bytes() - baseline)
+            yield batch
+        raise ValueError("reader exhausted")
+
+    reader = pa.RecordBatchReader.from_batches(schema, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        with pytest.raises((OSError, ValueError)) as error:
+            getattr(writer, operation)(reader, max_bytes=max_bytes)
+        # A tiny visible slice must still charge its complete retained parent.
+        # Allow overlap between the producer's previous and incoming batches.
+        assert peak_bytes <= max_bytes + 2 * parent_bytes + 4096
+        assert isinstance(error.value, OSError)
+        assert f"exceeds max_bytes={max_bytes}" in str(error.value)
+        assert generated == (1 if max_bytes < parent_bytes else 3)
+        assert writer.stats()["put_count"] == 0
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
 def test_shard_writer_reader_row_limit(tmp_path, operation):
     ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
     ds.initialize_mem_wal()
